@@ -1229,6 +1229,22 @@ target_include_directories(test_glm5_next_bridge PRIVATE
 # because at any geometry small enough to run in a test the default gives ONE
 # chunk and the loop would never be entered twice.
 vllm_cpp_add_test(test_glm5_next_forward vllm/models/test_glm5_next_forward.cpp)
+vllm_cpp_add_test(test_glm5_next_placement vllm/models/test_glm5_next_placement.cpp)
+target_include_directories(test_glm5_next_placement PRIVATE ${CMAKE_SOURCE_DIR}/src)
+set_tests_properties(test_glm5_next_placement PROPERTIES
+  ENVIRONMENT "VT_GLM5_NEXT_DEVICE_EXPERTS=1")
+add_test(NAME test_glm5_next_placement_default
+  COMMAND ${CMAKE_COMMAND} -E env --unset=VT_GLM5_NEXT_DEVICE_EXPERTS
+  $<TARGET_FILE:test_glm5_next_placement>
+  "--test-case=glm5_next placement: loaded CPU experts never upload to ROCm")
+add_test(NAME test_glm5_next_placement_off COMMAND test_glm5_next_placement
+  "--test-case=glm5_next placement: loaded CPU experts never upload to ROCm")
+set_tests_properties(test_glm5_next_placement_off PROPERTIES
+  ENVIRONMENT "VT_GLM5_NEXT_DEVICE_EXPERTS=0")
+add_test(NAME test_glm5_next_placement_nonexact COMMAND test_glm5_next_placement
+  "--test-case=glm5_next placement: loaded CPU experts never upload to ROCm")
+set_tests_properties(test_glm5_next_placement_nonexact PROPERTIES
+  ENVIRONMENT "VT_GLM5_NEXT_DEVICE_EXPERTS=11")
 target_include_directories(test_glm5_next_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(test_glm5_next_forward PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)

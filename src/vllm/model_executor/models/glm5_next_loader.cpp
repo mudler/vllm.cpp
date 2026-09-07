@@ -440,6 +440,11 @@ Glm5NextMoeWeights LoadMoe(const GgufFile& g, const GgufLoadPolicy& pol,
   const int64_t e = p.moe.n_routed_experts;
   const int64_t mi = p.moe.moe_intermediate_size;
   Glm5NextMoeWeights w;
+  // MoePlacementPlan::Resolve validates agreement among gate, up and down.
+  // ComputeDeviceFor maps their exact GGUF names to that resolved group.
+  // Capture it now so another model's placement cannot change this forward.
+  w.compute_device = pol.ComputeDeviceFor(
+      Blk(il, "ffn_gate_exps.weight"), GgufTensorRole::kStackedExpertWeight);
   w.router = LoadMatmulF32(g, Blk(il, "ffn_gate_inp.weight"), e, h);
   w.e_score_correction_bias = LoadVecF32(g, Blk(il, "exp_probs_b.bias"), e);
   w.gate_exps = LoadStackedExperts(g, pol, Blk(il, "ffn_gate_exps.weight"), e, mi, h);

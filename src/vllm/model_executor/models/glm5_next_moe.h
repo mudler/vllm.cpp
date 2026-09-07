@@ -98,6 +98,8 @@
 #define VLLM_MODEL_EXECUTOR_MODELS_GLM5_NEXT_MOE_H_
 
 #include <cstdint>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include "vllm/model_executor/models/dense_device_glue.h"  // dense_attn::Dev
@@ -288,6 +290,8 @@ struct MoeQuantBanks {
 // `Glm5NextTextExperts` declares them (`:116-117`) and how
 // `scripts/convert-glm5-next-gguf.py` writes them.
 struct MoeLayerWeights {
+  std::optional<vt::DeviceType> compute_device;
+  std::string expert_group;
   // `Glm5NextTextTopkRouter.weight`, [n_routed_experts, hidden].
   std::vector<float> router_weight;
   // `e_score_correction_bias`, [n_routed_experts]. A BUFFER upstream, zeroed by

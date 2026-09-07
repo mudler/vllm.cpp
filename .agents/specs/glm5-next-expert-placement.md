@@ -8,8 +8,9 @@
 
 ## Now
 
-Design committed before implementation. The campaign remains `ACTIVE`.
-The fresh implementer must reproduce #3019 through the production loader and forward.
+The scoped placement repair is implemented after the committed design.
+The production regression, focused CPU checks, and implementation mutations pass.
+The campaign remains `ACTIVE`; fresh review and hardware verification remain pending.
 This slice does not complete the model or establish performance parity.
 
 ## Problem and evidence
@@ -252,6 +253,172 @@ No timing becomes an accepted speed result before the campaign correctness gate.
 - [#2410](https://github.com/mudler/vllm.cpp/issues/2410) owns full device forward under `MODEL-MM-GLM53-FLASH`.
 - [#2942](https://github.com/mudler/vllm.cpp/issues/2942) retains the broader ROCm Flash campaign.
 - Backend encoding work in [#2782](https://github.com/mudler/vllm.cpp/pull/2782) does not discharge placement or admission.
+
+## Implementation evidence (2026-09-07)
+
+The implementation starts from committed design `472f1ea8118ddaeabc4810d2356d1c6b4edfe26b`.
+Its worktree is `/home/mudler/_git/vllm.cpp-glm53-placement-impl`.
+The branch is `row/MODEL-MM-GLM53-FLASH-PLACEMENT-IMPL-3019`.
+The original shared checkout remains untouched.
+The campaign remains `ACTIVE`; hardware and fresh review remain pending.
+
+### Harness and production boundary
+
+`tests/vllm/models/test_glm5_next_placement.cpp` enters through the registry loader and forward.
+The source explicitly targets ROCm, while the fake backend uses real CPU allocation and arithmetic.
+Bank-address counters distinguish expert uploads from KV and activation transfers.
+Prefill uses three tokens; continuation uses two tokens with the same model and cache topology.
+The global plan changes before both calls, after model loading.
+
+The shared `Topology` and `Step` definitions move mechanically into
+`tests/support/glm5_next_forward_fixture.h`.
+Their extracted bytes equal the original forward test's lines 109 to 337 at the committed design.
+The equality check exits 0, and the original forward test passes unchanged.
+The GGUF fixture retains Q8_0 by default.
+Its optional Q4_0 arm stores valid 32-element blocks with nonzero scales and distinct packed values.
+No dtype retagging substitutes for quantized bytes.
+
+The unsupported-bank tests separately label deliberately injected invalid runtime state.
+Gate/up and down enter through the registry; a stale up-view case directly exercises the runtime backstop.
+That case validates the source dtype independently from a previously bridged Q8_0 host view.
+It does not replace the ordinary production placement regression.
+
+### Test-first sequence
+
+All local logs use prefix `/tmp/glm53-placement-3019-`.
+The build directory is `/dev/shm/glm53-placement-build.THK1Vs`.
+Configuration uses Ninja, Release, CPU only, and ccache for both compilers:
+
+```sh
+cmake -S . -B /dev/shm/glm53-placement-build.THK1Vs -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF -DVLLM_CPP_HIP=OFF \
+  -DVLLM_CPP_METAL=OFF -DVLLM_CPP_VULKAN=OFF \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+  -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache
+```
+
+The initial build exposed a fixture namespace error, corrected before running the regression.
+That compile failure is not behavioral red evidence.
+With no product edits, the initial enabled executable exits 1:
+
+```sh
+VT_GLM5_NEXT_DEVICE_EXPERTS=1 \
+  /dev/shm/glm53-placement-build.THK1Vs/tests/test_glm5_next_placement
+```
+
+`red.log` records four cases, 163 assertions, and 14 failures.
+CPU-placed Q8_0 and Q4_0 banks incorrectly upload and invoke device kernels.
+The mixed layer also uploads three banks and executes again on continuation.
+The corresponding exact test-only patch is `red.patch`.
+Its SHA-256 is `930fa13ca0f891dc483c2f7d8157e85cac2aa176be6e3c1722c848c602b98be2`.
+The red executable hash is `b3fd1927e3a08e7cfe893ec576ff43b22196fdf545896f4969ee7284c98130e5`.
+The test source hash is `f77103f67759cbb0e118abf48f8b041b6028b0e88d7ae882b5dd78cbf1de4132`.
+
+The first product change only captures and carries placement, selecting host execution for CPU assignments.
+A clean rebuild precedes `stage1-green.log`: four cases and 139 assertions pass.
+New mismatch and source-admission tests then run before either refusal guard exists:
+
+```sh
+VT_GLM5_NEXT_DEVICE_EXPERTS=1 \
+  /dev/shm/glm53-placement-build.THK1Vs/tests/test_glm5_next_placement \
+  '--test-case=*conflicting*,*backstop*'
+```
+
+`guards-red.log` records exit 1, two cases, 58 assertions, and 26 failures.
+The guard-red executable hash is `1549bd6c4d1959aa2144e5cd2cfba0fcd460cda592a546f2188cb391dcd7dcaa`.
+Its test source hash is `f9088e243c9ebe8fd2128198082eb5d368ff1b688573dda89cad499b5583f298`.
+`stage1-product.patch` preserves the exact intermediate product delta.
+Its SHA-256 is `7f5cdd6edf9dd8429c7d009e43b3604fe10481f8268d4c74125bb01883982710`.
+
+The final guards reuse the existing capability function without changing its body or device sets.
+The shared header now declares that already externally linked function.
+`guards-green.log` records all four registered placement/forward processes passing.
+`focused.log` records the specified focused CTest expression passing all 16 tests.
+These are CPU mock and host regression results, not accelerator or oracle measurements.
+
+The final registration also tests the unset default through
+`cmake -E env --unset=VT_GLM5_NEXT_DEVICE_EXPERTS`.
+It selects the same production CPU-placement case.
+`default-green.log` records all four placement processes passing: enabled, unset, zero, and nonexact `11`.
+
+### Implementation mutations and restored build
+
+The implementer temporarily mutates only the isolated task worktree.
+`apply_patch` performs each mutation and its inverse.
+`final-product.sha256` verifies exact restoration of loader, bridge, MoE, and forward source after every mutation.
+`mutations.json` preserves every replacement, command, build status, test status, and restoration result.
+Each `mutation-<name>.log` contains the corresponding behavioral failure.
+These checks supplement, but do not replace, the fresh review's independent scratch mutations.
+
+| Mutation name | Observed failure |
+|---|---|
+| `loader-handoff` | CPU uploads, mixed-layer dispatch, and mismatch refusal fail; three cases fail |
+| `bridge-handoff` | The same three production cases fail when the bridge loses metadata |
+| `cpu-target` | Two valid CPU-placement cases throw a CPU/ROCm mismatch |
+| `mutable-plan` | Initial checks pass; continuation records one device call instead of two, with ten failed assertions |
+| `gate-up-admission` | Gate/up backstops upload unsupported sources; twelve assertions fail |
+| `down-admission` | The independent down backstop uploads and executes; seven assertions fail |
+| `actual-source-dtype` | Checking cached views misses the changed up source; five assertions fail |
+| `device-mismatch` | The mismatched accelerator uploads and executes; seven assertions fail |
+| `production-call` | Removing the call loses positive uploads and dispatch; two cases fail |
+| `positive-device-arm` | Disabling device execution loses the positive control; two cases fail |
+| `default-optin` | Enabling only the unset default removes the expected refusal; two assertions fail |
+
+All eleven variants compile successfully before their tests run.
+Ten doctest commands exit 1; the default-only CTest command exits 8.
+The first attempt to delete the sole production call failed compilation with `-Werror=unused-function`.
+That attempt is not behavioral evidence.
+The successful mutation retains an address-only reference, without invoking the function.
+
+`full-build.log` records the clean CPU build passing all 2012 steps.
+`restored-build.log` records the full canonical rebuild after mutations, exit 0.
+The restored placement executable SHA-256 is `07f04b15ecd6670e585b7ee7a7db58f03593454cdc6b1245ca5c0dcd0e8495c5`.
+The restored original forward executable SHA-256 is `ed7af8472d3e0e3f3868ca3e97f02af2450337c80c9c106c355187b1a6468d4f`.
+
+The same-config regeneration enables `CMAKE_EXPORT_COMPILE_COMMANDS=ON` for the CPU ISA audit:
+
+```sh
+python3 scripts/check-cpu-isa-build.py \
+  --compile-commands /dev/shm/glm53-placement-build.THK1Vs/compile_commands.json
+```
+
+`cpu-isa.log` records exit 0: portable baseline and exact x86 tiers pass.
+The compilation database SHA-256 is `8d3d51a1fa78be6d96315df05768b12e902d1dd4def8e3c96f41b60868ff54eb`.
+
+The restored focused expression passes all 17 registered tests in `focused-final.log`.
+The full command runs every registered CPU-build test:
+
+```sh
+ctest --test-dir /dev/shm/glm53-placement-build.THK1Vs --output-on-failure
+```
+
+`full-ctest.log` records exit 0 in 183.87 seconds: 744 registered tests, 737 passes, seven skips, zero failures.
+The skipped tests are `test_modelopt_mixed_precision_checkpoint`,
+`test_minimax_music3_device_arm_real`, `test_minimax_music3_depth_arm_real`,
+`test_cuda_deepseek_v4`, `test_voxtral_e2e`, `test_cuda_embedding_quant`, and `test_qwen35_paged_engine`.
+Their checkpoint or GPU execution is outside this scoped CPU placement repair.
+None is an executed pass or replacement for the Flash hardware obligations.
+
+### Remaining verification
+
+The startup preflight runs `--fail-on-skip` on the clean committed design.
+It exits 1 with zero failed checks and five argument-requiring skips.
+The tools suites pass, and all 25 syntax translation units pass.
+Its log is `startup-preflight.log`.
+The skipped checks require ARM/CPU build artifacts, CUDA gencode, Triton artifacts, or a PR range.
+They are not executed passes.
+
+The final staged command is `scripts/agent-preflight.sh --staged --fail-on-skip`.
+Read the implementation commit body for its exact result and `staged-preflight.log` for its output.
+The exported Python wrapper limits `check-tree-compiles.py` to `--jobs 2`.
+It appends full tools-suite output to `staged-tools.log` and preserves the Python exit status.
+This logging wrapper changes no checker or skip rule.
+The CPU ISA artifact check above separately closes that applicable bare-sweep skip.
+ARM, CUDA, and Triton artifact audits do not apply to this CPU-only change.
+The explicit PR-size base/head result belongs to the post-commit handoff because it needs the committed head.
+
+Fresh review and operator verification remain pending.
+Strix, DGX, and same-workload oracle gates remain pending external leased execution by the operator.
 
 ## Scope and stop conditions
 

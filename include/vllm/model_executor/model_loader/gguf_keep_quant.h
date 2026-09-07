@@ -117,6 +117,10 @@ bool KeepQuantDType(uint32_t ggml_type, vt::DType* out);
 // table for want of a kernel nothing calls.
 bool KeepQuantGatherDType(uint32_t ggml_type, vt::DType* out);
 
+// Whether the device's quantized GEMM supports this kept block encoding.
+// Shared by load-time residency selection and pre-upload expert admission.
+bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev);
+
 // True when the running device can gather from a BLOCK-QUANTIZED table. Same
 // shape and same reason as `DeviceKeepQuantSupported` for the GEMM arm: a
 // device whose Embedding kernel cannot decode blocks must keep the table's

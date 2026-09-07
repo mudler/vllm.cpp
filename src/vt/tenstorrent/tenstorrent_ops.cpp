@@ -2625,12 +2625,35 @@ void MatmulBTQuantGroupedKernel(Queue&, Tensor& out, const Tensor& act,
     // a capture-time constant replayed verbatim.
     const int64_t chunk_override =
         KeepQuantChunkRowsOverride().load(std::memory_order_relaxed);
-    const int64_t chunk =
+    // W4a wave-3b-2 (#3030): the plane budget is env-tunable the way
+    // VT_TT_TRACE_REGION_MB is. The 256 MiB default was surveyed on the 0.8B
+    // vehicle; at 27B the first forward's ffn_down chunk died with 244 MB
+    // free and a 105 MB largest block, so the gate recipe can shrink the
+    // plane without a rebuild. Empty/unset keeps the surveyed default.
+    int64_t plane_bytes = kKeepQuantChunkPlaneBytes;
+    bool plane_env_set = false;
+    if (const char* plane_env = std::getenv("VT_TT_KEEPQUANT_CHUNK_BYTES");
+        plane_env != nullptr && plane_env[0] != '\0') {
+      const long long parsed = std::atoll(plane_env);
+      if (parsed > 0) {
+        plane_bytes = static_cast<int64_t>(parsed);
+        plane_env_set = true;
+      }
+    }
+    int64_t chunk =
         chunk_override > 0
             ? std::min(chunk_override, N)
             : std::min(N, std::max<int64_t>(
-                              kKeepQuantChunkPlaneBytes / (K * 4),
+                              plane_bytes / (K * 4),
                               (N + 7) / 8));
+    // W4a wave-3b-2 (#3030): the env knob is a HARD CAP — the ceil(N/8)
+    // trace term above forces N/8-row chunks for wide-N weights (the head
+    // [248320, 5120] would decode 31040-row planes, 606+ MB, whatever the
+    // plane budget says), which is exactly the alloc that died at 27B. A
+    // set knob trades command-stream length for live memory, the same
+    // trade VT_TT_TRACE_REGION_MB records on its axis.
+    if (plane_env_set)
+      chunk = std::min(chunk, std::max<int64_t>(plane_bytes / (K * 4), 1));
     std::vector<ttnn::Tensor> partials;
     partials.reserve(static_cast<size_t>((N + chunk - 1) / chunk));
     for (int64_t c0 = 0; c0 < N; c0 += chunk) {

@@ -24,6 +24,13 @@
 // `RefuseUnaccountedClipMmproj` and the projector case.
 #include <doctest/doctest.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <string>
 
 #include "vllm/entrypoints/model_loader.h"
@@ -142,6 +149,89 @@ std::string Load(const std::string& model_path,
 
 constexpr const char* kTokenizerStop = "tokenizer: GGUF missing kv";
 
+// ── stderr, redirected to a file for the duration of a load ─────────────────
+//
+// The loud MTP skip line is a PRINT, so the only way to assert it reached an
+// operator is to read what the process wrote. Captured at REAL fd 2 by
+// dup/dup2 — the shape `test_qwen38_27b_radixark_w4a4_notice.cpp` uses — and
+// not a `std::cerr` rdbuf swap, because the surrounding load reports its phases
+// with C-level writes an rdbuf swap cannot see, and the capture window must
+// hold everything the load printed, in order.
+class StderrCapture {
+ public:
+  StderrCapture() {
+    static int counter = 0;
+    path_ = (std::filesystem::temp_directory_path() /
+             ("vllm_gguf_accounting_stderr_" + std::to_string(counter++) +
+              ".txt"))
+                .string();
+    std::fflush(stderr);
+    saved_ = ::dup(STDERR_FILENO);
+    sink_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (saved_ >= 0 && sink_ >= 0) ok_ = ::dup2(sink_, STDERR_FILENO) >= 0;
+  }
+  ~StderrCapture() {
+    Restore();
+    ::unlink(path_.c_str());
+  }
+  StderrCapture(const StderrCapture&) = delete;
+  StderrCapture& operator=(const StderrCapture&) = delete;
+
+  bool ok() const { return ok_; }
+
+  // Restores the real stderr and returns everything written while it was ours.
+  std::string Take() {
+    Restore();
+    std::ifstream in(path_, std::ios::binary);
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+  }
+
+ private:
+  void Restore() {
+    if (saved_ < 0) return;
+    std::fflush(stderr);
+    ::dup2(saved_, STDERR_FILENO);
+    ::close(saved_);
+    if (sink_ >= 0) ::close(sink_);
+    saved_ = -1;
+    sink_ = -1;
+  }
+  std::string path_;
+  int saved_ = -1;
+  int sink_ = -1;
+  bool ok_ = false;
+};
+
+// `Load` with the spec axis exposed, returning {thrown message, stderr}. The
+// MTP head loads only for method "mtp", so the skip line's polarity is a
+// property of these params — the test asserts it, not the log function.
+struct CapturedLoad {
+  std::string message;
+  std::string stderr_text;
+};
+
+CapturedLoad LoadCaptured(const std::string& model_path,
+                          const char* spec_method = nullptr) {
+  CapturedLoad out;
+  vllm::entrypoints::EngineParams params;
+  if (spec_method != nullptr) {
+    vllm::SpeculativeConfig spec;
+    spec.method = spec_method;
+    params.speculative_config = spec;
+  }
+  StderrCapture capture;
+  REQUIRE(capture.ok());
+  try {
+    (void)vllm::entrypoints::LoadedEngine::FromModelDir(model_path, params);
+  } catch (const std::exception& e) {
+    out.message = e.what();
+  }
+  out.stderr_text = capture.Take();
+  return out;
+}
+
 }  // namespace
 
 TEST_CASE("accounting reach: a fully-accounted GGUF is NOT refused") {
@@ -238,4 +328,70 @@ TEST_CASE("accounting reach: a DeepStack projector is accounted, not refused") {
   // an enumeration blind to the tap would refuse a file the reader handles.
   CHECK(message.find(kTokenizerStop) != std::string::npos);
   CHECK(message.find("NEVER reads") == std::string::npos);
+}
+
+// KEEPQUANT W4a wave-3b-2 (#3030): the accounting above PASSES a file whose
+// declared MTP head stays unread, because the head tensors are enumerated as
+// expected — and then the trunk-only load skips them SILENTLY, which is the
+// worst way for a gate to be honest about its denominator. The pinned
+// llama.cpp b10451 oracle ignores the same tensors (64 trunk layers, no MTP
+// head), so a gate against it is matched work only when this skip is LOUD.
+//
+// The loud line must reach the operator through the production entry point:
+// a test that calls the log function directly stays green when the loader's
+// call site is deleted, which is the mutation this case is built to fail.
+// The fixture stops at the tokenizer — the step AFTER the skip line's place —
+// so the tokenizer stop message in the thrown text proves the load walked
+// past it, and the captured fd 2 proves what it printed.
+TEST_CASE("a trunk-only load NAMES the MTP head tensors it leaves unread") {
+  // The artifact's shape at depth 5: the head declared AND shipped, the
+  // production-default spec-off load.
+  TempFile drafter(
+      BuildLanguageGguf({/*nextn_tensors=*/1, /*declare_nextn=*/true, ""}));
+  const CapturedLoad run = LoadCaptured(drafter.path());
+
+  // The load reached past the skip line's place (it died at the tokenizer,
+  // several steps later), so whatever it printed is evidence about the skip.
+  CAPTURE(run.message);
+  REQUIRE(run.message.find(kTokenizerStop) != std::string::npos);
+
+  const std::string& err = run.stderr_text;
+  CAPTURE(err);
+  CHECK(err.find("SKIPPING the MTP drafter head") != std::string::npos);
+  // The exact names, from the same enumeration the accounting refuses a
+  // forgotten name with: the four `nextn.*` scalars, then the head block's own
+  // full-attention set.
+  for (const char* name :
+       {"blk.4.nextn.eh_proj.weight", "blk.4.nextn.enorm.weight",
+        "blk.4.nextn.hnorm.weight", "blk.4.nextn.shared_head_norm.weight",
+        "blk.4.attn_q.weight", "blk.4.ffn_down.weight"}) {
+    CHECK(err.find(name) != std::string::npos);
+  }
+  // 4 nextn scalars + the 11 tensors of one full-attention block = 15, the
+  // same shape the 27B artifact skips at blk.64.
+  CHECK(err.find("15 tensor(s)") != std::string::npos);
+}
+
+TEST_CASE("the MTP head that WILL load prints no skip line") {
+  // The one config that reads the head: speculative method "mtp". The line
+  // printing here would tell an operator the head was skipped while the loader
+  // was about to attach it.
+  TempFile drafter(
+      BuildLanguageGguf({/*nextn_tensors=*/1, /*declare_nextn=*/true, ""}));
+  const CapturedLoad run = LoadCaptured(drafter.path(), /*spec_method=*/"mtp");
+  CAPTURE(run.message);
+  REQUIRE(run.message.find(kTokenizerStop) != std::string::npos);
+  CHECK(run.stderr_text.find("SKIPPING the MTP drafter head") ==
+        std::string::npos);
+}
+
+TEST_CASE("a head-less file prints no skip line") {
+  // No `nextn_predict_layers`, no head tensors: nothing is skipped, so the
+  // line must be inert rather than narrate an empty set.
+  TempFile plain(BuildLanguageGguf());
+  const CapturedLoad run = LoadCaptured(plain.path());
+  CAPTURE(run.message);
+  REQUIRE(run.message.find(kTokenizerStop) != std::string::npos);
+  CHECK(run.stderr_text.find("SKIPPING the MTP drafter head") ==
+        std::string::npos);
 }

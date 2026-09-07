@@ -255,4 +255,42 @@ void LoadGgufSharedEmbedAndHeadBf16(const GgufFile& gguf, OwnedTensor* embed,
                                     OwnedTensor* head,
                                     bool* head_was_quantized = nullptr);
 
+// KEEPQUANT W4a wave-3b-2 (issue #3030): the MTP drafter head a TRUNK-ONLY
+// load leaves unread.
+//
+// A Qwen3.5-family GGUF converted WITH the head folds it into the ordinary
+// block list (`<arch>.block_count` counts it; `<arch>.nextn_predict_layers`
+// announces it), and `LoadQwen3_5DenseFromGguf` / `LoadQwen3_5MoeFromGguf`
+// read the trunk only — `config.num_hidden_layers` blocks. The head tensors
+// (`blk.{L}.nextn.*` plus the head block's own attn/ffn set) are therefore
+// loaded ONLY when speculative decoding is configured, and on every spec-off
+// run — the production default, and the shape the pinned llama.cpp `b10451`
+// oracle runs too (it loads 64 of this family's 65 blocks and ignores all 15
+// `blk.64` tensors; .agents/oracles/llama-cpp.md) — they stay in the file
+// unread. Before wave-3b-2 that skip was SILENT, which is the worst way for a
+// gate to be honest about its denominator.
+struct Qwen3_5GgufMtpHeadSkip {
+  // True when the config declares a head AND the file carries at least one of
+  // its tensors.
+  bool present = false;
+  int64_t tensor_count = 0;
+  int64_t bytes = 0;
+  // The exact names, in file order. The loud skip line prints them all: a
+  // skipped set the reader cannot see is a silent one.
+  std::vector<std::string> names;
+};
+
+// Enumerates the head tensors `LoadQwen3_5{Dense,Moe}FromGguf` will NOT read,
+// with their file byte sizes. Kept in lockstep with the head block of
+// `Qwen3_5GgufExpectedTensors`, whose accounting is what refuses a tensor the
+// enumeration forgets.
+Qwen3_5GgufMtpHeadSkip Qwen3_5GgufMtpHeadSkipTensors(const GgufFile& gguf,
+                                                     const HfConfig& config);
+
+// The loud version: one stderr line naming every skipped tensor, the byte
+// total, the trunk/head arithmetic, the speculative-config condition that
+// would load them, and the llama.cpp `b10451` denominator-parity note. Inert
+// (prints nothing) when `Qwen3_5GgufMtpHeadSkip` reports nothing skipped.
+void LogQwen3_5GgufMtpHeadSkip(const GgufFile& gguf, const HfConfig& config);
+
 }  // namespace vllm

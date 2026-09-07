@@ -284,7 +284,14 @@ to make a failure pass.
 - IQ-family / sub-IQ1_S encodings (unsloth fork formats).
 - The int8-dot perf lever (#3031); llama.cpp-comparable throughput numbers.
 - `docs/USAGE.md` vehicle pin when the arm first runs end to end (the W3
-  capture leg hashes the local bytes); 27B arm entry at W4.
+  capture leg hashes the local bytes); the 27B arm entry LANDED with
+  wave-3b-2, provenance caveat included — the gate-completion half of that
+  pin stays owed to [#3042](https://github.com/mudler/vllm.cpp/issues/3042).
+- The 27B e2e gate, left UNREACHED by wave-3b-2:
+  [#3042](https://github.com/mudler/vllm.cpp/issues/3042) owns it. The
+  committed goldens (`tests/parity/goldens/qwen38_gguf_q4km_27b/`) are
+  lane-ready, and the TT-side run against them closes the gate. Evidence and
+  the next lever: `## W4`, wave-3b-2.
 - Residency reconciliation (RESOLVED BY ARITHMETIC, 2026-09-06, #3030):
   the twin residency is a 0.8B-only shape. Measured on the pinned 27B
   artifact: non-expert keep-quant twins need 18.47 GiB, the expert tower
@@ -382,6 +389,43 @@ accepted default. The twin-absence policy is unchanged: no whole-weight
 resident decoded shadow on the dense path; decode planes stay per-chain
 transients.
 
+**WAVE-3B-2 LANDED AS A STAGED SLICE (2026-09-07, the coordinator resolved
+the wave's NEEDS_DECISION as LAND AS A STAGED SLICE).** Landed: the
+production MTP drafter skip — the loader's accounting deliberately passes a
+declared head because its tensors ARE enumerated as expected, and the
+trunk-only load then leaves them unread, so `LogQwen3_5GgufMtpHeadSkip`
+prints the skip loud before any weight byte moves: all fifteen `blk.64.*`
+tensors, 289,527,808 B, named in full, suppressed only when speculative
+method `mtp` is configured (`model_loader.cpp`,
+`qwen3_5_gguf_weights.cpp`). The skip message carries the denominator fact:
+the pinned llama.cpp `b10451` oracle ignores the same tensors, so a gate
+against it is matched work only with this skip loud. Landed with it: the
+16-prompt oracle goldens `tests/parity/goldens/qwen38_gguf_q4km_27b/`
+(`greedy_ids.npy`), derived from the byte-identical llama.cpp `b10451`
+denominator harness — the TT-side run against them closes the gate; the
+reachability test `tests/vllm/entrypoints/test_gguf_accounting_reach.cpp`,
+which proves the skip through the PRODUCTION loader accounting rather than a
+hand-built type; the checkpoint-gated TEST_CASE in
+`tests/parity/test_qwen35_paged_engine.cpp`, inert until
+`VLLM_CPP_QWEN38_27B_GGUF` names the artifact; and
+`VT_TT_KEEPQUANT_CHUNK_BYTES` (env-doc allowlisted), the keep-quant chunk
+plane budget — default 256 MiB surveyed on the 0.8B vehicle, empty/unset
+keeps the default, a positive integer is a HARD CAP in bytes that trades
+command-stream length for live memory (the ceil(N/8) trace term otherwise
+forces a 606+ MB head plane whatever the budget says — exactly the alloc
+that died at 27B).
+
+UNREACHED: the 27B e2e gate, owed to
+[#3042](https://github.com/mudler/vllm.cpp/issues/3042). The OOM evidence,
+eight runs: failing allocations 1,073,725,440 B and 134,184,960 B;
+free-at-failure 244 MB → 46 MB → 12.7 MB/bank; ~34 GB allocated against the
+32 GB device with a 3.7 MB largest free block; batch budget 512 fails
+identically, so the demand is not activation-sized; three mitigations tried
+and failed. The residency sits ~11 GB above the ~22-23 GB surveyed design
+residency above. Suspects, named and unmeasured: the 2.5 GB bf16 embed
+twin, f32 plane transients, possible words double-staging. The next lever
+is the device-side allocation trace, not another mitigation.
+
 **W4b — the int8-dot lever ([#3031](https://github.com/mudler/vllm.cpp/issues/3031)).**
 Quantized-domain integer vec_dot behind the same seam; profile-first
 attribution; recorded-only throughput floor. Sequenced after W4a, never
@@ -424,4 +468,12 @@ dense; wave-3b = 27B wiring + gate + MTP skip + USAGE pin. AMENDED
 (444,424,192 B = ~113 chains × ~3.5 MB of decode command stream); the
 trace-region policy moves to the pinned tt-metal's dynamic / per-model
 practice, demand stays measured and reported, and wave-3b-1c repairs
-under it.
+under it. AMENDED 2026-09-07 (sixth): wave-3b-2 LANDS AS A STAGED SLICE
+(the coordinator's NEEDS_DECISION resolution) — production MTP head skip
+by name, byte-identical llama.cpp-b10451 denominator goldens committed,
+reachability test through the production loader accounting,
+`VT_TT_KEEPQUANT_CHUNK_BYTES`, and the `docs/USAGE.md` 27B arm entry. The
+27B e2e gate is UNREACHED — eight OOM runs, ~34 GB allocated against 32 GB
+— and [#3042](https://github.com/mudler/vllm.cpp/issues/3042) owns it (see
+`## Owed` and `## W4`). The row stays `ACTIVE`: W4b and the 27B gate are
+the open scope.

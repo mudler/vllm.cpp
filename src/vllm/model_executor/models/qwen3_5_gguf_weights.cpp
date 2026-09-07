@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -1765,6 +1766,67 @@ void RefuseUnaccountedQwen3_5Gguf(const GgufFile& gguf,
                "SILENTLY. Check <arch>.block_count against "
                "<arch>.nextn_predict_layers, and see "
                ".agents/specs/qwen38-27b-quant-arms.md");
+}
+
+Qwen3_5GgufMtpHeadSkip Qwen3_5GgufMtpHeadSkipTensors(const GgufFile& gguf,
+                                                     const HfConfig& config) {
+  Qwen3_5GgufMtpHeadSkip out;
+  const int64_t n_mtp = DeclaredMtpDepth(config);
+  if (n_mtp <= 0) return out;
+
+  // The same names the expected-tensor enumeration lists for the head block:
+  // the four scalar `nextn.*` tensors on the FIRST head block, then one
+  // ordinary (always full-attention) block per head layer. Kept in lockstep
+  // with `Qwen3_5GgufExpectedTensors` — its accounting is what refuses a name
+  // this list forgets, so the two cannot drift silently.
+  std::vector<std::string> want;
+  const int64_t L = config.num_hidden_layers;
+  for (const char* stem :
+       {"nextn.eh_proj.weight", "nextn.enorm.weight", "nextn.hnorm.weight",
+        "nextn.shared_head_norm.weight"}) {
+    want.push_back(Blk(L, stem));
+  }
+  for (int64_t i = 0; i < n_mtp; ++i) {
+    AppendBlockTensors(L + i, /*linear_attention=*/false,
+                       config.num_experts > 0, &want);
+  }
+
+  // Intersect with the file, in file order, and total the bytes: the numbers
+  // the loud skip line reports.
+  std::set<std::string> want_set(want.begin(), want.end());
+  for (const GgufTensorInfo& t : gguf.Tensors()) {
+    if (want_set.count(t.name) == 0) continue;
+    out.names.push_back(t.name);
+    out.bytes += static_cast<int64_t>(t.nbytes);
+  }
+  out.tensor_count = static_cast<int64_t>(out.names.size());
+  out.present = out.tensor_count > 0;
+  return out;
+}
+
+void LogQwen3_5GgufMtpHeadSkip(const GgufFile& gguf, const HfConfig& config) {
+  const Qwen3_5GgufMtpHeadSkip skip =
+      Qwen3_5GgufMtpHeadSkipTensors(gguf, config);
+  if (!skip.present) return;
+  std::string names;
+  for (size_t i = 0; i < skip.names.size(); ++i) {
+    names += (i == 0 ? "" : ", ") + skip.names[i];
+  }
+  std::cerr << "engine: qwen3.5 gguf: SKIPPING the MTP drafter head — "
+            << skip.tensor_count << " tensor(s), " << skip.bytes
+            << " B, none of them read by this trunk-only load: " << names
+            << ". They are the multi-token-prediction head at blk."
+            << config.num_hidden_layers << " (block_count "
+            << (config.num_hidden_layers + DeclaredMtpDepth(config))
+            << " = " << config.num_hidden_layers << " trunk + "
+            << DeclaredMtpDepth(config)
+            << " head); they load only when speculative decoding is "
+               "configured (speculative-config method \"mtp\"). Denominator "
+               "parity: the pinned llama.cpp b10451 oracle IGNORES these same "
+               "tensors too (64 trunk layers, no MTP head; "
+               ".agents/oracles/llama-cpp.md), so a gate against it is "
+               "matched work only with this skip loud."
+            << std::endl;
 }
 
 }  // namespace vllm

@@ -283,8 +283,10 @@ wheel. Do not alter distribution metadata or any donor environment. Run
 `pip check` again after this selection.
 
 Verify every installed compiler file against the wheel, including native
-backend files. Reject missing, changed, additional, or symlinked files;
-generated Python cache files are the only exception. Record the selected
+backend files. Reject missing, changed, additional, or symlinked files,
+including preexisting Python bytecode caches. Set `PYTHONDONTWRITEBYTECODE=1`
+for worker children so selected compiler imports do not add unverifiable
+executable cache bytes. Record the selected
 wheel identity, full namespace inventory, imported module path and version,
 AMD backend/native identities, and both distribution metadata versions.
 Explicitly label nonselected metadata as nonauthoritative for imported bytes.

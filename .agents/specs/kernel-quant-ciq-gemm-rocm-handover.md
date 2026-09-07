@@ -35,15 +35,17 @@ remaining gap, one measured hypothesis at a time.
 |---|---|---|
 | [#3033](https://github.com/mudler/vllm.cpp/pull/3033) | Widen the WMMA block 4→8 warps, alone | **REJECTED**: geomean -4.3% |
 | [#3035](https://github.com/mudler/vllm.cpp/pull/3035) | Spec only: cooperative activation share design | Landed as a spec; its own implementation (below) came back negative |
-| [#3036](https://github.com/mudler/vllm.cpp/pull/3036) | `Shared` (8x reuse) + `BigTile` (24x reuse, wider tile) | `Shared` **REJECTED** (-16% geomean); `BigTile` **ACCEPTED** (+16.0% geomean, -12.5% real-model, re-measured after the barrier repair) — **four review passes, eleven findings, all repaired** |
+| [#3036](https://github.com/mudler/vllm.cpp/pull/3036) | `Shared` (8x reuse) + `BigTile` (24x reuse, wider tile) | `Shared` **REJECTED** (-16% geomean); `BigTile` **ACCEPTED** (+16.0% geomean, -12.5% real-model, re-measured after the barrier repair) — **five review passes, fourteen findings; thirteen repaired, one held by the operator** |
 
-**#3036 has been through FOUR full review→fix cycles; check `gh pr view
+**#3036 has been through FIVE full review→fix cycles; check `gh pr view
 3036` for anything that has happened since.** The first two reviewers
 (protocol: `.agents/prompts/reviewer.md`, static read plus real mutation
 testing, not just reading the diff) found real defects that the green
-suite was structurally incapable of seeing. The third and fourth found no
-correctness defect, only drift between this record, the code's comments
-and the code. Twice that drift was inside a CORRECTION of earlier drift.
+suite was structurally incapable of seeing. The third, fourth and fifth
+found no correctness defect, only eight further ways this record, the
+code's comments and the pull request body had drifted from the code.
+Three of the eight were themselves drift inside a CORRECTION of earlier
+drift: pass 4's LOW, and both of pass 5's record findings.
 The full account, with every number, is the spec's
 `### Review cycle on #3036` section. Read that; this is the index entry.
 
@@ -80,17 +82,27 @@ The full account, with every number, is the spec's
   executable change is the LDS budget `static_assert`, which now bounds
   the probe instantiation, the tightest one this file emits.
 - **Pass 4, head `cff373abe`, one MEDIUM and one LOW, no correctness
-  finding**: both findings landed on pass 3's own repair. This file still
-  argued the K-chunking case from the superseded 6.98x gap rather than the
-  re-measured 7.12x. Pass 3's replacement for the clamp justification drew
-  a "grown pool means in-pool, exactly-sized means overrun" dichotomy that
-  is false in both directions, which the pass-1 bullet earlier now states
+  finding**: only the LOW landed on pass 3's own repair. The MEDIUM
+  landed on prose authored at `bc5d494ce` that the re-measurement commit
+  never came back for: this file still argued the K-chunking case from
+  the superseded 6.98x gap rather than the re-measured 7.12x. The LOW is
+  that pass 3's replacement for the clamp justification drew a "grown
+  pool means in-pool, exactly-sized means overrun" dichotomy that is
+  false in both directions, which the pass-1 bullet earlier now states
   correctly. Repaired with no executable change at all.
+- **Pass 5, head `6074ba02b`, two MEDIUM and one LOW, no correctness
+  finding**: pass 4's repair claimed both of pass 4's findings had landed
+  on pass 3's repair, which `git blame` refutes and which that same
+  commit contradicted 180 lines lower; and it claimed every claim in the
+  spec's review section cites a `file:line` when only three of them do.
+  Both corrected here, with no executable change. The third finding is the
+  pull request body carrying superseded figures; it is off this branch
+  and the operator holds it.
 
 **If you are picking this up fresh:** `bc5d494ce` has a real OOB read and
 `8b25f30c8` has a real race. The head after pass 2 is the first one no
-review pass has found a correctness defect in, and two further passes
-have since read it without finding one. What those two passes DID find,
+review pass has found a correctness defect in, and three further passes
+have since read it without finding one. What those three passes DID find,
 every time, is drift between this record, the kernel comments and the
 kernel. Treat the correctness as reviewed. Re-derive any load-bearing
 sentence here from the code before you rely on it.

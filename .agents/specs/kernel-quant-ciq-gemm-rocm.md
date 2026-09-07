@@ -929,16 +929,24 @@ artifact. Still default OFF behind `VT_ROCM_QUANT_WMMA_WIDE=1
 VT_ROCM_QUANT_WMMA_BIGTILE=1`; whether to flip the default is a decision
 for after review, not made in this wave.
 
-### Review cycle on #3036 (four passes, eleven findings, all repaired)
+### Review cycle on #3036 (five passes, fourteen findings)
 
-The PR has now been through four independent fresh reviews. The first
+The PR has now been through five independent fresh reviews. The first
 two each found a real defect that every green assertion in this tree was
 structurally incapable of seeing, which is the durable lesson of this
-section. The third and fourth found no correctness defect, and five more
-ways this record and the code's own comments had drifted from the code.
-Two of those five were drift in a CORRECTION of earlier drift, which is
-this row's own failure mode and the reason each claim below now cites the
-`file:line` it was checked against.
+section. The third, fourth and fifth found no correctness defect, and
+eight more ways this record, the code's own comments and the pull request
+body had drifted from the code. Three of those eight were themselves
+drift inside a CORRECTION of earlier drift, which is this row's own
+failure mode: pass 4's LOW landed on a sentence `cff373abe` had just
+written to correct pass 3's finding, and both of pass 5's record findings
+landed on sentences `6074ba02b` had just written to correct pass 4's.
+Each of those three authorships was read off `git blame`, and pass 5's
+finding 1 below gives the blame result for the five findings of passes 3
+and 4. Three claims below carry the `file:line` they were checked
+against -- the pass-1 statement, pass 3's finding 1 and pass 4's finding
+2. The rest do not, so re-derive any load-bearing sentence from the code
+before you rely on it.
 
 **Pass 1, against head `bc5d494ce` -- verdict FAIL, one HIGH.** An
 out-of-range device read in BigTile's activation staging: for the ragged
@@ -1110,7 +1118,10 @@ cooperative-tile cases green under `WIDE=1 BIGTILE=1` (2 cases, 24
 assertions) and `WIDE=1 SHARE_ACT=1` (2 cases, 18 assertions).
 
 **Pass 4, against head `cff373abe` -- no correctness finding, two record
-findings plus a phrasing note, all in the pass-3 repair itself.**
+findings plus a phrasing note.** Only the LOW was in the pass-3 repair
+itself. The MEDIUM was in `bc5d494ce`-era prose that repair never swept,
+and the phrasing note is that same repair's rewording having missed two
+older sentences.
 
 1. **MEDIUM, a superseded figure carried as current.** The handover's
    "what's NOT done" entry argued for finer K-chunking by the size of
@@ -1161,3 +1172,41 @@ Release, no `-g`). Post-repair gate, on a rebuilt binary:
 `ctest --test-dir build-hip -R 'rocm|cross_device'` 8/8, and the focused
 cooperative-tile cases green under `WIDE=1 BIGTILE=1` (2 cases, 24
 assertions) and `WIDE=1 SHARE_ACT=1` (2 cases, 18 assertions).
+
+**Pass 5, against head `6074ba02b` -- no correctness finding, two MEDIUM
+and one LOW.** Two are repaired here. The third is not on this branch.
+
+1. **MEDIUM, a false provenance claim that its own commit contradicted.**
+   `6074ba02b` wrote that pass 4's "both findings landed on pass 3's own
+   repair" (handover) and that "Two of those five were drift in a
+   CORRECTION of earlier drift" (this section), while stating the truth
+   about 180 lines lower in the same commit. Pass 4's MEDIUM target
+   blames to `bc5d494ce`, not to pass 3's repair `cff373abe`. Of the five
+   findings from passes 3 and 4, exactly one -- pass 4's LOW -- sat on
+   prose `cff373abe` wrote; pass 3's three targets blame to `b795c70fd`
+   (the `__syncthreads_or` LDS comment, authored with the probe it
+   describes), `bc5d494ce` (the `## Owed` geomean entry) and `35f9400bd`
+   (the clamp justification, authored with the clamp). Both documents now
+   count one of the five from passes 3 and 4, three of the eight once
+   pass 5's own two are included, and the pass-4 entries above say which
+   finding landed where.
+
+2. **LOW, an over-broad universal.** "the reason each claim below now
+   cites the `file:line` it was checked against" holds for three claim
+   groups and no others: the pass-1 statement, pass 3's finding 1 and
+   pass 4's finding 2. None of pass 2's five findings carries a
+   `file:line`, nor pass 3's findings 2 and 3, nor pass 4's findings 1
+   and 3. Narrowed to the three by name.
+
+3. **MEDIUM, the pull request body carried superseded figures.** Outside
+   this branch and held by the operator. It is not repaired here, and
+   this record does not claim otherwise.
+
+**Nothing executable changed in this pass either.** It edits this file
+and the handover, and no compiled file at all.
+`rocm_grouped_gemm.hip.o` still recompiles to
+`ad352c053118bcaf81b4bacffebd9044149912946fb22511ea156d5787c14a5c`
+(Release, no `-g`), the sha256 pass 4 recorded. Post-repair gate, on a
+rebuilt binary: `ctest --test-dir build-hip -R 'rocm|cross_device'` 8/8,
+and the focused cooperative-tile cases green under `WIDE=1 BIGTILE=1` (2
+cases, 24 assertions) and `WIDE=1 SHARE_ACT=1` (2 cases, 18 assertions).

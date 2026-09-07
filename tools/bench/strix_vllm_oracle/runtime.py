@@ -32,7 +32,7 @@ def identity():
 
     extensions = [importlib.import_module(name).__file__ for name in
                   ("vllm._C", "vllm._rocm_C", "vllm_gguf_plugin._C_gguf")]
-    paths = [vllm.__file__, vllm_gguf_plugin.__file__, *extensions]
+    paths = [vllm.__file__, vllm_gguf_plugin.__file__, triton.__file__, *extensions]
     if not all(Path(p).resolve().is_relative_to(Path(sys.prefix).resolve()) for p in paths):
         raise ValueError("runtime imported outside isolated venv")
     if not torch.version.hip or not current_platform.is_rocm():
@@ -52,7 +52,7 @@ def identity():
     return dict(runtime_version=vllm.__version__, distribution_version=metadata.version("vllm"),
                 platform="rocm", device_arch=arch, torch=torch.__version__, torchvision=torchvision.__version__,
                 triton=triton.__version__, triton_rocm_distribution=metadata.version("triton-rocm"),
-                triton_distribution=triton_distribution,
+                triton_distribution=triton_distribution, triton_path=triton.__file__,
                 vllm_path=vllm.__file__, plugin_path=vllm_gguf_plugin.__file__, extensions=extensions,
                 plugin_predicates=predicates, plugin_entry_points=entries,
                 plugin_version=metadata.version("vllm-gguf-plugin"))

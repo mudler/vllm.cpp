@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Isolated current-pin Strix oracle build and run worker (#3043)."""
 import argparse
+import base64
+import csv
+from email.parser import BytesParser
 import hashlib
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -15,6 +20,7 @@ import tempfile
 import time
 import tomllib
 import xml.etree.ElementTree as ET
+import zipfile
 
 PYTHON = sys.executable
 TOOLCHAIN = None
@@ -29,6 +35,7 @@ PLUGIN_REV = "d4c1f0d082fc7cd4350da56689109a01c1f29d6c"
 PLUGIN_SHA = "9e15c20e0b75f75bbf886966df07843c4b70a7952fad4b80e8e8183e2f70743b"
 MODEL_SIZE = 17106775008
 MODEL_SHA = "7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169"
+SELECTED_TRITON_SHA = "e91ffa46d095b252248297292dd22bcbacd53a125a0c2eefbbbf74925a320bc3"
 TUNING = ("VT_", "GGML_", "HSA_", "HIP_", "ROCR_", "PYTORCH_", "VLLM_", "TORCH_", "TRITON_", "CUDA_", "CMAKE_")
 INJECTION = {"PYTHONPATH", "PYTHONHOME", "LD_PRELOAD", "LD_LIBRARY_PATH", "CC", "CXX", "CFLAGS", "CXXFLAGS", "LDFLAGS"}
 
@@ -119,14 +126,85 @@ def installed_inventory(identity):
     return result
 
 
-def validate_identity(identity, venv, expected):
+def selected_triton_wheel(manifest):
+    record = manifest["dependencies"]["selected_triton"]
+    if (record.get("distribution") != "triton" or record.get("version") != "3.8.0"
+            or record.get("sha256") != SELECTED_TRITON_SHA):
+        raise ValueError("selected Triton wheel pin mismatch")
+    verify_file(record)
+    metadata_root = "triton-3.8.0.dist-info"
+    with zipfile.ZipFile(record["path"]) as wheel:
+        files = {}
+        for member in wheel.infolist():
+            path = safe_relative(member.filename)
+            mode = stat.S_IFMT(member.external_attr >> 16)
+            if (not path.parts or path.parts[0] not in ("triton", metadata_root)
+                    or "\\" in member.filename or str(path) != member.filename.rstrip("/")
+                    or mode not in (0, stat.S_IFREG, stat.S_IFDIR)):
+                raise ValueError("unsafe selected Triton wheel member")
+            if member.is_dir():
+                continue
+            if member.filename in files:
+                raise ValueError("duplicate selected Triton wheel member")
+            files[member.filename] = member
+        record_name = metadata_root + "/RECORD"
+        if record_name not in files or metadata_root + "/METADATA" not in files:
+            raise ValueError("selected Triton wheel metadata missing")
+        metadata = BytesParser().parsebytes(wheel.read(metadata_root + "/METADATA"))
+        if metadata.get("Name", "").replace("_", "-").lower() != "triton" or metadata.get("Version") != "3.8.0":
+            raise ValueError("selected Triton wheel metadata mismatch")
+        rows = {}
+        for row in csv.reader(wheel.read(record_name).decode().splitlines()):
+            if len(row) != 3 or row[0] in rows:
+                raise ValueError("invalid selected Triton RECORD")
+            rows[row[0]] = row[1:]
+        if set(rows) != set(files) or rows[record_name] != ["", ""]:
+            raise ValueError("selected Triton RECORD coverage mismatch")
+        namespace = {}
+        modes = {}
+        for name, member in files.items():
+            if name == record_name:
+                continue
+            with wheel.open(member) as stream:
+                sha = hashlib.file_digest(stream, "sha256")
+            encoded = base64.urlsafe_b64encode(sha.digest()).decode().rstrip("=")
+            if rows[name] != ["sha256=" + encoded, str(member.file_size)]:
+                raise ValueError("selected Triton RECORD hash or size mismatch")
+            if name.startswith("triton/"):
+                namespace[name.removeprefix("triton/")] = sha.hexdigest()
+                modes[name.removeprefix("triton/")] = (member.external_attr >> 16) & 0o777
+        if ("__init__.py" not in namespace or not any(p.startswith("backends/amd/") for p in namespace)
+                or not any(".so" in Path(p).name for p in namespace)):
+            raise ValueError("selected Triton compiler/backend files missing")
+    return record, namespace, modes
+
+
+def compiler_inventory(root):
+    root = Path(root)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("unsafe selected Triton namespace")
+    result = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink() or not (path.is_dir() or path.is_file()):
+            raise ValueError("unsafe selected Triton namespace member")
+        if path.is_file():
+            result[str(path.relative_to(root))] = digest(path)
+    return result
+
+
+def compiler_modes(root):
+    return {str(p.relative_to(root)): p.stat().st_mode & 0o7777
+            for p in Path(root).rglob("*") if p.is_file()}
+
+
+def validate_identity(identity, venv, expected, selection=None):
     if (identity.get("platform") != "rocm"
             or identity.get("device_arch", "").split(":")[0] != "gfx1151"
             or identity.get("torch") != expected["torch"]
             or identity.get("torchvision") != expected["torchvision"]
             or identity.get("triton") != expected["triton_runtime"]
             or identity.get("triton_rocm_distribution") != expected["triton-rocm"]
-            or identity.get("triton_distribution") is not None):
+            or identity.get("triton_distribution") != (expected.get("triton") if selection else None)):
         raise ValueError("runtime identity mismatch")
     for key in ("runtime_version", "distribution_version"):
         if not re.fullmatch(re.escape(VERSION) + r"(?:\.rocm[0-9]+)?", identity.get(key, "")):
@@ -136,6 +214,9 @@ def validate_identity(identity, venv, expected):
         raise ValueError("runtime identity imported outside isolated venv")
     if not all(identity.get("plugin_predicates", {}).get(k) is True for k in ("Q4_K", "Q5_K", "Q6_K", "Q8_0")):
         raise ValueError("runtime identity lacks native plugin predicates")
+    if selection and (identity.get("triton") != selection["version"]
+                      or identity.get("triton_path") != str(Path(selection["namespace"]) / "__init__.py")):
+        raise ValueError("selected Triton imported path/version mismatch")
 
 
 class Session:
@@ -143,10 +224,12 @@ class Session:
         self.manifest = manifest
         self.output = output
         self.local = Path(local or tempfile.mkdtemp(prefix="strix-vllm3043-", dir="/tmp"))
+        self.triton_selection = None
         self.logs = self.local / ("logs-" + output.name)
         self.logs.mkdir()
         self.limits = {**DEFAULT_LIMITS, **manifest.get("limits", {})}
-        if any(type(v) not in (int, float) or v <= 0 for v in self.limits.values()):
+        if any(type(v) not in (int, float) or v <= 0
+               or (type(v) is float and not math.isfinite(v)) for v in self.limits.values()):
             raise ValueError("invalid resource limits")
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith(("PIP_", "PYTHON")) and k != "VIRTUAL_ENV"}
@@ -157,7 +240,8 @@ class Session:
                         CMAKE_CXX_COMPILER_LAUNCHER="ccache", CMAKE_HIP_COMPILER_LAUNCHER="ccache",
                         SETUPTOOLS_SCM_PRETEND_VERSION=VERSION, PIP_DISABLE_PIP_VERSION_CHECK="1",
                         PIP_CONFIG_FILE=os.devnull,
-                        PYTHONNOUSERSITE="1", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
+                        PYTHONNOUSERSITE="1", PYTHONDONTWRITEBYTECODE="1",
+                        HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
         for variable, folder in (("PIP_CACHE_DIR", "pip-cache"), ("CCACHE_DIR", "ccache"),
                                  ("XDG_CACHE_HOME", "cache"), ("HF_HOME", "hf-cache"), ("TMPDIR", "tmp")):
             path = self.local / folder
@@ -233,11 +317,69 @@ class Session:
             self.preserve()
         return path.read_text(errors="replace")
 
+    def compiler_namespace(self, python, name):
+        # -S prevents site/.pth startup from importing resolver-created code
+        # before its compiler namespace has been verified. Python 3.12's -S
+        # skips venv prefix setup, so bind the install scheme explicitly.
+        value = self.command(name, [python, "-I", "-S", "-c",
+            "import sys, sysconfig; print(sysconfig.get_path('purelib', vars={'base': sys.argv[1], 'platbase': sys.argv[1]}))",
+            self.local / "venv"])
+        site = Path(value.strip())
+        if not site.is_absolute() or not site.resolve().is_relative_to((self.local / "venv").resolve()):
+            raise ValueError("selected Triton namespace outside isolated venv")
+        return site / "triton"
+
+    def select_compiler(self, python):
+        record, files, modes = selected_triton_wheel(self.manifest)
+        namespace = self.compiler_namespace(python, "compiler-site-build")
+        previous = compiler_inventory(namespace)
+        quarantine = Path(tempfile.mkdtemp(prefix="compiler-quarantine-", dir=self.local)) / "triton"
+        namespace.rename(quarantine)
+        namespace.mkdir()
+        with zipfile.ZipFile(record["path"]) as archive:
+            for relative in files:
+                target = namespace / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open("triton/" + relative) as source, target.open("wb") as destination:
+                    shutil.copyfileobj(source, destination)
+                target.chmod(modes[relative])
+        self.triton_selection = dict(namespace=str(namespace), wheel_sha256=record["sha256"],
+            distribution="triton", version="3.8.0", files=files, modes=modes,
+            native_files={p: sha for p, sha in files.items() if p.endswith(".so")},
+            amd_files={p: sha for p, sha in files.items() if p.startswith("backends/amd/")},
+            quarantine=str(quarantine), quarantine_files=previous,
+            nonselected_metadata="triton-rocm distribution metadata is nonauthoritative for imported compiler bytes")
+        self.verify_compiler(python, "compiler-site-selected")
+
+    def verify_compiler(self, python, name):
+        if not self.manifest["dependencies"].get("selected_triton"):
+            if self.triton_selection is not None:
+                raise ValueError("unexpected selected Triton state")
+            return
+        record, files, modes = selected_triton_wheel(self.manifest)
+        proof = self.triton_selection
+        namespace = self.compiler_namespace(python, name)
+        if (not proof or proof.get("namespace") != str(namespace)
+                or proof.get("wheel_sha256") != record["sha256"]
+                or proof.get("distribution") != "triton" or proof.get("version") != "3.8.0"
+                or proof.get("files") != files
+                or proof.get("modes") != modes or compiler_modes(namespace) != modes
+                or proof.get("native_files") != {p: sha for p, sha in files.items() if p.endswith(".so")}
+                or proof.get("amd_files") != {p: sha for p, sha in files.items() if p.startswith("backends/amd/")}
+                or compiler_inventory(namespace) != files):
+            raise ValueError("selected Triton compiler tree/state mismatch")
+        quarantine = Path(proof["quarantine"])
+        if (not quarantine.resolve().is_relative_to(self.local.resolve())
+                or compiler_inventory(quarantine) != proof["quarantine_files"]):
+            raise ValueError("selected Triton quarantine mismatch")
+        save(self.output / "triton-selection.json", proof)
+
     def probe(self, python, name):
+        self.verify_compiler(python, name + "-compiler-site")
         report = self.local / (name + ".json")
         self.command(name, [python, RUNTIME, "--mode", "identity", "--output", report], timeout=120)
         identity = json.loads(report.read_text())
-        validate_identity(identity, Path(python).parent.parent, self.manifest["dependencies"]["expected_versions"])
+        validate_identity(identity, Path(python).parent.parent, self.manifest["dependencies"]["expected_versions"], self.triton_selection)
         shutil.copyfile(report, self.output / report.name)
         return identity
 
@@ -270,7 +412,7 @@ def build(manifest, output):
     expected = dependencies["expected_versions"]
     if expected.get("torch") != "2.13.0+rocm7.2" or any(not re.fullmatch(r"[0-9A-Za-z.+_-]+", v) for v in expected.values()):
         raise ValueError("invalid dependency version binding")
-    constraints.write_text("\n".join(f"{name}=={expected[name]}" for name in ("torch", "torchvision", "triton-rocm")) + "\n")
+    constraints.write_text("\n".join(f"{name}=={expected[name]}" for name in ("torch", "torchvision", "triton-rocm", "triton") if name in expected) + "\n")
     indexes = dependencies["indexes"]
     if not indexes or any(not url.startswith("https://") for url in indexes):
         raise ValueError("explicit HTTPS dependency indexes required")
@@ -310,6 +452,9 @@ def build(manifest, output):
         raise ValueError("current source wheels missing")
     session.command("runtime-install", pip + ["install", *resolver, "--report", output / "runtime-install-report.json", *built_wheels])
     session.command("pip-check", pip + ["check"])
+    if dependencies.get("selected_triton"):
+        session.select_compiler(python)
+        session.command("pip-check-selected", pip + ["check"])
     session.command("pip-freeze", pip + ["freeze", "--all"])
     after = {name: inventory(source) for name, source in sources.items()}
     save(output / "source-after.json", after)
@@ -332,7 +477,8 @@ def build(manifest, output):
     save(output / "build-state.json", {"status": "BUILT", "local": str(local),
          "manifest_sha256": manifest_digest(manifest), "identity": identity,
          "installed": installed_inventory(identity), "source_after": after,
-         "worker_sha256": digest(__file__), "runtime_sha256": digest(RUNTIME)})
+         "worker_sha256": digest(__file__), "runtime_sha256": digest(RUNTIME),
+         "triton_selection": session.triton_selection})
 
 
 def run(manifest, state, output):
@@ -348,6 +494,7 @@ def run(manifest, state, output):
         if any(current.get(path) != sha for path, sha in recorded.items()):
             raise ValueError("source identity mismatch")
     session = Session(manifest, output, local)
+    session.triton_selection = state.get("triton_selection")
     python = local / "venv/bin/python"
     session.probe(python, "run-identity")
     model = manifest["model"]
@@ -378,8 +525,9 @@ def run(manifest, state, output):
     finally:
         if tokens.exists():
             shutil.copyfile(tokens, output / "tokens.json")
+        session.verify_compiler(python, "post-generation-compiler-site")
     generated = json.loads(tokens.read_text())
-    validate_identity(generated["identity"], local / "venv", manifest["dependencies"]["expected_versions"])
+    validate_identity(generated["identity"], local / "venv", manifest["dependencies"]["expected_versions"], session.triton_selection)
     from runtime import ENGINE_KWARGS, PROMPT_IDS
     if generated["engine_kwargs"] != ENGINE_KWARGS:
         raise ValueError("production compilation configuration mismatch")
@@ -397,9 +545,12 @@ def run(manifest, state, output):
     if digest(source) != digest(testdir / testname):
         raise ValueError("upstream test copy mismatch")
     report = output / "packed-tests.xml"
-    session.command("packed-tests", [python, "-m", "pytest", str(testdir / testname), "-ra",
-                                      "--junitxml=" + str(report)], cwd=testdir,
-                    timeout=session.limits["test_timeout"])
+    try:
+        session.command("packed-tests", [python, "-m", "pytest", str(testdir / testname), "-ra",
+                                          "--junitxml=" + str(report)], cwd=testdir,
+                        timeout=session.limits["test_timeout"])
+    finally:
+        session.verify_compiler(python, "post-tests-compiler-site")
     suites = ET.parse(report).getroot().iter("testsuite")
     counts = {key: 0 for key in ("tests", "failures", "errors", "skipped")}
     for suite in suites:

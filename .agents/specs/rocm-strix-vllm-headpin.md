@@ -232,8 +232,6 @@ handoff, including every argument-dependent SKIP. CPU fixtures substitute
 only external commands and tiny pinned artifacts; they execute the real
 worker CLI and a separately tested runtime CLI.
 
-## Owed
-
 ## Review repair: guard coverage and finite limits
 
 Fresh review of `799901422` found ten guards that the complete CPU suite
@@ -244,6 +242,12 @@ environment, local-state boundaries, copied upstream-test integrity, and
 missing resolved dtype. Assert the specific refusal and absence of later
 commands. Copy-corruption fixtures alter the destination after a real copy;
 they do not substitute a pre-copy checksum failure.
+
+Five further runtime mutations escaped the original suite. Extend its real
+runtime CLI fixtures to reject imports outside the environment, non-ROCm
+platforms, a non-gfx1151 device, and missing GGUF plugin registration. Supply
+a nonempty model projection fixture and assert captured metadata so deleting
+`LLM.apply_model` cannot pass. Keep all runtime production code unchanged.
 
 The review also found that nonfinite numeric limits pass the positive-number
 check. JSON accepts NaN and Infinity, and `1e309` parses as infinity. These
@@ -257,7 +261,7 @@ for every repaired guarantee. Restore scratch bytes after each mutation.
 Run the full preflight on the final immutable head after review findings are
 complete. The operator still owns dependency decisions and hardware execution.
 
-## Remaining work
+## Owed
 
 The packed ROCm port follows under its own issue and committed spec after
 this prerequisite. Its tests must follow current vLLM rather than old CUDA

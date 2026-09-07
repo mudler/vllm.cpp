@@ -301,6 +301,26 @@ class OracleCliTests(unittest.TestCase):
         result = self.cli(phase="run", output="dtype", state=state, STRIX_TEST_FAIL="dtype")
         self.assert_refused(result, "dtype", "resolved dtype missing", "packed-tests")
 
+    def test_cli_executes_compiler_site_expression_with_distinct_default_scheme(self):
+        self.fixture()
+        self.selected_compiler()
+        result = self.cli(STRIX_TEST_SYSCONFIG="1")
+        diagnostics = "\n".join(path.read_text() for path in
+                                (self.tmp / "out/logs").glob("compiler-site-*.log"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr + diagnostics)
+        state = self.tmp / "out/build-state.json"
+        data = json.loads(state.read_text())
+        expected = Path(data["local"]) / "venv/lib/site-packages/triton"
+        self.assertEqual(data["triton_selection"]["namespace"], str(expected))
+        result = self.cli(phase="run", output="scheme-run", state=state,
+                          STRIX_TEST_SYSCONFIG="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for output in ("out", "scheme-run"):
+            captures = list((self.tmp / output / "logs").glob("*compiler-site*.log"))
+            self.assertTrue(captures, "production compiler namespace lookup must execute")
+            for capture in captures:
+                self.assertEqual(capture.read_text().strip(), str(expected.parent))
+
     def test_cli_selects_exact_compiler_bytes_without_rewriting_metadata(self):
         self.fixture()
         self.selected_compiler()
@@ -853,8 +873,33 @@ elif args[:2] == ['-m', 'pip']:
         for name in ('triton-3.8.0.dist-info','triton_rocm-3.7.1.dist-info'):
             folder=packages/name; folder.mkdir(exist_ok=True)
             (folder/'METADATA').write_bytes(b'resolver metadata unchanged')
-elif args[:4] == ['-I', '-S', '-c', "import sys, sysconfig; print(sysconfig.get_path('purelib', vars={'base': sys.argv[1], 'platbase': sys.argv[1]}))"]:
-    print(os.environ.get('STRIX_TEST_COMPILER_SITE', pathlib.Path(__file__).parent.parent/'lib/site-packages'))
+elif '-c' in args and 'sysconfig' in args[args.index('-c') + 1]:
+    if os.environ.get('STRIX_TEST_SYSCONFIG') == '1':
+        import subprocess
+        # Execute the emitted expression in a real isolated interpreter. Only
+        # the distribution's scheme table differs from the host interpreter.
+        prelude = (
+            "import sys, sysconfig\n"
+            "assert sys.flags.isolated, 'compiler lookup lost -I'\n"
+            "assert sys.flags.no_site, 'compiler lookup lost -S'\n"
+            "default = sysconfig.get_default_scheme()\n"
+            "sysconfig._INSTALL_SCHEMES[default] = dict(sysconfig._INSTALL_SCHEMES[default], purelib='{base}/local/lib/dist-packages')\n"
+            "sysconfig._INSTALL_SCHEMES['venv'] = dict(sysconfig._INSTALL_SCHEMES['venv'], purelib='{base}/lib/site-packages')\n"
+            "get_path = sysconfig.get_path\n"
+            "def checked_path(name, *args, **kwargs):\n"
+            "    if name == 'purelib':\n"
+            "        bases = kwargs.get('vars', {})\n"
+            "        assert bases.get('base') == sys.argv[1], 'compiler lookup lost base'\n"
+            "        assert bases.get('platbase') == sys.argv[1], 'compiler lookup lost platbase'\n"
+            "    return get_path(name, *args, **kwargs)\n"
+            "sysconfig.get_path = checked_path\n"
+        )
+        index = args.index('-c')
+        child = subprocess.run([sys.executable, *args[:index], '-c',
+                                prelude + args[index + 1], *args[index + 2:]])
+        sys.exit(child.returncode)
+    else:
+        print(os.environ.get('STRIX_TEST_COMPILER_SITE', pathlib.Path(__file__).parent.parent/'lib/site-packages'))
 elif '--mode' in args:
     env = pathlib.Path(__file__).parent.parent
     packages = env/'lib/site-packages'

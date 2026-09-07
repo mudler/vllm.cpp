@@ -322,7 +322,7 @@ class Session:
         # before its compiler namespace has been verified. Python 3.12's -S
         # skips venv prefix setup, so bind the install scheme explicitly.
         value = self.command(name, [python, "-I", "-S", "-c",
-            "import sys, sysconfig; print(sysconfig.get_path('purelib', vars={'base': sys.argv[1], 'platbase': sys.argv[1]}))",
+            "import sys, sysconfig; print(sysconfig.get_path('purelib', scheme='venv', vars={'base': sys.argv[1], 'platbase': sys.argv[1]}))",
             self.local / "venv"])
         site = Path(value.strip())
         if not site.is_absolute() or not site.resolve().is_relative_to((self.local / "venv").resolve()):

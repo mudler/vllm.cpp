@@ -398,6 +398,31 @@ environment with verified read-only dependency inputs. Source identity,
 extension targets, compiler provenance, model outputs, and upstream tests
 remain mandatory. Model gateability and performance remain PENDING.
 
+### Namespace repair evidence
+
+`Session.compiler_namespace` now supplies `scheme='venv'` explicitly.
+The CPU regression executes its emitted expression in a real interpreter
+through both worker CLI phases. The fixture gives the default and `venv`
+schemes separate dictionaries, including on interpreters where they alias.
+Only the distribution scheme table changes. The real `sysconfig.get_path`
+expands the path, with assertions on isolation flags and supplied bases.
+
+The test-first command was `python3 -m unittest
+tests.tools.test_strix_vllm_oracle.OracleCliTests.test_cli_executes_compiler_site_expression_with_distinct_default_scheme`.
+It exited 1 with `unsafe selected Triton namespace` and the default scheme's
+`venv/local/lib/dist-packages` path. Evidence: `/tmp/strix3043-namespace-red.log`.
+The same test passed after the explicit scheme selected `venv/lib/site-packages`.
+The fixture keeps its existing abbreviated package layout, independent of
+the worker expression and the host's Python version.
+
+Scratch mutations removed the scheme, `-I`, `-S`, `base`, and `platbase`
+independently. Each exited 1. The scheme mutation reproduced the wrong path.
+The other four failed their named isolation or base assertion.
+Logs: `/tmp/strix3043-namespace-mutation-{scheme,I,S,base,platbase}.log`.
+`cmp` verified byte restoration after each mutation and exited 0.
+The complete focused gate and immutable-head preflight are reported in the
+implementer handoff. GPU execution remains the operator's obligation.
+
 ## Owed
 
 The packed ROCm port follows under its own issue and committed spec after

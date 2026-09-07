@@ -189,11 +189,30 @@ void ResetKeepQuantCaptureStagingWritesForTest();
 //    cover the whole [N, K] slice in one pass.
 int64_t LastTraceBytesForTest();
 void KeepQuantChunkRowsOverrideForTest(int64_t rows);
+
+// BACKEND-TENSTORRENT-KEEPQUANT W4a wave-3b-1 residency-policy probes, one
+// per shadow map, so the twin policy is a measurement and not a claim:
+//  - KeepQuantWordShadowPresentForTest: the PACKED i32 word shadow for a host
+//    weight is staged. The dense keep-quant matmul's residency — the chunked
+//    E=1 arm decodes from it every call.
+//  - DecodedWeightShadowPresentForTest: a decoded bf16 TWIN for a host weight
+//    exists. The dense keep-quant matmul must NOT build one — an entry here
+//    for a matmul weight is the wave-2 twin residency surviving the switch.
+//  - EmbedTableShadowPresentForTest: the embedding gather's bf16 table twin
+//    exists — the gather-class survivor the twin policy deliberately keeps
+//    (the vehicle's tied head shares the table: its GATHER keeps the twin,
+//    its MATMUL stages only the packed words).
+bool KeepQuantWordShadowPresentForTest(const void* host);
+bool DecodedWeightShadowPresentForTest(const void* host);
+bool EmbedTableShadowPresentForTest(const void* host);
 #else
 inline int64_t KeepQuantCaptureStagingWrites() { return 0; }
 inline void ResetKeepQuantCaptureStagingWritesForTest() {}
 inline int64_t LastTraceBytesForTest() { return 0; }
 inline void KeepQuantChunkRowsOverrideForTest(int64_t) {}
+inline bool KeepQuantWordShadowPresentForTest(const void*) { return false; }
+inline bool DecodedWeightShadowPresentForTest(const void*) { return false; }
+inline bool EmbedTableShadowPresentForTest(const void*) { return false; }
 #endif
 
 // ITEM 5 (rope): driver-side warm hook — populate the persistent device

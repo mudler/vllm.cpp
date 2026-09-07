@@ -469,6 +469,16 @@ void RunGate(const std::string& golden_subdir, const char* label,
                         << " word uploads DURING the captured e2e (the #2812 "
                            "class — a captured graph reading bytes its replay "
                            "cannot refresh)");
+    // W4a wave-3b-1: the device-reported live trace demand as of the last
+    // capture end (the wave-3a LastTraceBytesForTest pattern), recorded on
+    // both sides of the dense packed-word switch. Under the wave-3b-1c
+    // dynamic-first region policy (TraceRegionSizeFromEnv) tt-metal grows the
+    // capture region to the demand, so the number IS the axis: the measured
+    // command stream, not a carve-out against a fixed size.
+    MESSAGE(label << ": device trace demand at last capture end = "
+                  << vt::tenstorrent::LastTraceBytesForTest()
+                  << " B (dynamic trace region; VT_TT_TRACE_REGION_MB opts "
+                     "into a fixed one)");
   }
 
   // Backend proof: token equality alone does not prove which device ran.

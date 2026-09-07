@@ -6743,3 +6743,309 @@ TEST_CASE("kTENSTORRENT E=1 grouped keep-quant chunked slice-decode is bit-exact
   one_hot_leg(vt::DType::kQ8_0, 2, 2);   // K=64,  4 chunks of 2 rows
   one_hot_leg(vt::DType::kQ6_K, 3, 1);   // K=256, 3 chunks (last of 2)
 }
+
+// W4a wave-3b-1 (#3030): THE RESIDENCY SWITCH. The dense keep-quant matmul
+// routes through the wave-3a chunked E=1 grouped arm — the PACKED words stage
+// once per weight (EnsureKeepQuantWords) and every call chunk-decodes +
+// accumulates from them — so the decoded bf16 TWIN is gone from the matmul
+// path. RED-first at d614aa4f3: the twin build made the twin probe read TRUE
+// and the word probe FALSE (the twin path decoded host-side and staged no
+// words); the same warm-matmul pair must flip both after the switch. All four
+// registered encodings, entering through vt::MatmulBT's public dispatch (the
+// entry a GGUF load actually takes, ops.cpp:163). The gather class keeps its
+// own embed-table twin — that survivor leg is the next case.
+TEST_CASE("kTENSTORRENT dense keep-quant matmul stages PACKED words and builds NO twin (all four encodings)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBTQuant, vt::DeviceType::kTENSTORRENT));
+
+  Backend& backend = vt::GetBackend(vt::DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+
+  constexpr int64_t kN = 8;   // weight rows
+  constexpr int64_t kNb = 1;  // one block per row -> K spans a single block
+  std::mt19937 rng(20260921u);
+  auto rand_byte = [&rng]() { return static_cast<uint8_t>(rng() & 0xFF); };
+  auto put_f16 = [](uint8_t* blk, int64_t off, float v) {
+    const uint16_t bits = vt::F32ToF16(v);
+    std::memcpy(blk + off, &bits, sizeof(bits));
+  };
+
+  const vt::DType encodings[] = {vt::DType::kQ4_K, vt::DType::kQ5_K,
+                                 vt::DType::kQ6_K, vt::DType::kQ8_0};
+  for (const vt::DType enc : encodings) {
+    const int64_t bb = vt::BlockBytes(enc);
+    const int64_t be = vt::BlockElems(enc);
+    REQUIRE(be * bb > 0);
+    const int64_t K = kNb * be;
+
+    // Deterministic packed blocks (the W3 sweep generator): PRNG bytes
+    // everywhere, then finite f16 scales (d, and dmin where the encoding has
+    // one) placed at the layout's offsets, so the decode never sees NaN/Inf.
+    std::vector<uint8_t> packed(kN * kNb * bb);
+    for (int64_t b = 0; b < kN * kNb; ++b) {
+      uint8_t* blk = packed.data() + b * bb;
+      for (int i = 0; i < bb; ++i) blk[i] = rand_byte();
+      const float d = (0.05f + 0.35f * static_cast<float>(rng() % 64) / 64.0f) *
+                      ((rng() % 2) != 0 ? 1.0f : -1.0f);
+      if (enc == vt::DType::kQ6_K) {
+        put_f16(blk, 208, d);
+      } else {
+        put_f16(blk, 0, d);
+        if (enc == vt::DType::kQ4_K || enc == vt::DType::kQ5_K)
+          put_f16(blk, 2, 0.005f + 0.02f * static_cast<float>(rng() % 32) / 32.0f);
+      }
+    }
+    std::vector<uint16_t> a_bf(K);
+    for (auto& v : a_bf)
+      v = vt::F32ToBF16((static_cast<float>(rng() % 401) - 200.0f) / 100.0f);
+
+    // Envelope oracle (the W3 dot's shape, M=1): decode -> ONE bf16 RNE ->
+    // f32 ascending accumulation; 1.05 * 2^-8 bf16-operand bound.
+    std::vector<float> w_f32(kN * K);
+    vt::cpu::BlockToFloat(enc)(packed.data(), w_f32.data(), kN * K);
+    auto widen = [](uint16_t u) {
+      uint32_t bits = static_cast<uint32_t>(u) << 16;
+      float f;
+      std::memcpy(&f, &bits, 4);
+      return f;
+    };
+    std::vector<float> ref(kN), bound(kN);
+    for (int64_t n = 0; n < kN; ++n) {
+      float acc = 0.0f, mag = 0.0f;
+      for (int64_t k = 0; k < K; ++k) {
+        const float p = widen(a_bf[static_cast<size_t>(k)]) *
+                        widen(vt::F32ToBF16(w_f32[static_cast<size_t>(n) * K + k]));
+        acc += p;
+        mag += std::fabs(p);
+      }
+      ref[static_cast<size_t>(n)] = acc;
+      bound[static_cast<size_t>(n)] = 1.05f * std::ldexp(1.0f, -8) * (mag + std::fabs(acc));
+    }
+
+    void* mem_a = backend.Alloc(a_bf.size() * sizeof(uint16_t));
+    void* mem_b = backend.Alloc(packed.size());
+    void* mem_o = backend.Alloc(kN * sizeof(float));
+    backend.Copy(q, mem_a, a_bf.data(), a_bf.size() * sizeof(uint16_t));
+    backend.Copy(q, mem_b, packed.data(), packed.size());
+    Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {1, K});
+    Tensor b_t = Tensor::Contiguous(mem_b, enc,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {kN, K});
+    Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {1, kN});
+
+    // The warm pair: an eager warm matmul + a second call. A twin, if the
+    // policy still built one, exists after call one; the second call proves
+    // no lazy build either. Then the residency probes read the policy.
+    vt::MatmulBT(q, o_t, a_t, b_t);
+    vt::MatmulBT(q, o_t, a_t, b_t);
+
+    CHECK_FALSE_MESSAGE(
+        vt::tenstorrent::DecodedWeightShadowPresentForTest(b_t.data),
+        "TWIN-ABSENCE (" << vt::Name(enc) << "): the dense keep-quant matmul "
+                         "built a decoded bf16 twin — the wave-2 twin "
+                         "residency survived the wave-3b-1 switch");
+    REQUIRE_MESSAGE(
+        vt::tenstorrent::KeepQuantWordShadowPresentForTest(b_t.data),
+        "PACKED-WORDS (" << vt::Name(enc) << "): the dense keep-quant matmul "
+                         "staged no resident i32 word shadow — the chunked "
+                         "E=1 arm's residency did not engage");
+
+    std::vector<float> out(kN, 0.0f);
+    backend.Copy(q, out.data(), mem_o, out.size() * sizeof(float));
+    backend.Free(mem_a);
+    backend.Free(mem_b);
+    backend.Free(mem_o);
+    for (int64_t n = 0; n < kN; ++n) {
+      const float diff = std::fabs(out[static_cast<size_t>(n)] -
+                                   ref[static_cast<size_t>(n)]);
+      CHECK(std::isfinite(out[static_cast<size_t>(n)]));
+      CHECK_MESSAGE(diff <= bound[static_cast<size_t>(n)],
+                    vt::Name(enc) << " out[" << n <<"]=" << out[n]
+                                  << " ref=" << ref[n]
+                                  << " bound=" << bound[n]);
+    }
+    MESSAGE("dense keep-quant residency switch ", vt::Name(enc),
+            ": twin absent, words staged, envelope ok");
+  }
+}
+
+// W4a wave-3b-1 (#3030) survivor leg: the GATHER class keeps its twin. The
+// embedding table's bf16 device twin (EnsureEmbedTableDevice -> the
+// EmbedTableShadows map) is the residency the twin policy deliberately keeps;
+// the switch must not have over-removed it. Mutation guard for the same
+// commit's switch: delete the embed map's insert and this stays red.
+TEST_CASE("kTENSTORRENT embedding gather twin survives the wave-3b-1 switch (gather class)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kEmbedding, vt::DeviceType::kTENSTORRENT));
+
+  Backend& backend = vt::GetBackend(vt::DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+
+  constexpr int64_t Vocab = 17, H = 24, T = 3;
+  std::vector<float> host_table(Vocab * H);
+  for (size_t i = 0; i < host_table.size(); ++i)
+    host_table[i] = static_cast<float>(i % 13) * 0.1f - 0.5f;
+  const std::vector<int32_t> host_ids = {0, 16, 3};
+
+  std::vector<float> host_out(T * H, 0.0f);
+  void* mem_table = backend.Alloc(host_table.size() * sizeof(float));
+  void* mem_ids = backend.Alloc(host_ids.size() * sizeof(int32_t));
+  void* mem_out = backend.Alloc(host_out.size() * sizeof(float));
+  backend.Copy(q, mem_table, host_table.data(), host_table.size() * sizeof(float));
+  backend.Copy(q, mem_ids, host_ids.data(), host_ids.size() * sizeof(int32_t));
+
+  Tensor table = Tensor::Contiguous(mem_table, vt::DType::kF32,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {Vocab, H});
+  Tensor ids = Tensor::Contiguous(mem_ids, vt::DType::kI32,
+                                  Device{vt::DeviceType::kTENSTORRENT, 0}, {T});
+  Tensor out = Tensor::Contiguous(mem_out, vt::DType::kF32,
+                                  Device{vt::DeviceType::kTENSTORRENT, 0}, {T, H});
+
+  auto embedding = reinterpret_cast<vt::EmbeddingFn>(
+      vt::GetOp(vt::OpId::kEmbedding, vt::DeviceType::kTENSTORRENT));
+  embedding(q, out, table, ids);
+  embedding(q, out, table, ids);  // warm + second call, the twin pair
+
+  REQUIRE_MESSAGE(
+      vt::tenstorrent::EmbedTableShadowPresentForTest(table.data),
+      "GATHER-SURVIVOR: the embedding table's device twin is gone after a "
+      "warm gather pair — the switch over-removed the gather class");
+  REQUIRE_FALSE_MESSAGE(
+      vt::tenstorrent::DecodedWeightShadowPresentForTest(table.data),
+      "the gather must serve from the embed-table map, never from the "
+      "matmul twin map");
+
+  backend.Free(mem_table);
+  backend.Free(mem_ids);
+  backend.Free(mem_out);
+  MESSAGE("embedding gather twin survivor leg: embed twin present, matmul twin map clean");
+}
+
+// W4a wave-3b-1 (#3030) decode-shape leg: the ROW_MAJOR chained activation.
+// The vehicle's MLP down projection consumes the silu-mul output, whose slot
+// carries a ROW_MAJOR device staging (CommitDeviceLogical2D binds whatever
+// layout the chain produced), and EnsureDevice2D's exact-shape hit hands that
+// ROW_MAJOR tensor straight to the matmul. A ROW_MAJOR [M<32, K] operand
+// drives ttnn's auto program config to per_core_M = M / 32 == 0
+// (matmul_program_config.cpp get_mcast_1d_config) — the TT_FATAL the vehicle
+// AFTER leg hit on the first non-tile-aligned decode shape. RED-first: the
+// chain below fatals while the E=1 arm passes the activation through
+// untouched; the arm's TILE conversion makes it green and pins the fix.
+// Chained through public calls only: an E=1 grouped matmul produces the
+// bf16 activation slot state, then vt::MatmulBT consumes it.
+TEST_CASE("kTENSTORRENT dense keep-quant matmul converts a ROW_MAJOR chained activation to TILE (decode shape)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBTQuant, vt::DeviceType::kTENSTORRENT));
+
+  Backend& backend = vt::GetBackend(vt::DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+
+  constexpr int64_t kM = 5;   // the vehicle's decode M: < 32, non-tile-aligned
+  constexpr int64_t kK = 256; // one Q6_K block per row
+  std::mt19937 rng(20260922u);
+  auto rand_byte = [&rng]() { return static_cast<uint8_t>(rng() & 0xFF); };
+  auto put_f16 = [](uint8_t* blk, int64_t off, float v) {
+    const uint16_t bits = vt::F32ToF16(v);
+    std::memcpy(blk + off, &bits, sizeof(bits));
+  };
+  auto pack_q6 = [&rand_byte, &put_f16, &rng](int64_t rows) {
+    std::vector<uint8_t> packed(rows * vt::BlockBytes(vt::DType::kQ6_K));
+    for (int64_t b = 0; b < rows; ++b) {
+      uint8_t* blk = packed.data() + b * vt::BlockBytes(vt::DType::kQ6_K);
+      for (int i = 0; i < vt::BlockBytes(vt::DType::kQ6_K); ++i) blk[i] = rand_byte();
+      const float d = (0.05f + 0.35f * static_cast<float>(rng() % 64) / 64.0f) *
+                      ((rng() % 2) != 0 ? 1.0f : -1.0f);
+      put_f16(blk, 208, d);
+    }
+    return packed;
+  };
+  auto widen = [](uint16_t u) {
+    uint32_t bits = static_cast<uint32_t>(u) << 16;
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+  };
+
+  // Producer: [kM, kK] bf16 activation against a [kK, kK] Q6_K weight. The
+  // E=1 arm's assembly commits ROW_MAJOR f32 -> typecast bf16, so out1's slot
+  // ends ROW_MAJOR — the state the vehicle's elementwise chain leaves.
+  const std::vector<uint8_t> w1 = pack_q6(kK);
+  std::vector<uint16_t> a1(kM * kK);
+  for (auto& v : a1)
+    v = vt::F32ToBF16((static_cast<float>(rng() % 401) - 200.0f) / 100.0f);
+  void* mem_a1 = backend.Alloc(a1.size() * sizeof(uint16_t));
+  void* mem_w1 = backend.Alloc(w1.size());
+  void* mem_o1 = backend.Alloc(static_cast<size_t>(kM * kK) * sizeof(uint16_t));
+  backend.Copy(q, mem_a1, a1.data(), a1.size() * sizeof(uint16_t));
+  backend.Copy(q, mem_w1, w1.data(), w1.size());
+  Tensor a1_t = Tensor::Contiguous(mem_a1, vt::DType::kBF16,
+                                   Device{vt::DeviceType::kTENSTORRENT, 0}, {kM, kK});
+  Tensor w1_t = Tensor::Contiguous(mem_w1, vt::DType::kQ6_K,
+                                   Device{vt::DeviceType::kTENSTORRENT, 0}, {kK, kK});
+  Tensor o1_t = Tensor::Contiguous(mem_o1, vt::DType::kBF16,
+                                   Device{vt::DeviceType::kTENSTORRENT, 0}, {kM, kK});
+  vt::MatmulBT(q, o1_t, a1_t, w1_t);
+  vt::MatmulBT(q, o1_t, a1_t, w1_t);  // warm pair; slot state is what matters
+
+  // Consumer: out1 (bf16 [kM, kK], ROW_MAJOR slot) feeds a second keep-quant
+  // matmul — the vehicle's down-projection shape. Pre-fix this call fatals
+  // inside ttnn's program-config search.
+  const std::vector<uint8_t> w2 = pack_q6(8);
+  void* mem_w2 = backend.Alloc(w2.size());
+  void* mem_o2 = backend.Alloc(static_cast<size_t>(kM * 8) * sizeof(float));
+  backend.Copy(q, mem_w2, w2.data(), w2.size());
+  Tensor w2_t = Tensor::Contiguous(mem_w2, vt::DType::kQ6_K,
+                                   Device{vt::DeviceType::kTENSTORRENT, 0}, {8, kK});
+  Tensor o2_t = Tensor::Contiguous(mem_o2, vt::DType::kF32,
+                                   Device{vt::DeviceType::kTENSTORRENT, 0}, {kM, 8});
+  vt::MatmulBT(q, o2_t, o1_t, w2_t);
+  vt::MatmulBT(q, o2_t, o1_t, w2_t);  // second call: no lazy rebuild either
+
+  std::vector<uint16_t> o1_bits(kM * kK, 0);
+  backend.Copy(q, o1_bits.data(), mem_o1, o1_bits.size() * sizeof(uint16_t));
+  std::vector<float> out2(kM * 8, 0.0f);
+  backend.Copy(q, out2.data(), mem_o2, out2.size() * sizeof(float));
+  backend.Free(mem_a1);
+  backend.Free(mem_w1);
+  backend.Free(mem_o1);
+  backend.Free(mem_w2);
+  backend.Free(mem_o2);
+
+  // Envelope oracle for the chained call: the activation operand is EXACTLY
+  // the bf16 bits call one committed (read back above), one more bf16 RNE on
+  // the w2 decode, f32 ascending accumulation; 1.05 * 2^-8 bound.
+  std::vector<float> w2_f32(8 * kK);
+  vt::cpu::BlockToFloat(vt::DType::kQ6_K)(w2.data(), w2_f32.data(), 8 * kK);
+  for (int64_t m = 0; m < kM; ++m) {
+    for (int64_t n = 0; n < 8; ++n) {
+      float acc = 0.0f, mag = 0.0f;
+      for (int64_t k = 0; k < kK; ++k) {
+        const float p =
+            widen(o1_bits[static_cast<size_t>(m) * kK + k]) *
+            widen(vt::F32ToBF16(w2_f32[static_cast<size_t>(n) * kK + k]));
+        acc += p;
+        mag += std::fabs(p);
+      }
+      const float bound = 1.05f * std::ldexp(1.0f, -8) * (mag + std::fabs(acc));
+      const float got = out2[static_cast<size_t>(m) * 8 + n];
+      CHECK(std::isfinite(got));
+      CHECK_MESSAGE(std::fabs(got - acc) <= bound,
+                    "ROW-MAJOR chained activation: m=" << m << " n=" << n
+                                                       << " got=" << got
+                                                       << " ref=" << acc
+                                                       << " bound=" << bound);
+    }
+  }
+  MESSAGE("ROW_MAJOR chained activation leg: TILE conversion engaged, envelope ok");
+}
+

@@ -158,6 +158,80 @@ Stop for missing authority, unavailable assets, lost lease, GPU fault,
 unhealthy device, identity mismatch, or required changes outside this scope.
 No compiler success establishes performance or numerical parity.
 
+## Worker interface and dependency evidence
+
+The implementation entry point is
+`tools/bench/strix_vllm_oracle/worker.py`. Invoke it inside the operator's
+lease with `--phase build --manifest PATH --output UNUSED_PATH`. Run with
+`--phase run --manifest PATH --state BUILD_OUTPUT/build-state.json
+--output OTHER_UNUSED_PATH`. Stage `runtime.py` beside the worker and retain
+both bytes between phases; build state binds both hashes. State names the
+unique local build directory, which must remain available for the run.
+
+Manifest schema 1 contains these fields:
+
+- `sources.vllm` and `sources.plugin`: `path`, `revision`, `sha256`.
+- `model`: `path`, `bytes`, `sha256`, with the fixed artifact above.
+- `assets`: file records with `path`, `bytes`, `sha256`, `relative_path`.
+  Required relative paths are `model/config.json`, `tokenizer/config.json`,
+  `tokenizer/tokenizer_config.json`, `tokenizer/tokenizer.json`, and
+  `mmproj/mmproj-BF16.gguf`. Include every tokenizer sidecar in the manifest.
+- `dependencies.requirements`: a hashed file record for bootstrap pins.
+  `dependencies.indexes` lists explicit HTTPS indexes.
+  `dependencies.expected_versions` binds `torch`, `torchvision`,
+  `triton-rocm`, and the imported `triton_runtime` version.
+  Optional `dependencies.wheels` contains hashed wheel records copied to
+  an owned local find-links directory. Optional `source_archives` contains
+  hashed file records with a unique dependency `name`, such as `amdsmi`.
+  Dependency archives expose their build metadata at the archive root;
+  a leading `./` is supported.
+- Optional `limits` overrides positive `build_timeout`, `run_timeout`,
+  `test_timeout`, `min_mem_bytes`, `min_disk_bytes`, and `max_log_bytes`.
+  Defaults are 7200/3600/1800 seconds, 6 GiB available memory, 20 GiB free
+  disk, and 512 MiB aggregate command logs. These are safety limits, not
+  performance settings. The monitor terminates only its own process group.
+
+The worker provisions the pinned source's actual pyproject build requirements.
+It builds source wheels without build isolation, then resolves their runtime
+dependencies under the explicit Torch constraints. Pip reports retain
+resolved URLs and artifact hashes; freeze, pip check, wheel hashes, source
+inventories, and extension inventories accompany the build state. Inherited
+pip/Python installation destinations and pip configuration cannot redirect
+installation into a donor environment. Old packages are not a compatibility
+oracle: operator wheel metadata showed that torchvision 0.29 requires Torch
+2.14, whereas torchvision 0.28 accepts the required Torch 2.13. The operator
+manifest binds the compatible candidate versions, and overlap between plain
+`triton` and `triton-rocm` remains a refusal, not an ignored pip-check error.
+The current upstream runtime dependency closure is still unmeasured.
+
+The packed-test adaptation copies the pinned file byte-for-byte to an isolated
+test directory, avoiding unrelated repository-root conftest dependencies.
+The file has three functions and eight parameterized cases, not 23 cases.
+Success requires eight executed cases and zero errors, failures, or skips.
+The runtime records read-only `LLM.apply_model` projection metadata using
+`entrypoints/llm.py:599` at the pin. Parameter dtypes and shapes do not establish
+the projection output dtype; that capture remains explicitly PENDING.
+
+## Outcome
+
+The harness implementation establishes CPU-tested orchestration, not measured
+oracle gateability. The six-prompt model run, dependency closure, current-pin
+GPU build, and packed numerical tests remain PENDING for the operator's lease.
+No throughput, token-parity, or model-dtype result is accepted by this change.
+Production compilation remains enabled because it defines the denominator.
+The token gate remains FAIL from the survey; successful counts cannot repair it.
+
+The CLI test-first failure is retained in `/tmp/strix3043-red.log`; later red
+cases cover inherited install destinations, termination, continuous output,
+and partial capture in `/tmp/strix3043-red-{pip-target,signal,stream,partial}.log`.
+Focused green evidence is `/tmp/strix3043-green-final.log`. Scratch mutation
+commands and per-case logs are retained under `/tmp/strix3043-mutations*` and
+`/tmp/strix3043-mutation-*.log`, with byte-for-byte restoration assertions.
+The immutable-head full preflight is reported separately in the implementer
+handoff, including every argument-dependent SKIP. CPU fixtures substitute
+only external commands and tiny pinned artifacts; they execute the real
+worker CLI and a separately tested runtime CLI.
+
 ## Owed
 
 The packed ROCm port follows under its own issue and committed spec after

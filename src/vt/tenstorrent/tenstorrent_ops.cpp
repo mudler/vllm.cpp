@@ -203,6 +203,14 @@ std::atomic<int64_t>& KeepQuantCaptureStagingWritesCounter() {
   static std::atomic<int64_t>* c = new std::atomic<int64_t>(0);  // never destroyed (#1486)
   return *c;
 }
+
+// W4a wave-3a: the E=1 slice-decode chunk-rows override (0 = production
+// policy). Internal linkage; the ForTest setter below the anonymous
+// namespace is the external surface (the staging-counter pattern).
+std::atomic<int64_t>& KeepQuantChunkRowsOverride() {
+  static std::atomic<int64_t> v{0};
+  return v;
+}
 }  // namespace
 
 // ITEM 5 (rope): persistent device cos/sin (expanded per head), built OUTSIDE
@@ -2538,11 +2546,15 @@ void MatmulBTQuantKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) 
 // chain, bit-exact vs vt::cpu::BlockToFloat. Any other encoding refuses BY
 // NAME. Never a silent wrong answer — the ROCm refusal precedent.
 //
-// NOT capture-safe yet, and staged UNREACHED: the per-call EnsureHost of the
-// routing ids and the per-group decode writes are eager-path constructs;
-// capture compatibility of the grouped arm is wave-3's committed obligation,
-// and no production entry point reaches this kernel yet (the wiring row is
-// W4a wave-3, dense E=1 + the 27B gate).
+// W4a wave-3a (#3030) split the two arms by capture compatibility:
+//  - E=1 (dense, the 27B path) is CHUNKED slice-decode + f32 assembly and
+//    never reads the routing ids (statically all zero) — capture-clean and
+//    trace-bounded, see the CHUNK POLICY comment in the arm;
+//  - E=N (experts) keeps the wave-2 whole-slice decode and its dynamic-id
+//    host readback; its capture indirection is staged-owed behind a MoE
+//    artifact (spec ## W4), and it stays UNREACHED (no production entry
+//    point until wave-3b wires the model).
+constexpr int64_t kKeepQuantChunkPlaneBytes = 256 << 20;  // 256 MiB f32 plane
 void MatmulBTQuantGroupedKernel(Queue&, Tensor& out, const Tensor& act,
                                 const Tensor& weight,
                                 const Tensor& expert_ids) {
@@ -2593,15 +2605,6 @@ void MatmulBTQuantGroupedKernel(Queue&, Tensor& out, const Tensor& act,
   if (P == 0 || N == 0) return;
 
   MeshDevice& device = SharedMeshDevice();
-  // The routing ids are small; the established TT index-tensor contract is
-  // EnsureHost + a host read (EmbeddingKernel), range-checked like the
-  // embedding gather.
-  EnsureHost(expert_ids);
-  const int32_t* eids = expert_ids.Ptr<int32_t>();
-  for (int64_t p = 0; p < P; ++p)
-    VT_CHECK(eids[p] >= 0 && eids[p] < E,
-             "tenstorrent kMatmulBTQuantGrouped: expert id out of range (id " +
-                 std::to_string(eids[p]) + ", E " + std::to_string(E) + ")");
 
   // Stage the PACKED tower once — the resident i32 word shadow keyed by the
   // host weight pointer, served forever after (the dense arm's pattern). The
@@ -2619,10 +2622,96 @@ void MatmulBTQuantGroupedKernel(Queue&, Tensor& out, const Tensor& act,
         ttnn::typecast(std::move(dev_a), ttnn::DataType::BFLOAT16),
         ttnn::Layout::TILE);
   ttnn::Tensor a_rows;
-  if (Pa > 1)
+  if (E > 1 && Pa > 1)
     a_rows = ttnn::to_layout(std::move(dev_a), ttnn::Layout::ROW_MAJOR);
 
   const uint32_t wpb = static_cast<uint32_t>(KeepQuantWordsPerBlock(enc));
+
+  if (E == 1) {
+    // == W4a wave-3a (#3030): the DENSE arm — CHUNKED slice-decode + f32
+    // assembly, capture-clean. The fourth spec amendment (b40907ee2) makes
+    // this arm the row's production surface: the whole keep-quant set beyond
+    // the gather class is served PACKED through E=1, and a captured graph
+    // must never hold a whole-weight tile. Wave-1b falsified that shape on
+    // the vehicle; the chunk-count survey below (P150, 2026-09-07) measured
+    // BOTH capture-time failure modes on the head shape [248320, 1024] Q6_K:
+    // one whole-weight chunk dies on DEVICE DRAM (bank_manager.cpp:462 — a
+    // 1.02 GiB f32 decode plane), while many small chunks die on the TRACE
+    // REGION (mesh_trace.cpp:81): the captured command stream costs ~3.3 MB
+    // per chunk (485 chunks = 1,566,662,656 B; 16 chunks = 53,764,096 B;
+    // 2-4 chunks capture clean). CHUNK POLICY: decode [chunk, K] word
+    // ranges — one tile matmul per chunk — so the live working set is the
+    // i32 word slice, the chain's f32 planes and the bf16 tile of ONE chunk
+    // plus the tiny f32 partials, never a whole-weight tile; each chunk's
+    // decoded tile dies before the next chunk allocates. The budget bounds
+    // the chain's largest live tensor — one [chunk, K] f32 plane — at
+    // 256 MiB (chunk = 256 MiB / (4 B . K), and a whole decode for any
+    // weight whose plane fits), while ceil(N / 8) keeps the command stream
+    // under the 52,428,800 B trace region for weights large enough to
+    // chunk. Chunks cover DISJOINT weight rows, so every output element is
+    // still ONE dot over the full K and chunks concatenate in f32; the
+    // decode itself is unchanged (the bit-exact leg pins it). Capture-clean:
+    // E=1 ids are statically all zero — the only in-range expert — so the
+    // routing ids are never EnsureHosted or read, and every chunk offset is
+    // a capture-time constant replayed verbatim.
+    const int64_t chunk_override =
+        KeepQuantChunkRowsOverride().load(std::memory_order_relaxed);
+    const int64_t chunk =
+        chunk_override > 0
+            ? std::min(chunk_override, N)
+            : std::min(N, std::max<int64_t>(
+                              kKeepQuantChunkPlaneBytes / (K * 4),
+                              (N + 7) / 8));
+    std::vector<ttnn::Tensor> partials;
+    partials.reserve(static_cast<size_t>((N + chunk - 1) / chunk));
+    for (int64_t c0 = 0; c0 < N; c0 += chunk) {
+      const int64_t c1 = std::min(N, c0 + chunk);
+      const ttnn::Tensor sl = ttnn::slice(
+          words,
+          ttsl::SmallVector<uint32_t>{static_cast<uint32_t>(c0 * nb), 0u},
+          ttsl::SmallVector<uint32_t>{static_cast<uint32_t>(c1 * nb), wpb},
+          ttsl::SmallVector<uint32_t>{1u, 1u});
+      ttnn::Tensor wf = DecodeKeepQuantWordsF32(sl, enc, c1 - c0, nb, device);
+      ttnn::Tensor wb = ttnn::to_layout(
+          ttnn::typecast(std::move(wf), ttnn::DataType::BFLOAT16),
+          ttnn::Layout::TILE);
+      ttnn::Tensor part = ttnn::operations::matmul::matmul(
+          dev_a, std::move(wb), /*transpose_a=*/false, /*transpose_b=*/true);
+      partials.push_back(ttnn::to_layout(
+          ttnn::typecast(std::move(part), ttnn::DataType::FLOAT32),
+          ttnn::Layout::ROW_MAJOR));
+    }
+    ttnn::Tensor assembled =
+        partials.size() == 1
+            ? std::move(partials[0])
+            : ttnn::concat(std::move(partials), /*dim=*/1);
+    if (Pa == 1 && P > 1) {
+      // Broadcast contract: every output row is the SAME [1, K] activation
+      // against expert 0 — replicate the assembled row. Bit-identical to the
+      // wave-2 per-group decode (identical operands, identical programs).
+      std::vector<ttnn::Tensor> rows(static_cast<size_t>(P), assembled);
+      assembled = ttnn::concat(std::move(rows), /*dim=*/0);
+    }
+    if (out.dtype == DType::kBF16)
+      assembled =
+          ttnn::typecast(std::move(assembled), ttnn::DataType::BFLOAT16);
+    CommitDeviceLogical2D(out, std::move(assembled), static_cast<uint32_t>(P),
+                          static_cast<uint32_t>(N));
+    return;
+  }
+
+  // E=N EXPERT TOWER arm: the wave-2 path unchanged. The routing ids are
+  // dynamic here; the established TT index-tensor contract is EnsureHost + a
+  // host read (EmbeddingKernel), range-checked like the embedding gather.
+  // That host readback is the arm's eager construct, and its capture
+  // indirection is staged-owed behind a MoE artifact (spec ## W4).
+  EnsureHost(expert_ids);
+  const int32_t* eids = expert_ids.Ptr<int32_t>();
+  for (int64_t p = 0; p < P; ++p)
+    VT_CHECK(eids[p] >= 0 && eids[p] < E,
+             "tenstorrent kMatmulBTQuantGrouped: expert id out of range (id " +
+                 std::to_string(eids[p]) + ", E " + std::to_string(E) + ")");
+
   // The selected [N,K] slice for group p: word rows [e*N*nb, (e+1)*N*nb) —
   // decode, one bf16 RNE, TILE — the dense dot's exact weight convention.
   auto slice_decode = [&](int64_t p) {
@@ -7461,6 +7550,18 @@ void ResetKeepQuantCaptureStagingWritesForTest() {
   KeepQuantCaptureStagingWritesCounter().store(0, std::memory_order_relaxed);
 }
 
+// W4a wave-3a test hooks — the contract lives in tenstorrent_device.h.
+void KeepQuantChunkRowsOverrideForTest(int64_t rows) {
+  KeepQuantChunkRowsOverride().store(rows, std::memory_order_relaxed);
+}
+std::atomic<int64_t>& LastTraceBytes() {
+  static std::atomic<int64_t> v{0};
+  return v;
+}
+int64_t LastTraceBytesForTest() {
+  return LastTraceBytes().load(std::memory_order_relaxed);
+}
+
 // ---- ttnn mesh-trace capture (Backend graph-capture mapping) ----------------
 // Process-local single-slot capture + multi-graph handles (opaque MeshTraceId*).
 // Mirrors the CUDA backend's single-exec_ vs EndCaptureGraph split.
@@ -7526,6 +7627,10 @@ void TraceEndCapture() {
   VT_CHECK(s.capturing, "tenstorrent: TraceEndCapture without Begin");
   MeshDevice& device = SharedMeshDevice();
   ttnn::operations::trace::end_trace_capture(&device, s.capturing_id, kTraceCq);
+  // W4a wave-3a: expose the device-reported live trace demand so the
+  // chunked E=1 arm's fit inside the 50 MiB trace region is a measurement,
+  // not an assumption (the wave-1b falsification class).
+  LastTraceBytes() = static_cast<int64_t>(device.get_trace_buffers_size());
   // Drop previous single-slot replay if any.
   if (s.has_replay) {
     try {
@@ -7559,6 +7664,7 @@ void* TraceEndCaptureGraph() {
   VT_CHECK(s.capturing, "tenstorrent: TraceEndCaptureGraph without Begin");
   MeshDevice& device = SharedMeshDevice();
   ttnn::operations::trace::end_trace_capture(&device, s.capturing_id, kTraceCq);
+  LastTraceBytes() = static_cast<int64_t>(device.get_trace_buffers_size());
   NoteGraphCaptured();
   s.capturing = false;
   tt_capture_active() = false;

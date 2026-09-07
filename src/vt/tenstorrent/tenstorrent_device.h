@@ -174,9 +174,26 @@ bool CopyDeviceDeviceIfResident(void* dst, const void* src, size_t bytes);
 #ifdef VLLM_CPP_TENSTORRENT
 int64_t KeepQuantCaptureStagingWrites();
 void ResetKeepQuantCaptureStagingWritesForTest();
+
+// BACKEND-TENSTORRENT-KEEPQUANT W4a wave-3a test hooks (the red/green
+// measurement pair for the chunked E=1 arm):
+//  - LastTraceBytesForTest: the device-reported total live trace-buffer
+//    bytes as of the last EndCapture — the observable for the wave-1b
+//    falsification class (a whole-weight tile inside a captured graph
+//    demanding 425,754,624 B against the 52,428,800 B region). The reading
+//    accumulates across every live trace, so tests release a graph before
+//    measuring the next one in isolation.
+//  - KeepQuantChunkRowsOverrideForTest: forces the E=1 slice-decode chunk
+//    row count (0 = the production policy default), so the sweep and the
+//    bit-exact legs execute MANY chunks at shapes whose policy chunk would
+//    cover the whole [N, K] slice in one pass.
+int64_t LastTraceBytesForTest();
+void KeepQuantChunkRowsOverrideForTest(int64_t rows);
 #else
 inline int64_t KeepQuantCaptureStagingWrites() { return 0; }
 inline void ResetKeepQuantCaptureStagingWritesForTest() {}
+inline int64_t LastTraceBytesForTest() { return 0; }
+inline void KeepQuantChunkRowsOverrideForTest(int64_t) {}
 #endif
 
 // ITEM 5 (rope): driver-side warm hook — populate the persistent device

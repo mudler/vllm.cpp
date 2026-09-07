@@ -816,48 +816,103 @@ existing ~50 KiB per-warp weight-side footprint at 8 warps. Grid is 2D
 (`blockIdx.x` gives each warp a fixed `jt`, matching the existing design;
 `blockIdx.y` gives the whole block a shared `it_base` spanning `ItGroup`
 groups, looped inside each warp) rather than the previous flat 1D `tile`
-encoding, because a 2D grid needs no `n_tiles % WarpsPerBlock == 0`
-precondition on its OWN axis-mixing (removed for the `it`/M direction;
-kept for `jt`/N, because a warp whose `jt` falls outside `n_tiles` must
-never exist in a launched block -- its early `return` would desync the
-block's later `__syncthreads()` calls from warps that keep running).
+encoding. The 2D grid removes the `n_tiles % WarpsPerBlock == 0`
+precondition on the `it`/M direction (raggedness there is handled by a
+round-UP `grid_y` and a block-uniform `continue` inside the kernel) and
+keeps it on the `jt`/N direction.
+
+**Why that N-direction precondition is needed -- corrected 2026-09-07,
+because this paragraph previously named a mechanism the code does not
+have.** It is NOT an out-of-range-`jt` guard: `grid_x = n_tiles / wpb` is
+floor division, so no warp in a launched block can reach a `jt` past
+`n_tiles`, the kernel's own `if (jt >= n_tiles) return` is dead under this
+dispatch, and nothing desyncs. Removing the clause fails in two other ways,
+both mutation-measured on this box rather than argued:
+
+1. **Silently unwritten output columns**, the dominant mode, for ANY
+   `n_tiles % wpb != 0`. Floor division drops the remainder tiles; the
+   launch succeeds and output column tiles `[grid_x*wpb, n_tiles)` are
+   never written by anything. The M/N tail fill does not cover them either,
+   because it is keyed on `n_aligned < n` and here `n_aligned == n`. At
+   n_tiles=9 (N=144, M=80) the call returns clean and the test then reads
+   uninitialised device memory -- NMSE 0.111875, 0.137199 and 3.16e+68
+   within one run here, `nan` on the reviewer's box, so the mode has no
+   fixed signature, only a wrong answer.
+2. **Zero-sized grid**, the narrow-N special case of (1) where the
+   remainder is everything. At `n_tiles < wpb` (n_tiles=3, wpb=8 -- the
+   pre-existing N=48 WMMA test) `grid_x == 0` and HIP rejects the launch
+   with "invalid configuration argument", an uncaught exception rather than
+   a wrong number. Measured at N=48.
+
 Weight dequant (and, for Q4_K, `UnpackQ4KScalesMins`) now execute ONCE
 per superblock per warp and serve all `ItGroup` iterations, not just
 one -- weight-side reuse Shared did not have either.
 
-Hardware-verified correct via the new dedicated tests above (not the
-stale N=48 ones): `ctest -R rocm|cross_device`, 48/48 cases, 84084/84084
-assertions, zero regression, both configs.
+Correctness as first reported: `ctest -R rocm|cross_device`, 48/48 cases,
+84084/84084 assertions, zero regression, both configs. **That claim was
+true of the assertions and false of the kernel.** Two review passes have
+since found real defects behind it -- an out-of-bounds device read and a
+cross-warp race -- neither of which any of those assertions could see. The
+"Review cycle" section below is the current statement of what is verified;
+read it rather than this paragraph.
+
+**The performance numbers below were RE-MEASURED on 2026-09-07**, after
+the second review's barrier repair (see "Review cycle") put one more
+block-wide `__syncthreads()` in BigTile's per-superblock loop. That is the
+same cost class that sank the `Shared` arm at -16%, so the earlier
+measurement no longer described the code and was retaken rather than
+carried over. The first-cut figures are kept beside each new one, because
+the DIFFERENCE between them is the barrier's price and is the only
+measurement of it this row has.
 
 Op-level A/B (`examples/quant-gemm-bench`, RX 9060 XT, best-of-4, idle
-host), BigTile vs the shipping 4-warp default:
+host, `llama-server.service` inactive), BigTile vs the shipping 4-warp
+default and vs the rejected 8-warp arm:
 
-| Shape | Default | BigTile | ratio |
-|---|---:|---:|---:|
-| Q4_K N=3072 K=2048 | 1964.7 | 1996.6 | +1.6% |
-| Q4_K N=12288 K=2048 | 2247.0 | 2766.2 | +23.1% |
-| Q4_K N=2048 K=6144 | 1949.9 | 2377.6 | +21.9% |
-| Q6_K N=3072 K=2048 | 1883.1 | 2158.0 | +14.6% |
-| Q6_K N=12288 K=2048 | 2174.1 | 2775.2 | +27.6% |
-| Q6_K N=2048 K=6144 | 1876.8 | 2130.9 | +13.5% |
+| Shape | Default | 8-warp | BigTile | BT/def | first cut |
+|---|---:|---:|---:|---:|---:|
+| Q4_K N=3072 K=2048 M=128 | 1957.0 | 1796.0 | 2013.2 | +2.9% | +1.6% |
+| Q4_K N=12288 K=2048 M=128 | 2246.5 | 2019.3 | 2761.8 | +22.9% | +23.1% |
+| Q4_K N=2048 K=6144 M=128 | 1955.8 | 1961.7 | 2394.7 | +22.4% | +21.9% |
+| Q6_K N=3072 K=2048 M=128 | 1873.7 | 1787.2 | 2008.5 | +7.2% | +14.6% |
+| Q6_K N=12288 K=2048 M=128 | 2161.5 | 1976.2 | 2791.1 | +29.1% | +27.6% |
+| Q6_K N=2048 K=6144 M=128 | 1880.0 | 1930.3 | 2135.4 | +13.6% | +13.5% |
+| Q4_K N=12288 K=2048 **M=132 (tail)** | 2195.1 | 1980.8 | 2668.1 | +21.5% | +19.1% |
+| Q6_K N=12288 K=2048 **M=132 (tail)** | 1680.9 | 1565.9 | 2019.3 | +20.1% | +19.9% |
 
-Geomean **+16.8%**, and +22.9%/+38.9% against the two rejected arms
-(wider-block-alone, activation-share-alone) respectively -- consistent
-with the diagnosis that neither axis alone cleared the staging cost, and
-this row's own ragged "tail" shape (M=132, not 16-aligned) shows the same
-order of improvement (+19.1%/+19.9%), so this is not an artifact of
-perfectly-aligned synthetic shapes.
+Geomean over the same six non-tail shapes the first cut used: **+16.0%**,
+against the first cut's +16.8%. Over all eight including the two ragged
+non-16-aligned tail shapes: **+17.2%**. Against the rejected 8-warp arm:
++24.3%. The ragged tail shapes did not merely hold, they came in slightly
+ahead of the aligned ones, so this is still not an artifact of
+perfectly-aligned synthetic shapes. `q8_0`, an unrelated launch path
+carried through the same runs as a control, is flat (+0.3% to +2.5%).
 
 **Real-model confirmation**, same isolated-prefill recipe as gate (c)
-above (`Ornith-1.5-9B-Q4_K_M.gguf`, 512-token prompt, `rocprofv3`,
-isravale, idle, 3 reps):
+above (`Ornith-1.5-9B-Q4_K_M.gguf`, the same pinned 512-token prompt at
+`prompt_tokens=512`, `rocprofv3 --kernel-trace --stats`, isravale, idle,
+3 reps, per-rep figures):
 
-| | Default (4-warp) | BigTile | ratio |
-|---|---:|---:|---:|
-| Prefill total kernel time (whole forward pass) | 3012.9 ms | 2590.9 ms | -14.0% |
-| ...vs oracle pp512 (274.3 ms) | 10.98x slower | 9.45x slower | |
-| Quant-GEMM kernels only (Q4_K+Q6_K) | 1982.7 ms | 1552.0 ms | -21.7% |
-| ...vs llama.cpp `mul_mat_q` (222.3 ms) | 8.92x slower | 6.98x slower | |
+| | Default (4-warp) | BigTile | ratio | first cut |
+|---|---:|---:|---:|---:|
+| Prefill total kernel time (whole forward pass) | 3007.2 ms | 2630.3 ms | -12.5% | -14.0% |
+| ...vs oracle pp512 (277.9 ms) | 10.82x slower | 9.46x slower | | |
+| Quant-GEMM kernels only (Q4_K+Q6_K) | 1977.0 ms | 1583.5 ms | -19.9% | -21.7% |
+| ...vs llama.cpp `mul_mat_q` (222.4 ms) | 8.89x slower | **7.12x** slower | | 6.98x |
+
+The oracle side was re-run in the same session on the same pinned binary
+(`b10451`) and reproduces the first cut to within noise (`mul_mat_q`
+222.4 ms vs 222.3 ms per pp512 pass; llama-bench pp512 1842 tok/s), and
+so does our own default arm (3007.2 vs 3012.9 ms total, 1977.0 vs 1982.7
+ms quant-GEMM) -- so the box is in the same state and the deltas below
+are the barrier, not drift.
+
+**What the barrier cost, stated plainly.** Op-level geomean +16.8% ->
++16.0%. Real-model prefill -14.0% -> -12.5%. Isolated quant-GEMM gap
+6.98x -> 7.12x slower than llama.cpp. The repair is not free and the
+earlier figures were flattering, but BigTile remains a clear win on every
+axis measured, and the correctness it buys is not optional: without it
+the kernel returns NMSE 0.05-0.11 the moment the warps drift apart.
 
 The synthetic op-level win survives contact with the real checkpoint,
 diluted by the other kernels in the forward pass (`GdnScanK`, attention,
@@ -865,3 +920,94 @@ the dense bf16 GEMM) exactly as expected -- not inflated, not an
 artifact. Still default OFF behind `VT_ROCM_QUANT_WMMA_WIDE=1
 VT_ROCM_QUANT_WMMA_BIGTILE=1`; whether to flip the default is a decision
 for after review, not made in this wave.
+
+### Review cycle on #3036 (two passes, five findings, all repaired)
+
+The PR has now been through two independent fresh reviews. Both found
+real defects that every green assertion in this tree was structurally
+incapable of seeing, which is the durable lesson of this section.
+
+**Pass 1, against head `bc5d494ce` -- verdict FAIL, one HIGH.** An
+out-of-bounds device read in BigTile's activation staging: for the ragged
+last M-block (`m_tiles % ItGroup != 0`, the common case) the loop copied
+`ItGroup*16` rows unconditionally, past the end of `EnsureQuantScratch`'s
+buffer, before the `it_i` bounds check that would have prevented it was
+ever consulted. It never corrupted output, because those rows are never
+consumed -- so the whole suite was green with the read in it. Found by
+tracing address arithmetic against the real allocation size, not by a
+crash. Fixed in `35f9400bd`: staging clamped to
+`min(ItGroup*16, (m_tiles - it_base)*16)`.
+
+**Pass 2, against head `8b25f30c8` -- five findings, repaired here.**
+
+1. **HIGH, cross-warp write-after-read race on `act_stage`.** The `sb`
+   loop had no barrier at its end. `w_stage`, `raw_tile`, `row_scales` and
+   `row_mins` are all `[wy]`-indexed and private to one warp; `act_stage`
+   is the only block-shared array, and the loop's last barrier sits BEFORE
+   its last read. Nothing ordered warp A's read of superblock `sb` against
+   warp B's cooperative overwrite for `sb+1`. It affected all FOUR
+   cooperative kernels (`Q6KBigTile`, `Q4KBigTile`, `Q6KShared`,
+   `Q4KShared`).
+
+   Proven, not argued, and reproduced here independently of the reviewer:
+   injecting a TIMING-ONLY delay for one warp immediately before that read
+   (`__builtin_amdgcn_s_sleep` plus a compiler-only barrier -- no memory
+   operation added or removed) makes the unrepaired kernels return NMSE
+   0.050182 (Q6_K BigTile), 0.0555232 (Q4_K BigTile), 0.104243 (Q6_K
+   Shared) and 0.113616 (Q4_K Shared) against a 0.0005 tolerance. The
+   first and third reproduce the reviewer's figures to six digits on a
+   different session. Adding exactly one `__syncthreads()` at the end of
+   the `sb` loop, with the identical delay still in place and the identical
+   build, returns all four to green. Removing the delay leaves the tree
+   byte-for-byte as committed.
+
+   **This defect has no permanent runnable guard and cannot have one.** A
+   race is invisible until the warps drift, and on this workload they do
+   not drift on their own. The reproduction above is the guard: it is a
+   four-line scratch edit, recorded here so the next reader can re-run it
+   rather than re-derive it.
+
+2. **MEDIUM, the dispatch precondition comment described the wrong
+   mechanism.** Corrected in the code and in the "Why that N-direction
+   precondition is needed" paragraph above, with both failure modes
+   mutation-measured here. The Q4_K branch, which carried no comment at
+   all, now points at the Q6_K branch's.
+
+3. **MEDIUM, this spec contradicted the code.** Repaired by the same
+   paragraph, and by this section.
+
+4. **LOW, nothing could detect the pass-1 OOB class.** Reverting the clamp
+   left the focused suite fully green, because the rows read out of bounds
+   are exactly the rows never consumed. Now guarded: both BigTile kernels
+   take an `OobProbe` template parameter that turns the staging loop's own
+   row index into an assertion -- each thread checks the global row it is
+   about to read against the buffer's row count, and any block that goes
+   out of range poisons its own output with NaN, which the existing NMSE
+   assertions catch. It is a template parameter, not a kernel argument, so
+   the production instantiation compiles to exactly the code it did before
+   (the trace confirms `BigTile<..., false>` is what was measured) and the
+   probe costs the measurement nothing. Selected by
+   `KQuantWmmaSetBigTileOobProbeForTest`, exercised by both cooperative-
+   tile test cases, and mutation-proven: restoring the unclamped
+   `ItGroup*16` bound makes exactly the two probe assertions fail (NMSE
+   `nan`) while every value-only assertion stays green -- which is the
+   finding, executable.
+
+   A canary appended to the quant scratch was considered and rejected: the
+   defect is a READ, so a canary would have to be poison the kernel then
+   consumes, and it does not consume those rows. Only the address range is
+   observable, so the assertion has to live where the address is formed.
+
+5. **LOW, the test skip condition omitted `VT_ROCM_QUANT_WMMA_WIDE`.** Run
+   with `BIGTILE=1` alone the cooperative-tile cases did not skip; they
+   failed six dispatch-counter `CHECK`s, reporting an unmet harness
+   precondition as a defect. Confirmed by mutation (six failures with the
+   clause removed, a clean MESSAGE-and-return with it). All three toggles
+   are `static const bool` read once inside the backend, so the test can
+   only decline to run, never set them itself.
+
+Post-repair gate, all four toggle configurations, `ctest -R
+'rocm|cross_device'` 8/8 and the full `test_backend_cross_device` binary:
+48/48 cases in each of default (84068 assertions), `WIDE=1` (84068),
+`WIDE=1 SHARE_ACT=1` (84084) and `WIDE=1 BIGTILE=1` (84090, the six new
+ones being the OOB probe passes). Zero regression.

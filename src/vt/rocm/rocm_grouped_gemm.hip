@@ -779,6 +779,20 @@ __global__ void KQuantGemmKWmmaQ6KShared(OutT* __restrict__ out, const uint8_t* 
       const float d = DF16ToF32(xb_cur[jj]->d) * act_stage[ii].d;
       acc_f[c] += d * static_cast<float>(isum[c]);
     }
+    // WRITE-AFTER-READ barrier on the BLOCK-SHARED `act_stage` (review of
+    // #3036). `w_stage`/`raw_tile` are `[wy]`-indexed and therefore private
+    // to one warp; `act_stage` is the only array every warp in the block
+    // touches. The loop above is this superblock's LAST read of it, and the
+    // next `sb` iteration's cooperative stage OVERWRITES it. Without this
+    // barrier nothing orders warp A's read here against warp B's write
+    // there: the batch loop's own `__syncthreads()` calls all sit BEFORE
+    // this read, so the loop back-edge is an unsynchronised window.
+    // Mutation-proven, not argued: with a timing-only `s_sleep` delaying one
+    // warp immediately before this read (no memory operation added or
+    // removed), the barrier-less kernel returns NMSE 0.104243 against a
+    // 0.0005 tolerance, and restoring this line makes the identical build
+    // green again.
+    __syncthreads();
   }
 
 #pragma unroll
@@ -816,7 +830,25 @@ __global__ void KQuantGemmKWmmaQ6KShared(OutT* __restrict__ out, const uint8_t* 
 // `ItGroup` separate accumulators (three independent 16x16 output
 // tiles per warp, not one), which is the register-pressure cost this
 // design trades for the wider reuse.
-template <typename OutT, int WarpsPerBlock, int ItGroup>
+//
+// `OobProbe` is the runnable guard for the staging clamp below (review of
+// #3036, finding 4). That clamp's only defect class is an ADDRESS RANGE, and
+// a value test structurally cannot see it: the rows an unclamped loop reads
+// past the buffer are exactly the rows the `it_i` bounds check never
+// consumes, so every NMSE assertion stays green while the loop reads out of
+// bounds -- which is how `bc5d494ce` shipped that read through a full green
+// suite. There is no device-side ASan on RDNA/gfx12 to fall back on. This
+// parameter turns the staging loop's own row index into an assertion: each
+// thread checks the GLOBAL activation row it is about to read against the
+// scratch buffer's real row count, and if any thread in the block is out of
+// range the block poisons its OWN output with NaN, which the existing value
+// assertions then catch. It is a template parameter rather than a kernel
+// argument so the production instantiation (`OobProbe=false`) compiles to
+// exactly the code it does today -- the check is discarded, not predicted --
+// and the performance measurement is of the shipping kernel, not of a
+// kernel carrying a disabled probe. `KQuantWmmaSetBigTileOobProbeForTest`
+// selects the probing instantiation at the host call site.
+template <typename OutT, int WarpsPerBlock, int ItGroup, bool OobProbe = false>
 __global__ void KQuantGemmKWmmaQ6KBigTile(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
                                           const BlockQ8_K* __restrict__ act, int64_t m, int64_t n,
                                           int64_t nsb, int64_t n_tiles, int64_t m_tiles) {
@@ -855,6 +887,10 @@ __global__ void KQuantGemmKWmmaQ6KBigTile(OutT* __restrict__ out, const uint8_t*
   for (int g = 0; g < ItGroup; ++g)
 #pragma unroll
     for (int c = 0; c < 8; ++c) acc_f[g][c] = 0.0f;
+
+  // Test-only; see `OobProbe`'s comment above the template header.
+  bool oob_seen = false;
+  (void)oob_seen;
 
   for (int64_t sb = 0; sb < nsb; ++sb) {
     const BlockQ6_K* xb_cur[16];
@@ -895,6 +931,11 @@ __global__ void KQuantGemmKWmmaQ6KBigTile(OutT* __restrict__ out, const uint8_t*
       for (int idx = block_tid; idx < kTotalWords; idx += kBlockThreads) {
         const int row = idx / kWordsPerRow;
         const int w = idx % kWordsPerRow;
+        if constexpr (OobProbe) {
+          // `row` is relative to `a_row0`, which starts at global row
+          // it_base*16; the scratch buffer holds exactly m_tiles*16 rows.
+          if (it_base * 16 + row >= m_tiles * 16) oob_seen = true;
+        }
         act_dst_i[idx] = act_base_i[row * words_per_global_row + sb * kWordsPerRow + w];
       }
     }
@@ -948,6 +989,30 @@ __global__ void KQuantGemmKWmmaQ6KBigTile(OutT* __restrict__ out, const uint8_t*
         const float d = DF16ToF32(xb_cur[jj]->d) * act_stage[it_i * 16 + ii].d;
         acc_f[it_i][c] += d * static_cast<float>(isum[c]);
       }
+    }
+    // WRITE-AFTER-READ barrier on the block-shared `act_stage` -- see
+    // `KQuantGemmKWmmaQ6KShared`'s own comment on this line for the full
+    // reason and the mutation that proves it. Same window here: the `it_i`
+    // loop above ends with this superblock's last `act_stage` read, and the
+    // next `sb` iteration's cooperative stage overwrites the same array.
+    // The `it_i` loop's `continue` is block-uniform, so every thread in the
+    // block reaches this barrier.
+    __syncthreads();
+  }
+
+  if constexpr (OobProbe) {
+    // Block-wide reduction of the staging probe, then poison this block's
+    // own output. `__syncthreads_or` costs no LDS and every thread reaches
+    // it (the only early `return` above is `jt >= n_tiles`, which the
+    // dispatch precondition already makes unreachable inside a launched
+    // block -- if it were reachable the barriers in the loop above would
+    // already have desynced). NaN, because it survives the bf16 conversion
+    // and makes the existing NMSE assertions fail rather than merely drift.
+    if (__syncthreads_or(oob_seen ? 1 : 0) != 0) {
+#pragma unroll
+      for (int g = 0; g < ItGroup; ++g)
+#pragma unroll
+        for (int c = 0; c < 8; ++c) acc_f[g][c] = __builtin_nanf("");
     }
   }
 
@@ -1278,6 +1343,13 @@ __global__ void KQuantGemmKWmmaQ4KShared(OutT* __restrict__ out, const uint8_t* 
       const float dmin = DF16ToF32(xb_cur[jj]->dmin) * act_stage[ii].d;
       acc_f[c] += d * static_cast<float>(isum[c]) - dmin * static_cast<float>(sumi);
     }
+    // WRITE-AFTER-READ barrier on the block-shared `act_stage` -- see
+    // `KQuantGemmKWmmaQ6KShared`'s own comment on this line. Q4_K reads
+    // MORE of `act_stage` here than Q6_K does (`bsums` for the min
+    // correction, not just `.d`), so the unsynchronised window this closes
+    // is wider, not narrower: measured NMSE 0.113616 without it under the
+    // same timing-only probe.
+    __syncthreads();
   }
 
 #pragma unroll
@@ -1298,7 +1370,9 @@ __global__ void KQuantGemmKWmmaQ4KShared(OutT* __restrict__ out, const uint8_t* 
 // `jt`, not on `it`), so like the weight dequant fill they are computed
 // ONCE per superblock and reused across all ItGroup iterations, the same
 // reuse `KQuantGemmKWmmaQ4KShared` did not have either.
-template <typename OutT, int WarpsPerBlock, int ItGroup>
+// `OobProbe` carries the same test-only staging assertion, for the same
+// reason -- see `KQuantGemmKWmmaQ6KBigTile`'s own comment on it.
+template <typename OutT, int WarpsPerBlock, int ItGroup, bool OobProbe = false>
 __global__ void KQuantGemmKWmmaQ4KBigTile(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
                                           const BlockQ8_K* __restrict__ act, int64_t m, int64_t n,
                                           int64_t nsb, int64_t n_tiles, int64_t m_tiles) {
@@ -1338,6 +1412,10 @@ __global__ void KQuantGemmKWmmaQ4KBigTile(OutT* __restrict__ out, const uint8_t*
 #pragma unroll
     for (int c = 0; c < 8; ++c) acc_f[g][c] = 0.0f;
 
+  // Test-only; see `OobProbe`'s comment above `KQuantGemmKWmmaQ6KBigTile`.
+  bool oob_seen = false;
+  (void)oob_seen;
+
   for (int64_t sb = 0; sb < nsb; ++sb) {
     const BlockQ4_K* xb_cur[16];
 #pragma unroll
@@ -1366,6 +1444,11 @@ __global__ void KQuantGemmKWmmaQ4KBigTile(OutT* __restrict__ out, const uint8_t*
       for (int idx = block_tid; idx < kTotalWords; idx += kBlockThreads) {
         const int row = idx / kWordsPerRow;
         const int w = idx % kWordsPerRow;
+        if constexpr (OobProbe) {
+          // `row` is relative to `a_row0`, which starts at global row
+          // it_base*16; the scratch buffer holds exactly m_tiles*16 rows.
+          if (it_base * 16 + row >= m_tiles * 16) oob_seen = true;
+        }
         act_dst_i[idx] = act_base_i[row * words_per_global_row + sb * kWordsPerRow + w];
       }
     }
@@ -1423,6 +1506,26 @@ __global__ void KQuantGemmKWmmaQ4KBigTile(OutT* __restrict__ out, const uint8_t*
         const float dmin = DF16ToF32(xb_cur[jj]->dmin) * act_stage[it_i * 16 + ii].d;
         acc_f[it_i][c] += d * static_cast<float>(isum[c]) - dmin * static_cast<float>(sumi);
       }
+    }
+    // WRITE-AFTER-READ barrier on the block-shared `act_stage` -- see
+    // `KQuantGemmKWmmaQ6KShared`'s own comment on this line. Measured NMSE
+    // 0.0555232 without it under the same timing-only probe.
+    __syncthreads();
+  }
+
+  if constexpr (OobProbe) {
+    // Block-wide reduction of the staging probe, then poison this block's
+    // own output. `__syncthreads_or` costs no LDS and every thread reaches
+    // it (the only early `return` above is `jt >= n_tiles`, which the
+    // dispatch precondition already makes unreachable inside a launched
+    // block -- if it were reachable the barriers in the loop above would
+    // already have desynced). NaN, because it survives the bf16 conversion
+    // and makes the existing NMSE assertions fail rather than merely drift.
+    if (__syncthreads_or(oob_seen ? 1 : 0) != 0) {
+#pragma unroll
+      for (int g = 0; g < ItGroup; ++g)
+#pragma unroll
+        for (int c = 0; c < 8; ++c) acc_f[g][c] = __builtin_nanf("");
     }
   }
 
@@ -1898,6 +2001,16 @@ std::atomic<uint64_t> g_kq_wmma_share_q4k_dispatches{0};
 std::atomic<uint64_t> g_kq_wmma_bigtile_dispatches{0};
 std::atomic<uint64_t> g_kq_wmma_bigtile_q4k_dispatches{0};
 
+// Selects the `OobProbe=true` instantiation of both BigTile kernels (see
+// the template's own comment). A plain global rather than an environment
+// toggle, because the test needs to turn it on and off WITHIN one process
+// to prove both polarities, and every `VT_ROCM_QUANT_WMMA_*` toggle in this
+// file is a `static const bool` read once. Default off, and the production
+// dispatch below reads it exactly where it already reads the other
+// per-launch conditions. Same shape as
+// `Q8KSetKernelExecutionWitnessForTest` on this row's quantizer path.
+std::atomic<bool> g_kq_wmma_bigtile_oob_probe{false};
+
 // VT_ROCM_QUANT_WMMA=0 forces the scalar arm even on gfx1200/gfx1201 — the
 // A/B escape hatch every WMMA arm in this tree ships with
 // (VT_ATTN_PREFILL_SHAREDK_WMMA is the paged-attention precedent). Default
@@ -2035,6 +2148,10 @@ uint64_t KQuantWmmaBigTileQ4KDispatchCount() {
   return g_kq_wmma_bigtile_q4k_dispatches.load(std::memory_order_relaxed);
 }
 
+void KQuantWmmaSetBigTileOobProbeForTest(bool on) {
+  g_kq_wmma_bigtile_oob_probe.store(on, std::memory_order_relaxed);
+}
+
 void Q8KQuantizeForTest(Queue& q, void* scratch, const void* act, DType dtype,
                         int64_t row_stride, int64_t rows, int64_t nsb, bool candidate) {
   EnsureQueueDevice(q);
@@ -2154,30 +2271,57 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
         // rows for a block that straddles an `it` boundary.
         if (wpb == kQuantWmmaWideWarpsPerBlock && QuantWmmaBigTileEnabled() &&
             n_tiles % wpb == 0) {
-          // BigTile's grid is 2D and its jt dimension is sized EXACTLY to
-          // n_tiles/wpb (no remainder block) -- the same precondition
-          // Shared uses. Mutation-tested (review of #3036): removing this
-          // modulo check does NOT let an out-of-range jt reach a launched
-          // block -- grid_x = n_tiles / wpb below is already floor
-          // division, so grid_x*wpb <= n_tiles always holds and no warp's
-          // jt can land past n_tiles. The failure this precondition
-          // actually guards against is narrow N: for a shape where
-          // n_tiles < wpb (e.g. n_tiles=3 with wpb=8, the pre-existing
-          // N=48 WMMA test), floor division makes grid_x == 0, and HIP
-          // rejects that zero-sized launch outright with "invalid
-          // configuration argument" (an uncaught exception at launch),
-          // not a hang or an in-block desync. The `it` (M) direction
-          // needs no such precondition: its raggedness is handled by a
-          // block-uniform `continue` inside the loop, not a per-warp
-          // early return.
+          // WHY `n_tiles % wpb == 0` IS REQUIRED, both failure modes, each
+          // mutation-tested by removing the clause (review of #3036).
+          //
+          // What it is NOT: it is not an out-of-range `jt` guard. `grid_x =
+          // n_tiles / wpb` below is floor division, so `grid_x*wpb <=
+          // n_tiles` always holds and no warp in a launched block can reach
+          // a `jt` past `n_tiles`. The kernel's own `if (jt >= n_tiles)
+          // return` is therefore dead under this dispatch, and removing this
+          // clause would not wake it.
+          //
+          // 1. SILENTLY UNWRITTEN OUTPUT COLUMNS -- the dominant mode, and
+          //    the one that fires for ANY `n_tiles % wpb != 0`. Floor
+          //    division drops the remainder tiles: the launch succeeds, the
+          //    kernel runs, and output column tiles `[grid_x*wpb, n_tiles)`
+          //    are never written by anything. The M/N tail fill below does
+          //    not cover them either, because it is keyed on `n_aligned <
+          //    n` and here `n_aligned == n` -- those columns are inside the
+          //    "aligned corner" the tail fill assumes WMMA already wrote.
+          //    Measured with the clause removed at n_tiles=9 (N=144, M=80):
+          //    the call returns clean and the test then reads uninitialised
+          //    device memory. The NMSE it reports is whatever that memory
+          //    happened to hold -- 0.111875, 0.137199 and 3.16e+68 within
+          //    one run here, `nan` on the reviewer's box -- so this mode
+          //    has no fixed signature to assert on, only a wrong answer.
+          // 2. ZERO-SIZED GRID -- the narrow-N special case of (1), where
+          //    the remainder is everything. For `n_tiles < wpb` (e.g.
+          //    n_tiles=3 at wpb=8, the pre-existing N=48 WMMA test) floor
+          //    division makes `grid_x == 0` and HIP rejects the launch
+          //    outright with "invalid configuration argument", an uncaught
+          //    exception rather than a wrong number. Measured with the
+          //    clause removed at N=48.
+          //
+          // The `it` (M) direction needs no matching precondition: its
+          // raggedness is handled by a block-uniform `continue` inside the
+          // kernel loop and by the `grid_y` round-UP below, not by floor
+          // division and not by a per-warp early return.
           g_kq_wmma_bigtile_dispatches.fetch_add(1, std::memory_order_relaxed);
           const int64_t grid_x = n_tiles / kQuantWmmaWideWarpsPerBlock;
           const int64_t grid_y =
               (m_tiles + kQuantWmmaBigTileItGroup - 1) / kQuantWmmaBigTileItGroup;
-          KQuantGemmKWmmaQ6KBigTile<OutT, kQuantWmmaWideWarpsPerBlock, kQuantWmmaBigTileItGroup>
-              <<<dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y)),
-                 dim3(32, kQuantWmmaWideWarpsPerBlock), 0, s>>>(
-                  o, w, qact, m, n, nsb, n_tiles, m_tiles);
+          const dim3 bt_grid(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y));
+          const dim3 bt_block(32, kQuantWmmaWideWarpsPerBlock);
+          if (g_kq_wmma_bigtile_oob_probe.load(std::memory_order_relaxed)) {
+            KQuantGemmKWmmaQ6KBigTile<OutT, kQuantWmmaWideWarpsPerBlock,
+                                      kQuantWmmaBigTileItGroup, true>
+                <<<bt_grid, bt_block, 0, s>>>(o, w, qact, m, n, nsb, n_tiles, m_tiles);
+          } else {
+            KQuantGemmKWmmaQ6KBigTile<OutT, kQuantWmmaWideWarpsPerBlock,
+                                      kQuantWmmaBigTileItGroup>
+                <<<bt_grid, bt_block, 0, s>>>(o, w, qact, m, n, nsb, n_tiles, m_tiles);
+          }
         } else if (wpb == kQuantWmmaWideWarpsPerBlock && QuantWmmaShareActEnabled() &&
             n_tiles % wpb == 0) {
           g_kq_wmma_share_dispatches.fetch_add(1, std::memory_order_relaxed);
@@ -2215,14 +2359,26 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
         const int64_t grid_wmma = (m_tiles * n_tiles + wpb - 1) / wpb;
         if (wpb == kQuantWmmaWideWarpsPerBlock && QuantWmmaBigTileEnabled() &&
             n_tiles % wpb == 0) {
+          // `n_tiles % wpb == 0` is required here for exactly the two
+          // reasons the Q6_K branch above states in full -- silently
+          // unwritten output column tiles for any non-zero remainder, and a
+          // zero-sized grid when n_tiles < wpb. Same grid arithmetic, same
+          // kernel shape; read that comment, this branch does not repeat it.
           g_kq_wmma_bigtile_q4k_dispatches.fetch_add(1, std::memory_order_relaxed);
           const int64_t grid_x = n_tiles / kQuantWmmaWideWarpsPerBlock;
           const int64_t grid_y =
               (m_tiles + kQuantWmmaBigTileItGroup - 1) / kQuantWmmaBigTileItGroup;
-          KQuantGemmKWmmaQ4KBigTile<OutT, kQuantWmmaWideWarpsPerBlock, kQuantWmmaBigTileItGroup>
-              <<<dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y)),
-                 dim3(32, kQuantWmmaWideWarpsPerBlock), 0, s>>>(
-                  o, w, qact, m, n, nsb, n_tiles, m_tiles);
+          const dim3 bt_grid(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y));
+          const dim3 bt_block(32, kQuantWmmaWideWarpsPerBlock);
+          if (g_kq_wmma_bigtile_oob_probe.load(std::memory_order_relaxed)) {
+            KQuantGemmKWmmaQ4KBigTile<OutT, kQuantWmmaWideWarpsPerBlock,
+                                      kQuantWmmaBigTileItGroup, true>
+                <<<bt_grid, bt_block, 0, s>>>(o, w, qact, m, n, nsb, n_tiles, m_tiles);
+          } else {
+            KQuantGemmKWmmaQ4KBigTile<OutT, kQuantWmmaWideWarpsPerBlock,
+                                      kQuantWmmaBigTileItGroup>
+                <<<bt_grid, bt_block, 0, s>>>(o, w, qact, m, n, nsb, n_tiles, m_tiles);
+          }
         } else if (wpb == kQuantWmmaWideWarpsPerBlock && QuantWmmaShareActEnabled() &&
             n_tiles % wpb == 0) {
           g_kq_wmma_share_q4k_dispatches.fetch_add(1, std::memory_order_relaxed);

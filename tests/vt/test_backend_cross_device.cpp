@@ -2671,6 +2671,7 @@ uint64_t KQuantWmmaShareDispatchCount();
 uint64_t KQuantWmmaShareQ4KDispatchCount();
 uint64_t KQuantWmmaBigTileDispatchCount();
 uint64_t KQuantWmmaBigTileQ4KDispatchCount();
+void KQuantWmmaSetBigTileOobProbeForTest(bool on);
 void Q8KQuantizeForTest(vt::Queue& q, void* scratch, const void* act, vt::DType dtype,
                         int64_t row_stride, int64_t rows, int64_t nsb, bool candidate);
 bool Q8KCandidateSelectedForTest(const char* env_value, bool gfx1100_default_accepted,
@@ -3505,6 +3506,16 @@ TEST_CASE("keep-quant Q4_K WMMA tile arm matches the CPU oracle on RDNA4") {
 // counters (not the generic ones the tests above use, which cannot tell
 // these variants apart from the plain kernel) prove the SPECIFIC kernel
 // under test actually launched.
+// Turns BigTile's test-only staging range assertion on for one scope and
+// off again however the scope exits, so a failed CHECK inside cannot leave
+// the probing instantiation selected for every later case in this binary.
+struct BigTileOobProbeScope {
+  BigTileOobProbeScope() { vt::rocm::KQuantWmmaSetBigTileOobProbeForTest(true); }
+  ~BigTileOobProbeScope() { vt::rocm::KQuantWmmaSetBigTileOobProbeForTest(false); }
+  BigTileOobProbeScope(const BigTileOobProbeScope&) = delete;
+  BigTileOobProbeScope& operator=(const BigTileOobProbeScope&) = delete;
+};
+
 TEST_CASE("keep-quant Q6_K WMMA cooperative-tile arms match the CPU oracle") {
   const bool rocm_registered = [] {
     for (DeviceType dt : RegisteredDevices())
@@ -3517,11 +3528,21 @@ TEST_CASE("keep-quant Q6_K WMMA cooperative-tile arms match the CPU oracle") {
   const std::string actual_arch = vt::rocm::DeviceArchName(0);
   if (!vt::rocm::GcnArchNameIsGfx12PrefillWmma(actual_arch)) return;
 
+  // VT_ROCM_QUANT_WMMA_WIDE=1 is part of the precondition, not an extra:
+  // the dispatch only reaches EITHER cooperative-tile arm when the block is
+  // the 8-warp one, so a run with BIGTILE=1 alone lands on the plain kernel
+  // and the dispatch-counter CHECK below would report an unmet harness
+  // precondition as a defect (review of #3036, finding 5). All three
+  // toggles are `static const bool` read once inside the backend, so the
+  // test cannot set them itself -- it can only decline to run.
+  const char* wide = std::getenv("VT_ROCM_QUANT_WMMA_WIDE");
+  const bool wide_on = wide != nullptr && wide[0] == '1' && wide[1] == '\0';
   const bool bigtile = std::getenv("VT_ROCM_QUANT_WMMA_BIGTILE") != nullptr;
   const bool share = std::getenv("VT_ROCM_QUANT_WMMA_SHARE_ACT") != nullptr;
-  if (!bigtile && !share) {
-    MESSAGE("neither VT_ROCM_QUANT_WMMA_BIGTILE nor _SHARE_ACT set; "
-            "cooperative-tile arms not exercised this run");
+  if (!wide_on || (!bigtile && !share)) {
+    MESSAGE("VT_ROCM_QUANT_WMMA_WIDE=1 plus one of VT_ROCM_QUANT_WMMA_BIGTILE / "
+            "_SHARE_ACT is required to reach the cooperative-tile arms; "
+            "not exercised this run");
     return;
   }
 
@@ -3594,6 +3615,28 @@ TEST_CASE("keep-quant Q6_K WMMA cooperative-tile arms match the CPU oracle") {
         bigtile ? vt::rocm::KQuantWmmaBigTileDispatchCount() : vt::rocm::KQuantWmmaShareDispatchCount();
     CHECK(after > before);
   }
+
+  // BigTile's activation staging must read only rows the quant scratch
+  // actually holds. M=80 gives m_tiles=5 against ItGroup=3, so blockIdx.y=1
+  // starts at it_base=3 with only 2 of its 3 groups valid -- the ragged
+  // tail that `bc5d494ce` read 16 rows past the end of. That defect cannot
+  // be seen in a value: the rows it reads are the ones the kernel's own
+  // bounds check never consumes, so this suite was fully green with the
+  // out-of-bounds read in it. The probe instantiation checks the staging
+  // loop's global row index against the buffer's row count and poisons the
+  // block's output with NaN when it is out of range, which turns the
+  // address defect into a value the assertion below can see. Restoring the
+  // unclamped `ItGroup*16` staging bound makes this CHECK fail; nothing
+  // else in this file does.
+  if (bigtile) {
+    BigTileOobProbeScope probe;
+    DevBuf dout(rocm, q, on);
+    Tensor tout = T2(dout.ptr(), d, M, N);
+    const uint64_t before = vt::rocm::KQuantWmmaBigTileDispatchCount();
+    vt::MatmulBTQuant(q, tout, tact, twt);
+    CHECK(vt::rocm::KQuantWmmaBigTileDispatchCount() > before);
+    CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+  }
   rocm.DestroyQueue(q);
 }
 
@@ -3609,11 +3652,21 @@ TEST_CASE("keep-quant Q4_K WMMA cooperative-tile arms match the CPU oracle") {
   const std::string actual_arch = vt::rocm::DeviceArchName(0);
   if (!vt::rocm::GcnArchNameIsGfx12PrefillWmma(actual_arch)) return;
 
+  // VT_ROCM_QUANT_WMMA_WIDE=1 is part of the precondition, not an extra:
+  // the dispatch only reaches EITHER cooperative-tile arm when the block is
+  // the 8-warp one, so a run with BIGTILE=1 alone lands on the plain kernel
+  // and the dispatch-counter CHECK below would report an unmet harness
+  // precondition as a defect (review of #3036, finding 5). All three
+  // toggles are `static const bool` read once inside the backend, so the
+  // test cannot set them itself -- it can only decline to run.
+  const char* wide = std::getenv("VT_ROCM_QUANT_WMMA_WIDE");
+  const bool wide_on = wide != nullptr && wide[0] == '1' && wide[1] == '\0';
   const bool bigtile = std::getenv("VT_ROCM_QUANT_WMMA_BIGTILE") != nullptr;
   const bool share = std::getenv("VT_ROCM_QUANT_WMMA_SHARE_ACT") != nullptr;
-  if (!bigtile && !share) {
-    MESSAGE("neither VT_ROCM_QUANT_WMMA_BIGTILE nor _SHARE_ACT set; "
-            "cooperative-tile arms not exercised this run");
+  if (!wide_on || (!bigtile && !share)) {
+    MESSAGE("VT_ROCM_QUANT_WMMA_WIDE=1 plus one of VT_ROCM_QUANT_WMMA_BIGTILE / "
+            "_SHARE_ACT is required to reach the cooperative-tile arms; "
+            "not exercised this run");
     return;
   }
 
@@ -3689,6 +3742,19 @@ TEST_CASE("keep-quant Q4_K WMMA cooperative-tile arms match the CPU oracle") {
     const uint64_t after = bigtile ? vt::rocm::KQuantWmmaBigTileQ4KDispatchCount()
                                     : vt::rocm::KQuantWmmaShareQ4KDispatchCount();
     CHECK(after > before);
+  }
+
+  // Same staging range assertion as the Q6_K case above -- see its comment.
+  // Q4_K carries its own copy of the clamped staging loop, so proving it on
+  // Q6_K alone would prove nothing about this one.
+  if (bigtile) {
+    BigTileOobProbeScope probe;
+    DevBuf dout(rocm, q, on);
+    Tensor tout = T2(dout.ptr(), d, M, N);
+    const uint64_t before = vt::rocm::KQuantWmmaBigTileQ4KDispatchCount();
+    vt::MatmulBTQuant(q, tout, tact, twt);
+    CHECK(vt::rocm::KQuantWmmaBigTileQ4KDispatchCount() > before);
+    CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
   }
   rocm.DestroyQueue(q);
 }

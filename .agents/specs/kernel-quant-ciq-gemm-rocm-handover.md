@@ -35,30 +35,34 @@ remaining gap, one measured hypothesis at a time.
 |---|---|---|
 | [#3033](https://github.com/mudler/vllm.cpp/pull/3033) | Widen the WMMA block 4→8 warps, alone | **REJECTED**: geomean -4.3% |
 | [#3035](https://github.com/mudler/vllm.cpp/pull/3035) | Spec only: cooperative activation share design | Landed as a spec; its own implementation (below) came back negative |
-| [#3036](https://github.com/mudler/vllm.cpp/pull/3036) | `Shared` (8x reuse) + `BigTile` (24x reuse, wider tile) | `Shared` **REJECTED** (-16% geomean); `BigTile` **ACCEPTED** (+16.8% geomean, -14% real-model) — **reviewed, one HIGH finding fixed, gate-clean at HEAD** |
+| [#3036](https://github.com/mudler/vllm.cpp/pull/3036) | `Shared` (8x reuse) + `BigTile` (24x reuse, wider tile) | `Shared` **REJECTED** (-16% geomean); `BigTile` **ACCEPTED** (+16.0% geomean, -12.5% real-model, re-measured after the barrier repair) — **two review passes, six findings, all repaired** |
 
-**#3036 has been through one full review→fix→operator-reverify cycle
-already; check `gh pr view 3036` for anything that's happened since.** A
-fresh reviewer (protocol: `.agents/prompts/reviewer.md`, static read + real
-mutation testing, not just reading the diff) returned **verdict FAIL** on
-the first head (`bc5d494ce`): a HIGH-severity out-of-bounds device-memory
-read in `BigTile`'s activation-staging loop — for the ragged last M-block
-(`m_tiles % ItGroup != 0`, the common case, not an edge case), the loop
-copied `ItGroup*16` rows unconditionally, past the scratch buffer's actual
-allocated size, before the per-`it_i` bounds check that would have
-prevented the read was ever consulted. It never corrupted *output* (those
-rows are never read during compute), so every test was green — the bug was
-found by the reviewer tracing exact address arithmetic, not by a crash. Two
-LOW findings alongside it (a comment describing the wrong mechanism for why
-a precondition is needed; silent precedence when both experimental toggles
-are set at once). A fresh implementer fixed all three
-(`35f9400bdb9cb5ae86cea470868aafc0dc9dd82c`, clamped the staging loop to
-`min(ItGroup*16, (m_tiles-it_base)*16)` valid rows), and the operator
-reran the row's full gate independently against that exact commit: 8/8
-clean. **If you are picking this up fresh: `bc5d494ce` (the original
-BigTile commit) has a real bug; `35f9400bd` and later do not, as far as one
-review pass could find — a second review of the fix itself has not
-happened, so don't treat this as exhaustively proven.**
+**#3036 has been through TWO full review→fix cycles; check `gh pr view
+3036` for anything that has happened since.** Both reviewers (protocol:
+`.agents/prompts/reviewer.md`, static read plus real mutation testing, not
+just reading the diff) found real defects that the green suite was
+structurally incapable of seeing. The full account, with every number, is
+the spec's `### Review cycle on #3036` section — read that, this is the
+index entry.
+
+- **Pass 1, head `bc5d494ce`, verdict FAIL, one HIGH**: an out-of-bounds
+  device read in `BigTile`'s activation staging for the ragged last M-block
+  (`m_tiles % ItGroup != 0`, the common case). It never corrupted *output*
+  — those rows are never consumed — so every test was green; found by
+  tracing address arithmetic against the real allocation size. Fixed in
+  `35f9400bd` (staging clamped to `min(ItGroup*16, (m_tiles-it_base)*16)`).
+- **Pass 2, head `8b25f30c8`, five findings**: a HIGH cross-warp
+  write-after-read race on the block-shared `act_stage` (no barrier at the
+  end of the `sb` loop, affecting all FOUR cooperative kernels), two
+  record/comment contradictions, no runnable guard for the pass-1 OOB
+  class, and a test skip condition that omitted `VT_ROCM_QUANT_WMMA_WIDE`.
+  All repaired in one commit, which also RE-MEASURED both performance axes
+  because the barrier changed the inner loop.
+
+**If you are picking this up fresh:** `bc5d494ce` has a real OOB read and
+`8b25f30c8` has a real race. The head after pass 2 is the first one no
+review pass has found a defect in — and a third review of *that* has not
+happened, so do not treat it as exhaustively proven.
 
 ## What's proven, in the order it was learned
 
@@ -120,22 +124,29 @@ happened, so don't treat this as exhaustively proven.**
    (and Q4_K's scale/min unpack) now execute once per superblock and serve
    all `ItGroup` iterations — reuse `Shared` didn't have either.
 
-   - Op-level (`quant-gemm-bench`, best-of-4): **geomean +16.8%** vs
-     shipping default; holds on the ragged non-16-aligned tail shape too
-     (+19-20%).
+   Numbers below are the RE-MEASUREMENT taken after the pass-2 barrier
+   repair; the first cut's figures are in parentheses, and the difference
+   between them is what that barrier cost.
+
+   - Op-level (`quant-gemm-bench`, best-of-4): **geomean +16.0%** (was
+     +16.8%) vs shipping default over the six non-tail shapes, +17.2% over
+     all eight; the ragged non-16-aligned tail shapes came in slightly
+     ahead of the aligned ones at +20-22%.
    - Real model (`Ornith-1.5-9B-Q4_K_M.gguf`, isolated prefill,
-     `rocprofv3`): prefill total kernel time **-14.0%**; the isolated
-     quant-GEMM-kernel gap vs llama.cpp's `mul_mat_q` narrowed from **8.92x
-     to 6.98x slower**.
-   - Correctness: `ctest -R rocm|cross_device`, 48/48, 84084/84084
-     assertions, zero regression, via the real (N=128) tests, not the
-     stale N=48 ones.
-   - **Caveat this section didn't know yet: the first committed version
-     (`bc5d494ce`) had a real out-of-bounds read for the ragged M-tail,
-     invisible to every test above because it never corrupted output —
-     see "State of the four PRs" up top for the finding and its fix
-     (`35f9400bd`). None of the numbers above changed; the bug was in an
-     address range, not a value.**
+     `rocprofv3`): prefill total kernel time **-12.5%** (was -14.0%); the
+     isolated quant-GEMM-kernel gap vs llama.cpp's `mul_mat_q` narrowed
+     from **8.89x to 7.12x slower** (was 8.92x to 6.98x). The oracle and
+     our own default arm were re-run in the same session and reproduce the
+     first cut to within noise, so these deltas are the barrier and not
+     drift.
+   - Correctness: `ctest -R rocm|cross_device` 8/8, and the full
+     `test_backend_cross_device` binary 48/48 in each of the four toggle
+     configurations, via the real (N=128/M=80) tests, not the stale N=48
+     ones.
+   - **Two caveats this section did not know when it was first written:
+     `bc5d494ce` had a real out-of-bounds read and `8b25f30c8` a real
+     cross-warp race, both invisible to every assertion above. See "State
+     of the four PRs" up top.**
    - Still default OFF, behind `VT_ROCM_QUANT_WMMA_WIDE=1
      VT_ROCM_QUANT_WMMA_BIGTILE=1`. Whether to flip the default, and
      landing this PR, is undecided — see "What's not done" below.
@@ -190,6 +201,25 @@ VT_ROCM_QUANT_WMMA_WIDE=1 VT_ROCM_QUANT_WMMA_BIGTILE=1 \
   ./build-hip/tests/test_backend_cross_device --test-case="*cooperative-tile*"
 # swap BIGTILE=1 for SHARE_ACT=1 to re-check the rejected arm
 ```
+`VT_ROCM_QUANT_WMMA_WIDE=1` is part of the precondition, not decoration:
+neither cooperative arm is dispatched without the 8-warp block. Without it
+these cases MESSAGE-and-return rather than run.
+
+**Re-running the race reproduction** (the one defect in this row with no
+permanent runnable guard — a race is invisible until the warps drift, and
+on this workload they do not drift by themselves). In
+`rocm_grouped_gemm.hip`, immediately before the final `act_stage` read in
+any of the four cooperative kernels (the `acc_f` accumulation at the end of
+the `sb` loop body), insert a timing-only delay for one warp:
+```c++
+if (wy == 0) { for (int z = 0; z < 64; ++z) __builtin_amdgcn_s_sleep(127); }
+__asm__ __volatile__("" ::: "memory");
+```
+That adds and removes no memory operation. With the `__syncthreads()` at
+the end of the `sb` loop deleted, the four kernels return NMSE 0.050182 /
+0.0555232 / 0.104243 / 0.113616 against a 0.0005 tolerance; with it
+restored and the identical delay still present, all four are green. Remove
+the probe afterwards.
 
 **Op-level A/B** (`examples/quant-gemm-bench`, no args, best-of-N by
 running multiple times and taking the max per shape):
@@ -287,16 +317,22 @@ for it.
   same action — if that happens, ask the user to run it, don't work around
   it.
 - **Green NMSE tests do not prove the absence of an out-of-bounds device
-  read.** PR #3036's `BigTile` kernels passed every test with a real OOB
-  read in them (see "State of the four PRs" above) because the garbage
-  read never happened to feed a value that reaches output — the bug was
-  found by tracing exact address arithmetic against the actual buffer
-  allocation size, not by a crash or a wrong number. Device-side ASan for
-  HIP is CDNA-only (not available for RDNA/gfx12, confirmed by the
-  reviewer), so there is no sanitizer to lean on here — any new kernel
-  that computes a global-memory address from a block/grid index needs its
-  address range checked by hand against the buffer it reads, independent
-  of whether the values it produces look right. Async agents that stall
+  read, and they do not prove the absence of a race either.** PR #3036's
+  `BigTile` kernels passed every test with a real OOB read in them, and
+  then passed every test again with a real cross-warp write-after-read race
+  in them (see "State of the four PRs" above). Neither is a value defect on
+  this workload: the garbage read never feeds a value that reaches output,
+  and the racing warps never happen to drift far enough apart. Both were
+  found by reading the code — address arithmetic against the real
+  allocation size, and barrier coverage of every block-shared array — and
+  then made visible by deliberate mutation. Device-side ASan for HIP is
+  CDNA-only (not available for RDNA/gfx12, confirmed by the reviewer), so
+  there is no sanitizer to lean on. Two habits follow, and this row paid
+  for both: any kernel that computes a global-memory address from a
+  block/grid index needs its address range checked by hand against the
+  buffer it reads; and any array written by the whole block needs a barrier
+  between its last read in one iteration and its first write in the next,
+  the loop back-edge included. Async agents that stall
   waiting on their own backgrounded build/preflight/monitor and end their
   turn without actually finishing (rather than reporting real output) have
   happened more than once in this row's history — if you dispatch one and

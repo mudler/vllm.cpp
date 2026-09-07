@@ -333,14 +333,21 @@ E=1 covers dense; E=N covers experts fed by the stacked tower
 compatibility of the grouped arm is wave-3's committed obligation. (3) MTP `blk.64.*` skip/refuse by name. (4) 27B e2e greedy
 near-tie gate, checkpoint-gated opt-in loud-skip (#2811 precedent), goldens
 vs the pinned llama.cpp b10451 oracle, 500-mnat band + 0 forward-divergent.
-(5) `docs/USAGE.md` pin in the same change. Memory axis on 27B at steady
-state: 9.81 GiB experts packed + 6.01 GB non-expert packed (both through
-the native grouped kernel) + 2.37 GiB embedding twin + 2.37 GiB output
-twin ≈ 20.6 GB + activations on 32 GB. Interim (experts alone): non-expert
-twins 18.47 GB push the total to ~33 GB, so the 27B gate (wave-3) is
-reachable only behind the dense E=1 arm. The 0.8B vehicle carries no
-experts: its gate guards the dense twin path and must stay green
-throughout.
+(5) `docs/USAGE.md` pin in the same change. CORRECTED 2026-09-07
+(tensor-name scan of the pinned artifact): the 27B is DENSE — arch
+`qwen35`, zero `ffn_*_exps` / `ffn_gate_inp` / `exp_probs` tensors, and
+`blk.0` carries singular `ffn_down`/`ffn_gate`/`ffn_up`. The earlier
+"experts Q4_K ×294" classification was a dtype-only misread; those 294
+Q4_K tensors are dense ffn/attn weights. Memory axis on 27B: the keep-
+quant set beyond the gather class (~14.27 GB packed) cannot exist as
+twins (~42 GB); it is served PACKED through the E=1 arm with a CHUNKED
+slice-decode + accumulate matmul, so the captured graph holds chunk
+buffers and never a whole-weight tile — ≈ 15.92 GB packed + 2.37 GiB
+embedding twin + 2.37 GiB output twin + chunk tiles + activations ≈
+22-23 GB on 32 GB. Replay re-decodes each step: correct, slower;
+throughput is W4b's lever. The E=N expert arm serves the family's MoE
+models (30B-A3B class) and stays staged-owed: no MoE artifact is on disk
+and a ~17-20 GB download needs authority.
 
 **W4b — the int8-dot lever ([#3031](https://github.com/mudler/vllm.cpp/issues/3031)).**
 Quantized-domain integer vec_dot behind the same seam; profile-first
@@ -372,4 +379,11 @@ the branch diff reverted; dense twins are the shipped behavior. W4a(1)
 re-anchors on the TT `kMatmulBTQuantGrouped` provider (wave-2: packed
 tower, native in-kernel dequant, E=1 dense + E=N experts, Q4_K/Q8_0 first,
 Q5_K extension owed, staged slice owed to wave-3 wiring and the 27B gate).
-The 128M threshold dissolves.
+The 128M threshold dissolves. Wave-2b landed 14e8fe471 (registered set
+{Q4_K,Q5_K,Q6_K,Q8_0}; suite 27,456 green; vehicle 147/147; operator-
+passed; pushed). AMENDED 2026-09-07 (fourth): the 27B is dense
+(tensor-name scan — the ×294 "experts" were a dtype-only misread), so
+the 27B path is the E=1 arm with chunked slice-decode (capture holds
+chunks, never whole weights); the E=N expert arm stays staged-owed
+behind a MoE artifact. Wave-3a = E=1 chunked capture-compatible packed
+dense; wave-3b = 27B wiring + gate + MTP skip + USAGE pin.

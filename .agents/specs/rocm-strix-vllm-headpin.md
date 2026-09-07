@@ -2,6 +2,7 @@
 
 Row: `BACKEND-GATE-ROCM-VLLM`
 Issue: [#3043](https://github.com/mudler/vllm.cpp/issues/3043)
+In-flow runtime repair: [#3048](https://github.com/mudler/vllm.cpp/issues/3048)
 Base: `e2fb2f06d9944c4bbe66531034479d370df67815`
 
 ## Now
@@ -12,7 +13,9 @@ the first prerequisite. It does not implement the inference optimization.
 The isolated current-pin vLLM and GGUF plugin build on Strix is complete.
 Its build state records `BUILT` after dependency, source, compiler, and
 extension checks. Six-prompt generation and eight upstream packed-test cases
-remain PENDING. Model gateability remains PENDING. The row lifecycle is unchanged.
+remain owed. The first generation attempt failed at the metadata RPC under
+#3048 before token generation. Model gateability remains PENDING. The row
+lifecycle is unchanged.
 
 ## Scope and exclusions
 
@@ -455,6 +458,9 @@ implementer handoff. GPU execution remains the operator's obligation.
 
 ## Owed
 
+Issue #3048 owns the named metadata RPC repair specified below. It must land
+with its regression and independent review before retrying generation.
+
 Issue #3043 still owes production-mode generation for all six specified prompts,
 with 48 tokens each. Eight upstream packed-test cases must execute without
 errors, failures, or skips. The operator must retain the resolved configuration,
@@ -466,3 +472,80 @@ The packed ROCm port follows under its own issue and committed spec after
 this prerequisite. Its tests must follow current vLLM rather than old CUDA
 goldens. GGUF optimization remains #3016/#3017/#3018. Valid matched profiler
 timestamps remain #3040. Model correctness remains #2534 and the owning arm.
+
+## Named metadata RPC repair (#3048)
+
+### Measured failure and upstream anchors
+
+Run `112a91ad-e51a-4627-aeae-61e2c0ed9643` reached model loading and production
+graph compilation. Generation exited 1 after 412.604 seconds before any output
+tokens. `LLM.apply_model(projection_metadata)` sent a Python function through
+the default serializer, which refused it. Evidence remains in
+`run-9624441-01/logs/generation.log` and `run-9624441-01/failure.json`, beside
+the completed build evidence. The old fake `LLM.apply_model` accepted the
+function directly and therefore did not reproduce this failure.
+
+All upstream anchors use `e126687a9a828d513c01a07cd69f025f27d63280`:
+
+- `vllm/entrypoints/llm.py:567`: `collective_rpc` accepts a method name.
+- `vllm/v1/worker/worker_base.py:145`: `get_model` supplies the worker model.
+- `vllm/v1/worker/worker_base.py:285`: `worker_extension_cls` resolves a named
+  class and adds its nonconflicting methods to the worker.
+- `vllm/v1/serial_utils.py:221`: the default encoder rejects arbitrary objects.
+- `tests/v1/test_serial_utils.py:271`: the no-pickle test expects `TypeError`.
+
+`git log -S VLLM_ALLOW_INSECURE_SERIALIZATION` identifies upstream
+`6930a41116`, vLLM #17490, as the introduction of the explicit opt-in.
+Do not enable that opt-in. The user directed this repair on 7 September 2026.
+
+### Design, constraints, and stop conditions
+
+Keep the projection inspection helper and its returned metadata. Add one
+worker-extension class in the already hash-bound `runtime.py` module. Its
+uniquely named method calls the helper on `self.get_model()` inside the worker.
+Configure that class by its importable qualified name, not a class object.
+Call `LLM.collective_rpc` with the method name and no callable arguments.
+Only strings, lists, dictionaries, and primitive metadata cross the RPC.
+The named extension is diagnostic instrumentation, not a model replacement.
+Record its class in the resolved engine arguments without changing any
+production compilation, sampling, model, or quantization default.
+
+Keep projection output dtype explicitly PENDING. Do not replace parameter
+metadata with model configuration, remove the inspection, swallow its errors,
+or add a fallback to insecure serialization. Do not alter worker build-state
+identity checks, compiler checks, the oracle pin, or the eight upstream cases.
+A changed runtime hash requires a new certified build. Do not edit a completed
+build state to make old evidence accept new code.
+
+Stop for a required insecure setting, unimportable extension, missing model
+interface, or a change outside the runtime adapter and its CPU regression.
+The saved GPU failure is the real-oracle red result. CPU green does not prove
+that the repaired adapter executes on the real worker.
+
+### Task 1: use the named worker RPC {id: 1, deps: []}
+
+Files: `tools/bench/strix_vllm_oracle/runtime.py`,
+`tests/tools/test_strix_vllm_oracle.py`, and this spec's repair evidence only.
+The spec is committed before implementation. Use a fresh implementer and
+fresh independent reviewer, followed by the operator's own gate.
+
+First reproduce the failure through the real runtime entry point. The fake
+serializer must refuse a callable under the pinned default, as the upstream
+no-pickle test requires. Preserve that upstream revision and document the
+CPU-only adaptation rather than claiming a real GPU serializer test.
+Resolve the configured extension by its actual qualified name and execute its
+method on a worker fixture. Assert the independent expected parameter dtype,
+shape, quantization method, output-dtype limitation, and all six output lists.
+Assert no insecure setting is introduced and RPC failures remain failures.
+
+Capture red before implementation, then focused green. In scratch, restore
+the callable path, remove extension configuration, remove the named RPC call,
+and remove or corrupt the returned parameter metadata. Each mutation must fail
+its intended assertion. Restore the scratch bytes after every mutation.
+
+Verify: `python3 -m unittest tests.tools.test_strix_vllm_oracle`.
+Run `scripts/agent-preflight.sh` on an unchanged final head. Use a disk-backed
+temporary filesystem with adequate space, because the full tools suite
+explicitly tests file-cache eviction and tmpfs does not satisfy that contract.
+Report argument-dependent skips separately. Preserve test and review evidence
+here; retain #3043 for real model execution and matched benchmark acceptance.

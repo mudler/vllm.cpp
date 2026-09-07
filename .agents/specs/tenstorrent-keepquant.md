@@ -207,6 +207,37 @@ fatality — 36 i32 words are exactly 144 packed bytes, zero expansion), and
   mnat; the kernel set drifting wider than the predicate.
 - **PR shape.** Separate PR (developer call 2026-09-06, recorded in
   `.agents/developer-preferences.md`).
+
+### W4b survey outcome and path decision (2026-09-07, coordinator)
+
+The named risk fired at survey: ttnn has no integer matmul on Blackhole.
+`ttnn::matmul` is float-only by hard fatal
+(`matmul_device_operation.cpp:55-57`, pinned tt-metal `a3d33028975`); the
+BH LLK matmul is the FPU float path; the only int8 matmul in the tree is a
+one-tile tests/ demo with int8-saturating output. The decision is **A: a
+custom device kernel below ttnn, dense arm only** — the grouped E=1 arm
+keeps the bf16 dot and records the lever owed.
+
+The foundation that makes A tractable and bit-exact: upstream accumulates
+in 8 int32 lanes that stay under 2^24 by design (`quants.c:696` q4_K,
+`:771` q5_K, `:851` q6_K — `aux32[8]` ≤ 3.84M/7.95M/16.65M, min-correction
+`sumi` ≤ 2.05M), so every lane value is exactly f32-representable; the
+whole-block sum (up to 132M for q6_K) is not, and the per-block scale
+applies once at the end. An f32-FPU compute path that mirrors the 8-lane
+split and the lane/min interleave is therefore bit-exact vs the pinned
+`ggml_vec_dot_*` without integer hardware. Activation side:
+`quantize_row_q8_K_ref` (`ggml-quants.c:2768`; iscale = −127/amax,
+NearestInt, MIN(127,·), bsums per 16), already ported bit-exact at
+`src/vt/cpu/cpu_quant_act.cpp:88` and `cpu_quant_dot.cpp:285/367/457`.
+
+Option B — a lane-exact emulation composed from ttnn ops — was rejected on
+the survey's own numbers: ~10–15× today's per-chunk captured-op count and
+more bytes moved than the W4a packed path, so it plausibly loses to the
+18.02 s/cycle replay it exists to beat. The kernel path is expected to
+SHRINK capture demand (one kernel replaces the decode+where+matmul chain);
+the existing trace-demand measurement verifies this, and a measured
+increase is a stop-and-report. Kernel authorship follows the row's W1
+precedent (`KeepQuantDecodeKernel` and its op-level bit-exact sweep gate).
 zero-cache precedent. Red-first leg: with W2 code the captured vehicle run
 traces staging writes during capture and must fail the dump x2 byte-identity
 leg; after, zero writes during capture and dumps byte-identical across two
@@ -529,4 +560,11 @@ superseded by #3042 with the landing evidence, and the W4a branch and
 worktree are removed. W4b opens under `## W4b`: the int8-dot lever
 (#3031), profile-first, the integer-domain dot with bit-exact
 `ggml_vec_dot_*` authority where the domain matches, red-first,
-separate PR.
+separate PR. AMENDED 2026-09-07 (eighth): the survey fired the named
+risk — ttnn has no integer matmul on Blackhole (float-only fatal,
+`matmul_device_operation.cpp:55-57`). Path decided: **A, a custom
+device kernel below ttnn, dense arm only**. The 8-lane accumulators
+stay under 2^24 by upstream design (`quants.c:696/771/851`), so an
+f32-FPU lane-exact path is bit-exact vs `ggml_vec_dot_*` without
+integer hardware; the composed-ttnn option B was rejected on captured
+op count. See `## W4b` survey outcome.

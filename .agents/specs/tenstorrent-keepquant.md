@@ -349,6 +349,39 @@ throughput is W4b's lever. The E=N expert arm serves the family's MoE
 models (30B-A3B class) and stays staged-owed: no MoE artifact is on disk
 and a ~17-20 GB download needs authority.
 
+**AMENDED 2026-09-07 (fifth): the vehicle capture falsified the chunked
+arm's capture claim at model scale — demand is per CHAIN, not per chunk.**
+Wave-3b-1's vehicle AFTER leg fataled at capture with 444,424,192 B
+demanded of the 52,428,800 B region (mesh_trace.cpp:81) after the two
+device-level defects it exposed were fixed red-first (a chained ROW_MAJOR
+activation reaching `ttnn::matmul` unconverted — `per_core_M = 0` at
+`matmul_program_config.cpp:372`; and the E=1 arm committing ROW_MAJOR into
+the output slot, so replay's tile-padded view overran the buffer,
+`mesh_tensor_impl.hpp:33`; focused 4/4, suite 66/66, 524,428/524,428 after
+both fixes). The demand is ~113 keep-quant weights × ~3.5 MB/chain of
+serialized decode commands — the wave-3a per-chain constant — so chunk
+sizing cannot pay it down; the cost multiplies by chain count. This
+reconciles the third amendment's rejected "trace-region enlargement": that
+rejection sized wave-1b's whole-weight-per-step decode planes (~18 GB);
+the measured quantity here is the command stream (0.44 GB on 0.8B, to be
+measured on 27B). RESOLUTION: the region policy mirrors the pinned
+tt-metal's own practice (`models/demos/utils/trace_region_sizes.py`):
+DYNAMIC (`trace_region_size=0`, the upstream default for unconfigured
+models and deepseek-v3's explicit choice) is tried first on the vehicle;
+if the pre-ITEM-5 overlap hazard reproduces, the fallback is a per-model
+resolved region sized from measured demand (the upstream YAML shape),
+documented in `docs/USAGE.md` beside the demand number, with the fixed
+50 MB (the vLLM plugin's generic value, ITEM 5) as that fallback's
+unspecified-model default. Capture demand stays a MEASURED, reported axis
+(the gate message carries `LastTraceBytesForTest()`) — the axis is the
+number, not the carve-out. Perf guard: the vehicle leg records tokens/s on
+both sides of the switch ("replay re-decodes each step: correct, slower"
+is already the accepted state; W4b owes the lever); a gate that cannot
+complete inside the vehicle timeout is a NEEDS_DECISION stop, not an
+accepted default. The twin-absence policy is unchanged: no whole-weight
+resident decoded shadow on the dense path; decode planes stay per-chain
+transients.
+
 **W4b — the int8-dot lever ([#3031](https://github.com/mudler/vllm.cpp/issues/3031)).**
 Quantized-domain integer vec_dot behind the same seam; profile-first
 attribution; recorded-only throughput floor. Sequenced after W4a, never
@@ -386,4 +419,9 @@ passed; pushed). AMENDED 2026-09-07 (fourth): the 27B is dense
 the 27B path is the E=1 arm with chunked slice-decode (capture holds
 chunks, never whole weights); the E=N expert arm stays staged-owed
 behind a MoE artifact. Wave-3a = E=1 chunked capture-compatible packed
-dense; wave-3b = 27B wiring + gate + MTP skip + USAGE pin.
+dense; wave-3b = 27B wiring + gate + MTP skip + USAGE pin. AMENDED
+2026-09-07 (fifth): the vehicle falsified capture-safety at model scale
+(444,424,192 B = ~113 chains × ~3.5 MB of decode command stream); the
+trace-region policy moves to the pinned tt-metal's dynamic / per-model
+practice, demand stays measured and reported, and wave-3b-1c repairs
+under it.

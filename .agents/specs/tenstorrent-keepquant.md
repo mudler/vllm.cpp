@@ -157,9 +157,56 @@ the 0.8B and blow the 27B budget): stage the **i32 word form once per
 weight** through the existing persistent-shadow machinery
 (`EnsureMatmulWeightDevice`'s keyed-slot pattern, built for the view-staging
 fatality — 36 i32 words are exactly 144 packed bytes, zero expansion), and
-run the on-core decode chain from the resident words every call. Captured
-replay recomputes deterministically from fixed device bytes; a cache miss
-during capture CHECKs ("warm the keep-quant arm eagerly first"), the
+- **W4** (owed): Q5_K / Q6_K / Q8_0; the int8-dot perf lever; the 27B Q4_K_M
+  arm as the first qwen3.8 artifact on TT. The encodings and the 27B staging
+  landed in W4a (waves 2a–3b, `origin/main` `e06b10d29` + `e1948eceb`); the
+  27B e2e gate stays owed as #3042. The int8-dot lever is W4b, below.
+
+## W4b — the int8-dot lever (#3031)
+
+- **Scope.** The TT keep-quant dot moves from decode-to-bf16-then-tile-matmul
+  to the llama.cpp `b10451` quantized-domain `vec_dot` shape: activation rows
+  quantized once to the Q8 row form, an integer dot inside each K-quant
+  block, and the per-block scale applied once at the end. The seam is the
+  issue's `MatmulBTQuantKernel`; on TT the wave targets the dense keep-quant
+  arm the vehicle and the op suite exercise. The grouped chunked E=1 arm
+  keeps the bf16 dot and records the int8 dot as owed unless the two share
+  the composition for free.
+- **Upstream anchors.** `ggml_vec_dot_q4_K_q8_K` and siblings in the pinned
+  `b10451` tree (exact `file:line` pinned at implementation in the porting
+  inventory), plus the activation row-quantization pass they consume. Same
+  registered encoding set {Q4_K, Q5_K, Q6_K, Q8_0}; an encoding whose
+  `vec_dot` cannot land refuses by name, as today.
+- **Numerics bar.** Decode stays bit-exact vs `vt::cpu::BlockToFloat` —
+  unchanged authority. The dot changes domain: where the integer domain
+  matches the CPU arm, bit-exact against the pinned `ggml_vec_dot_*` is the
+  authority — the first dot with one, since the bf16 band existed only
+  because the domain differed. e2e adjudication stays against the committed
+  pair: STRICT or the ≤500-mnat band. A numerics change re-derives goldens
+  only through the documented dump path with the oracle regenerated and the
+  reason in the commit body (the amendment-5 convention). Never re-capture
+  to make a failure pass.
+- **Profile first.** Before any ratio claim: attribute decode cost vs dot
+  cost on the vehicle (W1's standalone decode numbers plus a packed-vs-int8
+  A/B on one build). The 6.1× packed-replay ratio (18.02 vs 2.95 s/cycle) is
+  the motivation, never the claim. The floor stays the developer's
+  2026-09-06 call: llama.cpp-comparable throughput, recorded only.
+- **Red-first.** The smallest failing test asserts the device dot equals the
+  CPU integer `vec_dot` reference on a swept shape; today's dot is
+  bf16-domain, so it is red. The decode bit-exactness suite stays green —
+- The int8-dot perf lever — W4b, in flight (#3031); llama.cpp-comparable
+  throughput numbers, recorded only.
+  returns as NEEDS_DECISION. (2) The activation row quantization must be
+  capture-safe: staged pre-capture, read-only under replay (the
+  #2812/#2907 discipline). (3) The band may tighten or shift; only the
+  documented re-derivation path is legal.
+- **Gates and stop conditions.** Unchanged (preflight; op suite; capture
+  dump ×2 byte-identity with a reset between; the 16-prompt vehicle battery;
+  `flock` legs, luwen reset per leg). Stop: no red-first evidence; a ratio
+  claimed without the profile attribution; a band regression beyond 500
+  mnat; the kernel set drifting wider than the predicate.
+- **PR shape.** Separate PR (developer call 2026-09-06, recorded in
+  `.agents/developer-preferences.md`).
 zero-cache precedent. Red-first leg: with W2 code the captured vehicle run
 traces staging writes during capture and must fail the dump x2 byte-identity
 leg; after, zero writes during capture and dumps byte-identical across two
@@ -476,4 +523,10 @@ reachability test through the production loader accounting,
 27B e2e gate is UNREACHED — eight OOM runs, ~34 GB allocated against 32 GB
 — and [#3042](https://github.com/mudler/vllm.cpp/issues/3042) owns it (see
 `## Owed` and `## W4`). The row stays `ACTIVE`: W4b and the 27B gate are
-the open scope.
+the open scope. AMENDED 2026-09-07 (seventh): #3044 MERGED — W4a is on
+`origin/main` (squashes `e06b10d29`, `e1948eceb`), #3030 closed as
+superseded by #3042 with the landing evidence, and the W4a branch and
+worktree are removed. W4b opens under `## W4b`: the int8-dot lever
+(#3031), profile-first, the integer-domain dot with bit-exact
+`ggml_vec_dot_*` authority where the domain matches, red-first,
+separate PR.

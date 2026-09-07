@@ -307,6 +307,13 @@ Explicitly label nonselected metadata as nonauthoritative for imported bytes.
 Recheck compiler state before run imports and after generation and tests.
 Overlap without this complete proof remains a failure.
 
+Preserve safe regular-file permission bits from the selected wheel, including
+its executable tools, without propagating setuid or setgid bits. Bind and
+recheck those modes alongside file hashes. A tiny executable wheel fixture
+must run after selection and fail its real CLI gate when mode preservation
+is removed. The selected wheel includes executable NVIDIA tools; preserving
+their installation fidelity does not claim new backend support.
+
 Use tiny wheels with valid RECORD metadata in CPU CLI tests. Capture a red
 successful-selection fixture with overlapping metadata before implementation.
 Cover wrong wheel, malformed RECORD, namespace changes, extra files, symlinks,

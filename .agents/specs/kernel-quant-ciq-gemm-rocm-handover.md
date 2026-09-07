@@ -29,26 +29,36 @@ checkpoint showed we were still ~11x slower than llama.cpp on prefill
 specifically (issue #3032). Everything since has been chasing that
 remaining gap, one measured hypothesis at a time.
 
-## State of the three PRs right now (all still open, none merged)
+## State of the four PRs right now (all still open, none merged)
 
 | PR | What | Verdict |
 |---|---|---|
 | [#3033](https://github.com/mudler/vllm.cpp/pull/3033) | Widen the WMMA block 4→8 warps, alone | **REJECTED**: geomean -4.3% |
 | [#3035](https://github.com/mudler/vllm.cpp/pull/3035) | Spec only: cooperative activation share design | Landed as a spec; its own implementation (below) came back negative |
-| *(not yet opened)* | `Shared` (activation-only sharing, 8x reuse) + `BigTile` (24x reuse, wider tile) | `Shared` **REJECTED** (-16% geomean); `BigTile` **ACCEPTED** (+16.8% geomean, -14% real-model) |
+| [#3036](https://github.com/mudler/vllm.cpp/pull/3036) | `Shared` (8x reuse) + `BigTile` (24x reuse, wider tile) | `Shared` **REJECTED** (-16% geomean); `BigTile` **ACCEPTED** (+16.8% geomean, -14% real-model) — **reviewed, one HIGH finding fixed, gate-clean at HEAD** |
 
-**The third PR does not exist yet.** All of `Shared` and `BigTile`'s code,
-tests, and spec updates are committed on branch
-`row/KERNEL-QUANT-CIQ-GEMM-ROCM-COOPTILE-w1` (worktree:
-`/home/justin/Projects/vllm.cpp-KERNEL-QUANT-CIQ-GEMM-ROCM-COOPTILE-w1`) —
-check `git log --oneline -3` there and `gh pr list` to see whether a
-session between this one and yours already pushed/opened it. If not, that
-worktree's HEAD is the thing to push and open a PR from (base:
-`row/KERNEL-QUANT-CIQ-GEMM-ROCM-COOPTILE`, which is #3035's already-merged
-spec — check whether #3035 itself has merged by the time you read this; if
-not, this branch is base-reachable from it but not from `main`, same
-pattern as `KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT-RDNA4` used earlier in this
-row's history).
+**#3036 has been through one full review→fix→operator-reverify cycle
+already; check `gh pr view 3036` for anything that's happened since.** A
+fresh reviewer (protocol: `.agents/prompts/reviewer.md`, static read + real
+mutation testing, not just reading the diff) returned **verdict FAIL** on
+the first head (`bc5d494ce`): a HIGH-severity out-of-bounds device-memory
+read in `BigTile`'s activation-staging loop — for the ragged last M-block
+(`m_tiles % ItGroup != 0`, the common case, not an edge case), the loop
+copied `ItGroup*16` rows unconditionally, past the scratch buffer's actual
+allocated size, before the per-`it_i` bounds check that would have
+prevented the read was ever consulted. It never corrupted *output* (those
+rows are never read during compute), so every test was green — the bug was
+found by the reviewer tracing exact address arithmetic, not by a crash. Two
+LOW findings alongside it (a comment describing the wrong mechanism for why
+a precondition is needed; silent precedence when both experimental toggles
+are set at once). A fresh implementer fixed all three
+(`35f9400bdb9cb5ae86cea470868aafc0dc9dd82c`, clamped the staging loop to
+`min(ItGroup*16, (m_tiles-it_base)*16)` valid rows), and the operator
+reran the row's full gate independently against that exact commit: 8/8
+clean. **If you are picking this up fresh: `bc5d494ce` (the original
+BigTile commit) has a real bug; `35f9400bd` and later do not, as far as one
+review pass could find — a second review of the fix itself has not
+happened, so don't treat this as exhaustively proven.**
 
 ## What's proven, in the order it was learned
 
@@ -120,6 +130,12 @@ row's history).
    - Correctness: `ctest -R rocm|cross_device`, 48/48, 84084/84084
      assertions, zero regression, via the real (N=128) tests, not the
      stale N=48 ones.
+   - **Caveat this section didn't know yet: the first committed version
+     (`bc5d494ce`) had a real out-of-bounds read for the ragged M-tail,
+     invisible to every test above because it never corrupted output —
+     see "State of the four PRs" up top for the finding and its fix
+     (`35f9400bd`). None of the numbers above changed; the bug was in an
+     address range, not a value.**
    - Still default OFF, behind `VT_ROCM_QUANT_WMMA_WIDE=1
      VT_ROCM_QUANT_WMMA_BIGTILE=1`. Whether to flip the default, and
      landing this PR, is undecided — see "What's not done" below.
@@ -270,3 +286,22 @@ for it.
   stop llama-server` even with prior in-conversation authorization for the
   same action — if that happens, ask the user to run it, don't work around
   it.
+- **Green NMSE tests do not prove the absence of an out-of-bounds device
+  read.** PR #3036's `BigTile` kernels passed every test with a real OOB
+  read in them (see "State of the four PRs" above) because the garbage
+  read never happened to feed a value that reaches output — the bug was
+  found by tracing exact address arithmetic against the actual buffer
+  allocation size, not by a crash or a wrong number. Device-side ASan for
+  HIP is CDNA-only (not available for RDNA/gfx12, confirmed by the
+  reviewer), so there is no sanitizer to lean on here — any new kernel
+  that computes a global-memory address from a block/grid index needs its
+  address range checked by hand against the buffer it reads, independent
+  of whether the values it produces look right. Async agents that stall
+  waiting on their own backgrounded build/preflight/monitor and end their
+  turn without actually finishing (rather than reporting real output) have
+  happened more than once in this row's history — if you dispatch one and
+  it reports "waiting on X" as its final message, resume it explicitly
+  rather than assuming it will keep going on its own, and independently
+  verify whatever it claims to have done before trusting it (this is also
+  just "the operator reruns the gate," AGENTS.md's own rule, applied
+  literally).

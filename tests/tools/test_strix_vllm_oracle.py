@@ -704,7 +704,9 @@ class OracleCliTests(unittest.TestCase):
                         [760, 5187, 92068, 43687, 55877, 5134, 421],
                         [623, 220, 16, 24, 21, 24, 11, 12313, 1118, 14428, 383],
                         [32, 9944, 1324, 369, 264, 5629, 1324]])
-                    self.assertTrue(all(len(r["gen_ids"]) == 48 for r in data["records"]))
+                    self.assertEqual([r["gen_ids"] for r in data["records"]], [[42] * 48 for _ in range(6)])
+                    self.assertEqual(data["resolved_engine_kwargs"]["worker_extension_cls"],
+                                     "runtime.StrixProjectionMetadataWorkerExtension")
                     self.assertEqual(data["resolved_config"]["dtype"], "bfloat16")
                     self.assertEqual(len(data["projection_metadata"]), 1)
                     captured = data["projection_metadata"][0]
@@ -713,6 +715,15 @@ class OracleCliTests(unittest.TestCase):
                          "quant_method": "QuantMethod", "parameters": [
                              {"name": "weight", "dtype": "torch.bfloat16", "shape": [12, 8]}]}])
                     self.assertIn("PENDING", captured["projection_output_dtype"])
+
+    def test_runtime_cli_propagates_metadata_rpc_failure(self):
+        output = self.tmp / "rpc-failure.json"
+        result = subprocess.run([sys.executable, "-c", RUNTIME_LOADER, str(RUNTIME),
+                                 str(self.tmp), str(output), "rpc-failure"],
+                                text=True, capture_output=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("metadata RPC failed", result.stderr)
+        self.assertFalse(output.exists())
 
     def test_runtime_cli_refuses_invalid_identity_before_model_creation(self):
         cases = (("outside", "runtime imported outside isolated venv"),
@@ -959,8 +970,11 @@ else:
 '''
 
 RUNTIME_LOADER = r'''
-import sys, types, pathlib, runpy, importlib.metadata
+import sys, types, pathlib, runpy, importlib.metadata, os
 runtime, root, out, bad = sys.argv[1:]
+# Match direct script startup, where the adapter directory is importable.
+sys.path.insert(0, str(pathlib.Path(runtime).parent))
+insecure_before = os.environ.get('VLLM_ALLOW_INSECURE_SERIALIZATION')
 root=pathlib.Path(root); sys.prefix=str(root)
 values=runpy.run_path(runtime)
 def module(name, **values):
@@ -981,7 +995,20 @@ class LLM:
         assert kwargs['limit_mm_per_prompt']=={'image':0,'video':0}
         self.llm_engine=types.SimpleNamespace(vllm_config=types.SimpleNamespace(
             model_config=types.SimpleNamespace(dtype='bfloat16'), compilation_config=types.SimpleNamespace(mode=3)))
+        self.extension_name=kwargs.get('worker_extension_cls')
     def apply_model(self, function):
+        # CPU adaptation of e126687a9a828d513c01a07cd69f025f27d63280:
+        # serial_utils.py:221 and tests/v1/test_serial_utils.py:271 reject
+        # arbitrary Python objects under the default no-pickle policy.
+        raise TypeError('Object of type function is not serializable')
+    def collective_rpc(self, method, timeout=None, args=(), kwargs=None):
+        assert isinstance(method,str) and method=='strix_projection_metadata'
+        assert args==() and kwargs is None and timeout is None
+        assert os.environ.get('VLLM_ALLOW_INSECURE_SERIALIZATION')==insecure_before
+        assert self.extension_name=='runtime.StrixProjectionMetadataWorkerExtension'
+        module_name, class_name=self.extension_name.rsplit('.',1)
+        extension=getattr(importlib.import_module(module_name),class_name)
+        assert pathlib.Path(sys.modules[module_name].__file__).resolve()==pathlib.Path(runtime).resolve()
         class QuantMethod: pass
         class Projection:
             quant_method=QuantMethod()
@@ -989,7 +1016,16 @@ class LLM:
                 assert recurse is False
                 return [('weight',types.SimpleNamespace(dtype='torch.bfloat16',shape=(12,8)))]
         model=types.SimpleNamespace(named_modules=lambda:[('model.layers.0.in_proj',Projection())])
-        return [function(model)]
+        class WorkerBase:
+            def get_model(self):
+                if bad=='rpc-failure':raise RuntimeError('metadata RPC failed')
+                return model
+        class Worker(WorkerBase): pass
+        # worker_base.py:285 resolves the name, checks conflicts, then extends.
+        for attr in dir(extension):
+            if not attr.startswith('__'):assert not hasattr(Worker,attr)
+        Worker.__bases__ += (extension,)
+        return [getattr(Worker(),method)()]
     def generate(self, prompts, sampling):
         assert sampling==dict(temperature=0.0,top_p=1.0,max_tokens=48,ignore_eos=True)
         assert [p['prompt_token_ids'] for p in prompts]==values['PROMPT_IDS']
@@ -1019,6 +1055,7 @@ if bad=='device': torch.cuda.get_device_properties=lambda i:types.SimpleNamespac
 if bad=='registration': importlib.metadata.entry_points=lambda **kw:[]
 sys.argv=[runtime,'--mode','generate','--assets',str(root),'--output',out]
 runpy.run_path(runtime,run_name='__main__')
+assert os.environ.get('VLLM_ALLOW_INSECURE_SERIALIZATION')==insecure_before
 '''
 
 

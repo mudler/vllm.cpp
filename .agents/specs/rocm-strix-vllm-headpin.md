@@ -549,3 +549,33 @@ temporary filesystem with adequate space, because the full tools suite
 explicitly tests file-cache eviction and tmpfs does not satisfy that contract.
 Report argument-dependent skips separately. Preserve test and review evidence
 here; retain #3043 for real model execution and matched benchmark acceptance.
+
+### Named metadata RPC repair evidence
+
+The runtime configures `runtime.StrixProjectionMetadataWorkerExtension` by name.
+Its `strix_projection_metadata` method inspects `self.get_model()` inside the worker.
+The RPC sends that method name without callable arguments. Parameter metadata
+and the PENDING output-dtype statement retain their existing format.
+
+The regression runs the runtime's `main` entry point. Its CPU serializer fixture
+rejects the old callable path under the pinned no-pickle policy. The test imports
+the configured class from the actual adapter file. It checks worker attribute
+conflicts and executes the extension on a worker that supplies `get_model()`.
+Independent assertions bind parameter metadata, all six output lists, and the
+resolved extension name. A worker failure must propagate without an output file.
+The fixture also checks that the insecure serialization setting stays unchanged.
+
+The test-first command was `python3 -m unittest
+tests.tools.test_strix_vllm_oracle.OracleCliTests.test_runtime_cli_executes_production_generation_contract`.
+It exited 1 with `TypeError: Object of type function is not serializable`.
+Evidence: `/dev/shm/strix3048-red.log`. Both runtime RPC tests passed after repair.
+
+Six scratch mutations restored the callable, removed extension configuration,
+removed the RPC, corrupted parameter dtype, replaced PENDING, and bypassed
+`get_model()`. Each runtime suite exited 1 at the corresponding assertion.
+Evidence: `/dev/shm/strix3048-mutation-{callable,extension,rpc,parameters,output_dtype,errors}.log`.
+SHA256 comparisons confirmed byte restoration after every mutation.
+The full focused result is retained in `/dev/shm/strix3048-focused.log`.
+The unchanged final-head preflight is reported in the implementer handoff.
+This CPU adaptation does not establish real-worker execution. Issue #3043 still
+owns the certified rebuild, GPU run, and benchmark evidence.

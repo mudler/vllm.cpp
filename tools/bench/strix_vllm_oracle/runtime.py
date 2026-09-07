@@ -59,7 +59,7 @@ def identity():
 
 
 def projection_metadata(model):
-    # Pinned LLM.apply_model at entrypoints/llm.py:599. No forward replacement.
+    # Parameter inspection only. No forward replacement or output-dtype claim.
     records = []
     for name, module in model.named_modules():
         if "in_proj" in name:
@@ -68,6 +68,12 @@ def projection_metadata(model):
                                 parameters=[dict(name=n, dtype=str(p.dtype), shape=list(p.shape))
                                             for n, p in module.named_parameters(recurse=False)]))
     return {"projections": records, "projection_output_dtype": "PENDING: parameter metadata is not a forward capture"}
+
+
+class StrixProjectionMetadataWorkerExtension:
+    def strix_projection_metadata(self):
+        # e126687a9a: v1/worker/worker_base.py:145,285 and entrypoints/llm.py:567.
+        return projection_metadata(self.get_model())
 
 
 def generate(assets, output):
@@ -82,6 +88,7 @@ def generate(assets, output):
         raise ValueError("tokenization differs from explicit oracle prompt IDs")
     kwargs = dict(ENGINE_KWARGS, model=str(assets / "model/Qwen3.8-27B-Q4_K_M.gguf"),
                   tokenizer=str(assets / "tokenizer"),
+                  worker_extension_cls="runtime.StrixProjectionMetadataWorkerExtension",
                   model_loader_extra_config={"mm_proj": str(assets / "mmproj/mmproj-BF16.gguf")})
     llm = LLM(**kwargs)
     config = llm.llm_engine.vllm_config
@@ -89,7 +96,7 @@ def generate(assets, output):
     resolved = dict(dtype=str(config.model_config.dtype),
                     compilation_config=dataclasses.asdict(compilation) if dataclasses.is_dataclass(compilation) else vars(compilation))
     data = dict(identity=runtime, engine_kwargs=ENGINE_KWARGS, resolved_engine_kwargs=kwargs,
-                resolved_config=resolved, projection_metadata=llm.apply_model(projection_metadata), records=[])
+                resolved_config=resolved, projection_metadata=llm.collective_rpc("strix_projection_metadata"), records=[])
     # Persist loaded identity/config before generation, retaining partial progress.
     output.write_text(json.dumps(data, default=str, indent=2) + "\n")
     sampling = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=48, ignore_eos=True)

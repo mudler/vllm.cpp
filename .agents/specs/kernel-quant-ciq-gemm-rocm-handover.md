@@ -35,22 +35,26 @@ remaining gap, one measured hypothesis at a time.
 |---|---|---|
 | [#3033](https://github.com/mudler/vllm.cpp/pull/3033) | Widen the WMMA block 4→8 warps, alone | **REJECTED**: geomean -4.3% |
 | [#3035](https://github.com/mudler/vllm.cpp/pull/3035) | Spec only: cooperative activation share design | Landed as a spec; its own implementation (below) came back negative |
-| [#3036](https://github.com/mudler/vllm.cpp/pull/3036) | `Shared` (8x reuse) + `BigTile` (24x reuse, wider tile) | `Shared` **REJECTED** (-16% geomean); `BigTile` **ACCEPTED** (+16.0% geomean, -12.5% real-model, re-measured after the barrier repair) — **two review passes, six findings, all repaired** |
+| [#3036](https://github.com/mudler/vllm.cpp/pull/3036) | `Shared` (8x reuse) + `BigTile` (24x reuse, wider tile) | `Shared` **REJECTED** (-16% geomean); `BigTile` **ACCEPTED** (+16.0% geomean, -12.5% real-model, re-measured after the barrier repair) — **three review passes, nine findings, all repaired** |
 
-**#3036 has been through TWO full review→fix cycles; check `gh pr view
-3036` for anything that has happened since.** Both reviewers (protocol:
-`.agents/prompts/reviewer.md`, static read plus real mutation testing, not
-just reading the diff) found real defects that the green suite was
-structurally incapable of seeing. The full account, with every number, is
-the spec's `### Review cycle on #3036` section — read that, this is the
-index entry.
+**#3036 has been through THREE full review→fix cycles; check `gh pr view
+3036` for anything that has happened since.** The first two reviewers
+(protocol: `.agents/prompts/reviewer.md`, static read plus real mutation
+testing, not just reading the diff) found real defects that the green
+suite was structurally incapable of seeing. The third found no
+correctness defect. The full account, with every number, is the spec's
+`### Review cycle on #3036` section — read that, this is the index entry.
 
-- **Pass 1, head `bc5d494ce`, verdict FAIL, one HIGH**: an out-of-bounds
+- **Pass 1, head `bc5d494ce`, verdict FAIL, one HIGH**: an out-of-range
   device read in `BigTile`'s activation staging for the ragged last M-block
   (`m_tiles % ItGroup != 0`, the common case). It never corrupted *output*
   — those rows are never consumed — so every test was green; found by
-  tracing address arithmetic against the real allocation size. Fixed in
-  `35f9400bd` (staging clamped to `min(ItGroup*16, (m_tiles-it_base)*16)`).
+  tracing address arithmetic. Fixed in `35f9400bd` (staging clamped to
+  `min(ItGroup*16, (m_tiles-it_base)*16)`). Pass 3 corrected the statement
+  of it: what it broke is the LOGICAL bound — the kernel is defined over
+  `m_tiles*16` activation rows — and not the allocation, because the quant
+  scratch holds `m >= m_tiles*16` rows and grows only, so against a grown
+  pool the read was of stale in-pool rows.
 - **Pass 2, head `8b25f30c8`, five findings**: a HIGH cross-warp
   write-after-read race on the block-shared `act_stage` (no barrier at the
   end of the `sb` loop, affecting all FOUR cooperative kernels), two
@@ -58,6 +62,15 @@ index entry.
   class, and a test skip condition that omitted `VT_ROCM_QUANT_WMMA_WIDE`.
   All repaired in one commit, which also RE-MEASURED both performance axes
   because the barrier changed the inner loop.
+- **Pass 3, head `b795c70fd`, three MEDIUM findings, no correctness
+  finding**: all three were record or comment drift — a comment claiming
+  the `OobProbe` instantiation costs no LDS when it costs 256 B and leaves
+  that arm 64 B under the limit, a `## Owed` entry still presenting the
+  superseded first-cut geomean as current, and a clamp justification that
+  named the scratch allocation rather than the logical row bound it
+  actually enforces. Repaired without changing kernel behaviour: the only
+  executable change is the LDS budget `static_assert`, which now bounds
+  the probe instantiation, the tightest one this file emits.
 
 **If you are picking this up fresh:** `bc5d494ce` has a real OOB read and
 `8b25f30c8` has a real race. The head after pass 2 is the first one no
@@ -316,23 +329,29 @@ for it.
   stop llama-server` even with prior in-conversation authorization for the
   same action — if that happens, ask the user to run it, don't work around
   it.
-- **Green NMSE tests do not prove the absence of an out-of-bounds device
+- **Green NMSE tests do not prove the absence of an out-of-range device
   read, and they do not prove the absence of a race either.** PR #3036's
-  `BigTile` kernels passed every test with a real OOB read in them, and
-  then passed every test again with a real cross-warp write-after-read race
-  in them (see "State of the four PRs" above). Neither is a value defect on
-  this workload: the garbage read never feeds a value that reaches output,
+  `BigTile` kernels passed every test with a real out-of-range read in
+  them, and then passed every test again with a real cross-warp
+  write-after-read race in them (see "State of the four PRs" above).
+  Neither is a value defect on
+  this workload: the stale read never feeds a value that reaches output,
   and the racing warps never happen to drift far enough apart. Both were
-  found by reading the code — address arithmetic against the real
-  allocation size, and barrier coverage of every block-shared array — and
-  then made visible by deliberate mutation. Device-side ASan for HIP is
-  CDNA-only (not available for RDNA/gfx12, confirmed by the reviewer), so
-  there is no sanitizer to lean on. Two habits follow, and this row paid
-  for both: any kernel that computes a global-memory address from a
-  block/grid index needs its address range checked by hand against the
-  buffer it reads; and any array written by the whole block needs a barrier
-  between its last read in one iteration and its first write in the next,
-  the loop back-edge included. Async agents that stall
+  found by reading the code — address arithmetic against the row range the
+  kernel is defined over, and barrier coverage of every block-shared array
+  — and then made visible by deliberate mutation. Device-side ASan for HIP
+  is CDNA-only (not available for RDNA/gfx12, confirmed by the reviewer),
+  so there is no sanitizer to lean on. Three habits follow, and this row
+  paid for all three: any kernel that computes a global-memory address
+  from a block/grid index needs its address range checked by hand against
+  the LOGICAL extent it is defined over, which a grow-only scratch pool's
+  physical capacity is not; any array written by the whole block needs a
+  barrier between its last read in one iteration and its first write in
+  the next, the loop back-edge included; and any claim about a kernel's
+  LDS, register or occupancy cost is measured with
+  `-Rpass-analysis=kernel-resource-usage` on the file's own compile
+  command, never reasoned about — `__syncthreads_or` looked free and costs
+  256 B a block. Async agents that stall
   waiting on their own backgrounded build/preflight/monitor and end their
   turn without actually finishing (rather than reporting real output) have
   happened more than once in this row's history — if you dispatch one and

@@ -340,8 +340,14 @@ recorded, not assumed.
 
   **UPDATE: partially done.** `KQuantGemmKWmmaQ6KBigTile`/`Q4KBigTile`
   (below) implement exactly this at `ItGroup=3` (48 rows) instead of
-  llama.cpp's 128, measured a real +16.8% geomean / -14% real-model win,
-  and are correctness-verified. The scope was deliberately narrower than
+  llama.cpp's 128. The first cut measured +16.8% geomean / -14.0%
+  real-model; those figures are superseded. The current, re-measured
+  numbers are **+16.0%** over the six non-tail shapes, **+17.2%** over all
+  eight, **-12.5%** real-model prefill, and 8.89x -> 7.12x against
+  llama.cpp's `mul_mat_q` — see "The performance numbers below were
+  RE-MEASURED on 2026-09-07" and the "Review cycle on #3036" section for
+  what is verified, which is not what the first cut claimed.
+  The scope was deliberately narrower than
   full parity: this row's kernels still stage one full 256-wide
   superblock at a time for BOTH operands, where llama.cpp stages 32
   (weight) and 128 (activation) K-elements at a time (confirmed by
@@ -921,22 +927,36 @@ artifact. Still default OFF behind `VT_ROCM_QUANT_WMMA_WIDE=1
 VT_ROCM_QUANT_WMMA_BIGTILE=1`; whether to flip the default is a decision
 for after review, not made in this wave.
 
-### Review cycle on #3036 (two passes, five findings, all repaired)
+### Review cycle on #3036 (three passes, nine findings, all repaired)
 
-The PR has now been through two independent fresh reviews. Both found
-real defects that every green assertion in this tree was structurally
-incapable of seeing, which is the durable lesson of this section.
+The PR has now been through three independent fresh reviews. The first
+two each found a real defect that every green assertion in this tree was
+structurally incapable of seeing, which is the durable lesson of this
+section. The third found no correctness defect, and three ways this
+record and the code's own comments had drifted from the code.
 
 **Pass 1, against head `bc5d494ce` -- verdict FAIL, one HIGH.** An
-out-of-bounds device read in BigTile's activation staging: for the ragged
+out-of-range device read in BigTile's activation staging: for the ragged
 last M-block (`m_tiles % ItGroup != 0`, the common case) the loop copied
-`ItGroup*16` rows unconditionally, past the end of `EnsureQuantScratch`'s
-buffer, before the `it_i` bounds check that would have prevented it was
-ever consulted. It never corrupted output, because those rows are never
-consumed -- so the whole suite was green with the read in it. Found by
-tracing address arithmetic against the real allocation size, not by a
-crash. Fixed in `35f9400bd`: staging clamped to
-`min(ItGroup*16, (m_tiles - it_base)*16)`.
+`ItGroup*16` rows unconditionally, past the last row the kernel is
+defined over, before the `it_i` bounds check that would have prevented it
+was ever consulted. It never corrupted output, because those rows are
+never consumed -- so the whole suite was green with the read in it. Found
+by tracing address arithmetic, not by a crash. Fixed in `35f9400bd`:
+staging clamped to `min(ItGroup*16, (m_tiles - it_base)*16)`.
+
+The original statement of this finding said the read went past the end of
+`EnsureQuantScratch`'s buffer. Pass 3 showed that is true only when the
+pool happens to be exactly sized. The request at the Q8_K dispatch is
+`m * nsb * sizeof(BlockQ8_K)` -- `m` rows, and m >= m_tiles*16 strictly
+whenever m % 16 != 0 -- and `vt::GrowOnlyStreamScratch` never shrinks, so
+live capacity is the high-water mark over every prior call on the stream.
+Against a grown pool the unclamped read was therefore a read of stale
+in-pool rows, not an allocation overrun. What was violated in every case
+is the LOGICAL bound: the kernel is defined over m_tiles*16 activation
+rows, and it read beyond them. That is the invariant the clamp restores
+and the invariant the probe below tests, which is why the probe fires
+reliably rather than only when the pool is exactly sized.
 
 **Pass 2, against head `8b25f30c8` -- five findings, repaired here.**
 
@@ -977,16 +997,19 @@ crash. Fixed in `35f9400bd`: staging clamped to
    paragraph, and by this section.
 
 4. **LOW, nothing could detect the pass-1 OOB class.** Reverting the clamp
-   left the focused suite fully green, because the rows read out of bounds
+   left the focused suite fully green, because the rows read out of range
    are exactly the rows never consumed. Now guarded: both BigTile kernels
    take an `OobProbe` template parameter that turns the staging loop's own
    row index into an assertion -- each thread checks the global row it is
-   about to read against the buffer's row count, and any block that goes
-   out of range poisons its own output with NaN, which the existing NMSE
-   assertions catch. It is a template parameter, not a kernel argument, so
+   about to read against `m_tiles*16`, the row count the kernel is defined
+   over, and any block that goes out of range poisons its own output with
+   NaN, which the existing NMSE assertions catch. It is a template
+   parameter, not a kernel argument, so
    the production instantiation compiles to exactly the code it did before
    (the trace confirms `BigTile<..., false>` is what was measured) and the
-   probe costs the measurement nothing. Selected by
+   probe costs the shipping measurement nothing -- it does cost the probe
+   instantiation 256 B of LDS, which pass 3 measured and which the LDS
+   budget `static_assert` now carries. Selected by
    `KQuantWmmaSetBigTileOobProbeForTest`, exercised by both cooperative-
    tile test cases, and mutation-proven: restoring the unclamped
    `ItGroup*16` bound makes exactly the two probe assertions fail (NMSE
@@ -1011,3 +1034,48 @@ Post-repair gate, all four toggle configurations, `ctest -R
 48/48 cases in each of default (84068 assertions), `WIDE=1` (84068),
 `WIDE=1 SHARE_ACT=1` (84084) and `WIDE=1 BIGTILE=1` (84090, the six new
 ones being the OOB probe passes). Zero regression.
+
+**Pass 3, against head `b795c70fd` -- no correctness finding, three
+MEDIUM record findings, repaired without touching kernel behaviour.**
+
+1. **The `__syncthreads_or` comment claimed the probe costs no LDS.** It
+   costs 256 B per block: ROCm lowers `__syncthreads_or` to
+   `__ockl_wgred_or_i32`
+   (`/opt/rocm/include/hip/amd_detail/amd_device_functions.h:725`), a
+   workgroup reduction with LDS scratch. Measured with
+   `-Rpass-analysis=kernel-resource-usage` on this file's own compile
+   command, LDS bytes/block on gfx1200:
+
+   | kernel | `OobProbe=false` | `OobProbe=true` |
+   |---|---:|---:|
+   | `KQuantGemmKWmmaQ6KBigTile<f32,8,3>` | 63,168 | 63,424 |
+   | `KQuantGemmKWmmaQ4KBigTile<f32,8,3>` | 65,216 | **65,472** |
+
+   So the Q4_K probe instantiation is the tightest one this file emits, at
+   64 B of residual headroom, while the `static_assert` bounded only the
+   65,216 B production footprint. A future LDS addition or `ItGroup` bump
+   would have broken the build on the probe arm alone with no assert
+   naming why. The assert now carries
+   `kQuantWmmaBigTileOobProbeLdsBytes`, and is mutation-proven: adding a
+   synthetic 128 B to the budgeted footprint compiles under the old
+   production-only bound (65,344 <= 65,536) and fails under the new one
+   (65,600 > 65,536), so the added term is what rejects it.
+
+2. **This spec stated two different geomeans for one arm.** The `## Owed`
+   entry above still presented the first cut's +16.8% / -14.0% as current
+   and called the arm correctness-verified, ~500 lines before this
+   section retracts exactly that. That entry now names the first cut as
+   superseded and points here.
+
+3. **The clamp's safety argument named the wrong allocation.** Repaired in
+   the pass-1 paragraph above, in both BigTile kernels' comments, and in
+   the test's. The clamp itself was and remains correct; only its
+   justification was wrong.
+
+Nothing executable changed except the `static_assert` bound, and the
+shipping instantiation's resource usage is byte-identical before and
+after (`KQuantGemmKWmmaQ4KBigTile<f32,8,3,false>` 65,216 B, VGPRs and
+occupancy unchanged), so the measurements above stand without a retake.
+Post-repair gate: `ctest -R 'rocm|cross_device'` 8/8, and the focused
+cooperative-tile cases green under `WIDE=1 BIGTILE=1` (2 cases, 24
+assertions) and `WIDE=1 SHARE_ACT=1` (2 cases, 18 assertions).

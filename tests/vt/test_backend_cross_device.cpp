@@ -3616,18 +3616,19 @@ TEST_CASE("keep-quant Q6_K WMMA cooperative-tile arms match the CPU oracle") {
     CHECK(after > before);
   }
 
-  // BigTile's activation staging must read only rows the quant scratch
-  // actually holds. M=80 gives m_tiles=5 against ItGroup=3, so blockIdx.y=1
-  // starts at it_base=3 with only 2 of its 3 groups valid -- the ragged
-  // tail that `bc5d494ce` read 16 rows past the end of. That defect cannot
-  // be seen in a value: the rows it reads are the ones the kernel's own
-  // bounds check never consumes, so this suite was fully green with the
-  // out-of-bounds read in it. The probe instantiation checks the staging
-  // loop's global row index against the buffer's row count and poisons the
-  // block's output with NaN when it is out of range, which turns the
-  // address defect into a value the assertion below can see. Restoring the
-  // unclamped `ItGroup*16` staging bound makes this CHECK fail; nothing
-  // else in this file does.
+  // BigTile's activation staging must read only the m_tiles*16 activation
+  // rows the kernel is defined over. M=80 gives m_tiles=5 against
+  // ItGroup=3, so blockIdx.y=1 starts at it_base=3 with only 2 of its 3
+  // groups valid -- the ragged tail `bc5d494ce` read 16 rows beyond. That
+  // defect cannot be seen in a value: the rows it reads are the ones the
+  // kernel's own bounds check never consumes, so this suite was fully
+  // green with the out-of-range read in it. The probe instantiation checks
+  // the staging loop's global row index against m_tiles*16 -- the logical
+  // bound, not the quant scratch pool's physical capacity, which is >= m
+  // rows and grow-only -- and poisons the block's output with NaN when it
+  // is out of range, which turns the address defect into a value the
+  // assertion below can see. Restoring the unclamped `ItGroup*16` staging
+  // bound makes this CHECK fail; nothing else in this file does.
   if (bigtile) {
     BigTileOobProbeScope probe;
     DevBuf dout(rocm, q, on);

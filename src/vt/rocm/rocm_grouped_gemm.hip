@@ -509,8 +509,27 @@ static_assert(kQuantWmmaWideWarpsPerBlock * 6400 + 16 * 292 <= 65536,
 // ~8 (128 activation rows), which would need 8*16*292 = 37,376 B more and
 // does not fit here (51,200 + 37,376 > 65,536).
 constexpr int kQuantWmmaBigTileItGroup = 3;
-static_assert(kQuantWmmaWideWarpsPerBlock * 6400 + kQuantWmmaBigTileItGroup * 16 * 292 <= 65536,
-             "bigger-cooperative-tile arm must stay under the 64KiB LDS budget");
+// The `OobProbe=true` instantiation of those same arms (see the template's
+// own comment) costs 256 B MORE, because its `__syncthreads_or` is not free:
+// ROCm lowers it to `__ockl_wgred_or_i32`
+// (`/opt/rocm/include/hip/amd_detail/amd_device_functions.h:725`), a
+// workgroup reduction that carries its own LDS scratch. Measured on gfx1200
+// with `-Rpass-analysis=kernel-resource-usage`, LDS bytes/block:
+//
+//   KQuantGemmKWmmaQ6KBigTile<f32,8,3>  63,168 (probe off)  63,424 (probe on)
+//   KQuantGemmKWmmaQ4KBigTile<f32,8,3>  65,216 (probe off)  65,472 (probe on)
+//
+// Q4_K with the probe on is therefore the TIGHTEST instantiation this file
+// emits, at 64 B of residual headroom, and the budget is asserted against it
+// rather than against the production footprint alone. Bounding only the
+// production arm would let the next LDS addition or `ItGroup` bump break the
+// build on the probe arm's codegen with no assert naming the reason.
+constexpr int kQuantWmmaBigTileOobProbeLdsBytes = 256;
+static_assert(kQuantWmmaWideWarpsPerBlock * 6400 + kQuantWmmaBigTileItGroup * 16 * 292 +
+                      kQuantWmmaBigTileOobProbeLdsBytes <=
+                  65536,
+              "bigger-cooperative-tile arm, including its OobProbe instantiation, must stay "
+              "under the 64KiB LDS budget");
 
 template <typename OutT, int WarpsPerBlock>
 __global__ void KQuantGemmKWmmaQ6K(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
@@ -834,14 +853,16 @@ __global__ void KQuantGemmKWmmaQ6KShared(OutT* __restrict__ out, const uint8_t* 
 // `OobProbe` is the runnable guard for the staging clamp below (review of
 // #3036, finding 4). That clamp's only defect class is an ADDRESS RANGE, and
 // a value test structurally cannot see it: the rows an unclamped loop reads
-// past the buffer are exactly the rows the `it_i` bounds check never
+// beyond m_tiles*16 are exactly the rows the `it_i` bounds check never
 // consumes, so every NMSE assertion stays green while the loop reads out of
-// bounds -- which is how `bc5d494ce` shipped that read through a full green
+// range -- which is how `bc5d494ce` shipped that read through a full green
 // suite. There is no device-side ASan on RDNA/gfx12 to fall back on. This
 // parameter turns the staging loop's own row index into an assertion: each
-// thread checks the GLOBAL activation row it is about to read against the
-// scratch buffer's real row count, and if any thread in the block is out of
-// range the block poisons its OWN output with NaN, which the existing value
+// thread checks the GLOBAL activation row it is about to read against
+// m_tiles*16, the row count this kernel is DEFINED over (not the scratch
+// pool's capacity, which is >= m rows and grow-only -- see the staging
+// comment inside the loop), and if any thread in the block is out of range
+// the block poisons its OWN output with NaN, which the existing value
 // assertions then catch. It is a template parameter rather than a kernel
 // argument so the production instantiation (`OobProbe=false`) compiles to
 // exactly the code it does today -- the check is discarded, not predicted --
@@ -908,17 +929,31 @@ __global__ void KQuantGemmKWmmaQ6KBigTile(OutT* __restrict__ out, const uint8_t*
     // Cooperative activation stage: ItGroup*16 rows this time, same
     // division-free-in-practice flat word loop as `...Shared` above.
     //
-    // Clamped to the rows that are actually VALID for this it_base: `qact`
-    // (EnsureQuantScratch's scratch buffer) is sized at exactly
-    // m_tiles*16 rows, no padding, and the last blockIdx.y block's
-    // it_base can leave fewer than ItGroup*16 rows before that logical
-    // end whenever m_tiles % ItGroup != 0 (the ragged last block, not an
-    // edge case). Copying the unconditional ItGroup*16 rows there read
-    // past the buffer -- an out-of-bounds device read that never
-    // corrupted OUTPUT only because the `it_i` bounds check below already
-    // skips every row this loop would otherwise not have filled, so
-    // leaving those rows' shared memory unwritten from a prior fill is
-    // safe.
+    // Clamped to the rows that are actually VALID for this it_base. The
+    // bound is the LOGICAL one: this kernel is defined over m_tiles*16
+    // activation rows (`m_tiles = m / 16`, floored), and the last
+    // blockIdx.y block's it_base can leave fewer than ItGroup*16 rows
+    // before that end whenever m_tiles % ItGroup != 0 -- the ragged last
+    // block, not an edge case. An unconditional ItGroup*16 copy reads
+    // rows the kernel is not defined over.
+    //
+    // It is NOT the pool's physical capacity, and that distinction is the
+    // one an earlier version of this comment got wrong. `qact` comes from
+    // `EnsureQuantScratch`, whose request below is `m * nsb *
+    // sizeof(BlockQ8_K)` -- `m` rows, and m >= m_tiles*16 strictly
+    // whenever m % 16 != 0 -- backed by `vt::GrowOnlyStreamScratch`, which
+    // never shrinks, so live capacity is the high-water mark over every
+    // prior call on this stream. m_tiles*16 <= m <= capacity, so this
+    // clamp is conservative against the allocation and exact against the
+    // definition, which is why the `OobProbe` below tests it against the
+    // logical row count. Unclamped, the read was in-pool but stale
+    // whenever the pool had grown, and past the allocation only when the
+    // pool happened to be exactly sized.
+    //
+    // Either way it never corrupted OUTPUT, because the `it_i` bounds
+    // check below already skips every row this loop would otherwise not
+    // have filled, so leaving those rows' shared memory unwritten from a
+    // prior fill is safe.
     {
       constexpr int kWordsPerRow = static_cast<int>(sizeof(BlockQ8_K) / sizeof(int));
       constexpr int kBlockThreads = WarpsPerBlock * 32;
@@ -933,7 +968,9 @@ __global__ void KQuantGemmKWmmaQ6KBigTile(OutT* __restrict__ out, const uint8_t*
         const int w = idx % kWordsPerRow;
         if constexpr (OobProbe) {
           // `row` is relative to `a_row0`, which starts at global row
-          // it_base*16; the scratch buffer holds exactly m_tiles*16 rows.
+          // it_base*16; m_tiles*16 is the last row this kernel is defined
+          // over. Not the pool's capacity, which is >= m rows and
+          // grow-only -- see the staging comment above.
           if (it_base * 16 + row >= m_tiles * 16) oob_seen = true;
         }
         act_dst_i[idx] = act_base_i[row * words_per_global_row + sb * kWordsPerRow + w];
@@ -1002,12 +1039,20 @@ __global__ void KQuantGemmKWmmaQ6KBigTile(OutT* __restrict__ out, const uint8_t*
 
   if constexpr (OobProbe) {
     // Block-wide reduction of the staging probe, then poison this block's
-    // own output. `__syncthreads_or` costs no LDS and every thread reaches
-    // it (the only early `return` above is `jt >= n_tiles`, which the
-    // dispatch precondition already makes unreachable inside a launched
-    // block -- if it were reachable the barriers in the loop above would
-    // already have desynced). NaN, because it survives the bf16 conversion
-    // and makes the existing NMSE assertions fail rather than merely drift.
+    // own output. `__syncthreads_or` costs 256 B of LDS, not nothing: ROCm
+    // lowers it to `__ockl_wgred_or_i32`, a workgroup reduction with its own
+    // scratch. Measured, this kernel is 63,168 B with the probe off and
+    // 63,424 B with it on; `KQuantGemmKWmmaQ4KBigTile`'s probe arm is the
+    // tightest instantiation in this file at 65,472 B, 64 B under the
+    // limit. `kQuantWmmaBigTileOobProbeLdsBytes` carries that 256 B into
+    // the budget `static_assert` above.
+    //
+    // Every thread reaches it: the only early `return` above is
+    // `jt >= n_tiles`, which the dispatch precondition already makes
+    // unreachable inside a launched block -- if it were reachable the
+    // barriers in the loop above would already have desynced. NaN, because
+    // it survives the bf16 conversion and makes the existing NMSE
+    // assertions fail rather than merely drift.
     if (__syncthreads_or(oob_seen ? 1 : 0) != 0) {
 #pragma unroll
       for (int g = 0; g < ItGroup; ++g)
@@ -1446,7 +1491,9 @@ __global__ void KQuantGemmKWmmaQ4KBigTile(OutT* __restrict__ out, const uint8_t*
         const int w = idx % kWordsPerRow;
         if constexpr (OobProbe) {
           // `row` is relative to `a_row0`, which starts at global row
-          // it_base*16; the scratch buffer holds exactly m_tiles*16 rows.
+          // it_base*16; m_tiles*16 is the last row this kernel is defined
+          // over. Not the pool's capacity, which is >= m rows and
+          // grow-only -- see the staging comment above.
           if (it_base * 16 + row >= m_tiles * 16) oob_seen = true;
         }
         act_dst_i[idx] = act_base_i[row * words_per_global_row + sb * kWordsPerRow + w];
@@ -1515,12 +1562,21 @@ __global__ void KQuantGemmKWmmaQ4KBigTile(OutT* __restrict__ out, const uint8_t*
 
   if constexpr (OobProbe) {
     // Block-wide reduction of the staging probe, then poison this block's
-    // own output. `__syncthreads_or` costs no LDS and every thread reaches
-    // it (the only early `return` above is `jt >= n_tiles`, which the
-    // dispatch precondition already makes unreachable inside a launched
-    // block -- if it were reachable the barriers in the loop above would
-    // already have desynced). NaN, because it survives the bf16 conversion
-    // and makes the existing NMSE assertions fail rather than merely drift.
+    // own output. `__syncthreads_or` costs 256 B of LDS, not nothing: ROCm
+    // lowers it to `__ockl_wgred_or_i32`, a workgroup reduction with its own
+    // scratch. Measured, this kernel is 65,216 B with the probe off and
+    // 65,472 B with it on, which makes the probe arm HERE the tightest
+    // instantiation in this file, 64 B under the 64 KiB limit.
+    // `kQuantWmmaBigTileOobProbeLdsBytes` carries that 256 B into the
+    // budget `static_assert` above, so a future LDS addition fails there
+    // rather than only in this arm's codegen.
+    //
+    // Every thread reaches it: the only early `return` above is
+    // `jt >= n_tiles`, which the dispatch precondition already makes
+    // unreachable inside a launched block -- if it were reachable the
+    // barriers in the loop above would already have desynced. NaN, because
+    // it survives the bf16 conversion and makes the existing NMSE
+    // assertions fail rather than merely drift.
     if (__syncthreads_or(oob_seen ? 1 : 0) != 0) {
 #pragma unroll
       for (int g = 0; g < ItGroup; ++g)

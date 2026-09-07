@@ -1,0 +1,166 @@
+# Current-pin vLLM on Strix Halo
+
+Row: `BACKEND-GATE-ROCM-VLLM`
+Issue: [#3043](https://github.com/mudler/vllm.cpp/issues/3043)
+Base: `e2fb2f06d9944c4bbe66531034479d370df67815`
+
+## Now
+
+The developer approved the sequence on 7 September 2026: current-pin
+baseline, packed decode, then GGUF optimization. This change establishes
+the first prerequisite. It does not implement the inference optimization.
+Current-pin model gateability on Strix remains PENDING until the worker
+builds and emits the specified tokens. The row lifecycle remains unchanged.
+
+## Scope and exclusions
+
+Build vLLM at the active repository pin in an isolated environment on
+`strix:gpu0`. Build its pinned GGUF plugin against the same environment.
+Run Qwen3.8-27B Q4_K_M in production compilation mode. Preserve the old
+oracle, all existing environments, source checkouts, models, and captures.
+Capture the current upstream packed-decode tests as the next port's oracle.
+
+Do not advance the global pin, alter product code, replace the old oracle,
+change graph admission, or change quantization defaults. Do not publish an
+accepted performance ratio. `TOKEN_GATE=FAIL` is carried from the survey,
+not repaired by successful generation. A failure stays visible and nonzero.
+
+Use one issue change with this spec committed before its harness. Repository
+policy defaults to one integration change. The campaign's recorded local
+merge authority applies after fresh review and operator verification.
+
+## Source and runtime evidence
+
+The active vLLM pin is `e126687a9a828d513c01a07cd69f025f27d63280`.
+Read `.agents/upstream-sync.md` for its identity contract. Historical
+`5559679229` measurements cannot stand for this pin.
+
+The GGUF plugin pin is `d4c1f0d082fc7cd4350da56689109a01c1f29d6c`.
+Its archive SHA256 is
+`9e15c20e0b75f75bbf886966df07843c4b70a7952fad4b80e8e8183e2f70743b`.
+The archive is retained beside the previous build recipe under
+`docs/bench-evidence/oracle-vllm-gfx1151-20260903/` by reference to its
+captured shared artifact. New manifests supply paths, never infer them.
+
+Read-only lease `d24f3a86-70fc-4d77-b4c1-54deb998715b` found installed
+vLLM distribution `0.26.0.dev0+g5559679229.rocm724`, Torch
+`2.13.0+rocm7.2`, Triton `3.8.0`, and plugin `0.0.5`.
+Lease `eab2c163-9fe2-44a5-b886-1dc33f9c9224` found native plugin
+MMVQ predicates enabled for Q4_K, Q5_K, Q6_K, and Q8_0. Its extension hash
+matches the historical capture. Neither probe ran the model or proved a
+current-pin dispatch. The old installation is not a build cache to overwrite.
+
+Pinned upstream anchors:
+
+- `vllm/plugins/__init__.py::load_general_plugins` loads the GGUF plugin.
+- Plugin `quantization/linear.py::_fused_mul_mat_gguf` selects MMVQ at
+  one token for these quant types. `ops.py::ggml_mul_mat_vec_a8` chooses
+  the installed native extension or Triton fallback.
+- `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py::_forward_core_decode_non_spec`
+  calls the packed recurrence after convolution.
+- `vllm/third_party/flash_linear_attention/ops/fused_recurrent.py::fused_recurrent_gated_delta_rule_packed_decode_kernel`
+  retains normalized Q/K and beta in FP32 registers.
+- `tests/kernels/test_fused_recurrent_packed_decode.py::test_packed_decode_keeps_beta_in_fp32`
+  is the smallest current-pin numerical regression. `git log -S` identifies
+  upstream `56058fd572`, issue vllm#53877, as its introduction.
+
+## Harness design
+
+Add a bounded worker and CPU tests under `tools/bench/strix_vllm_oracle/`
+and `tests/tools/`. The operator supplies a JSON manifest and an unused
+output directory. Preserve a normalized copy and SHA256 of the manifest.
+The worker requires `RC_DEVICE=strix:gpu0` and a nonempty `RC_JOB_ID`.
+Reject architecture overrides and inherited experimental tuning. Do not
+silently reuse an output directory or a success marker from another run.
+
+The manifest binds each source archive's revision, SHA256, and path. Verify
+the vLLM archive's git-archive commit marker as well as its hash. Verify the
+plugin archive against its recorded hash. Extract without path traversal or
+escaping links into newly created local storage. Record the source digest
+before and after building, distinguishing generated build outputs from source.
+
+Create a new virtual environment and build directory. Builds use local `/tmp`
+because shared CIFS storage cannot carry build symlinks. Export retained
+artifacts with dereferenced copies. Dependencies stay isolated. An explicitly
+supplied old environment may supply a package cache or read-only dependency
+inventory, never an installation target or silently imported old vLLM.
+Use the ROCm Torch package, ccache, `MAX_JOBS=4`, and only `gfx1151`.
+Record compiler, ROCm, Torch, Triton, installed distributions, build commands,
+logs, source archives, wheel hashes, extension hashes, and device code targets.
+Do not relabel an old binary using a version string. Current source must build.
+
+Separate build and run phases. A run consumes successful build state, verifies
+the same manifest and installed source/extension identity, and refuses stale
+state. Import vLLM from outside its source directory. Assert the resolved
+platform is ROCm and the reported device is genuinely gfx1151. Record the
+runtime version and distribution version, allowing a measured ROCm packaging
+suffix without substituting a different commit.
+
+The run copies the model and its required configuration/tokenizer assets to
+unique local storage. Verify the local model before loading:
+`Qwen3.8-27B-Q4_K_M.gguf`, 17,106,775,008 bytes, SHA256
+`7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169`.
+The operator manifest binds the configuration, tokenizer, and required mmproj
+assets by content. Reuse already staged assets rather than download new models.
+
+Reuse the six explicit prompt-ID lists in the historical `gen_rocm.py`.
+Assert tokenization agrees. Generate 48 tokens for every prompt with
+temperature zero, top_p one, ignore_eos true, and max_num_seqs one.
+Use max_model_len and max_num_batched_tokens 2048, memory utilization 0.60,
+image/video limits zero, GGUF quantization, and trust_remote_code false.
+Use `enforce_eager=False`. An eager diagnostic is allowed only as a separately
+labelled failure investigation, never a production denominator.
+Persist every prompt ID, output ID, resolved engine configuration, dtype,
+plugin backend predicates, and exit status. Successful generation establishes
+gateability only. Do not infer token parity from text or token counts.
+
+Run the current pinned packed-recurrence test file in this environment.
+Preserve its parameters, fixtures, tolerances, skipped cases, and exit status.
+No skipped case is a pass. This file's tests include FP16/BF16/FP32, strided
+inputs, padded state slots, grouped heads, output/state comparisons, and FP32
+beta. These results do not substitute for the model token gate.
+
+All child processes have finite timeouts. Stream logs to local files and
+periodically preserve them to the supplied evidence directory. Stop on live
+GPU-fault diagnostics and preserve partial captures. Do not reset the GPU,
+clear quarantine, kill unrelated processes, or delete old installations.
+Fail on exhausted memory/disk headroom instead of risking the worker.
+Use existing managed-process helpers where their contracts fit this worker.
+
+## Tests, gates, and acceptance
+
+The fresh implementer first captures focused failure through the worker's
+real CLI. CPU tests simulate external builds and model execution, never claim
+GPU coverage. Test lease refusal, wrong hashes/revisions, unsafe archive paths,
+stale build state, output reuse, wrong runtime/device, partial generation,
+command failure, timeouts/fatal diagnostics, and evidence preservation.
+Mutate each guarantee in scratch and require focused failure and restoration.
+
+Focused gate: `python3 -m unittest tests.tools.test_strix_vllm_oracle`.
+Run full `scripts/agent-preflight.sh` at the immutable head. A fresh reviewer
+checks that head and repeats independent scratch mutations. The operator
+reruns focused and applicable repository gates before executing the worker.
+Report argument-dependent skips individually, not as a green full gate.
+
+The operator owns a bounded resource-controller lease and runs build, model
+generation, and upstream tests serially. Accept current-pin gateability only
+after the pinned source builds and all six outputs contain 48 tokens with the
+required identities. Report upstream tests separately. Preserve failure logs
+without claiming the baseline is complete. Finish with an Outcome section
+that records measurements, rejected choices, and remaining obligations.
+
+## Risks and stop conditions
+
+The new pin changes dependencies and model code. Plugin compatibility is
+unmeasured. A dependency or compiler failure can block the run, but does not
+prove the architecture unsupported. Resolve packaging failures in isolation.
+Stop for missing authority, unavailable assets, lost lease, GPU fault,
+unhealthy device, identity mismatch, or required changes outside this scope.
+No compiler success establishes performance or numerical parity.
+
+## Owed
+
+The packed ROCm port follows under its own issue and committed spec after
+this prerequisite. Its tests must follow current vLLM rather than old CUDA
+goldens. GGUF optimization remains #3016/#3017/#3018. Valid matched profiler
+timestamps remain #3040. Model correctness remains #2534 and the owning arm.

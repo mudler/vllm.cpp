@@ -204,6 +204,60 @@ remaining gap points somewhere else — raw WMMA instruction throughput or
 shared-memory bank-conflict patterns, not data reuse. Either result is
 recorded, not assumed.
 
+## Cooperative test toggle repair (#3063)
+
+Issue [#3063](https://github.com/mudler/vllm.cpp/issues/3063) owns this
+test-harness repair in PR #3036. The row remains `ACTIVE`. Issue #3034
+continues to own the narrower K-chunk redesign under `## Owed`.
+
+At `d295f00cb`, both cooperative test cases treat `BIGTILE` and `SHARE_ACT`
+as enabled whenever their environment variables exist. Production requires
+the exact value `1`. The tests also omit the master `WMMA` switch.
+Thus `WIDE=1 SHARE_ACT=1 BIGTILE=0` dispatches Shared but checks BigTile.
+`WMMA=0` prevents WMMA dispatch but still reaches the tests' counter checks.
+
+### Scope and anchors
+
+Correct only the environment guards in the Q4_K and Q6_K cooperative cases
+in `tests/vt/test_backend_cross_device.cpp`. Preserve all numerical and
+dispatch-counter assertions, shape prerequisites, and production kernels.
+
+The executing source at `d295f00cb` defines the contract:
+`src/vt/rocm/rocm_grouped_gemm.hip::QuantWmmaEnabled` disables only exact
+`0`. `QuantWmmaWideBlockEnabled`, `QuantWmmaShareActEnabled`, and
+`QuantWmmaBigTileEnabled` enable only exact `1`. BigTile takes precedence
+over Shared when both are enabled. These are local diagnostic switches,
+so no vLLM counterpart or numerical tolerance changes in this repair.
+
+### Regression and gates
+
+Add a CPU regression that compiles and executes each test's actual guard
+source. Cover unset, empty, zero, one, longer values, switch precedence,
+and the master switch. The regression must fail against the existing
+guards before the repair. Register it in preflight and CI.
+
+Run `python3 tests/scripts/test_rocm_cooperative_toggles.py` and the full
+`scripts/agent-preflight.sh`. In a scratch copy, restore presence checks
+and remove the master-switch guard separately. Both mutations must fail
+the CPU regression. Restore the scratch source byte-for-byte.
+
+GPU validation remains `PENDING` until a leased gfx1200 or gfx1201 device
+is available. On that device, run `test_backend_cross_device` with
+`--test-case="*cooperative-tile*"` in fresh processes for the defaults,
+`WIDE=1 SHARE_ACT=1`, `WIDE=1 BIGTILE=1`, both arms enabled,
+`WIDE=1 SHARE_ACT=1 BIGTILE=0`, both arms zero, and master `WMMA=0`.
+Use the full `VT_ROCM_QUANT_WMMA` prefix for these environment variables.
+The full `ctest -R 'rocm|cross_device' --output-on-failure` remains the
+device gate. CPU guard execution does not prove GPU dispatch or numerics.
+
+### Integration and stop conditions
+
+Commit this amendment before the repair, then carry both commits in
+PR #3036. The landing body closes #3063 and retains #3034's owed work.
+Fresh review and an independent operator gate precede integration.
+Stop if the repair requires changing production dispatch, tolerances, or
+hardware policy. Report unavailable device evidence as `PENDING`.
+
 ## Port map
 
 | Upstream | Local |

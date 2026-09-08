@@ -2851,9 +2851,11 @@ void MatmulBTQuantGroupedKernel(Queue&, Tensor& out, const Tensor& act,
 // whole-block sum is NOT f32-exact, which is why the lane split and the
 // lane-sum/min-correction interleave are preserved verbatim). The algorithm
 // lives in kernels/keepquant_kernel_code.h — the SAME file the red-first
-// sweep test pins host-side against vt::cpu::BlockVecDot/BlockFromFloat —
-// included by the device kernel through compiler_include_paths, so there is
-// one numerics source of truth, not a device twin.
+// sweep test pins on the DEVICE-COMPILED path (the header reaches the core
+// through compiler_include_paths; no host test includes it) against
+// vt::cpu::BlockVecDot/BlockFromFloat, across every registered encoding
+// {Q4_K, Q5_K, Q6_K, Q8_0} — one numerics source of truth, not a device
+// twin.
 //
 // CAPTURE (the shrink-or-flat gate): the per-call program enqueues ONE
 // MeshWorkload on the trace cq (QueueId 0, the cq ttnn traces), so the
@@ -3034,7 +3036,8 @@ void kernel_main() {
 )TTKQ";
 
 // The kernels/ dir next to this translation unit — the include path that lets
-// the device kernel #include the same header the host-side sweep test pins.
+// the device kernel #include the same header the device-compiled sweep test
+// pins (all four registered encodings).
 std::filesystem::path KeepQuantKernelIncludeDir() {
   return std::filesystem::path(__FILE__).parent_path() / "kernels";
 }

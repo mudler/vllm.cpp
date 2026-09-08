@@ -5381,18 +5381,27 @@ TEST_CASE("kTENSTORRENT kMatmulBTQuant Q4_K via vt::MatmulBT matches the decode-
 // matmul, the W4a wave-3b-1 arm), so it cannot agree BIT-EXACTLY with the
 // CPU integer vec_dot the CPU provider runs — this test is RED on the W4a
 // code and turns GREEN only when the device dot moves into the quantized
-// domain (activation quantized once to the Q8 row form, the upstream 8-lane
-// integer dot, the per-block scale applied once). The oracle is the pinned
-// llama.cpp b10451 chain already ported bit-exact host-side:
-// `quantize_row_q8_K_ref` (cpu_quant_act.cpp:88, via
-// vt::cpu::BlockFromFloat(kQ8_K)) then `ggml_vec_dot_q4_K_q8_K_generic`
-// (cpu_quant_dot.cpp:285, via vt::cpu::BlockVecDot(kQ4_K) — the K-quants
-// have no ISA tier, the generic scalar IS the selected kernel). The sweep
-// is the W1 shape pattern: weight rows {1,3,17} x blocks {1,2,16}, with
-// activation rows {1,3}. An f32-activation case pins the domain contract
-// the lever exists to restore: the CPU provider quantizes the F32 master,
-// so the device must not take the bf16 detour the W4a arm takes today.
-TEST_CASE("kTENSTORRENT kMatmulBTQuant Q4_K matches the CPU integer vec_dot bit-exactly (int8-dot sweep)") {
+// domain (activation quantized once to the encoding the vec_dot pairs with
+// the weight, the upstream 8-lane integer dot, the per-block scale applied
+// once). The oracle is the pinned llama.cpp b10451 chain already ported
+// bit-exact host-side, PER ENCODING: quantize_row_q8_K_ref
+// (cpu_quant_act.cpp:88, via vt::cpu::BlockFromFloat(kQ8_K)) or
+// quantize_row_q8_0_ref (cpu_quant_act.cpp:47, via
+// vt::cpu::BlockFromFloat(kQ8_0)) — the QuantTraits vec_dot_type pairing,
+// the fact QuantActRowBytes derives — then that encoding's own
+// ggml_vec_dot_q4_K_q8_K_generic (cpu_quant_dot.cpp:285),
+// ggml_vec_dot_q5_K_q8_K_generic (:367), ggml_vec_dot_q6_K_q8_K_generic
+// (:457) or ggml_vec_dot_q8_0_q8_0_generic (~170), via
+// vt::cpu::BlockVecDot — the K-quants have no ISA tier, the generic scalar
+// IS the selected kernel. The sweep pins the WHOLE registered set {Q4_K,
+// Q5_K, Q6_K, Q8_0} — a Q4_K-only sweep left the bit-exact claim unpinned
+// for three of the four encodings the lever registers — with the W1 shape
+// pattern per encoding: weight rows {1,3,17} x blocks {1,2,16}, with
+// activation rows {1,3}. An f32-activation case per encoding pins the
+// domain contract the lever exists to restore: the CPU provider quantizes
+// the F32 master, so the device must not take the bf16 detour the W4a arm
+// takes today.
+TEST_CASE("kTENSTORRENT kMatmulBTQuant matches the CPU integer vec_dot bit-exactly across the registered set (int8-dot sweep)") {
   // W4b landing decision: the lever is OP-LEVEL and DEFAULT OFF. On default
   // this f32-out dispatch serves the W4a grouped arm (BF16 domain), and this
   // test's oracle is the CPU integer vec_dot that arm does not compute — so
@@ -5412,171 +5421,219 @@ TEST_CASE("kTENSTORRENT kMatmulBTQuant Q4_K matches the CPU integer vec_dot bit-
   }
   REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBTQuant, vt::DeviceType::kTENSTORRENT));
 
-  const int64_t kBlockBytes = vt::BlockBytes(vt::DType::kQ4_K);
-  const int64_t kBlockElems = vt::BlockElems(vt::DType::kQ4_K);
-  auto quant_act = vt::cpu::BlockFromFloat(vt::DType::kQ8_K);
-  auto vec_dot = vt::cpu::BlockVecDot(vt::DType::kQ4_K);
-  REQUIRE(quant_act != nullptr);
-  REQUIRE(vec_dot != nullptr);
-
   Backend& backend = vt::GetBackend(vt::DeviceType::kTENSTORRENT);
   Queue q = backend.CreateQueue();
 
-  // The W1 Q4_K packed generator: PRNG nibbles and full-byte scales (the
-  // scale formulas consume bits 6-7), d/dmin drawn from finite f16
-  // magnitudes with both signs so the comparison never degenerates on
-  // NaN/Inf propagation.
-  std::mt19937 rng(20260909u);
-  auto rand_byte = [&rng]() { return static_cast<uint8_t>(rng() & 0xFF); };
-  auto rand_f16_signed = [&rng](float lo, float span) {
-    return (lo + span * static_cast<float>(rng() % 64) / 64.0f) *
-           ((rng() % 2) != 0 ? 1.0f : -1.0f);
-  };
+  // The registered set, in the kernel's ARG_ENC order (0/1/2/3): Q4_K is
+  // W1's vehicle, Q5_K/Q6_K/Q8_0 the W3 decode set.
+  const vt::DType encodings[] = {vt::DType::kQ4_K, vt::DType::kQ5_K,
+                                 vt::DType::kQ6_K, vt::DType::kQ8_0};
+  for (const vt::DType enc : encodings) {
+    const int64_t kBlockBytes = vt::BlockBytes(enc);
+    const int64_t kBlockElems = vt::BlockElems(enc);
+    if (enc == vt::DType::kQ4_K) {
+      REQUIRE(kBlockBytes == 144);
+      REQUIRE(kBlockElems == 256);
+    } else if (enc == vt::DType::kQ5_K) {
+      REQUIRE(kBlockBytes == 176);
+      REQUIRE(kBlockElems == 256);
+    } else if (enc == vt::DType::kQ6_K) {
+      REQUIRE(kBlockBytes == 210);
+      REQUIRE(kBlockElems == 256);
+    } else {
+      REQUIRE(kBlockBytes == 34);
+      REQUIRE(kBlockElems == 32);
+    }
+    const vt::DType act_enc =
+        enc == vt::DType::kQ8_0 ? vt::DType::kQ8_0 : vt::DType::kQ8_K;
+    auto quant_act = vt::cpu::BlockFromFloat(act_enc);
+    auto vec_dot = vt::cpu::BlockVecDot(enc);
+    REQUIRE(quant_act != nullptr);
+    REQUIRE(vec_dot != nullptr);
 
-  const int64_t n_list[] = {1, 3, 17};
-  const int64_t nb_list[] = {1, 2, 16};
-  const int64_t m_list[] = {1, 3};
-  for (int64_t M : m_list) {
-    for (int64_t N : n_list) {
-      for (int64_t nb : nb_list) {
-        const int64_t K = nb * kBlockElems;
-        std::vector<uint8_t> packed(N * nb * kBlockBytes);
-        for (int64_t b = 0; b < N * nb; ++b) {
-          uint8_t* blk = packed.data() + b * kBlockBytes;
-          const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
-          const uint16_t dmin_bits = vt::F32ToF16(rand_f16_signed(0.005f, 0.02f));
-          std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
-          std::memcpy(blk + 2, &dmin_bits, sizeof(dmin_bits));
-          for (int i = 0; i < 12; ++i) blk[4 + i] = rand_byte();
-          for (int i = 0; i < 128; ++i) blk[16 + i] = rand_byte();
-        }
-        // f32 master, rounded ONCE to bf16: the activation the device arm
-        // actually receives. The oracle quantizes the bf16 values widened
-        // back to f32 (lossless), so the ONLY domain difference left is the
-        // dot's.
-        std::vector<float> a_f32(M * K);
-        for (auto& v : a_f32) v = (static_cast<float>(rng() % 401) - 200.0f) / 100.0f;
-        std::vector<uint16_t> a_bf(M * K);
-        for (size_t i = 0; i < a_f32.size(); ++i) a_bf[i] = vt::F32ToBF16(a_f32[i]);
-        std::vector<float> a_q32(M * K);
-        for (size_t i = 0; i < a_f32.size(); ++i) a_q32[i] = vt::BF16ToF32(a_bf[i]);
+    // Per-encoding PRNG and packed-block generator (the decode sweeps' W1/W3
+    // fixtures): PRNG payload bytes and full-byte scale sets where the
+    // encoding has them (the K-quant scale formulas consume bits 6-7), d
+    // (and dmin where the encoding has one) drawn from finite f16 magnitudes
+    // with both signs so the bit comparison never degenerates on NaN/Inf
+    // propagation.
+    std::mt19937 rng(20260909u);
+    auto rand_byte = [&rng]() { return static_cast<uint8_t>(rng() & 0xFF); };
+    auto rand_f16_signed = [&rng](float lo, float span) {
+      return (lo + span * static_cast<float>(rng() % 64) / 64.0f) *
+             ((rng() % 2) != 0 ? 1.0f : -1.0f);
+    };
+    auto fill_block = [&](uint8_t* blk) {
+      if (enc == vt::DType::kQ4_K) {
+        // block_q4_K = { f16 d; f16 dmin; u8 scales[12]; u8 qs[128] } (144B)
+        const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
+        const uint16_t dmin_bits = vt::F32ToF16(rand_f16_signed(0.005f, 0.02f));
+        std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
+        std::memcpy(blk + 2, &dmin_bits, sizeof(dmin_bits));
+        for (int i = 0; i < 12; ++i) blk[4 + i] = rand_byte();
+        for (int i = 0; i < 128; ++i) blk[16 + i] = rand_byte();
+      } else if (enc == vt::DType::kQ5_K) {
+        // block_q5_K = { f16 d; f16 dmin; u8 scales[12]; u8 qh[32];
+        //                u8 qs[128] } (176B)
+        const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
+        const uint16_t dmin_bits = vt::F32ToF16(rand_f16_signed(0.005f, 0.02f));
+        std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
+        std::memcpy(blk + 2, &dmin_bits, sizeof(dmin_bits));
+        for (int i = 0; i < 12; ++i) blk[4 + i] = rand_byte();
+        for (int i = 0; i < 32; ++i) blk[16 + i] = rand_byte();   // qh
+        for (int i = 0; i < 128; ++i) blk[48 + i] = rand_byte();  // qs
+      } else if (enc == vt::DType::kQ6_K) {
+        // block_q6_K = { u8 ql[128]; u8 qh[64]; i8 scales[16]; f16 d }
+        // (210B) — the scales are signed bytes both sides read as int8, so
+        // random bytes stay in the dot's bit-exact class.
+        for (int i = 0; i < 128; ++i) blk[0 + i] = rand_byte();   // ql
+        for (int i = 0; i < 64; ++i) blk[128 + i] = rand_byte();  // qh
+        for (int i = 0; i < 16; ++i) blk[192 + i] = rand_byte();  // scales
+        const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
+        std::memcpy(blk + 208, &d_bits, sizeof(d_bits));
+      } else {
+        // block_q8_0 = { f16 d; i8 qs[32] } (34B)
+        const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
+        std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
+        for (int i = 0; i < 32; ++i) blk[2 + i] = rand_byte();  // full int8 range
+      }
+    };
 
-        // CPU integer oracle: quantize each activation row once, then one
-        // nrc==1 vec_dot per (m, n) pair — the exact work the CPU provider
-        // does per output element.
-        const size_t y_row_bytes = vt::cpu::QuantActRowBytes(vt::DType::kQ4_K, K);
-        std::vector<uint8_t> y(M * y_row_bytes);
-        for (int64_t m = 0; m < M; ++m)
-          quant_act(a_q32.data() + m * K, y.data() + m * y_row_bytes, K);
-        std::vector<float> oracle(M * N);
-        for (int64_t m = 0; m < M; ++m)
-          for (int64_t n = 0; n < N; ++n)
-            vec_dot(static_cast<int>(K), &oracle[static_cast<size_t>(m) * N + n],
-                    /*bs=*/0, packed.data() + static_cast<size_t>(n) * nb * kBlockBytes,
-                    /*bx=*/0, y.data() + m * y_row_bytes, /*by=*/0, /*nrc=*/1);
+    const int64_t n_list[] = {1, 3, 17};
+    const int64_t nb_list[] = {1, 2, 16};
+    const int64_t m_list[] = {1, 3};
+    for (int64_t M : m_list) {
+      for (int64_t N : n_list) {
+        for (int64_t nb : nb_list) {
+          const int64_t K = nb * kBlockElems;
+          std::vector<uint8_t> packed(N * nb * kBlockBytes);
+          for (int64_t b = 0; b < N * nb; ++b)
+            fill_block(packed.data() + b * kBlockBytes);
+          // f32 master, rounded ONCE to bf16: the activation the device arm
+          // actually receives. The oracle quantizes the bf16 values widened
+          // back to f32 (lossless), so the ONLY domain difference left is the
+          // dot's.
+          std::vector<float> a_f32(M * K);
+          for (auto& v : a_f32) v = (static_cast<float>(rng() % 401) - 200.0f) / 100.0f;
+          std::vector<uint16_t> a_bf(M * K);
+          for (size_t i = 0; i < a_f32.size(); ++i) a_bf[i] = vt::F32ToBF16(a_f32[i]);
+          std::vector<float> a_q32(M * K);
+          for (size_t i = 0; i < a_f32.size(); ++i) a_q32[i] = vt::BF16ToF32(a_bf[i]);
 
-        void* mem_a = backend.Alloc(a_bf.size() * sizeof(uint16_t));
-        void* mem_b = backend.Alloc(packed.size());
-        void* mem_o = backend.Alloc(std::max<size_t>(M * N, 16) * sizeof(float));
-        backend.Copy(q, mem_a, a_bf.data(), a_bf.size() * sizeof(uint16_t));
-        backend.Copy(q, mem_b, packed.data(), packed.size());
-        Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
-                                        Device{vt::DeviceType::kTENSTORRENT, 0}, {M, K});
-        Tensor b_t = Tensor::Contiguous(mem_b, vt::DType::kQ4_K,
-                                        Device{vt::DeviceType::kTENSTORRENT, 0}, {N, K});
-        Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
-                                        Device{vt::DeviceType::kTENSTORRENT, 0}, {M, N});
-        vt::MatmulBT(q, o_t, a_t, b_t);
-        std::vector<float> out(std::max<size_t>(M * N, 16), 0.0f);
-        backend.Copy(q, out.data(), mem_o, out.size() * sizeof(float));
-        backend.Free(mem_a);
-        backend.Free(mem_b);
-        backend.Free(mem_o);
+          // CPU integer oracle: quantize each activation row once, then one
+          // nrc==1 vec_dot per (m, n) pair — the exact work the CPU provider
+          // does per output element.
+          const size_t y_row_bytes = vt::cpu::QuantActRowBytes(enc, K);
+          std::vector<uint8_t> y(M * y_row_bytes);
+          for (int64_t m = 0; m < M; ++m)
+            quant_act(a_q32.data() + m * K, y.data() + m * y_row_bytes, K);
+          std::vector<float> oracle(M * N);
+          for (int64_t m = 0; m < M; ++m)
+            for (int64_t n = 0; n < N; ++n)
+              vec_dot(static_cast<int>(K), &oracle[static_cast<size_t>(m) * N + n],
+                      /*bs=*/0, packed.data() + static_cast<size_t>(n) * nb * kBlockBytes,
+                      /*bx=*/0, y.data() + m * y_row_bytes, /*by=*/0, /*nrc=*/1);
 
-        INFO("M=", M, " N=", N, " nb=", nb, " K=", K);
-        if (std::memcmp(out.data(), oracle.data(), oracle.size() * sizeof(float)) != 0) {
-          int64_t bad = 0;
-          for (int64_t i = 0; i < static_cast<int64_t>(oracle.size()); ++i) {
-            if (std::memcmp(&out[static_cast<size_t>(i)], &oracle[static_cast<size_t>(i)],
-                            sizeof(float)) != 0) {
-              if (bad < 4)
-                MESSAGE("diff m=", i / N, " n=", i % N, " dev=", out[static_cast<size_t>(i)],
-                        " oracle=", oracle[static_cast<size_t>(i)]);
-              ++bad;
+          void* mem_a = backend.Alloc(a_bf.size() * sizeof(uint16_t));
+          void* mem_b = backend.Alloc(packed.size());
+          void* mem_o = backend.Alloc(std::max<size_t>(M * N, 16) * sizeof(float));
+          backend.Copy(q, mem_a, a_bf.data(), a_bf.size() * sizeof(uint16_t));
+          backend.Copy(q, mem_b, packed.data(), packed.size());
+          Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                          Device{vt::DeviceType::kTENSTORRENT, 0}, {M, K});
+          Tensor b_t = Tensor::Contiguous(mem_b, enc,
+                                          Device{vt::DeviceType::kTENSTORRENT, 0}, {N, K});
+          Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                          Device{vt::DeviceType::kTENSTORRENT, 0}, {M, N});
+          vt::MatmulBT(q, o_t, a_t, b_t);
+          std::vector<float> out(std::max<size_t>(M * N, 16), 0.0f);
+          backend.Copy(q, out.data(), mem_o, out.size() * sizeof(float));
+          backend.Free(mem_a);
+          backend.Free(mem_b);
+          backend.Free(mem_o);
+
+          INFO("enc=", static_cast<int>(enc), " M=", M, " N=", N, " nb=", nb,
+               " K=", K);
+          if (std::memcmp(out.data(), oracle.data(), oracle.size() * sizeof(float)) != 0) {
+            int64_t bad = 0;
+            for (int64_t i = 0; i < static_cast<int64_t>(oracle.size()); ++i) {
+              if (std::memcmp(&out[static_cast<size_t>(i)], &oracle[static_cast<size_t>(i)],
+                              sizeof(float)) != 0) {
+                if (bad < 4)
+                  MESSAGE("diff m=", i / N, " n=", i % N, " dev=", out[static_cast<size_t>(i)],
+                          " oracle=", oracle[static_cast<size_t>(i)]);
+                ++bad;
+              }
             }
+            MESSAGE("total bad: ", bad, " / ", oracle.size(),
+                    " (bf16-domain dot vs the integer reference)");
           }
-          MESSAGE("total bad: ", bad, " / ", oracle.size(),
-                  " (bf16-domain dot vs the integer reference)");
-        }
-        CHECK(std::memcmp(out.data(), oracle.data(), oracle.size() * sizeof(float)) == 0);
-      }
-    }
-  }
-
-  // The f32-activation domain contract: the CPU provider quantizes the f32
-  // master directly (no bf16 detour), so the device must too. One small
-  // shape; the same bit-exact bar.
-  {
-    const int64_t M = 2, N = 5, nb = 2;
-    const int64_t K = nb * kBlockElems;
-    std::vector<uint8_t> packed(N * nb * kBlockBytes);
-    for (int64_t b = 0; b < N * nb; ++b) {
-      uint8_t* blk = packed.data() + b * kBlockBytes;
-      const uint16_t d_bits = vt::F32ToF16(rand_f16_signed(0.05f, 0.35f));
-      const uint16_t dmin_bits = vt::F32ToF16(rand_f16_signed(0.005f, 0.02f));
-      std::memcpy(blk + 0, &d_bits, sizeof(d_bits));
-      std::memcpy(blk + 2, &dmin_bits, sizeof(dmin_bits));
-      for (int i = 0; i < 12; ++i) blk[4 + i] = rand_byte();
-      for (int i = 0; i < 128; ++i) blk[16 + i] = rand_byte();
-    }
-    std::vector<float> a_f32(M * K);
-    for (auto& v : a_f32) v = (static_cast<float>(rng() % 401) - 200.0f) / 100.0f;
-
-    const size_t y_row_bytes = vt::cpu::QuantActRowBytes(vt::DType::kQ4_K, K);
-    std::vector<uint8_t> y(M * y_row_bytes);
-    for (int64_t m = 0; m < M; ++m)
-      quant_act(a_f32.data() + m * K, y.data() + m * y_row_bytes, K);
-    std::vector<float> oracle(M * N);
-    for (int64_t m = 0; m < M; ++m)
-      for (int64_t n = 0; n < N; ++n)
-        vec_dot(static_cast<int>(K), &oracle[static_cast<size_t>(m) * N + n],
-                /*bs=*/0, packed.data() + static_cast<size_t>(n) * nb * kBlockBytes,
-                /*bx=*/0, y.data() + m * y_row_bytes, /*by=*/0, /*nrc=*/1);
-
-    void* mem_a = backend.Alloc(a_f32.size() * sizeof(float));
-    void* mem_b = backend.Alloc(packed.size());
-    void* mem_o = backend.Alloc(std::max<size_t>(M * N, 16) * sizeof(float));
-    backend.Copy(q, mem_a, a_f32.data(), a_f32.size() * sizeof(float));
-    backend.Copy(q, mem_b, packed.data(), packed.size());
-    Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kF32,
-                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {M, K});
-    Tensor b_t = Tensor::Contiguous(mem_b, vt::DType::kQ4_K,
-                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {N, K});
-    Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
-                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {M, N});
-    vt::MatmulBT(q, o_t, a_t, b_t);
-    std::vector<float> out(M * N, 0.0f);
-    backend.Copy(q, out.data(), mem_o, out.size() * sizeof(float));
-    backend.Free(mem_a);
-    backend.Free(mem_b);
-    backend.Free(mem_o);
-
-    INFO("f32 activation: M=", M, " N=", N, " nb=", nb, " K=", K);
-    if (std::memcmp(out.data(), oracle.data(), oracle.size() * sizeof(float)) != 0) {
-      int64_t bad = 0;
-      for (int64_t i = 0; i < static_cast<int64_t>(oracle.size()); ++i) {
-        if (std::memcmp(&out[static_cast<size_t>(i)], &oracle[static_cast<size_t>(i)],
-                        sizeof(float)) != 0) {
-          if (bad < 4)
-            MESSAGE("diff m=", i / N, " n=", i % N, " dev=", out[static_cast<size_t>(i)],
-                    " oracle=", oracle[static_cast<size_t>(i)]);
-          ++bad;
+          CHECK(std::memcmp(out.data(), oracle.data(), oracle.size() * sizeof(float)) == 0);
         }
       }
-      MESSAGE("total bad: ", bad, " / ", oracle.size(),
-              " (f32 activation took the bf16 detour)");
     }
-    CHECK(std::memcmp(out.data(), oracle.data(), oracle.size() * sizeof(float)) == 0);
+
+    // The f32-activation domain contract, per encoding: the CPU provider
+    // quantizes the f32 master directly (no bf16 detour), so the device must
+    // too. One small shape; the same bit-exact bar.
+    {
+      const int64_t M = 2, N = 5, nb = 2;
+      const int64_t K = nb * kBlockElems;
+      std::vector<uint8_t> packed(N * nb * kBlockBytes);
+      for (int64_t b = 0; b < N * nb; ++b)
+        fill_block(packed.data() + b * kBlockBytes);
+      std::vector<float> a_f32(M * K);
+      for (auto& v : a_f32) v = (static_cast<float>(rng() % 401) - 200.0f) / 100.0f;
+
+      const size_t y_row_bytes = vt::cpu::QuantActRowBytes(enc, K);
+      std::vector<uint8_t> y(M * y_row_bytes);
+      for (int64_t m = 0; m < M; ++m)
+        quant_act(a_f32.data() + m * K, y.data() + m * y_row_bytes, K);
+      std::vector<float> oracle(M * N);
+      for (int64_t m = 0; m < M; ++m)
+        for (int64_t n = 0; n < N; ++n)
+          vec_dot(static_cast<int>(K), &oracle[static_cast<size_t>(m) * N + n],
+                  /*bs=*/0, packed.data() + static_cast<size_t>(n) * nb * kBlockBytes,
+                  /*bx=*/0, y.data() + m * y_row_bytes, /*by=*/0, /*nrc=*/1);
+
+      void* mem_a = backend.Alloc(a_f32.size() * sizeof(float));
+      void* mem_b = backend.Alloc(packed.size());
+      void* mem_o = backend.Alloc(std::max<size_t>(M * N, 16) * sizeof(float));
+      backend.Copy(q, mem_a, a_f32.data(), a_f32.size() * sizeof(float));
+      backend.Copy(q, mem_b, packed.data(), packed.size());
+      Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kF32,
+                                      Device{vt::DeviceType::kTENSTORRENT, 0}, {M, K});
+      Tensor b_t = Tensor::Contiguous(mem_b, enc,
+                                      Device{vt::DeviceType::kTENSTORRENT, 0}, {N, K});
+      Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                      Device{vt::DeviceType::kTENSTORRENT, 0}, {M, N});
+      vt::MatmulBT(q, o_t, a_t, b_t);
+      std::vector<float> out(M * N, 0.0f);
+      backend.Copy(q, out.data(), mem_o, out.size() * sizeof(float));
+      backend.Free(mem_a);
+      backend.Free(mem_b);
+      backend.Free(mem_o);
+
+      INFO("f32 activation: enc=", static_cast<int>(enc), " M=", M, " N=", N,
+           " nb=", nb, " K=", K);
+      if (std::memcmp(out.data(), oracle.data(), oracle.size() * sizeof(float)) != 0) {
+        int64_t bad = 0;
+        for (int64_t i = 0; i < static_cast<int64_t>(oracle.size()); ++i) {
+          if (std::memcmp(&out[static_cast<size_t>(i)], &oracle[static_cast<size_t>(i)],
+                          sizeof(float)) != 0) {
+            if (bad < 4)
+              MESSAGE("diff m=", i / N, " n=", i % N, " dev=", out[static_cast<size_t>(i)],
+                      " oracle=", oracle[static_cast<size_t>(i)]);
+            ++bad;
+          }
+        }
+        MESSAGE("total bad: ", bad, " / ", oracle.size(),
+                " (f32 activation took the bf16 detour)");
+      }
+      CHECK(std::memcmp(out.data(), oracle.data(), oracle.size() * sizeof(float)) == 0);
+    }
+    MESSAGE("int8-dot sweep enc=", static_cast<int>(enc),
+            ": the 18-shape bf16-act sweep + the f32-act leg bit-exact vs the CPU vec_dot");
   }
 }
 

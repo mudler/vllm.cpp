@@ -46,6 +46,10 @@
 #include "vt/recipes.h"
 #include "vt/rocm/rocm_arch.h"
 #include "vt/rocm/rocm_runtime.h"
+#if defined(VLLM_CPP_HIP)
+#include "../../src/vt/cpu/cpu_quant_iq_tables.h"
+#include "../../src/vt/rocm/rocm_iq_table_seal.h"
+#endif
 
 // KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT (#1940): the real-checkpoint IQ4_XS
 // blocks and llama.cpp's own vec_dot output for them, shared with the CUDA
@@ -2880,6 +2884,35 @@ TEST_CASE("keep-quant Q6_K GEMM runs at the production launch geometry") {
 }
 
 #if defined(VLLM_CPP_HIP)
+// Mirror test_cuda_quant_dot.cpp's device-byte seal. Numerical samples can
+// leave entries unvisited, so compare the complete executing tables (#3067).
+TEST_CASE("ROCm device codebooks == the CPU host tables (byte-exact)") {
+  if (vt::TryGetBackend(DeviceType::kROCM) == nullptr) {
+    MESSAGE("no ROCm backend on this host; device-codebook seal skipped");
+    return;
+  }
+  vt::GetBackend(DeviceType::kROCM);
+  vt::rocm::IqTableSnapshot snap{};
+  vt::rocm::SnapshotIqTablesFromDevice(&snap);
+
+  int sealed = 0;
+  auto seal = [&](const std::string& name, const void* device, const void* host, size_t bytes) {
+    CAPTURE(name);
+    CHECK(std::memcmp(device, host, bytes) == 0);
+    ++sealed;
+  };
+  seal("d_kmask_iq2xs", snap.kmask_iq2xs, vt::cpu::kKmaskIq2xs, sizeof(snap.kmask_iq2xs));
+  seal("d_ksigns_iq2xs", snap.ksigns_iq2xs, vt::cpu::kKsignsIq2xs, sizeof(snap.ksigns_iq2xs));
+  seal("d_iq3xxs_grid", snap.iq3xxs_grid, vt::cpu::kIq3xxsGrid, sizeof(snap.iq3xxs_grid));
+  seal("d_kvalues_iq4nl", snap.kvalues_iq4nl, vt::cpu::kValuesIq4nl,
+       sizeof(snap.kvalues_iq4nl));
+  CHECK(sealed == 4);
+  CHECK(sizeof(snap.kmask_iq2xs) == sizeof(vt::cpu::kKmaskIq2xs));
+  CHECK(sizeof(snap.ksigns_iq2xs) == sizeof(vt::cpu::kKsignsIq2xs));
+  CHECK(sizeof(snap.iq3xxs_grid) == sizeof(vt::cpu::kIq3xxsGrid));
+  CHECK(sizeof(snap.kvalues_iq4nl) == sizeof(vt::cpu::kValuesIq4nl));
+}
+
 // Declared here rather than included: the ROCm kernels have no public header,
 // and src/vt/rocm/rocm_ops.hip:65 already reaches MatmulBTQuantKernelRocm by a
 // file-local extern declaration. This row mirrors that convention instead of

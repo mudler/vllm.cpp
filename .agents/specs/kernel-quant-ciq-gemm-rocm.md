@@ -250,6 +250,20 @@ Use the full `VT_ROCM_QUANT_WMMA` prefix for these environment variables.
 The full `ctest -R 'rocm|cross_device' --output-on-failure` remains the
 device gate. CPU guard execution does not prove GPU dispatch or numerics.
 
+### Repair evidence
+
+The host regression on unchanged `d295f00cb` failed 24 assertions across
+58 scenarios. The repaired guards pass all 58 scenarios. Exact zero now
+disables the experimental switches, and the master switch suppresses both
+arms. Empty and longer strings follow their respective production rules.
+
+Six scratch mutations restore presence checks for each experimental switch
+or ignore the master switch, separately in Q4_K and Q6_K. Each mutation
+fails the host regression. Every mutated source is restored byte-for-byte.
+Production kernels, device shapes, numerical tolerances, and counter checks
+remain unchanged. GPU validation and fresh implementation review remain
+`PENDING`.
+
 ### Integration and stop conditions
 
 Commit this amendment before the repair, then carry both commits in

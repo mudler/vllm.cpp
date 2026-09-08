@@ -3532,16 +3532,20 @@ TEST_CASE("keep-quant Q6_K WMMA cooperative-tile arms match the CPU oracle") {
   // the dispatch only reaches EITHER cooperative-tile arm when the block is
   // the 8-warp one, so a run with BIGTILE=1 alone lands on the plain kernel
   // and the dispatch-counter CHECK below would report an unmet harness
-  // precondition as a defect (review of #3036, finding 5). All three
+  // precondition as a defect (review of #3036, finding 5). All four
   // toggles are `static const bool` read once inside the backend, so the
   // test cannot set them itself -- it can only decline to run.
   const char* wide = std::getenv("VT_ROCM_QUANT_WMMA_WIDE");
   const bool wide_on = wide != nullptr && wide[0] == '1' && wide[1] == '\0';
-  const bool bigtile = std::getenv("VT_ROCM_QUANT_WMMA_BIGTILE") != nullptr;
-  const bool share = std::getenv("VT_ROCM_QUANT_WMMA_SHARE_ACT") != nullptr;
-  if (!wide_on || (!bigtile && !share)) {
-    MESSAGE("VT_ROCM_QUANT_WMMA_WIDE=1 plus one of VT_ROCM_QUANT_WMMA_BIGTILE / "
-            "_SHARE_ACT is required to reach the cooperative-tile arms; "
+  const char* wmma = std::getenv("VT_ROCM_QUANT_WMMA");
+  const bool wmma_on = wmma == nullptr || !(wmma[0] == '0' && wmma[1] == '\0');
+  const char* bigtile_env = std::getenv("VT_ROCM_QUANT_WMMA_BIGTILE");
+  const bool bigtile = bigtile_env != nullptr && bigtile_env[0] == '1' && bigtile_env[1] == '\0';
+  const char* share_env = std::getenv("VT_ROCM_QUANT_WMMA_SHARE_ACT");
+  const bool share = share_env != nullptr && share_env[0] == '1' && share_env[1] == '\0';
+  if (!wmma_on || !wide_on || (!bigtile && !share)) {
+    MESSAGE("WMMA must be enabled, with VT_ROCM_QUANT_WMMA_WIDE=1 and either "
+            "VT_ROCM_QUANT_WMMA_BIGTILE=1 or VT_ROCM_QUANT_WMMA_SHARE_ACT=1; "
             "not exercised this run");
     return;
   }
@@ -3657,16 +3661,20 @@ TEST_CASE("keep-quant Q4_K WMMA cooperative-tile arms match the CPU oracle") {
   // the dispatch only reaches EITHER cooperative-tile arm when the block is
   // the 8-warp one, so a run with BIGTILE=1 alone lands on the plain kernel
   // and the dispatch-counter CHECK below would report an unmet harness
-  // precondition as a defect (review of #3036, finding 5). All three
+  // precondition as a defect (review of #3036, finding 5). All four
   // toggles are `static const bool` read once inside the backend, so the
   // test cannot set them itself -- it can only decline to run.
   const char* wide = std::getenv("VT_ROCM_QUANT_WMMA_WIDE");
   const bool wide_on = wide != nullptr && wide[0] == '1' && wide[1] == '\0';
-  const bool bigtile = std::getenv("VT_ROCM_QUANT_WMMA_BIGTILE") != nullptr;
-  const bool share = std::getenv("VT_ROCM_QUANT_WMMA_SHARE_ACT") != nullptr;
-  if (!wide_on || (!bigtile && !share)) {
-    MESSAGE("VT_ROCM_QUANT_WMMA_WIDE=1 plus one of VT_ROCM_QUANT_WMMA_BIGTILE / "
-            "_SHARE_ACT is required to reach the cooperative-tile arms; "
+  const char* wmma = std::getenv("VT_ROCM_QUANT_WMMA");
+  const bool wmma_on = wmma == nullptr || !(wmma[0] == '0' && wmma[1] == '\0');
+  const char* bigtile_env = std::getenv("VT_ROCM_QUANT_WMMA_BIGTILE");
+  const bool bigtile = bigtile_env != nullptr && bigtile_env[0] == '1' && bigtile_env[1] == '\0';
+  const char* share_env = std::getenv("VT_ROCM_QUANT_WMMA_SHARE_ACT");
+  const bool share = share_env != nullptr && share_env[0] == '1' && share_env[1] == '\0';
+  if (!wmma_on || !wide_on || (!bigtile && !share)) {
+    MESSAGE("WMMA must be enabled, with VT_ROCM_QUANT_WMMA_WIDE=1 and either "
+            "VT_ROCM_QUANT_WMMA_BIGTILE=1 or VT_ROCM_QUANT_WMMA_SHARE_ACT=1; "
             "not exercised this run");
     return;
   }

@@ -635,6 +635,8 @@ jobs:
         run: |
           python3 scripts/check-conflict-markers.py
           python3 tests/scripts/test_check_conflict_markers.py
+      - name: ROCm cooperative tests follow production toggle values (#3063)
+        run: python3 tests/scripts/test_rocm_cooperative_toggles.py
       - name: The staged gfx1151 paired measurement still refuses to run (#2497)
         # Registered in TWO places, like the suites above, and it was in ONE.
         # `scripts/agent-preflight.sh` held it from the start and this file never

@@ -587,6 +587,28 @@ TEST_CASE("every encoding in the Qwen3.8-2.4T UD-Q1_0 checkpoint decodes") {
   CheckCheckpointCensus(kUdQ10Census, "UD-Q1_0");
 }
 
+TEST_CASE("ROCm IQ3_XXS loader admission keeps matrix and expert blocks") {
+  // Direct GEMM tests bypass DeviceKeepQuantSupported. Enter the loader route
+  // so deleting IQ3_XXS admission cannot silently restore bf16 expansion.
+  constexpr uint32_t iq3_xxs = 18;
+  for (const auto role : {GgufTensorRole::kMatmulWeight,
+                          GgufTensorRole::kStackedExpertWeight}) {
+    CAPTURE(vllm::Name(role));
+    std::vector<int64_t> shape = role == GgufTensorRole::kMatmulWeight
+                                     ? std::vector<int64_t>{8, 256}
+                                     : std::vector<int64_t>{2, 8, 256};
+    auto route = [&](bool keep_quant, bool cpu_ref) {
+      return RouteGgufTensor(keep_quant, /*keep_f16=*/false, /*nvfp4_fp4=*/false,
+                             cpu_ref, role, iq3_xxs, shape, vt::DeviceType::kROCM);
+    };
+    CHECK(route(true, false) == GgufResidency::kKeepQuant);
+    CHECK(route(false, false) == GgufResidency::kExpandBf16);
+    CHECK(route(true, true) == GgufResidency::kExpandBf16);
+    shape.back() = 255;
+    CHECK(route(true, false) == GgufResidency::kExpandBf16);
+  }
+}
+
 TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   // The expectation is written out LONGHAND here rather than derived from the
   // implementation, so this is a real cross-check and not a tautology.

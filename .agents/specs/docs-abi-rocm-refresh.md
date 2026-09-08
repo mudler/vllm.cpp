@@ -6,8 +6,10 @@ Base: `2add10f31`.
 
 ## Now
 
-The scoped public corrections are implemented. Independent review is pending. This is an ad hoc documentation task, not a model or engine lifecycle
-transition. The work ID identifies the branch and issue, not a new capability.
+The scoped public corrections include both README repairs from independent
+review: the C ABI version and ROCm hardware row. Fresh review is pending.
+Full preflight remains INCOMPLETE. This documentation task changes no model or
+engine lifecycle state. The work ID identifies the branch and issue.
 
 ## Scope
 
@@ -104,12 +106,15 @@ their existing negative mutations. No new test or product mutation applies to
 this prose change. The source inventory now names the actual ROCm files.
 The retired `check-public-doc-tables.py` is absent and is not a runnable gate.
 
-Full preflight was invoked before editing. It reports host failures that also
-occur on the coordinator's unchanged base: missing CMake and ELF tools, and
-packaging subprocesses that cannot load the isolated Python shared library.
-Its focused documentation checks pass. The coordinator supplied an isolated
-Tiny C Compiler and musl headers. Extracting the first C block from the final
-reference page and running this command exits 0:
+Full preflight is INCOMPLETE. The coordinator and initial implementer invoked
+it, then stopped after baseline failures involving missing CMake and ELF tools,
+isolated Python loading errors, and unrelated preflight and report failures.
+Those runs do not establish a full pass. The repair runs only the role check
+and the focused documentation checks above, not another full preflight.
+
+The coordinator supplied an isolated Tiny C Compiler and musl headers.
+The initial implementer extracted the first C block from the reference page.
+This compilation command exited 0:
 
 ```sh
 tcc -B/tmp/vllm-doc-tools/root/usr/lib/tcc \
@@ -119,3 +124,17 @@ tcc -B/tmp/vllm-doc-tools/root/usr/lib/tcc \
 
 This verifies compilation only. Linking, model generation, GPU execution, and
 new performance measurements are excluded.
+
+## Review repair evidence
+
+The README now reports `VLLM_ABI_VERSION 26`, matching `include/vllm.h:354`.
+Its hardware row describes native EXL3 generation on gfx1151 and retains the
+unverified discrete GPU correctness and competitive performance limits.
+The source registers `kCastF16` at `src/vt/rocm/rocm_ops.hip:190` and
+`kExl3Gemm` at `src/vt/rocm/rocm_ops.hip:292`. The existing
+[`BACKEND-ROCM-EXL3` evidence](backend-rocm-exl3.md) establishes CPU reference
+agreement on gfx1151 and states the remaining measurement limits.
+
+The repair uses the same isolated Python environment and repeats all four
+checks and the 82 tests above. A text search over the three scoped public
+pages finds no residual ABI 23 or ROCm skeleton claim. No GPU runs apply.

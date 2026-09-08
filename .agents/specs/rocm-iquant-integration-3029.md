@@ -6,7 +6,9 @@ open for the other quantized formats.
 Contribution: [#3029](https://github.com/mudler/vllm.cpp/pull/3029).
 Parent spec: [ROCm I-quant port](kernel-quant-ciq-gemm-rocm-iquant.md).
 Contribution base: `7aa0aa00a8eb79d53e65685e78e8da6d3f10482a`.
-Integration target: `415d17859500caf2a4cac00511820e4f4760e86f`.
+Initial integration target: `415d17859500caf2a4cac00511820e4f4760e86f`.
+Final integration target: `08a34c3a74d78046f83886f242d07110a70ff45e`, which
+includes the prerequisite README scan repair from #3064.
 
 ## Scope and source
 

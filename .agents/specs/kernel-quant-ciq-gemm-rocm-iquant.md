@@ -218,7 +218,7 @@ vllm-cli: run=1/1 finish_reason=length prompt_tokens=5 completion_tokens=16 secs
  Paris. The capital of Germany is Berlin. The capital of Italy is Rome.
 ```
 
-The decisive number is the **19,333,564,672 B (~19.33 GiB) footprint** --
+The decisive number is the **19,333,564,672 B (~18.01 GiB) footprint** --
 it matches the file's on-disk size, not the ~70 GiB a bf16 expansion of
 these tensors would produce. That is the keep-quant residency actually
 taking effect on ROCm, not merely compiling: before this row,
@@ -276,7 +276,7 @@ sufficient, no CUDA-style non-fused-multiply workaround needed.
 **The real-checkpoint end-to-end reload also LANDED**, after this pull
 request was first drafted: `Nail-Qwen3.6-35B-A3B-MTP-IQ4_XS.gguf` loads and
 generates coherent tokens on `isravale`, with the resident footprint
-(~19.33 GiB) matching the on-disk size rather than a bf16 blow-up — see
+(~18.01 GiB) matching the on-disk size rather than a bf16 blow-up — see
 Tests. That was the row's actual acceptance criterion, and it is now
 satisfied on the artifact that motivated the row, not a synthetic
 stand-in.

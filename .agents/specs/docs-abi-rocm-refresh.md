@@ -6,8 +6,7 @@ Base: `2add10f31`.
 
 ## Now
 
-The documentation audit is scoped. Implementation and independent review are
-pending. This is an ad hoc documentation task, not a model or engine lifecycle
+The scoped public corrections are implemented. Independent review is pending. This is an ad hoc documentation task, not a model or engine lifecycle
 transition. The work ID identifies the branch and issue, not a new capability.
 
 ## Scope
@@ -26,8 +25,8 @@ states, and the GLM and FP8 placement edits in PRs #2374 and #2236.
 |---|---|---|
 | Current ABI and additions | `include/vllm.h:324` through `include/vllm.h:354` | Correct ABI 23 to 26. Explain KV dtype, speculative acceptance, and sliding-window controls with their limits |
 | Server executable | `examples/CMakeLists.txt:91`, `examples/CMakeLists.txt:108` | Use `build/examples/vllm-server` |
-| ROCm configuration | `cmake/Dependencies.cmake`, `CMakeLists.txt`, `src/vt/rocm/` | Check real option names, compiler selection, and optimization behavior before editing |
-| ROCm native coverage and allocation | `src/vt/rocm/backend.cpp`, `docs/ROCM.md`, `.agents/specs/backend-rocm-exl3.md` | Replace the obsolete one-kernel skeleton description with current coverage and explicit unresolved gates |
+| ROCm configuration | `CMakeLists.txt:337-455`, `src/vt/rocm/` | Check real option names, compiler selection, and optimization behavior before editing |
+| ROCm native coverage and allocation | `src/vt/rocm/rocm_backend.hip`, `docs/ROCM.md`, `.agents/specs/backend-rocm-exl3.md` | Replace the obsolete one-kernel skeleton description with current coverage and explicit unresolved gates |
 | Public C example | `include/vllm.h`, `tests/capi/test_capi.cpp` | Present a complete C program if revising the example. Preserve defaults and cleanup |
 
 ## Upstream chain
@@ -40,7 +39,7 @@ registration or advertise a new speed ratio.
 ## Tests and gates
 
 Run CPU-only documentation checks: `check-readme-structure.py`,
-`check-supported-models.py`, `check-public-doc-tables.py`,
+`check-supported-models.py`,
 `check-surface-coverage.py`, and `check-benchmark-index.py` under `scripts/`.
 Run the relevant existing mutation suites and `git diff --check`.
 Run `scripts/agent-preflight.sh` and report each unavailable host-dependent
@@ -67,3 +66,56 @@ Unrelated baseline failures remain explicit and cannot justify weaker gates.
 Do not promote a capability or invent a measurement. A missing source anchor
 requires a narrower statement. Product defects require separate tracked work.
 No merge authority is granted by the user's request to open a PR.
+
+## Implementation evidence
+
+The changes correct ABI 26 and the `vllm-server` executable name. September
+news describes shipped controls and native ROCm EXL3 generation without adding
+a speed claim. The ROCm instructions retain allocation and hardware limits.
+The C example now includes `stdio.h`, `main`, and completion failure cleanup.
+
+Source checks used `include/vllm.h:354`, `include/vllm.h:586-599`,
+`include/vllm.h:706-713`, and `include/vllm.h:825-882` for ABI values and semantics.
+`src/capi/vllm_c.cpp:535-543`, `:688-689`, `:746-760`, and `:862-890` confirm
+parameter defaults, loading, and acceptance queries.
+`examples/CMakeLists.txt:91-108` defines the server output name.
+`CMakeLists.txt:370-449` defines compiler hints and the Debug optimization floor.
+`src/vt/rocm/rocm_ops.hip:190-293` registers the documented native operations.
+`src/vt/rocm/rocm_backend.hip:200-235` implements allocation selection.
+`backend-rocm-exl3.md` records gfx1151 generation and the unmeasured discrete
+and competitive performance gates.
+
+With the isolated Python tool directory from this spec, these commands exit 0:
+
+```sh
+python3 scripts/check-readme-structure.py
+python3 scripts/check-supported-models.py
+python3 scripts/check-surface-coverage.py
+python3 scripts/check-benchmark-index.py
+python3 -m unittest discover -s tests/scripts -p 'test_check_readme_structure.py'
+python3 -m unittest discover -s tests/scripts -p 'test_check_supported_models.py'
+python3 -m unittest discover -s tests/scripts -p 'test_check_surface_coverage.py'
+python3 -m unittest discover -s tests/scripts -p 'test_check_benchmark_index.py'
+git diff --check
+```
+
+The four existing suites pass 19, 11, 46, and 6 tests respectively, including
+their existing negative mutations. No new test or product mutation applies to
+this prose change. The source inventory now names the actual ROCm files.
+The retired `check-public-doc-tables.py` is absent and is not a runnable gate.
+
+Full preflight was invoked before editing. It reports host failures that also
+occur on the coordinator's unchanged base: missing CMake and ELF tools, and
+packaging subprocesses that cannot load the isolated Python shared library.
+Its focused documentation checks pass. The coordinator supplied an isolated
+Tiny C Compiler and musl headers. Extracting the first C block from the final
+reference page and running this command exits 0:
+
+```sh
+tcc -B/tmp/vllm-doc-tools/root/usr/lib/tcc \
+  -I/tmp/vllm-doc-tools/root/usr/include -Iinclude \
+  -c /tmp/vllm-docs-impl-c-api.c -o /tmp/vllm-docs-impl-c-api.o
+```
+
+This verifies compilation only. Linking, model generation, GPU execution, and
+new performance measurements are excluded.

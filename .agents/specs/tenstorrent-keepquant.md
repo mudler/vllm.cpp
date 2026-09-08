@@ -194,10 +194,9 @@ fatality — 36 i32 words are exactly 144 packed bytes, zero expansion), and
 - **Red-first.** The smallest failing test asserts the device dot equals the
   CPU integer `vec_dot` reference on a swept shape; today's dot is
   bf16-domain, so it is red. The decode bit-exactness suite stays green —
-- The int8-dot perf lever — W4b, in flight (#3031); llama.cpp-comparable
-  throughput numbers, recorded only.
-  returns as NEEDS_DECISION. (2) The activation row quantization must be
-  capture-safe: staged pre-capture, read-only under replay (the
+  unchanged. Risks: (1) the dot changes the e2e domain, so tokens may
+  flip; a flip the band cannot adjudicate returns as NEEDS_DECISION.
+  (2) The activation row quantization must be capture-safe: staged pre-capture, read-only under replay (the
   #2812/#2907 discipline). (3) The band may tighten or shift; only the
   documented re-derivation path is legal.
 - **Gates and stop conditions.** Unchanged (preflight; op suite; capture
@@ -248,6 +247,71 @@ DEQUANTIZED artifact — `from_pretrained(gguf_file=...)` if the pinned
 transformers 5.14.1 parses qwen35 GGUF, otherwise our own bit-exact decoder
 (W1-proven) writing a safetensors dir first. Never teacher-force against
 the bf16 safetensors checkpoint: those logits are a different model's.
+
+### W4b outcome (2026-09-08): the lever lands op-level
+
+Implemented on the row branch, one commit, separate PR per the recorded
+call. The kernel (`kKeepQuantInt8DotKernelSrc`,
+`src/vt/tenstorrent/tenstorrent_ops.cpp`) is a custom device kernel below
+ttnn, dense arm, ported from the pinned b10451 `ggml_vec_dot_q4_K_q8_K`,
+`ggml_vec_dot_q5_K_q8_K`, `ggml_vec_dot_q6_K_q8_K` and the
+`quantize_row_q8_K_ref` activation pass; the 8-lane f32-FPU accumulation
+mirrors the lane/min interleave and is bit-exact vs the pinned `vec_dot`
+on the swept shapes.
+
+Findings that shaped it:
+
+- tt-metal builds every device kernel with `-ffast-math`
+  (`tt_metal/hw/CMakeLists.txt:311`, pinned `a3d33028975`);
+  `-freciprocal-math` rewrote the q8_K quantizer's `iscale = -127/amax`
+  and `1/iscale` into reciprocal multiplies, shifting the quantized
+  payload by 1 ulp and with it every dot. `volatile float iscale` pins
+  the divisions; host probes confirmed both the rewrite and the fix.
+- The development-time `mesh_command_queue().finish()` drain fataled
+  under capture; it is now gated on `tt_capture_active()` and the
+  non-capture path is byte-identical.
+- A fresh `MeshWorkload` per call fatals `mesh_workload.cpp:153` (no
+  binary loads during trace capture). `Int8DotWorkloadCache` keys
+  (encoding, act_f32, M, K, N, grid), updates the runtime args in place
+  with a fresh runtime id, and mirrors ttnn's device_operation cache
+  (`device_operation.hpp:371-384`, `:283`). The red-first capture test
+  drives the int8-dot path through a live capture and reds without the
+  cache.
+
+Evidence (row branch, `flock` legs, luwen reset per leg):
+
+- Op suite 69/69 cases, 524,428 assertions on the default build; the
+  int8-dot sweep and the capture test skip loudly without
+  `VT_TT_KEEPQUANT_INT8DOT` and pass opt-in (the capture test's own
+  demand is 49,152 B against the 52,428,800 B region).
+- Decode sweeps Q5_K/Q6_K/Q8_0 exit 0; capture dump ×2 byte-identical
+  across a reset (md5 `8f617b275dbf0c3a9c4685ddca4a35cc`).
+- Lever-lane trace demand 294,010,880 B vs W4a's 444,424,192 B: SHRINK
+  −33.8%, the spec bar met. Default-lane demand 444,973,056 B, +0.12% —
+  flat.
+- e2e: the lever lane fails the committed ≤500-mnat band at (5,7)
+  1125 mnats (self-consistency gap, first divergence) with a (5,11)
+  750 cascade; determinism proven; the pinned llama.cpp b10451 raw run
+  diverges from the ROCm-domain oracle at a different cell on p5, so
+  the ROCm-domain band cannot adjudicate the int8-dot lane. Returned to
+  the developer with the analysis; decision (2026-09-08): **op-level
+  landing** — the committed goldens stay untouched, the default stays
+  W4a.
+- Default vehicle: 16/16 PASS (10 strict / 6 near-tie, max gap 0.375
+  mnats at p9 tok4), 0 forward-divergent — the production path is
+  unchanged.
+- Microbench (recorded only, `TT_GDN_BENCH=1`): per-call int8-dot vs
+  packed ratios 0.04-0.44 over 16 shapes
+  M{1,4}×K{1024,4096}×N{1024,4096}×{Q4_K,Q6_K}, kWarm 5, kIters 200,
+  seed 20260917; fastest at M=1 wide-N (Q6_K 1×1024×4096 = 0.041). No
+  throughput claim; the llama.cpp-comparable floor rides with the e2e
+  gate.
+
+Landing shape: a `VT_TT_KEEPQUANT_INT8DOT` dispatch gate at the dense
+arm site, default OFF (unset or "0" routes to the W4a grouped arm; an
+f32-out call falls through the same way). The committed goldens are
+untouched. The lane's e2e gate wave and production routing are owed
+under [#3079](https://github.com/mudler/vllm.cpp/issues/3079).
 
 ## Tests to port
 
@@ -360,7 +424,11 @@ to make a failure pass.
   literally true.
 - Block-decoding n-gram gather ([#2394](https://github.com/mudler/vllm.cpp/issues/2394)).
 - IQ-family / sub-IQ1_S encodings (unsloth fork formats).
-- The int8-dot perf lever (#3031); llama.cpp-comparable throughput numbers.
+- The int8-dot lane's e2e gate wave and production routing
+  ([#3079](https://github.com/mudler/vllm.cpp/issues/3079)); the
+  llama.cpp-comparable throughput floor rides with it. The lever itself
+  landed op-level behind `VT_TT_KEEPQUANT_INT8DOT` (#3031, default
+  off).
 - `docs/USAGE.md` vehicle pin when the arm first runs end to end (the W3
   capture leg hashes the local bytes); the 27B arm entry LANDED with
   wave-3b-2, provenance caveat included — the gate-completion half of that
@@ -567,4 +635,23 @@ device kernel below ttnn, dense arm only**. The 8-lane accumulators
 stay under 2^24 by upstream design (`quants.c:696/771/851`), so an
 f32-FPU lane-exact path is bit-exact vs `ggml_vec_dot_*` without
 integer hardware; the composed-ttnn option B was rejected on captured
-op count. See `## W4b` survey outcome.
+op count. See `## W4b` survey outcome. AMENDED 2026-09-08 (ninth): W4b
+is implementation-complete on the row branch and lands op-level (the
+developer's call on the anchor analysis). The custom int8-dot kernel is
+bit-exact vs the pinned `ggml_vec_dot_*`; the root cause of the payload
+shift is tt-metal's `-ffast-math` device build (reciprocal-math on the
+q8_K quantizer divisions), pinned by `volatile float iscale`. Two
+capture blockers repaired (dev drain fataled mid-capture; per-call
+MeshWorkload fatals `mesh_workload.cpp:153`) — a keyed
+`Int8DotWorkloadCache` mirrors the ttnn device_operation cache,
+red-first capture test green. Lever-lane trace demand SHRINK −33.8% vs
+W4a, bar met; the lever lane fails the committed ≤500-mnat band with
+determinism proven and the ROCm-domain band unable to adjudicate the
+int8-dot lane, hence the op-level call: `VT_TT_KEEPQUANT_INT8DOT`
+dispatch gate, default OFF, committed goldens untouched, default stays
+W4a (vehicle 16/16 PASS, demand 444,973,056 B, +0.12% — flat).
+Microbench recorded-only: per-call ratios 0.04-0.44 over 16 shapes. The
+lane's e2e gate wave and production routing are owed under
+[#3079](https://github.com/mudler/vllm.cpp/issues/3079). Next: the
+single commit (#3031 + #3079), the checks, push to the fork, fresh
+review, PR.

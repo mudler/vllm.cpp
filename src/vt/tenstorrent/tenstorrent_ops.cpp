@@ -53,6 +53,7 @@
 #endif
 
 #include <ttnn/tensor/tensor.hpp>
+#include <ttnn/core.hpp>
 // W4 lever 1 (#2107): the bulk bf16 upload hands the master's own bytes to
 // ttnn::Tensor::from_span<bfloat16> — these two headers provide the element
 // type and the span view it takes.
@@ -134,6 +135,21 @@ std::tuple<ttnn::Tensor, std::optional<ttnn::Tensor>> chunk_gated_delta_rule(
 #include <ttnn/tensor/tensor_ops.hpp>  // create_device_tensor, copy_to_device
 #include <tt-metalium/core_coord.hpp>
 #include <tt-metalium/work_split.hpp>
+// W4b int8-dot (#3031): the raw below-ttnn device kernel path. The host API
+// (CreateProgram/CreateKernelFromString/CreateCircularBuffer/SetRuntimeArgs),
+// the program/workload types, the data-movement kernel config, the CB config,
+// and the mesh-aware TensorAccessorArgs — the last so the kernel reads the
+// staged PACKED words / ROW_MAJOR activation / f32 out through tt-metal's own
+// bank-interleave math instead of hand-rolled DRAM addressing.
+#include <tt-metalium/host_api.hpp>
+#include <tt-metalium/program.hpp>
+#include <tt-metalium/mesh_workload.hpp>
+#include <tt-metalium/distributed.hpp>
+#include <tt-metalium/kernel_types.hpp>
+#include <tt-metalium/circular_buffer.hpp>
+#include <tt-metalium/circular_buffer_config.hpp>
+#include <tt-metalium/tensor_accessor_args.hpp>
+#include <filesystem>
 #include <tt-metalium/experimental/tensor/spec/memory_config/memory_config.hpp>
 // Exact row gather/scatter for the GDN caches (BACKEND-TENSTORRENT-GDN W2):
 // ttnn::gather (data_movement/gather/gather.hpp) and ttnn::indexed_fill
@@ -1782,17 +1798,22 @@ void EmbeddingKernel(Queue&, Tensor& out, const Tensor& table, const Tensor& ids
 
 
 // ---- KEEPQUANT W3: the resident i32 word shadow -----------------------------
-// Words per staged packed block: 144B -> 36 and 176B -> 44 (multiples of
-// four); 210B -> 53 and 34B -> 9 for Q6_K/Q8_0, whose 2-byte tails the
-// staging zero-fills (the GGUF stream never carries them, and every byte
-// position the decoders read is inside the true block bytes, so the pad
-// never reaches an output).
+// Words per staged packed block: the GGML block bytes (Q4_K 144 B -> 36
+// words, Q5_K 176 -> 44, Q6_K 210 -> 53, Q8_0 32 -> 9; the 2-byte tails of
+// Q6_K/Q8_0 zero-fill) ZERO-PADDED UP so the staged row is a 64-B multiple:
+// the tensor's logical page size then EQUALS the device accessor's aligned
+// page size, and the host write and the kernel read share one stride (leg33:
+// a 144-B logical page inside 192-B DRAM slots read back as stream bytes
+// 16 + 152*slot — the tensor write and the accessor disagreed on the
+// layout; padding removes the disagreement by construction). The pad never
+// reaches an output: every byte position the decoders read is inside the
+// true block bytes, and the dot strides the padded width.
 int KeepQuantWordsPerBlock(DType enc) {
   switch (enc) {
-    case DType::kQ4_K: return 36;
-    case DType::kQ5_K: return 44;
-    case DType::kQ6_K: return 53;
-    case DType::kQ8_0: return 9;
+    case DType::kQ4_K: return 48;
+    case DType::kQ5_K: return 48;
+    case DType::kQ6_K: return 64;
+    case DType::kQ8_0: return 16;
     default: return 0;
   }
 }
@@ -1818,12 +1839,26 @@ std::map<const void*, KeepQuantWordShadow>& KeepQuantWordShadows() {
   return *m;
 }
 
+// Free path hook: a freed host weight must drop its word shadow, so a
+// recycled address can never alias a stale PACKED stage (UnregisterHostBuffer,
+// the DropDecodedWeightShadow pattern). The immutable-post-load assumption
+// covers the bytes, never the ADDRESS: std::aligned_alloc recycles chunks, and
+// a later test/tensor reusing the address with matching (rows, nb, wpb) would
+// otherwise be served another weight's words (leg41: the Q5_K decode sweep
+// read Q4_K words — 256/256 wrong from a silent (1,1,48) key hit).
+void DropKeepQuantWordShadow(void* host) {
+  if (host == nullptr) return;
+  std::lock_guard<std::mutex> g(KeepQuantWordMutex());
+  KeepQuantWordShadows().erase(host);
+}
+
 // Stage the packed keep-quant stream as a resident i32 word tensor ONCE per
 // weight — the eager pre-capture step or the first eager call pays it — and
 // serve it forever after: the per-call decode runs entirely on-core from the
 // resident words (no host repack, no from_vector upload). The packed master is
-// immutable post-load, so a serve can never go stale (same assumption as the
-// BufferSlot/WeightViewShadow resident shadows).
+// immutable post-load, so a serve can never go stale while the master lives
+// (same assumption as the BufferSlot/WeightViewShadow resident shadows); the
+// UnregisterHostBuffer drop above covers the recycle case.
 ttnn::Tensor EnsureKeepQuantWords(const Tensor& packed, DType enc, int64_t rows,
                                   int64_t nb, MeshDevice& device) {
   VT_CHECK(packed.rank == 2 && packed.IsContiguous(),
@@ -2406,6 +2441,10 @@ void KeepQuantDecodeKernel(Queue&, Tensor& out, const Tensor& packed) {
 // unimplemented encoding from reaching the device.
 void MatmulBTQuantGroupedKernel(Queue&, Tensor& out, const Tensor& act,
                                 const Tensor& weight, const Tensor& expert_ids);
+// W4b (#3031): the below-ttnn int8-dot device kernel — the dense arm's
+// quantized-domain dot (definition below, after the grouped kernel).
+void MatmulBTQuantInt8DotKernel(Queue& q, Tensor& out, const Tensor& a,
+                                const Tensor& b);
 void MatmulBTQuantKernel(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   TT_OP_TRACE("MatmulBTQuant");
   VT_CHECK(a.rank == 2 && b.rank == 2 && out.rank == 2,
@@ -2439,13 +2478,44 @@ void MatmulBTQuantKernel(Queue& q, Tensor& out, const Tensor& a, const Tensor& b
   VT_CHECK(a.IsContiguous() && b.IsContiguous() && out.IsContiguous(),
            "tenstorrent kMatmulBTQuant: strided tensors are not supported in W2");
 
-  // W4a wave-3b-1 (#3030): the dispatch. P = M output rows against expert 0;
-  // the ids are statically all zero and the E=1 arm never reads them (the
-  // capture contract proven by the garbage-ids leg), so a host zeros tensor
-  // is all the grouped contract needs. Capture-safe by construction: the
-  // eager warm step stages every word shadow before capture (a capture-time
-  // miss refuses inside EnsureKeepQuantWords) and every chunk offset is a
-  // capture-time constant replayed verbatim.
+  // W4b (#3031, path decided in the spec amendment): the int8-dot device
+  // kernel behind the F32-OUT dense arm — the quantized-domain dot,
+  // activation quantized once on-core to the vec_dot pairing encoding, the
+  // upstream 8-lane lane split preserved verbatim, bit-exact vs
+  // vt::cpu::BlockVecDot by the red-first sweep. One captured launch replaces
+  // the per-chunk E=1 chain (the capture-demand gate this row owes).
+  //
+  // LANDING DECISION: the lever lands OP-LEVEL and DEFAULT OFF — the e2e
+  // anchor band (<= 500 mnat, spec ## W4b) fails on the quantized domain's
+  // one non-tie flip (vehicle p5 tok7, 1125 mnats; determinism-proven by
+  // byte-identical capture dumps x2), so the production vehicle keeps the W4a
+  // path this wave. With VT_TT_KEEPQUANT_INT8DOT unset or "0" the f32-out
+  // dense arm falls through to the W4a E=1 grouped arm below, which served
+  // exactly these calls before W4b; the env opts the lever in, the op suite
+  // opts in explicitly, and e2e reach is owed (row spec ## Owed + follow-up).
+  //
+  // A BF16-OUT call keeps the W4a E=1 grouped arm: the int8-dot kernel
+  // computes f32 cells only, and committing its f32 dev_out into a bf16
+  // slot left the slot holding f32 bytes at an f32 page geometry — the next
+  // consumer that reads the slot as bf16 got word-halved garbage (the
+  // ROW_MAJOR chained leg's NaN signature: the vehicle's mid-layer bf16
+  // keep-quant matmul fed a down-projection whose activation read the
+  // poisoned slot).
+  if (out.dtype == DType::kF32) {
+    if (const char* int8dot_env = std::getenv("VT_TT_KEEPQUANT_INT8DOT");
+        int8dot_env != nullptr && int8dot_env[0] != '\0' &&
+        std::strcmp(int8dot_env, "0") != 0) {
+      MatmulBTQuantInt8DotKernel(q, out, a, b);
+      return;
+    }
+  }
+  // W4a wave-3b-1 (#3030): the bf16-out dispatch. P = M output rows against
+  // expert 0; the ids are statically all zero and the E=1 arm never reads
+  // them (the capture contract proven by the garbage-ids leg), so a host
+  // zeros tensor is all the grouped contract needs. Capture-safe by
+  // construction: the eager warm step stages every word shadow before
+  // capture (a capture-time miss refuses inside EnsureKeepQuantWords) and
+  // every chunk offset is a capture-time constant replayed verbatim.
   std::vector<int32_t> zero_ids(static_cast<size_t>(a.shape[0]), 0);
   const Tensor ids = Tensor::Contiguous(zero_ids.data(), DType::kI32,
                                         Device{DeviceType::kCPU, 0},
@@ -2766,6 +2836,546 @@ void MatmulBTQuantGroupedKernel(Queue&, Tensor& out, const Tensor& act,
           ttnn::typecast(std::move(assembled), ttnn::DataType::BFLOAT16);
   }
   CommitDeviceLogical2D(out, std::move(assembled), static_cast<uint32_t>(P),
+                        static_cast<uint32_t>(N));
+}
+
+// == W4b int8-dot (BACKEND-TENSTORRENT-KEEPQUANT, #3031): the custom device
+// kernel below ttnn — the decided path (spec ## W4b, amendment 4f95e6fe4).
+//
+// The dense keep-quant matmul runs in the QUANTIZED DOMAIN: the packed words
+// are never decoded to f32 and the activation is quantized ONCE per row to
+// the encoding the CPU vec_dot pairs with the weight (q8_K for the K-quants,
+// q8_0 for Q8_0 — ggml-cpu.c:230-326), then every output element is the
+// upstream generic vec_dot itself, on-core, in the upstream 8-lane split
+// (aux32[8] each <= 2^24, so every f32 `sums[l] += d*aux32[l]` is exact; the
+// whole-block sum is NOT f32-exact, which is why the lane split and the
+// lane-sum/min-correction interleave are preserved verbatim). The algorithm
+// lives in kernels/keepquant_kernel_code.h — the SAME file the red-first
+// sweep test pins host-side against vt::cpu::BlockVecDot/BlockFromFloat —
+// included by the device kernel through compiler_include_paths, so there is
+// one numerics source of truth, not a device twin.
+//
+// CAPTURE (the shrink-or-flat gate): the per-call program enqueues ONE
+// MeshWorkload on the trace cq (QueueId 0, the cq ttnn traces), so the
+// captured graph holds one launch instead of the W4a chunk chain's hundreds
+// of ttnn programs per chunk. Everything the kernel reads is a stable address
+// at capture time: the word shadow (EnsureKeepQuantWords, warmed eagerly),
+// the ROW_MAJOR activation view (slot-hit or a to_layout conversion recorded
+// ahead of the launch in the same trace), and the freshly allocated out
+// tensor whose buffer the capture bakes. The activation quantization runs
+// ON-CORE inside the launch, so replay re-quantizes fresh activations —
+// nothing capture-time is frozen into the graph (the #2812 class).
+//
+// SHAPE VARIANCE IS RUNTIME: every size/count/address reaches the kernel as
+// launch arguments, so tt-metal's kernel cache compiles the source exactly
+// once per (accessor page geometry) — the eager warm step pays it before any
+// capture.
+namespace {
+
+// The device kernel source. keepquant_kernel_code.h comes from the repo
+// kernels/ dir via compiler_include_paths (resolved from __FILE__ below), so
+// the shipped tree — not a copy — is what runs on-core.
+constexpr const char* kKeepQuantInt8DotKernelSrc = R"TTKQ(
+#include "api/dataflow/dataflow_api.h"
+#include "keepquant_kernel_code.h"
+
+// Per-core runtime args (the SetRuntimeArgs stream).
+constexpr uint32_t ARG_M = 0;
+constexpr uint32_t ARG_K = 1;
+constexpr uint32_t ARG_N = 2;
+constexpr uint32_t ARG_NB = 3;        // weight blocks per row (K / elems)
+constexpr uint32_t ARG_WPB = 4;       // staged i32 words per block
+constexpr uint32_t ARG_ACT_F32 = 5;   // 1: f32 activation bytes, 0: bf16
+constexpr uint32_t ARG_ROW0 = 6;      // first weight column of this core (4*group0)
+constexpr uint32_t ARG_ROWC = 7;      // real columns this core dots (0: idle)
+constexpr uint32_t ARG_MTILE = 8;     // activation rows per quantize tile
+constexpr uint32_t ARG_QB_PAD = 9;    // 16B-aligned activation-quant row bytes
+constexpr uint32_t ARG_ENC = 10;      // 0/1/2/3 = Q4_K/Q5_K/Q6_K/Q8_0
+constexpr uint32_t ARG_TCOLS = 11;    // padded tile width (uniform): groups_per_core*4
+
+// CB scratch (self-cycled: reserve -> use -> push -> pop; no consumer core).
+constexpr uint32_t CB_F32 = 0;  // one activation row widened to f32 (K*4 B)
+                                //   plus the raw bf16 tail (K*2 B)
+constexpr uint32_t CB_Q8 = 1;   // mtile quantized activation rows
+constexpr uint32_t CB_W = 2;    // one weight row's packed words (nb*wpb*4 B)
+constexpr uint32_t CB_O = 3;    // out staging, mtile x tcols f32 (tcols % 4 == 0)
+
+void kernel_main() {
+  // Three interleaved DRAM tensors: packed words, activation, out. Interleaved
+  // accessors consume two ct args each (config word + aligned page size) and
+  // zero crta words; the bank bases are the three words SetCommonRuntimeArgs
+  // pushes (address, then accessor's own words — none — then the next).
+  constexpr auto args_w = TensorAccessorArgs<0, 0>();
+  constexpr uint32_t cta_1 = args_w.next_compile_time_args_offset();
+  constexpr auto args_a = TensorAccessorArgs<cta_1, 0>();
+  constexpr uint32_t cta_2 = args_a.next_compile_time_args_offset();
+  constexpr auto args_o = TensorAccessorArgs<cta_2, 0>();
+  const auto acc_w =
+      TensorAccessor(args_w, get_common_arg_val<uint32_t>(0));
+  const auto acc_a =
+      TensorAccessor(args_a, get_common_arg_val<uint32_t>(1));
+  const auto acc_o =
+      TensorAccessor(args_o, get_common_arg_val<uint32_t>(2));
+
+  const uint32_t M = get_arg_val<uint32_t>(ARG_M);
+  const uint32_t K = get_arg_val<uint32_t>(ARG_K);
+  const uint32_t N = get_arg_val<uint32_t>(ARG_N);
+  const uint32_t nb = get_arg_val<uint32_t>(ARG_NB);
+  const uint32_t wpb = get_arg_val<uint32_t>(ARG_WPB);
+  const uint32_t act_f32 = get_arg_val<uint32_t>(ARG_ACT_F32);
+  const uint32_t row0 = get_arg_val<uint32_t>(ARG_ROW0);
+  const uint32_t rowc = get_arg_val<uint32_t>(ARG_ROWC);
+  const uint32_t mtile = get_arg_val<uint32_t>(ARG_MTILE);
+  const uint32_t qb_pad = get_arg_val<uint32_t>(ARG_QB_PAD);
+  const uint32_t enc = get_arg_val<uint32_t>(ARG_ENC);
+  const uint32_t tcols = get_arg_val<uint32_t>(ARG_TCOLS);  // padded tile width
+  if (rowc == 0 || M == 0) return;
+
+  const uint32_t word_bytes = wpb * 4;
+  const uint32_t act_bytes = K * (act_f32 ? 4u : 2u);
+
+  for (uint32_t m0 = 0; m0 < M; m0 += mtile) {
+    const uint32_t mr = (m0 + mtile <= M) ? mtile : (M - m0);
+    // Quantize this tile's activation rows into the core-private q8 scratch.
+    cb_reserve_back(CB_Q8, mr);
+    const uint32_t q8_base = get_write_ptr(CB_Q8);
+    for (uint32_t r = 0; r < mr; ++r) {
+      cb_reserve_back(CB_F32, 1);
+      const uint32_t fp = get_write_ptr(CB_F32);
+      if (act_f32) {
+        noc_async_read(acc_a.get_noc_addr(m0 + r), fp, act_bytes);
+        noc_async_read_barrier();
+      } else {
+        // bf16 -> f32 is exact (f32 bits = u16 << 16). Read the raw u16 row
+        // into the tail PAST the widened row (fp is a byte address, so the
+        // tail starts at fp + K*4), then convert backward.
+        noc_async_read(acc_a.get_noc_addr(m0 + r), fp + K * 4, act_bytes);
+        noc_async_read_barrier();
+        uint32_t* dst = reinterpret_cast<uint32_t*>(fp);
+        const uint16_t* src =
+            reinterpret_cast<const uint16_t*>(fp + K * 4);
+        for (int32_t j = static_cast<int32_t>(K) - 1; j >= 0; --j)
+          dst[j] = static_cast<uint32_t>(src[j]) << 16;
+      }
+      cb_push_back(CB_F32, 1);
+      cb_pop_front(CB_F32, 1);
+      uint8_t* q8row = reinterpret_cast<uint8_t*>(q8_base) + r * qb_pad;
+      if (enc == 3)
+        kq_quantize_row_q8_0(reinterpret_cast<const uint8_t*>(fp), q8row, K);
+      else
+        kq_quantize_row_q8_K(reinterpret_cast<const uint8_t*>(fp), q8row, K);
+    }
+    cb_push_back(CB_Q8, mr);
+
+    cb_reserve_back(CB_W, 1);
+    const uint32_t wp = get_write_ptr(CB_W);
+    cb_reserve_back(CB_O, mr);
+    const uint32_t op = get_write_ptr(CB_O);
+    // Pad columns [rowc, tcols) of every tile row carry ZEROS: the last core's
+    // partial 4-column group writes the whole 16-B sector, and the pad floats
+    // land in the out page's alignment padding, never in a logical cell.
+    for (uint32_t z = 0; z < mr * tcols; ++z)
+      reinterpret_cast<uint32_t*>(op)[z] = 0u;
+
+    // Each assigned weight row streams in once per tile and dots against
+    // every quantized activation row — the m-tile loop bounds the q8 L1
+    // residency, not the math.
+    for (uint32_t n = 0; n < rowc; ++n) {
+      const uint32_t grow = row0 + n;
+      for (uint32_t b = 0; b < nb; ++b)
+        noc_async_read(acc_w.get_noc_addr(grow * nb + b),
+                       wp + b * word_bytes, word_bytes);
+      noc_async_read_barrier();
+      float* out_tile = reinterpret_cast<float*>(op);
+      for (uint32_t r = 0; r < mr; ++r) {
+        const uint8_t* xw = reinterpret_cast<const uint8_t*>(wp);
+        const uint8_t* yq =
+            reinterpret_cast<const uint8_t*>(q8_base) + r * qb_pad;
+        float v = 0.0f;
+        if (enc == 0)
+          v = kq_vec_dot_q4_K_q8_K(xw, word_bytes, yq, nb);
+        else if (enc == 1)
+          v = kq_vec_dot_q5_K_q8_K(xw, word_bytes, yq, nb);
+        else if (enc == 2)
+          v = kq_vec_dot_q6_K_q8_K(xw, word_bytes, yq, nb);
+        else
+          v = kq_vec_dot_q8_0_q8_0(xw, word_bytes, yq, nb);
+        out_tile[r * tcols + n] = v;
+      }
+    }
+
+    // The out tensor is ROW_MAJOR f32 with page = row. Blackhole's NOC moves
+    // DRAM writes in 16-byte units (NOC_DRAM_WRITE_ALIGNMENT_BYTES —
+    // noc_parameters.h:380), so the old per-cell 4-byte writes at row0*4
+    // offsets were off-alignment for most cores, and the misdirected or
+    // dropped transactions are exactly the leg36 scattered-cell signature.
+    // The write unit is therefore a 4-float GROUP: the column split gives
+    // every core whole groups (row0 = 4*group0, tile width tcols = 4*groups),
+    // each group is one 16-B write at byte offset row0*4 + g*16 inside page
+    // m, the pad floats a partial last group carries are the zeros written
+    // above, and groups never straddle cores — one writer per 16-B sector,
+    // no read-modify-write race. The last group's bytes land inside the out
+    // page's alignment padding (align16(N*4) <= page size, host-checked).
+    for (uint32_t r = 0; r < mr; ++r) {
+      const uint32_t src = op + r * tcols * 4;
+      for (uint32_t g = 0; g < tcols / 4; ++g)
+        noc_async_write(src + g * 16,
+                        acc_o.get_noc_addr(m0 + r, row0 * 4 + g * 16), 16);
+    }
+    noc_async_write_barrier();
+
+    cb_push_back(CB_W, 1);
+    cb_pop_front(CB_W, 1);
+    cb_push_back(CB_O, mr);
+    cb_pop_front(CB_O, mr);
+    cb_pop_front(CB_Q8, mr);
+  }
+}
+)TTKQ";
+
+// The kernels/ dir next to this translation unit — the include path that lets
+// the device kernel #include the same header the host-side sweep test pins.
+std::filesystem::path KeepQuantKernelIncludeDir() {
+  return std::filesystem::path(__FILE__).parent_path() / "kernels";
+}
+
+// KEEPQUANT W4b (#3031): the int8-dot arm's persisted MeshWorkload, keyed by
+// program identity — the encoding, the activation dtype, M, K, N and the
+// grid, i.e. everything the kernel compile args (buffer page sizes) and the
+// CB geometry derive from. The in-tree pattern this mirrors is the ttnn
+// program cache: a cache miss builds the program, wraps it in a MeshWorkload
+// and enqueues it once eagerly; every later call re-sets the runtime args on
+// the SAME workload's program (ttnn's override_runtime_arguments hook,
+// device_operation.hpp:283) and re-enqueues that workload object
+// (device_operation.hpp:291). Reuse is what makes the arm capture-safe:
+// EnqueueMeshWorkload runs load_binaries on EVERY enqueue
+// (distributed.cpp:118-121), and load_binaries fatals whenever
+// program_binary_status_ is empty while a trace is being captured
+// (mesh_workload.cpp:148-153) — a workload enqueued once eagerly is
+// Committed (fd_mesh_command_queue.cpp:549) and takes the non-fatal branch,
+// the exact contract every cached ttnn op in the decode graph already relies
+// on. The entry also holds the kernel handle the runtime-arg setters address
+// inside the persisted program.
+struct Int8DotWorkloadEntry {
+  tt::tt_metal::distributed::MeshWorkload workload;
+  tt::tt_metal::KernelHandle kernel;
+};
+std::mutex& Int8DotWorkloadMutex() {
+  static std::mutex m;
+  return m;
+}
+std::map<std::string, Int8DotWorkloadEntry>& Int8DotWorkloadCache() {
+  // Heap-allocated, deliberately never destroyed (#1486 — every cache
+  // accessor in this file): the workload owns device-backed Program state,
+  // and a static-storage destructor would unwind after tt-metal's own
+  // teardown (tenstorrent_device.cpp:36).
+  static std::map<std::string, Int8DotWorkloadEntry>* c =
+      new std::map<std::string, Int8DotWorkloadEntry>();
+  return *c;
+}
+
+}  // namespace
+// kMatmulBTQuant's W4b body: out[M,N] = a[M,K] @ b[N,K]^T with b PACKED
+// keep-quant blocks, computed entirely by the device kernel above. M, N, K,
+// nb, wpb and the per-core row split are launch arguments; the activation is
+// quantized on-core per m-tile into core-private L1 (redundant across the
+// grid, never shared, so there is no inter-core sync and no DRAM q8 scratch).
+void MatmulBTQuantInt8DotKernel(Queue& q, Tensor& out, const Tensor& a,
+                                const Tensor& b) {
+  MeshDevice& device = SharedMeshDevice();
+  (void)q;  // the workload enqueues on the device's mesh command queue
+  const DType enc = b.dtype;
+  const int64_t elems = BlockElems(enc);
+  const int64_t M = a.shape[0];
+  const int64_t K = a.shape[1];
+  const int64_t N = b.shape[0];
+  const int64_t nb = K / elems;
+  if (M == 0 || N == 0) return;
+
+  // PACKED words: the resident i32 shadow ([N*nb, wpb]), staged once per
+  // weight and refused on a capture-time miss (the warm-first contract).
+  const ttnn::Tensor words = EnsureKeepQuantWords(b, enc, N, nb, device);
+
+  // Activation: ROW_MAJOR flat bytes in the declared dtype (f32 stays f32 —
+  // the quantizer consumes the master's own values; bf16 stays bf16, widened
+  // exactly on-core). A slot hit returns the producer's layout; a TILE view
+  // converts through a recorded to_layout ahead of the launch in the trace.
+  // Activation: ROW_MAJOR flat bytes in the declared dtype. A bf16 master
+  // rides the proven EnsureDevice2D staging (persistent-buffer in-place
+  // writes under capture) and a TILE view converts through a recorded
+  // to_layout ahead of the launch. An F32 MASTER STAGES AS F32: the old
+  // route (EnsureDevice2D's f32 reference arm) stages every non-bf16 master
+  // as a BFLOAT16 TILE, while the kernel's act_f32 flag then read the bf16
+  // bytes as f32 words — the leg41 act_f32 sweep failing 10/10 including
+  // (0,0). from_span FLOAT32 ROW_MAJOR is the same direct staging the words
+  // shadow uses; capture-time arrival refuses by name (the words-shadow
+  // discipline — no captured consumer exists for an f32 activation today).
+  ttnn::Tensor dev_a;
+  if (a.dtype == DType::kF32) {
+    VT_CHECK(!tt_capture_active(),
+             "tenstorrent kMatmulBTQuant int8-dot: f32 activation staging "
+             "during trace capture — stage the f32 master eagerly first");
+    EnsureHost(a);
+    dev_a = ttnn::Tensor::from_span(
+        ttsl::Span<const float>(a.Ptr<float>(),
+                                static_cast<size_t>(M) * static_cast<size_t>(K)),
+        SpecOf(tt::tt_metal::Shape({static_cast<uint32_t>(M),
+                                    static_cast<uint32_t>(K)}),
+               ttnn::DataType::FLOAT32, ttnn::Layout::ROW_MAJOR),
+        &device);
+  } else {
+    dev_a = EnsureDevice2D(a, device);
+    if (dev_a.layout() != ttnn::Layout::ROW_MAJOR)
+      dev_a = ttnn::to_layout(std::move(dev_a), ttnn::Layout::ROW_MAJOR);
+  }
+
+  // The out pages must be 16-B multiples: Blackhole moves DRAM writes in
+  // 16-B units (NOC_DRAM_WRITE_ALIGNMENT_BYTES — noc_parameters.h:380), and
+  // ttnn sizes a ROW_MAJOR page at N*4 exactly (a {3,3} f32 page is 12 B), so
+  // a narrow-N out cannot legally receive the 16-B group writes at all — the
+  // leg36 scattered-cell signature. The width is therefore padded to
+  // align4(N) here and sliced back to N before the commit; N % 4 == 0 (every
+  // model shape) takes no slice.
+  const uint32_t n4 = (static_cast<uint32_t>(N) + 3u) & ~3u;
+  ttnn::Tensor dev_out =
+      ttnn::empty(ttnn::Shape({static_cast<uint32_t>(M), n4}),
+                  ttnn::DataType::FLOAT32, ttnn::Layout::ROW_MAJOR, &device,
+                  ttnn::MemoryConfig{});
+
+  // Grid: one core per 4-column GROUP slice. The write unit the out page
+  // gets is one 16-B group (see the kernel's write loop), so the split is in
+  // groups — row0 = 4*group0, a core's real column count rowc <= tcols, and
+  // tcols is uniform so the staging CB geometry is per-program constant.
+  const auto grid = device.compute_with_storage_grid_size();
+  const uint32_t grid_cores =
+      static_cast<uint32_t>(grid.x) * static_cast<uint32_t>(grid.y);
+  const uint32_t groups_total =
+      (static_cast<uint32_t>(N) + 3u) / 4u;
+  const uint32_t groups_per_core =
+      (groups_total + grid_cores - 1) / grid_cores;
+  const uint32_t tcols = groups_per_core * 4u;  // padded tile width, uniform
+  const uint32_t qb_pad =
+      (enc == DType::kQ8_0
+           ? (static_cast<uint32_t>((K / 32) * 34) + 15u) & ~15u
+           : (static_cast<uint32_t>(nb * 292) + 15u) & ~15u);
+  // m-tile: keep the per-core q8 residency inside the L1 budget.
+  const uint32_t mtile =
+      std::max(1u, std::min(8u, (160u << 10) / std::max(qb_pad, 1u)));
+  const uint32_t weight_row_bytes = static_cast<uint32_t>(
+      KeepQuantWordsPerBlock(enc) * 4 * nb);
+  const uint64_t l1_bytes = static_cast<uint64_t>(K) * 6 +
+                            static_cast<uint64_t>(mtile) * qb_pad +
+                            weight_row_bytes +
+                            static_cast<uint64_t>(mtile) * tcols * 4;
+  VT_CHECK(l1_bytes <= (768u << 10),
+           "tenstorrent kMatmulBTQuant int8-dot: shape needs " +
+               std::to_string(l1_bytes) +
+               " B of per-core L1, over the 768 KiB budget — refuse by name "
+               "rather than corrupt a neighboring buffer");
+  {
+    // Tripwire, not a fix: dev_out's width is padded to align4(N) above, so
+    // the page the group writes target is a 16-B multiple by construction.
+    // This fires if ttnn changes page sizing under us.
+    const uint32_t out_page =
+        dev_out.mesh_buffer().page_size();
+    VT_CHECK(out_page % 16u == 0u && out_page >= (tcols * 4u),
+             "tenstorrent kMatmulBTQuant int8-dot: out page " +
+                 std::to_string(out_page) +
+                 " B is not a 16-B multiple wide enough for a group tile row (" +
+                 std::to_string(tcols * 4u) +
+                 " B) — the group write would be misaligned or leave the page");
+  }
+
+  // Program identity: the encoding, activation dtype, M, K, N and grid —
+  // everything the compile args (buffer page sizes) and CB geometry derive
+  // from; the shape-spec identity the ttnn program cache hashes. Per-call
+  // variation (buffer addresses, the per-core shape/slice words) is runtime
+  // args, re-set on EVERY call below.
+  const uint32_t enc_sel = enc == DType::kQ4_K    ? 0
+                           : enc == DType::kQ5_K  ? 1
+                           : enc == DType::kQ6_K  ? 2
+                                                  : 3;
+  const uint32_t wpb = static_cast<uint32_t>(KeepQuantWordsPerBlock(enc));
+  const uint32_t act_f32 = a.dtype == DType::kF32 ? 1u : 0u;
+  const std::string workload_key =
+      std::to_string(static_cast<int>(enc)) + "x" + std::to_string(act_f32) +
+      "x" + std::to_string(M) + "x" + std::to_string(K) + "x" +
+      std::to_string(N) + "x" + std::to_string(grid.x) + "x" +
+      std::to_string(grid.y);
+
+  std::lock_guard<std::mutex> workload_guard(Int8DotWorkloadMutex());
+  auto& workload_cache = Int8DotWorkloadCache();
+  auto workload_it = workload_cache.find(workload_key);
+  const bool workload_miss = workload_it == workload_cache.end();
+  if (workload_miss) {
+    // A workload never enqueued eagerly cannot enter a trace: load_binaries
+    // fatals on an empty program_binary_status_ mid-capture
+    // (mesh_workload.cpp:148-153). Refuse by name — the warm-first contract
+    // the words shadow and the f32 staging already bind.
+    VT_CHECK(!tt_capture_active(),
+             "tenstorrent kMatmulBTQuant int8-dot: shape not warmed before "
+             "trace capture — run the shape eagerly once first (tt-metal "
+             "refuses new binaries mid-capture, mesh_workload.cpp:153)");
+    tt::tt_metal::Program program = tt::tt_metal::CreateProgram();
+
+    const auto align16 = [](uint32_t x) { return (x + 15u) & ~15u; };
+    // Widened f32 row (K*4 B) plus, for the bf16 arm, the raw u16 tail (K*2 B)
+    // the kernel reads before widening in place.
+    const uint32_t cb_f32_page = align16(static_cast<uint32_t>(K) * 4 +
+                                         static_cast<uint32_t>(K) * 2);
+    {
+      tt::tt_metal::CircularBufferConfig cfg(
+          cb_f32_page,
+          {{tt::CBIndex::c_0, tt::DataFormat::Float32}});
+      cfg.set_page_size(tt::CBIndex::c_0, cb_f32_page);
+      tt::tt_metal::CreateCircularBuffer(
+          program,
+          tt::tt_metal::CoreRange(tt::tt_metal::CoreCoord{0, 0},
+                                  tt::tt_metal::CoreCoord{grid.x - 1, grid.y - 1}),
+          cfg);
+    }
+    {
+      tt::tt_metal::CircularBufferConfig cfg(
+          mtile * qb_pad, {{tt::CBIndex::c_1, tt::DataFormat::Float32}});
+      cfg.set_page_size(tt::CBIndex::c_1, qb_pad);
+      tt::tt_metal::CreateCircularBuffer(
+          program,
+          tt::tt_metal::CoreRange(tt::tt_metal::CoreCoord{0, 0},
+                                  tt::tt_metal::CoreCoord{grid.x - 1, grid.y - 1}),
+          cfg);
+    }
+    {
+      const uint32_t page = align16(weight_row_bytes);
+      tt::tt_metal::CircularBufferConfig cfg(
+          page, {{tt::CBIndex::c_2, tt::DataFormat::Float32}});
+      cfg.set_page_size(tt::CBIndex::c_2, page);
+      tt::tt_metal::CreateCircularBuffer(
+          program,
+          tt::tt_metal::CoreRange(tt::tt_metal::CoreCoord{0, 0},
+                                  tt::tt_metal::CoreCoord{grid.x - 1, grid.y - 1}),
+          cfg);
+    }
+    {
+      const uint32_t page = tcols * 4u;  // already a 16-B multiple
+      tt::tt_metal::CircularBufferConfig cfg(
+          mtile * page, {{tt::CBIndex::c_3, tt::DataFormat::Float32}});
+      cfg.set_page_size(tt::CBIndex::c_3, page);
+      tt::tt_metal::CreateCircularBuffer(
+          program,
+          tt::tt_metal::CoreRange(tt::tt_metal::CoreCoord{0, 0},
+                                  tt::tt_metal::CoreCoord{grid.x - 1, grid.y - 1}),
+          cfg);
+    }
+
+    std::vector<uint32_t> compile_args;
+    tt::tt_metal::TensorAccessorArgs(words.mesh_buffer()).append_to(compile_args);
+    tt::tt_metal::TensorAccessorArgs(dev_a.mesh_buffer()).append_to(compile_args);
+    tt::tt_metal::TensorAccessorArgs(dev_out.mesh_buffer()).append_to(compile_args);
+
+    tt::tt_metal::KernelHandle kernel = tt::tt_metal::CreateKernelFromString(
+        program, kKeepQuantInt8DotKernelSrc,
+        tt::tt_metal::CoreRange(tt::tt_metal::CoreCoord{0, 0},
+                                tt::tt_metal::CoreCoord{grid.x - 1, grid.y - 1}),
+        tt::tt_metal::DataMovementConfig{
+            .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
+            .noc = tt::tt_metal::NOC::RISCV_0_default,
+            .noc_mode = tt::tt_metal::NOC_MODE::DM_DEDICATED_NOC,
+            .compile_args = compile_args,
+            .defines = {},
+            .named_compile_args = {},
+            .opt_level = tt::tt_metal::KernelBuildOptLevel::O2,
+            .compiler_include_paths = {KeepQuantKernelIncludeDir()}});
+    // The ONE legal initial common-args set (kernel.cpp:786: common runtime
+    // args can only be set once; later calls update them in place).
+    tt::tt_metal::SetCommonRuntimeArgs(
+        program, kernel,
+        {static_cast<uint32_t>(words.mesh_buffer().address()),
+         static_cast<uint32_t>(dev_a.mesh_buffer().address()),
+         static_cast<uint32_t>(dev_out.mesh_buffer().address())});
+
+    tt::tt_metal::distributed::MeshWorkload workload;
+    workload.add_program(
+        tt::tt_metal::distributed::MeshCoordinateRange(device.shape()),
+        std::move(program));
+    workload_it =
+        workload_cache
+            .emplace(workload_key,
+                     Int8DotWorkloadEntry{std::move(workload), kernel})
+            .first;
+  }
+
+  // The program lives INSIDE the persisted workload from here on — ttnn
+  // reaches its cached program the same way (workload.get_programs(),
+  // device_operation.hpp:184). Per-call runtime args on it (the ttnn
+  // override_runtime_arguments contract): the common args carry this call's
+  // buffer addresses; the per-core args the shape, encoding and column-slice
+  // words. Dispatch commands regenerate from these on every enqueue
+  // (mesh_workload.cpp:210), so a re-enqueued workload always runs this
+  // call's values.
+  tt::tt_metal::Program& program =
+      workload_it->second.workload.get_programs().begin()->second;
+  if (!workload_miss) {
+    // Update the common args IN PLACE on a reused program (kernel.cpp:786
+    // forbids a second set). The three words are this call's bank bases: the
+    // words shadow, the activation, the out page — the GetCommonRuntimeArgs
+    // pattern (ttnn unary_program_factory.cpp:647-652). A miss just set them
+    // with this call's addresses.
+    auto& common_args =
+        tt::tt_metal::GetCommonRuntimeArgs(program, workload_it->second.kernel);
+    common_args[0] = static_cast<uint32_t>(words.mesh_buffer().address());
+    common_args[1] = static_cast<uint32_t>(dev_a.mesh_buffer().address());
+    common_args[2] = static_cast<uint32_t>(dev_out.mesh_buffer().address());
+  }
+
+  std::vector<tt::tt_metal::CoreCoord> core_coords;
+  std::vector<std::vector<uint32_t>> per_core;
+  core_coords.reserve(grid_cores);
+  per_core.reserve(grid_cores);
+  for (uint32_t c = 0; c < grid_cores; ++c) {
+    const uint32_t r0 = c * tcols;
+    const uint32_t rc =
+        r0 >= static_cast<uint32_t>(N)
+            ? 0u
+            : std::min(tcols, static_cast<uint32_t>(N) - r0);
+    core_coords.push_back(tt::tt_metal::CoreCoord{c % grid.x, c / grid.x});
+    per_core.push_back({static_cast<uint32_t>(M), static_cast<uint32_t>(K),
+                        static_cast<uint32_t>(N), static_cast<uint32_t>(nb),
+                        wpb, act_f32, r0, rc, mtile, qb_pad, enc_sel, tcols});
+  }
+  tt::tt_metal::SetRuntimeArgs(program, workload_it->second.kernel,
+                               core_coords, per_core);
+  // A fresh runtime id before EVERY enqueue, hit or miss — what the ttnn
+  // dispatch does unconditionally (device_operation.hpp:181-186).
+  program.set_runtime_id(static_cast<uint64_t>(
+      ttnn::CoreIDs::instance().fetch_and_increment_device_operation_id()));
+
+  // Eager mode keeps the drain: the staging writes (from_vector words,
+  // to_layout activation) must be visible to the raw workload below, and
+  // that ordering contract is otherwise unproven. During capture the drain
+  // is skipped — finish() records a mesh event, which ttnn forbids
+  // mid-capture; the recorded ops carry the ordering (capture/replay tests
+  // and the vehicle's token-exact gates hold without it).
+  if (!tt_capture_active()) {
+    device.mesh_command_queue().finish();
+  }
+  tt::tt_metal::distributed::EnqueueMeshWorkload(device.mesh_command_queue(),
+                                                 workload_it->second.workload,
+                                                 /*blocking=*/false);
+
+  if (n4 != static_cast<uint32_t>(N)) {
+    // Drop the pad columns the pages carry — the commit volume must match
+    // the caller's [M, N] exactly.
+    dev_out = ttnn::slice(
+        dev_out, ttsl::SmallVector<uint32_t>{0u, 0u},
+        ttsl::SmallVector<uint32_t>{static_cast<uint32_t>(M),
+                                    static_cast<uint32_t>(N)},
+        ttsl::SmallVector<uint32_t>{1u, 1u});
+  }
+  // Commit form: TILE (the twin path's layout — a ROW_MAJOR commit leaves a
+  // slot the next consumer's tile view can overflow, the wave-3b lesson).
+  ttnn::Tensor committed =
+      ttnn::to_layout(std::move(dev_out), ttnn::Layout::TILE);
+  CommitDeviceLogical2D(out, std::move(committed), static_cast<uint32_t>(M),
                         static_cast<uint32_t>(N));
 }
 
@@ -7868,6 +8478,7 @@ void UnregisterHostBuffer(void* host) {
   DropPagedKvShadow(host);
   DropEmbedTableShadow(host);
   DropDecodedWeightShadow(host);
+  DropKeepQuantWordShadow(host);
 }
 
 void MarkHostWritten(void* host) {
@@ -7885,6 +8496,9 @@ void MarkHostWritten(void* host) {
   }
   // Weight tables may be rewritten in place during load — drop embed cache.
   DropEmbedTableShadow(host);
+  // ... and the PACKED word shadow: a weight re-staged in place must not keep
+  // serving the pre-rewrite words (same in-place-load hazard as the embed twin).
+  DropKeepQuantWordShadow(host);
 }
 
 void MarkScratchAcquired(void* host) {

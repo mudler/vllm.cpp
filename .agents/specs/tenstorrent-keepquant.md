@@ -424,11 +424,11 @@ to make a failure pass.
   literally true.
 - Block-decoding n-gram gather ([#2394](https://github.com/mudler/vllm.cpp/issues/2394)).
 - IQ-family / sub-IQ1_S encodings (unsloth fork formats).
-- The int8-dot lane's e2e gate wave and production routing
-  ([#3079](https://github.com/mudler/vllm.cpp/issues/3079)); the
-  llama.cpp-comparable throughput floor rides with it. The lever itself
-  landed op-level behind `VT_TT_KEEPQUANT_INT8DOT` (#3031, default
-  off).
+- The int8-dot lane's e2e gate wave and production routing — MOVED
+  INTO W4c SCOPE ([#3079](https://github.com/mudler/vllm.cpp/issues/3079)).
+  The lever itself landed op-level behind `VT_TT_KEEPQUANT_INT8DOT`
+  (#3031, default off); the llama.cpp-comparable throughput floor
+  remains [#1003](https://github.com/mudler/vllm.cpp/issues/1003)'s.
 - `docs/USAGE.md` vehicle pin when the arm first runs end to end (the W3
   capture leg hashes the local bytes); the 27B arm entry LANDED with
   wave-3b-2, provenance caveat included — the gate-completion half of that
@@ -577,6 +577,97 @@ Quantized-domain integer vec_dot behind the same seam; profile-first
 attribution; recorded-only throughput floor. Sequenced after W4a, never
 bundled.
 
+## W4c — the lane gate and production routing (#3079)
+
+- **Scope.** The int8-dot lane (#3031) is op-level exact and
+  capture-safe, but no committed gate adjudicates the lane end to end,
+  the env knob is classified kernel-internal, and the vehicle's
+  default-config reach is the op suite's opt-in only. This wave gives
+  the lane its own oracle pair, its committed e2e gate, the
+  user-facing configuration surface, and the recorded profile. The
+  default-config flip stays OUT of scope — a product decision recorded
+  as NEEDS_DECISION; the wave's deliverable is that the env-set
+  configuration is supported and gateable.
+- **The lane's denominator.** The ROCm-domain pair cannot adjudicate
+  the lane (W4b outcome: the ≤500-mnat band fails at (5,7) 1125 mnats
+  with determinism proven, and the flip is the quantized domain's
+  authentic behavior at a non-tie boundary). The lane implements the
+  pinned llama.cpp `b10451` integer `vec_dot` domain bit-exactly per
+  op, so its e2e denominator is llama.cpp itself: the registered
+  `llama-cpp` oracle (gateable = yes, `.agents/oracles/llama-cpp.md`),
+  same artifact, same 16 prompts, same greedy discipline. This is the
+  issue's named candidate. The alternative — widening the ROCm-domain
+  band to cover the measured drift — is rejected as exactly the silent
+  widening the issue forbids: a band that only legalizes the drift we
+  already saw adjudicates nothing.
+- **Mechanism.** (1) Oracle side: `llama-perplexity
+  --save-all-logits` at the pin dumps per-position logits for the 16
+  prompt texts; the gap script gains an oracle mode that reads the
+  dump and computes, for each of OUR prefix positions,
+  argmax − ours in mnats — the ROCm pair's exact methodology, a
+  different oracle. Teacher-force on OUR prefix (the capture's ids),
+  never on the oracle's own continuation. The pinned build needs the
+  root libs (`LD_LIBRARY_PATH=/tmp/llamacpp-b10451`; the `build/bin`
+  set alone fails on `common_prompt_batch_decode`). (2) Our side: the
+  documented dump path with `VT_TT_KEEPQUANT_INT8DOT=1`. The pair
+  lands under `tests/parity/goldens/qwen35_gguf_q4km_lanegate/` in the
+  established convention (`.npy` pairs + `p{i}_prompt.i32`), with the
+  recipe (tool, exact flags, thread pin, artifact sha256) in
+  `## Evidence`. Load fidelity is recorded for the vehicle artifact
+  the way the oracle file mandates for the 27B: tensors loaded,
+  tensors dropped (if any), MTP/`nextn` disposition. (3) Precision
+  guard: the dump's float formatting must survive log_softmax; if the
+  CSV precision is insufficient, fall back to a minimal reader against
+  `libllama` at the pin (`llama_get_logits_ith`) — recorded as an
+  unavoidable adaptation, never a silent one.
+- **The gate.** A new opt-in battery (`VT_TT_KEEPQUANT_INT8DOT=1`,
+  loud named skip on default) runs the vehicle's captured production
+  path over the 16 prompts and adjudicates against the lane pair: 0
+  forward-divergent cells, every flip inside the ratified band, dump
+  ×2 byte-identity across reset (the W4b determinism proof, committed
+  as a leg), trace demand reported per run. The band starts at the
+  row's ≤500 mnats. The pair's measured gap distribution is recorded
+  in the spec amendment that lands with the pair; a wider band is an
+  EXPLICIT amendment with the distribution beside it — never prose.
+  Stop-and-report if the distribution demands ≥2× the starting band
+  (≥1000 mnats): that magnitude says the lane diverges from its own
+  domain reference, which is a bug hunt, not a band.
+- **Red-first.** Before the pair exists, the battery reds by absence —
+  a loud skip naming the missing pair is not a pass. The committed
+  mutation leg: invert one adjudication assertion in a scratch copy
+  and red the battery on the W4b-known drift cell (5,7) — the gate
+  must detect by machine what the W4b analysis found by hand.
+- **Routing and docs.** `docs/ENVIRONMENT.md` gains the
+  `VT_TT_KEEPQUANT_INT8DOT` entry and the allowlist line moves out
+  (check-env-doc enforces the pairing). `docs/USAGE.md` gains the
+  lever section: the artifact pin (unchanged from the W3 arm entry),
+  the env configuration, the drift statement (lane vs the llama.cpp
+  pair band; lane vs the ROCm-domain oracle is NOT band-adjudicated
+  and says so), and the capture-demand numbers. The throughput floor
+  stays recorded-only: the vehicle decode A/B (lever on vs off, same
+  build, idle host, flock mutex) lands in `## Evidence` and a
+  `docs/benchmarks/` detail page; the llama.cpp-comparable floor
+  itself remains [#1003](https://github.com/mudler/vllm.cpp/issues/1003)'s
+  owed measurement.
+- **Risks.** (1) The dump's CSV precision loses ulps that matter at
+  band-edge cells — the precision guard and the fallback reader cover
+  it. (2) `llama-perplexity` may run the GDN hybrid's graph
+  differently than `llama-completion` did — the load-fidelity record
+  plus one greedy cross-check (completion vs perplexity, prompt p0)
+  catch it before the pair is built. (3) The band does not fit 500 —
+  the explicit-amendment rule above; ≥1000 mnats stops the wave.
+  (4) The 0.8B artifact drops tensors in llama.cpp — recorded; a
+  dropped tensor that changes the graph disqualifies the pair and
+  reopens the denominator choice (NEEDS_DECISION).
+- **Gates and stop conditions.** Preflight; default op suite unchanged
+  (lane tests skipping loudly); default vehicle battery unchanged (W4a
+  16/16 — the invariant); the new lane battery green opt-in; dump ×2
+  identity; check-env-doc pairing. Stop: any default-path regression;
+  a band amendment without its distribution; a lane flip outside the
+  band treated as pass; the oracle pin moving.
+- **PR shape.** One PR, spec and implementation (row claim answer
+  2026-09-05, recorded; the spec commits first inside it).
+
 ## Now
 
 `ACTIVE`, 2026-09-06. W1 complete (#2989, open). W2 complete on the row
@@ -663,5 +754,10 @@ matched), scoped re-review of the repair PASS with no findings; the
 CI failures on the PR (windows api_server explicit-cpu/embeddings
 0xC0000409, TSan gemma4 fp8 arm guard, UBSan misaligned loads in the
 AVX cpu matmul) are inherited from `main`'s red and touch no path in
-the diff. The worktree and branch are retired. Next: #3079 (the lane's
-e2e gate wave + production routing + the user-facing env doc).
+the diff. The worktree and branch are retired. AMENDED 2026-09-09
+(eleventh): records reconciled on `main` (#3114), and W4c opens under
+`## W4c` — the lane gate and production routing (#3079): the
+llama.cpp-domain oracle pair per the registered-oracle rule, the
+committed opt-in lane battery with dump ×2 identity, the user-facing
+env doc, the recorded vehicle decode A/B; the default-config flip
+stays a NEEDS_DECISION.

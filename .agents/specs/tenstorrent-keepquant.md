@@ -652,6 +652,16 @@ dispatch gate, default OFF, committed goldens untouched, default stays
 W4a (vehicle 16/16 PASS, demand 444,973,056 B, +0.12% — flat).
 Microbench recorded-only: per-call ratios 0.04-0.44 over 16 shapes. The
 lane's e2e gate wave and production routing are owed under
-[#3079](https://github.com/mudler/vllm.cpp/issues/3079). Next: the
-single commit (#3031 + #3079), the checks, push to the fork, fresh
-review, PR.
+[#3079](https://github.com/mudler/vllm.cpp/issues/3079). AMENDED
+2026-09-09 (tenth): W4b MERGED — PR #3087 rebased onto `main` as
+`d9298c85c` (the lever, op-level behind `VT_TT_KEEPQUANT_INT8DOT`) plus
+`96c5e4719` (the full-review repair: the device sweep pins the full
+registered set {Q4_K, Q5_K, Q6_K, Q8_0} with red-first re-proof, the
+comment pins corrected, the matrix cell reconciled). The review cycle:
+full fresh review PASS (four mutations red, full gate green, numbers
+matched), scoped re-review of the repair PASS with no findings; the
+CI failures on the PR (windows api_server explicit-cpu/embeddings
+0xC0000409, TSan gemma4 fp8 arm guard, UBSan misaligned loads in the
+AVX cpu matmul) are inherited from `main`'s red and touch no path in
+the diff. The worktree and branch are retired. Next: #3079 (the lane's
+e2e gate wave + production routing + the user-facing env doc).

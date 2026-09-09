@@ -202,9 +202,10 @@ supported width to 576. The run reported 5 cases and 136 assertions with no
 failures and no portable-fallback line. Unsupported shapes returned their named
 refusal.
 
-This is not a model gate and not a speed result. No token-exact comparison
-against vLLM has run through this arm, and the device run recorded neither
-controlled clocks nor contention. It proves only the shapes that were run.
+This component run validates the seven tested shapes against the CPU reference.
+It recorded neither controlled clocks nor contention, so it establishes no speed result.
+The separate [model token gate](#the-token-gate-against-vllm) ran on 23 August 2026,
+with six token-identical prompts and one adjudicated near-tie.
 [#1437](https://github.com/mudler/vllm.cpp/issues/1437) records both runs,
 milestone M5 of [#1189](https://github.com/mudler/vllm.cpp/issues/1189) owns the
 kernel, and [#1166](https://github.com/mudler/vllm.cpp/issues/1166) is the

@@ -36,3 +36,23 @@ gate dependency explicitly. No merge into upstream is authorized.
 ## Owed
 
 - ISSUE-LOCAL-01M221WAVSK2STJ49Y3WTDSDS3: correct the three public surfaces above.
+
+## Review handoff
+
+The editorial changes are implemented on the task branch. The canonical issue
+stays open until upstream integration. No feature state or measured number
+changes. Resume by reviewing the three public-file changes against these anchors:
+
+- `.agents/specs/gate-qwen38-27b-fp8-block.md:539`: model token gate.
+- `.agents/specs/vt-matmul-fp8-block-cuda.md:638`: CUDA component evidence.
+- `tests/vt/test_ops_matmul_fp8_block_cuda.cpp:9`: component test scope.
+- `src/vllm/model_executor/models/qwen3_5.cpp:2652`: block-FP8 dispatch.
+- `docs/benchmarks/qwen38-27b-exl3-variadic-gb10.md:13`: comparison limits.
+
+CPU-only validation uses the existing `check-readme-structure.py`,
+`check-benchmark-index.py`, `check-site.py`, and `check-agent-record.py` scripts.
+All four pass. The existing README and benchmark-index mutation suites pass.
+Full preflight was attempted, but its initial run lacked Python validation
+packages and native tool dependencies. Release packaging subprocess tests also
+failed with the temporary Python runtime's shared-library lookup. Those results
+are not a full-preflight pass. The focused editorial checks require no GPU.

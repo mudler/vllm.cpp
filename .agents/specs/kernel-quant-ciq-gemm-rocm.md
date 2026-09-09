@@ -151,6 +151,127 @@ accumulation, following the same shape as the existing scalar path
 because the risk below is that no library path carries the per-superblock
 scale layout through the tile op.
 
+## Design: cooperative activation share (issue #3034)
+
+A follow-on wave, after the wider-block A/B (#3032/#3033, measured and
+rejected, geomean -4.3%) and reading llama.cpp's actual `mul_mat_q` source
+(confirmed, not inferred: `ggml-cuda/mmq.cuh`, `mmq-config-rdna4.cuh`,
+`mmq-load-tiles.cuh`) to find out why widening alone did not help.
+
+**The precise redundancy, traced through this kernel's own index math.**
+`tile = blockIdx.x * WarpsPerBlock + threadIdx.y`, `it = tile / n_tiles`,
+`jt = tile % n_tiles`. Because `n_tiles` (weight-row tile count, e.g. 192 at
+N=3072) is always far larger than `WarpsPerBlock`, every warp in one block
+shares the SAME `it` (activation rows) and gets a DIFFERENT, consecutive
+`jt` (weight rows). So within one block, every warp already reads the
+identical 16 activation rows — and does so independently, via its own
+`load_matrix_sync` call straight to global memory, every superblock. The
+rejected wide-block experiment widened this same redundancy (more warps
+sharing one `it`) without adding any sharing to fix it, which is exactly
+why it did not help: it made the redundant pattern wider, not cheaper.
+
+**The design**, scoped deliberately smaller than matching llama.cpp's full
+128x128 cooperative tile (that would also share the WEIGHT tile across a
+wider `jt` range per warp, which our current per-warp weight assignment
+does not need — weight rows are already disjoint across warps in one
+block, so there is no analogous weight-side redundancy to remove):
+
+1. Reuse `kQuantWmmaWideWarpsPerBlock == 8` (already in the tree from
+   #3033, currently unused/rejected on its own). At 8 warps, one block
+   already spans a 128 weight-row range, matching llama.cpp's `I=128` on
+   that one axis, for free.
+2. Add cooperative activation staging: once per superblock, before any
+   warp's WMMA calls for that superblock, ALL 8 warps' threads together
+   copy the shared `it`'s `BlockQ8_K` bytes (`qs`, `bsums`, `d`) for this
+   one superblock into ONE shared buffer, `__syncthreads()`, then every
+   warp's `load_matrix_sync` (and the Q4_K min-correction's `bsums` read)
+   reads from that shared copy instead of calling global memory
+   independently 8 times.
+3. LDS budget check: the existing 8-warp arm already uses ~50 KiB
+   (`w_stage` 32 KiB + `row_scales`/`row_mins` 2 KiB + `raw_tile` 16 KiB
+   for Q4_K, the larger of the two formats). One superblock's worth of
+   shared `BlockQ8_K` bytes for 16 rows is `qs` (256 B) + `bsums` (32 B) +
+   `d` (4 B) per row x 16 rows ~= 4.7 KiB. Total ~55 KiB, under the 64 KiB
+   limit — no redesign of the existing weight-side staging is needed to
+   fit this.
+
+**What this measurement isolates.** If this wins, sharing was the lever
+the wider-block-alone experiment could not reach, and it is worth checking
+whether widening `J` (the activation range one warp loops over, still 16
+today) compounds it further. If it does not win, the redundant reads were
+likely already served by cache rather than costing real bandwidth, and the
+remaining gap points somewhere else — raw WMMA instruction throughput or
+shared-memory bank-conflict patterns, not data reuse. Either result is
+recorded, not assumed.
+
+## Cooperative test toggle repair (#3063)
+
+Issue [#3063](https://github.com/mudler/vllm.cpp/issues/3063) owns this
+test-harness repair in PR #3036. The row remains `ACTIVE`. Issue #3034
+continues to own the narrower K-chunk redesign under `## Owed`.
+
+At `d295f00cb`, both cooperative test cases treat `BIGTILE` and `SHARE_ACT`
+as enabled whenever their environment variables exist. Production requires
+the exact value `1`. The tests also omit the master `WMMA` switch.
+Thus `WIDE=1 SHARE_ACT=1 BIGTILE=0` dispatches Shared but checks BigTile.
+`WMMA=0` prevents WMMA dispatch but still reaches the tests' counter checks.
+
+### Scope and anchors
+
+Correct only the environment guards in the Q4_K and Q6_K cooperative cases
+in `tests/vt/test_backend_cross_device.cpp`. Preserve all numerical and
+dispatch-counter assertions, shape prerequisites, and production kernels.
+
+The executing source at `d295f00cb` defines the contract:
+`src/vt/rocm/rocm_grouped_gemm.hip::QuantWmmaEnabled` disables only exact
+`0`. `QuantWmmaWideBlockEnabled`, `QuantWmmaShareActEnabled`, and
+`QuantWmmaBigTileEnabled` enable only exact `1`. BigTile takes precedence
+over Shared when both are enabled. These are local diagnostic switches,
+so no vLLM counterpart or numerical tolerance changes in this repair.
+
+### Regression and gates
+
+Add a CPU regression that compiles and executes each test's actual guard
+source. Cover unset, empty, zero, one, longer values, switch precedence,
+and the master switch. The regression must fail against the existing
+guards before the repair. Register it in preflight and CI.
+
+Run `python3 tests/scripts/test_rocm_cooperative_toggles.py` and the full
+`scripts/agent-preflight.sh`. In a scratch copy, restore presence checks
+and remove the master-switch guard separately. Both mutations must fail
+the CPU regression. Restore the scratch source byte-for-byte.
+
+GPU validation remains `PENDING` until a leased gfx1200 or gfx1201 device
+is available. On that device, run `test_backend_cross_device` with
+`--test-case="*cooperative-tile*"` in fresh processes for the defaults,
+`WIDE=1 SHARE_ACT=1`, `WIDE=1 BIGTILE=1`, both arms enabled,
+`WIDE=1 SHARE_ACT=1 BIGTILE=0`, both arms zero, and master `WMMA=0`.
+Use the full `VT_ROCM_QUANT_WMMA` prefix for these environment variables.
+The full `ctest -R 'rocm|cross_device' --output-on-failure` remains the
+device gate. CPU guard execution does not prove GPU dispatch or numerics.
+
+### Repair evidence
+
+The host regression on unchanged `d295f00cb` failed 24 assertions across
+58 scenarios. The repaired guards pass all 58 scenarios. Exact zero now
+disables the experimental switches, and the master switch suppresses both
+arms. Empty and longer strings follow their respective production rules.
+
+Six scratch mutations restore presence checks for each experimental switch
+or ignore the master switch, separately in Q4_K and Q6_K. Each mutation
+fails the host regression. Every mutated source is restored byte-for-byte.
+Production kernels, device shapes, numerical tolerances, and counter checks
+remain unchanged. GPU validation and fresh implementation review remain
+`PENDING`.
+
+### Integration and stop conditions
+
+Commit this amendment before the repair, then carry both commits in
+PR #3036. The landing body closes #3063 and retains #3034's owed work.
+Fresh review and an independent operator gate precede integration.
+Stop if the repair requires changing production dispatch, tolerances, or
+hardware policy. Report unavailable device evidence as `PENDING`.
+
 ## Port map
 
 | Upstream | Local |
@@ -258,6 +379,55 @@ scale layout through the tile op.
   this row gates against (`Q4_K_M`) never invokes Q5_K at all — it is a
   `Q5_K_M`/`Q5_K_S`-only format — so porting it would not move this row's own
   gate (c) measurement, only a differently-quantized checkpoint's.
+- Cross-warp data reuse in the WMMA kernel body (issue #3032). **CONFIRMED
+  by reading the actual source**, not inferred: llama.cpp's Q4_K config at
+  this row's shapes (`ggml/src/ggml-cuda/mmq-config-rdna4.cuh:127`,
+  `GGML_TYPE_Q4_K, 256, ..., 128, 128, ...`) gives ONE BLOCK an I=128 (weight
+  rows) x J=128 (activation columns) output tile — 8-64x the area our
+  4-8-warp block covers, since each of OUR warps independently owns only a
+  16x16 tile. That whole I x J tile is loaded ONCE per block, not once per
+  warp: `ggml_cuda_mmq_load_tiles_q4_K`
+  (`ggml/src/ggml-cuda/mmq-load-tiles.cuh:703-741`) stripes the I=128 rows
+  across every warp's threads (`i0 += nrows*nwarps`, each warp taking a
+  DIFFERENT row range), dequantizing each row exactly once into one shared
+  `x_tile`; `mmq_get_nbytes_shared` (`mmq.cuh:1379-1383`) sizes the
+  activation-tile allocation by `J` alone, not `J*nwarps`, confirming one
+  shared activation copy too. The compute phase
+  (`ggml_cuda_mmq_write_back_mma`, `mmq.cuh:476-500`) then splits the I
+  dimension across warps (`rows_per_warp = I/nwarps`), each warp looping the
+  FULL J range doing 16x16 MMA ops against that one shared load. This
+  kernel's per-warp-independent design (own `w_stage`/`raw_tile` slice, own
+  `load_matrix_sync` call, zero sharing even when two warps in one block
+  share the same M-tile) is the actual mechanism gap the wider-block
+  experiment above could not touch, because widening never introduced
+  sharing — it only added more independent warps to the same per-warp-load
+  pattern. Matching this (cooperative tile load + row-split compute over a
+  much larger shared tile) is a real kernel redesign, materially bigger than
+  the block-width experiment, and is the next traceable step — not attempted
+  in this row.
+
+  **UPDATE: partially done.** `KQuantGemmKWmmaQ6KBigTile`/`Q4KBigTile`
+  (below) implement exactly this at `ItGroup=3` (48 rows) instead of
+  llama.cpp's 128. The first cut measured +16.8% geomean / -14.0%
+  real-model; those figures are superseded. The current, re-measured
+  numbers are **+16.0%** over the six non-tail shapes, **+17.2%** over all
+  eight, **-12.5%** real-model prefill, and 8.89x -> 7.12x against
+  llama.cpp's `mul_mat_q` — see "The performance numbers below were
+  RE-MEASURED on 2026-09-07" and the "Review cycle on #3036" section for
+  what is verified, which is not what the first cut claimed.
+  The scope was deliberately narrower than
+  full parity: this row's kernels still stage one full 256-wide
+  superblock at a time for BOTH operands, where llama.cpp stages 32
+  (weight) and 128 (activation) K-elements at a time (confirmed by
+  reading `ggml_cuda_mmq_get_nbytes_shared_x`, `mmq.cuh:415-419`, and
+  `ggml_cuda_mmq_get_sram_stride`, `mmq.cuh:132-153` — not a smaller
+  encoding, nearly identical bytes/element, just a narrower chunk staged
+  more often). Finer K-chunking on our side — the next traceable step —
+  would shrink both operands' per-load footprint and could afford a much
+  wider `ItGroup` (closer to llama.cpp's 8) within the same 64 KiB
+  budget, at the cost of more frequent, smaller syncs; this is a bigger
+  change than BigTile was (it touches the weight-side staging every wave
+  of this row has left untouched) and is not attempted here.
 
 ## Stop conditions
 
@@ -549,3 +719,562 @@ W1.5 tail-fill landing, both fixed in the same follow-up commit:
    than a single cherry-picked run. Q8_0 (a different, unrelated launch
    path that carries no tail-fill mechanism) was measured alongside as a
    control and is flat before/after (~2065-2083 GFLOP/s), as expected.
+
+**Wider WMMA block (issue #3032): MEASURED AND REJECTED.** A same-tool
+`rocprofv3` trace of `KQuantGemmKWmmaQ4K`/`Q6K` against llama.cpp's own
+`mul_mat_q` on the identical model/prompt found this kernel 4.9x (Q6_K) to
+10.6x (Q4_K) slower per-kernel, and llama.cpp's launch configuration uses
+double the warps per block (256 vs 128 threads) and 16-48x fewer blocks per
+launch yet finishes 15-45x faster. The obvious hypothesis — that packing
+more of this kernel's already-independent warps into fewer, bigger blocks
+would close some of that gap — does not hold: each warp here owns a fully
+independent output tile with its own shared-memory slice, so widening only
+changes how many independent warps share one launch's LDS budget, not how
+much work any one warp does.
+
+Templated `KQuantGemmKWmmaQ6K`/`KQuantGemmKWmmaQ4K` on `WarpsPerBlock` and
+added an 8-warp instantiation behind `VT_ROCM_QUANT_WMMA_WIDE=1` (default
+off). Hardware-verified correct (`ctest -R rocm|cross_device`, both configs,
+46/46 cases, 84066/84066 assertions, zero regression). Op-level A/B
+(`examples/quant-gemm-bench`, RX 9060 XT, best-of-4, idle host), 4-warp
+(current default) vs 8-warp, all six Q4_K/Q6_K prefill shapes:
+
+| Shape | 4-warp (current) | 8-warp | ratio |
+|---|---:|---:|---:|
+| Q4_K N=3072 K=2048 | 1948.5 GFLOP/s | 1827.9 GFLOP/s | -6.2% |
+| Q4_K N=12288 K=2048 | 2242.7 GFLOP/s | 2027.9 GFLOP/s | -9.6% |
+| Q4_K N=2048 K=6144 | 1941.3 GFLOP/s | 1966.1 GFLOP/s | +1.3% |
+| Q6_K N=3072 K=2048 | 1874.0 GFLOP/s | 1775.9 GFLOP/s | -5.2% |
+| Q6_K N=12288 K=2048 | 2159.1 GFLOP/s | 1981.4 GFLOP/s | -8.2% |
+| Q6_K N=2048 K=6144 | 1885.0 GFLOP/s | 1933.5 GFLOP/s | +2.6% |
+
+Geomean -4.3%: a net regression, not a win. `VT_ROCM_QUANT_WMMA_WIDE` stays
+in the tree default-off, the same posture `VT_ROCM_Q6K_SMALL_PRIVATE` above
+ships with, as a ready-made A/B for re-checking this specific axis on
+different hardware (gfx1201) or a future toolchain revision rather than
+re-deriving it from scratch — not carried forward as an open question. The
+sharper, still-open hypothesis this measurement points at — cross-warp data
+reuse llama.cpp's kernel may have that this one's per-warp-independent
+design does not — is recorded in `## Owed` above, unread and unconfirmed,
+not assumed.
+
+**Cooperative activation share (issue #3034): MEASURED AND REJECTED, and
+worse than the wider-block-alone result above.** Implemented
+`KQuantGemmKWmmaQ6KShared`/`KQuantGemmKWmmaQ4KShared` per the `## Design:
+cooperative activation share` section: the 8-warp block cooperatively
+stages the shared `it`'s 16-row `BlockQ8_K` bytes into shared memory once
+per superblock, gated on `n_tiles % 8 == 0` (falls back to the plain
+per-warp kernel otherwise) behind `VT_ROCM_QUANT_WMMA_SHARE_ACT=1`
+(default off). Hardware-verified correct: `ctest -R rocm|cross_device`,
+46/46 cases, 84066/84066 assertions, zero regression, both configs.
+
+Two copy implementations were tried, in order, because the first one's
+result was ambiguous enough to check rather than trust:
+
+1. A byte-at-a-time copy computing `row = byte / sizeof(BlockQ8_K)` per
+   byte. Best-of-4 geomean across the six shapes: -18.7% vs the plain
+   8-warp arm.
+2. Suspecting the per-byte division, rewrote as an outer loop over the 16
+   rows (unrolled) with an inner word-sized (`int`, `sizeof(BlockQ8_K)` is
+   exactly 73 words) copy, division-free. Barely moved: -10.9% vs the
+   plain 8-warp arm, because the real cost of that version was ~73-of-256
+   threads active per row-step, not the division it removed.
+3. Rewrote again as ONE flat loop over all 1168 words (16 rows'
+   worth), keeping every thread active every iteration: still `idx /
+   kWordsPerRow` and `idx % kWordsPerRow`, but by the compile-time
+   constant 73, which the compiler lowers to a multiply-shift rather than
+   a genuine divide.
+
+Op-level A/B (`examples/quant-gemm-bench`, RX 9060 XT, best-of-4, idle
+host), version 3 (the fully-parallel, division-by-constant copy) against
+both prior arms:
+
+| Shape | 4-warp default | 8-warp, no share (#3033) | 8-warp + share |
+|---|---:|---:|---:|
+| Q4_K N=3072 K=2048 | 1964.7 | 1830.4 | 1620.4 |
+| Q4_K N=12288 K=2048 | 2247.0 | 2015.4 | 1772.8 |
+| Q4_K N=2048 K=6144 | 1949.9 | 1953.9 | 1726.3 |
+| Q6_K N=3072 K=2048 | 1883.1 | 1769.0 | 1564.8 |
+| Q6_K N=12288 K=2048 | 2174.1 | 1973.3 | 1757.0 |
+| Q6_K N=2048 K=6144 | 1876.8 | 1930.1 | 1704.4 |
+
+Geomean: -16.0% vs the 4-warp default, **-11.5% vs the already-rejected
+8-warp-no-share arm** — sharing did not just fail to help, it cost more
+than the 8-warp width regression by itself. The result held essentially
+unchanged (within noise) across all three copy implementations once the
+worst inefficiency was fixed, which is itself evidence: this is not a
+copy-implementation artifact, it is the cost of the cooperative-staging
+mechanism itself (the extra shared-memory round trip and its
+`__syncthreads()`, once per superblock, `nsb` times per kernel call)
+outweighing whatever redundant-global-read cost it removes.
+
+**What this settles and what it does not.** The confirmed redundancy
+(every warp in a block independently re-reading the same activation rows)
+is real and traced precisely in `## Owed` above — but removing it this
+way costs more than it saves, which is itself evidence that those
+redundant reads were likely already well-served by cache (this card's
+Infinity Cache) rather than costing real DRAM bandwidth. Two of the three
+axes this row has now measured (block width, activation sharing) are
+closed as net negatives. `VT_ROCM_QUANT_WMMA_SHARE_ACT` stays in the tree,
+default off, for the same reason `VT_ROCM_QUANT_WMMA_WIDE` does: a
+ready-made, already-correct A/B for different hardware or a future
+toolchain, not an open question to re-litigate here. The remaining
+untested hypothesis is llama.cpp's own per-kernel efficiency at the
+instruction/ISA level (WMMA throughput, register allocation, shared-memory
+bank-conflict patterns in its actual generated code) rather than tiling or
+data reuse — not confirmed, not assumed, the next traceable step if this
+row continues.
+
+**Test-coverage gap found and fixed.** Both this row's existing WMMA
+correctness tests ("keep-quant Q6_K/Q4_K WMMA tile arm...") use N=48
+(`n_tiles=3`), which never satisfies `n_tiles % WarpsPerBlock(8) == 0` --
+the precondition Shared (and BigTile, below) both require. Every "green"
+result reported for Shared above was real (the assertions did pass), but
+the kernel under test was silently the plain fallback, not Shared itself,
+because the existing tests structurally never reach it. Added
+per-variant dispatch counters (`g_kq_wmma_share_dispatches`/
+`_share_q4k_`/`_bigtile_`/`_bigtile_q4k_`, distinct from the generic ones
+the old tests use, which cannot tell variants apart) and two new test
+cases at N=128/M=80 (n_tiles=8 satisfies the precondition; m_tiles=5 is
+deliberately not a multiple of ItGroup=3, exercising BigTile's ragged
+last-block skip) that prove the SPECIFIC kernel launched via
+`CHECK(after > before)` on its own counter, not inferred from shapes.
+Re-ran Shared under this real test: still correct (NMSE clean), so its
+rejection above stands on genuine evidence, just not the evidence
+originally cited for it.
+
+**ISA-level check (the ratified next step above): CONFIRMED to rule out
+register allocation, not to explain the gap.** Read the actual compiled
+GCN assembly on both sides (`-save-temps` for ours; llama.cpp's own
+`.so` unbundled per-`ggml_type` via `clang-offload-bundler` and read
+through `llvm-readobj --notes` for the AMDGPU kernel metadata) rather
+than inferring from source:
+
+| Kernel | VGPRs | Spill |
+|---|---:|---|
+| Ours `KQuantGemmKWmmaQ4K` (shipping default) | 192 | 60 B, one-time setup/epilogue only (traced: outside the per-superblock loop, not a recurring cost) |
+| Ours `KQuantGemmKWmmaQ6K` (shipping default) | 142 | none |
+| llama.cpp `mul_mat_q<Q4_K, I=128, J=128>` | 247 | none |
+| llama.cpp `mul_mat_q<Q6_K, I=128, J=128>` | 202 | none |
+
+llama.cpp uses MORE registers than us in both formats and still wins by a
+wide margin -- ruling out "fewer registers, more occupancy" as their
+advantage. Our one real spill is confirmed cosmetic (one-time, not
+per-iteration). This corroborates the structural (tile-size/reuse) story
+rather than pointing at a codegen defect on either side.
+
+**BigTile (second cut, issue #3034): MEASURED AND ACCEPTED.** Reading
+llama.cpp's actual shared-memory formula
+(`ggml_cuda_mmq_get_nbytes_shared_x`, `mmq.cuh:415-419`) resolved why its
+128x128 tile fits this card's 64 KiB LDS budget when a naive scale-up of
+our own approach does not (86.5 KiB, see the Shared section above): it is
+NOT a smaller encoding -- their `block_q8_1_mmq` (144 B / 128 K-elements
+~= 1.125 B/element) and our `BlockQ8_K` (292 B / 256 K-elements ~= 1.14
+B/element) have essentially identical density. The difference is
+granularity: their weight tile stages only `MMQ_TILE_NE_K=32`
+K-elements/row at a time (`mmq.cuh:132-136`) and their activation tile
+stages only 128 K-elements/row at a time, against our 256-wide
+superblock-at-once staging for both operands -- computed exactly for
+I=128/J=128/Q4_K: `nbs_x` (38.9 KiB) + `nbs_y` (18.0 KiB, padded) +
+`nbs_ids` (0.5 KiB) = 56.5 KiB, comfortably under budget with 7.5 KiB to
+spare. They pay the staging/sync cost up to 8x more often per unit of K
+depth than we do, in exchange for a peak footprint small enough to afford
+a much wider tile.
+
+Implemented `KQuantGemmKWmmaQ6KBigTile`/`Q4KBigTile<OutT, WarpsPerBlock,
+ItGroup>`, keeping this row's existing 256-wide superblock staging
+granularity (unlike llama.cpp, not chunked finer -- see `## Owed`) and
+choosing the largest `ItGroup` (activation-row groups reused per staged
+load) that still fits: `ItGroup=3` (48 rows, ~14 KiB) alongside the
+existing ~50 KiB per-warp weight-side footprint at 8 warps. Grid is 2D
+(`blockIdx.x` gives each warp a fixed `jt`, matching the existing design;
+`blockIdx.y` gives the whole block a shared `it_base` spanning `ItGroup`
+groups, looped inside each warp) rather than the previous flat 1D `tile`
+encoding. The 2D grid removes the `n_tiles % WarpsPerBlock == 0`
+precondition on the `it`/M direction (raggedness there is handled by a
+round-UP `grid_y` and a block-uniform `continue` inside the kernel) and
+keeps it on the `jt`/N direction.
+
+**Why that N-direction precondition is needed -- corrected 2026-09-07,
+because this paragraph previously named a mechanism the code does not
+have.** It is NOT an out-of-range-`jt` guard: `grid_x = n_tiles / wpb` is
+floor division, so no warp in a launched block can reach a `jt` past
+`n_tiles`, the kernel's own `if (jt >= n_tiles) return` is dead under this
+dispatch, and nothing desyncs. Removing the clause fails in two other ways,
+both mutation-measured on this box rather than argued:
+
+1. **Silently unwritten output columns**, the dominant mode, for ANY
+   `n_tiles % wpb != 0`. Floor division drops the remainder tiles; the
+   launch succeeds and output column tiles `[grid_x*wpb, n_tiles)` are
+   never written by anything. The M/N tail fill does not cover them either,
+   because it is keyed on `n_aligned < n` and here `n_aligned == n`. At
+   n_tiles=9 (N=144, M=80) the call returns clean and the test then reads
+   uninitialised device memory -- NMSE 0.111875, 0.137199 and 3.16e+68
+   within one run here, `nan` on the reviewer's box, so the mode has no
+   fixed signature, only a wrong answer.
+2. **Zero-sized grid**, the narrow-N special case of (1) where the
+   remainder is everything. At `n_tiles < wpb` (n_tiles=3, wpb=8 -- the
+   pre-existing N=48 WMMA test) `grid_x == 0` and HIP rejects the launch
+   with "invalid configuration argument", an uncaught exception rather than
+   a wrong number. Measured at N=48.
+
+Weight dequant (and, for Q4_K, `UnpackQ4KScalesMins`) now execute ONCE
+per superblock per warp and serve all `ItGroup` iterations, not just
+one -- weight-side reuse Shared did not have either.
+
+Correctness as first reported: `ctest -R rocm|cross_device`, 48/48 cases,
+84084/84084 assertions, zero regression, both configs. **That claim was
+true of the assertions and false of the kernel.** Two review passes have
+since found real defects behind it -- an out-of-range device read and a
+cross-warp race -- neither of which any of those assertions could see. The
+"Review cycle" section below is the current statement of what is verified;
+read it rather than this paragraph.
+
+**The performance numbers below were RE-MEASURED on 2026-09-07**, after
+the second review's barrier repair (see "Review cycle") put one more
+block-wide `__syncthreads()` in BigTile's per-superblock loop. That is the
+same cost class that sank the `Shared` arm at -16%, so the earlier
+measurement no longer described the code and was retaken rather than
+carried over. The first-cut figures are kept beside each new one, because
+the DIFFERENCE between them is the barrier's price and is the only
+measurement of it this row has.
+
+Op-level A/B (`examples/quant-gemm-bench`, RX 9060 XT, best-of-4, idle
+host, `llama-server.service` inactive), BigTile vs the shipping 4-warp
+default and vs the rejected 8-warp arm:
+
+| Shape | Default | 8-warp | BigTile | BT/def | first cut |
+|---|---:|---:|---:|---:|---:|
+| Q4_K N=3072 K=2048 M=128 | 1957.0 | 1796.0 | 2013.2 | +2.9% | +1.6% |
+| Q4_K N=12288 K=2048 M=128 | 2246.5 | 2019.3 | 2761.8 | +22.9% | +23.1% |
+| Q4_K N=2048 K=6144 M=128 | 1955.8 | 1961.7 | 2394.7 | +22.4% | +21.9% |
+| Q6_K N=3072 K=2048 M=128 | 1873.7 | 1787.2 | 2008.5 | +7.2% | +14.6% |
+| Q6_K N=12288 K=2048 M=128 | 2161.5 | 1976.2 | 2791.1 | +29.1% | +27.6% |
+| Q6_K N=2048 K=6144 M=128 | 1880.0 | 1930.3 | 2135.4 | +13.6% | +13.5% |
+| Q4_K N=12288 K=2048 **M=132 (tail)** | 2195.1 | 1980.8 | 2668.1 | +21.5% | +19.1% |
+| Q6_K N=12288 K=2048 **M=132 (tail)** | 1680.9 | 1565.9 | 2019.3 | +20.1% | +19.9% |
+
+Geomean over the same six non-tail shapes the first cut used: **+16.0%**,
+against the first cut's +16.8%. Over all eight including the two ragged
+non-16-aligned tail shapes: **+17.2%**. Against the rejected 8-warp arm:
++24.3% over all eight and +21.9% over the same six -- this line quoted
+the eight-shape figure without saying so until pass 4 asked which geomean
+it was. The ragged tail shapes did not merely hold, they came in slightly
+ahead of the aligned ones, so this is still not an artifact of
+perfectly-aligned synthetic shapes. `q8_0`, an unrelated launch path
+carried through the same runs as a control, is flat (+0.3% to +2.5%).
+
+**Real-model confirmation**, same isolated-prefill recipe as gate (c)
+above (`Ornith-1.5-9B-Q4_K_M.gguf`, the same pinned 512-token prompt at
+`prompt_tokens=512`, `rocprofv3 --kernel-trace --stats`, isravale, idle,
+3 reps, per-rep figures):
+
+| | Default (4-warp) | BigTile | ratio | first cut |
+|---|---:|---:|---:|---:|
+| Prefill total kernel time (whole forward pass) | 3007.2 ms | 2630.3 ms | -12.5% | -14.0% |
+| ...vs oracle pp512 (277.9 ms) | 10.82x slower | 9.46x slower | | |
+| Quant-GEMM kernels only (Q4_K+Q6_K) | 1977.0 ms | 1583.5 ms | -19.9% | -21.7% |
+| ...vs llama.cpp `mul_mat_q` (222.4 ms) | 8.89x slower | **7.12x** slower | | 6.98x |
+
+The oracle side was re-run in the same session on the same pinned binary
+(`b10451`) and reproduces the first cut to within noise (`mul_mat_q`
+222.4 ms vs 222.3 ms per pp512 pass; llama-bench pp512 1842 tok/s), and
+so does our own default arm (3007.2 vs 3012.9 ms total, 1977.0 vs 1982.7
+ms quant-GEMM) -- so the box is in the same state and the deltas below
+are the barrier, not drift.
+
+**What the barrier cost, stated plainly.** Op-level geomean +16.8% ->
++16.0%. Real-model prefill -14.0% -> -12.5%. Isolated quant-GEMM gap
+6.98x -> 7.12x slower than llama.cpp. The repair is not free and the
+earlier figures were flattering, but BigTile remains a clear win on every
+axis measured, and the correctness it buys is not optional: without it
+the kernel returns NMSE 0.05-0.11 the moment the warps drift apart.
+
+The synthetic op-level win survives contact with the real checkpoint,
+diluted by the other kernels in the forward pass (`GdnScanK`, attention,
+the dense bf16 GEMM) exactly as expected -- not inflated, not an
+artifact. Still default OFF behind `VT_ROCM_QUANT_WMMA_WIDE=1
+VT_ROCM_QUANT_WMMA_BIGTILE=1`; whether to flip the default is a decision
+for after review, not made in this wave.
+
+### Review cycle on #3036 (five passes, fourteen findings)
+
+The PR has now been through five independent fresh reviews. The first
+two each found a real defect that every green assertion in this tree was
+structurally incapable of seeing, which is the durable lesson of this
+section. The third, fourth and fifth found no correctness defect, and
+eight more ways this record, the code's own comments and the pull request
+body had drifted from the code. Three of those eight were themselves
+drift inside a CORRECTION of earlier drift, which is this row's own
+failure mode: pass 4's LOW landed on a sentence `cff373abe` had just
+written to correct pass 3's finding, and both of pass 5's record findings
+landed on sentences `6074ba02b` had just written to correct pass 4's.
+Each of those three authorships was read off `git blame`, and pass 5's
+finding 1 below gives the blame result for the five findings of passes 3
+and 4. Three claims below carry the `file:line` they were checked
+against -- the pass-1 statement, pass 3's finding 1 and pass 4's finding
+2. The rest do not, so re-derive any load-bearing sentence from the code
+before you rely on it.
+
+**Pass 1, against head `bc5d494ce` -- verdict FAIL, one HIGH.** An
+out-of-range device read in BigTile's activation staging: for the ragged
+last M-block (`m_tiles % ItGroup != 0`, the common case) the loop copied
+`ItGroup*16` rows unconditionally, past the last row the kernel is
+defined over, before the `it_i` bounds check that would have prevented it
+was ever consulted. It never corrupted output, because those rows are
+never consumed -- so the whole suite was green with the read in it. Found
+by tracing address arithmetic, not by a crash. Fixed in `35f9400bd`:
+staging clamped to `min(ItGroup*16, (m_tiles - it_base)*16)`.
+
+This finding has now been stated three ways, and the third is the one to
+read. Pass 1 said the read went past the end of `EnsureQuantScratch`'s
+buffer. Pass 3 said that holds only when the pool happens to be exactly
+sized, because the request at the Q8_K dispatch is
+`m * nsb * sizeof(BlockQ8_K)` -- `m` rows, and m >= m_tiles*16 strictly
+whenever m % 16 != 0 -- and `vt::GrowOnlyStreamScratch` never shrinks
+(`src/vt/grow_only_stream_scratch.h:57-71`), so live capacity is the
+high-water mark over every prior call on the stream. Pass 4 showed that
+correction is itself too narrow in both directions, and the accurate
+statement is this one.
+
+The unclamped loop ran to global row
+`ceil(m_tiles/ItGroup)*ItGroup*16 - 1`, because the dispatch rounds
+`grid_y` UP: `grid_y = (m_tiles + ItGroup - 1) / ItGroup` at both BigTile
+dispatches (`src/vt/rocm/rocm_grouped_gemm.hip:2383-2384` for Q6_K,
+`:2440-2441` for Q4_K), and `it_base = blockIdx.y * ItGroup` (`:885`).
+That is up to `(ItGroup-1)*16` = 32 rows past `m_tiles*16` at the shipped
+`ItGroup=3`. The high-water mark is kept in BYTES, so in rows at a given
+call's `nsb` it reaches that overrun end only when some earlier call on
+the stream asked for that many. An exactly-sized pool never does. A GROWN
+pool need not either: reachable
+through `MatmulBTQuant` on one stream at fixed `nsb`, a prior `m=85` call
+publishes 85 rows, and a later `m=80` call has `m_tiles=5`, `grid_y=2`
+and a maximum `it_base` of 3, so the unclamped read reaches row 95 -- the
+pool had grown, and the read is still 11 rows past the allocation. The
+allocation was therefore overrun in the exactly-sized case AND in every
+insufficiently-grown one; the read was in-pool-but-stale only where
+capacity happened to cover the overrun end.
+
+What was violated in every case is the LOGICAL bound: the kernel is
+defined over `m_tiles*16` activation rows, and it read beyond them. That
+is the invariant the clamp restores and the invariant the probe below
+tests, which is why the probe fires reliably rather than only on some
+pool states. What none of the three statements changes is the
+consequence: the read never corrupted output, because the `it_i` bounds
+check never consumes those rows.
+
+**Pass 2, against head `8b25f30c8` -- five findings, repaired here.**
+
+1. **HIGH, cross-warp write-after-read race on `act_stage`.** The `sb`
+   loop had no barrier at its end. `w_stage`, `raw_tile`, `row_scales` and
+   `row_mins` are all `[wy]`-indexed and private to one warp; `act_stage`
+   is the only block-shared array, and the loop's last barrier sits BEFORE
+   its last read. Nothing ordered warp A's read of superblock `sb` against
+   warp B's cooperative overwrite for `sb+1`. It affected all FOUR
+   cooperative kernels (`Q6KBigTile`, `Q4KBigTile`, `Q6KShared`,
+   `Q4KShared`).
+
+   Proven, not argued, and reproduced here independently of the reviewer:
+   injecting a TIMING-ONLY delay for one warp immediately before that read
+   (`__builtin_amdgcn_s_sleep` plus a compiler-only barrier -- no memory
+   operation added or removed) makes the unrepaired kernels return NMSE
+   0.050182 (Q6_K BigTile), 0.0555232 (Q4_K BigTile), 0.104243 (Q6_K
+   Shared) and 0.113616 (Q4_K Shared) against a 0.0005 tolerance. The
+   first and third reproduce the reviewer's figures to six digits on a
+   different session. Adding exactly one `__syncthreads()` at the end of
+   the `sb` loop, with the identical delay still in place and the identical
+   build, returns all four to green. Removing the delay leaves the tree
+   byte-for-byte as committed.
+
+   **This defect has no permanent runnable guard and cannot have one.** A
+   race is invisible until the warps drift, and on this workload they do
+   not drift on their own. The reproduction above is the guard: it is a
+   four-line scratch edit, recorded here so the next reader can re-run it
+   rather than re-derive it.
+
+2. **MEDIUM, the dispatch precondition comment described the wrong
+   mechanism.** Corrected in the code and in the "Why that N-direction
+   precondition is needed" paragraph above, with both failure modes
+   mutation-measured here. The Q4_K branch, which carried no comment at
+   all, now points at the Q6_K branch's.
+
+3. **MEDIUM, this spec contradicted the code.** Repaired by the same
+   paragraph, and by this section.
+
+4. **LOW, nothing could detect the pass-1 OOB class.** Reverting the clamp
+   left the focused suite fully green, because the rows read out of range
+   are exactly the rows never consumed. Now guarded: both BigTile kernels
+   take an `OobProbe` template parameter that turns the staging loop's own
+   row index into an assertion -- each thread checks the global row it is
+   about to read against `m_tiles*16`, the row count the kernel is defined
+   over, and any block that goes out of range poisons its own output with
+   NaN, which the existing NMSE assertions catch. It is a template
+   parameter, not a kernel argument, so
+   the production instantiation compiles to exactly the code it did before
+   (the trace confirms `BigTile<..., false>` is what was measured) and the
+   probe costs the shipping measurement nothing -- it does cost the probe
+   instantiation 256 B of LDS, which pass 3 measured and which the LDS
+   budget `static_assert` now carries. Selected by
+   `KQuantWmmaSetBigTileOobProbeForTest`, exercised by both cooperative-
+   tile test cases, and mutation-proven: restoring the unclamped
+   `ItGroup*16` bound makes exactly the two probe assertions fail (NMSE
+   `nan`) while every value-only assertion stays green -- which is the
+   finding, executable.
+
+   A canary appended to the quant scratch was considered and rejected: the
+   defect is a READ, so a canary would have to be poison the kernel then
+   consumes, and it does not consume those rows. Only the address range is
+   observable, so the assertion has to live where the address is formed.
+
+5. **LOW, the test skip condition omitted `VT_ROCM_QUANT_WMMA_WIDE`.** Run
+   with `BIGTILE=1` alone the cooperative-tile cases did not skip; they
+   failed six dispatch-counter `CHECK`s, reporting an unmet harness
+   precondition as a defect. Confirmed by mutation (six failures with the
+   clause removed, a clean MESSAGE-and-return with it). All three toggles
+   are `static const bool` read once inside the backend, so the test can
+   only decline to run, never set them itself.
+
+Post-repair gate, all four toggle configurations, `ctest -R
+'rocm|cross_device'` 8/8 and the full `test_backend_cross_device` binary:
+48/48 cases in each of default (84068 assertions), `WIDE=1` (84068),
+`WIDE=1 SHARE_ACT=1` (84084) and `WIDE=1 BIGTILE=1` (84090, the six new
+ones being the OOB probe passes). Zero regression.
+
+**Pass 3, against head `b795c70fd` -- no correctness finding, three
+MEDIUM record findings, repaired without touching kernel behaviour.**
+
+1. **The `__syncthreads_or` comment claimed the probe costs no LDS.** It
+   costs 256 B per block: ROCm lowers `__syncthreads_or` to
+   `__ockl_wgred_or_i32`
+   (`/opt/rocm/include/hip/amd_detail/amd_device_functions.h:725`), a
+   workgroup reduction with LDS scratch. Measured with
+   `-Rpass-analysis=kernel-resource-usage` on this file's own compile
+   command, LDS bytes/block on gfx1200:
+
+   | kernel | `OobProbe=false` | `OobProbe=true` |
+   |---|---:|---:|
+   | `KQuantGemmKWmmaQ6KBigTile<f32,8,3>` | 63,168 | 63,424 |
+   | `KQuantGemmKWmmaQ4KBigTile<f32,8,3>` | 65,216 | **65,472** |
+
+   So the Q4_K probe instantiation is the tightest one this file emits, at
+   64 B of residual headroom, while the `static_assert` bounded only the
+   65,216 B production footprint. A future LDS addition or `ItGroup` bump
+   would have broken the build on the probe arm alone with no assert
+   naming why. The assert now carries
+   `kQuantWmmaBigTileOobProbeLdsBytes`, and is mutation-proven: adding a
+   synthetic 128 B to the budgeted footprint compiles under the old
+   production-only bound (65,344 <= 65,536) and fails under the new one
+   (65,600 > 65,536), so the added term is what rejects it.
+
+2. **This spec stated two different geomeans for one arm.** The `## Owed`
+   entry above still presented the first cut's +16.8% / -14.0% as current
+   and called the arm correctness-verified, ~500 lines before this
+   section retracts exactly that. That entry now names the first cut as
+   superseded and points here.
+
+3. **The clamp's safety argument named the wrong allocation.** Repaired in
+   the pass-1 paragraph above, in both BigTile kernels' comments, and in
+   the test's. The clamp itself was and remains correct; only its
+   justification was wrong.
+
+Nothing executable changed except the `static_assert` bound, and the
+shipping instantiation's resource usage is byte-identical before and
+after (`KQuantGemmKWmmaQ4KBigTile<f32,8,3,false>` 65,216 B, VGPRs and
+occupancy unchanged), so the measurements above stand without a retake.
+Post-repair gate: `ctest -R 'rocm|cross_device'` 8/8, and the focused
+cooperative-tile cases green under `WIDE=1 BIGTILE=1` (2 cases, 24
+assertions) and `WIDE=1 SHARE_ACT=1` (2 cases, 18 assertions).
+
+**Pass 4, against head `cff373abe` -- no correctness finding, two record
+findings plus a phrasing note.** Only the LOW was in the pass-3 repair
+itself. The MEDIUM was in `bc5d494ce`-era prose that repair never swept,
+and the phrasing note is that same repair's rewording having missed two
+older sentences.
+
+1. **MEDIUM, a superseded figure carried as current.** The handover's
+   "what's NOT done" entry argued for finer K-chunking by the size of
+   "the remaining 6.98x gap". 6.98x is the FIRST CUT's ratio. The same
+   handover section records the re-measurement as 8.89x -> 7.12x, and this
+   spec's real-model table records 7.12x as current. The handover's own
+   line was authored at `bc5d494ce`, when 6.98x was the live number, and
+   the re-measurement commit never came back for it. Now states 7.12x and
+   names 6.98x as superseded.
+
+2. **LOW, the "grown pool" dichotomy was not exhaustive, and understated
+   the overrun.** The pass-3 correction above said the unclamped read was
+   in-pool but stale whenever the pool had grown, and past the allocation
+   only when the pool was exactly sized. Both halves are false, because
+   the two quantities are not commensurable: `GrowOnlyStreamScratch` keeps
+   a BYTE high-water mark of `m * nsb * sizeof(BlockQ8_K)`
+   (`src/vt/grow_only_stream_scratch.h:57-71`), while the unclamped loop
+   reaches global row `ceil(m_tiles/ItGroup)*ItGroup*16 - 1` because
+   `grid_y` rounds UP (`src/vt/rocm/rocm_grouped_gemm.hip:2383-2384`), up
+   to 32 rows past `m_tiles*16` at `ItGroup=3`. A grown pool therefore
+   overruns too whenever it did not grow far enough: at fixed `nsb`, a
+   prior `m=85` call followed by `m=80` reads row 95, 11 rows past an
+   allocation that HAD grown. Restated in the pass-1 paragraph above, in
+   `KQuantGemmKWmmaQ6KBigTile`'s staging comment (the one both BigTile
+   kernels point at), and in the handover's index entry. The consequence
+   is unchanged and was already stated correctly: the read never corrupted
+   output.
+
+3. **Sub-LOW, folded into (2): the phrase pass 3 set out to fix survived
+   in two places.** `cff373abe` reworded the pass-1 defect from
+   "out-of-bounds" to "out-of-range" everywhere except this section's
+   own summary paragraph and the handover's caveat bullet. Both now say
+   out-of-range. The `OobProbe`/"OOB" identifier keeps its spelling,
+   because it names the probe in the code.
+
+Also corrected while in the file, flagged by pass 4 as pre-existing: the
+"+24.3% against the rejected 8-warp arm" above is the eight-shape
+geomean (24.33%), not the six-shape one (21.93%) the two sentences before
+it are about. Both figures are now given and attributed.
+
+**Nothing executable changed in this pass.** It edits comments and
+records only -- no kernel, no dispatch, no `static_assert`, no bound. The
+measurements above stand untouched and were not retaken. The comment-only
+edit is proven non-behavioural: `rocm_grouped_gemm.hip.o` recompiles to
+the identical sha256 with and without it
+(`ad352c053118bcaf81b4bacffebd9044149912946fb22511ea156d5787c14a5c`,
+Release, no `-g`). Post-repair gate, on a rebuilt binary:
+`ctest --test-dir build-hip -R 'rocm|cross_device'` 8/8, and the focused
+cooperative-tile cases green under `WIDE=1 BIGTILE=1` (2 cases, 24
+assertions) and `WIDE=1 SHARE_ACT=1` (2 cases, 18 assertions).
+
+**Pass 5, against head `6074ba02b` -- no correctness finding, two MEDIUM
+and one LOW.** Two are repaired here. The third is not on this branch.
+
+1. **MEDIUM, a false provenance claim that its own commit contradicted.**
+   `6074ba02b` wrote that pass 4's "both findings landed on pass 3's own
+   repair" (handover) and that "Two of those five were drift in a
+   CORRECTION of earlier drift" (this section), while stating the truth
+   about 180 lines lower in the same commit. Pass 4's MEDIUM target
+   blames to `bc5d494ce`, not to pass 3's repair `cff373abe`. Of the five
+   findings from passes 3 and 4, exactly one -- pass 4's LOW -- sat on
+   prose `cff373abe` wrote; pass 3's three targets blame to `b795c70fd`
+   (the `__syncthreads_or` LDS comment, authored with the probe it
+   describes), `bc5d494ce` (the `## Owed` geomean entry) and `35f9400bd`
+   (the clamp justification, authored with the clamp). Both documents now
+   count one of the five from passes 3 and 4, three of the eight once
+   pass 5's own two are included, and the pass-4 entries above say which
+   finding landed where.
+
+2. **LOW, an over-broad universal.** "the reason each claim below now
+   cites the `file:line` it was checked against" holds for three claim
+   groups and no others: the pass-1 statement, pass 3's finding 1 and
+   pass 4's finding 2. None of pass 2's five findings carries a
+   `file:line`, nor pass 3's findings 2 and 3, nor pass 4's findings 1
+   and 3. Narrowed to the three by name.
+
+3. **MEDIUM, the pull request body carried superseded figures.** Outside
+   this branch and held by the operator. It is not repaired here, and
+   this record does not claim otherwise.
+
+**Nothing executable changed in this pass either.** It edits this file
+and the handover, and no compiled file at all.
+`rocm_grouped_gemm.hip.o` still recompiles to
+`ad352c053118bcaf81b4bacffebd9044149912946fb22511ea156d5787c14a5c`
+(Release, no `-g`), the sha256 pass 4 recorded. Post-repair gate, on a
+rebuilt binary: `ctest --test-dir build-hip -R 'rocm|cross_device'` 8/8,
+and the focused cooperative-tile cases green under `WIDE=1 BIGTILE=1` (2
+cases, 24 assertions) and `WIDE=1 SHARE_ACT=1` (2 cases, 18 assertions).

@@ -249,15 +249,24 @@ need one format the CPU keeps and ROCm expands, and they had been re-pointed at
 IQ4_XS when ROCm gained IQ1_S. Admitting IQ4_XS made them red for the right
 reason, and they now use IQ2_XS, which no ROCm provider implements.
 
-- Extend `test_ops_quant_dot.cpp`'s existing IQ4_XS `vec_dot`
-  golden-vector gates (`iq2xs_iq4xs_dot_golden.h`, already committed and
-  sourced from real `unsloth/GLM-5.3-Flash-GGUF` checkpoint bytes) to a new
-  `test_rocm_quant_dot.cpp`, same shape as the CUDA gate
-  (`test_cuda_quant_dot.cpp`): bit-exact for IQ4_XS against the same
-  real-checkpoint golden values CUDA's gate uses, since
-  bit-exactness is the property the FMA-contraction risk above is actually
-  about.
-- `test_backend_cross_device.cpp`: add IQ4_XS to the CPU-vs-ROCM cross-check.
+- The bit-exact golden gate lands in `test_backend_cross_device.cpp`, NOT in
+  a new file. This bullet planned a new `test_rocm_quant_dot.cpp` shaped like
+  the CUDA gate (`test_cuda_quant_dot.cpp`); the reconciliation onto main's
+  quant-dot dispatch made that plan stale, because main already owns
+  `tests/vt/test_rocm_quant_dot.cpp` and this row's implementation does not
+  create it. `test_backend_cross_device.cpp` includes
+  `iq2xs_iq4xs_dot_golden.h` (already committed, sourced from real
+  `unsloth/GLM-5.3-Flash-GGUF` checkpoint bytes) and carries "ROCm IQ4_XS dots
+  the ORACLE's own numbers on REAL checkpoint bytes", which asserts the total
+  and every per-block value as f32 BIT PATTERNS against the same golden values
+  CUDA's gate uses. Bit-exactness is the property the FMA-contraction risk
+  above is actually about, and that case is what measures it.
+- `test_backend_cross_device.cpp`: add IQ4_XS to the CPU-vs-ROCM cross-check,
+  on the non-grouped and the grouped keep-quant arms both.
+- `test_rocm_quant_dot.cpp`: add IQ4_XS to that file's own `kCases` format
+  table, so the ROCm provider's format coverage there stays in step with what
+  `IsRocmKeepQuantSupported` admits. This is coverage the row adds to an
+  existing file, not the row's golden gate.
 - Rerun `ROCM-KQUANT-NWARPS-DECODE`'s own measurement recipe
   (`rocprofv3 --kernel-trace` on a real quant-matched trace workload) for
   IQ4_XS specifically, to answer the nwarps question this issue was

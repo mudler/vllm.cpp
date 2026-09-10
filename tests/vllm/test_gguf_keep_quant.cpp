@@ -2781,14 +2781,14 @@ TEST_CASE(
   const vllm::GgufTensorInfo t = IqTower("blk.3.ffn_gate_exps.weight");
 
   // NO PLAN INSTALLED — the inertness pin, and the state every load in this
-  // tree that configured no placement is in. IQ4_XS remains outside this row,
-  // so the tower expands until #3029 lands.
+  // tree that configured no placement is in. No ROCm provider implements
+  // IQ2_XS (#1940 owns that gap), so the tower expands.
   CHECK(rocm.Route(t, vllm::GgufTensorRole::kStackedExpertWeight) ==
         vllm::GgufResidency::kExpandBf16);
 
   // WITH the plan installed, the same tensor under the same policy keeps its
   // blocks, because the device that will run it is the CPU and
-  // `vt::cpu::HasQuantDotKernel(kIQ1_S)` is true.
+  // `vt::cpu::HasQuantDotKernel(kIQ2_XS)` is true (#2247).
   {
     ScopedPlan guard(CpuMoePlan(vt::DeviceType::kROCM, /*layers=*/8,
                                 /*first_placed=*/0));

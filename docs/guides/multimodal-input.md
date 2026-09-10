@@ -1,31 +1,80 @@
 # Send multimodal input
 
-Use the OpenAI-compatible server for image, video, and audio input.
+The OpenAI-compatible server routes supported image and audio content parts
+through `/v1/chat/completions` to the model. Support depends on the model:
 
-The OpenAI API accepts multimodal input. `vllm-cli` accepts only text:
-`--model --prompt --max-tokens --temperature --top-k --top-p --seed --stream
---speculative-config --tokenizer-config`.
+| Server architecture | Image items per prompt | Audio items per prompt | Video |
+|---|---:|---:|---|
+| `Qwen3VLForConditionalGeneration` | 1 | 0 | Refused |
+| `Dots3NoteForCausalLM` | 512 | 128 with `audio_config`; otherwise 0 | Refused |
 
-Start the server with a multimodal model, then send content parts on
-`/v1/chat/completions`:
+These are implementation ceilings. `--limit-mm-per-prompt` can lower them;
+`--language-model-only` sets them to zero. Dots3-note can mix images and audio
+in one prompt. Qwen3-VL serves one sequence per model step.
 
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+CPU tests exercise the serving path with synthetic weights. They establish
+that media reaches the model, not token parity on real checkpoints:
+[Qwen3-VL tests](../../tests/vllm/entrypoints/openai/test_api_server_mm_forward.cpp)
+and [dots3-note tests](../../tests/vllm/entrypoints/openai/test_api_server_dots3_mm_forward.cpp).
+No real-checkpoint token-parity or accelerator-performance claim follows from
+these tests. Other multimodal architectures do not gain HTTP support from
+registration alone. The text CLI and `vllm_chat` C API do not accept these
+media requests.
 
-client.chat.completions.create(model="Qwen3.6-27B", messages=[{"role": "user", "content": [
-    {"type": "text",      "text": "Describe this image."},
-    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,<...>"}},
-]}])
+## Send an image
+
+The server accepts square RGB images as packed, unsigned 8-bit bytes, with
+three channels per pixel and no file header. Use `image/x-raw-rgb` in the data
+URI. PNG and JPEG files are refused; changing their MIME type does not convert
+them to raw RGB.
+
+Start a server with a local Qwen3-VL safetensors checkpoint:
+
+```sh
+./build/examples/vllm-server \
+  --model /models/Qwen3-VL-4B-Instruct \
+  --served-model-name qwen3-vl --port 8000
 ```
 
-Accepted part types (`src/vllm/entrypoints/openai/chat_mm.cpp`):
+Save a square raw RGB image as `image.rgb`. For a 448 by 448 image, the file
+must contain exactly 602,112 bytes. Run this request with Python's standard
+library; it reads the image from disk and sends its bytes:
 
-| part type | modality |
-|---|---|
-| `image_url` | image |
-| `video_url` | video |
-| `input_audio` / `audio_url` | audio |
+```python
+import base64
+import json
+import math
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+rgb = Path("image.rgb").read_bytes()
+side = math.isqrt(len(rgb) // 3)
+if side == 0 or side * side * 3 != len(rgb):
+    raise ValueError("image.rgb must be a square HxWx3 raw RGB buffer")
+
+image_url = "data:image/x-raw-rgb;base64," + base64.b64encode(rgb).decode("ascii")
+payload = {
+    "model": "qwen3-vl",
+    "max_tokens": 32,
+    "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "Describe this image."},
+        {"type": "image_url", "image_url": {"url": image_url}},
+    ]}],
+}
+request = Request(
+    "http://localhost:8000/v1/chat/completions",
+    data=json.dumps(payload).encode("utf-8"),
+    headers={"Content-Type": "application/json"},
+)
+with urlopen(request) as response:
+    print(json.load(response))
+```
+
+Dots3-note uses the same image format. Its audio path accepts `input_audio`
+or `audio_url` parts carrying PCM16 RIFF/WAVE data. It mixes channels to mono
+and resamples to the checkpoint's configured sample rate. MP3, FLAC, and Ogg
+are refused. Parsing a part type does not establish model support: both
+registered chat paths refuse `video_url`.
 
 ## Add a `clip` multimodal projector to GGUF
 
@@ -86,17 +135,14 @@ through it is dropped and answered as text. The refusals below are the server's.
 `vllm_model_params.mmproj_path` (ABI v22) is in the same position: it loads and
 validates the projector, and no C-ABI call can feed the tower an image yet.
 
-The flag sets all modality limits to zero. It does not skip the encoder. The
-server refuses multimodal requests.
+The flag sets all modality limits to zero, refuses media requests, and skips
+loading a tower when all modalities it serves have zero limits.
 
-```console
-$ curl -s localhost:8000/v1/chat/completions -d '{... three image_url parts ...}'
-{"error":{"type":"BadRequestError",
-          "message":"At most 1 image(s) may be provided in one prompt."}}   # HTTP 400
+For example, a Qwen3-VL server refuses three images with HTTP 400:
 
-$ vllm-server --model … --language-model-only     # then any image request:
+```json
 {"error":{"type":"BadRequestError",
-          "message":"At most 0 image(s) may be provided in one prompt. Set `--limit-mm-per-prompt` to increase this limit."}}
+          "message":"At most 1 image(s) may be provided in one prompt."}}
 ```
 
 Two things follow from how the limit is computed
@@ -104,9 +150,8 @@ Two things follow from how the limit is computed
 
 - A user limit can only **lower** the ceiling, and what it lowers is declared
   **per architecture** by the chat seam that architecture registers. On a
-  `Qwen3VLForConditionalGeneration` server — which is also the `--mmproj`
-  projector path — `--limit-mm-per-prompt '{"image": 99}'` still refuses a
-  second image, because that seam declares `{"image": 1}` and routes no video or
+  `Qwen3VLForConditionalGeneration` server, the option
+  `--limit-mm-per-prompt '{"image": 99}'` still refuses a second image, because that seam declares `{"image": 1}` and routes no video or
   audio part at all, so those limits are 0 and such a part is refused by name
   rather than dropped, which is what closed
   [#686](https://github.com/mudler/vllm.cpp/issues/686).
@@ -134,8 +179,7 @@ read. This mirrors vLLM's `_mark_tower_model`
 LIMITS rather than from the flag: `--limit-mm-per-prompt '{"image":0,"video":0}'`
 skips the same tower, and one non-zero modality keeps it.
 
-Three production tower loads exist and all three are gated: the two
-architectures that read a tower out of their own checkpoint,
+Tower-skip tests cover the checkpoint loaders for
 `MuseGlimmerForConditionalGeneration` and `Qwen3VLForConditionalGeneration`, and
 the `--mmproj` projector, which is the Qwen3-VL tower read out of a second
 `clip` GGUF beside a `.gguf` language file. On the `--mmproj` path the file is

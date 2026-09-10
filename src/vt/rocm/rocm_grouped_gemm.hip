@@ -48,9 +48,6 @@
 
 // Block layouts — the single source of truth (ggml-common.h mirrors).
 #include "vt/cpu/cpu_quant_blocks.h"
-// KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT: the IQ4_XS/IQ3_XXS device codebooks,
-// generated from the same source the CPU/CUDA tables read (see the header).
-#include "vt/rocm/rocm_quant_iq_tables.h"
 
 namespace vt::rocm {
 namespace {
@@ -62,8 +59,6 @@ using vt::cpu::BlockQ4_K;
 using vt::cpu::BlockQ5_K;
 using vt::cpu::BlockQ6_K;
 using vt::cpu::kQK4_NL;
-using vt::cpu::BlockIQ4_XS;
-using vt::cpu::BlockIQ3_XXS;
 using vt::cpu::kQK8_0;
 using vt::cpu::kQK_K;
 
@@ -328,98 +323,6 @@ __device__ inline float DotQ6K(const BlockQ6_K* xb, const BlockQ8_K* yb) {
   int isum = 0;
   for (int l = 0; l < 8; ++l) isum += aux32[l];
   return d * isum;
-}
-
-// IQ3_XXS x Q8_K: cuda_quant_dot.cu DotIQ3XXS (KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT,
-// #1940). Ported verbatim -- no CUDA-only intrinsic in this body (no __dp4a,
-// no __vcmpne4/__vsub4; those belong to DotIQ2XXS, not this one), so the port
-// is a straight recompile against this file's own tables. A per-tensor
-// FinalFactor of 0.25 applies ONCE after the warp reduction sums every
-// super-block's `d * bsum`, not inside this function -- see KQuantGemmK.
-__device__ inline float DotIQ3XXS(const BlockIQ3_XXS* xb, const BlockQ8_K* yb) {
-  const float d = DF16ToF32(xb->d) * yb->d;
-  const uint8_t* q3 = xb->qs;
-  const uint8_t* gas = xb->qs + kQK_K / 4;
-  const int8_t* q8 = yb->qs;
-  int32_t bsum = 0;
-  for (int ib32 = 0; ib32 < kQK_K / 32; ++ib32) {
-    uint32_t a32;
-    memcpy(&a32, gas, sizeof(uint32_t));
-    gas += sizeof(uint32_t);
-    const uint32_t ls = 2 * (a32 >> 28) + 1;
-    int32_t sumi = 0;
-    for (int l = 0; l < 4; ++l) {
-      const uint32_t g1 = d_iq3xxs_grid[q3[2 * l + 0]];
-      const uint32_t g2 = d_iq3xxs_grid[q3[2 * l + 1]];
-      const uint8_t signs = d_ksigns_iq2xs[(a32 >> (7 * l)) & 127];
-      for (int j = 0; j < 4; ++j) {
-        const int b1 = static_cast<int>((g1 >> (8 * j)) & 0xff);
-        const int b2 = static_cast<int>((g2 >> (8 * j)) & 0xff);
-        sumi += b1 * q8[j + 0] * ((signs & d_kmask_iq2xs[j + 0]) ? -1 : 1);
-        sumi += b2 * q8[j + 4] * ((signs & d_kmask_iq2xs[j + 4]) ? -1 : 1);
-      }
-      q8 += 8;
-    }
-    q3 += 8;
-    bsum += sumi * static_cast<int32_t>(ls);
-  }
-  return d * bsum;  // final *0.25 applied after the warp reduction
-}
-
-// IQ4_XS x Q8_K: cuda_quant_dot.cu DotIQ4XS (KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT,
-// #1940). IQ4_XS shares IQ4_NL's 16-entry d_kvalues_iq4nl codebook and NOT its
-// activation pairing: its block is a 256-element SUPER-block, so it dots
-// Q8_K. The `ib` loop steps by TWO because one `scales_l` byte serves two
-// sub-blocks; `d1`/`d2` are formed as f32 BEFORE the integer sums fold in, so
-// a super-block is EIGHT f32 accumulation steps -- upstream's association,
-// kept rather than hoisted into one integer accumulator. FinalFactor<kIQ4_XS>
-// is 1 (the per-sub-block delta is already folded in as `d1`/`d2` here).
-//
-// CUDA's port of this body needed __fmul_rn/__fadd_rn in place of `*`/`+`,
-// because nvcc's default -fmad=true silently contracts the two-rounding
-// sequence into a single-rounding FMA and measurably disagreed with the
-// oracle by 1-4 ULP on two of eight real super-blocks (cuda_quant_dot.cu,
-// same function, extensively commented on this exact point). This project's
-// CMakeLists.txt already passes -ffp-contract=off to $<COMPILE_LANGUAGE:HIP>
-// project-wide (unlike its CXX-only reach on the CUDA side), so plain `*`/`+`
-// is used here rather than carrying the CUDA workaround over unexamined --
-// the row's bit-exact golden-vector gate is what actually proves this, not
-// this comment; if that gate goes red, apply the same non-fused-multiply
-// discipline HIP provides before assuming anything else is wrong.
-__device__ inline float DotIQ4XS(const BlockIQ4_XS* xb, const BlockQ8_K* yb) {
-  const float d4d8 = DF16ToF32(xb->d) * yb->d;
-  uint16_t h = xb->scales_h;
-  const uint8_t* qs = xb->qs;
-  const int8_t* q8 = yb->qs;
-  float sumf = 0.0f;
-  for (int ib = 0; ib < kQK_K / 32; ib += 2) {
-    const uint8_t ls1 =
-        static_cast<uint8_t>((xb->scales_l[ib / 2] & 0xf) | ((h << 4) & 0x30));
-    const uint8_t ls2 =
-        static_cast<uint8_t>((xb->scales_l[ib / 2] >> 4) | ((h << 2) & 0x30));
-    h = static_cast<uint16_t>(h >> 4);
-    const float d1 = d4d8 * (ls1 - 32);
-    const float d2 = d4d8 * (ls2 - 32);
-    int sumi1 = 0;
-    int sumi2 = 0;
-    for (int j = 0; j < 16; ++j) {
-      sumi1 += q8[j + 0] * d_kvalues_iq4nl[qs[j] & 0xf];
-      sumi2 += q8[j + 16] * d_kvalues_iq4nl[qs[j] >> 4];
-    }
-    sumf += d1 * static_cast<float>(sumi1 + sumi2);
-    qs += 16;
-    q8 += 32;
-    sumi1 = 0;
-    sumi2 = 0;
-    for (int j = 0; j < 16; ++j) {
-      sumi1 += q8[j + 0] * d_kvalues_iq4nl[qs[j] & 0xf];
-      sumi2 += q8[j + 16] * d_kvalues_iq4nl[qs[j] >> 4];
-    }
-    sumf += d2 * static_cast<float>(sumi1 + sumi2);
-    qs += 16;
-    q8 += 32;
-  }
-  return sumf;
 }
 
 // Q6_K integer core over a SUB-BLOCK RANGE, for the cooperative decode arm
@@ -949,12 +852,6 @@ __global__ void GroupedIQ4NLK(OutT* __restrict__ out, const uint8_t* __restrict_
 
 // K-quant grouped kernel body (shared by Q4_K/Q5_K/Q6_K instantiations).
 // Fmt: 0=Q4_K, 1=Q5_K, 2=Q6_K.
-
-// K-quant grouped kernel body (shared by Q4_K/Q5_K/Q6_K/IQ4_XS/IQ3_XXS
-// instantiations). Fmt: 0=Q4_K, 1=Q5_K, 2=Q6_K, 4=IQ4_XS, 5=IQ3_XXS
-// (KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT, #1940) -- same Fmt numbering as
-// KQuantGemmK above, so a caller's `fmt` value means the same thing on
-// either entry point.
 template <typename OutT, int Fmt>
 __global__ void GroupedKQ8K(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
                             const BlockQ8_K* __restrict__ act,
@@ -974,13 +871,10 @@ __global__ void GroupedKQ8K(OutT* __restrict__ out, const uint8_t* __restrict__ 
     const BlockQ8_K* a_sb = a_row + sb;
     if constexpr (Fmt == 2) partial += DotQ6K(static_cast<const BlockQ6_K*>(w_sb), a_sb);
     else if constexpr (Fmt == 1) partial += DotQ5K(static_cast<const BlockQ5_K*>(w_sb), a_sb);
-    else if constexpr (Fmt == 4) partial += DotIQ4XS(static_cast<const BlockIQ4_XS*>(w_sb), a_sb);
-    else if constexpr (Fmt == 5) partial += DotIQ3XXS(static_cast<const BlockIQ3_XXS*>(w_sb), a_sb);
     else partial += DotQ4K(static_cast<const BlockQ4_K*>(w_sb), a_sb);
   }
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) partial += __shfl_down_sync(0xffffffffULL, partial, off);
-  if constexpr (Fmt == 5) partial *= 0.25f;  // see KQuantGemmK's FinalFactor note
   if (lane == 0) {
     if constexpr (sizeof(OutT) == 4) out[p * n + j] = partial;
     else out[p * n + j] = DF32ToBF16(partial);
@@ -1063,22 +957,10 @@ __global__ void KQuantGemmK(OutT* __restrict__ out, const uint8_t* __restrict__ 
       partial += (DF16ToF32(xb->d) * yb->d) * DotQ6KIsumRange(xb, yb, 0, kSubBlocks);
     } else if constexpr (Fmt == 2) partial += DotQ6K(static_cast<const BlockQ6_K*>(w_sb), a_row + sb);
     else if constexpr (Fmt == 1) partial += DotQ5K(static_cast<const BlockQ5_K*>(w_sb), a_row + sb);
-    // Fmt 4/5 (KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT, #1940): IQ4_XS/IQ3_XXS.
-    // Both dot bodies already read the ROCm codebook tables at file scope, so
-    // this is a dispatch-table extension over the same nsb=K/256 skeleton the
-    // four existing formats use -- no new activation quantizer, no new grid.
-    else if constexpr (Fmt == 4) partial += DotIQ4XS(static_cast<const BlockIQ4_XS*>(w_sb), a_row + sb);
-    else if constexpr (Fmt == 5) partial += DotIQ3XXS(static_cast<const BlockIQ3_XXS*>(w_sb), a_row + sb);
     else partial += DotQ4K(static_cast<const BlockQ4_K*>(w_sb), a_row + sb);
   }
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) partial += __shfl_down_sync(0xffffffffULL, partial, off);
-  // The IQ3_XXS codebook stores lanes at a fixed 4x magnitude that upstream
-  // applies ONCE per row rather than per super-block (cuda_quant_dot.cu
-  // FinalFactor<kIQ3_XXS> = 0.25f); IQ4_XS's per-sub-block delta is already
-  // folded into `d1`/`d2` inside DotIQ4XS, so its factor is 1 (a no-op, not
-  // written out as a multiply).
-  if constexpr (Fmt == 5) partial *= 0.25f;
   if (lane == 0) {
     if constexpr (sizeof(OutT) == 4) out[i * n + j] = partial;
     else out[i * n + j] = DF32ToBF16(partial);
@@ -1858,21 +1740,14 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
     return;
   }
   if (b.dtype == DType::kQ4_K || b.dtype == DType::kQ5_K || b.dtype == DType::kQ6_K) {
-
-  if (b.dtype == DType::kQ4_K || b.dtype == DType::kQ5_K || b.dtype == DType::kQ6_K ||
-      b.dtype == DType::kIQ4_XS || b.dtype == DType::kIQ3_XXS) {
     if (k % kQK_K != 0) throw std::runtime_error("vt rocm: matmul_bt_quant K-quant: K%256!=0");
     const int64_t nsb = k / kQK_K;
     const size_t w_block_bytes = b.dtype == DType::kQ6_K    ? sizeof(BlockQ6_K)
                                 : b.dtype == DType::kQ5_K    ? sizeof(BlockQ5_K)
-                                : b.dtype == DType::kIQ4_XS  ? sizeof(BlockIQ4_XS)
-                                : b.dtype == DType::kIQ3_XXS ? sizeof(BlockIQ3_XXS)
                                                               : sizeof(BlockQ4_K);
     const size_t w_row_bytes = static_cast<size_t>(nsb) * w_block_bytes;
     const int fmt = b.dtype == DType::kQ6_K    ? 2
                   : b.dtype == DType::kQ5_K    ? 1
-                  : b.dtype == DType::kIQ4_XS  ? 4
-                  : b.dtype == DType::kIQ3_XXS ? 5
                                                 : 0;
     const int coop = KQuantDecodeCoopWarps(b.dtype, m, nsb);
     const detail::MmvqRoute mmvq_route = detail::SelectMmvqRoute(
@@ -2029,8 +1904,6 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
       if (fmt == 2 && Q6KSmallPrivateEnabled()) KQuantGemmK<OutT, 3><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes, 0, 0);
       else if (fmt == 2) KQuantGemmK<OutT, 2><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes, 0, 0);
       else if (fmt == 1) KQuantGemmK<OutT, 1><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes, 0, 0);
-      else if (fmt == 4) KQuantGemmK<OutT, 4><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes, 0, 0);
-      else if (fmt == 5) KQuantGemmK<OutT, 5><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes, 0, 0);
       else KQuantGemmK<OutT, 0><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes, 0, 0);
     };
     if (out.dtype == DType::kF32) launch(float{}); else launch(uint16_t{});
@@ -2039,7 +1912,8 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
   }
   throw std::runtime_error(
       "vt rocm: internal GDN matmul_bt_quant provider received an unsupported weight dtype "
-      "(GDN-owned: Q8_0/IQ4_NL/Q4_K/Q5_K/Q6_K/IQ4_XS/IQ3_XXS; wrapper-owned: Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ2_S/IQ1_S/IQ1_XXXS; unimplemented: Q4_0/Q5_0/IQ2_XS/IQ3_S/MXFP4 -- the ROCm wrapper must delegate only the GDN-owned set)\n"
+      "(GDN-owned: Q8_0/IQ4_NL/Q4_K/Q5_K/Q6_K; wrapper-owned: Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ2_S/IQ1_S/IQ1_XXXS/IQ4_XS; "
+      "unimplemented: Q4_0/Q5_0/IQ2_XS/IQ3_S/MXFP4 -- the ROCm wrapper must delegate only the GDN-owned set)");
 }
 
 
@@ -2104,16 +1978,13 @@ void MatmulBTQuantGroupedKernelRocmGdn(Queue& q, Tensor& out, const Tensor& act,
     return;
   }
 
-  if (weight.dtype == DType::kQ4_K || weight.dtype == DType::kQ5_K || weight.dtype == DType::kQ6_K ||
-      weight.dtype == DType::kIQ4_XS || weight.dtype == DType::kIQ3_XXS) {
+  if (weight.dtype == DType::kQ4_K || weight.dtype == DType::kQ5_K || weight.dtype == DType::kQ6_K) {
     if (k % kQK_K != 0)
       throw std::runtime_error("vt rocm: matmul_bt_quant_grouped K-quant: K must be a multiple of 256");
     const int64_t nsb = k / kQK_K;
     const size_t w_block_bytes = weight.dtype == DType::kQ4_K    ? sizeof(BlockQ4_K)
                                 : weight.dtype == DType::kQ5_K    ? sizeof(BlockQ5_K)
-                                : weight.dtype == DType::kQ6_K    ? sizeof(BlockQ6_K)
-                                : weight.dtype == DType::kIQ4_XS  ? sizeof(BlockIQ4_XS)
-                                                                   : sizeof(BlockIQ3_XXS);
+                                                                   : sizeof(BlockQ6_K);
     const size_t w_row_bytes = static_cast<size_t>(nsb) * w_block_bytes;
     BlockQ8_K* qact = static_cast<BlockQ8_K*>(EnsureQuantScratch(
         static_cast<size_t>(Pa) * nsb * sizeof(BlockQ8_K), s));
@@ -2122,16 +1993,12 @@ void MatmulBTQuantGroupedKernelRocmGdn(Queue& q, Tensor& out, const Tensor& act,
     const int64_t grid = (P * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
     const int fmt = weight.dtype == DType::kQ6_K    ? 2
                   : weight.dtype == DType::kQ5_K    ? 1
-                  : weight.dtype == DType::kIQ4_XS  ? 4
-                  : weight.dtype == DType::kIQ3_XXS ? 5
                                                      : 0;
     auto launch = [&](auto ot) {
       using OutT = decltype(ot);
       auto* o = static_cast<OutT*>(out.data);
       if (fmt == 2) GroupedKQ8K<OutT, 2><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast);
       else if (fmt == 1) GroupedKQ8K<OutT, 1><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast);
-      else if (fmt == 4) GroupedKQ8K<OutT, 4><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast);
-      else if (fmt == 5) GroupedKQ8K<OutT, 5><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast);
       else GroupedKQ8K<OutT, 0><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast);
     };
     if (out.dtype == DType::kF32) launch(float{}); else launch(uint16_t{});
@@ -2141,7 +2008,8 @@ void MatmulBTQuantGroupedKernelRocmGdn(Queue& q, Tensor& out, const Tensor& act,
 
   throw std::runtime_error(
       "vt rocm: internal GDN matmul_bt_quant_grouped provider received an unsupported weight dtype "
-      "(GDN-owned: Q8_0/IQ4_NL/Q4_K/Q5_K/Q6_K/IQ4_XS/IQ3_XXS; wrapper-owned: Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ2_S/IQ1_S/IQ1_XXXS; unimplemented: Q4_0/Q5_0/IQ2_XS/IQ3_S/MXFP4 -- the ROCm wrapper must delegate only the GDN-owned set)\n"
+      "(GDN-owned: Q8_0/IQ4_NL/Q4_K/Q5_K/Q6_K; wrapper-owned: Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ2_S/IQ1_S/IQ1_XXXS/IQ4_XS; "
+      "unimplemented: Q4_0/Q5_0/IQ2_XS/IQ3_S/MXFP4 -- the ROCm wrapper must delegate only the GDN-owned set)");
 }
 
 }  // namespace vt::rocm

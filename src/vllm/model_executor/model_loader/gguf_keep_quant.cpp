@@ -136,16 +136,18 @@ bool KeepNvfp4DType(uint32_t ggml_type) { return ggml_type == 40; }
 bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
   switch (dev) {
     case vt::DeviceType::kROCM:
-      // rocm_grouped_gemm.hip implements Q8_0/IQ4_NL/Q4_K/Q5_K/Q6_K/IQ4_XS/IQ3_XXS,
-      // while rocm_quant_dot.hip adds the six Q8_K-activation formats below
-      // (IQ2_XXS, Q2_K, Q3_K, IQ2_S, IQ1_S, IQ1_XXXS) on both grouped and
-      // non-grouped arms.
+      // rocm_grouped_gemm.hip implements Q8_0/IQ4_NL/Q4_K/Q5_K/Q6_K, while
+      // rocm_quant_dot.hip adds the eight Q8_K-activation formats below on
+      // both grouped and non-grouped arms. IQ4_XS is the last of the eight
+      // (KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT, #1940 in pull request #3029). It
+      // used to fall through to `false` here, and that is the host-RAM SIGSEGV
+      // a real IQ4_XS checkpoint hit on ROCm: the loader chose exactly the
+      // expand-bf16 residency this comment block warns about.
       //
       // IQ4_NL is admitted on BOTH arms or neither. It is the only entry here
       // whose activation encoding is Q8_0 rather than Q8_K, served by DotIQ4_NL
       // through IQ4NLGemmK (single) and GroupedIQ4NLK (expert towers).
       //
-      // IQ4_XS/IQ3_XXS added by KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT (#1940).
       // Q4_0/Q5_0/IQ2_XS/IQ3_S/MXFP4 stay on the named expand-or-refuse path.
       return dt == vt::DType::kQ8_0 || dt == vt::DType::kIQ4_NL ||
              dt == vt::DType::kQ4_K ||
@@ -154,7 +156,7 @@ bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
              dt == vt::DType::kIQ2_XXS || dt == vt::DType::kIQ3_XXS ||
              dt == vt::DType::kQ2_K || dt == vt::DType::kQ3_K ||
              dt == vt::DType::kIQ2_S || dt == vt::DType::kIQ1_S ||
-             dt == vt::DType::kIQ1_XXXS;
+             dt == vt::DType::kIQ1_XXXS || dt == vt::DType::kIQ4_XS;
     case vt::DeviceType::kTENSTORRENT:
       // KEEPQUANT W3: the P150 is discrete with no CPU fallback tier, so this
       // arm admits exactly what src/vt/tenstorrent/tenstorrent_ops.cpp has a
@@ -456,12 +458,14 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv(
 // this GEMM have a `vec_dot` for this encoding", so for a PLACED routed-expert
 // tower it is a question about the placement device, not about the engine.
 //
-// On GLM-5.3 `UD-IQ1_S`, five of the six expert formats now stay quantized on
-// ROCm: IQ1_S/IQ3_XXS/IQ2_XXS/Q2_K/Q3_K. IQ4_XS still routes
-// `kExpandBf16`, so `LoadStackedExperts` can refuse a load for a tower whose
-// bytes never reach the GPU (the model reads a tower only through
-// `GlmExpertSlice`, never through `ResidentWeight`) and which the installed
-// plan has already sent to the CPU. The CPU `vec_dot` table covers all six.
+// On GLM-5.3 `UD-IQ1_S`, all six expert formats now stay quantized on ROCm:
+// IQ1_S/IQ3_XXS/IQ2_XXS/Q2_K/Q3_K, and IQ4_XS since #3029. This seam still
+// matters, because a format ROCm does not admit routes `kExpandBf16` and
+// `LoadStackedExperts` then refuses a load for a tower whose bytes never reach
+// the GPU (the model reads a tower only through `GlmExpertSlice`, never
+// through `ResidentWeight`) and which the installed plan has already sent to
+// the CPU. The CPU `vec_dot` table covers all six, and IQ2_XS, IQ4_NL and
+// IQ3_S are formats where the two answers still differ.
 //
 // THIS IS #1136 AND #2406 ONE SEAM FURTHER ALONG. Both were the same shape: a
 // residency decision resolved against a device other than the one that would

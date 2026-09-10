@@ -859,8 +859,8 @@ skips with that refusal quoted.
   [complete model gate](../.agents/specs/rocm-f16-weights.md) remains failing.
 - On ROCm, GGUF mixture-of-experts checkpoints compute on the quantized
   expert blocks (Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ3_XXS,
-  IQ2_S, IQ1_S, IQ1_XXXS, IQ4_XS) instead of being dequantized to bf16 at load
-  time.
+  IQ2_S, IQ1_S, IQ1_XXXS, IQ4_XS) instead of being dequantized to bf16 at
+  load time.
 - On ROCm, mixture-of-experts models run the shared-expert gate and both
   expert-combine steps on device. Before these ops were registered the
   engine refused with `no kernel for op` on that path.

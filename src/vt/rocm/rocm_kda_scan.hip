@@ -1,8 +1,9 @@
 // ROCm KDA per-K-channel-decay gated-delta recurrence (BACKEND-ROCM; issue #2942).
 // kKdaGatedDeltaRule — hand-translation of cuda_gdn.cu KdaScanKernel (:3139) +
 // LaunchKdaScan + KdaGatedDeltaRuleKernelCuda (:3207-3235), readable side by side
-// against the donor. CPU oracle: src/vt/cpu/cpu_ops.cpp:4046
-// (KdaGatedDeltaRuleKernel). Spec: .agents/specs/rocm-kda-gated-delta-rule.md.
+// against the donor. CPU oracle: src/vt/cpu/cpu_ops.cpp:2241
+// (KdaGatedDeltaRuleKernel; recurrence math in KdaHeadTokenStep :2208).
+// Spec: .agents/specs/rocm-kda-gated-delta-rule.md.
 //
 // Byte-for-byte GdnScanK (rocm_gdn_scan.hip) EXCEPT the state decay is
 // per-K-channel: GDN uses one scalar decay = expf(g[t*hv_n+hv]) for the whole

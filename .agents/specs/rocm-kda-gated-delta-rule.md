@@ -63,7 +63,7 @@ tier is dead.
 
 | Role | Path |
 |---|---|
-| Numerics donor (the golden) | `src/vt/cpu/cpu_ops.cpp:4046`, `KdaGatedDeltaRuleKernel` |
+| Numerics donor (the golden) | `src/vt/cpu/cpu_ops.cpp:2241`, `KdaGatedDeltaRuleKernel` (recurrence math: `KdaHeadTokenStep` :2208) |
 | CUDA kernel (the port donor) | `src/vt/cuda/cuda_gdn.cu:3139-3235`, `KdaScanKernel` + `LaunchKdaScan` + `KdaGatedDeltaRuleKernelCuda` |
 | ROCm GDN kernel (the template) | `src/vt/rocm/rocm_gdn_scan.hip` (181 lines, `GdnScanK` + launchers) |
 | Seam contract | `include/vt/ops.h:2348-2350` (`KdaGatedDeltaRuleFn`), `include/vt/ops.h:3862` (`vt::KdaGatedDeltaRule`) |

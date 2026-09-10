@@ -131,6 +131,13 @@ void GdnPrefillKernelRocm(Queue& q, Tensor& out, const Tensor& q_in, const Tenso
 void GdnDecodeKernelRocm(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
                          const Tensor& v, const Tensor& g, const Tensor& beta,
                          Tensor& state, const Tensor* state_idx, const GdnArgs& args);
+// BACKEND-ROCM-KDA (#2942, rocm_kda_scan.hip): per-K-channel-decay gated-delta
+// recurrence. Same shape as GdnPrefillFn; the only difference is g is [T,Hv,Dk]
+// (per-channel) not [T,Hv] (per-head). Staged slice: unreached by the model
+// forward until the CPU-only refusal at glm5_next_kda.cpp:322 lifts (W9c-2).
+void KdaGatedDeltaRuleKernelRocm(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                                 const Tensor& v, const Tensor& g, const Tensor& beta,
+                                 Tensor& state, const Tensor& qsl, const GdnArgs& args);
 // BACKEND-ROCM-GDN-KERNELS family 5 (rocm_gdn_fused.hip): gated RMSNorm,
 // sigmoid gate, and the fused full-attention preamble.
 void RmsNormGatedKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
@@ -283,6 +290,9 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<GdnPrefillFn>(&GdnPrefillKernelRocm)));
     RegisterOp(OpId::kGdnDecode, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<GdnDecodeFn>(&GdnDecodeKernelRocm)));
+    RegisterOp(OpId::kKdaGatedDeltaRule, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<KdaGatedDeltaRuleFn>(
+                   &KdaGatedDeltaRuleKernelRocm)));
     RegisterOp(OpId::kRmsNormGated, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<RmsNormGatedFn>(&RmsNormGatedKernelRocm)));

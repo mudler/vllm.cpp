@@ -1811,6 +1811,100 @@ TEST_CASE("GDN prefill/decode recurrence matches the CPU oracle within NMSE <= 5
 }
 
 
+TEST_CASE("KDA per-K-channel-decay recurrence matches the CPU oracle within NMSE <= 5e-4") {
+  // KDA is GDN with per-K-channel decay: the gate g is [T,Hv,Dk] (per-channel)
+  // not [T,Hv] (per-head). This is the load-bearing assertion — if the kernel
+  // reads g at the wrong stride, the per-channel decay is wrong and the output
+  // diverges. Three assertions per device (PR #3001 precedent): (1) NMSE on out
+  // AND state, (2) OpRegistered is the native-only probe, (3) reference-tier
+  // hits do not increase (the call did not fall through to the CPU tier).
+  const int64_t HK = 2, HV = 4, DK = 16, DV = 24;  // HV = ratio*HK
+  const float scale = 0.25f;
+  vt::GdnArgs ga;
+  ga.scale = scale;
+
+  // ---- prefill: two sequences, lens 4 and 1, fresh zero state.
+  const std::vector<int32_t> qsl = {0, 4, 5};
+  const int64_t N = 2, T = 5;
+  const size_t qkn = static_cast<size_t>(T * HK * DK), vn = static_cast<size_t>(T * HV * DV);
+  const size_t ggn = static_cast<size_t>(T * HV * DK), gbn = static_cast<size_t>(T * HV);
+  const size_t stn = static_cast<size_t>(N * HV * DV * DK);
+  const std::vector<float> qin = RandomVec(qkn, 871, -0.5f, 0.5f);
+  const std::vector<float> kin = RandomVec(qkn, 872, -0.5f, 0.5f);
+  const std::vector<float> vin = RandomVec(vn, 873, -0.5f, 0.5f);
+  const std::vector<float> gin = RandomVec(ggn, 874, -0.3f, -0.01f);  // log-decay < 0
+  const std::vector<float> bin = RandomVec(gbn, 875, 0.0f, 0.5f);
+
+  std::vector<float> ref_out(vn, 0.0f), ref_st(stn, 0.0f);
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> hq = qin, hk_ = kin, hv_ = vin, hg = gin, hb = bin;
+    std::vector<int32_t> cqsl = qsl;
+    Tensor tq = Tensor::Contiguous(hq.data(), DType::kF32, cd, {T, HK, DK});
+    Tensor tk = Tensor::Contiguous(hk_.data(), DType::kF32, cd, {T, HK, DK});
+    Tensor tv = Tensor::Contiguous(hv_.data(), DType::kF32, cd, {T, HV, DV});
+    Tensor tg = Tensor::Contiguous(hg.data(), DType::kF32, cd, {T, HV, DK});
+    Tensor tb = T2(hb.data(), cd, T, HV);
+    Tensor tst = Tensor::Contiguous(ref_st.data(), DType::kF32, cd, {N, HV, DV, DK});
+    Tensor tqsl = TI32(cqsl.data(), cd, N + 1);
+    Tensor tout = Tensor::Contiguous(ref_out.data(), DType::kF32, cd, {T, HV, DV});
+    vt::KdaGatedDeltaRule(cq, tout, tq, tk, tv, tg, tb, tst, tqsl, ga);
+    cpu.DestroyQueue(cq);
+  }
+
+  // ASSERTION 2, unconditional on a ROCm build and NOT `if (!OpAvailable)
+  // continue`. A missing registration is the defect under test: the portable
+  // reference tier computes the SAME answer as a native kernel, so assertion (1)
+  // alone is green with no kernel at all.
+  const bool rocm_built = [&] {
+    for (DeviceType dt : RegisteredDevices())
+      if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (rocm_built) {
+    CHECK(vt::OpRegistered(vt::OpId::kKdaGatedDeltaRule, DeviceType::kROCM));
+  }
+
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!OpAvailable(vt::OpId::kKdaGatedDeltaRule, dt)) continue;
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+    DevBuf dq(dev, q, qkn), dk(dev, q, qkn), dv(dev, q, vn), dg(dev, q, ggn),
+        db(dev, q, gbn), dout(dev, q, vn), dst(dev, q, stn);
+    DevBufI32 dqsl(dev, q, N + 1);
+    dq.Upload(qin);
+    dk.Upload(kin);
+    dv.Upload(vin);
+    dg.Upload(gin);
+    db.Upload(bin);
+    dst.Upload(std::vector<float>(stn, 0.0f));
+    dqsl.Upload(qsl);
+    Tensor tq = Tensor::Contiguous(dq.ptr(), DType::kF32, d, {T, HK, DK});
+    Tensor tk = Tensor::Contiguous(dk.ptr(), DType::kF32, d, {T, HK, DK});
+    Tensor tv = Tensor::Contiguous(dv.ptr(), DType::kF32, d, {T, HV, DV});
+    Tensor tg = Tensor::Contiguous(dg.ptr(), DType::kF32, d, {T, HV, DK});
+    Tensor tb = T2(db.ptr(), d, T, HV);
+    Tensor tst = Tensor::Contiguous(dst.ptr(), DType::kF32, d, {N, HV, DV, DK});
+    Tensor tqsl = TI32(dqsl.ptr(), d, N + 1);
+    Tensor tout = Tensor::Contiguous(dout.ptr(), DType::kF32, d, {T, HV, DV});
+    // ASSERTION 3. OpRegistered says a native provider EXISTS; this says the
+    // call did not fall through to the tier anyway.
+    const unsigned long long hits_before = vt::GetReferenceTierHits();
+    vt::KdaGatedDeltaRule(q, tout, tq, tk, tv, tg, tb, tst, tqsl, ga);
+    dev.Synchronize(q);
+    CHECK(vt::GetReferenceTierHits() == hits_before);
+    // ASSERTION 1. Green with no kernel at all — never read it alone.
+    CHECK(Nmse(ref_out, dout.Download()) <= kNmseTol);
+    CHECK(Nmse(ref_st, dst.Download()) <= kNmseTol);
+    dev.DestroyQueue(q);
+  }
+}
+
+
 TEST_CASE("RmsNormGated and SigmoidGate match the CPU oracle") {
   // §5. RmsNormGated: NMSE (rms reduction + gate activation), both gate
   // activations, and BOTH gate layouts — contiguous rank-2 and the padded-row

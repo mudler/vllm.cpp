@@ -49,4 +49,9 @@ changes residency-budget semantics, or needs a new kernel design.
 
 ## Now
 
-ACTIVE: integration and loader regression specified before code changes.
+DONE, and partly superseded. The integration this spec defines landed against
+target `08a34c3a7`. Main then moved the ROCm quant-GEMM registration into
+`src/vt/rocm/rocm_quant_dot.hip` and shipped IQ3_XXS there itself, so the
+second 2026-09-09 reconciliation dropped IQ3_XXS from this row. The
+IQ3_XXS loader-admission test this spec asked for is kept and still passes,
+now against main's kernel. See "Reconciliation with main" in the parent spec.

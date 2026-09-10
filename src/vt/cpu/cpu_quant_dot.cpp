@@ -985,6 +985,98 @@ void VecDotMXFP4Q8_0(int n, float* s, size_t bs, const void* vx, size_t bx,
 // the assembly tier, so exact-order comparisons must reference THIS symbol.
 VecDotFn QuantQ8PortableVecDot() { return &VecDotQ8_0Q8_0; }
 
+
+// TQ1_0/TQ2_0 (Vulkan-native ternary keep-quant) dotted against Q8_K activations.
+// These make the CPU keep-quant path NUMERICALLY CONSISTENT with the Vulkan native
+// shaders, which quantize activations to Q8_K on device. Previously the CPU TQ path
+// used the dequant-composite fallback (weight -> f32, exact f32 dot), so a Vulkan
+// vs CPU comparison carried the full Q8_K activation-quantization error (~0.5% NMSE)
+// and could never meet the keep-quant tests' nmse<1e-6 oracle. Now both sides
+// quantize activations to Q8_K identically (same signed-extremum iscale=-127/maxv,
+// same NearestInt, same clamp-to-127), so only accumulation order differs.
+void VecDotTQ2_0Q8_K(int n, float* s, size_t bs, const void* vx, size_t bx,
+                      const void* vy, size_t by, int nrc) {
+  VT_CHECK(n % kQK_K == 0, "vec_dot_tq2_0_q8_K: n must be a multiple of 256");
+  VT_CHECK(nrc == 1, "vec_dot_tq2_0_q8_K: generic tier supports nrc == 1 only");
+  (void)bs; (void)bx; (void)by; (void)nrc;
+  auto RdF16 = [](const uint8_t* p) {
+    uint16_t h;
+    std::memcpy(&h, p, 2);
+    return vt::F16ToF32(h);
+  };
+  const uint8_t* x = static_cast<const uint8_t*>(vx);
+  const BlockQ8_K* y = static_cast<const BlockQ8_K*>(vy);
+  const int nb = n / kQK_K;
+  float sumf = 0.0f;
+  for (int i = 0; i < nb; ++i) {
+    const uint8_t* blk = x + static_cast<size_t>(i) * 66;
+    const float d_w = RdF16(blk + 64);   // weight block scale (f16)
+    const float d_act = y[i].d;              // activation block delta
+    const int8_t* q8 = y[i].qs;
+    int32_t acc = 0;
+    for (int e = 0; e < kQK_K; ++e) {
+      const int j = (e >= 128) ? 32 : 0;
+      const int l = (e % 128) / 32;
+      const int k = e % 32;
+      const uint8_t code = (blk[j + k] >> (l * 2)) & 3;
+      const int trit = static_cast<int>(code) - 1;
+      acc += trit * q8[e];
+    }
+    sumf += static_cast<float>(acc) * d_act * d_w;
+  }
+  *s = sumf;
+}
+
+void VecDotTQ1_0Q8_K(int n, float* s, size_t bs, const void* vx, size_t bx,
+                      const void* vy, size_t by, int nrc) {
+  VT_CHECK(n % kQK_K == 0, "vec_dot_tq1_0_q8_K: n must be a multiple of 256");
+  VT_CHECK(nrc == 1, "vec_dot_tq1_0_q8_K: generic tier supports nrc == 1 only");
+  (void)bs; (void)bx; (void)by; (void)nrc;
+  auto RdF16 = [](const uint8_t* p) {
+    uint16_t h;
+    std::memcpy(&h, p, 2);
+    return vt::F16ToF32(h);
+  };
+  static const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+  const uint8_t* x = static_cast<const uint8_t*>(vx);
+  const BlockQ8_K* y = static_cast<const BlockQ8_K*>(vy);
+  const int nb = n / kQK_K;
+  float sumf = 0.0f;
+  for (int i = 0; i < nb; ++i) {
+    const uint8_t* blk = x + static_cast<size_t>(i) * 54;
+    const float d_w = RdF16(blk + 52);
+    const float d_act = y[i].d;
+    const int8_t* q8 = y[i].qs;
+    const uint8_t* qs = blk;
+    const uint8_t* qh = blk + 48;
+    int32_t acc = 0;
+    for (int l = 0; l < 5; ++l) {
+      for (int m = 0; m < 32; ++m) {
+        const uint8_t q = static_cast<uint8_t>(qs[m] * pow3[l]);
+        const int xi = (q * 3) >> 8;
+        acc += (xi - 1) * q8[l * 32 + m];
+      }
+    }
+    for (int l = 0; l < 5; ++l) {
+      for (int m = 0; m < 16; ++m) {
+        const uint8_t q = static_cast<uint8_t>(qs[32 + m] * pow3[l]);
+        const int xi = (q * 3) >> 8;
+        acc += (xi - 1) * q8[160 + l * 16 + m];
+      }
+    }
+    for (int l = 0; l < 4; ++l) {
+      const uint8_t p3 = (l == 0) ? 1u : (l == 1) ? 3u : (l == 2) ? 9u : 27u;
+      for (int j = 0; j < 4; ++j) {
+        const uint8_t q = static_cast<uint8_t>(qh[j] * p3);
+        const int xi = (q * 3) >> 8;
+        acc += (xi - 1) * q8[240 + l * 4 + j];
+      }
+    }
+    sumf += static_cast<float>(acc) * d_act * d_w;
+  }
+  *s = sumf;
+}
+
 VecDotFn BlockVecDot(DType dtype) {
   switch (dtype) {
     case DType::kQ4_0: return &VecDotQ4_0Q8_0;        // quants.c:174
@@ -1005,6 +1097,8 @@ VecDotFn BlockVecDot(DType dtype) {
     case DType::kIQ1_S: return &VecDotIQ1_SQ8_K;      // quants.c:1099
     case DType::kIQ1_XXXS: return &VecDotIQ1_XXXSQ8_K;  // fork quants.c:1281
     case DType::kMXFP4: return &VecDotMXFP4Q8_0;      // quants.c:247
+    case DType::kTQ2_0: return &VecDotTQ2_0Q8_K;
+    case DType::kTQ1_0: return &VecDotTQ1_0Q8_K;
     default:
       // kQ8_K is the ACTIVATION encoding — upstream gives it no vec_dot row
       // (it is only ever the `y` side of the K-quant kernels above), so a

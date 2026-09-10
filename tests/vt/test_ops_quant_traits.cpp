@@ -375,9 +375,14 @@ TEST_CASE("TQ2_0/TQ1_0 ternary block dtypes (geometry + dequant, no CPU vec_dot)
     // Has a QuantTraits row with vec_dot_type = kQ8_K...
     const vt::cpu::QuantTypeTraits& t = vt::cpu::QuantTraits(c.dtype);
     CHECK(t.vec_dot_type == c.vec_dot_type);
-    // ...but NO vec_dot (Vulkan-only), so HasQuantDotKernel is FALSE.
-    CHECK(t.vec_dot == nullptr);
-    CHECK_FALSE(vt::cpu::HasQuantDotKernel(c.dtype));
+    // Has a vec_dot against Q8_K activations (the CPU keep-quant tier that
+    // reproduces the on-device Vulkan shader, which quantizes activations to Q8_K),
+    // so HasQuantDotKernel is TRUE. Added with the TQ Vulkan shaders so the CPU
+    // fallback is numerically consistent with the GPU and the keep-quant tests compare
+    // against a Q8_K-quantized oracle at nmse<1e-6 (not the whole Q8_K
+    // activation-quantization error of the old exact-f32 composite oracle).
+    CHECK(t.vec_dot != nullptr);
+    CHECK(vt::cpu::HasQuantDotKernel(c.dtype));
     // Nothing quantizes an activation INTO them (weight-only encodings).
     CHECK(vt::cpu::BlockFromFloat(c.dtype) == nullptr);
   }

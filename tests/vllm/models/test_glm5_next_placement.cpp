@@ -134,10 +134,19 @@ struct Environment {
       static ExpertPlatform platform;
       vllm::platforms::RegisterPlatform(DeviceType::kROCM, &platform);
       vt::RegisterBackend({DeviceType::kROCM, 0}, &Backend());
-      vt::RegisterOp(vt::OpId::kMoeGateUpSwiGLUGrouped, DeviceType::kROCM,
-                     reinterpret_cast<void*>(&Gate));
-      vt::RegisterOp(vt::OpId::kMatmulBTQuantGrouped, DeviceType::kROCM,
-                     reinterpret_cast<void*>(&Down));
+      // Priority 100 under a test-only name so the fakes outrank real ROCm
+      // kernels (priority 0, kNativeProviderName) on a GPU build. RegisterOp
+      // would reuse kNativeProviderName and be silently ignored.
+      vt::OpProvider fake;
+      fake.name = "test-placement";
+      fake.priority = 100;
+      fake.supports = nullptr;
+      fake.fn = reinterpret_cast<void*>(&Gate);
+      vt::RegisterOpProvider(vt::OpId::kMoeGateUpSwiGLUGrouped,
+                             DeviceType::kROCM, fake);
+      fake.fn = reinterpret_cast<void*>(&Down);
+      vt::RegisterOpProvider(vt::OpId::kMatmulBTQuantGrouped,
+                             DeviceType::kROCM, fake);
       return true;
     }();
     (void)registered;

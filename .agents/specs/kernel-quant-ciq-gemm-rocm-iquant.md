@@ -209,8 +209,45 @@ reconciled tree. The contributor run at 41/42 cases and the operator's
 reproduction at head `fa39a45a3` (48/48 cases, 84,104 assertions) both
 exercised `DotIQ4XS` and `DotIQ3XXS` inside `rocm_grouped_gemm.hip`, which the
 merge removed. The operator's later `strix:gpu0` run covered the device-table
-seal, which moves in the same change. Re-run the gate on the reconciled tree
-and record that run instead.
+seal, which moves in the same change. The gate below replaces all three.
+
+### Measured on the reconciled tree
+
+`isravale` (RX 9060 XT, `gfx1200`, ROCm 7.2.3), every GPU command under
+`flock ${GPU_LOCK:-$HOME/gpu.lock}`, `llama-server.service` confirmed
+`inactive` before and after.
+
+RED, at merge commit `cf1f39396` with the port not yet applied:
+`test_backend_cross_device` 45/48, three cases failing. Each threw
+`vt rocm: matmul_bt_quant: no keep-quant kernel for dtype iq4_xs` or its
+grouped twin -- "non-grouped keep-quant GEMM ... matches the CPU oracle",
+"grouped quant expert GEMM ... matches the CPU oracle", and "ROCm IQ4_XS dots
+the ORACLE's own numbers on REAL checkpoint bytes". The loader suites were
+green there, which is the point: a GEMM the loader never routes to cannot be
+caught by the loader's own tests.
+
+GREEN, after the port:
+
+- `test_backend_cross_device` **48/48**, 84,104/84,104 assertions, five
+  consecutive full runs. One earlier run of the same binary reported one
+  failed case and did not reproduce in five; the recorded flake on this box is
+  `MoeSiluMul` (#1954).
+- `test_gguf_keep_quant` **55/55**, 11,980/11,980 assertions.
+- `test_gguf_device_fit` **24/24**, 182/182. `test_gguf_device_fit_reach`
+  **21/21**, 100/100.
+- `ctest -R 'rocm|cross_device'`: 10/10 targets pass, `test_rocm_quant_dot`
+  included.
+- The bit-exact IQ4_XS oracle case passes in the new location, so the
+  `-ffp-contract=off` finding holds where the code now lives rather than only
+  where it was measured. The flag is on `rocm_quant_dot.hip`'s own compile
+  line, read from the generated build command and not from `CMakeLists.txt`.
+- The device-codebook seal passes over the `vt::cuda` symbols the ROCm dots
+  index, which is the copy that now executes.
+
+Three `#2516` cases in `test_gguf_keep_quant.cpp` had to change encoding. They
+need one format the CPU keeps and ROCm expands, and they had been re-pointed at
+IQ4_XS when ROCm gained IQ1_S. Admitting IQ4_XS made them red for the right
+reason, and they now use IQ2_XS, which no ROCm provider implements.
 
 - Extend `test_ops_quant_dot.cpp`'s existing IQ4_XS `vec_dot`
   golden-vector gates (`iq2xs_iq4xs_dot_golden.h`, already committed and
@@ -246,6 +283,12 @@ and record that run instead.
   implementation wave for lack of a `rocprofv3` profiling setup on
   `isravale`, not silently dropped. The correctness gates (Tests) are
   unaffected by this being open.
+- A fresh end-to-end reload of the motivating checkpoint on the reconciled
+  tree. `Nail-Qwen3.6-35B-A3B-MTP-IQ4_XS.gguf` loaded and generated on the
+  pre-reconciliation head, and that head's IQ4_XS kernel no longer exists.
+  The artifact also carries no recorded repository revision and no sha256, so
+  `docs/USAGE.md` cannot pin it as this row's gate checkpoint until both are
+  measured.
 
 ## Stop conditions
 
@@ -267,7 +310,18 @@ that merge commit the three IQ4_XS cases in `test_backend_cross_device.cpp`
 are red, each throwing `no keep-quant kernel for dtype iq4_xs`. That is the
 red half of this row's red-and-green pair.
 
-Next in the same pull request: port `DotIQ4XS` into `rocm_quant_dot.hip`'s
-`WType` system, admit IQ4_XS in `DeviceKeepQuantSupported`, move the codebook
-seal to the translation unit that now owns the tables, and re-run the gate on
-`isravale` under the GPU file mutex.
+That port has now landed in the same pull request. `DotIQ4XS` sits in
+`rocm_quant_dot.hip`'s `WType` system, `DeviceKeepQuantSupported` admits
+IQ4_XS as ROCm's twelfth keep-quant format, the codebook seal moved to the
+translation unit that owns the tables, and the ROCm copy of those tables is
+deleted. The gate is under "Measured on the reconciled tree".
+
+The FMA-contraction risk resolved the same way it did before the move, and it
+was re-measured rather than carried: HIP's project-wide `-ffp-contract=off`
+reaches this translation unit, and the bit-exact oracle case passes with plain
+`*` and `+`.
+
+Remaining before `DONE`: the `ROCM-KQUANT-NWARPS-DECODE` re-measurement, which
+is `PENDING` for want of a `rocprofv3` setup on `isravale`, and a fresh
+end-to-end reload of the motivating checkpoint. The earlier reload ran on the
+pre-reconciliation head and does not carry over.

@@ -704,18 +704,21 @@ TEST_CASE(
   //
   // #2516: NAMED DEVICES, not `CurrentPlatform()`. This case is about the CPU
   // and CUDA `vec_dot` kernels #2247 added, and asking the running platform made
-  // it RED on every ROCm build for a reason the case did not state --
-  // `DeviceKeepQuantSupported` served exactly {Q8_0, Q4_K, Q5_K, Q6_K} there
-  // (#1940 owned the gap). Both answers are pinned instead, because the ROCm
-  // ones are a real property of this tree and a case that merely skipped them
-  // would stop noticing when #1940 landed.
+  // it RED on every ROCm build for a reason the case did not state. Both
+  // answers are pinned instead, because the ROCm one is a real property of this
+  // tree, and the case said a version that merely skipped it "would stop
+  // noticing when either gap lands".
   //
-  // KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT (#1940) is that landing, for IQ4_XS
-  // (ggml_type 23, `down_exps`): this case's own comment said a case that
-  // merely skipped the ROCm answer "would stop noticing when #1940 lands", so
-  // the per-tensor split below is that noticing, not a loosened assertion.
-  // IQ2_XS (ggml_type 17, `gate_exps`) is unaffected -- #1940's scope is
-  // IQ4_XS and IQ3_XXS only -- and keeps the same `kExpandBf16` pin on ROCm.
+  // One of the two gaps has landed, and the per-tensor split below is that
+  // noticing rather than a loosened assertion. ROCm now serves thirteen
+  // keep-quant formats: the five its GDN provider owns (Q8_0, IQ4_NL, Q4_K,
+  // Q5_K, Q6_K), and the eight the quant-dot provider brought (Q2_K, Q3_K,
+  // IQ2_XXS, IQ3_XXS, IQ2_S, IQ1_S, IQ1_XXXS, and IQ4_XS from
+  // KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT, #1940, pull request #3029). This
+  // fixture's `blk.1.ffn_down_exps.weight` is ggml_type 23 (IQ4_XS) and keeps
+  // on ROCm from here on. Its `blk.0.ffn_gate_exps.weight` is ggml_type 17
+  // (IQ2_XS), which no ROCm provider implements, so that tensor holds the
+  // `kExpandBf16` pin it had.
   for (const vllm::GgufTensorInfo& t : gguf.Tensors()) {
     CAPTURE(t.name);
     CHECK(vllm::RouteGgufTensor(true, false, false, false,
@@ -943,12 +946,11 @@ TEST_CASE(
   vllm::GgufLoadPolicy rocm = PolicyWith(true, false, false, false);
   rocm.device = vt::DeviceType::kROCM;
 
-  // NO PLAN: this fixture's `gate_exps` tower is IQ2_XS, which ROCm still has
-  // no `vec_dot` for (#1940 tracks IQ2_XS as owed; only IQ4_XS and IQ3_XXS
-  // landed under KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT). The lane is all-or-
-  // nothing over BOTH `_exps.weight` towers, so one unsupported encoding still
-  // fails the whole predicate even though the OTHER tower (`down_exps`,
-  // IQ4_XS) now keeps on ROCm by itself -- see the per-tensor split in
+  // NO PLAN: this fixture's `gate_exps` tower is IQ2_XS, which no ROCm provider
+  // implements (#1940 still owns that gap), so it expands. The lane is
+  // all-or-nothing over BOTH `_exps.weight` towers, so one unsupported encoding
+  // fails the whole predicate even though the OTHER tower (`down_exps`, IQ4_XS)
+  // keeps on ROCm by itself since #3029 -- see the per-tensor split in
   // "gguf_device_fit: IQ2_XS and IQ4_XS expert towers REACH the slot lane"
   // above. This is the state #2516 reports and the inertness pin for every
   // ROCm load that configures no placement.

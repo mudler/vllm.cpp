@@ -5,7 +5,9 @@ Issue: [#2942](https://github.com/mudler/vllm.cpp/issues/2942)
 
 ## Now
 
-`ACTIVE`, implementation pending. Base
+`ACTIVE`, implementation committed (`8d0186d79`), device gate `PENDING`.
+CPU-only build and test pass; the ROCm `.hip` TU and the `gfx1151` test
+case are pending a HIP toolchain and AMD device. Base
 `ed03e50ee8e8e3723f9b8c5fae1f1a5f6e8e8a5d`.
 
 ## Scope

@@ -12,7 +12,46 @@
 - Pull request shape: separate spec and implementation pull requests
   (developer decision 2026-09-05, recorded in
   `.agents/developer-preferences.md`). The spec landed in its own pull
-  request first; this implementation is the second.
+  request first. Pull request #3029 carries the implementation and the
+  reconciliation below.
+
+## Reconciliation with main, 2026-09-09
+
+Main restructured the ROCm quant-GEMM dispatch while #3029 was open, and this
+section records what the branch had to give up and what it kept.
+
+`src/vt/rocm/rocm_quant_dot.hip` is new on main. It owns the `kROCM`
+registration of `OpId::kMatmulBTQuant` and `OpId::kMatmulBTQuantGrouped`
+(`rocm_ops.hip`). The former entry points in `rocm_grouped_gemm.hip` were
+renamed `MatmulBTQuantKernelRocmGdn` and `MatmulBTQuantGroupedKernelRocmGdn`,
+and the new wrapper delegates to them for Q8_0, Q4_K, Q5_K and Q6_K only.
+Every other dtype resolves through the wrapper's own `enum class WType`,
+`DotSuperblock<WType>` specializations, `IsRocmKeepQuantSupported`,
+`LaunchGemm` and `LaunchGroupedGemm`.
+
+**IQ3_XXS leaves this row.** Main implements and registers it in
+`rocm_quant_dot.hip` as `WType::kIQ3_XXS`. Its `DotIQ3XXS` reads the same
+`d_iq3xxs_grid`, `d_ksigns_iq2xs` and `d_kmask_iq2xs` tables in the same
+order as the body this branch wrote, and defers the same 0.25 final factor
+to the warp reduction. Both are ports of `cuda_quant_dot.cu::DotIQ3XXS`, and
+they differ only in how the tables are named. The branch's copy sat inside the
+renamed GDN function, which the wrapper never reaches for IQ3_XXS, so keeping
+it would have landed dead code beside a working implementation.
+
+**IQ4_XS stays with this row and changes address.** No part of
+`rocm_quant_dot.hip` mentions IQ4_XS on main, and `DeviceKeepQuantSupported`
+does not admit it. Main's own `docs/USAGE.md` says the format "remains
+separate work in #3029". The branch's `DotIQ4XS` body is preserved unchanged
+in substance and moves into the wrapper's `WType` system, because the GDN
+function it used to live in is unreachable for this dtype.
+
+**The device-codebook seal follows the tables it seals.** The branch added
+`SnapshotIqTablesFromDevice` beside a ROCm copy of the codebooks in
+`rocm_quant_iq_tables.h`. Main's wrapper reads `vt/cuda/cuda_quant_iq_tables.cuh`
+instead, which is plain `__device__` syntax and compiles under HIP. The seal
+moves into `rocm_quant_dot.hip` and snapshots those symbols, and the ROCm
+copy of the tables is deleted. A seal over a table no kernel reads measures
+nothing.
 
 ## Scope
 
@@ -68,33 +107,42 @@ adaptation of an existing algorithm.
 |---|---|---|---|
 | `IQ4_XS` | `DotIQ4XS`, `cuda_quant_dot.cu:650` | `VecDotIQ4_XSQ8_K`, `cpu_quant_dot.cpp:844` | `quants.c:1283` `ggml_vec_dot_iq4_xs_q8_K_generic` |
 
-The CUDA bodies are the ones to adapt line-for-line into
-`rocm_grouped_gemm.hip`'s existing `__device__ inline float Dot*(const
-Block*, const BlockQ8_K*)` shape (matching `DotQ4K`/`DotQ5K`/`DotQ6K`'s
+The CUDA body is the one to adapt line-for-line into
+`rocm_quant_dot.hip`'s existing `__device__ inline float Dot*(const Block*,
+const BlockQ8_K*)` shape (matching `DotQ4K`/`DotIQ3XXS`/`DotIQ2S`'s
 signature), because CUDA already carries the oracle-verified accumulation
 order (see Risks) that a fresh transcription from the CPU generic body could
 silently reassociate.
 
-`IQ4_XS` needs only `d_kvalues_iq4nl` (16 entries, already small enough to
-inline as a `__constant__`/`__device__` array directly, matching CUDA's
-approach).
+`IQ4_XS` needs only `d_kvalues_iq4nl` (16 entries). The wrapper already
+includes `vt/cuda/cuda_quant_iq_tables.cuh`, which defines that table, so the
+port adds no table of its own.
 
 ## Design
 
-Add `DotIQ4XS` beside the current format arms with the same `__device__ inline
-float Dot*(const Block*, const BlockQ8_K*)` signature. Dispatch it through the
-existing `nsb = K / 256` loop. This is a dispatch-table extension, not a new
-kernel family.
+Add `DotIQ4XS` beside the wrapper's other format arms with the same
+`__device__ inline float Dot*(const Block*, const BlockQ8_K*)` signature.
+Dispatch it through the existing `nsb = K / 256` loop. This is a dispatch-table
+extension, not a new kernel family.
 
-Wire IQ4_XS into:
+Wire IQ4_XS into `src/vt/rocm/rocm_quant_dot.hip`:
+
+- `enum class WType` — one new value, `kIQ4_XS`.
+- `DotSuperblock<WType::kIQ4_XS>` — the one-line specialization every sibling
+  format has.
+- `FinalFactor<W>` — IQ4_XS keeps the default 1.0. Its per-sub-block delta is
+  already folded into `d1` and `d2` inside the dot body.
+- `IsRocmKeepQuantSupported` — one `case DType::kIQ4_XS`.
+- The `LaunchGemm` and `LaunchGroupedGemm` switches — one case each. A missing
+  case there throws by design (#967), so both arms move together.
+
+Then wire the loader and the refusals:
 
 - `DeviceKeepQuantSupported`'s `kROCM` arm (`gguf_keep_quant.cpp:136-145`) —
   add `dt == vt::DType::kIQ4_XS`.
-- The two refusal-message switches in `rocm_grouped_gemm.hip` (`:889`,
-  `:959`) — remove IQ4_XS from the unsupported list and add its dispatch case.
-- Whatever grouped/plain GEMM dtype switch selects `DotQ4K` etc. today
-  (mirror the CUDA `WType` enum shape if ROCm has an equivalent, otherwise
-  the existing block-dtype `switch`).
+- The two refusal messages in `rocm_grouped_gemm.hip` — move IQ4_XS from the
+  `unimplemented` list to the `wrapper-owned` list. The GDN provider itself
+  gains no IQ4_XS arm, because the wrapper never delegates this dtype to it.
 
 ## Upstream anchor
 
@@ -155,88 +203,37 @@ llama.cpp, pin `b10451` per `.agents/upstream-sync.md`.
 
 ## Tests
 
-Landed, on `isravale` (RX 9060 XT, gfx1200, ROCm 7.2.3), GPU work under
-`flock ${GPU_LOCK:-$HOME/gpu.lock}` throughout:
+Every ROCm number this row measured before 2026-09-09 was taken against the
+superseded code location, so it is retained as history and does not gate the
+reconciled tree. The contributor run at 41/42 cases and the operator's
+reproduction at head `fa39a45a3` (48/48 cases, 84,104 assertions) both
+exercised `DotIQ4XS` and `DotIQ3XXS` inside `rocm_grouped_gemm.hip`, which the
+merge removed. The operator's later `strix:gpu0` run covered the device-table
+seal, which moves in the same change. Re-run the gate on the reconciled tree
+and record that run instead.
 
-- **`test_backend_cross_device.cpp`**, three cases touched/added, run
-  standalone and as part of the full file (41/42 cases, 83998/83999
-  assertions — the one failure is `MoeSiluMul matches the CPU oracle within
-  NMSE <= 5e-4`, confirmed PRE-EXISTING and unrelated: byte-identical
-  mismatch reproduced on an independent binary built from the sibling
-  `KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4-w1` worktree, which touches neither this
-  kernel nor this dtype):
-  - "non-grouped keep-quant GEMM (...IQ4_XS/IQ3_XXS) matches the CPU
-    oracle" — both new formats added to the existing table-driven CPU-vs-
-    ROCm case, NMSE ≤ 5e-4, random valid blocks (unconstrained lookup
-    indices need no in-range fixture change).
-  - "grouped quant expert GEMM (...IQ4_XS/IQ3_XXS) matches the CPU oracle"
-    — same extension on the grouped/MoE path, the one the motivating
-    checkpoint's routed experts actually use.
-  - "ROCm IQ4_XS dots the ORACLE's own numbers on REAL checkpoint bytes"
-    (NEW) — the bit-exact gate the FMA-contraction risk needed, ported from
-    `test_cuda_quant_dot.cpp`'s `CheckCudaOracleDot` shape onto the same
-    golden vectors: bit-exact per-superblock (k=256, one contributing lane)
-    and warp-reduction-order-exact combined (k=1024, four lanes, primary
-    bit-equality + secondary reassociation-bound check). 13/13 assertions.
-- **`test_gguf_keep_quant.cpp`**: the exhaustive per-device totality table's
-  hand-mirrored ROCm predicate and its `gemm_kept` constant (8 → 10) updated
-  to admit IQ4_XS; IQ3_XXS is not in this test's `all_types` enumeration
-  (a pre-existing gap shared with Q2_K, not closed by this row) and is left
-  to the cross-device gate above. 52/52 cases, 10325/10325 assertions.
-- **`test_gguf_device_fit.cpp`**: `#2516`'s two ROCm residency pins split
-  per-tensor (IQ4_XS's `down_exps` now expects `kKeepQuant` on ROCm;
-  IQ2_XS's `gate_exps` is unaffected and still expects `kExpandBf16`,
-  since #1940's other five formats stay owed); the all-or-nothing
-  "NO PLAN" case is unchanged in outcome (`CHECK_FALSE` still holds, because
-  the still-unsupported IQ2_XS tower alone fails the lane) with its comment
-  corrected to say why. 24/24 cases, 182/182 assertions.
-- `ctest -R 'rocm|cross_device'` (plus the individually-run ROCm suites
-  `test_rocm_arch`/`test_rocm_backend`/`test_exl3_rocm`/
-  `test_gemma4_rocm_fp8_seams`/`test_rocm_fp8_kv_cache`): zero regression,
-  all green.
-
-**End-to-end reload — the row's actual acceptance criterion — LANDED.**
-`Nail-Qwen3.6-35B-A3B-MTP-IQ4_XS.gguf` (19.39 GB on disk, `isravale`
-`/home/justin/Nail/`) is the real motivating checkpoint, not a stand-in: its
-own header histogram is `{BF16: 2, F32: 308, IQ4_XS: 391, Q5_K: 51,
-Q6_K: 1}` — every quantized tensor in the file is one of the three dtypes
-this row's target hardware now has a keep-quant kernel for (read with
-`docs/bench-evidence/limb3-vehicle-search-20260904/gguf_header.py` before
-running anything, not assumed from the filename).
-
-```
-VT_DEVICE_WEIGHT_BUDGET_BYTES=13000000000 \
-./build-hip/examples/vllm-cli --model /home/justin/Nail/Nail-Qwen3.6-35B-A3B-MTP-IQ4_XS.gguf \
-  --device auto --max-num-seqs 1 --kv-cache-dtype fp8 --kv-cache-memory 2000000000 \
-  --prompt "The capital of France is" --max-tokens 16
-```
-
-```
-engine: device placement INSTALLED: 15 layers run their routed experts on cpu, the rest on rocm (resolved against 40 layers, origin fit)
-engine: device placement: --fit placed 15 layer(s) (6417285120 B) to bring a 19333564672 B footprint under a 13000000000 B budget
-vllm-cli: run=1/1 finish_reason=length prompt_tokens=5 completion_tokens=16 secs=3.919 tok_s=4.083
- Paris. The capital of Germany is Berlin. The capital of Italy is Rome.
-```
-
-The decisive number is the **19,333,564,672 B (~18.01 GiB) footprint** --
-it matches the file's on-disk size, not the ~70 GiB a bf16 expansion of
-these tensors would produce. That is the keep-quant residency actually
-taking effect on ROCm, not merely compiling: before this row,
-`DeviceKeepQuantSupported` routed every IQ4_XS tower to `kExpandBf16` here
-and the streamed-expert lane's blow-up SIGSEGV'd this same box on this
-family of checkpoint (`vllm-cpp-rocm-crash-iq4xs` session memory). Clean
-exit, coherent completion, zero crash. Not a synthetic fixture, not a
-narrower stand-in geometry -- the actual artifact the row exists for.
-
-Not done in this wave (see Owed):
-
-- The `ROCM-KQUANT-NWARPS-DECODE` re-measurement (`rocprofv3 --kernel-trace`
-  on a real quant-matched trace workload) — this issue's own stated reason
-  for existing beyond plain coverage. `isravale` has no `rocprofv3` profiling
-  set up in this session; the correctness gates above stand on their own,
-  but the nwarps question is still open. The 4.083 tok/s figure above is NOT
-  a substitute measurement for it: it is a mixed CPU+ROCm run at a
-  CPU-offload-heavy split, not an isolated ROCm-kernel throughput number.
+- Extend `test_ops_quant_dot.cpp`'s existing IQ4_XS `vec_dot`
+  golden-vector gates (`iq2xs_iq4xs_dot_golden.h`, already committed and
+  sourced from real `unsloth/GLM-5.3-Flash-GGUF` checkpoint bytes) to a new
+  `test_rocm_quant_dot.cpp`, same shape as the CUDA gate
+  (`test_cuda_quant_dot.cpp`): bit-exact for IQ4_XS against the same
+  real-checkpoint golden values CUDA's gate uses, since
+  bit-exactness is the property the FMA-contraction risk above is actually
+  about.
+- `test_backend_cross_device.cpp`: add IQ4_XS to the CPU-vs-ROCM cross-check.
+- Rerun `ROCM-KQUANT-NWARPS-DECODE`'s own measurement recipe
+  (`rocprofv3 --kernel-trace` on a real quant-matched trace workload) for
+  IQ4_XS specifically, to answer the nwarps question this issue was
+  filed to test — record the result (transfers / does not transfer) rather
+  than assuming either.
+- `ctest -R 'rocm|cross_device'`, zero regression on the four existing
+  formats' numerics.
+- End-to-end: reload the motivating checkpoint (or a same-format synthetic
+  fixture if the real 35B-A3B artifact is not staged on the gate host) on
+  `isravale` (RX 9060 XT, gfx1200) or an `rc`-leased ROCm fleet device, and
+  confirm keep-quant residency replaces the prior bf16 SIGSEGV — this is
+  the row's actual acceptance criterion, not merely the unit-level dot
+  gates.
 
 ## Owed
 
@@ -264,24 +261,13 @@ Not done in this wave (see Owed):
 
 ## Now
 
-`ACTIVE`. W0 (FMA-contraction probe), W1 (`DotIQ4XS`) and W2 (`DotIQ3XXS`)
-are LANDED in this pull request, on both the plain (`MatmulBTQuantKernelRocm`
-/ `KQuantGemmK`) and grouped/MoE (`MatmulBTQuantGroupedKernelRocm` /
-`GroupedKQ8K`) arms, plus `DeviceKeepQuantSupported`'s ROCm admission list.
-Gated per the Tests section above, on target hardware (`isravale`,
-RX 9060 XT / gfx1200), zero regression. The FMA-contraction risk resolved in
-favor of the simpler path: HIP's project-wide `-ffp-contract=off` is
-sufficient, no CUDA-style non-fused-multiply workaround needed.
+`ACTIVE`. Pull request #3029 merged main's quant-dot dispatch and dropped
+IQ3_XXS from this row, for the reasons under "Reconciliation with main". At
+that merge commit the three IQ4_XS cases in `test_backend_cross_device.cpp`
+are red, each throwing `no keep-quant kernel for dtype iq4_xs`. That is the
+red half of this row's red-and-green pair.
 
-**The real-checkpoint end-to-end reload also LANDED**, after this pull
-request was first drafted: `Nail-Qwen3.6-35B-A3B-MTP-IQ4_XS.gguf` loads and
-generates coherent tokens on `isravale`, with the resident footprint
-(~18.01 GiB) matching the on-disk size rather than a bf16 blow-up — see
-Tests. That was the row's actual acceptance criterion, and it is now
-satisfied on the artifact that motivated the row, not a synthetic
-stand-in.
-
-Remaining before `DONE`: only the `ROCM-KQUANT-NWARPS-DECODE`
-re-measurement (`PENDING`, see Owed) — it does not block this pull request,
-since the row's own scope is coverage and correctness, and it is named
-rather than silently dropped.
+Next in the same pull request: port `DotIQ4XS` into `rocm_quant_dot.hip`'s
+`WType` system, admit IQ4_XS in `DeviceKeepQuantSupported`, move the codebook
+seal to the translation unit that now owns the tables, and re-run the gate on
+`isravale` under the GPU file mutex.

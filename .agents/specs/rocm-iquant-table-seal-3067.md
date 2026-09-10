@@ -8,10 +8,10 @@ Repair base: `b2ee9d8389caf974f3178613a6313e788dd93c4b`.
 
 ## Gap and source
 
-The parent spec and `rocm_quant_iq_tables.h:17-20` require a complete seal.
-Review found no executing comparison of the four ROCm device tables against
-their CPU references. Host-parsed arrays currently agree, but that inspection
-does not pin every executing device byte in a regression test.
+The parent spec requires a complete seal. Review found no executing comparison
+of the four ROCm device tables against their CPU references. Host-parsed arrays
+currently agree, but that inspection does not pin every executing device byte
+in a regression test.
 
 Mirror the existing CUDA snapshot in `cuda_quant_dot.cu:2637` and the test in
 `test_cuda_quant_dot.cpp:1702`. The CPU tables carry the parent spec's pinned
@@ -21,7 +21,11 @@ llama.cpp reference. This change adds no quantization algorithm or oracle.
 
 Add a HIP-free internal snapshot declaration for the four arrays:
 `d_kmask_iq2xs`, `d_ksigns_iq2xs`, `d_iq3xxs_grid`, and `d_kvalues_iq4nl`.
-Define the copy in `rocm_grouped_gemm.hip`, which defines the device symbols.
+Define the copy in the translation unit that owns the device symbols the ROCm
+dots read. Since the 2026-09-09 reconciliation onto main's quant-dot dispatch
+(see the parent spec) that unit is `rocm_quant_dot.hip`, and the symbols are
+the `vt::cuda` ones `cuda_quant_iq_tables.cuh` defines. Sealing any other copy
+would measure a table no ROCm kernel reads.
 Use `hipMemcpyFromSymbol` and the existing HIP error checker. Compile-time
 extent checks prevent truncation. Do not change table values, storage classes,
 arithmetic, dispatch, or any other quantized format.

@@ -15,7 +15,9 @@ struct IqTableSnapshot {
 };
 
 // Copy the actual device symbols into out. Requires a live HIP context and
-// throws on copy failure. Defined beside the symbols in rocm_grouped_gemm.hip.
+// throws on copy failure. Defined in rocm_quant_dot.hip, the translation unit
+// that compiles the `vt::cuda::d_*` tables the ROCm dots actually index, so the
+// snapshot reads the device image that executes rather than host literals.
 void SnapshotIqTablesFromDevice(IqTableSnapshot* out);
 
 }  // namespace vt::rocm

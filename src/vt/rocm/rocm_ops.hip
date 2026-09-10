@@ -138,6 +138,20 @@ void GdnDecodeKernelRocm(Queue& q, Tensor& out, const Tensor& q_in, const Tensor
 void KdaGatedDeltaRuleKernelRocm(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
                                  const Tensor& v, const Tensor& g, const Tensor& beta,
                                  Tensor& state, const Tensor& qsl, const GdnArgs& args);
+// BACKEND-ROCM-KPOOL (#2942, rocm_glm5_next_kpool.hip): the GLM-5.3-Flash
+// k-pool DSA indexer pair. Staged slice: unreached by the model forward until
+// the compose (W9c-0, #2415) that would call them exists. No CPU provider by
+// design — the host reference glm5_next_dsa.cpp is the oracle, not a second
+// registration under the same OpId.
+void Glm5NextKpoolCompressRocm(Queue& q, Tensor& pool_keys, Tensor& pool_indices,
+                               Tensor& pool_valid, Tensor& num_pools, const Tensor& packed,
+                               const Tensor& ape);
+void Glm5NextKpoolSelectRocm(Queue& q, Tensor& topk_indices, Tensor& index_scores,
+                             const Tensor& q_states, const Tensor& head_weights,
+                             const Tensor& pool_keys, const Tensor& pool_indices,
+                             const Tensor& pool_valid, const Tensor& num_pools,
+                             const Tensor& valid_keys, const Tensor& q_mask,
+                             const Glm5NextKpoolSelectArgs& args);
 // BACKEND-ROCM-GDN-KERNELS family 5 (rocm_gdn_fused.hip): gated RMSNorm,
 // sigmoid gate, and the fused full-attention preamble.
 void RmsNormGatedKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
@@ -293,6 +307,12 @@ struct Registrar {
     RegisterOp(OpId::kKdaGatedDeltaRule, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<KdaGatedDeltaRuleFn>(
                    &KdaGatedDeltaRuleKernelRocm)));
+    RegisterOp(OpId::kGlm5NextKpoolCompress, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<Glm5NextKpoolCompressFn>(
+                   &Glm5NextKpoolCompressRocm)));
+    RegisterOp(OpId::kGlm5NextKpoolSelect, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<Glm5NextKpoolSelectFn>(
+                   &Glm5NextKpoolSelectRocm)));
     RegisterOp(OpId::kRmsNormGated, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<RmsNormGatedFn>(&RmsNormGatedKernelRocm)));

@@ -1735,6 +1735,7 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_gdn_postconv.hip
     src/vt/rocm/rocm_gdn_scan.hip
     src/vt/rocm/rocm_kda_scan.hip
+    src/vt/rocm/rocm_glm5_next_kpool.hip
     src/vt/rocm/rocm_gdn_fused.hip
     src/vt/rocm/rocm_mla_fused_norm_rope.hip
     src/vt/rocm/rocm_mla_ops.hip
@@ -1765,6 +1766,7 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_gdn_postconv.hip
       src/vt/rocm/rocm_gdn_scan.hip
       src/vt/rocm/rocm_kda_scan.hip
+      src/vt/rocm/rocm_glm5_next_kpool.hip
       src/vt/rocm/rocm_gdn_fused.hip
       src/vt/rocm/rocm_mla_fused_norm_rope.hip
       src/vt/rocm/rocm_mla_ops.hip

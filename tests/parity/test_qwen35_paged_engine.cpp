@@ -538,6 +538,235 @@ void RunGate(const std::string& golden_subdir, const char* label,
   REQUIRE(fail == 0);
 }
 
+// KEEPQUANT W4c (issue #3079): the int8-dot LANE's own end-to-end gate.
+//
+// The lane (W4b's `VT_TT_KEEPQUANT_INT8DOT`, op-level bit-exact vs the pinned
+// llama.cpp `ggml_vec_dot_*` integer domain) cannot be adjudicated by the
+// ROCm-domain pair — the W4b outcome recorded the ≤500-mnat band failing at
+// cell (5,7) with 1125 mnats there. The lane's denominator is therefore the
+// `llama-cpp` oracle ITSELF (registered, gateable = yes): this battery runs
+// the vehicle's captured production path over the standard 16-prompt battery
+// with the lever ON and adjudicates against the LANE pair committed under
+// tests/parity/goldens/qwen35_gguf_q4km_lanegate/ — the pin's teacher-forced
+// gap on OUR captured prefix, in the established pair convention. Adjudication
+// mirrors RunGate exactly: anchor drift is a hard REQUIRE (regression
+// suspect), 0 forward-divergent cells, every flip inside the ratified band,
+// an exact tie with a different id is legit (gap 0 is inside any band). The
+// determinism leg re-runs the battery in-process through a SECOND engine load
+// (a second decode-graph capture — the op-level capture test's x2
+// byte-identity mechanism at vehicle scale) and REQUIREs the byte-identical
+// token stream, reporting the device trace demand per run.
+//
+// Opt-in by design: the lever is default OFF (the default-config flip is a
+// recorded NEEDS_DECISION), so without VT_TT_KEEPQUANT_INT8DOT this gate
+// skips loudly and the default vehicle battery above stays the W4a invariant.
+constexpr int32_t kLaneBandMnats = 500;  // the row's ratified starting band
+
+void RunLaneGate(const std::string& golden_subdir, const char* label,
+                 const std::string& model) {
+  const fs::path gdir = fs::path(PARITY_GOLDENS_DIR) / golden_subdir;
+  const bool dump = std::getenv("VT_DUMP_IDS") != nullptr;
+  const bool have_anchor = fs::exists(gdir / "our_ids.npy");
+  const bool have_gap = fs::exists(gdir / "neartie_gap_mnats.npy");
+  if (!have_anchor || !have_gap) {
+    if (dump) {
+      // BOOTSTRAP: the lane pair does not exist yet — generate the 16
+      // prompts with the lever ON and dump OUR token ids so the pinned
+      // llama.cpp oracle can teacher-force them
+      // (scripts/qwen3-neartie-gap-llamacpp-oracle.py).
+      MESSAGE(label << ": BOOTSTRAP dump (lane pair absent) via "
+                       "FromModelDir("
+                    << model << ") with VT_TT_KEEPQUANT_INT8DOT=1...");
+      std::unique_ptr<vllm::entrypoints::LoadedEngine> le =
+          vllm::entrypoints::LoadedEngine::FromModelDir(
+              model, vllm::entrypoints::EngineParams{});
+      std::vector<int32_t> buf;
+      for (size_t i = 0; i < Prompts().size(); ++i) {
+        const vllm::RequestOutput out = le->engine().generate(
+            Prompts()[i], Greedy(16), "laneboot" + std::to_string(i));
+        REQUIRE(out.finished);
+        const std::vector<int32_t>& got = out.outputs[0].token_ids;
+        REQUIRE(static_cast<int64_t>(got.size()) == 16);
+        buf.insert(buf.end(), got.begin(), got.end());
+      }
+      const fs::path path = gdir / "our_ids.i32";
+      std::FILE* f = std::fopen(path.string().c_str(), "wb");
+      if (f != nullptr) {
+        std::fwrite(buf.data(), sizeof(int32_t), buf.size(), f);
+        std::fclose(f);
+      }
+      MESSAGE(label << " BOOTSTRAP dumped our token ids -> " << path);
+      SkipGate(label, "bootstrap does not run the correctness gate. Run "
+                      "scripts/qwen3-neartie-gap-llamacpp-oracle.py, commit "
+                      "the lane pair, then rerun without VT_DUMP_IDS");
+    }
+    // RED-BY-ABSENCE: a loud skip naming the missing pair is NOT a pass —
+    // the opt-in battery must FAIL until the lane pair exists.
+    const bool have_pair = have_anchor && have_gap;
+    REQUIRE_MESSAGE(have_pair == true,
+                    label << ": the LANE PAIR IS ABSENT in " << gdir
+                          << " (our_ids.npy: " << have_anchor
+                          << ", neartie_gap_mnats.npy: " << have_gap
+                          << ") — capture with VT_DUMP_IDS=1 under "
+                             "VT_TT_KEEPQUANT_INT8DOT=1, build the pair with "
+                             "scripts/qwen3-neartie-gap-llamacpp-oracle.py "
+                             "(pinned llama.cpp b10451 oracle), and commit it. "
+                             "This failure is the red-first evidence");
+  }
+
+  MESSAGE(label << ": loading via FromModelDir(" << model << ")...");
+  std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded =
+      vllm::entrypoints::LoadedEngine::FromModelDir(model,
+                                                    vllm::entrypoints::EngineParams{});
+  const vt::DeviceType run_dev = loaded->runner().device().type;
+  REQUIRE_MESSAGE(run_dev == vt::DeviceType::kTENSTORRENT,
+                  label << ": the lane battery is Tenstorrent-only; this run "
+                           "is on device type "
+                        << static_cast<int>(run_dev));
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBTQuant, run_dev));
+  vt::ResetOpProviderStats(vt::OpId::kMatmulBTQuant, run_dev);
+  vt::EnableOpProviderCallStats(true);
+
+  const parity::NpyArray g = parity::LoadNpy((gdir / "greedy_ids.npy").string());
+  const parity::NpyArray o = parity::LoadNpy((gdir / "our_ids.npy").string());
+  const parity::NpyArray gap = parity::LoadNpy((gdir / "neartie_gap_mnats.npy").string());
+  REQUIRE(g.dtype == "<i4");
+  REQUIRE(o.dtype == "<i4");
+  REQUIRE(gap.dtype == "<i4");
+  const int64_t N = g.shape[0];
+  const int64_t T = g.shape[1];
+  REQUIRE(static_cast<size_t>(N) == Prompts().size());
+  REQUIRE(o.shape.size() == 2);
+  REQUIRE(o.shape[0] == N);
+  REQUIRE(o.shape[1] == T);
+  REQUIRE(gap.shape.size() == 2);
+  REQUIRE(gap.shape[0] == N);
+  REQUIRE(gap.shape[1] == T);
+  const int32_t* gd = AsI32(g);
+  const int32_t* od = AsI32(o);
+  const int32_t* gapd = AsI32(gap);
+
+  if (vt::tenstorrent::DecodeCaptureEnabled())
+    vt::tenstorrent::ResetKeepQuantCaptureStagingWritesForTest();
+
+  int strict_exact = 0;
+  int neartie_only = 0;
+  int fail = 0;
+  int32_t worst_gap = 0;
+  int worst_i = -1, worst_j = -1;
+  std::vector<int32_t> run1;
+  for (int64_t i = 0; i < N; ++i) {
+    const vllm::RequestOutput out = loaded->engine().generate(
+        Prompts()[static_cast<size_t>(i)], Greedy(static_cast<int>(T)),
+        "lane" + std::to_string(i));
+    REQUIRE(out.finished);
+    const std::vector<int32_t>& got = out.outputs[0].token_ids;
+    REQUIRE(static_cast<int64_t>(got.size()) == T);
+    run1.insert(run1.end(), got.begin(), got.end());
+
+    int first_div = -1;
+    for (int64_t j = 0; j < T; ++j) {
+      if (got[static_cast<size_t>(j)] != od[i * T + j]) {
+        first_div = static_cast<int>(j);
+        break;
+      }
+    }
+    REQUIRE_MESSAGE(first_div < 0,
+                    label << " anchor drift prompt[" << i << "] tok=" << first_div
+                          << " engine="
+                          << (first_div < 0 ? -1 : got[static_cast<size_t>(first_div)])
+                          << " committed lane anchor="
+                          << (first_div < 0 ? -1 : od[i * T + first_div])
+                          << " — REGRESSION SUSPECTED: the lane capture is the "
+                             "fixed lever path's sequence; re-derive only after "
+                             "the drift is proven a justified numerical change");
+    bool exact = true;
+    bool prompt_ok = true;
+    int first_bad = -1;
+    for (int64_t j = 0; j < T; ++j) {
+      if (got[static_cast<size_t>(j)] != gd[i * T + j]) exact = false;
+      const int32_t mn = gapd[i * T + j];
+      if (mn > worst_gap) {
+        worst_gap = mn;
+        worst_i = static_cast<int>(i);
+        worst_j = static_cast<int>(j);
+      }
+      if (mn > kLaneBandMnats) {
+        prompt_ok = false;
+        if (first_bad < 0) first_bad = static_cast<int>(j);
+      }
+    }
+    if (!prompt_ok) {
+      ++fail;
+      MESSAGE(label << " FORWARD DIVERGENCE prompt[" << i << "] tok=" << first_bad
+              << " our=" << got[static_cast<size_t>(first_bad)]
+              << " llamacpp_greedy=" << gd[i * T + first_bad]
+              << " gap=" << (gapd[i * T + first_bad] / 1000.0) << " nats (> "
+              << (kLaneBandMnats / 1000.0) << ") \"" << out.outputs[0].text
+              << "\"");
+    } else if (exact) {
+      ++strict_exact;
+    } else {
+      ++neartie_only;
+    }
+    CHECK(prompt_ok);
+  }
+  {
+    const int64_t staged = vt::tenstorrent::KeepQuantCaptureStagingWrites();
+    CHECK_MESSAGE(staged == 0,
+                  label << ": keep-quant decode staged " << staged
+                        << " word uploads DURING the captured e2e (the #2812 "
+                           "class)");
+    MESSAGE(label << ": device trace demand at last capture end = "
+            << vt::tenstorrent::LastTraceBytesForTest()
+            << " B (lane run 1; dynamic trace region)");
+  }
+  const int64_t selections =
+      vt::GetOpProviderStats(vt::OpId::kMatmulBTQuant, run_dev).selections;
+  const int64_t declines =
+      vt::GetOpProviderStats(vt::OpId::kMatmulBTQuant, run_dev).declines;
+  CHECK_MESSAGE(selections > 0,
+                label << ": kMatmulBTQuant never dispatched (lane e2e reach)");
+  CHECK_MESSAGE(declines == 0,
+                label << ": kMatmulBTQuant DECLINED and fell back");
+  vt::EnableOpProviderCallStats(false);
+
+  // Determinism leg: a SECOND engine load in this process is a SECOND decode
+  // capture (the op-level int8-dot capture test's x2 byte-identity mechanism
+  // at vehicle scale). The 16-prompt token stream must be byte-identical.
+  loaded.reset();
+  MESSAGE(label << ": determinism leg — reloading the engine (capture x2)...");
+  std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded2 =
+      vllm::entrypoints::LoadedEngine::FromModelDir(model,
+                                                    vllm::entrypoints::EngineParams{});
+  std::vector<int32_t> run2;
+  for (int64_t i = 0; i < N; ++i) {
+    const vllm::RequestOutput out = loaded2->engine().generate(
+        Prompts()[static_cast<size_t>(i)], Greedy(static_cast<int>(T)),
+        "lane2-" + std::to_string(i));
+    REQUIRE(out.finished);
+    const std::vector<int32_t>& got = out.outputs[0].token_ids;
+    REQUIRE(static_cast<int64_t>(got.size()) == T);
+    run2.insert(run2.end(), got.begin(), got.end());
+  }
+  REQUIRE_MESSAGE(run1 == run2,
+                  label << ": capture x2 token streams DIVERGE at vehicle "
+                           "scale — the lane decode is not deterministic "
+                           "across two in-process captures");
+  MESSAGE(label << ": capture x2 byte-identity at vehicle scale: PASS; trace "
+                  "demand run 2 = "
+          << vt::tenstorrent::LastTraceBytesForTest() << " B");
+
+  MESSAGE(label << " lane correctness gate: " << (strict_exact + neartie_only)
+          << "/" << N << " prompts PASS  (STRICT token-exact vs pinned "
+                          "llama.cpp greedy: "
+          << strict_exact << "/" << N << "; near-tie-band only: " << neartie_only
+          << "/" << N << "; max gap " << (worst_gap / 1000.0) << " nats @ prompt["
+          << worst_i << "] tok=" << worst_j << "; band " << kLaneBandMnats
+          << " mnats; " << fail << " forward-divergent)");
+  REQUIRE(fail == 0);
+}
+
 }  // namespace
 
 // Qwen3.5-0.8B (GDN hybrid: linear-attention recurrence + full-attention
@@ -595,4 +824,28 @@ TEST_CASE("qwen3.8-27B GGUF Q4_K_M paged-engine greedy near-tie gate (Tenstorren
   }
   RunGate("qwen38_gguf_q4km_27b", "qwen38-gguf-q4km-27b", std::string(gguf),
           /*keep_quant=*/true);
+}
+
+// KEEPQUANT W4c (issue #3079): the int8-dot lane's e2e battery — lever
+// opt-in, llama.cpp-b10451-denominated, red-first on the missing pair.
+TEST_CASE("qwen3.5-0.8B GGUF Q4_K_M int8-dot lane e2e battery (Tenstorrent, lever opt-in)") {
+  const char* lever = std::getenv("VT_TT_KEEPQUANT_INT8DOT");
+  if (lever == nullptr || lever[0] == '\0' || std::string_view(lever) == "0") {
+    MESSAGE("SKIPPED: set VT_TT_KEEPQUANT_INT8DOT=1 — the int8-dot lane is "
+            "default OFF (the default-config flip is a recorded "
+            "NEEDS_DECISION); the default vehicle battery stays the W4a "
+            "16/16 invariant and this battery runs only as the documented "
+            "opt-in configuration");
+    return;
+  }
+  const char* gguf = std::getenv("VLLM_CPP_QWEN35_Q4KM_GGUF");
+  if (gguf == nullptr || gguf[0] == '\0') {
+    SkipGate("qwen35-gguf-q4km-lanegate",
+             "VLLM_CPP_QWEN35_Q4KM_GGUF is absent — set it to the local "
+             "Qwen3.5-0.8B-Q4_K_M.gguf (unsloth/Qwen3.5-0.8B-GGUF @ 6ab46149, "
+             "sha256 bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a0"
+             "6121dc517, 532517120 bytes) to run the int8-dot lane battery");
+  }
+  RunLaneGate("qwen35_gguf_q4km_lanegate", "qwen35-gguf-q4km-lanegate",
+              std::string(gguf));
 }

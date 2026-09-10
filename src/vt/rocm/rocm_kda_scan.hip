@@ -40,13 +40,14 @@ inline void Check(hipError_t err, const char* what) {
 inline hipStream_t AsStream(const Queue& q) {
   return static_cast<hipStream_t>(q.handle);
 }
+// KDA dispatches Tin/Tout in {float, __hip_bfloat16} only (never __half);
+// TState is always float.  The __half overloads that GDN carries would be
+// dead code here and trip -Werror,-Wunused-function.
 __device__ inline float Ld(const float* p, int64_t i) { return p[i]; }
-__device__ inline float Ld(const __half* p, int64_t i) { return __half2float(p[i]); }
 __device__ inline float Ld(const __hip_bfloat16* p, int64_t i) {
   return __bfloat162float(p[i]);
 }
 __device__ inline void St(float* p, int64_t i, float v) { p[i] = v; }
-__device__ inline void St(__half* p, int64_t i, float v) { p[i] = __float2half_rn(v); }
 __device__ inline void St(__hip_bfloat16* p, int64_t i, float v) {
   p[i] = __float2bfloat16(v);
 }

@@ -54,6 +54,7 @@ PROMPTS = [
 ]
 OUTSIDE_TOPK_MNATS = 99_999_000
 MAGIC = b"VTLGDUMP"
+EXPECTED_N_VOCAB = 248_320  # the qwen3 vocab this script is written for
 
 
 def read_dump(path: str):
@@ -61,6 +62,8 @@ def read_dump(path: str):
     if raw[:8] != MAGIC:
         raise SystemExit(f"{path}: bad magic {raw[:8]!r}")
     n, n_vocab = struct.unpack_from("<ii", raw, 8)
+    if n_vocab != EXPECTED_N_VOCAB:
+        raise SystemExit(f"{path}: n_vocab {n_vocab}, expected {EXPECTED_N_VOCAB}")
     off = 16
     toks = np.empty(n, dtype="<i4")
     rows = np.empty((n, n_vocab), dtype=np.float32)

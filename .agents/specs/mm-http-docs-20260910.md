@@ -60,5 +60,28 @@ cannot establish it.
 
 ## Now
 
-Documentation correction scoped. Benchmark disposition: NOT APPLICABLE;
-commands and prose change no runtime behavior or measured result.
+Documentation correction implemented; upstream integration remains pending.
+Benchmark disposition: NOT APPLICABLE; commands and prose change no runtime
+behavior or measured result. The existing feature lifecycle is unchanged.
+
+## Verification and review correction
+
+The five documentation checks above pass. Existing mutation suites for README
+structure, surface coverage, supported models, and quickstart recipes pass
+108 tests in total. Offline execution of the image example verifies the POST
+endpoint, model name, MIME type, and exact RGB bytes. Empty and malformed
+buffers refuse before HTTP. Local links in all four edited documents resolve.
+
+Independent review identified a tower-loading distinction. Qwen3-VL,
+MuseGlimmer, and the `clip` projector skip loading at zero modality limits
+(`qwen3_vl.cpp:463`, `muse_glimmer_weights.cpp:803`, and
+`src/vllm/entrypoints/model_loader.cpp:3049`). Dots3-note still loads supported
+towers (`src/vllm/model_executor/models/dots3_note.cpp:782` and `:807`). The
+guide, feature table, and server reference now distinguish request refusal
+from tower loading. The refusal example explicitly uses default limits.
+
+Full preflight was attempted on the local Alpine shell. It did not pass:
+the C/C++ toolchain is unavailable, BusyBox `find` lacks `-printf`, and tests
+that clear the environment cannot load the temporary Python libraries.
+These broader environment failures do not establish a documentation regression.
+No inference, GPU gate, or benchmark was run.

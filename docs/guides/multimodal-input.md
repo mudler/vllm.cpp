@@ -135,10 +135,12 @@ through it is dropped and answered as text. The refusals below are the server's.
 `vllm_model_params.mmproj_path` (ABI v22) is in the same position: it loads and
 validates the projector, and no C-ABI call can feed the tower an image yet.
 
-The flag sets all modality limits to zero, refuses media requests, and skips
-loading a tower when all modalities it serves have zero limits.
+The flag sets all modality limits to zero and refuses media requests.
+Qwen3-VL, MuseGlimmer, and `clip` projector loaders also skip a tower when all
+modalities it serves have zero limits. The dots3-note loader still loads its
+supported vision and audio towers, even with zero limits.
 
-For example, a Qwen3-VL server refuses three images with HTTP 400:
+With default limits, a Qwen3-VL server refuses three images with HTTP 400:
 
 ```json
 {"error":{"type":"BadRequestError",
@@ -171,8 +173,9 @@ Two things follow from how the limit is computed
   refusal message itself does not say which
   ([#758](https://github.com/mudler/vllm.cpp/issues/758)).
 
-**What the zero limits now free.** A tower whose every modality is at limit 0 is
-constructed but never loaded: its geometry is still parsed from `vision_config`,
+**What the zero limits now free.** In the Qwen3-VL, MuseGlimmer, and `clip`
+projector loaders, a tower whose every modality is at limit 0 is constructed but
+never loaded: its geometry is still parsed from `vision_config`,
 so a refusal can still name what is missing, and its checkpoint tensors are never
 read. This mirrors vLLM's `_mark_tower_model`
 (`vllm/model_executor/models/interfaces.py:288-293`), and it follows from the

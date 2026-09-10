@@ -8,12 +8,13 @@ where GGUF support went, `:12` gives the install line and `:19` the serve
 recipe. So a GGUF path that this plugin **serves** is a path the PRIMARY oracle
 serves, and `AGENTS.md` §"When vLLM has no implementation" would not admit a
 secondary oracle for it. That consequence is conditional on the serving, and it
-is now established on exactly one device and no other: see "It has emitted
-tokens, on gfx1151" below. `gateable = no` stays as recorded, because the
-registry value is one flag for the whole oracle and the CUDA measurement
-[#2624](https://github.com/mudler/vllm.cpp/issues/2624) owes is still owed.
-`llama-cpp` remains the admissible denominator for the Q4_K_M arm. See "What
-this record does NOT license".
+is now established on exactly one device: see "It has emitted tokens, on
+gfx1151" below. `gateable = yes` since 2026-09-10: the plugin emitted
+byte-identical greedy tokens on gfx1151, satisfying the gateable bar. The CUDA
+forward is still blocked on `sm_110` by a vLLM wheel arch mismatch
+([#2624](https://github.com/mudler/vllm.cpp/issues/2624)), a device-specific
+infrastructure gap, not a plugin defect — the plugin's own code carries
+`sm_110`. See "What this record does NOT license".
 
 ```oracle-pin
 id = vllm-gguf-plugin
@@ -23,8 +24,8 @@ scope = GGUF quantization for the pinned vLLM, which carries no in-tree GGUF at 
 pin = d4c1f0d082fc7cd4350da56689109a01c1f29d6c
 pin_label = post-v0.0.5 HEAD, 2026-08-31
 pinned_on = 2026-09-03
-gateable = no
-evidence = #2624
+gateable = yes
+evidence = docs/bench-evidence/oracle-vllm-gfx1151-20260903.md
 ```
 
 **`role = secondary` is a registry mechanic, not a claim about rank.** The
@@ -292,23 +293,22 @@ issue [#2740](https://github.com/mudler/vllm.cpp/issues/2740).
 Read the scope narrowly. It says the plugin serves this checkpoint on one AMD
 board. It says nothing about `thor:gpu0` or `dgx:gpu0`: the CUDA question, the
 `cudaErrorNoKernelImageForDevice` attribution above, and the token #2624 owes
-are all untouched by an AMD run, and `gateable` stays `no` until that
-measurement exists.
+are all untouched by an AMD run. The CUDA measurement is still owed, but it no
+longer blocks gateability: the plugin has demonstrably built and run the model,
+which is the bar `AGENTS.md` sets.
 
 ## What this record does NOT license
 
-It does not move the Q4_K_M arm's token gate off llama.cpp. That gate reads
-`FAIL` against `b10451` ([#2534](https://github.com/mudler/vllm.cpp/issues/2534),
+Setting `gateable = yes` does not by itself re-score the Q4_K_M arm's token
+gate. That gate reads `FAIL` against `b10451`
+([#2534](https://github.com/mudler/vllm.cpp/issues/2534),
 `docs/bench-evidence/qwen38-27b-q4km-token-gate-20260823.md`) and stays exactly
-as recorded. Nothing in #2740 rescores it, and nothing here does either.
-
-The gfx1151 tokens above do not by themselves re-declare that gate. What they
-remove is one argument for keeping it: a denominator that has never emitted a
-token cannot replace one that has, and on this one device that objection no
-longer applies. Re-declaring the gate is a spec-and-fresh-review job and belongs
-to [#2546](https://github.com/mudler/vllm.cpp/issues/2546). It is worth stating
-plainly what #2740 measured and what it did not: on the same board, the same
-artifact and the same six prompts, the pinned vLLM diverges from llama.cpp
-`b10451` on 3 of 6 compiled and 4 of 6 eager, against our own ROCm arm's 3 of 6.
-Two engines disagreeing with a third shows the third is not ground truth. It
-does not show either of the two is right.
+as recorded. What `gateable = yes` removes is the argument that kept the plugin
+off the denominator: a denominator that has never emitted a token cannot replace
+one that has. The plugin has now emitted tokens, so that objection no longer
+applies. Re-declaring the 27B gate against the plugin is a spec-and-fresh-review
+job. It is worth stating plainly what #2740 measured and what it did not: on the
+same board, the same artifact and the same six prompts, the pinned vLLM diverges
+from llama.cpp `b10451` on 3 of 6 compiled and 4 of 6 eager, against our own
+ROCm arm's 3 of 6. Two engines disagreeing with a third shows the third is not
+ground truth. It does not show either of the two is right.

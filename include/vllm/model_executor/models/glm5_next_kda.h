@@ -92,6 +92,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/models/dense_device_glue.h"  // dense_attn::Dev
 #include "vt/ops.h"  // vt::Queue, vt::KdaGatedDeltaRule
 
 namespace vllm::glm5_next_kda {
@@ -324,8 +325,11 @@ struct Glm5NextKdaCache {
 // per-K-channel log-decay `g`; see the header comment for why
 // `vt::KdaChunkPrefill` cannot serve this model.
 //
-// `queue` must be a CPU queue. The device arm of this layer is the assembled
-// text forward's (W5) and is refused by name here rather than half-built.
+// When `dev` is null, `queue` must be a CPU queue: `vt::KdaGatedDeltaRule`
+// dispatches on the queue's device and host pointers on a CUDA queue are a
+// crash, not a fallback. When `dev` is non-null the delta recurrence runs on
+// `dev->q`; the projections, conv and gates stay on the host, and only the
+// recurrence operands are uploaded and its outputs downloaded.
 //
 // `cache` may be null (a one-shot forward with no carry). When it is not null
 // it is read for the initial conv and recurrent state and written with the
@@ -337,7 +341,8 @@ struct Glm5NextKdaCache {
 std::vector<float> Glm5NextKdaLayerForward(
     const Glm5NextKdaLayerWeights& weights,
     const std::vector<float>& hidden_states, const Glm5NextKdaDims& dims,
-    int64_t num_tokens, Glm5NextKdaCache* cache, vt::Queue& queue);
+    int64_t num_tokens, Glm5NextKdaCache* cache, vt::Queue& queue,
+    dense_attn::Dev* dev = nullptr);
 
 }  // namespace vllm::glm5_next_kda
 

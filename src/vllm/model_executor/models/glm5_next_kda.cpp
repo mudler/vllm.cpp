@@ -304,7 +304,7 @@ std::vector<float> Glm5NextMixedQkvConv(const std::vector<float>& x,
 std::vector<float> Glm5NextKdaLayerForward(
     const Glm5NextKdaLayerWeights& w, const std::vector<float>& hidden_states,
     const Glm5NextKdaDims& d, int64_t num_tokens, Glm5NextKdaCache* cache,
-    vt::Queue& queue) {
+    vt::Queue& queue, dense_attn::Dev* dev) {
   const int64_t H = d.hidden_size;
   const int64_t nh = d.num_heads;
   const int64_t hd = d.head_dim;
@@ -315,14 +315,8 @@ std::vector<float> Glm5NextKdaLayerForward(
   VT_CHECK(H > 0 && nh > 0 && hd > 0 && K > 0, "glm5_next kda: bad layer dims");
   VT_CHECK(static_cast<int64_t>(hidden_states.size()) == T * H,
            "glm5_next kda: hidden_states size mismatch");
-  // The device arm of this layer belongs to the assembled text forward (W5).
-  // Refusing here beats half-wiring it: vt::KdaGatedDeltaRule dispatches on the
-  // queue's device, and handing it host pointers on a CUDA queue is a crash,
-  // not a fallback.
-  VT_CHECK(queue.device.type == vt::DeviceType::kCPU,
-           "glm5_next kda: Glm5NextKdaLayerForward is the HOST reference and "
-           "needs a CPU queue; the device arm is the assembled text forward's "
-           "(W5, .agents/specs/glm5-next-flash.md)");
+  // The device arm dispatches the delta recurrence on the device queue when
+  // `dev` is non-null; the projections, conv and gates stay on the host.
 
   // q/k/v projections, then ONE concatenated [q; k; v] stream (:655-661).
   const std::vector<float> q_raw = MatVecRows(w.q_proj, hidden_states, proj, H, T, "q_proj");
@@ -390,18 +384,44 @@ std::vector<float> Glm5NextKdaLayerForward(
            "glm5_next kda: recurrent_state must be [num_heads, head_dim, head_dim]");
   std::vector<float> core(static_cast<size_t>(T) * proj, 0.0f);
   std::vector<int32_t> qsl = {0, static_cast<int32_t>(T)};
-  const vt::Device dev = queue.device;
-  vt::Tensor t_out = MakeT(core.data(), vt::DType::kF32, dev, {T, nh, hd});
-  vt::Tensor t_q = MakeT(const_cast<float*>(q_n.data()), vt::DType::kF32, dev, {T, nh, hd});
-  vt::Tensor t_k = MakeT(const_cast<float*>(k_n.data()), vt::DType::kF32, dev, {T, nh, hd});
-  vt::Tensor t_v = MakeT(const_cast<float*>(v.data()), vt::DType::kF32, dev, {T, nh, hd});
-  vt::Tensor t_g = MakeT(const_cast<float*>(g.data()), vt::DType::kF32, dev, {T, nh, hd});
-  vt::Tensor t_b = MakeT(beta.data(), vt::DType::kF32, dev, {T, nh});
-  vt::Tensor t_s = MakeT(state.data(), vt::DType::kF32, dev, {1, nh, hd, hd});
-  vt::Tensor t_qsl = MakeT(qsl.data(), vt::DType::kI32, dev, {2});
   vt::GdnArgs args;
   args.scale = static_cast<float>(std::pow(static_cast<double>(hd), -0.5));  // :464
-  vt::KdaGatedDeltaRule(queue, t_out, t_q, t_k, t_v, t_g, t_b, t_s, t_qsl, args);
+
+  if (dev != nullptr) {
+    // W9c-2 device arm. The projections, conv, gates and norms stay on the
+    // host; only the delta recurrence dispatches on the device queue. The
+    // operands are uploaded, the output and updated state are downloaded, and
+    // the host computation below reads host vectors unchanged.
+    dense_attn::DBuf d_out(*dev, vt::DType::kF32, {T, nh, hd});
+    dense_attn::DBuf d_q(*dev, vt::DType::kF32, {T, nh, hd}, q_n.data());
+    dense_attn::DBuf d_k(*dev, vt::DType::kF32, {T, nh, hd}, k_n.data());
+    dense_attn::DBuf d_v(*dev, vt::DType::kF32, {T, nh, hd}, v.data());
+    dense_attn::DBuf d_g(*dev, vt::DType::kF32, {T, nh, hd}, g.data());
+    dense_attn::DBuf d_b(*dev, vt::DType::kF32, {T, nh}, beta.data());
+    dense_attn::DBuf d_s(*dev, vt::DType::kF32, {1, nh, hd, hd}, state.data());
+    dense_attn::DBuf d_qsl(*dev, vt::DType::kI32, {2}, qsl.data());
+    vt::KdaGatedDeltaRule(dev->q, d_out.t(), d_q.t(), d_k.t(), d_v.t(),
+                          d_g.t(), d_b.t(), d_s.t(), d_qsl.t(), args);
+    d_out.Download(*dev, core.data());
+    d_s.Download(*dev, state.data());
+  } else {
+    // Host arm. `vt::KdaGatedDeltaRule` dispatches on the queue's device, and
+    // handing it host pointers on a CUDA queue is a crash, not a fallback.
+    VT_CHECK(queue.device.type == vt::DeviceType::kCPU,
+             "glm5_next kda: Glm5NextKdaLayerForward's host arm needs a CPU "
+             "queue; pass a non-null `dev` for the device arm "
+             "(.agents/specs/glm5-next-flash.md)");
+    const vt::Device hdev = queue.device;
+    vt::Tensor t_out = MakeT(core.data(), vt::DType::kF32, hdev, {T, nh, hd});
+    vt::Tensor t_q = MakeT(const_cast<float*>(q_n.data()), vt::DType::kF32, hdev, {T, nh, hd});
+    vt::Tensor t_k = MakeT(const_cast<float*>(k_n.data()), vt::DType::kF32, hdev, {T, nh, hd});
+    vt::Tensor t_v = MakeT(const_cast<float*>(v.data()), vt::DType::kF32, hdev, {T, nh, hd});
+    vt::Tensor t_g = MakeT(const_cast<float*>(g.data()), vt::DType::kF32, hdev, {T, nh, hd});
+    vt::Tensor t_b = MakeT(beta.data(), vt::DType::kF32, hdev, {T, nh});
+    vt::Tensor t_s = MakeT(state.data(), vt::DType::kF32, hdev, {1, nh, hd, hd});
+    vt::Tensor t_qsl = MakeT(qsl.data(), vt::DType::kI32, hdev, {2});
+    vt::KdaGatedDeltaRule(queue, t_out, t_q, t_k, t_v, t_g, t_b, t_s, t_qsl, args);
+  }
 
   // `update_recurrent_state(last_recurrent_state.to(torch.float32))` (:739):
   // the state is f32 whatever the model dtype is, because it is a running sum

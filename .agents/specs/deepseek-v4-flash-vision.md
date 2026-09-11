@@ -684,6 +684,40 @@ manifest is a semantic checker change and is owed below, with the measurement
 above as its red-before input.
 
 ## Owed
+- **THE OFFICIAL SAFETENSORS VISION ARM LOADS, AND ITS REAL PAYLOAD HAS NEVER
+  BEEN READ.** `src/vllm/model_executor/models/deepseek_v4_vision_weights.cpp`
+  materializes the released 267-tensor BF16 vision group out of the checkpoint's
+  own shards and `LoadDeepseekV4ForCausalLM`'s safetensors branch now attaches
+  the tower, which closes the "MATERIALISING them is owed" note that branch
+  carried in prose. EVERY GATE OVER IT IS SYNTHETIC. The pinned
+  `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` at
+  `86f746b36186f0e567729a5c06a8c918caba82a9` is 156.287 GiB over 48 shards, it
+  is staged on no device this row can reach, and nobody has authority to fetch
+  it here, so not one weight byte of the official artifact has been read by this
+  tree. What the arm is held to instead is the artifact's own METADATA: the
+  released `config.json` and the shard-1 safetensors HEADER, committed under
+  `tests/parity/goldens/deepseek_v4_vision/` and rebuilt from the pinned
+  revision by `scripts/check-deepseek-v4-vision-manifests.py --refresh`, which
+  reads two HTTP ranges and no payload. So the tensor NAMES, SHAPES, DTYPES and
+  COUNTS are pinned to the real file, and the VALUES the loader produces are
+  proven only on a synthetic fixture built to that header. A first real load,
+  and any oracle or device gate for this arm, are owed by issue #2411 and the
+  multi-device official-arm gate this spec's "Released artifact and geometry"
+  section already scopes to tensor parallelism 4.
+- **BOTH FILES ABOVE ARE PORTS, and the line they came from is preserved.** The
+  loader and the manifest checker were ported from a parallel implementation of
+  this row at `row/MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm-CODEX-LINE`
+  (`3f3860851`), which forked before this spec's amendment and built against
+  different vision types and a single combined-GGUF vehicle. Each file's header
+  records what changed and why. Two of those changes are behavioural rather than
+  stylistic and are recorded here because a reviewer may want to revisit them:
+  the loader COPIES the group into owned storage instead of borrowing the
+  safetensors mmap, because a safetensors payload offset carries no alignment
+  guarantee and a borrowed bf16 view can begin at an odd address; and the
+  checker's DEFAULT MODE now verifies the committed fixtures offline, because a
+  record gate that must reach `huggingface.co` cannot run in CI. The ported
+  line's combined-GGUF vision entry point was deliberately NOT taken: this row's
+  vehicle is the two-file llama.cpp one, which `clip_mmproj_gguf.cpp` reads.
 - **The PAGED attention arms cannot express the image-span exemption, and they
   REFUSE it.** `vt::AttentionWindow` carries one window per call, so the mask is
   per-call while the exemption is per-position. With `sliding_window = 128` and a

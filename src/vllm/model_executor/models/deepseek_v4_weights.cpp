@@ -75,6 +75,7 @@
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/deepseek_v4_mm.h"  // the official vision name map
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"  // OwnGgufQuantBlocks
 #include "vllm/v1/core/kv_cache_utils.h"  // host_available_memory_bytes
 #include "vt/dtype.h"
@@ -1316,6 +1317,23 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
                                         host_available);
   }
 
+  // MODEL-MM-deepseek-v4 (#2411): the OFFICIAL vision group on an EXL3-carried
+  // checkpoint. This arm REFUSES any tensor no arm routes, so without this the
+  // 267 vision names would make a vision checkpoint refuse outright rather than
+  // load tower-free. The names come from the same map the materializing reader
+  // uses; `LoadDeepseekV4ForCausalLM` decides whether a tower is built.
+  if (DeepSeekV4ShardsCarryVision(shards)) {
+    for (const std::string& name :
+         DeepSeekV4OfficialVisionExpectedTensors(
+             DeepSeekV4OfficialVisionConfig(config))) {
+      VT_CHECK(index.count(name) != 0,
+               "deepseek-v4 exl3 loader: expected vision tensor missing: " +
+                   name);
+      routed.insert(name);
+      ++accounted;
+    }
+  }
+
   // ── totality: every checkpoint tensor is routed or explicitly skipped. ─────
   // vLLM's DeepSeek-V4 loader skips the MTP tail wholesale
   // (`AutoWeightsLoader(skip_substrs=["mtp."])`, nvidia/model.py:1474) and so do
@@ -1457,6 +1475,26 @@ DeepseekV4Weights LoadDeepseekV4ForCausalLMWeights(
       const std::string ep = f + "experts." + std::to_string(e) + ".";
       for (const char* w : {"w1", "w2", "w3"})
         for (const std::string& suf : expert_suffixes) require(ep + w + suf);
+    }
+  }
+
+  // MODEL-MM-deepseek-v4 (#2411): the OFFICIAL vision group, 267 tensors on the
+  // released artifact. Conditional for the same reason `gate.bias_vl` above is:
+  // a DeepSeek-V4 TEXT checkpoint carries none of them and `require` is a
+  // REFUSAL, so asking unconditionally would reject every text checkpoint this
+  // arm already loads. A checkpoint carrying SOME of the group is not treated as
+  // text -- `DeepSeekV4ShardsCarryVision` keys on the patch embedding, and each
+  // remaining name then refuses by itself.
+  //
+  // Unlike the wave that only COUNTED these, the names enumerated here are the
+  // ones `LoadDeepSeekV4VisionFromSafetensors` actually reads: the accounting
+  // and the materialization share one name map, so a tensor counted here is a
+  // tensor some tower row holds.
+  if (DeepSeekV4ShardsCarryVision(shards)) {
+    for (const std::string& name :
+         DeepSeekV4OfficialVisionExpectedTensors(
+             DeepSeekV4OfficialVisionConfig(config))) {
+      require(name);
     }
   }
 

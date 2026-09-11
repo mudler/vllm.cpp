@@ -78,7 +78,30 @@ multimodal::DeepSeekV4Vision& DeepseekV4LoadedModel::vision_tower(
 
 std::unique_ptr<DeepseekV4VisionRuntime> LoadDeepseekV4VisionRuntime(
     const ModelSource& source, const HfConfig& config) {
-  if (source.mmproj == nullptr) return nullptr;
+  // MODEL-MM-deepseek-v4 (#2411): THE OFFICIAL SAFETENSORS ARM. The released
+  // `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` checkpoint carries its vision
+  // group in its own shards, so there is no second file to name and the
+  // projector-shaped questions below do not apply to it. Until this arm landed
+  // the safetensors branch was tower-free by construction and an image request
+  // on it refused in `encode_mm`.
+  if (source.mmproj == nullptr) {
+    if (source.safetensors == nullptr) return nullptr;
+    if (!DeepSeekV4ShardsCarryVision(*source.safetensors)) return nullptr;
+    // The same #607 L3 rule the projector arm follows: the engine's multimodal
+    // limits decide whether the tower's tensors are read at all, and
+    // `--language-model-only` must not pay for 0.870 GiB it will never use.
+    if (SkipTowerForModalities(source.multimodal, {"image"})) return nullptr;
+    auto runtime = std::make_unique<DeepseekV4VisionRuntime>();
+    runtime->config = DeepSeekV4OfficialVisionConfig(config);
+    runtime->projector =
+        LoadDeepSeekV4VisionFromSafetensors(*source.safetensors, runtime->config);
+    // No pairing check here, and that is not an omission: on this vehicle the
+    // aligner width and the language width are read from ONE config.json, so
+    // `DeepSeekV4OfficialVisionConfig` takes the language `hidden_size` as the
+    // output width and the two cannot disagree. The projector arm below needs
+    // the check because its two files are named independently.
+    return runtime;
+  }
   // A projector of another family is not this architecture's to open. It is not
   // refused here either: `--mmproj` still means the Qwen3-VL arm in
   // `model_loader.cpp`, and that arm sets no `ModelSource::mmproj`, so reaching

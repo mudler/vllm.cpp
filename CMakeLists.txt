@@ -802,6 +802,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/deepseek_v4_registry.cpp
   src/vllm/model_executor/models/deepseek_v4_mm.cpp
   src/vllm/model_executor/models/deepseek_v4_weights.cpp
+  src/vllm/model_executor/models/deepseek_v4_vision_weights.cpp
   src/vllm/model_executor/models/deepseek_v4.cpp
   src/vllm/model_executor/models/deepseek_v4_dsa.cpp
   src/vllm/model_executor/models/deepseek_v4_dspark.cpp

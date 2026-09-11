@@ -28,7 +28,9 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
+#include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/clip_mmproj_gguf.h"
 #include "vllm/model_executor/models/deepseek_v4.h"
 #include "vllm/model_executor/models/deepseek_v4_vision.h"
@@ -37,11 +39,16 @@
 
 namespace vllm {
 
-// The `deepseek4v` projector one load was given, and the tower over it.
+// The vision group one load was given, and the tower over it.
 //
 // `projector` OWNS the host storage; `weights` inside it holds non-owning views
 // into that storage, and `tower` holds a copy of those views. So the projector
 // must outlive the tower, which is what keeping both in one struct guarantees.
+//
+// ITS NAME COMES FROM THE VEHICLE THAT NEEDED IT FIRST. The same struct now
+// holds the OFFICIAL safetensors vision group as well as a `deepseek4v`
+// projector, because the two vehicles differ in where the bytes live and in
+// nothing the tower can observe. See `LoadDeepseekV4VisionRuntime`.
 struct DeepseekV4VisionRuntime {
   multimodal::DeepSeekV4VisionConfig config;
   DeepSeekV4ClipMmproj projector;
@@ -110,16 +117,57 @@ class DeepseekV4LoadedModel final : public LoadedModel {
   std::unique_ptr<DeepseekV4VisionRuntime> vision_;
 };
 
-// THE PRODUCTION READ of the `deepseek4v` projector. Returns null when the load
-// named no `--mmproj`, when the file is another family's projector, and when
-// the engine's multimodal limits put every modality this tower serves at zero
-// (`SkipTowerForModalities`, the mirror of `interfaces.py:288-293`).
+// THE PRODUCTION READ of whichever vehicle carries this load's vision group.
+// Returns null when neither does: a GGUF load that named no `--mmproj`, a
+// safetensors checkpoint with no `vision.*` group (every DeepSeek-V4 TEXT
+// checkpoint), a projector of another family, or an engine whose multimodal
+// limits put every modality this tower serves at zero (`SkipTowerForModalities`,
+// the mirror of `interfaces.py:288-293`).
+//
+// TWO ARMS, ONE RUNTIME. `--mmproj` reads the `deepseek4v` projector of the
+// shipped two-file GGUF vehicle; a safetensors source reads the OFFICIAL BF16
+// vision group out of the model's own shards. Both fill the same
+// `DeepSeekV4ClipMmproj` owner and the same W2 weight views, so everything
+// above this function is indifferent to which vehicle was fed.
 //
 // It REFUSES BY NAME otherwise, in the one order the refusals may run in --
 // `LoadDeepSeekV4ClipMmprojArm` holds that order and this function does not
 // restate it.
 std::unique_ptr<DeepseekV4VisionRuntime> LoadDeepseekV4VisionRuntime(
     const ModelSource& source, const HfConfig& config);
+
+// ─── The OFFICIAL safetensors vision arm (`deepseek_v4_vision_weights.cpp`) ──
+//
+// The released `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` checkpoint carries its
+// 267-tensor vision group in its own shards rather than in a second file. These
+// four functions are that vehicle's counterpart to the `deepseek4v` mmproj
+// reader's `DeepSeekV4ClipMmprojVisionConfig` / `...ExpectedTensors` /
+// `LoadDeepSeekV4VisionFromClipMmproj` trio.
+
+// The vision geometry the released `config.json` resolves. Refuses an absent or
+// absurd value BY THE KEY that carried it. `output_size` is the LANGUAGE
+// model's hidden size, because the aligner lands in the text hidden space.
+multimodal::DeepSeekV4VisionConfig DeepSeekV4OfficialVisionConfig(
+    const HfConfig& config);
+
+// Does this checkpoint carry the official vision group at all? False for every
+// DeepSeek-V4 TEXT checkpoint, which is what keeps the text arm tower-free.
+// A checkpoint carrying only SOME of the group is not silently text: the loader
+// then refuses the missing names one by one.
+bool DeepSeekV4ShardsCarryVision(const std::vector<SafetensorsFile>& shards);
+
+// The EXACT set of names the loader below reads for `config`: the patch
+// embedding and its bias, `depth` blocks of eight, the final norm, the
+// aligner's two weight/bias pairs and the four sentinels. At the released depth
+// 32 that is 267, which is the pinned shard-1 header's vision tensor count.
+std::vector<std::string> DeepSeekV4OfficialVisionExpectedTensors(
+    const multimodal::DeepSeekV4VisionConfig& config);
+
+// Read the official vision group into the W2 types. Every view in the result
+// points into storage the result owns, so it survives the shards being closed.
+DeepSeekV4ClipMmproj LoadDeepSeekV4VisionFromSafetensors(
+    const std::vector<SafetensorsFile>& shards,
+    const multimodal::DeepSeekV4VisionConfig& config);
 
 // The registered `encode_mm` hook: `SupportsMultiModal.embed_multimodal`.
 //

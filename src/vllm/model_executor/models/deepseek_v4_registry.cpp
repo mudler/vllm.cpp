@@ -121,17 +121,25 @@ std::unique_ptr<LoadedModel> LoadDeepseekV4ForCausalLM(
   if (source.safetensors == nullptr) {
     throw std::runtime_error("safetensors model source is empty");
   }
-  // THE SAFETENSORS ARM STAYS TOWER-FREE, and it is not this wave's oversight.
-  // `--mmproj` is refused for a safetensors checkpoint by name in
-  // `model_loader.cpp` ("a multimodal projector attaches to a .gguf language
-  // file"), so no production path can put a projector on a safetensors source
-  // and a branch that read one here would be unreachable. The official arm
-  // carries `vision.*` and `aligner.*` in its own shards; ACCOUNTING for them
-  // landed with W3, MATERIALISING them is owed by issue #2411 and row
-  // `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm`, and until it lands an
-  // image request on this arm refuses in `encode_mm` rather than answering.
+  // THE SAFETENSORS ARM CARRIES ITS OWN TOWER (#2411). `--mmproj` is refused
+  // for a safetensors checkpoint by name in `model_loader.cpp` ("a multimodal
+  // projector attaches to a .gguf language file"), so this arm never reads a
+  // second file; the official checkpoint carries `vision.*`, `aligner.*` and
+  // the four sentinels in its OWN shards. Accounting for them landed with W3
+  // and MATERIALISING them was owed until now, which is what
+  // `LoadDeepseekV4VisionRuntime`'s safetensors arm does here. A DeepSeek-V4
+  // TEXT checkpoint carries none of the group and still loads tower-free, which
+  // is the inertness the loader gate asserts.
+  //
+  // ORDERED LIKE THE GGUF BRANCH: the vision group is read BEFORE the language
+  // weights, so a vision checkpoint this build cannot read costs a message
+  // rather than a 156 GiB map followed by one.
+  std::unique_ptr<DeepseekV4VisionRuntime> st_vision =
+      LoadDeepseekV4VisionRuntime(source, config);
   return std::make_unique<DeepseekV4LoadedModel>(
-      registration, LoadDeepseekV4ForCausalLMWeights(*source.safetensors, config));
+      registration,
+      LoadDeepseekV4ForCausalLMWeights(*source.safetensors, config),
+      std::move(st_vision));
 }
 
 void PrepareDeepseekV4ForCausalLM(LoadedModel& model, const HfConfig& config,

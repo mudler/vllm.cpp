@@ -1734,6 +1734,151 @@ TEST_CASE("runner: sample_tokens_async decode is token-identical to sync") {
   CHECK(async_out == sync);  // token-for-token identical
 }
 
+// ─── SPEC-DFLASH2 A2-4 (#2920): sample_tokens_async's DECODE arm must propose ─
+//
+// A2-2 gave `sample_tokens_async` a verify arm and put `propose_after_verify`
+// inside it, so a step that DRAFTS proposed correctly and a step that did not
+// proposed nothing at all. The arm that runs when `StepRoutesToVerify` is false
+// is a speculative engine's FIRST step — there is no previous step to have
+// proposed — so an engine on that path would sample, propose nothing, and every
+// step after it would find nothing to verify: `pending_drafts_` stays empty and
+// the async scheduler's `-1` placeholders have nothing to fill.
+//
+// WHAT THESE CASES SUPPLY BY HAND, and what they do not. The runner is the
+// production type and `execute_model` is the production entry point. The one
+// thing supplied is `set_async_input_combine(true)`, which is exactly what the
+// veto at both `GPUModelRunner` constructors withholds from every speculative
+// engine. Lifting that veto is A2-5, it is not this change, and until it lands
+// this arm is UNREACHED from any production configuration — recorded in the
+// spec's `## Owed` rather than implied by these cases.
+//
+// THE SPECULATOR IS THE N-GRAM PROPOSER because it is the only arm that needs
+// no draft model, which keeps the case a runner case instead of an engine one.
+//
+// WHAT THE DRAFT ASSERTION PROVES. `take_draft_token_ids()` moves out
+// `pending_drafts_`, and the only writer of that member is `set_draft_tokens`,
+// which is also the only caller of `ProposedDraftLedger::Record`. So a value
+// here is a propose that ran AND the ledger entry the async placeholder fill
+// reads for freshness; the two cannot come apart at this seam.
+TEST_CASE("runner: sample_tokens_async's decode arm proposes on the first step") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  // The LoadedModel constructor is the one that carries a SpeculativeConfig;
+  // the concrete-weight overloads do not.
+  std::unique_ptr<vllm::LoadedModel> lm = vllm::BorrowQwen3_5MoeLoadedModel(w);
+  const vllm::SpeculativeConfig spec = vllm::SpeculativeConfig::ResolveNgram(
+      /*k=*/3, /*user_min=*/2, /*user_max=*/2);
+  GPUModelRunner runner(c, *lm, MakeKvConfig(c), Q(), /*max_num_reqs=*/8,
+                        kMaxModelLen, /*max_num_batched_tokens=*/64, spec);
+  runner.set_async_input_combine(true);
+  REQUIRE(runner.async_input_combine());
+
+  const std::vector<int32_t> prompt = {5, 9, 2, 31, 17};
+  const int P = static_cast<int>(prompt.size());
+  SchedulerOutput s1 =
+      NewStep({MakeNewReq("A", prompt, {}, 0, {0, 1}, 0, Greedy())}, {{"A", P}});
+  REQUIRE_FALSE(runner.execute_model(s1).has_value());
+
+  std::unique_ptr<vllm::v1::AsyncModelRunnerOutput> a =
+      runner.sample_tokens_async(std::nullopt);
+  const ModelRunnerOutput m = a->get_output();
+  REQUIRE(m.sampled_token_ids.size() == 1);
+  REQUIRE(m.sampled_token_ids[0].size() == 1);
+  const int32_t sampled = m.sampled_token_ids[0][0];
+
+  // THE DEFECT #2920 NAMES: before the fix this is nullopt, because the decode
+  // arm never reached a propose.
+  const std::optional<vllm::v1::DraftTokenIds> drafts =
+      runner.take_draft_token_ids();
+  REQUIRE(drafts.has_value());
+  CHECK(drafts->req_ids == std::vector<std::string>{"A"});
+  CHECK(drafts->draft_token_ids.size() == 1u);
+
+  // The n-gram matcher reads `token_ids_cpu[:num_tokens_no_spec]`, and the
+  // async arm advances that counter without writing the column. The propose
+  // branch restores the value at the column the counter moved past; without it
+  // the matcher drafts off a token nobody committed, which costs acceptance and
+  // raises nothing.
+  const auto& ib = runner.input_batch();
+  const int row = ib.req_id_to_index.at("A");
+  REQUIRE(ib.num_tokens_no_spec[static_cast<size_t>(row)] == P + 1);
+  CHECK(ib.last_sampled_tokens[static_cast<size_t>(row)] == sampled);
+  CHECK(ib.token_ids_cpu[static_cast<size_t>(row) *
+                             static_cast<size_t>(ib.max_model_len) +
+                         static_cast<size_t>(P)] == sampled);
+}
+
+// The same arm on a MIXED step with num_reqs > 1, which is the shape this row
+// has already shipped a wrong answer in: a per-request reading of a per-step
+// rule answers differently when some rows commit a token and others do not, and
+// `tests/vllm/v1/worker/test_combine_row_predicate.cpp` (#2710) records a
+// version that survived 27 mutations because every case used num_reqs == 1.
+//
+// "P" is fully prefilled in its step and commits a token. "C" is a chunked
+// prefill continuation: it is scheduled, it samples a garbage token at its
+// prefill position, and the discard mask says it committed nothing. The step
+// carries no drafts either way, so it is one DECODE-arm step with two rows that
+// the propose must treat differently.
+TEST_CASE("runner: the async decode arm's propose covers a mixed num_reqs > 1 step") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  std::unique_ptr<vllm::LoadedModel> lm = vllm::BorrowQwen3_5MoeLoadedModel(w);
+  const vllm::SpeculativeConfig spec = vllm::SpeculativeConfig::ResolveNgram(
+      /*k=*/3, /*user_min=*/2, /*user_max=*/2);
+  GPUModelRunner runner(c, *lm, MakeKvConfig(c), Q(), /*max_num_reqs=*/8,
+                        kMaxModelLen, /*max_num_batched_tokens=*/64, spec);
+  runner.set_async_input_combine(true);
+
+  const std::vector<int32_t> p_prompt = {5, 9, 2, 31, 17, 4};
+  std::vector<int32_t> c_prompt(20);
+  for (int i = 0; i < 20; ++i) c_prompt[static_cast<size_t>(i)] = 1 + i;
+  SchedulerOutput s1 = NewStep(
+      {MakeNewReq("P", p_prompt, {}, /*num_computed=*/0, {0}, 0, Greedy()),
+       MakeNewReq("C", c_prompt, {}, /*num_computed=*/0, {1, 2}, 1, Greedy())},
+      {{"P", 6}, {"C", 10}});
+  REQUIRE_FALSE(runner.execute_model(s1).has_value());
+  REQUIRE(runner.last_step().num_draft_tokens == 0);  // the DECODE arm
+
+  std::unique_ptr<vllm::v1::AsyncModelRunnerOutput> a =
+      runner.sample_tokens_async(std::nullopt);
+  const ModelRunnerOutput m = a->get_output();
+  REQUIRE(m.req_id_to_index.count("P") == 1u);
+  REQUIRE(m.req_id_to_index.count("C") == 1u);
+  const int32_t p_sampled =
+      m.sampled_token_ids[static_cast<size_t>(m.req_id_to_index.at("P"))][0];
+  // The discarded row emits nothing (outputs.py:303).
+  CHECK(m.sampled_token_ids[static_cast<size_t>(m.req_id_to_index.at("C"))]
+            .empty());
+
+  const std::optional<vllm::v1::DraftTokenIds> drafts =
+      runner.take_draft_token_ids();
+  REQUIRE(drafts.has_value());
+  REQUIRE(drafts->req_ids.size() == 2u);
+  REQUIRE(drafts->draft_token_ids.size() == 2u);
+  std::map<std::string, std::vector<int32_t>> by_id;
+  for (size_t i = 0; i < drafts->req_ids.size(); ++i) {
+    by_id[drafts->req_ids[i]] = drafts->draft_token_ids[i];
+  }
+  REQUIRE(by_id.count("P") == 1u);
+  REQUIRE(by_id.count("C") == 1u);
+  // A row that committed nothing this step drafts nothing
+  // (ngram_proposer.py:157-172 valid_ngram_requests).
+  CHECK(by_id["C"].empty());
+
+  const auto& ib = runner.input_batch();
+  const int p_row = ib.req_id_to_index.at("P");
+  const int c_row = ib.req_id_to_index.at("C");
+  // The committed row's column advanced and carries its token; the discarded
+  // row's counter did not move (add_request seeds it from request.num_tokens(),
+  // so it still reads the 20-token prompt length and no column past it was
+  // written).
+  REQUIRE(ib.num_tokens_no_spec[static_cast<size_t>(p_row)] == 7);
+  CHECK(ib.token_ids_cpu[static_cast<size_t>(p_row) *
+                             static_cast<size_t>(ib.max_model_len) +
+                         6u] == p_sampled);
+  CHECK(ib.num_tokens_no_spec[static_cast<size_t>(c_row)] == 20);
+}
+
 // ─── W1: runner generalization to a FULL-ATTENTION-ONLY model ────────────────
 // The first additive-model bring-up (Qwen3ForCausalLM) forces the runner to
 // stop assuming the Qwen3.6 hybrid KV topology. These two cases pin the fix:
@@ -1775,21 +1920,44 @@ TEST_CASE("runner: full-attention-only step skips GDN metadata build (no OOB)") 
   SchedulerOutput s1 =
       NewStep({MakeFaNewReq("A", prompt, 0, {0, 1}, Greedy())}, {{"A", P}});
 
-  // Pre-generalization, execute_model called gather_block_table(gdn_group_id_ ==
-  // -1) → input_batch_.block_table[-1] (out-of-bounds → crash) BEFORE reaching
-  // the model forward. Post-generalization the whole GDN metadata build is gated
-  // on gdn_group_id_ >= 0, so a full-attention-only step builds a default-empty
-  // gdn_meta and reaches the model forward WITHOUT any out-of-bounds.
-  //
-  // The forward it reaches here is the BORROWED 27B *dense* forward, which
-  // carries its OWN hybrid assumption (gdn_meta must describe every token —
-  // qwen3_5.cpp:5463). That is a FORWARD-side seam gap, NOT a runner one:
-  // Qwen3ForCausalLM's own dense forward (W3) will not assume a GDN group. So we
-  // assert only that control reached the forward via a clean, CATCHABLE throw
-  // (not an uncatchable OOB), which proves the runner's GDN path was skipped.
-  CHECK_THROWS_WITH_AS(runner.execute_model(s1),
-                       doctest::Contains("qwen3_5 dense paged forward"),
-                       std::runtime_error);
+  REQUIRE(runner.attn_kv().size() == static_cast<size_t>(c.num_hidden_layers));
+  std::vector<std::vector<uint8_t>> kv_before;
+  for (const PagedKvCache& kv : runner.attn_kv()) {
+    const size_t block_bytes = static_cast<size_t>(
+        2 * kv.block_size * kv.num_kv_heads * kv.head_size) * vt::SizeOf(kv.dtype);
+    const auto* bytes = static_cast<const uint8_t*>(kv.data);
+    kv_before.emplace_back(bytes, bytes + block_bytes);
+  }
+
+  // #3098 removes the borrowed dense forward's former GDN requirement. The
+  // unchanged full-attention fixture must now finish with real attention state
+  // and sampled-token feedback, while the runner leaves GDN metadata empty.
+  REQUIRE_FALSE(runner.execute_model(s1).has_value());
+  CHECK(runner.gdn_group_id() == -1);
+  CHECK(runner.gdn_state().empty());
+  CHECK(runner.last_gdn_meta().num_actual_tokens == 0);
+  CHECK(runner.last_step().input_token_ids == prompt);
+  CHECK(runner.last_forward_rows() == 1);
+  CHECK(runner.last_forward_num_actual_tokens() == P);
+  CHECK(runner.last_forward_num_reqs() == 1);
+  for (size_t layer = 0; layer < runner.attn_kv().size(); ++layer) {
+    CAPTURE(layer);
+    const auto* bytes = static_cast<const uint8_t*>(runner.attn_kv()[layer].data);
+    const std::vector<uint8_t> kv_after(bytes, bytes + kv_before[layer].size());
+    CHECK(kv_after != kv_before[layer]);
+  }
+
+  const ModelRunnerOutput output = runner.sample_tokens(std::nullopt);
+  REQUIRE(output.req_ids == std::vector<std::string>{"A"});
+  REQUIRE(output.sampled_token_ids.size() == 1);
+  REQUIRE(output.sampled_token_ids[0].size() == 1);
+  const int32_t token = output.sampled_token_ids[0][0];
+  CHECK(token >= 0);
+  CHECK(token < c.vocab_size);
+  const auto& batch = runner.input_batch();
+  const int row = batch.req_id_to_index.at("A");
+  CHECK(batch.num_tokens_no_spec[static_cast<size_t>(row)] == P + 1);
+  CHECK(batch.token_id(row, P) == token);
 }
 
 // ─── M3: THE BLOCK-SIZE CONTRACT AT ITS PRODUCTION CALL SITE ─────────────────

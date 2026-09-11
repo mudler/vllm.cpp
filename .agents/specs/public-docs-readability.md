@@ -842,7 +842,7 @@ non-force-push rule.
 
 ## Owed
 
-- [#1463](https://github.com/mudler/vllm.cpp/issues/1463) owns W1 to W8 of this
+- ISSUE-GH-1463 owns W1 to W8 of this
   campaign. The issue closes only after the verified documentation-only pull
   request reaches `main`.
 

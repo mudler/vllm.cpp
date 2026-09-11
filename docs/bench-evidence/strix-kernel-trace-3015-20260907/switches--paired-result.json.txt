@@ -1,0 +1,50 @@
+{
+  "token_gate": "FAIL (carried, not remeasured)",
+  "measurement": "unprofiled warm whole completion, includes prefill",
+  "output_check": "cold text bytes only; CLI does not emit warm text or token IDs",
+  "warm_output_equality": "PENDING",
+  "pairs": [
+    {
+      "switch": "VT_ROCM_Q8K_BLOCK",
+      "pair": 0,
+      "default_seconds": 12.001,
+      "candidate_seconds": 11.303,
+      "default_over_candidate": 1.0617535167654604
+    },
+    {
+      "switch": "VT_ROCM_Q8K_BLOCK",
+      "pair": 1,
+      "default_seconds": 12.101,
+      "candidate_seconds": 11.329,
+      "default_over_candidate": 1.0681437020037072
+    },
+    {
+      "switch": "VT_ROCM_Q8K_BLOCK",
+      "pair": 2,
+      "default_seconds": 12.116,
+      "candidate_seconds": 11.351,
+      "default_over_candidate": 1.0673949431768126
+    },
+    {
+      "switch": "VT_ROCM_Q6K_SMALL_PRIVATE",
+      "pair": 0,
+      "default_seconds": 12.129,
+      "candidate_seconds": 13.585,
+      "default_over_candidate": 0.892822966507177
+    },
+    {
+      "switch": "VT_ROCM_Q6K_SMALL_PRIVATE",
+      "pair": 1,
+      "default_seconds": 12.128,
+      "candidate_seconds": 13.556,
+      "default_over_candidate": 0.8946591915019181
+    },
+    {
+      "switch": "VT_ROCM_Q6K_SMALL_PRIVATE",
+      "pair": 2,
+      "default_seconds": 12.136,
+      "candidate_seconds": 13.603,
+      "default_over_candidate": 0.8921561420274939
+    }
+  ]
+}

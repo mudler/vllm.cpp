@@ -223,7 +223,7 @@ box, and the real-hardware attempt that surfaced #1934.
 
 ## Owed
 
-- **#1928** — the ROCm `kMoeGroupedGemmBf16` provider gap #1870's "related gap,
+- **ISSUE-GH-1928** — the ROCm `kMoeGroupedGemmBf16` provider gap #1870's "related gap,
   same area" section names. Not fixed in flow; scoped out above.
 - **#1934** — `RocmPlatform::needs_weight_staging()` is stale-false, so this
   row's fix (and the refusal it corrects) never runs on ROCm. THE ACTUAL

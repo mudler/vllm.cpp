@@ -1,0 +1,67 @@
+reading from /mnt/nas_share/rc/strix-arm-2933/out
+=== per-leg, re-derived from .err ===
+n64-r1: rc=0 reps=4 kept=3 ctok={64,64,64,64} finish={length} median_secs=11.979 median_tok_s=5.3430 faults=[] tier_lines=0
+n64-r2: rc=0 reps=4 kept=3 ctok={64,64,64,64} finish={length} median_secs=12.062 median_tok_s=5.3060 faults=[] tier_lines=0
+n64-r3: rc=0 reps=4 kept=3 ctok={64,64,64,64} finish={length} median_secs=12.078 median_tok_s=5.2990 faults=[] tier_lines=0
+n64-r4: rc=0 reps=4 kept=3 ctok={64,64,64,64} finish={length} median_secs=12.067 median_tok_s=5.3040 faults=[] tier_lines=0
+n128-r1: rc=0 reps=4 kept=3 ctok={128,128,128,128} finish={length} median_secs=23.885 median_tok_s=5.3590 faults=[] tier_lines=0
+n128-r2: rc=0 reps=4 kept=3 ctok={128,128,128,128} finish={length} median_secs=23.905 median_tok_s=5.3550 faults=[] tier_lines=0
+n128-r3: rc=0 reps=4 kept=3 ctok={128,128,128,128} finish={length} median_secs=23.917 median_tok_s=5.3520 faults=[] tier_lines=0
+n128-r4: rc=0 reps=4 kept=3 ctok={128,128,128,128} finish={length} median_secs=23.942 median_tok_s=5.3460 faults=[] tier_lines=0
+
+n64: median whole-completion 5.3050 tok/s (12.0645 s), spread 0.8294% of median, 4 of 4 clean
+
+n128: median whole-completion 5.3535 tok/s (23.9110 s), spread 0.2428% of median, 4 of 4 clean
+pair r1: t_a=11.979 t_b=23.885 slope=5.375441 tok/s fixed_cost=0.073000s
+pair r2: t_a=12.062 t_b=23.905 slope=5.404036 tok/s fixed_cost=0.219000s
+pair r3: t_a=12.078 t_b=23.917 slope=5.405862 tok/s fixed_cost=0.239000s
+pair r4: t_a=12.067 t_b=23.942 slope=5.389474 tok/s fixed_cost=0.192000s
+
+decode DERIVED: 5.396755 tok/s, spread 0.563691%, 4 of 4 pairs usable
+
+=== clocks, re-derived from .jsonl ===
+clock-n64-r1: n=306 sclk mean=2050.6 min=600 max=2897 busy mean=63.1 boots=1
+clock-n64-r2: n=307 sclk mean=2044.3 min=600 max=2895 busy mean=63.2 boots=1
+clock-n64-r3: n=307 sclk mean=2045.2 min=600 max=2896 busy mean=63.3 boots=1
+clock-n64-r4: n=306 sclk mean=2045.7 min=600 max=2895 busy mean=63.3 boots=1
+clock-n128-r1: n=503 sclk mean=2337.6 min=600 max=2897 busy mean=76.0 boots=1
+clock-n128-r2: n=503 sclk mean=2312.8 min=600 max=2896 busy mean=75.1 boots=1
+clock-n128-r3: n=491 sclk mean=2350.7 min=600 max=2897 busy mean=76.8 boots=1
+clock-n128-r4: n=493 sclk mean=2360.2 min=600 max=2895 busy mean=77.4 boots=1
+ALL LEGS POOLED: n=3216 sclk mean=2228.2 busy mean=71.3
+
+whole completion  vLLM 6.734 / ours 5.3050 = 1.269369x
+decode  llama.cpp 12.219 / ours(derived) 5.396755 = 2.264138x
+
+=== CLAIMS CHECKED ===
+[OK ] n64 median tok_s: mine=5.305 result.json=5.305
+[OK ] n128 median tok_s: mine=5.3535 result.json=5.3535
+[OK ] n64 median secs: mine=12.064499999999999 result.json=12.064499999999999
+[OK ] n128 median secs: mine=23.911 result.json=23.911
+[OK ] n64 spread%: mine=0.8294062205466465 result.json=0.8294062205466465
+[OK ] n128 spread%: mine=0.24283179228541887 result.json=0.24283179228541887
+[OK ] decode derived: mine=5.3967549118511045 result.json=5.3967549118511045
+[OK ] decode spread%: mine=0.5636911059034639 result.json=0.563691105903464
+[OK ] pair r1 slope: mine=5.375440954140768 result.json=5.375440954140768
+[OK ] pair r2 slope: mine=5.404036139491682 result.json=5.404036139491682
+[OK ] pair r3 slope: mine=5.405861981586281 result.json=5.405861981586281
+[OK ] pair r4 slope: mine=5.389473684210526 result.json=5.389473684210526
+[OK ] ratio vllm/ours whole: mine=1.269368520263902 result.json=1.269368520263902
+[OK ] ratio lcpp/ours decode: mine=2.2641383941982354 result.json=2.2641383941982354
+[OK ] fault_rate_all_legs: mine=0 faults, 8 of 8 clean result.json=0 of 8
+[OK ] reference_tier_lines total: mine=0 result.json=0
+
+CLAIMS_CHECKED=16  MISMATCHES=0
+
+=== generated text, checked as bytes ===
+n64: 1 distinct completion(s) across 4 legs (byte-identical)
+n128: 1 distinct completion(s) across 4 legs (byte-identical)
+n128 continues n64 exactly: True (the 64-token capture adds a trailing newline the 128-token one does not)
+
+=== reproducibility of this file ===
+The run above read the raw artefacts on the share. Re-run with the share
+unreachable, the script falls back to this directory and reads the committed
+copies -- `*.err.txt`, `*.out.txt`, `*.rc`, `clock-*.jsonl.gz`,
+`RESULT.json.txt`. Both runs were compared line by line and are identical
+apart from the `reading from` line, so every figure this file reports can be
+reproduced from the committed evidence alone.

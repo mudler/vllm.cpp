@@ -233,7 +233,7 @@ is implied. §Scope excluded speed claims and the run measured tokens.
 
 ## Owed
 
-- [#910](https://github.com/mudler/vllm.cpp/issues/910): our on-device argmax
+- ISSUE-GH-910: our on-device argmax
   resolves an exact logit tie toward the HIGHER token id where `torch.argmax`
   takes the lower. Found while adjudicating this row's gate. Benign here and
   deterministic everywhere, so it is a permanent behavioral divergence from the

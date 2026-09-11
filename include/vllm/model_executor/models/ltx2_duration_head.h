@@ -52,10 +52,39 @@
 // requires the connector's output, not a raw padded batch — a caller that hands
 // it padded tokens gets a duration computed over the padding, silently.
 //
-// ─── DTYPE ───────────────────────────────────────────────────────────────────
-// f32, the parity dtype of this gate. Upstream constructs the head in the
-// pipeline's dtype (distilled.py:163-167 passes `self.dtype` = bfloat16), so the
-// bf16 arm is owed by phase L6.
+// ─── DTYPE — TWO ARMS, AND THEY CLAIM DIFFERENT THINGS ───────────────────────
+//
+// Upstream resolves ONE pipeline dtype and it is `torch.bfloat16`
+// (distilled.py:109), handed to `DurationPredictor.from_checkpoint` at
+// :163-165, so upstream's head IS a bf16 module: all fifteen of its tensors
+// narrow under `.to(dtype)` and every store point in its forward rounds. That
+// arm is row LTX25-A24-DURATION-HEAD-BF16 (#2955), gap A24's eighth and last
+// component, and it is what a production render loads
+// (`Ltx2VideoEngine::Load` asks for `kBF16` at both call sites).
+//
+// f32 remains the PARITY arm of the goldens above, and it is WIDER than
+// upstream. Both are served; `Ltx2VaeWeights::dtype` selects, and a third width
+// refuses by name.
+//
+// WHICH CLAIM EACH ARM MAKES, kept apart on purpose — wave 5 of this gap failed
+// review for gating an arithmetic width while claiming a storage one:
+//
+//  * STORAGE is the weight bag. On `kBF16` it holds 16-bit words and
+//    `Ltx2VaeWeights::Bytes()` is EXACTLY half the f32 arm's over the same
+//    tensor set. That ratio is the observable, so no byte count is quoted.
+//  * ARITHMETIC is the activations. They stay in `std::vector<float>` holding
+//    NARROWED values, exactly as the connector's arm does, and this port does
+//    NOT claim the activation buffers are half. Saying so is the point: the
+//    claim that is true is gated, and the claim that is not true is not made.
+//    `Ltx2DurationWidthCounts` is what makes the arithmetic claim observable,
+//    because nothing else on this path can see a dtype that is too wide.
+//
+// THE MEASURED RULES ARE IN `.agents/specs/ltx25-a24-duration-head-bf16.md` §3,
+// with the rejected hypothesis beside each. The one whose obvious C++ spelling
+// is wrong is the Linear: upstream's bf16 `F.linear` is bit-exactly
+// `bf16(f32(a) @ f32(w)^T + f32(b))`, ONE rounding with the bias added at the
+// accumulator's width. Rounding the GEMM and then adding the bias in bf16
+// type-checks identically and disagrees in a QUARTER of all outputs.
 #pragma once
 
 #include <cstdint>
@@ -93,13 +122,58 @@ struct Ltx2DurationHeadTensorSpec {
 std::vector<Ltx2DurationHeadTensorSpec> EnumerateLtx2DurationHeadTensors(
     const Ltx2DurationHeadConfig& config);
 
+// THE ARITHMETIC WIDTH, MADE OBSERVABLE FROM OUTSIDE THE HEAD (A24 wave 6).
+//
+// How many of the values the head PRODUCED could not have come out of a bf16
+// store, out of how many it produced. On the bf16 arm every store point rounds,
+// so `not_bf16` is ZERO; on the f32 parity arm it is essentially the whole
+// population. `values` is the control that says the counter looked at anything
+// at all — "zero wide values" is also what a counter that ran over nothing
+// reports, and AGENTS.md names this exact blind spot: a token gate cannot detect
+// a dtype that is too wide. The INPUT tokens are deliberately not counted; they
+// are the caller's data, not the head's product.
+//
+// WHAT IT MEASURES IS NARROWER THAN "THE HEAD'S WIDTH", and the difference
+// matters to whoever reads the number next. Each count is taken at its store
+// point AFTER that store has run, so on the bf16 arm it is zero by idempotence
+// whether the store point is there or not. It therefore detects a store point
+// handed the WRONG ARM — an f32 head, or one site reverted while the others
+// stay — and NOT a store point that is missing altogether: deleting one outright
+// leaves this counter at zero. That half is covered by the bit-exact goldens and
+// by the assertion that the returned seconds survive a bf16 round trip, both of
+// which a deleted store does move.
+struct Ltx2DurationWidthCounts {
+  int64_t not_bf16 = 0;
+  int64_t values = 0;
+};
+
 // AttentionPooler.forward (duration_head.py:45-49) on its own, so a pooler defect
 // localizes instead of arriving as one wrong scalar. `tokens` is
 // [batch, token_count, pooler_hidden_dim]; the result is
 // [batch, num_queries, pooler_hidden_dim].
+//
+// THE ENTRY CONTRACT ON THE BF16 ARM, WHICH IS A CONTRACT AND NOT A GUARD.
+// `tokens` are the CALLER'S already-stored activations, and this function does
+// not narrow them. Upstream's pooler is a submodule and narrows nothing either:
+// it receives whatever the enclosing forward stored, which is why an entry
+// narrowing here MASKED a real store-point defect for a whole review round
+// (see the note at the head of the definition). `Ltx2DurationPredict`, the only
+// caller in this tree, satisfies the contract by storing at the projection and
+// again after the modality-embedding add.
+//
+// No `Require` enforces it, deliberately. Checking it means walking the whole
+// token buffer on every render-path call to re-derive something the one
+// production caller establishes by construction, and it would refuse the use
+// this entry point EXISTS for: a pooler case localizes a defect by choosing its
+// own input, and the bf16 pooler case does exactly that. Handing it f32 tokens
+// is well defined and is the sharper gate, because a pooler whose own store
+// point was deleted then returns values that are visibly not on the bf16 grid.
+// What the contract governs is COMPOSITION, not safety: tokens off the grid are
+// simply not the chain upstream builds.
 std::vector<float> Ltx2DurationAttentionPool(const Ltx2DurationHeadConfig& config,
                                              const Ltx2VaeWeights& weights, const float* tokens,
-                                             int64_t batch, int64_t token_count);
+                                             int64_t batch, int64_t token_count,
+                                             Ltx2DurationWidthCounts* widths = nullptr);
 
 // DurationHead.forward (duration_head.py:89-118). Either stream may be null, and
 // both being null throws exactly as upstream does (:104-105). Returns the
@@ -107,7 +181,8 @@ std::vector<float> Ltx2DurationAttentionPool(const Ltx2DurationHeadConfig& confi
 std::vector<float> Ltx2DurationPredict(const Ltx2DurationHeadConfig& config,
                                        const Ltx2VaeWeights& weights, const float* video_tokens,
                                        int64_t video_token_count, const float* audio_tokens,
-                                       int64_t audio_token_count, int64_t batch);
+                                       int64_t audio_token_count, int64_t batch,
+                                       Ltx2DurationWidthCounts* widths = nullptr);
 
 
 // ─── THE DRIVER (row LTX25-DURATION-HEAD-WIRE, #2900) ────────────────────────
@@ -164,7 +239,8 @@ int64_t Ltx2DurationPredictFrames(const Ltx2DurationHeadConfig& config,
                                   int64_t video_token_count, const float* audio_tokens,
                                   int64_t audio_token_count, double frame_rate, double min_seconds,
                                   double max_seconds, int64_t time_scale,
-                                  float* predicted_seconds);
+                                  float* predicted_seconds,
+                                  Ltx2DurationWidthCounts* widths = nullptr);
 
 // `require_num_frames_source` (utils/blocks.py:894-905). THE POSITION IS PART OF
 // THE BEHAVIOUR: upstream calls this at the very top of `__call__`, before prompt
@@ -176,8 +252,11 @@ void Ltx2RequireNumFramesSource(bool auto_requested, bool has_predictor);
 // `DurationPredictor.from_checkpoint` (utils/blocks.py:816-848). Returns FALSE —
 // upstream's `None` — when the file carries no head or only part of one, and
 // refuses only a tensor that is PRESENT at the wrong shape. `compute_dtype`
-// exists so the owed bf16 arm (A24's eighth component) is a call-site change
-// rather than a signature change; anything but f32/bf16 refuses by name.
+// selects the arm — `kBF16` is upstream's own model dtype and what a production
+// render asks for (A24 wave 6, #2955), `kF32` is the wider parity arm — and
+// anything else refuses by name. A BF16 source is moved WORD FOR WORD onto the
+// bf16 arm rather than round-tripped through f32, which is what makes
+// `Ltx2VaeWeights::Bytes()` the storage claim rather than a report of it.
 bool Ltx2LoadDurationHeadWeights(const SafetensorsFile& file,
                                  const Ltx2DurationHeadConfig& config, vt::DType compute_dtype,
                                  Ltx2VaeWeights* out);

@@ -41,6 +41,19 @@ __device__ inline void St(float* p, int64_t i, float v) { p[i] = v; }
 __device__ inline void St(__hip_bfloat16* p, int64_t i, float v) {
   p[i] = __float2bfloat16(v);
 }
+// Narrow an f32 value through the gate dtype (round-trip), matching the CPU
+// oracle's RoundThrough (cpu_ops.cpp:2355) and upstream vLLM's silu_kernel
+// (activation_kernels.cu:158) which casts the intermediate to T before
+// compute multiplies. f32 is identity; bf16 round-trips through the reduced
+// width so the multiply sees exactly the rounded silu value.
+template <typename T>
+__device__ inline float NarrowTo(float v) {
+  return v;  // f32: no narrowing
+}
+template <>
+__device__ inline float NarrowTo<__hip_bfloat16>(float v) {
+  return __bfloat162float(__float2bfloat16(v));
+}
 
 template <typename Tin, typename Tout>
 __global__ void MulScalarK(Tout* out, const Tin* x, int64_t n, float s) {
@@ -71,6 +84,11 @@ __global__ void AddBcastK(T* out, const T* a, const T* b, int64_t rows, int64_t 
     St(out, idx, Ld(a, idx) + Ld(b, idx % cols));
 }
 
+// gelu(gate) * up from a packed [gate||up] input. The gelu intermediate is
+// narrowed to the input dtype exactly as the silu one below is: the CPU oracle
+// rounds it through in_dt before the multiply (cpu_ops.cpp:644), so without
+// this the bf16 arm multiplies an f32 gelu where the oracle multiplies a
+// bf16-rounded one.
 template <typename Tin, typename Tout>
 __global__ void GeluMulK(Tout* out, const Tin* x, int64_t n, int64_t d) {
   for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n;
@@ -79,7 +97,7 @@ __global__ void GeluMulK(Tout* out, const Tin* x, int64_t n, int64_t d) {
     const float g = Ld(x, i * 2 * d + j);
     const float up = Ld(x, i * 2 * d + d + j);
     const float inner = 0.7978845608028654f * (g + 0.044715f * g * g * g);
-    St(out, idx, 0.5f * g * (1.0f + tanhf(inner)) * up);
+    St(out, idx, NarrowTo<Tin>(0.5f * g * (1.0f + tanhf(inner))) * up);
   }
 }
 
@@ -91,10 +109,14 @@ __global__ void GeluMulSepK(Tout* out, const Tin* gate, const Tin* up, int64_t n
     const float g = Ld(gate, idx);
     const float u = Ld(up, idx);
     const float inner = 0.7978845608028654f * (g + 0.044715f * g * g * g);
-    St(out, idx, 0.5f * g * (1.0f + tanhf(inner)) * u);
+    St(out, idx, NarrowTo<Tin>(0.5f * g * (1.0f + tanhf(inner))) * u);
   }
 }
 
+// silu(gate) * up from a packed [gate||up] input. The silu intermediate is
+// narrowed to the input dtype (Tin) before the multiply, matching the CPU
+// oracle's RoundThrough(in_dt, ...) (cpu_ops.cpp:669) and upstream vLLM's
+// silu_kernel cast to T (activation_kernels.cu:158) before compute multiplies.
 template <typename Tin, typename Tout>
 __global__ void SiluMulK(Tout* out, const Tin* x, int64_t n, int64_t d) {
   for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n;
@@ -102,7 +124,7 @@ __global__ void SiluMulK(Tout* out, const Tin* x, int64_t n, int64_t d) {
     const int64_t i = idx / d, j = idx - i * d;
     const float g = Ld(x, i * 2 * d + j);
     const float up = Ld(x, i * 2 * d + d + j);
-    St(out, idx, (g / (1.0f + expf(-g))) * up);
+    St(out, idx, NarrowTo<Tin>(g / (1.0f + expf(-g))) * up);
   }
 }
 

@@ -270,7 +270,7 @@ are the ones tracked elsewhere; this row claims only its own.
 ## Owed
 
 - A guard against a borrowed `vt::Tensor` outliving the object that owns its
-  storage — filed as [#949](https://github.com/mudler/vllm.cpp/issues/949) and
+  storage — filed as ISSUE-GH-949 and
   indexed in [`.agents/issue-index.md`](../completed/issue-index.md). Nothing in the tree
   refuses it, and it took ASan on a lane that has been cancelled on every `main`
   run for weeks to find this one instance. The review of this row sharpened the
@@ -279,7 +279,7 @@ are the ones tracked elsewhere; this row claims only its own.
   assertions, `rc=0`, because `dtype` lives in the `vt::Tensor` struct and not
   in the freed buffer, so even the refusal path cannot notice garbage. The only
   instrument that sees this defect is therefore a lane that is
-  `continue-on-error`, which is how #904 reached `main` at all. #949 weighs
+  `continue-on-error`, which is how #904 reached `main` at all. ISSUE-GH-949 weighs
   three remedies — promoting the lane once it has a `main` baseline, a test that
   fails without a sanitizer, and a static check for the pattern — rather than
   presuming one; scoping it stays a `vt` design question, which is why it is an

@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -83,11 +84,15 @@ inline void PrefaultBorrowedSpan(const uint8_t* src, size_t bytes) {
 OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
                                int64_t k, int64_t row_offset,
                                const GgufFile* mmap_src, bool repack,
-                               bool cuda_align, bool prefault) {
+                               bool cuda_align, bool prefault, GgufTensorRole role) {
   vt::DType dt = vt::DType::kF32;
-  VT_CHECK(KeepQuantDType(tensor.ggml_type, &dt),
+  const bool gather = role == GgufTensorRole::kEmbeddingTable;
+  VT_CHECK(gather ? KeepQuantGatherDType(tensor.ggml_type, &dt)
+                  : KeepQuantDType(tensor.ggml_type, &dt),
            "qwen3_5 gguf: keep-quant on a non-keep-quant encoding for " +
                tensor.name);
+  VT_CHECK(!gather || (!repack && !cuda_align),
+             "qwen3_5 gguf: embedding blocks cannot use a matrix repack");
   VT_CHECK(n > 0 && k > 0 && row_offset >= 0,
            "qwen3_5 gguf: bad keep-quant slice for " + tensor.name);
   // Throws when k is not a whole number of blocks (ggml_row_size contract).
@@ -809,7 +814,8 @@ void LoadEmbedAndHead(const GgufFile& g, const GgufLoadPolicy& pol,
     // it does on the f16 arm — this tensor is a table, not a [N,K] GEMM weight.
     *embed = OwnGgufQuantBlocks(et, et.shape[0], et.shape[1], /*row_offset=*/0,
                                 MmapSrc(g, pol), /*repack=*/false,
-                                /*cuda_align=*/false);
+                                /*cuda_align=*/false, /*prefault=*/true,
+                                GgufTensorRole::kEmbeddingTable);
     embed->nk = false;
   } else if (embed_r == GgufResidency::kKeepF16) {
     VT_CHECK(et.shape.size() == 2, "qwen3_5 gguf: token_embd must be 2-D");
@@ -1765,6 +1771,67 @@ void RefuseUnaccountedQwen3_5Gguf(const GgufFile& gguf,
                "SILENTLY. Check <arch>.block_count against "
                "<arch>.nextn_predict_layers, and see "
                ".agents/specs/qwen38-27b-quant-arms.md");
+}
+
+Qwen3_5GgufMtpHeadSkip Qwen3_5GgufMtpHeadSkipTensors(const GgufFile& gguf,
+                                                     const HfConfig& config) {
+  Qwen3_5GgufMtpHeadSkip out;
+  const int64_t n_mtp = DeclaredMtpDepth(config);
+  if (n_mtp <= 0) return out;
+
+  // The same names the expected-tensor enumeration lists for the head block:
+  // the four scalar `nextn.*` tensors on the FIRST head block, then one
+  // ordinary (always full-attention) block per head layer. Kept in lockstep
+  // with `Qwen3_5GgufExpectedTensors` — its accounting is what refuses a name
+  // this list forgets, so the two cannot drift silently.
+  std::vector<std::string> want;
+  const int64_t L = config.num_hidden_layers;
+  for (const char* stem :
+       {"nextn.eh_proj.weight", "nextn.enorm.weight", "nextn.hnorm.weight",
+        "nextn.shared_head_norm.weight"}) {
+    want.push_back(Blk(L, stem));
+  }
+  for (int64_t i = 0; i < n_mtp; ++i) {
+    AppendBlockTensors(L + i, /*linear_attention=*/false,
+                       config.num_experts > 0, &want);
+  }
+
+  // Intersect with the file, in file order, and total the bytes: the numbers
+  // the loud skip line reports.
+  std::set<std::string> want_set(want.begin(), want.end());
+  for (const GgufTensorInfo& t : gguf.Tensors()) {
+    if (want_set.count(t.name) == 0) continue;
+    out.names.push_back(t.name);
+    out.bytes += static_cast<int64_t>(t.nbytes);
+  }
+  out.tensor_count = static_cast<int64_t>(out.names.size());
+  out.present = out.tensor_count > 0;
+  return out;
+}
+
+void LogQwen3_5GgufMtpHeadSkip(const GgufFile& gguf, const HfConfig& config) {
+  const Qwen3_5GgufMtpHeadSkip skip =
+      Qwen3_5GgufMtpHeadSkipTensors(gguf, config);
+  if (!skip.present) return;
+  std::string names;
+  for (size_t i = 0; i < skip.names.size(); ++i) {
+    names += (i == 0 ? "" : ", ") + skip.names[i];
+  }
+  std::cerr << "engine: qwen3.5 gguf: SKIPPING the MTP drafter head — "
+            << skip.tensor_count << " tensor(s), " << skip.bytes
+            << " B, none of them read by this trunk-only load: " << names
+            << ". They are the multi-token-prediction head at blk."
+            << config.num_hidden_layers << " (block_count "
+            << (config.num_hidden_layers + DeclaredMtpDepth(config))
+            << " = " << config.num_hidden_layers << " trunk + "
+            << DeclaredMtpDepth(config)
+            << " head); they load only when speculative decoding is "
+               "configured (speculative-config method \"mtp\"). Denominator "
+               "parity: the pinned llama.cpp b10451 oracle IGNORES these same "
+               "tensors too (64 trunk layers, no MTP head; "
+               ".agents/oracles/llama-cpp.md), so a gate against it is "
+               "matched work only with this skip loud."
+            << std::endl;
 }
 
 }  // namespace vllm

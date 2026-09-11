@@ -1,0 +1,11 @@
+Traceback (most recent call last):
+  File "/workspace/strix-3015-20260907.Gq6MW5/worker-measure.py", line 384, in <module>
+    main()
+  File "/workspace/strix-3015-20260907.Gq6MW5/worker-measure.py", line 380, in main
+    measure(manifest, json.loads(args.state.read_text()), args.output)
+  File "/workspace/strix-3015-20260907.Gq6MW5/worker-measure.py", line 341, in measure
+    ours = run("vllmcpp", "trace-vllmcpp", 1, profile=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/strix-3015-20260907.Gq6MW5/worker-measure.py", line 332, in run
+    raise ValueError(f"leg {tag} failed; see captured logs")
+ValueError: leg trace-vllmcpp failed; see captured logs

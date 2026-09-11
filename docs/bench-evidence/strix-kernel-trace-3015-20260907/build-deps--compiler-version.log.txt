@@ -1,0 +1,6 @@
+["podman", "--storage-driver=vfs", "--root", "/tmp/podman-pr66-root-vfs", "--runroot", "/tmp/podman-pr66-run-vfs", "run", "--rm", "--name", "strix-3015-d81cf2fa1e3f4cb682e0f50f88f12205", "--device=/dev/kfd", "--device=/dev/dri", "--group-add", "video", "-v", "/tmp/strix-3015-4fdrfcj3:/tmp/strix-3015-4fdrfcj3:rw", "-v", "/workspace/ccache:/workspace/ccache:rw", "--entrypoint", "/opt/rocm/lib/llvm/bin/clang++", "d554fe849c5e3c4d6b81227e0b87f165fa3b7b015899872bd93bc732c12ffeb6", "--version"]
+AMD clang version 22.0.0git (https://github.com/RadeonOpenCompute/llvm-project roc-7.2.4 26084 f58b06dce1f9c15707c5f808fd002e18c2accf7e)
+Target: x86_64-unknown-linux-gnu
+Thread model: posix
+InstalledDir: /opt/rocm-7.2.4/lib/llvm/bin
+Configuration file: /opt/rocm-7.2.4/lib/llvm/bin/clang++.cfg

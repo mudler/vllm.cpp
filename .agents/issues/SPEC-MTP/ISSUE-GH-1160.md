@@ -1,0 +1,23 @@
+ID: ISSUE-GH-1160
+Title: `--speculative-config` read five keys (`src/vllm/config/speculative.cpp:14-131` @ `affc2a7fd`) and DROPPED every other one, so `{"method":"dspark","model":"...","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}` started a server that drafted GREEDY, logged nothing and exited 0, and a misspelled `"num_speculatve_tokens"` silently took the resolved default. Upstream gets this refusal free: `SpeculativeConfig` carries `extra="forbid"` through its `@config` decorator (`vllm/config/speculative.py:81-83` @ `555967922`), and the hand-written C++ parser reproduced the reads without the guard. The method value WAS validated (`speculative.cpp:43,48-54`), so the strictness existed for one field and was absent for the object. Not merely an inert flag: draft sampling and verify are greedy here (`include/vllm/v1/worker/gpu/spec_decode/dspark/speculator.h:36-38`, `include/vllm/v1/spec_decode/rejection_sampler.h:53-57`), so a dropped `probabilistic` yields a DETERMINISTIC run when a sampled draft was requested, and a deterministic run is adjudicable by the token-exact greedy gate while the requested configuration is not, which lets a parity or benchmark number be taken under a configuration nobody chose. Fixed by admitting the object key by key against the `SpeculativeConfig` field set at the pin (`speculative.py:85-283`), in three classes. The five honoured keys pass. `draft_sample_method` and `rejection_sample_method` pass at their upstream defaults `greedy` and `standard`, which are what this engine implements, and any other value names row `SPEC-ACCEPT-VARIANTS`. Every other name is refused, worded differently for a declared vLLM field than for a typo. Scope item 2 of the issue, probabilistic draft sampling itself, stays owned by `SPEC-ACCEPT-VARIANTS` (`.agents/engine-matrix.md:191`, `INVENTORIED`) and is NOT in this change. Gated by `tests/vllm/config/test_speculative_unknown_keys.cpp` (9/9, 63 assertions, RED-first at 6/9 failing) plus three black-box server-CLI cases in `examples/CMakeLists.txt`, which are the reach proof: the unit file calls the parser directly and stays GREEN with the server call site deleted, while the CLI cases go RED
+Row: SPEC-MTP
+State: UNKNOWN
+Kind: bug
+GitHub: 1160
+Mirror: MISSING
+Availability: METADATA_ONLY
+Created: UNKNOWN
+Updated: UNKNOWN
+Closed: UNKNOWN
+
+## Problem
+
+Archive: `.agents/completed/issue-index.md:358`
+
+### Frozen archive evidence
+
+> | [#1160](https://github.com/mudler/vllm.cpp/issues/1160) | `SPEC-MTP` | `--speculative-config` read five keys (`src/vllm/config/speculative.cpp:14-131` @ `affc2a7fd`) and DROPPED every other one, so `{"method":"dspark","model":"...","num_speculative_tokens":7,"draft_sample_method":"probabilistic"}` started a server that drafted GREEDY, logged nothing and exited 0, and a misspelled `"num_speculatve_tokens"` silently took the resolved default. Upstream gets this refusal free: `SpeculativeConfig` carries `extra="forbid"` through its `@config` decorator (`vllm/config/speculative.py:81-83` @ `555967922`), and the hand-written C++ parser reproduced the reads without the guard. The method value WAS validated (`speculative.cpp:43,48-54`), so the strictness existed for one field and was absent for the object. Not merely an inert flag: draft sampling and verify are greedy here (`include/vllm/v1/worker/gpu/spec_decode/dspark/speculator.h:36-38`, `include/vllm/v1/spec_decode/rejection_sampler.h:53-57`), so a dropped `probabilistic` yields a DETERMINISTIC run when a sampled draft was requested, and a deterministic run is adjudicable by the token-exact greedy gate while the requested configuration is not, which lets a parity or benchmark number be taken under a configuration nobody chose. Fixed by admitting the object key by key against the `SpeculativeConfig` field set at the pin (`speculative.py:85-283`), in three classes. The five honoured keys pass. `draft_sample_method` and `rejection_sample_method` pass at their upstream defaults `greedy` and `standard`, which are what this engine implements, and any other value names row `SPEC-ACCEPT-VARIANTS`. Every other name is refused, worded differently for a declared vLLM field than for a typo. Scope item 2 of the issue, probabilistic draft sampling itself, stays owned by `SPEC-ACCEPT-VARIANTS` (`.agents/engine-matrix.md:191`, `INVENTORIED`) and is NOT in this change. Gated by `tests/vllm/config/test_speculative_unknown_keys.cpp` (9/9, 63 assertions, RED-first at 6/9 failing) plus three black-box server-CLI cases in `examples/CMakeLists.txt`, which are the reach proof: the unit file calls the parser directly and stays GREEN with the server call site deleted, while the CLI cases go RED | bug |
+
+## Resolution
+
+-

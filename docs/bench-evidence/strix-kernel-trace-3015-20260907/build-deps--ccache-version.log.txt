@@ -1,0 +1,13 @@
+["podman", "--storage-driver=vfs", "--root", "/tmp/podman-pr66-root-vfs", "--runroot", "/tmp/podman-pr66-run-vfs", "run", "--rm", "--name", "strix-3015-a1ec023e36634c5a98ca58a7b531f7a9", "--device=/dev/kfd", "--device=/dev/dri", "--group-add", "video", "-v", "/tmp/strix-3015-4fdrfcj3:/tmp/strix-3015-4fdrfcj3:rw", "-v", "/workspace/ccache:/workspace/ccache:rw", "--entrypoint", "ccache", "d554fe849c5e3c4d6b81227e0b87f165fa3b7b015899872bd93bc732c12ffeb6", "--version"]
+ccache version 4.9.1
+Features: file-storage http-storage redis+unix-storage redis-storage
+
+Copyright (C) 2002-2007 Andrew Tridgell
+Copyright (C) 2009-2024 Joel Rosdahl and other contributors
+
+See <https://ccache.dev/credits.html> for a complete list of contributors.
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 3 of the License, or (at your option) any later
+version.

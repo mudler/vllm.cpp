@@ -1,0 +1,535 @@
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+hash DETECTED failures 9 errors 3
+  review2_tests.CommandTests.test_cli_rejects_archive AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_corrupt_copied_model AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_model AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_tampered_binaries_and_libraries (engine='vllmcpp', path='/tmp/tmptm3hsk9t/local/vllm-cli') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_tampered_binaries_and_libraries Diff is 20028 characters long. Set self.maxDiff to None to see it.
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='model') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='binary') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='library') AssertionError: ValueError not raised
+  review2_tests.EvidenceTests.test_artifact_identity AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_tampered_binaries_and_libraries (engine='vllmcpp', path='/tmp/tmptm3hsk9t/local/vllmcpp.so') FileExistsError: [Errno 17] File exists: '/tmp/tmptm3hsk9t/local/trace-vllmcpp'
+  review2_tests.CommandTests.test_cli_rejects_tampered_binaries_and_libraries (engine='llamacpp', path='/tmp/tmptm3hsk9t/local/llama-completion') FileExistsError: [Errno 17] File exists: '/tmp/tmptm3hsk9t/local/trace-vllmcpp'
+  review2_tests.CommandTests.test_cli_rejects_tampered_binaries_and_libraries (engine='llamacpp', path='/tmp/tmptm3hsk9t/local/llamacpp.so') FileExistsError: [Errno 17] File exists: '/tmp/tmptm3hsk9t/local/trace-vllmcpp'
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+size DETECTED failures 1 errors 0
+  review2_tests.EvidenceTests.test_artifact_identity AssertionError: ValueError not raised
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+archive hash call DETECTED failures 1 errors 0
+  review2_tests.CommandTests.test_cli_rejects_archive AssertionError: ValueError not raised
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+archive revision DETECTED failures 1 errors 0
+  review2_tests.EvidenceTests.test_archive_revision_guard AssertionError: ValueError not raised
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+llama pin DETECTED failures 2 errors 0
+  review2_tests.CommandTests.test_cli_rejects_valid_archive_at_wrong_llama_pin AssertionError: ValueError not raised
+  review2_tests.EvidenceTests.test_archive_revision_guard AssertionError: ValueError not raised
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+llama counts DETECTED failures 5 errors 0
+  review2_tests.CommandTests.test_cli_rejects_matched_counts AssertionError: ValueError not raised
+  review2_tests.EvidenceTests.test_llama_refuses_short_or_different_prompt (bad='') AssertionError: ValueError not raised
+  review2_tests.EvidenceTests.test_llama_refuses_short_or_different_prompt (bad='common_perf_print: samplers time = 2.50 ms / 63 tokens\ncommon_perf_print: prompt eval time = 2.50 ms / 5 tokens\ncommon_perf_print: eval time = 100.00 ms / 63 runs') AssertionError: ValueError not raised
+  review2_tests.EvidenceTests.test_llama_refuses_short_or_different_prompt (bad='common_perf_print: samplers time = 2.50 ms / 64 tokens\ncommon_perf_print: prompt eval time = 2.50 ms / 6 tokens\ncommon_perf_print: eval time = 100.00 ms / 63 runs') AssertionError: ValueError not raised
+  review2_tests.EvidenceTests.test_llama_refuses_short_or_different_prompt (bad='common_perf_print: samplers time = 2.50 ms / 64 tokens\ncommon_perf_print: prompt eval time = 2.50 ms / 5 tokens\ncommon_perf_print: eval time = 100.00 ms / 63 runs\ncommon_perf_print: samplers time = 2.50 ms / 64 tokens\ncommon_perf_print: prompt eval time = 2.50 ms / 5 tokens\ncommon_perf_print: eval time = 100.00 ms / 63 runs') AssertionError: ValueError not raised
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+generation complete DETECTED failures 2 errors 0
+  review2_tests.EvidenceTests.test_requires_complete_matching_generations (broken='vllm-cli: run=1/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=2.000 tok_s=32.000\nvllm-cli: run=1/4 generate_start_unix=103.000000 generate_end_unix=105.000000\nvllm-cli: run=2/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=2.000 tok_s=32.000\nvllm-cli: run=2/4 generate_start_unix=106.000000 generate_end_unix=108.000000\nvllm-cli: run=3/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=2.000 tok_s=32.000\nvllm-cli: run=3/4 generate_start_unix=109.000000 generate_end_unix=111.000000\nvllm-cli: run=3/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=2.000 tok_s=32.000\nvllm-cli: run=3/4 generate_start_unix=112.000000 generate_end_unix=114.000000') AssertionError: ValueError not raised
+  review2_tests.EvidenceTests.test_requires_complete_matching_generations (broken='vllm-cli: run=1/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=2.000 tok_s=32.000\nvllm-cli: run=1/4 generate_start_unix=103.000000 generate_end_unix=105.000000\nvllm-cli: run=2/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=2.000 tok_s=32.000\nvllm-cli: run=2/4 generate_start_unix=106.000000 generate_end_unix=108.000000\nvllm-cli: run=3/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=2.000 tok_s=32.000\nvllm-cli: run=3/4 generate_start_unix=109.000000 generate_end_unix=111.000000\n') AssertionError: ValueError not raised
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+generation workload DETECTED failures 2 errors 0
+  review2_tests.EvidenceTests.test_requires_complete_matching_generations (broken='vllm-cli: run=1/4 finish_reason=length prompt_tokens=5 completion_tokens=63 secs=2.000 tok_s=32.000\nvllm-cli: run=1/4 generate_start_unix=103.000000 generate_end_unix=105.000000\nvllm-cli: run=2/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=2.000 tok_s=32.000\nvllm-cli: run=2/4 generate_start_unix=106.000000 generate_end_unix=108.000000\nvllm-cli: run=3/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=2.000 tok_s=32.000\nvllm-cli: run=3/4 generate_start_unix=109.000000 generate_end_unix=111.000000\nvllm-cli: run=4/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=2.000 tok_s=32.000\nvllm-cli: run=4/4 generate_start_unix=112.000000 generate_end_unix=114.000000') AssertionError: ValueError not raised
+  review2_tests.EvidenceTests.test_requires_complete_matching_generations (broken='vllm-cli: run=1/4 finish_reason=stop prompt_tokens=5 completion_tokens=64 secs=2.000 tok_s=32.000\nvllm-cli: run=1/4 generate_start_unix=103.000000 generate_end_unix=105.000000\nvllm-cli: run=2/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=2.000 tok_s=32.000\nvllm-cli: run=2/4 generate_start_unix=106.000000 generate_end_unix=108.000000\nvllm-cli: run=3/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=2.000 tok_s=32.000\nvllm-cli: run=3/4 generate_start_unix=109.000000 generate_end_unix=111.000000\nvllm-cli: run=4/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=2.000 tok_s=32.000\nvllm-cli: run=4/4 generate_start_unix=112.000000 generate_end_unix=114.000000') AssertionError: ValueError not raised
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+duration DETECTED failures 1 errors 0
+  review2_tests.EvidenceTests.test_requires_complete_matching_generations (broken='vllm-cli: run=1/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=8.000 tok_s=32.000\nvllm-cli: run=1/4 generate_start_unix=103.000000 generate_end_unix=105.000000\nvllm-cli: run=2/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=2.000 tok_s=32.000\nvllm-cli: run=2/4 generate_start_unix=106.000000 generate_end_unix=108.000000\nvllm-cli: run=3/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=2.000 tok_s=32.000\nvllm-cli: run=3/4 generate_start_unix=109.000000 generate_end_unix=111.000000\nvllm-cli: run=4/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=2.000 tok_s=32.000\nvllm-cli: run=4/4 generate_start_unix=112.000000 generate_end_unix=114.000000') AssertionError: ValueError not raised
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+prompt consistency DETECTED failures 1 errors 0
+  review2_tests.EvidenceTests.test_requires_complete_matching_generations (broken='vllm-cli: run=1/4 finish_reason=length prompt_tokens=6 completion_tokens=64 secs=2.000 tok_s=32.000\nvllm-cli: run=1/4 generate_start_unix=103.000000 generate_end_unix=105.000000\nvllm-cli: run=2/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=2.000 tok_s=32.000\nvllm-cli: run=2/4 generate_start_unix=106.000000 generate_end_unix=108.000000\nvllm-cli: run=3/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=2.000 tok_s=32.000\nvllm-cli: run=3/4 generate_start_unix=109.000000 generate_end_unix=111.000000\nvllm-cli: run=4/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=2.000 tok_s=32.000\nvllm-cli: run=4/4 generate_start_unix=112.000000 generate_end_unix=114.000000') AssertionError: ValueError not raised
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+clock cold exclusion DETECTED failures 1 errors 0
+  review2_tests.EvidenceTests.test_clock_fold_uses_only_warm_windows AssertionError: 4 != 3
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+clock window DETECTED failures 1 errors 0
+  review2_tests.EvidenceTests.test_clock_fold_uses_only_warm_windows AssertionError: 15 != 3
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+pair completeness DETECTED failures 1 errors 1
+  review2_tests.EvidenceTests.test_pair_fold_rejects_missing_output_or_workload (broken=[{'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 0, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 0, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 1, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 1, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 2, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 2, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 0, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 0, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 1, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 1, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 2, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 2, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 0, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}]) AssertionError: ValueError not raised
+  review2_tests.EvidenceTests.test_pair_fold_rejects_missing_output_or_workload (broken=[{'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 0, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 0, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 1, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 1, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 2, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 2, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 0, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 0, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 1, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 1, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 2, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}]) KeyError: ('VT_ROCM_Q6K_SMALL_PRIVATE', 2, 'candidate')
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+pair output DETECTED failures 3 errors 0
+  review2_tests.CommandTests.test_cli_rejects_pair_output AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_rejects_changed_output AssertionError: ValueError not raised
+  review2_tests.EvidenceTests.test_pair_fold_rejects_missing_output_or_workload (broken=[{'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 0, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'returncode': 0}, {'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 0, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 1, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 1, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 2, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 2, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 0, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 0, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 1, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 1, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 2, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 2, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}]) AssertionError: ValueError not raised
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+pair status DETECTED failures 1 errors 0
+  review2_tests.EvidenceTests.test_pair_fold_rejects_missing_output_or_workload (broken=[{'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 0, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 1}, {'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 0, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 1, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 1, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 2, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q8K_BLOCK', 'pair': 2, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 0, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 0, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 1, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 1, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 2, 'arm': 'default', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 100, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 4, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 6, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}, {'switch': 'VT_ROCM_Q6K_SMALL_PRIVATE', 'pair': 2, 'arm': 'candidate', 'runs': [{'run': 1, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 80, 'start': 103.0, 'end': 105.0}, {'run': 2, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 1, 'start': 106.0, 'end': 108.0}, {'run': 3, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 2, 'start': 109.0, 'end': 111.0}, {'run': 4, 'prompt_tokens': 5, 'completion_tokens': 64, 'seconds': 3, 'start': 112.0, 'end': 114.0}], 'output_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'returncode': 0}]) AssertionError: ValueError not raised
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+default cold exclusion DETECTED failures 1 errors 0
+  review2_tests.EvidenceTests.test_pair_fold_rejects_missing_output_or_workload + (4, 2, 2)
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+candidate cold exclusion DETECTED failures 1 errors 0
+  review2_tests.EvidenceTests.test_pair_fold_rejects_missing_output_or_workload + (4, 2, 2)
+main reachability DETECTED failures 45 errors 0
+  review2_tests.CommandTests.test_cli_build_and_measure AssertionError: False is not true
+  review2_tests.CommandTests.test_cli_rejects_archive AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_corrupt_copied_model AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_host_tuning (prefix='VT_') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_host_tuning (prefix='GGML_') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_host_tuning (prefix='HSA_') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_host_tuning (prefix='HIP_') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_host_tuning (prefix='ROCR_') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_host_tuning (prefix='PYTORCH_') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_image AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_image_tuning (name='VT_ROCM_Q8K_BLOCK') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_image_tuning (name='GGML_SETTING') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_image_tuning (name='HSA_SETTING') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_image_tuning (name='HIP_SETTING') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_image_tuning (name='ROCR_SETTING') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_image_tuning (name='PYTORCH_SETTING') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_manifest AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_matched_counts AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_model AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_pair_output AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_reference_fallback AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_tampered_binaries_and_libraries (engine='vllmcpp', path='/tmp/tmpqxbad1xr/local/vllm-cli') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_tampered_binaries_and_libraries (engine='vllmcpp', path='/tmp/tmpqxbad1xr/local/vllmcpp.so') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_tampered_binaries_and_libraries (engine='llamacpp', path='/tmp/tmpqxbad1xr/local/llama-completion') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_tampered_binaries_and_libraries (engine='llamacpp', path='/tmp/tmpqxbad1xr/local/llamacpp.so') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_valid_archive_at_wrong_llama_pin AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_wrong_or_missing_lease (lease={}) AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_wrong_or_missing_lease (lease={'RC_DEVICE': 'strix:gpu0'}) AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_wrong_or_missing_lease (lease={'RC_JOB_ID': 'test'}) AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_wrong_or_missing_lease (lease={'RC_DEVICE': 'other:gpu0', 'RC_JOB_ID': 'test'}) AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_wrong_or_missing_lease (lease={'RC_DEVICE': 'strix:gpu0', 'RC_JOB_ID': ''}) AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_stops_excess_host_output AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_stops_live_gpu_fault_and_preserves_evidence AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='manifest') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='image') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='model') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='binary') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='library') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='host tuning') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='image tuning') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='lease') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_refuses_existing_leg AssertionError: FileExistsError not raised
+  review2_tests.CommandTests.test_cli_switches_rejects_changed_output AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_requires_state AssertionError: SystemExit not raised
+  review2_tests.CommandTests.test_cli_switches_runs_all_pairs_without_traces AssertionError: False is not true
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+build reachability DETECTED failures 4 errors 0
+  review2_tests.CommandTests.test_cli_build_and_measure AssertionError: False is not true
+  review2_tests.CommandTests.test_cli_rejects_archive AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_corrupt_copied_model AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_valid_archive_at_wrong_llama_pin AssertionError: ValueError not raised
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+measure reachability DETECTED failures 26 errors 2
+  review2_tests.CommandTests.test_cli_rejects_image AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_image_tuning (name='VT_ROCM_Q8K_BLOCK') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_image_tuning (name='GGML_SETTING') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_image_tuning (name='HSA_SETTING') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_image_tuning (name='HIP_SETTING') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_image_tuning (name='ROCR_SETTING') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_image_tuning (name='PYTORCH_SETTING') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_manifest AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_matched_counts AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_model AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_pair_output AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_reference_fallback AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_tampered_binaries_and_libraries (engine='vllmcpp', path='/tmp/tmplxh0enx9/local/vllm-cli') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_tampered_binaries_and_libraries (engine='vllmcpp', path='/tmp/tmplxh0enx9/local/vllmcpp.so') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_tampered_binaries_and_libraries (engine='llamacpp', path='/tmp/tmplxh0enx9/local/llama-completion') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_tampered_binaries_and_libraries (engine='llamacpp', path='/tmp/tmplxh0enx9/local/llamacpp.so') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_stops_excess_host_output AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_stops_live_gpu_fault_and_preserves_evidence AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='manifest') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='image') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='model') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='binary') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='library') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='image tuning') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_refuses_existing_leg AssertionError: FileExistsError not raised
+  review2_tests.CommandTests.test_cli_switches_rejects_changed_output AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_build_and_measure FileNotFoundError: [Errno 2] No such file or directory: '/tmp/tmpr7gmgowq/output/paired-result.json'
+  review2_tests.CommandTests.test_cli_switches_runs_all_pairs_without_traces FileNotFoundError: [Errno 2] No such file or directory: '/tmp/tmp96_c7tmd/output/trace-status.json'
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+build archive reachability DETECTED failures 2 errors 0
+  review2_tests.CommandTests.test_cli_rejects_archive AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_valid_archive_at_wrong_llama_pin AssertionError: ValueError not raised
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+build model reachability DETECTED failures 1 errors 0
+  review2_tests.CommandTests.test_cli_rejects_corrupt_copied_model AssertionError: ValueError not raised
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+measure model reachability DETECTED failures 2 errors 0
+  review2_tests.CommandTests.test_cli_rejects_model AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='model') AssertionError: ValueError not raised
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+measure binary reachability DETECTED failures 4 errors 3
+  review2_tests.CommandTests.test_cli_rejects_tampered_binaries_and_libraries (engine='vllmcpp', path='/tmp/tmphbmhni2k/local/vllm-cli') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_tampered_binaries_and_libraries Diff is 20028 characters long. Set self.maxDiff to None to see it.
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='binary') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='library') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_tampered_binaries_and_libraries (engine='vllmcpp', path='/tmp/tmphbmhni2k/local/vllmcpp.so') FileExistsError: [Errno 17] File exists: '/tmp/tmphbmhni2k/local/trace-vllmcpp'
+  review2_tests.CommandTests.test_cli_rejects_tampered_binaries_and_libraries (engine='llamacpp', path='/tmp/tmphbmhni2k/local/llama-completion') FileExistsError: [Errno 17] File exists: '/tmp/tmphbmhni2k/local/trace-vllmcpp'
+  review2_tests.CommandTests.test_cli_rejects_tampered_binaries_and_libraries (engine='llamacpp', path='/tmp/tmphbmhni2k/local/llamacpp.so') FileExistsError: [Errno 17] File exists: '/tmp/tmphbmhni2k/local/trace-vllmcpp'
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+pair call DETECTED failures 2 errors 2
+  review2_tests.CommandTests.test_cli_rejects_pair_output AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_rejects_changed_output AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_build_and_measure KeyError: 'pairs'
+  review2_tests.CommandTests.test_cli_switches_runs_all_pairs_without_traces KeyError: 'pairs'
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+matched counts call DETECTED failures 1 errors 1
+  review2_tests.CommandTests.test_cli_rejects_matched_counts AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_build_and_measure KeyError: 'completion_tokens'
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+image tuning DETECTED failures 2 errors 5
+  review2_tests.CommandTests.test_cli_rejects_image_tuning (name='VT_ROCM_Q8K_BLOCK') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='image tuning') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_image_tuning (name='GGML_SETTING') FileExistsError: [Errno 17] File exists: '/tmp/tmpyry_wu69/local/trace-vllmcpp'
+  review2_tests.CommandTests.test_cli_rejects_image_tuning (name='HSA_SETTING') FileExistsError: [Errno 17] File exists: '/tmp/tmpyry_wu69/local/trace-vllmcpp'
+  review2_tests.CommandTests.test_cli_rejects_image_tuning (name='HIP_SETTING') FileExistsError: [Errno 17] File exists: '/tmp/tmpyry_wu69/local/trace-vllmcpp'
+  review2_tests.CommandTests.test_cli_rejects_image_tuning (name='ROCR_SETTING') FileExistsError: [Errno 17] File exists: '/tmp/tmpyry_wu69/local/trace-vllmcpp'
+  review2_tests.CommandTests.test_cli_rejects_image_tuning (name='PYTORCH_SETTING') FileExistsError: [Errno 17] File exists: '/tmp/tmpyry_wu69/local/trace-vllmcpp'
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+host tuning DETECTED failures 2 errors 5
+  review2_tests.CommandTests.test_cli_rejects_host_tuning (prefix='VT_') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='host tuning') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_host_tuning (prefix='GGML_') FileExistsError: [Errno 17] File exists: '/tmp/tmpm1edl3jc/local/trace-vllmcpp'
+  review2_tests.CommandTests.test_cli_rejects_host_tuning (prefix='HSA_') FileExistsError: [Errno 17] File exists: '/tmp/tmpm1edl3jc/local/trace-vllmcpp'
+  review2_tests.CommandTests.test_cli_rejects_host_tuning (prefix='HIP_') FileExistsError: [Errno 17] File exists: '/tmp/tmpm1edl3jc/local/trace-vllmcpp'
+  review2_tests.CommandTests.test_cli_rejects_host_tuning (prefix='ROCR_') FileExistsError: [Errno 17] File exists: '/tmp/tmpm1edl3jc/local/trace-vllmcpp'
+  review2_tests.CommandTests.test_cli_rejects_host_tuning (prefix='PYTORCH_') FileExistsError: [Errno 17] File exists: '/tmp/tmpm1edl3jc/local/trace-vllmcpp'
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+manifest identity DETECTED failures 2 errors 0
+  review2_tests.CommandTests.test_cli_rejects_manifest AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='manifest') AssertionError: ValueError not raised
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+image identity DETECTED failures 2 errors 0
+  review2_tests.CommandTests.test_cli_rejects_image AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='image') AssertionError: ValueError not raised
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+lease guard DETECTED failures 3 errors 4
+  review2_tests.CommandTests.test_cli_rejects_wrong_or_missing_lease (lease={'RC_DEVICE': 'other:gpu0', 'RC_JOB_ID': 'test'}) AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_wrong_or_missing_lease Diff is 20028 characters long. Set self.maxDiff to None to see it.
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='lease') AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_rejects_wrong_or_missing_lease (lease={}) KeyError: 'RC_DEVICE'
+  review2_tests.CommandTests.test_cli_rejects_wrong_or_missing_lease (lease={'RC_DEVICE': 'strix:gpu0'}) KeyError: 'RC_JOB_ID'
+  review2_tests.CommandTests.test_cli_rejects_wrong_or_missing_lease (lease={'RC_JOB_ID': 'test'}) KeyError: 'RC_DEVICE'
+  review2_tests.CommandTests.test_cli_rejects_wrong_or_missing_lease (lease={'RC_DEVICE': 'strix:gpu0', 'RC_JOB_ID': ''}) FileExistsError: [Errno 17] File exists: '/tmp/tmpq23yachc/local/trace-vllmcpp'
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+immutable image DETECTED failures 9 errors 0
+  review2_tests.CommandTests.test_cli_build_and_measure + image-id
+  review2_tests.CommandTests.test_cli_rejects_archive + image-id
+  review2_tests.CommandTests.test_cli_rejects_corrupt_copied_model + image-id
+  review2_tests.CommandTests.test_cli_rejects_matched_counts + image-id
+  review2_tests.CommandTests.test_cli_rejects_pair_output + image-id
+  review2_tests.CommandTests.test_cli_rejects_reference_fallback + image-id
+  review2_tests.CommandTests.test_cli_rejects_valid_archive_at_wrong_llama_pin + image-id
+  review2_tests.CommandTests.test_cli_switches_rejects_changed_output + image-id
+  review2_tests.CommandTests.test_cli_switches_runs_all_pairs_without_traces + image-id
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+cleanup stop DETECTED failures 11 errors 0
+  review2_tests.CommandTests.test_cli_stops_excess_host_output + ['stop', 'rm']
+  review2_tests.CommandTests.test_cli_stops_live_gpu_fault_and_preserves_evidence + ['stop', 'rm']
+  review2_tests.CommandTests.test_managed_command_cleanup_and_limits (mode='success') + ['stop', 'rm']
+  review2_tests.CommandTests.test_managed_command_cleanup_and_limits (mode='failure') + ['stop', 'rm']
+  review2_tests.CommandTests.test_managed_command_cleanup_and_limits (mode='timeout') + ['stop', 'rm']
+  review2_tests.CommandTests.test_managed_command_cleanup_and_limits (mode='output') + ['stop', 'rm']
+  review2_tests.CommandTests.test_managed_command_cleanup_and_limits (mode='trace') + ['stop', 'rm']
+  review2_tests.CommandTests.test_managed_command_cleanup_and_limits (mode='aggregate') + ['stop', 'rm']
+  review2_tests.CommandTests.test_managed_live_fault_and_capture_boundaries (stream='stderr', diagnostic='GPU Hang') + ['stop', 'rm']
+  review2_tests.CommandTests.test_managed_live_fault_and_capture_boundaries (stream='stdout', diagnostic='Memory access fault') + ['stop', 'rm']
+  review2_tests.CommandTests.test_managed_live_fault_and_capture_boundaries (stream='stderr', diagnostic='HW Exception') + ['stop', 'rm']
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+cleanup rm DETECTED failures 12 errors 0
+  review2_tests.CommandTests.test_cli_build_and_measure AssertionError: False is not true
+  review2_tests.CommandTests.test_cli_stops_excess_host_output + ['stop', 'rm']
+  review2_tests.CommandTests.test_cli_stops_live_gpu_fault_and_preserves_evidence + ['stop', 'rm']
+  review2_tests.CommandTests.test_managed_command_cleanup_and_limits (mode='success') + ['stop', 'rm']
+  review2_tests.CommandTests.test_managed_command_cleanup_and_limits (mode='failure') + ['stop', 'rm']
+  review2_tests.CommandTests.test_managed_command_cleanup_and_limits (mode='timeout') + ['stop', 'rm']
+  review2_tests.CommandTests.test_managed_command_cleanup_and_limits (mode='output') + ['stop', 'rm']
+  review2_tests.CommandTests.test_managed_command_cleanup_and_limits (mode='trace') + ['stop', 'rm']
+  review2_tests.CommandTests.test_managed_command_cleanup_and_limits (mode='aggregate') + ['stop', 'rm']
+  review2_tests.CommandTests.test_managed_live_fault_and_capture_boundaries (stream='stderr', diagnostic='GPU Hang') + ['stop', 'rm']
+  review2_tests.CommandTests.test_managed_live_fault_and_capture_boundaries (stream='stdout', diagnostic='Memory access fault') + ['stop', 'rm']
+  review2_tests.CommandTests.test_managed_live_fault_and_capture_boundaries (stream='stderr', diagnostic='HW Exception') + ['stop', 'rm']
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+aggregate cap DETECTED failures 0 errors 4
+  review2_tests.CommandTests.test_cli_stops_excess_host_output subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-7d53234ff16c4c01afd69146a3c4165e', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmpswpbbhdl/local:/tmp/tmpswpbbhdl/local:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--ulimit', 'fsize=536870912:536870912', '-e', 'LD_LIBRARY_PATH=/tmp/tmpswpbbhdl/local/build-vllmcpp:/tmp/tmpswpbbhdl/local/build-vllmcpp/bin:/opt/rocm/lib', '-e', 'VT_OP_PROVIDER_STATS=1', '--entrypoint', 'profiler', 'image-id', '/tmp/tmpswpbbhdl/local/trace-vllmcpp/trace', '/tmp/tmpswpbbhdl/local/vllm-cli', '--model', '/tmp/tmpswpbbhdl/local/model', '--prompt', 'The capital of France is', '--max-tokens', '64', '--temperature', '0', '--repeat', '1', '--max-num-seqs', '1']' timed out after 3 seconds
+  review2_tests.CommandTests.test_managed_command_cleanup_and_limits (mode='output') subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-2f6813f015ef4e18b31a437160a22065', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmp6bywsqbs:/tmp/tmp6bywsqbs:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--entrypoint', 'app', 'test']' timed out after 0.3 seconds
+  review2_tests.CommandTests.test_managed_command_cleanup_and_limits (mode='trace') subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-11e766f59b9144bea13f48f25b813931', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmp7j5tqqca:/tmp/tmp7j5tqqca:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--entrypoint', 'app', 'test']' timed out after 0.3 seconds
+  review2_tests.CommandTests.test_managed_command_cleanup_and_limits (mode='aggregate') subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-331b510ccd10433681f144daf08e9871', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmpulbxqa0h:/tmp/tmpulbxqa0h:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--entrypoint', 'app', 'test']' timed out after 0.3 seconds
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+perfile cap DETECTED failures 7 errors 0
+  review2_tests.CommandTests.test_cli_build_and_measure AssertionError: 'fsize=536870912:536870912' not found in ['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-91dbfa6aa94540d2b9fff062ddf45363', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmpopuxzq9t/tmp8a0hz6hh:/tmp/tmpopuxzq9t/tmp8a0hz6hh:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '-e', 'LD_LIBRARY_PATH=/tmp/tmpopuxzq9t/tmp8a0hz6hh/build-vllmcpp:/tmp/tmpopuxzq9t/tmp8a0hz6hh/build-vllmcpp/bin:/opt/rocm/lib', '-e', 'VT_OP_PROVIDER_STATS=1', '--entrypoint', 'profiler', 'image-id', '/tmp/tmpopuxzq9t/tmp8a0hz6hh/trace-vllmcpp/trace', '/tmp/tmpopuxzq9t/tmp8a0hz6hh/build-vllmcpp/examples/vllm-cli', '--model', '/tmp/tmpopuxzq9t/tmp8a0hz6hh/Qwen3.8-27B-Q4_K_M.gguf', '--prompt', 'The capital of France is', '--max-tokens', '64', '--temperature', '0', '--repeat', '1', '--max-num-seqs', '1']
+  review2_tests.CommandTests.test_cli_rejects_matched_counts AssertionError: 'fsize=536870912:536870912' not found in ['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-664259e5cc6244d9bc6976f976550880', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmpye5wl3me/local:/tmp/tmpye5wl3me/local:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '-e', 'LD_LIBRARY_PATH=/tmp/tmpye5wl3me/local/build-vllmcpp:/tmp/tmpye5wl3me/local/build-vllmcpp/bin:/opt/rocm/lib', '-e', 'VT_OP_PROVIDER_STATS=1', '--entrypoint', 'profiler', 'image-id', '/tmp/tmpye5wl3me/local/trace-vllmcpp/trace', '/tmp/tmpye5wl3me/local/vllm-cli', '--model', '/tmp/tmpye5wl3me/local/model', '--prompt', 'The capital of France is', '--max-tokens', '64', '--temperature', '0', '--repeat', '1', '--max-num-seqs', '1']
+  review2_tests.CommandTests.test_cli_rejects_pair_output AssertionError: 'fsize=536870912:536870912' not found in ['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-b4341a66a2f04ad1a9f82f321833da5b', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmp_cmz6j6x/local:/tmp/tmp_cmz6j6x/local:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '-e', 'LD_LIBRARY_PATH=/tmp/tmp_cmz6j6x/local/build-vllmcpp:/tmp/tmp_cmz6j6x/local/build-vllmcpp/bin:/opt/rocm/lib', '-e', 'VT_OP_PROVIDER_STATS=1', '--entrypoint', 'profiler', 'image-id', '/tmp/tmp_cmz6j6x/local/trace-vllmcpp/trace', '/tmp/tmp_cmz6j6x/local/vllm-cli', '--model', '/tmp/tmp_cmz6j6x/local/model', '--prompt', 'The capital of France is', '--max-tokens', '64', '--temperature', '0', '--repeat', '1', '--max-num-seqs', '1']
+  review2_tests.CommandTests.test_cli_rejects_reference_fallback AssertionError: 'fsize=536870912:536870912' not found in ['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-03f2ba7f5b844c0fb1854c5799381749', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmp_34fgbyb/local:/tmp/tmp_34fgbyb/local:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '-e', 'LD_LIBRARY_PATH=/tmp/tmp_34fgbyb/local/build-vllmcpp:/tmp/tmp_34fgbyb/local/build-vllmcpp/bin:/opt/rocm/lib', '-e', 'VT_OP_PROVIDER_STATS=1', '--entrypoint', 'profiler', 'image-id', '/tmp/tmp_34fgbyb/local/trace-vllmcpp/trace', '/tmp/tmp_34fgbyb/local/vllm-cli', '--model', '/tmp/tmp_34fgbyb/local/model', '--prompt', 'The capital of France is', '--max-tokens', '64', '--temperature', '0', '--repeat', '1', '--max-num-seqs', '1']
+  review2_tests.CommandTests.test_cli_switches_rejects_changed_output AssertionError: 'fsize=536870912:536870912' not found in ['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-5fef35828de44939a45d4c2009717ef5', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmpaelevuvf/local:/tmp/tmpaelevuvf/local:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '-e', 'LD_LIBRARY_PATH=/tmp/tmpaelevuvf/local/build-vllmcpp:/tmp/tmpaelevuvf/local/build-vllmcpp/bin:/opt/rocm/lib', '-e', 'VT_OP_PROVIDER_STATS=1', '--entrypoint', '/tmp/tmpaelevuvf/local/vllm-cli', 'image-id', '--model', '/tmp/tmpaelevuvf/local/model', '--prompt', 'The capital of France is', '--max-tokens', '64', '--temperature', '0', '--repeat', '4', '--max-num-seqs', '1']
+  review2_tests.CommandTests.test_cli_switches_runs_all_pairs_without_traces AssertionError: 'fsize=536870912:536870912' not found in ['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-47213209462141c78a511ae05fd2d00a', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmpzs2lhhb8/local:/tmp/tmpzs2lhhb8/local:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '-e', 'LD_LIBRARY_PATH=/tmp/tmpzs2lhhb8/local/build-vllmcpp:/tmp/tmpzs2lhhb8/local/build-vllmcpp/bin:/opt/rocm/lib', '-e', 'VT_OP_PROVIDER_STATS=1', '--entrypoint', '/tmp/tmpzs2lhhb8/local/vllm-cli', 'image-id', '--model', '/tmp/tmpzs2lhhb8/local/model', '--prompt', 'The capital of France is', '--max-tokens', '64', '--temperature', '0', '--repeat', '4', '--max-num-seqs', '1']
+  review2_tests.EvidenceTests.test_runtime_output_limit_and_literal_command AssertionError: 'fsize=536870912:536870912' not found in ['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-bbd93a29a3ff4d479eeae9efa2f2a72e', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/test:/tmp/test:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--entrypoint', 'app', 'test-image']
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+run perfile cap DETECTED failures 6 errors 0
+  review2_tests.CommandTests.test_cli_build_and_measure AssertionError: 'fsize=536870912:536870912' not found in ['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-b414ffc0d06a4c55a59055f30b600a4a', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmp79353yya/tmprlxkcsiu:/tmp/tmp79353yya/tmprlxkcsiu:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '-e', 'LD_LIBRARY_PATH=/tmp/tmp79353yya/tmprlxkcsiu/build-vllmcpp:/tmp/tmp79353yya/tmprlxkcsiu/build-vllmcpp/bin:/opt/rocm/lib', '-e', 'VT_OP_PROVIDER_STATS=1', '--entrypoint', 'profiler', 'image-id', '/tmp/tmp79353yya/tmprlxkcsiu/trace-vllmcpp/trace', '/tmp/tmp79353yya/tmprlxkcsiu/build-vllmcpp/examples/vllm-cli', '--model', '/tmp/tmp79353yya/tmprlxkcsiu/Qwen3.8-27B-Q4_K_M.gguf', '--prompt', 'The capital of France is', '--max-tokens', '64', '--temperature', '0', '--repeat', '1', '--max-num-seqs', '1']
+  review2_tests.CommandTests.test_cli_rejects_matched_counts AssertionError: 'fsize=536870912:536870912' not found in ['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-75e90470be94459fabac0b0b3a971004', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmpeos0dvmc/local:/tmp/tmpeos0dvmc/local:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '-e', 'LD_LIBRARY_PATH=/tmp/tmpeos0dvmc/local/build-vllmcpp:/tmp/tmpeos0dvmc/local/build-vllmcpp/bin:/opt/rocm/lib', '-e', 'VT_OP_PROVIDER_STATS=1', '--entrypoint', 'profiler', 'image-id', '/tmp/tmpeos0dvmc/local/trace-vllmcpp/trace', '/tmp/tmpeos0dvmc/local/vllm-cli', '--model', '/tmp/tmpeos0dvmc/local/model', '--prompt', 'The capital of France is', '--max-tokens', '64', '--temperature', '0', '--repeat', '1', '--max-num-seqs', '1']
+  review2_tests.CommandTests.test_cli_rejects_pair_output AssertionError: 'fsize=536870912:536870912' not found in ['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-f520900475154126aec2af0f11f2dfe8', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmpvpruae02/local:/tmp/tmpvpruae02/local:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '-e', 'LD_LIBRARY_PATH=/tmp/tmpvpruae02/local/build-vllmcpp:/tmp/tmpvpruae02/local/build-vllmcpp/bin:/opt/rocm/lib', '-e', 'VT_OP_PROVIDER_STATS=1', '--entrypoint', 'profiler', 'image-id', '/tmp/tmpvpruae02/local/trace-vllmcpp/trace', '/tmp/tmpvpruae02/local/vllm-cli', '--model', '/tmp/tmpvpruae02/local/model', '--prompt', 'The capital of France is', '--max-tokens', '64', '--temperature', '0', '--repeat', '1', '--max-num-seqs', '1']
+  review2_tests.CommandTests.test_cli_rejects_reference_fallback AssertionError: 'fsize=536870912:536870912' not found in ['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-3f6811c7712848718c56d74b5dfd71fc', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmpf5v9v79c/local:/tmp/tmpf5v9v79c/local:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '-e', 'LD_LIBRARY_PATH=/tmp/tmpf5v9v79c/local/build-vllmcpp:/tmp/tmpf5v9v79c/local/build-vllmcpp/bin:/opt/rocm/lib', '-e', 'VT_OP_PROVIDER_STATS=1', '--entrypoint', 'profiler', 'image-id', '/tmp/tmpf5v9v79c/local/trace-vllmcpp/trace', '/tmp/tmpf5v9v79c/local/vllm-cli', '--model', '/tmp/tmpf5v9v79c/local/model', '--prompt', 'The capital of France is', '--max-tokens', '64', '--temperature', '0', '--repeat', '1', '--max-num-seqs', '1']
+  review2_tests.CommandTests.test_cli_switches_rejects_changed_output AssertionError: 'fsize=536870912:536870912' not found in ['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-e13ecc2bc68f40f2ade42fbbed44aaf5', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmp743d1up5/local:/tmp/tmp743d1up5/local:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '-e', 'LD_LIBRARY_PATH=/tmp/tmp743d1up5/local/build-vllmcpp:/tmp/tmp743d1up5/local/build-vllmcpp/bin:/opt/rocm/lib', '-e', 'VT_OP_PROVIDER_STATS=1', '--entrypoint', '/tmp/tmp743d1up5/local/vllm-cli', 'image-id', '--model', '/tmp/tmp743d1up5/local/model', '--prompt', 'The capital of France is', '--max-tokens', '64', '--temperature', '0', '--repeat', '4', '--max-num-seqs', '1']
+  review2_tests.CommandTests.test_cli_switches_runs_all_pairs_without_traces AssertionError: 'fsize=536870912:536870912' not found in ['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-050eab562b0f419abae1f55c2ef54b06', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmpgeegl52j/local:/tmp/tmpgeegl52j/local:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '-e', 'LD_LIBRARY_PATH=/tmp/tmpgeegl52j/local/build-vllmcpp:/tmp/tmpgeegl52j/local/build-vllmcpp/bin:/opt/rocm/lib', '-e', 'VT_OP_PROVIDER_STATS=1', '--entrypoint', '/tmp/tmpgeegl52j/local/vllm-cli', 'image-id', '--model', '/tmp/tmpgeegl52j/local/model', '--prompt', 'The capital of France is', '--max-tokens', '64', '--temperature', '0', '--repeat', '4', '--max-num-seqs', '1']
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+fallback refusal DETECTED failures 1 errors 0
+  review2_tests.CommandTests.test_cli_rejects_reference_fallback AssertionError: ValueError not raised
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+alternating pair order DETECTED failures 2 errors 0
+  review2_tests.CommandTests.test_cli_build_and_measure    'VT_ROCM_Q6K_SMALL_PRIVATE']
+  review2_tests.CommandTests.test_cli_switches_runs_all_pairs_without_traces    ('VT_ROCM_Q6K_SMALL_PRIVATE', 2, 'candidate')]
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+candidate activation DETECTED failures 4 errors 0
+  review2_tests.CommandTests.test_cli_build_and_measure +  'VT_ROCM_Q6K_SMALL_PRIVATE']
+  review2_tests.CommandTests.test_cli_rejects_pair_output AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_rejects_changed_output AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_switches_runs_all_pairs_without_traces + ['VT_ROCM_Q8K_BLOCK']
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+profile reachability DETECTED failures 1 errors 0
+  review2_tests.CommandTests.test_cli_build_and_measure + profiler
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+greedy args DETECTED failures 6 errors 0
+  review2_tests.CommandTests.test_cli_build_and_measure + 0
+  review2_tests.CommandTests.test_cli_rejects_matched_counts + 0
+  review2_tests.CommandTests.test_cli_rejects_pair_output + 0
+  review2_tests.CommandTests.test_cli_rejects_reference_fallback + 0
+  review2_tests.CommandTests.test_cli_switches_rejects_changed_output + 0
+  review2_tests.CommandTests.test_cli_switches_runs_all_pairs_without_traces + 0
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+build four jobs DETECTED failures 3 errors 0
+  review2_tests.CommandTests.test_cli_build_and_measure + 4
+  review2_tests.CommandTests.test_cli_rejects_corrupt_copied_model + 4
+  review2_tests.CommandTests.test_cli_rejects_valid_archive_at_wrong_llama_pin + 4
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+live detector DETECTED failures 1 errors 4
+  review2_tests.CommandTests.test_managed_checks_fault_written_during_exit_poll AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_stops_live_gpu_fault_and_preserves_evidence subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-c17bf42f6394476683add2b37b7e1f13', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmp6ad0np8o/local:/tmp/tmp6ad0np8o/local:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--ulimit', 'fsize=536870912:536870912', '-e', 'LD_LIBRARY_PATH=/tmp/tmp6ad0np8o/local/build-vllmcpp:/tmp/tmp6ad0np8o/local/build-vllmcpp/bin:/opt/rocm/lib', '-e', 'VT_OP_PROVIDER_STATS=1', '--entrypoint', 'profiler', 'image-id', '/tmp/tmp6ad0np8o/local/trace-vllmcpp/trace', '/tmp/tmp6ad0np8o/local/vllm-cli', '--model', '/tmp/tmp6ad0np8o/local/model', '--prompt', 'The capital of France is', '--max-tokens', '64', '--temperature', '0', '--repeat', '1', '--max-num-seqs', '1']' timed out after 3 seconds
+  review2_tests.CommandTests.test_managed_live_fault_and_capture_boundaries (stream='stderr', diagnostic='GPU Hang') subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-92da680caf004649871a5affe6b52aa1', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmppvflzeks:/tmp/tmppvflzeks:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--entrypoint', 'app', 'test']' timed out after 3 seconds
+  review2_tests.CommandTests.test_managed_live_fault_and_capture_boundaries (stream='stdout', diagnostic='Memory access fault') subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-e69773c5c0674da387e90c47d22820c3', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmp38xpbmtf:/tmp/tmp38xpbmtf:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--entrypoint', 'app', 'test']' timed out after 3 seconds
+  review2_tests.CommandTests.test_managed_live_fault_and_capture_boundaries (stream='stderr', diagnostic='HW Exception') subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-6dfaeb29f83a4737b40b513816dda14b', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmph7ub5u94:/tmp/tmph7ub5u94:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--entrypoint', 'app', 'test']' timed out after 3 seconds
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+live scan calls DETECTED failures 1 errors 4
+  review2_tests.CommandTests.test_managed_checks_fault_written_during_exit_poll AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_stops_live_gpu_fault_and_preserves_evidence subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-08082986f219428e89da134d42be52f4', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmpg9_omlm3/local:/tmp/tmpg9_omlm3/local:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--ulimit', 'fsize=536870912:536870912', '-e', 'LD_LIBRARY_PATH=/tmp/tmpg9_omlm3/local/build-vllmcpp:/tmp/tmpg9_omlm3/local/build-vllmcpp/bin:/opt/rocm/lib', '-e', 'VT_OP_PROVIDER_STATS=1', '--entrypoint', 'profiler', 'image-id', '/tmp/tmpg9_omlm3/local/trace-vllmcpp/trace', '/tmp/tmpg9_omlm3/local/vllm-cli', '--model', '/tmp/tmpg9_omlm3/local/model', '--prompt', 'The capital of France is', '--max-tokens', '64', '--temperature', '0', '--repeat', '1', '--max-num-seqs', '1']' timed out after 3 seconds
+  review2_tests.CommandTests.test_managed_live_fault_and_capture_boundaries (stream='stderr', diagnostic='GPU Hang') subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-55570a2c16a243188afb98884f352a6d', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmp4t_9n2vj:/tmp/tmp4t_9n2vj:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--entrypoint', 'app', 'test']' timed out after 3 seconds
+  review2_tests.CommandTests.test_managed_live_fault_and_capture_boundaries (stream='stdout', diagnostic='Memory access fault') subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-6bce424d01414c36af633a3dbbeaa92b', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmpfcd8zqj4:/tmp/tmpfcd8zqj4:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--entrypoint', 'app', 'test']' timed out after 3 seconds
+  review2_tests.CommandTests.test_managed_live_fault_and_capture_boundaries (stream='stderr', diagnostic='HW Exception') subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-ad6b5173b4fe492aadc06ec2d2472b7e', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmp6cax1scu:/tmp/tmp6cax1scu:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--entrypoint', 'app', 'test']' timed out after 3 seconds
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+scan only after exit DETECTED failures 0 errors 4
+  review2_tests.CommandTests.test_cli_stops_live_gpu_fault_and_preserves_evidence subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-fe05139c96274050ae7a9a92cdf82383', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmpsp4o60_5/local:/tmp/tmpsp4o60_5/local:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--ulimit', 'fsize=536870912:536870912', '-e', 'LD_LIBRARY_PATH=/tmp/tmpsp4o60_5/local/build-vllmcpp:/tmp/tmpsp4o60_5/local/build-vllmcpp/bin:/opt/rocm/lib', '-e', 'VT_OP_PROVIDER_STATS=1', '--entrypoint', 'profiler', 'image-id', '/tmp/tmpsp4o60_5/local/trace-vllmcpp/trace', '/tmp/tmpsp4o60_5/local/vllm-cli', '--model', '/tmp/tmpsp4o60_5/local/model', '--prompt', 'The capital of France is', '--max-tokens', '64', '--temperature', '0', '--repeat', '1', '--max-num-seqs', '1']' timed out after 3 seconds
+  review2_tests.CommandTests.test_managed_live_fault_and_capture_boundaries (stream='stderr', diagnostic='GPU Hang') subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-f17e16c246a54e9db4d3d6c02c1a9ac3', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmpywcu5ncw:/tmp/tmpywcu5ncw:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--entrypoint', 'app', 'test']' timed out after 3 seconds
+  review2_tests.CommandTests.test_managed_live_fault_and_capture_boundaries (stream='stdout', diagnostic='Memory access fault') subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-36dc213bb94d41e8b3bac09a2e2d9050', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmpk_2omy7m:/tmp/tmpk_2omy7m:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--entrypoint', 'app', 'test']' timed out after 3 seconds
+  review2_tests.CommandTests.test_managed_live_fault_and_capture_boundaries (stream='stderr', diagnostic='HW Exception') subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-d3918161755a4d48ac92800376098a68', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmpjzn1_f5k:/tmp/tmpjzn1_f5k:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--entrypoint', 'app', 'test']' timed out after 3 seconds
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+omit final drain DETECTED failures 1 errors 0
+  review2_tests.CommandTests.test_managed_checks_fault_written_during_exit_poll AssertionError: ValueError not raised
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+omit fragment tail DETECTED failures 0 errors 3
+  review2_tests.CommandTests.test_managed_live_fault_and_capture_boundaries (stream='stderr', diagnostic='GPU Hang') subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-f0a06af1090844aebf29110c4ed52e39', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmpd3911_vw:/tmp/tmpd3911_vw:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--entrypoint', 'app', 'test']' timed out after 3 seconds
+  review2_tests.CommandTests.test_managed_live_fault_and_capture_boundaries (stream='stdout', diagnostic='Memory access fault') subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-547b1d41217b487290319faaeb60afd7', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmp170zg62d:/tmp/tmp170zg62d:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--entrypoint', 'app', 'test']' timed out after 3 seconds
+  review2_tests.CommandTests.test_managed_live_fault_and_capture_boundaries (stream='stderr', diagnostic='HW Exception') subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-2af545ddff0a40d588a9b4219ab251fd', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmpex0uk1ke:/tmp/tmpex0uk1ke:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--entrypoint', 'app', 'test']' timed out after 3 seconds
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+scan old capture bytes DETECTED failures 0 errors 1
+  review2_tests.CommandTests.test_managed_ignores_old_logs_and_command_metadata ValueError: fatal GPU diagnostic in /tmp/tmp3duns6v_/combined: GPU Hang
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+omit stdout capture DETECTED failures 0 errors 1
+  review2_tests.CommandTests.test_managed_live_fault_and_capture_boundaries (stream='stdout', diagnostic='Memory access fault') subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-d494b8a6ea9a4c1f8ee0e9fc6cdf1931', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmp94tax7td:/tmp/tmp94tax7td:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--entrypoint', 'app', 'test']' timed out after 3 seconds
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+omit stderr capture DETECTED failures 1 errors 3
+  review2_tests.CommandTests.test_managed_checks_fault_written_during_exit_poll AssertionError: ValueError not raised
+  review2_tests.CommandTests.test_cli_stops_live_gpu_fault_and_preserves_evidence subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-473e3db94eca4c169e471255cdcb2913', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmpfglmwa_3/local:/tmp/tmpfglmwa_3/local:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--ulimit', 'fsize=536870912:536870912', '-e', 'LD_LIBRARY_PATH=/tmp/tmpfglmwa_3/local/build-vllmcpp:/tmp/tmpfglmwa_3/local/build-vllmcpp/bin:/opt/rocm/lib', '-e', 'VT_OP_PROVIDER_STATS=1', '--entrypoint', 'profiler', 'image-id', '/tmp/tmpfglmwa_3/local/trace-vllmcpp/trace', '/tmp/tmpfglmwa_3/local/vllm-cli', '--model', '/tmp/tmpfglmwa_3/local/model', '--prompt', 'The capital of France is', '--max-tokens', '64', '--temperature', '0', '--repeat', '1', '--max-num-seqs', '1']' timed out after 3 seconds
+  review2_tests.CommandTests.test_managed_live_fault_and_capture_boundaries (stream='stderr', diagnostic='GPU Hang') subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-10af4abf0a3e4c3487745ce8897511fc', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmpgs8tzqyf:/tmp/tmpgs8tzqyf:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--entrypoint', 'app', 'test']' timed out after 3 seconds
+  review2_tests.CommandTests.test_managed_live_fault_and_capture_boundaries (stream='stderr', diagnostic='HW Exception') subprocess.TimeoutExpired: Command '['podman', '--storage-driver=vfs', '--root', '/tmp/podman-pr66-root-vfs', '--runroot', '/tmp/podman-pr66-run-vfs', 'run', '--rm', '--name', 'strix-3015-f51c475f99bf49c38df31507793fc302', '--device=/dev/kfd', '--device=/dev/dri', '--group-add', 'video', '-v', '/tmp/tmpcrhi7vah:/tmp/tmpcrhi7vah:rw', '-v', '/workspace/ccache:/workspace/ccache:rw', '--entrypoint', 'app', 'test']' timed out after 3 seconds
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+omit evidence copy DETECTED failures 0 errors 2
+  review2_tests.CommandTests.test_cli_stops_live_gpu_fault_and_preserves_evidence FileNotFoundError: [Errno 2] No such file or directory: '/tmp/tmpn1co4593/output/trace-vllmcpp/stderr'
+  review2_tests.CommandTests.test_cli_switches_runs_all_pairs_without_traces FileNotFoundError: [Errno 2] No such file or directory: '/tmp/tmp2fqsx0e_/output/VT_ROCM_Q8K_BLOCK-0-default/command.json'
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure} [--state STATE]
+worker.py: error: argument --phase: invalid choice: 'switches' (choose from 'build', 'measure')
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure} [--state STATE]
+worker.py: error: argument --phase: invalid choice: 'switches' (choose from 'build', 'measure')
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure} [--state STATE]
+worker.py: error: argument --phase: invalid choice: 'switches' (choose from 'build', 'measure')
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure} [--state STATE]
+worker.py: error: argument --phase: invalid choice: 'switches' (choose from 'build', 'measure')
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure} [--state STATE]
+worker.py: error: argument --phase: invalid choice: 'switches' (choose from 'build', 'measure')
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure} [--state STATE]
+worker.py: error: argument --phase: invalid choice: 'switches' (choose from 'build', 'measure')
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure} [--state STATE]
+worker.py: error: argument --phase: invalid choice: 'switches' (choose from 'build', 'measure')
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure} [--state STATE]
+worker.py: error: argument --phase: invalid choice: 'switches' (choose from 'build', 'measure')
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure} [--state STATE]
+worker.py: error: argument --phase: invalid choice: 'switches' (choose from 'build', 'measure')
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure} [--state STATE]
+worker.py: error: argument --phase: invalid choice: 'switches' (choose from 'build', 'measure')
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure} [--state STATE]
+worker.py: error: argument --phase: invalid choice: 'switches' (choose from 'build', 'measure')
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure} [--state STATE]
+worker.py: error: argument --phase: invalid choice: 'switches' (choose from 'build', 'measure')
+switch phase omitted DETECTED failures 0 errors 11
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='manifest') SystemExit: 2
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='image') SystemExit: 2
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='model') SystemExit: 2
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='binary') SystemExit: 2
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='library') SystemExit: 2
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='host tuning') SystemExit: 2
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='image tuning') SystemExit: 2
+  review2_tests.CommandTests.test_cli_switches_preserves_identity_guards (defect='lease') SystemExit: 2
+  review2_tests.CommandTests.test_cli_switches_refuses_existing_leg SystemExit: 2
+  review2_tests.CommandTests.test_cli_switches_rejects_changed_output SystemExit: 2
+  review2_tests.CommandTests.test_cli_switches_runs_all_pairs_without_traces SystemExit: 2
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+switch trace omission DETECTED failures 1 errors 1
+  review2_tests.CommandTests.test_cli_switches_refuses_existing_leg Diff is 2898 characters long. Set self.maxDiff to None to see it.
+  review2_tests.CommandTests.test_cli_switches_runs_all_pairs_without_traces FileExistsError: [Errno 17] File exists: '/tmp/tmpx9f11dyw/local/trace-vllmcpp'
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+trace mislabeled run DETECTED failures 1 errors 0
+  review2_tests.CommandTests.test_cli_switches_runs_all_pairs_without_traces AssertionError: True is not False
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+trace mislabeled success DETECTED failures 1 errors 0
+  review2_tests.CommandTests.test_cli_switches_runs_all_pairs_without_traces AssertionError: False is not true
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+trace owner omitted DETECTED failures 1 errors 0
+  review2_tests.CommandTests.test_cli_switches_runs_all_pairs_without_traces AssertionError: '#3040' not found in 'PENDING: trace not run'
+usage: worker.py [-h] --manifest MANIFEST --output OUTPUT --phase
+                 {build,measure,switches} [--state STATE]
+worker.py: error: switches requires --state from this build
+twelve leg schedule DETECTED failures 2 errors 2
+  review2_tests.CommandTests.test_cli_rejects_pair_output AssertionError: "output mismatch" does not match "incomplete or duplicate paired legs"
+  review2_tests.CommandTests.test_cli_switches_rejects_changed_output AssertionError: "output mismatch" does not match "incomplete or duplicate paired legs"
+  review2_tests.CommandTests.test_cli_build_and_measure ValueError: incomplete or duplicate paired legs
+  review2_tests.CommandTests.test_cli_switches_runs_all_pairs_without_traces ValueError: incomplete or duplicate paired legs
+state required DETECTED failures 0 errors 1
+  review2_tests.CommandTests.test_cli_switches_requires_state AttributeError: 'NoneType' object has no attribute 'read_text'
+byte-identical; survivors: []

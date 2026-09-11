@@ -16,7 +16,13 @@ document proves that mapping from data committed in this repository.
 **Read that claim exactly.** It says the window reaches those forwards. It does
 **not** say that an instrument observed a disagreement there, and it does not say
 the arms were measured to diverge at forward 4. Those are different statements,
-and the second one is still unmeasured.
+and the second one was still unmeasured when this file was written.
+**IT IS MEASURED NOW.** Job `9e0864da` completed at 2026-09-06T02:21:41Z and the
+reading is
+[`qwen4exp-moe-selection-fwd-20260906.md`](qwen4exp-moe-selection-fwd-20260906.md)
+([#2998](https://github.com/mudler/vllm.cpp/issues/2998)). Everything below this
+line is the state of knowledge **before** that reading, kept because it is the
+argument that scoped the run. Read §5 and §6 against the correction notes there.
 
 **What is still owed is one arm, not one instrument.** MOEDIV's decode columns are
 VOID because its CUDA arm answered the degenerate pre-#2550 sequence
@@ -154,10 +160,13 @@ the first call at which the axis stops being bit-identical, and prints no ratio.
 |---|---|---|
 | CPU-CTRL against CUDA `VT_GDN_CHUNKED=0` | `2.139e-05` | no flip, all five tokens agree |
 | CPU-CTRL against CUDA-PROD | `4.999e-04` | flip at token 2 |
-| **CPU-chunked against CUDA-chunked**, the algorithm-matched pair | **`4.324e-05`** | **unknown** |
+| **CPU-chunked against CUDA-chunked**, the algorithm-matched pair | **`4.324e-05`** | **NO FLIP**, read 2026-09-06 |
 
 `4.324e-05` sits inside the bracket, so the norm cannot say which side of the
-threshold the matched pair is on. A selection is a discrete property with bimodal
+threshold the matched pair is on. **The tap has since said which side**: no flip,
+so the no-flip bound lifts from `2.139e-05` to `4.324e-05`
+([the reading](qwen4exp-moe-selection-fwd-20260906.md) §5.1). This table's
+`unknown` was correct when it was written. A selection is a discrete property with bimodal
 error, and `VT_MOE_SEL_FP` reports it directly as set equality. That is the axis
 the bracket cannot resolve and this tap can.
 
@@ -202,9 +211,13 @@ sequence the same binary produced with the tap off. A mismatch exits 50, which i
 distinct from every instrument-failure exit, because an instrument whose failure
 looks like a result is this row's defining trap.
 
-**State.** PENDING. Read by id with `rc jobs -o json` and not from `rc ps`,
-because `rc ps` lists only pending and running work, so absence there is not
-cancellation:
+**State.** **SUCCEEDED**, `exit_code = 0`, `finished_at = 2026-09-06T02:21:41Z`.
+The reading it produced is
+[`qwen4exp-moe-selection-fwd-20260906.md`](qwen4exp-moe-selection-fwd-20260906.md),
+which quotes the job's own per-step lines and commits the full `rc logs` capture,
+because that log ages out within a day. The table below is the **stamped queued
+reading** this file was written against, kept because the two sections after it
+are about how a queued job reads:
 
 | Field | Value at 2026-09-06T02:13:21Z |
 |---|---|
@@ -261,10 +274,27 @@ RESULT BINARY CARRIES: VT_MOE_SEL_FP=1(>=1) moesel_fmt=2(>=1) poscontrol=3(>=1) 
 ```
 
 So the binary under measurement is ARMTOKENS' by digest and it carries the tap,
-with the negative control reading 0 as it must. The selection result itself is
-owed by whoever reads this job to completion, and section 6 still stands.
+with the negative control reading 0 as it must. The selection result itself was
+owed by whoever read this job to completion. **It has been read**, and section 6
+is superseded on two of its four bullets; see the correction there.
 
 ## 6. What this document does not establish
+
+**CORRECTION 2026-09-06 ([#2998](https://github.com/mudler/vllm.cpp/issues/2998)):
+the first two bullets are superseded by the job this document submitted.** The
+bullets are kept verbatim because they scoped the run that answered them, and a
+later reader needs to see what was open at the time. What the answers are:
+
+- The matched pair's **layer 0 does NOT flip**, on equal `sel` hashes at boundary
+  margins of 4, 2, 1, 1 and 0 ulps, with the pair identity asserted at call 0.
+  `4.324e-05` is on the **no-flip** side.
+- Forwards 4, 6 and 7 **were read** on a non-degenerate pair, against a negative
+  control that flips nothing. They flip 127 of 144 slots, and the four agreeing
+  forwards flip 116 of 192, so **the flips do not separate the two groups**.
+
+The last two bullets stand unchanged, and the fourth is the row's open question.
+[The reading](qwen4exp-moe-selection-fwd-20260906.md) quotes no ratio either, and
+what still owes a cause is [#2999](https://github.com/mudler/vllm.cpp/issues/2999).
 
 - **Whether the matched pair's layer-0 selection flips.** The job that answers it
   sat at queue position 1 on `thor:gpu0` for 5 hours behind one unrelated job, and

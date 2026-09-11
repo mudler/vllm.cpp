@@ -1,0 +1,53 @@
+[
+  {
+    "name": "focused-and-rocm-regressions",
+    "argv": [
+      "flock",
+      "-n",
+      "-F",
+      "/home/vikash/gpu.lock",
+      "ctest",
+      "--test-dir",
+      "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather",
+      "--output-on-failure",
+      "--verbose",
+      "-R",
+      "^(test_rocm_embedding_quant|test_capi_rocm_embedding_quant|test_gguf_keep_quant|test_ops_embedding_quant|test_gguf_dequant|test_backend_cross_device|test_gguf|test_rocm_arch|test_rocm_backend|test_rocm_fp8_kv_cache|test_ops_rocm_silu_rounding|test_exl3_rocm|test_gemma4_rocm_fp8_seams|test_backend_multidevice|test_runner)$"
+    ],
+    "env": {
+      "HIP_VISIBLE_DEVICES": "0",
+      "ROCR_VISIBLE_DEVICES": "0",
+      "TMPDIR": "/home/vikash/.cache/rdna3-gather-impl/tmp",
+      "VT_ROCM_GATHER_PUBLIC_EVIDENCE": "/home/vikash/.cache/rdna3-gather-impl/native-final-v4/public-captures",
+      "VT_ROCM_GATHER_TEST_CORPUS": "/home/vikash/.cache/rdna3-gather-impl/native-final-v4/random-corpus"
+    },
+    "cwd": "/home/vikash/vllm.cpp-rdna3-gather-impl",
+    "exit": 0,
+    "seconds": 25.545061588287354,
+    "log_sha256": "655a9a16c07f8c9300e36fff4482106d91868935952efe2cc9dc5ef53ba7816f",
+    "inputs_unchanged": true
+  },
+  {
+    "name": "required-ambient-device",
+    "argv": [
+      "flock",
+      "-n",
+      "-F",
+      "/home/vikash/gpu.lock",
+      "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/tests/test_rocm_embedding_quant",
+      "--test-case=ROCm gather follows the queue device when the ambient device differs",
+      "--abort-after=1"
+    ],
+    "env": {
+      "HIP_VISIBLE_DEVICES": "0,1",
+      "ROCR_VISIBLE_DEVICES": "0,1",
+      "TMPDIR": "/home/vikash/.cache/rdna3-gather-impl/tmp",
+      "VT_ROCM_GATHER_REQUIRE_TWO_DEVICES": "1"
+    },
+    "cwd": "/home/vikash/vllm.cpp-rdna3-gather-impl",
+    "exit": 0,
+    "seconds": 0.7371315956115723,
+    "log_sha256": "38fec7edbc44a0e557538088a130e98da012892fdec43f29234989d35718209e",
+    "inputs_unchanged": true
+  }
+]

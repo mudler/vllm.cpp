@@ -988,6 +988,28 @@ struct Ltx2PipelineRecipe {
   // takes the keyframe item under BOTH of them.
   Ltx2ImageConditioningBuilder image_conditioning = Ltx2ImageConditioningBuilder::kCombined;
 
+  // WHETHER THIS PIPELINE CONDITIONS ON A REFERENCE CLIP. Row
+  // LTX25-IC-LORA-REF-VIDEO, issue #3020 (gaps A15 and A16).
+  //
+  // A FLAG ON THE RECIPE, for the reason `checkpoint_class` gives above, and
+  // because exactly one upstream pipeline class has this: `ICLoraPipeline`
+  // (ic_lora.py:60) calls `append_ic_lora_reference_video_conditionings`
+  // (`:381-402`) and no other pipeline in `ltx-pipelines` does. Serving the arm
+  // on `distilled_two_stage` would be inventing conditioning `distilled.py` has
+  // no call to.
+  //
+  // AND IT IS THE SAME PREDICATE THAT REFUSES. The phase loop reads this field
+  // once, binds it to a named local, and both the routing branch and the refusal
+  // beside it use that local. A refusal and its route predicate that are two
+  // expressions is how this campaign shipped a silently wrong answer.
+  //
+  // STAGE 1 ONLY is NOT this flag: it is the phase index, because upstream gives
+  // stage 1 `_create_conditionings` (which appends the reference item,
+  // ic_lora.py:269-281) and stage 2 plain `combined_image_conditionings` with no
+  // reference item at all (`:314-321`). A recipe-level "which phase" field would
+  // have exactly one value on the one recipe that sets this.
+  bool ic_lora_reference = false;
+
   int64_t max_spatial_downscale() const;
 };
 

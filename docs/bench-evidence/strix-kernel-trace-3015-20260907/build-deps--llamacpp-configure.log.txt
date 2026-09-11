@@ -1,0 +1,57 @@
+["podman", "--storage-driver=vfs", "--root", "/tmp/podman-pr66-root-vfs", "--runroot", "/tmp/podman-pr66-run-vfs", "run", "--rm", "--name", "strix-3015-d939bc1ec255462fa9746d13da63fd38", "--device=/dev/kfd", "--device=/dev/dri", "--group-add", "video", "-v", "/tmp/strix-3015-4fdrfcj3:/tmp/strix-3015-4fdrfcj3:rw", "-v", "/workspace/ccache:/workspace/ccache:rw", "-e", "CCACHE_DIR=/workspace/ccache", "-e", "CCACHE_BASEDIR=/tmp/strix-3015-4fdrfcj3/llamacpp", "--entrypoint", "cmake", "d554fe849c5e3c4d6b81227e0b87f165fa3b7b015899872bd93bc732c12ffeb6", "-S", "/tmp/strix-3015-4fdrfcj3/llamacpp", "-B", "/tmp/strix-3015-4fdrfcj3/build-llamacpp", "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_C_COMPILER_LAUNCHER=ccache", "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache", "-DCMAKE_HIP_COMPILER_LAUNCHER=ccache", "-DGGML_HIP=ON", "-DAMDGPU_TARGETS=gfx1151", "-DCMAKE_HIP_ARCHITECTURES=gfx1151", "-DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang", "-DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++", "-DGGML_NATIVE=OFF", "-DLLAMA_BUILD_TESTS=OFF", "-DLLAMA_CURL=OFF"]
+-- The C compiler identification is Clang 22.0.0
+-- The CXX compiler identification is Clang 22.0.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /opt/rocm/lib/llvm/bin/clang - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /opt/rocm/lib/llvm/bin/clang++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- llama.cpp version: 0.1.0-dev
+CMAKE_BUILD_TYPE=Release
+-- Found Git: /usr/bin/git (found version "2.43.0") 
+fatal: not a git repository (or any of the parent directories): .git
+fatal: not a git repository (or any of the parent directories): .git
+-- The ASM compiler identification is Clang with GNU-like command-line
+-- Found assembler: /opt/rocm/lib/llvm/bin/clang
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE  
+-- CMAKE_SYSTEM_PROCESSOR: x86_64
+-- GGML_SYSTEM_ARCH: x86
+-- Found OpenMP_C: -fopenmp=libomp (found version "5.1") 
+-- Found OpenMP_CXX: -fopenmp=libomp (found version "5.1") 
+-- Found OpenMP: TRUE (found version "5.1")  
+-- Including CPU backend
+-- x86 detected
+-- Adding CPU backend variant ggml-cpu: -msse4.2;-mf16c;-mfma;-mbmi2;-mavx;-mavx2 GGML_SSE42;GGML_F16C;GGML_FMA;GGML_BMI2;GGML_AVX;GGML_AVX2
+-- The HIP compiler identification is Clang 22.0.0
+-- Detecting HIP compiler ABI info
+-- Detecting HIP compiler ABI info - done
+-- Check for working HIP compiler: /opt/rocm/lib/llvm/bin/clang++ - skipped
+-- Detecting HIP compile features
+-- Detecting HIP compile features - done
+-- Performing Test HIP_CLANG_SUPPORTS_PARALLEL_JOBS
+-- Performing Test HIP_CLANG_SUPPORTS_PARALLEL_JOBS - Success
+-- HIP and hipBLAS found
+-- Including HIP backend
+-- ggml version: 0.20.0
+-- ggml commit:  unknown
+CMake Warning at common/CMakeLists.txt:33 (message):
+  Git repository not found; to enable automatic generation of build info,
+  make sure Git is installed and the project is a Git repository.
+
+
+-- Could NOT find OpenSSL, try to set the path to OpenSSL root folder in the system variable OPENSSL_ROOT_DIR (missing: OPENSSL_CRYPTO_LIBRARY OPENSSL_INCLUDE_DIR) 
+CMake Warning at vendor/cpp-httplib/CMakeLists.txt:152 (message):
+  OpenSSL not found, HTTPS support disabled
+
+
+-- Generating embedded license file for target: llama-app
+-- Configuring done (1.4s)
+-- Generating done (0.1s)
+-- Build files have been written to: /tmp/strix-3015-4fdrfcj3/build-llamacpp

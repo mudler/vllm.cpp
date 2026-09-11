@@ -419,7 +419,7 @@ shift.
 
 - **Per-phase adapter STRENGTH**, which `ti2vid_two_stages_hq.py:92-101` needs
   and this field cannot express. **Owned by
-  [#1144](https://github.com/mudler/vllm.cpp/issues/1144), not by #921.** This
+  ISSUE-GH-1144, not by #921.** This
   spec said #921 until 2026-08-17, and #921 was closed as completed that same
   day by `LTX25-RES2S-LOOP` (`4d7748646`, PR #1125), which landed the res_2s
   sampler. That row named the distilled LoRA per stage as out of scope and was

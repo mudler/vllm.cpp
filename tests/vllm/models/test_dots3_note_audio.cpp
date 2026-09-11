@@ -51,6 +51,7 @@
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/dots3_note.h"
 #include "vllm/multimodal/dots3_note_processor.h"
+#include "dots3_note_ref_independence.h"
 #include "dots3_note_resample_golden.h"
 #include "vllm/multimodal/audio_processor.h"
 #include "vllm/multimodal/audio_resample.h"
@@ -785,126 +786,24 @@ inline Applied Apply(const std::vector<int>& ids,
 
 }  // namespace ref_apply
 
-// ═══════════════════════════════════════════════════════════════════════════
-// THE ENUMERATION INSTRUMENT.
-//
-// Reads THIS source file at `DOTS3_AUDIO_TEST_SOURCE` (the same arrangement
-// `MODELOPT_MIXED_FIXTURE_DIR` uses to hand a test a path), strips comments and
-// string/char literals, takes the span of one reference namespace, and counts
-// every `scope::name`. Comments must be stripped or the enumeration LIST above
-// would count itself and the instrument would agree with any list it was given
-// — which is the exact failure this replaces.
-// ═══════════════════════════════════════════════════════════════════════════
+// THE ENUMERATION INSTRUMENT moved to
+// `tests/vllm/models/dots3_note_ref_independence.h` at W9d (#2881), unchanged
+// except that its source path is now an argument. It reads a test source file,
+// strips comments and string/char literals, takes the span of one reference
+// namespace and counts every `scope::name`. W9d's own reference lives in
+// `test_dots3_note_vision.cpp`, and a second copy of this scan would be a
+// second pp-number rule to keep in step -- which is the failure the header's
+// own prose names. The counts asserted below are unchanged by the move, and
+// that is the regression check on it.
 namespace {
-
-struct RefNames {
-  int distinct = 0;
-  int occurrences = 0;
-  std::set<std::string> scopes;
-  std::set<std::string> names;
-};
-
-std::string Join(const std::set<std::string>& s) {
-  std::string out;
-  for (const std::string& v : s) {
-    if (!out.empty()) out += ",";
-    out += v;
-  }
-  return out;
-}
-
-bool IsIdentChar(char c) {
-  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-         (c >= '0' && c <= '9') || c == '_';
-}
-
-// Comments and literals out, everything else through unchanged.
-std::string StripCommentsAndLiterals(const std::string& code) {
-  std::string out;
-  const size_t n = code.size();
-  for (size_t i = 0; i < n;) {
-    const char c = code[i];
-    if (c == '/' && i + 1 < n && code[i + 1] == '/') {
-      const size_t j = code.find('\n', i);
-      i = (j == std::string::npos) ? n : j;
-    } else if (c == '/' && i + 1 < n && code[i + 1] == '*') {
-      const size_t j = code.find("*/", i + 2);
-      i = (j == std::string::npos) ? n : j + 2;
-    } else if (c >= '0' && c <= '9' && (i == 0 || !IsIdentChar(code[i - 1]))) {
-      // A pp-number, taken WHOLE. C++14 lets a numeric literal carry `'` digit
-      // separators (`16'000`), and treating that `'` as a char-literal
-      // delimiter makes the scan below run to the NEXT `'` and drop everything
-      // in between. That is a hole in THIS instrument and not a cosmetic one:
-      // two separators bracketing a `vt::` call would hide the call from the
-      // enumeration, and the independence property would read GREEN while being
-      // false. The token must START at a digit that does not continue an
-      // identifier, so `u8'a'` is still a char literal and is still stripped.
-      size_t j = i;
-      while (j < n) {
-        if (IsIdentChar(code[j]) || code[j] == '.') {
-          ++j;
-        } else if (code[j] == '\'' && j + 1 < n && IsIdentChar(code[j + 1])) {
-          j += 2;
-        } else if ((code[j] == '+' || code[j] == '-') && j > i &&
-                   (code[j - 1] == 'e' || code[j - 1] == 'E' ||
-                    code[j - 1] == 'p' || code[j - 1] == 'P')) {
-          ++j;
-        } else {
-          break;
-        }
-      }
-      out.append(code, i, j - i);
-      i = j;
-    } else if (c == '"' || c == '\'') {
-      size_t j = i + 1;
-      while (j < n && code[j] != c) j += (code[j] == '\\') ? 2 : 1;
-      i = j + 1;
-    } else {
-      out += c;
-      ++i;
-    }
-  }
-  return out;
-}
+using dots3_ref_independence::Join;
+using dots3_ref_independence::RefNames;
+using dots3_ref_independence::StripCommentsAndLiterals;
 
 RefNames QualifiedNamesIn(const std::string& ns) {
-  std::ifstream in(DOTS3_AUDIO_TEST_SOURCE, std::ios::binary);
-  REQUIRE_MESSAGE(in.good(),
-                  "the enumeration instrument could not open its own source at "
-                      << DOTS3_AUDIO_TEST_SOURCE);
-  const std::string src((std::istreambuf_iterator<char>(in)),
-                        std::istreambuf_iterator<char>());
-  const std::string open = "namespace " + ns + " {";
-  const std::string close = "}  // namespace " + ns;
-  const size_t a = src.find(open);
-  const size_t b = src.find(close);
-  REQUIRE(a != std::string::npos);
-  REQUIRE(b != std::string::npos);
-  REQUIRE(b > a);
-  const std::string body = StripCommentsAndLiterals(src.substr(a, b - a));
-
-  RefNames r;
-  for (size_t i = 0; i + 1 < body.size(); ++i) {
-    if (body[i] != ':' || body[i + 1] != ':') continue;
-    // the scope to the left
-    size_t s = i;
-    while (s > 0 && IsIdentChar(body[s - 1])) --s;
-    if (s == i) continue;
-    // the name to the right
-    size_t e = i + 2;
-    size_t t = e;
-    while (t < body.size() && IsIdentChar(body[t])) ++t;
-    if (t == e) continue;
-    const std::string scope = body.substr(s, i - s);
-    const std::string name = body.substr(e, t - e);
-    r.scopes.insert(scope);
-    r.names.insert(scope + "::" + name);
-    ++r.occurrences;
-  }
-  r.distinct = static_cast<int>(r.names.size());
-  return r;
+  return dots3_ref_independence::QualifiedNamesInFile(DOTS3_AUDIO_TEST_SOURCE,
+                                                      ns);
 }
-
 }  // namespace
 
 // ═══════════════════════════════════════════════════════════════════════════

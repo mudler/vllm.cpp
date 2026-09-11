@@ -116,6 +116,29 @@ struct TinySpec {
   int64_t p_max_pixels = 1 << 20;
   std::string v_router_scoring_func = "sigmoid";
   double v_router_scale = 1.0;
+  // `enable_fp8_moe` (`vision.py:69` @ 9035151d6), written into `vision_config`
+  // ONLY when it is false. TRUE is upstream's constructor default AND the
+  // released checkpoint's effective value precisely because the key is ABSENT
+  // there, so a fixture that always wrote the key could not reproduce the
+  // config the released checkpoint actually ships -- which is the whole subject
+  // of W9d (#2881). A case that wants upstream's other branch sets this false
+  // and the key appears.
+  bool v_enable_fp8_moe = true;
+  // Give each routed expert's weight a PER-128x128-BLOCK gain, so its blocks
+  // have genuinely different absolute maxima. Off by default; only the FP8
+  // cases set it.
+  //
+  // WHY IT HAS TO EXIST, MEASURED. `Values` draws uniform in `[-amp, amp]`, so
+  // over the 16384 samples of a 128x128 block the absolute maximum is `amp` to
+  // within about 1e-4 relative -- and then it is rounded to BF16, which keeps 8
+  // significant bits, so EVERY block's absmax rounds to the same number.
+  // `dense_fp8_block::Fp8BlockScaleSpread` therefore reads exactly 1.0 on such
+  // a tensor, which is the reading that says "this grid is per-TENSOR wearing a
+  // block shape" -- and a mutation that really did collapse the caster to a
+  // per-tensor amax was invisible (spec section 4.20.4.1, M3). A real trained
+  // projection's output channels do not share one scale; a fixture whose blocks
+  // are statistically identical is the unrealistic thing, not this knob.
+  bool v_expert_block_gain = false;
   // The AMPLITUDE of the generated `mlp.router_bias` values, and the ONLY
   // reason it is settable. Two checkpoints that differ in this and in nothing
   // else are the served gate's handle on the router: every other tensor is
@@ -446,6 +469,7 @@ inline nlohmann::json TinyConfigDoc(const std::string& fixture_dir,
     v["capacity_factor"] = s.v_capacity_factor;
     v["router_scoring_func"] = s.v_router_scoring_func;
     v["router_scale"] = s.v_router_scale;
+    if (!s.v_enable_fp8_moe) v["enable_fp8_moe"] = false;
     v["adapter_type"] = s.v_adapter_type;
     v["adapter_in_dim"] = s.v_embed;
     v["adapter_out_dim"] = s.v_adapter_out();
@@ -699,11 +723,30 @@ inline std::vector<StOut> TinyEntries(const TinySpec& s, uint64_t seed = 7) {
                    Values(ne, next() + s.v_router_seed_nudge,
                           s.v_router_bias_amp),
                    "F32"});
+      // Three gains, cycled by `(row_block + col_block) % 3` and deliberately
+      // NOT powers of two: a power-of-two gain would move every block scale
+      // along the e8m0 lattice, which is the very thing the no-e8m0 assertion
+      // reads, and a fixture that put the scales there by construction would
+      // make that assertion meaningless.
+      const auto blocked = [&s](std::vector<double> v, int64_t rows,
+                                int64_t cols) {
+        if (!s.v_expert_block_gain) return v;
+        static const double kGain[3] = {1.0, 1.7, 2.9};
+        for (int64_t r = 0; r < rows; ++r) {
+          for (int64_t c = 0; c < cols; ++c) {
+            const double g = kGain[static_cast<size_t>(((r / 128) + (c / 128)) % 3)];
+            const size_t i = static_cast<size_t>(r * cols + c);
+            v[i] = static_cast<double>(
+                vt::BF16ToF32(vt::F32ToBF16(static_cast<float>(v[i] * g))));
+          }
+        }
+        return v;
+      };
       for (int64_t x = 0; x < ne; ++x) {
         const std::string ep = pre + "mlp.experts." + std::to_string(x) + ".";
-        e.push_back({ep + "fc1.weight", {mi, E}, proj(mi * E)});
-        e.push_back({ep + "fc2.weight", {E, mi}, proj(E * mi)});
-        e.push_back({ep + "fc3.weight", {mi, E}, proj(mi * E)});
+        e.push_back({ep + "fc1.weight", {mi, E}, blocked(proj(mi * E), mi, E)});
+        e.push_back({ep + "fc2.weight", {E, mi}, blocked(proj(E * mi), E, mi)});
+        e.push_back({ep + "fc3.weight", {mi, E}, blocked(proj(mi * E), mi, E)});
       }
     } else {
       e.push_back({pre + "mlp.fc1.weight", {VI, E}, proj(VI * E)});

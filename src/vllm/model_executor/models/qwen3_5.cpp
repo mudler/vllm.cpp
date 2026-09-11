@@ -7835,6 +7835,32 @@ DBuf MtpHeadHidden(Dev device, const Qwen3_5MTPWeights& weights,
   return MatmulBf16D(device, concatenated.t(), weights.fc);
 }
 
+template <class Weights>
+bool HasGdnConsumers(const Weights& weights) {
+  // vLLM qwen3_5.py:144-160 @ e126687a9a constructs GDN only for these layers.
+  // Cache absence cannot establish this: a hybrid model can have missing caches.
+  return std::any_of(weights.layers.begin(), weights.layers.end(),
+                     [](const auto& layer) { return layer.is_linear_attention; });
+}
+
+void ValidateFullAttnStepMetadata(int64_t tokens, const CommonAttentionMetadata& am) {
+  VT_CHECK(am.num_actual_tokens == tokens,
+           "qwen3_5 full-attn: attn metadata token count must match positions");
+  VT_CHECK(static_cast<int64_t>(am.slot_mapping.size()) == tokens,
+           "qwen3_5 full-attn: slot_mapping must cover every token");
+  VT_CHECK(am.num_reqs >= 0 &&
+               static_cast<int64_t>(am.seq_lens.size()) == am.num_reqs &&
+               static_cast<int64_t>(am.query_start_loc.size()) == am.num_reqs + 1,
+           "qwen3_5 full-attn: malformed full-attn metadata shapes");
+  VT_CHECK(am.block_table_num_cols >= 0 &&
+               static_cast<int64_t>(am.block_table_tensor.size()) ==
+                   static_cast<int64_t>(am.num_reqs) * am.block_table_num_cols,
+           "qwen3_5 full-attn: malformed block table");
+  VT_CHECK(am.query_start_loc.front() == 0 && am.query_start_loc.back() == tokens &&
+               std::is_sorted(am.query_start_loc.begin(), am.query_start_loc.end()),
+           "qwen3_5 full-attn: query offsets must span tokens in order");
+}
+
 // ── Full-attention-only per-step device inputs (SPEC-MTP I5c). ──────────────
 // BuildStepDevInputs sibling for a step with NO GDN layers (the MTP draft head
 // is a single layer_type="full_attention" decoder — qwen3_5_mtp.py:105-112). It
@@ -7846,13 +7872,7 @@ StepDevInputs BuildFullAttnStepDevInputs(Dev d,
                                          const std::vector<int32_t>& positions,
                                          const CommonAttentionMetadata& am) {
   const int64_t T = static_cast<int64_t>(positions.size());
-  VT_CHECK(am.num_actual_tokens == T,
-           "qwen3_5 MTP paged: attn metadata token count must match positions");
-  VT_CHECK(static_cast<int64_t>(am.slot_mapping.size()) == T,
-           "qwen3_5 MTP paged: slot_mapping must cover every token");
-  VT_CHECK(static_cast<int64_t>(am.seq_lens.size()) == am.num_reqs &&
-               static_cast<int64_t>(am.query_start_loc.size()) == am.num_reqs + 1,
-           "qwen3_5 MTP paged: malformed full-attn metadata shapes");
+  ValidateFullAttnStepMetadata(T, am);
   return StepDevInputs{
       DBuf(d, DType::kI32, {T}, positions.data()),
       DBuf(d, DType::kI64, {T}, am.slot_mapping.data()),
@@ -8376,8 +8396,10 @@ static DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
   }();
   std::optional<StepDevInputs> local_sdi;
   if (persistent_sdi == nullptr)
-    local_sdi.emplace(
-        BuildStepDevInputs(d, positions, attn_meta, gdn_meta, gdn_state_slots));
+    local_sdi.emplace(HasGdnConsumers(weights)
+                          ? BuildStepDevInputs(d, positions, attn_meta, gdn_meta,
+                                               gdn_state_slots)
+                          : BuildFullAttnStepDevInputs(d, positions, attn_meta));
   StepDevInputs& sdi = persistent_sdi != nullptr ? *persistent_sdi : *local_sdi;
   // Build the fused-preamble cos|sin cache ONCE; fp4_attn keys the per-arch
   // default (fp8/bf16 attn — the 35B — stays OFF; VT_FUSE_ATTN_PREAMBLE overrides).
@@ -8521,8 +8543,6 @@ static void CheckPagedForward(const std::vector<int32_t>& token_ids,
            "qwen3_5 paged forward: weights.layers size must equal num_hidden_layers");
   VT_CHECK(attn_meta.num_actual_tokens == T,
            "qwen3_5 paged forward: attn_meta.num_actual_tokens must equal T");
-  VT_CHECK(gdn_meta.num_actual_tokens == T,
-           "qwen3_5 paged forward: gdn_meta.num_actual_tokens must equal T");
   int64_t n_full = 0, n_gdn = 0;
   for (const auto& l : weights.layers)
     (l.is_linear_attention ? n_gdn : n_full) += 1;
@@ -8532,8 +8552,12 @@ static void CheckPagedForward(const std::vector<int32_t>& token_ids,
            "qwen3_5 paged forward: gdn_state count must equal GDN layer count");
   const int64_t state_slots =
       detail::ValidateGdnStateCacheLayout(gdn_state);
-  detail::ValidateGdnAttentionMetadata(
-      gdn_meta, state_slots, /*allow_inert_padding=*/false);
+  if (n_gdn > 0) {
+    VT_CHECK(gdn_meta.num_actual_tokens == T,
+             "qwen3_5 paged forward: gdn_meta.num_actual_tokens must equal T");
+    detail::ValidateGdnAttentionMetadata(
+        gdn_meta, state_slots, /*allow_inert_padding=*/false);
+  }
 }
 
 // Transfer a freshly-produced [rows, vocab] device logits DBuf into an OWNING
@@ -9235,8 +9259,6 @@ static void CheckDensePagedForward(const std::vector<int32_t>& token_ids,
            "num_hidden_layers");
   VT_CHECK(attn_meta.num_actual_tokens == T,
            "qwen3_5 dense paged forward: attn_meta.num_actual_tokens must equal T");
-  VT_CHECK(gdn_meta.num_actual_tokens == T,
-           "qwen3_5 dense paged forward: gdn_meta.num_actual_tokens must equal T");
   int64_t n_full = 0, n_gdn = 0;
   for (const auto& l : weights.layers) (l.is_linear_attention ? n_gdn : n_full) += 1;
   VT_CHECK(static_cast<int64_t>(attn_kv.size()) == n_full,
@@ -9245,8 +9267,12 @@ static void CheckDensePagedForward(const std::vector<int32_t>& token_ids,
            "qwen3_5 dense paged forward: gdn_state count must equal GDN layers");
   const int64_t state_slots =
       detail::ValidateGdnStateCacheLayout(gdn_state);
-  detail::ValidateGdnAttentionMetadata(
-      gdn_meta, state_slots, /*allow_inert_padding=*/false);
+  if (n_gdn > 0) {
+    VT_CHECK(gdn_meta.num_actual_tokens == T,
+             "qwen3_5 dense paged forward: gdn_meta.num_actual_tokens must equal T");
+    detail::ValidateGdnAttentionMetadata(
+        gdn_meta, state_slots, /*allow_inert_padding=*/false);
+  }
 }
 
 // Dense embed (27B): hidden[T,H] bf16 = embed_tokens[token_ids] (device-resident
@@ -9319,8 +9345,10 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
       gdn_state.empty() ? 0 : gdn_state.front().ssm_state.shape[0];
   std::optional<StepDevInputs> local_sdi;
   if (persistent_sdi == nullptr)
-    local_sdi.emplace(
-        BuildStepDevInputs(d, positions, attn_meta, gdn_meta, gdn_state_slots));
+    local_sdi.emplace(HasGdnConsumers(weights)
+                          ? BuildStepDevInputs(d, positions, attn_meta, gdn_meta,
+                                               gdn_state_slots)
+                          : BuildFullAttnStepDevInputs(d, positions, attn_meta));
   StepDevInputs& sdi = persistent_sdi != nullptr ? *persistent_sdi : *local_sdi;
   // Build the fused-preamble cos|sin cache ONCE; fp4_attn keys the per-arch
   // default (the real 27B W4A4 => ON; bf16/GGUF dense => OFF; env overrides).
@@ -10760,7 +10788,9 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   CheckPagedForward(token_ids, positions, attn_meta, gdn_meta, attn_kv,
                     gdn_state, impl_->weights, impl_->config);
   const int64_t B = static_cast<int64_t>(token_ids.size());
-  detail::ValidateGdnDecodeGraphState(gdn_meta, gdn_state, B);
+  const bool has_gdn = HasGdnConsumers(impl_->weights);
+  if (has_gdn) detail::ValidateGdnDecodeGraphState(gdn_meta, gdn_state, B);
+  else ValidateFullAttnStepMetadata(B, attn_meta);
   Backend& b = vt::GetBackend(impl_->queue.device.type);
   Dev d{b, impl_->queue};
   // #1380: open a fresh demand measurement for this step. `PreGrowForCapture`
@@ -10784,7 +10814,7 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   // exact shape trivially satisfies that while keeping the padded-row inertness
   // question out of the spec path. The shape count stays bounded by max_num_seqs
   // because num_reqs is.
-  const bool spec_step = gdn_meta.num_spec_decodes > 0;
+  const bool spec_step = has_gdn && gdn_meta.num_spec_decodes > 0;
   const int64_t S = spec_step ? B : PadToCaptureSize(B, impl_->max_num_reqs);
   // ENG-CUDAGRAPH-BREAK W6 (#1374): this step's uniform query length, and the
   // ring key built from it. `Q == 0` means the batch does not divide evenly into
@@ -10803,8 +10833,8 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
   const bool qlen_capped = DecodeGraphQueryLenCapped(impl_->slots, key);
   if (qlen_capped) v1::NoteDecodeGraphQueryLenDecline();
   if (!impl_->enabled || S < 0 || !servable_shape || qlen_capped ||
-      !detail::CanUseGdnDecodeGraphSize(
-          B, S, IndexedGdnStateIoEnabled(impl_->queue.device))) {
+      (has_gdn && !detail::CanUseGdnDecodeGraphSize(
+          B, S, IndexedGdnStateIoEnabled(impl_->queue.device)))) {
     if (aux_out != nullptr && !aux_out->layer_ids.empty()) {
       // The graph cannot serve this batch (disabled / unsupported size), so fall
       // back to the EAGER multi-tap forward, which fills aux_out itself. Without
@@ -10906,7 +10936,10 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
     pam = attn_meta;
     pgm = gdn_meta;
   } else {
-    BuildPaddedDecode(S, token_ids, positions, attn_meta, gdn_meta, ptok, ppos,
+    // The padding helper copies GDN indices into S entries. Without consumers,
+    // the caller's unused metadata has no validated bound and must stay inert.
+    BuildPaddedDecode(S, token_ids, positions, attn_meta,
+                      has_gdn ? gdn_meta : GDNAttentionMetadata{}, ptok, ppos,
                       pam, pgm);
   }
 
@@ -11033,8 +11066,10 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
       s.pin.Free();
       {
         ActivePoolScope persistent_scope(&PersistentDecodeInputPool(d.b));
-        s.dev = std::make_unique<StepDevInputs>(BuildStepDevInputs(
-            d, s.positions, s.attn_meta, s.gdn_meta, gdn_state_slots));
+        s.dev = std::make_unique<StepDevInputs>(
+            has_gdn ? BuildStepDevInputs(d, s.positions, s.attn_meta, s.gdn_meta,
+                                         gdn_state_slots)
+                    : BuildFullAttnStepDevInputs(d, s.positions, s.attn_meta));
         MaybeBuildAttnCosSin(d, *s.dev, impl_->config, S, fp4_attn);
       }
       const bool has_idx = s.dev->has_gdn_idx &&
@@ -11388,7 +11423,9 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   CheckDensePagedForward(token_ids, positions, attn_meta, gdn_meta, attn_kv,
                          gdn_state, impl_->weights, impl_->config);
   const int64_t B = static_cast<int64_t>(token_ids.size());
-  detail::ValidateGdnDecodeGraphState(gdn_meta, gdn_state, B);
+  const bool has_gdn = HasGdnConsumers(impl_->weights);
+  if (has_gdn) detail::ValidateGdnDecodeGraphState(gdn_meta, gdn_state, B);
+  else ValidateFullAttnStepMetadata(B, attn_meta);
   Backend& b = vt::GetBackend(impl_->queue.device.type);
   Dev d{b, impl_->queue};
   // #1380: open a fresh demand measurement for this step. `PreGrowForCapture`
@@ -11410,7 +11447,7 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   // exact shape trivially satisfies that while keeping the padded-row inertness
   // question out of the spec path. The shape count stays bounded by max_num_seqs
   // because num_reqs is.
-  const bool spec_step = gdn_meta.num_spec_decodes > 0;
+  const bool spec_step = has_gdn && gdn_meta.num_spec_decodes > 0;
   const int64_t S = spec_step ? B : PadToCaptureSize(B, impl_->max_num_reqs);
   // ENG-CUDAGRAPH-BREAK W6 (#1374): this step's uniform query length, and the
   // ring key built from it. `Q == 0` means the batch does not divide evenly into
@@ -11429,8 +11466,8 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   const bool qlen_capped = DecodeGraphQueryLenCapped(impl_->slots, key);
   if (qlen_capped) v1::NoteDecodeGraphQueryLenDecline();
   if (!impl_->enabled || S < 0 || !servable_shape || qlen_capped ||
-      !detail::CanUseGdnDecodeGraphSize(
-          B, S, IndexedGdnStateIoEnabled(impl_->queue.device))) {
+      (has_gdn && !detail::CanUseGdnDecodeGraphSize(
+          B, S, IndexedGdnStateIoEnabled(impl_->queue.device)))) {
     if (aux_out != nullptr && !aux_out->layer_ids.empty()) {
       // The graph cannot serve this batch (disabled / unsupported size), so fall
       // back to the EAGER multi-tap forward, which fills aux_out itself. Without
@@ -11530,7 +11567,10 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     pam = attn_meta;
     pgm = gdn_meta;
   } else {
-    BuildPaddedDecode(S, token_ids, positions, attn_meta, gdn_meta, ptok, ppos,
+    // The padding helper copies GDN indices into S entries. Without consumers,
+    // the caller's unused metadata has no validated bound and must stay inert.
+    BuildPaddedDecode(S, token_ids, positions, attn_meta,
+                      has_gdn ? gdn_meta : GDNAttentionMetadata{}, ptok, ppos,
                       pam, pgm);
   }
 
@@ -11771,8 +11811,10 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
       s.pin.Free();
       {
         ActivePoolScope persistent_scope(&PersistentDecodeInputPool(d.b));
-        s.dev = std::make_unique<StepDevInputs>(BuildStepDevInputs(
-            d, s.positions, s.attn_meta, s.gdn_meta, gdn_state_slots));
+        s.dev = std::make_unique<StepDevInputs>(
+            has_gdn ? BuildStepDevInputs(d, s.positions, s.attn_meta, s.gdn_meta,
+                                         gdn_state_slots)
+                    : BuildFullAttnStepDevInputs(d, s.positions, s.attn_meta));
         MaybeBuildAttnCosSin(d, *s.dev, impl_->config, S, fp4_attn);
       }
       const bool has_idx = s.dev->has_gdn_idx &&

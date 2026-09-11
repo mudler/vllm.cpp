@@ -70,6 +70,10 @@ per-layer pattern); those are model shape, not the window rule, and must not mov
 into a shared function. The value each site computes must be unchanged, and a
 test asserts that per site rather than asserting the resolver in isolation.
 
+**W2 — the shared-path sites** (there are THREE; see the W2 outcome below, which
+re-derived the list. This paragraph's original text follows, wrong count and all,
+because the wrong count is what deferred the wave.)
+
 **W2 — the two shared-path sites**
 (`v1/attention/backend.cpp:323`, `mla_chunked_context.h:363`) are NOT model code
 and take an already-resolved `sliding_window`. They are listed for completeness
@@ -243,11 +247,74 @@ partly moot — `hf_config.cpp:80-87` already normalises a 0 window to `nullopt`
 which produces the same *window* outcome without setting a flag — but the
 max-length cap is a real missing behaviour and is owed.
 
+## W2 outcome — it never needed a device, and there were three sites, not two
+
+**Landed.** `v1/attention/backend.cpp`, `mla_chunked_context.h` and
+`deepseek_v4_dsa.cpp` now call `ResolveAttentionWindow`. No inline
+`vt::AttentionWindow{static_cast<int32_t>(sliding_window - 1), 0}` remains
+anywhere in `src/` or `include/`.
+
+**The deferral reason was wrong, and the error is worth keeping.** W2 was held
+back because those sites "sit under paths no CPU-only build exercises, and moving
+them without a device gate would be the unverified change this work has been
+closing." That conflates two questions with different answers:
+
+- *Does the resolver return the same value?* Pure arithmetic. No device. It is
+  exactly what W1 shipped for the five model sites, in the same test file.
+- *Is the site reached?* Unchanged by W2, and equally ungated before and after.
+
+Holding the first hostage to the second kept a shared seam split for no gain.
+This is the same shape as `ENG-HYBRID-PLACEMENT`'s placed branch, which sat
+"needs a GPU" for weeks and turned out to need a loopback engine.
+
+**The recorded site list was wrong in both count and location.** The spec named
+two sites; `git grep -n 'AttentionWindow{static_cast<int32_t>'` finds three, and
+`mla_chunked_context.h` had moved under
+`include/vllm/model_executor/layers/attention/`. `deepseek_v4_dsa.cpp:275` was
+never listed.
+
+**What changed, precisely.** All three guarded the inline expression with
+`if (sliding_window > 0)`, and that guard becomes the `optional` the resolver
+takes, so the VALUE is unchanged. Two behaviours are added:
+
+1. **They obey `--disable-sliding-window`.** This is a gap W3 opened: after W3 the
+   flag reached five of the eight sites carrying a window, so one engine would
+   have honoured the switch on Gemma and quietly kept the window on dots3-note's
+   windowed decode, DeepSeek-V4's DSA, and the MLA chunked-prefill context.
+2. **They refuse a window past `INT32_MAX` instead of truncating it.**
+   `static_cast<int32_t>(sliding_window - 1)` wraps, handing the kernel a
+   plausible small or negative radius. This is a deliberate behaviour change and
+   the only one W2 makes.
+
+**Gates.** `test_attention_window_adoption.cpp` grows from 5 cases / 27
+assertions to 8 / 41: the guard translation preserves `nullopt` for 0 and
+negative and reproduces the inlined value for real windows; the truncation is now
+a refusal; the three sites obey the switch. Mutation-proven, each mutant
+compiling at rc=0 — making the resolver ignore `disable_model_sliding_window`
+reds 2 assertions here and 1 in `test_disable_sliding_window`; removing the
+`INT32_MAX` bound reds 2.
+
+Value-unchanged evidence beyond the unit gate: `test_mla_attention_block`
+(2,282,067 assertions), `test_ops_mla_attn` (289,456) and
+`test_ops_mla_chunked_context` (30,797) all pass unchanged.
+
+**Owed, and it is the same debt W1 and W3 carry.** No gate executes the WINDOWED
+branch at any of the eight sites. `test_mla_attention_block:1472` sets
+`sliding_window = 513` but only calls `Validate()`; the large MLA suites run the
+unwindowed path. So mutating a production site back to its inline expression reds
+nothing. Closing that needs a windowed execution fixture per path, and it is one
+piece of work for all eight sites rather than three separate ones.
+
 ## Now
 
-W1 done. W3 done (see the outcome above). **W2 is still owed**, and the previous
-revision of this paragraph said so in a sentence that also called W3 owed, which
-it no longer is — the W3 landing edited around that line instead of through it.
+W1, W2 and W3 all done (see the outcomes above).
+
+Two corrections made while planning this wave are kept below, because both are
+about how the record itself went wrong rather than about the code.
+
+**The W3 landing left this section self-contradictory.** It edited around the
+`## Now` paragraph instead of through it and produced a sentence that called W3
+both done and owed. Corrected when W2 was picked up.
 
 **#2388 was closed by the W3 commit and should not have been.** Its scope is the
 generic layer and the sites that bypass it; W1 took five model sites and W3 took
@@ -255,7 +322,8 @@ the switch, but the shared-path sites are the same issue's work and had not
 landed. Reopened rather than re-filed, because a second issue for one issue's
 remaining wave is the intake shape `AGENTS.md` asks not to create.
 
-**W2's site list in `## Work breakdown` is stale in BOTH line numbers and count.**
+**W2's site list in `## Work breakdown` was stale in BOTH line numbers and count**
+— resolved by the W2 outcome above, which re-derived it and found three sites.
 It names `v1/attention/backend.cpp:323` and `mla_chunked_context.h:363`. The
 header moved to
 `include/vllm/model_executor/layers/attention/mla_chunked_context.h:363`, the

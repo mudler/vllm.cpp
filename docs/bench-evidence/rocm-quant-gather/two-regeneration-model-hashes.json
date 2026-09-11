@@ -1,0 +1,347 @@
+{
+  "files": [
+    {
+      "file": "IQ1_S-dense.gguf",
+      "bytes": 991296,
+      "first_sha256": "c67f7dcb52d65f3751c0e06b37e0e61b188c2b093f2c5f9e92190955391a1666",
+      "second_sha256": "c67f7dcb52d65f3751c0e06b37e0e61b188c2b093f2c5f9e92190955391a1666"
+    },
+    {
+      "file": "IQ1_S.gguf",
+      "bytes": 932160,
+      "first_sha256": "30ce542d730ee89631229d7e51fe7fadaf14a23bca4b656ba3d6000b280901d8",
+      "second_sha256": "30ce542d730ee89631229d7e51fe7fadaf14a23bca4b656ba3d6000b280901d8"
+    },
+    {
+      "file": "IQ1_S.packed",
+      "bytes": 6400,
+      "first_sha256": "754f0d0b9e7d3656a1f669cf756779352cccb246bf6aa0b25e7f362180cf0882",
+      "second_sha256": "754f0d0b9e7d3656a1f669cf756779352cccb246bf6aa0b25e7f362180cf0882"
+    },
+    {
+      "file": "IQ1_XXXS-dense.gguf",
+      "bytes": 991296,
+      "first_sha256": "55e0de6d6b5fb16baaf534ca9fa2f259f94b676f831b745929b7e997dffc930f",
+      "second_sha256": "55e0de6d6b5fb16baaf534ca9fa2f259f94b676f831b745929b7e997dffc930f"
+    },
+    {
+      "file": "IQ1_XXXS.gguf",
+      "bytes": 930624,
+      "first_sha256": "3d16b36474ae4e4663f1bc4842d9bfe8e62843491d3e6f5724173c04495e2c72",
+      "second_sha256": "3d16b36474ae4e4663f1bc4842d9bfe8e62843491d3e6f5724173c04495e2c72"
+    },
+    {
+      "file": "IQ1_XXXS.packed",
+      "bytes": 4864,
+      "first_sha256": "af0b5e336987746fd49cd33c790b99eb1479c26f64b6679fa6c685e5934ba0c4",
+      "second_sha256": "af0b5e336987746fd49cd33c790b99eb1479c26f64b6679fa6c685e5934ba0c4"
+    },
+    {
+      "file": "IQ2_S-dense.gguf",
+      "bytes": 991296,
+      "first_sha256": "dadcca3abfae7e710a1ed9bd6e679a92a02206cd41ee6709dd6713de201ff0a7",
+      "second_sha256": "dadcca3abfae7e710a1ed9bd6e679a92a02206cd41ee6709dd6713de201ff0a7"
+    },
+    {
+      "file": "IQ2_S.gguf",
+      "bytes": 936256,
+      "first_sha256": "fa8f65a209f9f838f79523ca3a8baf60d244099b321610f1b224dd52f2d6d18a",
+      "second_sha256": "fa8f65a209f9f838f79523ca3a8baf60d244099b321610f1b224dd52f2d6d18a"
+    },
+    {
+      "file": "IQ2_S.packed",
+      "bytes": 10496,
+      "first_sha256": "6eb1966662d9e424fefc5c3625282e7f33fdfab3af9cb4c0cbac6bdc593711ea",
+      "second_sha256": "6eb1966662d9e424fefc5c3625282e7f33fdfab3af9cb4c0cbac6bdc593711ea"
+    },
+    {
+      "file": "IQ2_XS-dense.gguf",
+      "bytes": 991296,
+      "first_sha256": "341a57b2dca5fce0c9554ae388fb3ccc04c6d2ac180b7201fdd85427c79360a5",
+      "second_sha256": "341a57b2dca5fce0c9554ae388fb3ccc04c6d2ac180b7201fdd85427c79360a5"
+    },
+    {
+      "file": "IQ2_XS.gguf",
+      "bytes": 935232,
+      "first_sha256": "91301828d93a083a1a0d8aba9cbbad2d0ba4f8cbef6ee6499b8ed2fdba6a074b",
+      "second_sha256": "91301828d93a083a1a0d8aba9cbbad2d0ba4f8cbef6ee6499b8ed2fdba6a074b"
+    },
+    {
+      "file": "IQ2_XS.packed",
+      "bytes": 9472,
+      "first_sha256": "3281c7397dde054ea6c9c8a661cab43dbd0c982eb23b9a31523a616565c827e7",
+      "second_sha256": "3281c7397dde054ea6c9c8a661cab43dbd0c982eb23b9a31523a616565c827e7"
+    },
+    {
+      "file": "IQ2_XXS-dense.gguf",
+      "bytes": 991296,
+      "first_sha256": "ed1114ef1967ad0f750758e42d3818b0ac48ce0948b3ba7bfc79c0491390882e",
+      "second_sha256": "ed1114ef1967ad0f750758e42d3818b0ac48ce0948b3ba7bfc79c0491390882e"
+    },
+    {
+      "file": "IQ2_XXS.gguf",
+      "bytes": 934208,
+      "first_sha256": "e8c8da741d84aae97b3acdda1543d5a47c889998609ad37d5fdffff2c5e1440e",
+      "second_sha256": "e8c8da741d84aae97b3acdda1543d5a47c889998609ad37d5fdffff2c5e1440e"
+    },
+    {
+      "file": "IQ2_XXS.packed",
+      "bytes": 8448,
+      "first_sha256": "4a3c10afb47315763ce507edcb5814e06d1be93a21b178cf73183302a3f1ceb9",
+      "second_sha256": "4a3c10afb47315763ce507edcb5814e06d1be93a21b178cf73183302a3f1ceb9"
+    },
+    {
+      "file": "IQ3_S-dense.gguf",
+      "bytes": 991296,
+      "first_sha256": "2767698af39a4c7a62137500a9c29b5946d043814b482a5b6e691253cb6fd0d7",
+      "second_sha256": "2767698af39a4c7a62137500a9c29b5946d043814b482a5b6e691253cb6fd0d7"
+    },
+    {
+      "file": "IQ3_S.gguf",
+      "bytes": 939840,
+      "first_sha256": "788e8878029509075a038030e94618ec5f01f98e5f822b18433f46db2f68ae48",
+      "second_sha256": "788e8878029509075a038030e94618ec5f01f98e5f822b18433f46db2f68ae48"
+    },
+    {
+      "file": "IQ3_S.packed",
+      "bytes": 14080,
+      "first_sha256": "d4eebe1369e21b0efd6ec5c89f54c785849c02edde957ebd302dad376f63c14c",
+      "second_sha256": "d4eebe1369e21b0efd6ec5c89f54c785849c02edde957ebd302dad376f63c14c"
+    },
+    {
+      "file": "IQ3_XXS-dense.gguf",
+      "bytes": 991296,
+      "first_sha256": "441678a7caac93dbb5da84ec3e245849b7e26184b027dc03016ce58d81c6e78e",
+      "second_sha256": "441678a7caac93dbb5da84ec3e245849b7e26184b027dc03016ce58d81c6e78e"
+    },
+    {
+      "file": "IQ3_XXS.gguf",
+      "bytes": 938304,
+      "first_sha256": "124e98d2acba39dea81d04807f2d5d3863b47556245b6994a22b9ee52b60ad48",
+      "second_sha256": "124e98d2acba39dea81d04807f2d5d3863b47556245b6994a22b9ee52b60ad48"
+    },
+    {
+      "file": "IQ3_XXS.packed",
+      "bytes": 12544,
+      "first_sha256": "d0f775f8e88d87ae542de6d16122a7a1cea09ebba91203f6513b74727082b6db",
+      "second_sha256": "d0f775f8e88d87ae542de6d16122a7a1cea09ebba91203f6513b74727082b6db"
+    },
+    {
+      "file": "IQ4_NL-dense.gguf",
+      "bytes": 991296,
+      "first_sha256": "5eba44b7fed6a00a9e7644874cf7d973a55d3d06e2d953d12928ca1560fa3442",
+      "second_sha256": "5eba44b7fed6a00a9e7644874cf7d973a55d3d06e2d953d12928ca1560fa3442"
+    },
+    {
+      "file": "IQ4_NL.gguf",
+      "bytes": 944192,
+      "first_sha256": "7dd47db4741f71965cb512e9965d9c7aed638f482d87a4132fbd34d8f7d3aad8",
+      "second_sha256": "7dd47db4741f71965cb512e9965d9c7aed638f482d87a4132fbd34d8f7d3aad8"
+    },
+    {
+      "file": "IQ4_NL.packed",
+      "bytes": 18432,
+      "first_sha256": "cd292582c61c4b4b89606c85a80a6bb6ed8af98503a4d2f3737e02ae4e711d19",
+      "second_sha256": "cd292582c61c4b4b89606c85a80a6bb6ed8af98503a4d2f3737e02ae4e711d19"
+    },
+    {
+      "file": "IQ4_XS-dense.gguf",
+      "bytes": 991296,
+      "first_sha256": "365673ef465a02cccca10fdc9c90080c9350afa408249e4582a12804d0ad7221",
+      "second_sha256": "365673ef465a02cccca10fdc9c90080c9350afa408249e4582a12804d0ad7221"
+    },
+    {
+      "file": "IQ4_XS.gguf",
+      "bytes": 943168,
+      "first_sha256": "d5a51e4ed1629f705aa9b7edf761cf6a868db8ee73b881ed1d4f23af774e1c91",
+      "second_sha256": "d5a51e4ed1629f705aa9b7edf761cf6a868db8ee73b881ed1d4f23af774e1c91"
+    },
+    {
+      "file": "IQ4_XS.packed",
+      "bytes": 17408,
+      "first_sha256": "35b2a41e738a6cb0a86deb4fd366f71ae2dc2a6fad7169f5a9afb53f523e919c",
+      "second_sha256": "35b2a41e738a6cb0a86deb4fd366f71ae2dc2a6fad7169f5a9afb53f523e919c"
+    },
+    {
+      "file": "MXFP4-dense.gguf",
+      "bytes": 991296,
+      "first_sha256": "d2014d4edd896fa070308a926ebf6792cc5fc672c0e8df69f6bea7975c59b5f7",
+      "second_sha256": "d2014d4edd896fa070308a926ebf6792cc5fc672c0e8df69f6bea7975c59b5f7"
+    },
+    {
+      "file": "MXFP4.gguf",
+      "bytes": 943168,
+      "first_sha256": "e60f444269c54001579cb5bd2ad652b00ac6070984f62ca4a88450e36e8260de",
+      "second_sha256": "e60f444269c54001579cb5bd2ad652b00ac6070984f62ca4a88450e36e8260de"
+    },
+    {
+      "file": "MXFP4.packed",
+      "bytes": 17408,
+      "first_sha256": "baa828a753cc6f496f356271dad644976cd57d1218517e3f641fe56b7ec8db4a",
+      "second_sha256": "baa828a753cc6f496f356271dad644976cd57d1218517e3f641fe56b7ec8db4a"
+    },
+    {
+      "file": "Q2_K-dense.gguf",
+      "bytes": 991296,
+      "first_sha256": "17f23518c6149e753d0d3af3edd348084fb9b1ff6ba7f9d290843917a045f3c1",
+      "second_sha256": "17f23518c6149e753d0d3af3edd348084fb9b1ff6ba7f9d290843917a045f3c1"
+    },
+    {
+      "file": "Q2_K.gguf",
+      "bytes": 936512,
+      "first_sha256": "05a27385779d3dc34a9b537b7228afc756ea5450cfc8b6051913caab3eaf8e48",
+      "second_sha256": "05a27385779d3dc34a9b537b7228afc756ea5450cfc8b6051913caab3eaf8e48"
+    },
+    {
+      "file": "Q2_K.packed",
+      "bytes": 10752,
+      "first_sha256": "655f77ebb32d974da7907da4a217c45bbbcd0b127df73a731f85afe427bb7dcc",
+      "second_sha256": "655f77ebb32d974da7907da4a217c45bbbcd0b127df73a731f85afe427bb7dcc"
+    },
+    {
+      "file": "Q3_K-dense.gguf",
+      "bytes": 991296,
+      "first_sha256": "05d3df4df491774148b9d0bab74c10d0b328c5515452641859b0fd5e1ca052d3",
+      "second_sha256": "05d3df4df491774148b9d0bab74c10d0b328c5515452641859b0fd5e1ca052d3"
+    },
+    {
+      "file": "Q3_K.gguf",
+      "bytes": 939840,
+      "first_sha256": "dcd12ce3b94f0f35033a220fbc3b72836321382857f1e1ffe077ab24239a28c2",
+      "second_sha256": "dcd12ce3b94f0f35033a220fbc3b72836321382857f1e1ffe077ab24239a28c2"
+    },
+    {
+      "file": "Q3_K.packed",
+      "bytes": 14080,
+      "first_sha256": "e4c3a11c1bbff806ae2729033910b7db606452d1b9aa499aa2ced46740ad85d4",
+      "second_sha256": "e4c3a11c1bbff806ae2729033910b7db606452d1b9aa499aa2ced46740ad85d4"
+    },
+    {
+      "file": "Q4_0-dense.gguf",
+      "bytes": 991296,
+      "first_sha256": "0e6554ba521edfde00d4d025a3058eabaaacdce6b24344f959e83d8dde35df7f",
+      "second_sha256": "0e6554ba521edfde00d4d025a3058eabaaacdce6b24344f959e83d8dde35df7f"
+    },
+    {
+      "file": "Q4_0.gguf",
+      "bytes": 944192,
+      "first_sha256": "663597e28852d64097f7a67542675e4575ee158d3c5e6e2143aadd1b4188f4af",
+      "second_sha256": "663597e28852d64097f7a67542675e4575ee158d3c5e6e2143aadd1b4188f4af"
+    },
+    {
+      "file": "Q4_0.packed",
+      "bytes": 18432,
+      "first_sha256": "cd292582c61c4b4b89606c85a80a6bb6ed8af98503a4d2f3737e02ae4e711d19",
+      "second_sha256": "cd292582c61c4b4b89606c85a80a6bb6ed8af98503a4d2f3737e02ae4e711d19"
+    },
+    {
+      "file": "Q4_K-dense.gguf",
+      "bytes": 991296,
+      "first_sha256": "735e81ccff33826d58db60d097e5ef1f37fe385178c680460c4d620d3b5363b0",
+      "second_sha256": "735e81ccff33826d58db60d097e5ef1f37fe385178c680460c4d620d3b5363b0"
+    },
+    {
+      "file": "Q4_K.gguf",
+      "bytes": 944192,
+      "first_sha256": "fbf3a0d6132bdb891b7747f0867a7c4da7262bc10a7cd63ea98a62a2523aa479",
+      "second_sha256": "fbf3a0d6132bdb891b7747f0867a7c4da7262bc10a7cd63ea98a62a2523aa479"
+    },
+    {
+      "file": "Q4_K.packed",
+      "bytes": 18432,
+      "first_sha256": "b0c107c4b353e2a169247e0406c1eb015d7a6d97edd5906f710868b8c2cecce1",
+      "second_sha256": "b0c107c4b353e2a169247e0406c1eb015d7a6d97edd5906f710868b8c2cecce1"
+    },
+    {
+      "file": "Q5_0-dense.gguf",
+      "bytes": 991296,
+      "first_sha256": "65a79d19109a0c5d8f0387da349eeac75ab47913ecf7749ef2498056e57e943f",
+      "second_sha256": "65a79d19109a0c5d8f0387da349eeac75ab47913ecf7749ef2498056e57e943f"
+    },
+    {
+      "file": "Q5_0.gguf",
+      "bytes": 948288,
+      "first_sha256": "8609984dbf7afeb73ca7f8f82029bac3da9195140888c37294056ceff0c22e37",
+      "second_sha256": "8609984dbf7afeb73ca7f8f82029bac3da9195140888c37294056ceff0c22e37"
+    },
+    {
+      "file": "Q5_0.packed",
+      "bytes": 22528,
+      "first_sha256": "b3531b1abd263bc4c6a3174b22fa1fd54a4b89b66e737f2eb3ba36be771d7528",
+      "second_sha256": "b3531b1abd263bc4c6a3174b22fa1fd54a4b89b66e737f2eb3ba36be771d7528"
+    },
+    {
+      "file": "Q5_K-dense.gguf",
+      "bytes": 991296,
+      "first_sha256": "21b1500a894f9c5ec5e3c48cf8968a652ba45b697e18ffdd7f3bb4fc05ef2c17",
+      "second_sha256": "21b1500a894f9c5ec5e3c48cf8968a652ba45b697e18ffdd7f3bb4fc05ef2c17"
+    },
+    {
+      "file": "Q5_K.gguf",
+      "bytes": 948288,
+      "first_sha256": "e054b9109627c979fb24a0cdb3497068a0e26b49d16944cbf69741d5d1e1ca99",
+      "second_sha256": "e054b9109627c979fb24a0cdb3497068a0e26b49d16944cbf69741d5d1e1ca99"
+    },
+    {
+      "file": "Q5_K.packed",
+      "bytes": 22528,
+      "first_sha256": "5e63d961f36486c9636dd2657e9069bd83ece65e466c56c657265fbd97353b07",
+      "second_sha256": "5e63d961f36486c9636dd2657e9069bd83ece65e466c56c657265fbd97353b07"
+    },
+    {
+      "file": "Q6_K-dense.gguf",
+      "bytes": 991296,
+      "first_sha256": "64a8f5bd55792bb8635ebb46c81f10580e28a74fec18fe568a8da387375d21e1",
+      "second_sha256": "64a8f5bd55792bb8635ebb46c81f10580e28a74fec18fe568a8da387375d21e1"
+    },
+    {
+      "file": "Q6_K.gguf",
+      "bytes": 952640,
+      "first_sha256": "7e2c9a7f3ef05fe47848ada7b7dfdb4d1fe38f9a7c84becda978030130490c45",
+      "second_sha256": "7e2c9a7f3ef05fe47848ada7b7dfdb4d1fe38f9a7c84becda978030130490c45"
+    },
+    {
+      "file": "Q6_K.packed",
+      "bytes": 26880,
+      "first_sha256": "134bba0f8076d43d31fcbbaeb37c3d8191b0d383e6595f787d3387e2e016738a",
+      "second_sha256": "134bba0f8076d43d31fcbbaeb37c3d8191b0d383e6595f787d3387e2e016738a"
+    },
+    {
+      "file": "Q8_0-dense.gguf",
+      "bytes": 991296,
+      "first_sha256": "068dcce514e4f6262bea8da54470b1295f046238f4e27cbe08679410ea72509d",
+      "second_sha256": "068dcce514e4f6262bea8da54470b1295f046238f4e27cbe08679410ea72509d"
+    },
+    {
+      "file": "Q8_0.gguf",
+      "bytes": 960576,
+      "first_sha256": "23064f6eb0c979d64eec4ac86299756c416ea40565b92ff38d527a39964b4d9d",
+      "second_sha256": "23064f6eb0c979d64eec4ac86299756c416ea40565b92ff38d527a39964b4d9d"
+    },
+    {
+      "file": "Q8_0.packed",
+      "bytes": 34816,
+      "first_sha256": "8be599e194405f9b5429e578a03a5717e4d78f53ab4c9c11a52659495ce805ee",
+      "second_sha256": "8be599e194405f9b5429e578a03a5717e4d78f53ab4c9c11a52659495ce805ee"
+    },
+    {
+      "file": "Q8_K-dense.gguf",
+      "bytes": 991296,
+      "first_sha256": "89ae45d6d0247457067a9e9dd23fef45c3805a08ee7708655e4979a0192e4f96",
+      "second_sha256": "89ae45d6d0247457067a9e9dd23fef45c3805a08ee7708655e4979a0192e4f96"
+    },
+    {
+      "file": "Q8_K.gguf",
+      "bytes": 963136,
+      "first_sha256": "11d9cfc51e3c8badb93a0ca48c20280c46794647cab65cb30aa0102c8818bfbc",
+      "second_sha256": "11d9cfc51e3c8badb93a0ca48c20280c46794647cab65cb30aa0102c8818bfbc"
+    },
+    {
+      "file": "Q8_K.packed",
+      "bytes": 37376,
+      "first_sha256": "bcf6f6691a787fe3f2a9bcc3d7923eeb4953862c30f904a6b10fc07410f8d657",
+      "second_sha256": "bcf6f6691a787fe3f2a9bcc3d7923eeb4953862c30f904a6b10fc07410f8d657"
+    }
+  ],
+  "all_identical": true
+}

@@ -12,10 +12,21 @@ disagree.**
 ([#2969](https://github.com/mudler/vllm.cpp/issues/2969)).** This line said "no
 instrument", and that is wrong for the other tap. `VT_MOE_SEL_FP` counts MoE
 block invocations and not model forwards, so its 384-call window reaches
-forwards 4, 6 and 7. **That does not supply a reading.** The comparison taken in
+forwards 4, 6 and 7. **That did not supply a reading.** The comparison taken in
 that window is VOID, because its CUDA arm answered the degenerate pre-#2550
-sequence `11751 271 271 271 271 271 0 0`. What is missing is a non-degenerate
+sequence `11751 271 271 271 271 271 0 0`. What was missing was a non-degenerate
 arm, not a wider window.
+
+**A READING WAS TAKEN ON 2026-09-06 AND IT DOES NOT RESTORE ANY ATTRIBUTION IN
+THIS FILE** ([#2998](https://github.com/mudler/vllm.cpp/issues/2998),
+[the reading](qwen4exp-moe-selection-fwd-20260906.md)). `rc` job `9e0864da` ran
+the same tap at the same budget on a non-degenerate pair. Forwards 4, 6 and 7 are
+read, against a negative control that flips nothing, and the expert selection does
+flip: 296 of 576 slots over 8 forwards. **It explains nothing about the three
+disagreeing ids.** Agreeing forward 5 flips 48 of 48 expert slots; disagreeing
+forward 7 flips 48 of 48; disagreeing forward 4 flips 33 of 48. Every claim in
+this file about which forwards an instrument has observed is superseded. No claim
+in this file about what causes the three ids becomes supported.
 
 | arm | token ids | agrees with CPU |
 |---|---|---|
@@ -588,6 +599,22 @@ CPU arms, 2.320338e-02 between CPU and CUDA.
 > layer-0 selection flip is **unmeasured**. That single run, and a fingerprint
 > budget that reaches forward 7, are the next two measurements. Both need the
 > 68 GB released artifact and a GPU for the CUDA arm.
+>
+> *(Editorial note, 2026-09-06,
+> [#2998](https://github.com/mudler/vllm.cpp/issues/2998): that single run was
+> taken. `rc` job `9e0864da` on `thor:gpu0`,
+> [reading](qwen4exp-moe-selection-fwd-20260906.md). **Layer 0 does NOT flip** at
+> the matched pair — all five prefill tokens select the same ten experts on both
+> arms, equal `sel` digest, boundary margins 4, 2, 1, 1 and 0 ulps — so the
+> no-flip bound lifts from `2.139e-05` to `4.324e-05` and the layer-0 residue here
+> is the keep-quant expert GEMM's reassociation rather than the top-k term. The
+> **fingerprint budget that reaches forward 7 is still owed for the OTHER tap**;
+> `VT_Q4EXP_LAYER_FP` counts forwards and this reading did not extend it. And the
+> same run read expert selection at forwards 4, 6 and 7, where it flips 127 of 144
+> slots against the agreeing forwards' 116 of 192 — **which explains nothing**,
+> because agreeing forward 5 flips 48 of 48 while disagreeing forward 4 flips 33
+> of 48. The 32.9% tie rate above is prefill-only on a different pair and is not
+> the same measurement as that run's 24.8% and 23.1% over all eight forwards.)*
 >
 > **AND ONE CORRECTION TO THIS ANNOTATION'S OWN §5 NOTE.** "`42` is layer-0
 > coverage" is wrong for 3 of the 14 tags: `emb`, `wide` and `out` are tapped with

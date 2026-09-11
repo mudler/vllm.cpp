@@ -1,0 +1,67 @@
+{
+  "local": "/tmp/strix-3015-pqw30wit",
+  "manifest": {
+    "image": "localhost/vllmcpp-strix-profile:3015",
+    "model": "/workspace/ckpt/qwen38-27b-q4km/Qwen3.8-27B-Q4_K_M.gguf",
+    "clock_device": "/sys/class/drm/card1/device",
+    "sources": {
+      "vllmcpp": {
+        "archive": "/workspace/strix-3015-20260907.Gq6MW5/vllmcpp.tar",
+        "sha256": "a57ae15a89351f216fa7002c4300fa72d67e48b234ac6dd898f115751c812647",
+        "revision": "f98b638673b4d2edc0250eec56d229357ea38ab1"
+      },
+      "llamacpp": {
+        "archive": "/workspace/strix-3015-20260907.Gq6MW5/llamacpp.tar",
+        "sha256": "0f43551d3da94ba0d2af80e202177008a91966de66dbabf87a2042377d16d133",
+        "revision": "10bf611e533d81f739128304991c5e133c6aebd8"
+      }
+    },
+    "profiler_prefix": [
+      "/opt/rocm/bin/rocprofv3",
+      "--kernel-trace",
+      "--hip-runtime-trace",
+      "--memory-copy-trace",
+      "--scratch-memory-trace",
+      "--output-format",
+      "csv",
+      "--output-directory",
+      "{trace_dir}",
+      "--"
+    ]
+  },
+  "binaries": {
+    "vllmcpp": {
+      "/tmp/strix-3015-pqw30wit/build-vllmcpp/examples/vllm-cli": "6531cfb11e1f119744beb49d11d3c7a86ceb4118920888f5153043ab1e31aace",
+      "/tmp/strix-3015-pqw30wit/build-vllmcpp/libvllm.so.0.0.3": "aa0ff599f89db6de10304bb28ed40b5a286e16a2309d3a834c0429f19d0ef7d6"
+    },
+    "llamacpp": {
+      "/tmp/strix-3015-pqw30wit/build-llamacpp/bin/llama-completion": "40ea097a1a7c88cc56125c72ec243cb1c4e7883c19f262acc3e70800b122a33c",
+      "/tmp/strix-3015-pqw30wit/build-llamacpp/bin/libggml-base.so.0.20.0": "acf34a3128c3e36a8eac83f00d092e8b7c97579270a7ad7fbad0b353d50e4caf",
+      "/tmp/strix-3015-pqw30wit/build-llamacpp/bin/libggml-cpu.so.0.20.0": "6bfc3ca019cee08630b7b78fb4f3d1f6ad780b4d3c39e46c834eb1457e83d289",
+      "/tmp/strix-3015-pqw30wit/build-llamacpp/bin/libggml-hip.so.0.20.0": "16aad6e2a280691df209145541fa39f9ed4a8b9ab5d0f14b30fbda1cc866a2f6",
+      "/tmp/strix-3015-pqw30wit/build-llamacpp/bin/libggml.so.0.20.0": "8d89f40f3412a520041e0faa0405c970479d5a59120b336f97ad876f53f6e1d5",
+      "/tmp/strix-3015-pqw30wit/build-llamacpp/bin/libllama-common.so.0.1.0": "35e016f892e2bc1fe196d93e13aba522418afb533672ed8f14aea1cc12392b87",
+      "/tmp/strix-3015-pqw30wit/build-llamacpp/bin/libllama-completion-impl.so": "c3c2742ac71905ea339a0339f3c272504db8ade74d1464d435ea14d041dab024",
+      "/tmp/strix-3015-pqw30wit/build-llamacpp/bin/libllama.so.0.1.0": "fc2ecdd0cddb9d9c64f8860cf5a3826fdfc7f8674b4ba021581cbf83e85c49fa"
+    }
+  },
+  "sources": {
+    "vllmcpp": {
+      "archive": "/workspace/strix-3015-20260907.Gq6MW5/vllmcpp.tar",
+      "sha256": "a57ae15a89351f216fa7002c4300fa72d67e48b234ac6dd898f115751c812647",
+      "revision": "f98b638673b4d2edc0250eec56d229357ea38ab1"
+    },
+    "llamacpp": {
+      "archive": "/workspace/strix-3015-20260907.Gq6MW5/llamacpp.tar",
+      "sha256": "0f43551d3da94ba0d2af80e202177008a91966de66dbabf87a2042377d16d133",
+      "revision": "10bf611e533d81f739128304991c5e133c6aebd8"
+    }
+  },
+  "boot_id": "a5bc8128-f6ad-4767-8614-6923f88032e1",
+  "rc_job_id": "55980d1c-261b-4f95-9995-e204afe26177",
+  "created_unix": 1788775298.0765896,
+  "image_id": "828575f512a17ddbf74d140737b1a6434be192e62c900bc804379c6f5f875e7f",
+  "vllmcpp": "/tmp/strix-3015-pqw30wit/build-vllmcpp/examples/vllm-cli",
+  "llamacpp": "/tmp/strix-3015-pqw30wit/build-llamacpp/bin/llama-completion",
+  "model": "/tmp/strix-3015-pqw30wit/Qwen3.8-27B-Q4_K_M.gguf"
+}

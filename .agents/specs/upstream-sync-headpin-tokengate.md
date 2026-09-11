@@ -11,6 +11,19 @@ Row spec: [`upstream-sync-headpin.md`](upstream-sync-headpin.md).
 
 ## Now
 
+**SUPERSEDED 2026-09-04: THE GATE HAS RUN AND IT PASSED.** Job
+`7386f034-246a-4af5-9a04-f98aafffce54` captured the oracle at the target on
+`dgx:gpu0` and it reproduces `tests/parity/goldens/opt_greedy` **byte for byte**:
+`IDS mismatched_positions 0 of 96`, `IDS_BYTE_EQUAL True`,
+`SELECTOR K=5 multi_valued_cells 0`, `TOKENGATE_VERDICT PASS`, `DIFF_RC=0`. §4's
+last row carries the preconditions; the standing record with the recipe, the
+exit-code map, the wrapper that stood between `rc` and the harness, and what the
+result does and does not license is
+[`../../docs/bench-evidence/opt125m-token-gate-e126687-dgx-20260904.md`](../../docs/bench-evidence/opt125m-token-gate-e126687-dgx-20260904.md).
+
+The paragraph below was this wave's own position and is kept because it was true
+of the wave. It is no longer true of the tree.
+
 **The gate does not yet exist, and what prevents it is a queue, not a
 refusal.** This wave establishes what the gate must compare, makes that
 comparison executable, proves the instrument on four mutations, stages every
@@ -440,15 +453,44 @@ Every rc above was read directly, never after a pipe.
 
 ## Owed
 
-- **The capture itself**, until job `efc30c74-005e-4e80-bc28-bd34f5b76b77`
-  returns (#2794).
-- **Our arm re-run against whatever golden that job produces.** If the bytes are
-  identical the existing green `test_opt_paged_engine` measurement carries over
-  to those bytes unchanged; if they drift, the gate must be re-passed on GB10
-  with our code byte-unchanged, which is a second lease (#2794).
-- **A re-capture of the OPT golden at the ACTIVE pin `5559679229`**, which §2.4
-  shows was skipped. A candidate capture that reproduces the committed bytes
-  answers this too; one that does not leaves it open (#2794).
+**DISCHARGED 2026-09-04 by job `7386f034-246a-4af5-9a04-f98aafffce54`.** Three
+bullets stood here and the capture answered all three. They are recorded rather
+than deleted, because what a wave owed is part of how it was closed.
+
+- ~~**The capture itself**, until job `efc30c74-005e-4e80-bc28-bd34f5b76b77`
+  returns.~~ `efc30c74` failed (exit 4, missing PEP-518 requires, #2895); its
+  requeue `7386f034` ran on `dgx:gpu0` on 2026-09-04 and exited **0**.
+- ~~**Our arm re-run against whatever golden that job produces.**~~ The bytes are
+  identical, so the branch this bullet named resolved to the first arm: the
+  existing green `test_opt_paged_engine` measurement carries over to those bytes
+  unchanged, because they are the same bytes. **Our arm re-run at today's HEAD is
+  a different obligation and is NOT discharged** — byte-identity of the bar says
+  nothing about our code since; that needs its own lease and belongs to
+  `MODEL-TEXT-opt-optfor-causal-lm`.
+- ~~**A re-capture of the OPT golden at the ACTIVE pin `5559679229`**, which §2.4
+  shows was skipped.~~ Answered in the first direction this bullet allowed: the
+  candidate reproduces the committed bytes, so `tests/parity/goldens/opt_greedy`
+  now holds across vLLM 0.25.0 / `e24d1b24`, `5559679229` and `e126687a9a`.
+
+Two questions this section recorded rather than probed are also answered, and by
+the same log rather than by a second run:
+
+- ~~**Whether the leased container can satisfy the pin's Rust workspace.**~~ It
+  does not have to. The wrapper preamble reads `cargo=ABSENT rustc=ABSENT` and
+  `SUM SRCBUILD_RC=0` follows it, so `setup.py:1495`'s
+  `optional=not should_require_rust_frontend()` tolerates an absent frontend at
+  this revision **in practice**, which is what the bullet said had been read from
+  source and never observed.
+- ~~**Whether `--max-runtime 5h` covers a COLD build.**~~ It does, with margin: a
+  cold `MAX_JOBS=4` build at `TORCH_CUDA_ARCH_LIST=12.1` took **7740 s** and the
+  whole job 2 h 15 m 18 s. **The 94-minute budget was 37% low**, because it came
+  from a Thor build; the next lease that builds this oracle should budget from
+  the GB10 number.
+
+Below: what remains owed. The two answered bullets are kept in their
+original place with their original reasoning, struck through and marked
+ANSWERED, because the reasoning is what the observation confirmed.
+
 - **[#2805](https://github.com/mudler/vllm.cpp/issues/2805): the STRICT bar's
   licence is inside an existence guard.**
   `tests/vllm/models/test_opt_paged_engine.cpp:155` wraps the self-determinism
@@ -483,6 +525,11 @@ Every rc above was read directly, never after a pipe.
   `tests/parity/goldens/qwen35_greedy_0_8b/manifest.json` already uses. §2.6. The
   OPT one should be written from the capture job's own output rather than
   reconstructed, which is why it is owed rather than done here (#2794).
+  **The blocker named in this bullet is gone**: `7386f034` produced the
+  authoritative capture, so the OPT manifest can now be written from a job log
+  rather than reconstructed, and its `vllm_commit` is
+  `e126687a9a828d513c01a07cd69f025f27d63280`. The bullet stays owed because
+  writing it is work this wave did not do, and it is no longer anchored on #2794.
   A reviewer of #2801 noted that writing nothing is not the only honest option:
   a manifest recording date, device, invocation and checkpoint with
   `vllm_commit` explicitly **null** would manufacture no fact and would still
@@ -495,8 +542,9 @@ Every rc above was read directly, never after a pipe.
   for the first of those; re-counted here it is 67, and the count that belongs
   in the record is the one this wave measured rather than the one it was
   handed.
-- **[#2794](https://github.com/mudler/vllm.cpp/issues/2794): whether the leased
-  container can satisfy the pin's Rust workspace.** The target carries
+- ~~**Whether the leased container can satisfy the pin's Rust workspace.**~~
+  **ANSWERED above by `7386f034`.** The reasoning is kept because it is what the
+  observation confirmed. The target carries
   `rust/Cargo.toml` and a `rust-toolchain.toml` on channel 1.95, and the
   container's toolchain is unknown. `setup.py:1495` passes
   `optional=not should_require_rust_frontend()` and `VLLM_REQUIRE_RUST_FRONTEND`
@@ -504,8 +552,8 @@ Every rc above was read directly, never after a pipe.
   skipped. Read from the source, never observed: the build has not yet reached
   that line on the fleet. The next run answers it, and it is recorded rather
   than probed because probing it costs the same lease the run needs.
-- **[#2794](https://github.com/mudler/vllm.cpp/issues/2794): whether
-  `--max-runtime 5h` covers a COLD build.** The job's ccache remote store at
+- ~~**Whether `--max-runtime 5h` covers a COLD build.**~~ **ANSWERED above by
+  `7386f034`: 7740 s of build inside a 2 h 15 m job.** The job's ccache remote store at
   `$WS/ccache-remote` is empty, because the run that would have filled it never
   reached compilation. Every published timing for this tree's CUDA builds is a
   warm one, so the budget for a cold `MAX_JOBS=4` build at `TORCH_CUDA_ARCH_LIST=12.1`
@@ -513,12 +561,29 @@ Every rc above was read directly, never after a pipe.
   `STAGE=build` is separable from `STAGE=capture`, so a timeout costs a requeue
   and not the measurement.
 
-  Both are anchored on #2794 and not on #2895. #2895 is the build failure, and
-  the change that records these questions closes it; an `## Owed` bullet whose
-  issue closes in the same commit points at a closed issue from the moment it
-  lands. #2794 is the obligation that outlives it — the declared token-exact
-  gate at `e126687a9a` — and the leased run that discharges it is the same run
-  that answers both questions.
+  Both were anchored on #2794 and not on #2895, on the reasoning that #2794 was
+  the obligation that outlived the build failure and that the leased run
+  discharging it would answer both questions. That is what happened, so neither
+  bullet is anchored on an issue any more: the answers are in the log and in
+  [`../../docs/bench-evidence/opt125m-token-gate-e126687-dgx-20260904.md`](../../docs/bench-evidence/opt125m-token-gate-e126687-dgx-20260904.md).
 - **The other strict goldens at the target** — 27B W4A4, 32B-NVFP4A16, 35B,
   Coder. The pin advance re-captured all four at `5559679229`; none has been
-  re-captured at `e126687a9a`, and this wave does not attempt it (#2794).
+  re-captured at `e126687a9a`, and this wave does not attempt it.
+
+  **This bullet is deliberately NOT anchored on an issue, and that is the point
+  of moving it.** It used to cite #2794, which is closed by the OPT capture; an
+  `## Owed` bullet pointing at a closed issue is how an obligation stops being
+  read. AGENTS.md admits exactly two homes for work nobody is doing yet — an
+  issue whose `Row:` line names an owner, or a spec's `## Owed` — and this is the
+  second. Whoever takes it files the issue then, against row
+  `UPSTREAM-SYNC-HEADPIN`; filing one now would add intake to a row that already
+  carries **five** open issues — #2611, #2655, #2794, #2798, #2818, counted with
+  `gh issue list --state open --search 'UPSTREAM-SYNC-HEADPIN in:body'` on
+  2026-09-06 — and no capacity to work a fifth golden. Four of the five survive
+  this change, since it closes #2794. An earlier draft of this bullet said six.
+
+  What it costs is one lease per golden on `dgx:gpu0`, on the recipe §2.2 states
+  and the harness `.agents/scripts/tokengate-e126687-job.sh` already implements —
+  the oracle wheel `7386f034` persisted to `/workspace/tokengate-e126687/wheel/`
+  makes the 2 h build a no-op for the first of them, since `STAGE=capture` is
+  separable from `STAGE=build`.

@@ -1,0 +1,22 @@
+vllm-cli: loading model from /tmp/rocm-strix-q4k/models/Qwen3.8-27B-Q4_K_M.gguf
+engine: device placement: --fit resolved NO placement: the model has no routed-expert layers, so a placement has nothing to move
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+[vt op-provider] op=4 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=75 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=1 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=81 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=86 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=5 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=87 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=74 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=10 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=9 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=82 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=61 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=76 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=62 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=28 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=36 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=67 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+HW Exception by GPU node-1 (Agent handle: 0x5bae52a0afb0) reason :GPU Hang

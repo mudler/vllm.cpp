@@ -162,6 +162,72 @@ bool MemsetDeviceIfCapture(void* p, int value, size_t bytes);
 bool MemsetDeviceFill(void* p, int value, size_t bytes);
 bool CopyDeviceDeviceIfResident(void* dst, const void* src, size_t bytes);
 
+// BACKEND-TENSTORRENT-KEEPQUANT W3 capture-safety probe: how many staging
+// writes (host repack + from_vector upload) the keep-quant decode path has
+// performed while a trace capture was active. The staged arm performs ZERO —
+// the i32 word shadow is resident before capture and the per-call decode
+// recomputes from it — so any positive count inside a captured run is the
+// #2812 class (a captured graph reading a buffer its replay cannot refresh).
+// The reset hook exists for the op-level red-first test only. Defined only
+// when the backend is built (tenstorrent_ops.cpp); inline no-ops otherwise,
+// the WarmPagedKvShadow pattern, so device-agnostic TUs may call them.
+#ifdef VLLM_CPP_TENSTORRENT
+int64_t KeepQuantCaptureStagingWrites();
+void ResetKeepQuantCaptureStagingWritesForTest();
+
+// BACKEND-TENSTORRENT-KEEPQUANT W4a wave-3a test hooks (the red/green
+// measurement pair for the chunked E=1 arm):
+//  - LastTraceBytesForTest: the device-reported total live trace-buffer
+//    bytes as of the last EndCapture — the observable for the wave-1b
+//    falsification class (a whole-weight tile inside a captured graph
+//    demanding 425,754,624 B against the 52,428,800 B region). The reading
+//    accumulates across every live trace, so tests release a graph before
+//    measuring the next one in isolation.
+//  - KeepQuantChunkRowsOverrideForTest: forces the E=1 slice-decode chunk
+//    row count (0 = the production policy default), so the sweep and the
+//    bit-exact legs execute MANY chunks at shapes whose policy chunk would
+//    cover the whole [N, K] slice in one pass.
+int64_t LastTraceBytesForTest();
+void KeepQuantChunkRowsOverrideForTest(int64_t rows);
+
+// BACKEND-TENSTORRENT-KEEPQUANT W4a wave-3b-1 residency-policy probes, one
+// per shadow map, so the twin policy is a measurement and not a claim:
+//  - KeepQuantWordShadowPresentForTest: the PACKED i32 word shadow for a host
+//    weight is staged. The dense keep-quant matmul's residency — the chunked
+//    E=1 arm decodes from it every call.
+//  - DecodedWeightShadowPresentForTest: a decoded bf16 TWIN for a host weight
+//    exists. The dense keep-quant matmul must NOT build one — an entry here
+//    for a matmul weight is the wave-2 twin residency surviving the switch.
+//  - EmbedTableShadowPresentForTest: the embedding gather's bf16 table twin
+//    exists — the gather-class survivor the twin policy deliberately keeps
+//    (the vehicle's tied head shares the table: its GATHER keeps the twin,
+//    its MATMUL stages only the packed words).
+bool KeepQuantWordShadowPresentForTest(const void* host);
+bool DecodedWeightShadowPresentForTest(const void* host);
+bool EmbedTableShadowPresentForTest(const void* host);
+// W4d W0 (#3042): device-side allocation trace — interleaves
+// get_memory_view snapshots between ops to attribute the 27B OOM.
+// Gated by VT_TT_ALLOC_TRACE. The snapshot count and max-allocation-delta
+// probes are the red-first observables: zero before any device work,
+// positive after the keep-quant path runs instrumented.
+void AllocTraceSnapshot(MeshDevice& device, const char* label);
+int64_t AllocTraceSnapshotCountForTest();
+int64_t AllocTraceMaxDeltaForTest();
+void ResetAllocTraceForTest();
+#else
+inline int64_t KeepQuantCaptureStagingWrites() { return 0; }
+inline void ResetKeepQuantCaptureStagingWritesForTest() {}
+inline int64_t LastTraceBytesForTest() { return 0; }
+inline void KeepQuantChunkRowsOverrideForTest(int64_t) {}
+inline bool KeepQuantWordShadowPresentForTest(const void*) { return false; }
+inline bool DecodedWeightShadowPresentForTest(const void*) { return false; }
+inline bool EmbedTableShadowPresentForTest(const void*) { return false; }
+inline void AllocTraceSnapshot(MeshDevice&, const char*) {}
+inline int64_t AllocTraceSnapshotCountForTest() { return 0; }
+inline int64_t AllocTraceMaxDeltaForTest() { return 0; }
+inline void ResetAllocTraceForTest() {}
+#endif
+
 // ITEM 5 (rope): driver-side warm hook — populate the persistent device
 // cos/sin tensors for the step's positions BEFORE BeginCapture (the
 // SizeSlot::Refresh slot), so the captured rope cache-HITs. No-op unless

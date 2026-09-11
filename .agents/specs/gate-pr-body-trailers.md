@@ -241,7 +241,7 @@ reaches a network.
 
 ## Owed
 
-[#1298](https://github.com/mudler/vllm.cpp/issues/1298): `agent-integration.py`
+ISSUE-GH-1298: `agent-integration.py`
 raises before it reads anything, because the `.agents/policy-cutover` anchor it
 loads was deleted on 2026-08-09 and never restored. Measured here and not fixed
 here: the repair is a decision about whether `--cutover` belongs in that command

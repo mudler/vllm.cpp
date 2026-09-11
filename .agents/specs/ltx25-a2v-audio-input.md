@@ -478,7 +478,7 @@ in the waveform's own dtype (`ops.py:54`) and the encoder in the parameters'
   Recorded so the next reader can tell a deliberate deferral from an oversight.
 - **The silent-ignore paths found while surveying**, each filed rather than
   fixed in flow because each needs a contract decision this row has no mandate to
-  make: [#927](https://github.com/mudler/vllm.cpp/issues/927) (seven typed
+  make: ISSUE-GH-927 (seven typed
   `VideoGenParams` / `VideoModelParams` fields LTX-2.5 accepts and never reads,
   all seven of which H3 does read) and
   [#928](https://github.com/mudler/vllm.cpp/issues/928) (`/v1/videos` forwards no

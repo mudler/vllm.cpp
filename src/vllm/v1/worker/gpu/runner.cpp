@@ -2359,19 +2359,29 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   // SPEC-DFLASH2 W7 (#1824), the async draft-in-output WORKER half. Under
   // async scheduling two things differ from the sync flow, both handled here:
   //
-  // (a) COMPUTED-TOKEN CORRECTION. The scheduler's num_computed_tokens for a
-  //     request whose PREVIOUS step scheduled drafts may still include that
-  //     step's rejected drafts — the rollback runs in update_from_output,
-  //     which the depth-2 loop applies AFTER this schedule. Upstream corrects
-  //     optimistically on-device (gpu_model_runner.py:1356-1396 prev_num_
-  //     draft_len + the _prepare_inputs GPU correction) because its rejection
-  //     result is not host-visible in time; OUR rejection ran on the host
-  //     last step, so the exact value is STRUCTURAL: the newest committed
-  //     token's position, num_tokens_no_spec - 1. That equals the scheduler's
-  //     value when the rollback already ran (the depth-1 LLMEngine::step
-  //     order) and subtracts exactly num_rejected when it has not (the
-  //     depth-2 batch-queue order) — both orders are live in production,
-  //     which is why the rule is structural rather than temporal.
+  // (a) COMPUTED-TOKEN CORRECTION, OPTIMISTIC HALF (SPEC-DFLASH2 A2-4, #3004).
+  //     The scheduler's num_computed_tokens for a request whose PREVIOUS step
+  //     scheduled drafts may still include that step's rejected drafts — the
+  //     rollback runs in update_from_output, which the depth-2 loop applies
+  //     AFTER this schedule.
+  //
+  //     W7 answered that with a STRUCTURAL value, the newest committed token's
+  //     position `num_tokens_no_spec - 1`, and it was right for one reason: our
+  //     rejection walk ran on the HOST before this step was scheduled, so the
+  //     exact value was already known here. A2-2 began removing that property
+  //     and A2-5 finishes removing it, so the rule was correct and
+  //     self-invalidating — which is what this wave is for.
+  //
+  //     What replaces it is upstream's, in upstream's two halves
+  //     (gpu_model_runner.py:1356-1396 @ pin 5559679229). HERE: assume every one
+  //     of last step's drafts was accepted and write that value, which needs no
+  //     accept result at all — `prev_num_computed_tokens + 1 +
+  //     prev_num_draft_len`, all of it this runner's own bookkeeping, and
+  //     therefore the same number in BOTH engine orders rather than a rule that
+  //     has to be indifferent to which one ran. THEN, in
+  //     `apply_deferred_spec_decode_corrections`, subtract what was rejected.
+  //     Upstream's optimism is the same one: `optimistic_num_accepted =
+  //     req_state.prev_num_draft_len` (:1376).
   //
   // (b) PLACEHOLDER FILL. The scheduler ships -1 placeholders
   //     (async_scheduler.py:43-45); the real values are the drafts THIS
@@ -2389,32 +2399,46 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
   //     upstream's shape (model_runner.py:1548,1553-1556).
   if (spec_on()) {
     if (use_async_scheduling_) {
+      deferred_spec_corrections_.clear();
       const CachedRequestData& cached = scheduler_output.scheduled_cached_reqs;
       for (int ci = 0; ci < cached.num_reqs(); ++ci) {
         const std::string& req_id = cached.req_ids[static_cast<size_t>(ci)];
-        const auto prev_it = prev_sched_draft_counts_.find(req_id);
-        if (prev_it == prev_sched_draft_counts_.end() || prev_it->second <= 0) {
+        const auto prev_it = prev_num_draft_len_.find(req_id);
+        if (prev_it == prev_num_draft_len_.end() || prev_it->second <= 0) {
           continue;  // no drafts scheduled for it last step: value is exact.
         }
         const auto idx_it = input_batch_.req_id_to_index.find(req_id);
         if (idx_it == input_batch_.req_id_to_index.end()) {
           continue;  // not in the persistent batch (resumed-as-new path).
         }
+        const auto pos_it = prev_num_computed_tokens_.find(req_id);
+        if (pos_it == prev_num_computed_tokens_.end()) {
+          continue;  // this runner recorded no position for it last step.
+        }
         const int req_index = idx_it->second;
+        // OPTIMISTICALLY ASSUME ALL ACCEPTED (gpu_model_runner.py:1373-1381).
+        // The position this runner wrote last step, plus the token that step's
+        // input carried, plus every draft it scheduled. No accept result reads
+        // into this expression, which is the whole point of the wave.
+        const int optimistic_num_accepted = prev_it->second;
+        const int optimistic = pos_it->second + 1 + optimistic_num_accepted;
         const int sent =
             input_batch_.num_computed_tokens_cpu[static_cast<size_t>(req_index)];
-        const int corrected =
-            input_batch_.num_tokens_no_spec[static_cast<size_t>(req_index)] - 1;
-        // sent == corrected (rollback already applied) or exceeds it by at
-        // most the previous step's rejected count (bounded by its draft
-        // count). Anything else is a bookkeeping defect — refuse loudly.
-        VT_CHECK(sent - corrected >= 0 && sent - corrected <= prev_it->second,
+        // The scheduler's value is the optimistic one when its rollback has not
+        // yet run (the depth-2 batch-queue order) and the corrected one when it
+        // has (the depth-1 LLMEngine::step order), so it brackets ours from
+        // above and below. Anything outside that bracket is a bookkeeping
+        // defect — refuse loudly, exactly as W7's range check did.
+        VT_CHECK(optimistic - sent >= 0 &&
+                     optimistic - sent <= optimistic_num_accepted,
                  "async spec computed-token correction out of range for '" +
                      req_id + "': scheduler sent " + std::to_string(sent) +
-                     ", structural value " + std::to_string(corrected) +
-                     ", prev drafts " + std::to_string(prev_it->second));
+                     ", optimistic value " + std::to_string(optimistic) +
+                     ", prev drafts " + std::to_string(optimistic_num_accepted));
         input_batch_.num_computed_tokens_cpu[static_cast<size_t>(req_index)] =
-            corrected;
+            optimistic;
+        deferred_spec_corrections_.push_back(
+            {req_id, req_index, optimistic_num_accepted});
       }
     }
 
@@ -2462,13 +2486,40 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     }
 
     if (use_async_scheduling_) {
-      // Record THIS step's scheduled draft counts for (a) next step.
-      prev_sched_draft_counts_.clear();
+      // SPEC-DFLASH2 A2-4 (#3004). `prev_num_draft_len` is written where the
+      // drafts are spliced, which is upstream's site verbatim
+      // (`gpu_input_batch.py:517` @ pin 5559679229,
+      // `request.prev_num_draft_len = num_spec_tokens`, inside
+      // `update_req_spec_token_ids`).
+      //
+      // `prev_num_computed_tokens_` is recorded BESIDE it and from the same
+      // step, so the next step's optimistic value is this runner's own number
+      // rather than the scheduler's. It is read here AFTER the optimistic pass
+      // above wrote it, which is deliberate: the value the next step must
+      // extend is the one this step actually ran on. The deferred correction
+      // below rewrites it once the accept result is in, and its own tail
+      // re-records it, so the two writers cannot disagree.
+      prev_num_draft_len_.clear();
       for (const auto& [rid, toks] : *sched_spec) {
-        prev_sched_draft_counts_[rid] = static_cast<int>(toks.size());
+        prev_num_draft_len_[rid] = static_cast<int>(toks.size());
+      }
+      prev_num_computed_tokens_.clear();
+      for (int i = 0; i < nr; ++i) {
+        prev_num_computed_tokens_[*input_batch_.req_ids[static_cast<size_t>(i)]] =
+            input_batch_.num_computed_tokens_cpu[static_cast<size_t>(i)];
       }
     }
   }
+
+  // SPEC-DFLASH2 A2-4 (#3004): the DEFERRED half of the computed-token
+  // correction, which turns each optimistic value above into the exact one.
+  // Upstream calls this after the model LAUNCH (gpu_model_runner.py:4524-4525)
+  // and keeps the in-step positions right with a device kernel inside
+  // `_prepare_inputs` (:2148-2166); our positions are computed on the host from
+  // `num_computed_tokens_cpu`, so it must run before `prepare_inputs` reads
+  // them, and it does — one line above the read it protects. Moving it past the
+  // launch is A2-5's, with that kernel; see the declaration.
+  apply_deferred_spec_decode_corrections();
 
   // Build the flattened dense-order step inputs (M1.5).
   StepInputs step = prepare_inputs(input_batch_, scheduler_output);
@@ -3500,6 +3551,12 @@ ModelRunnerOutput GPUModelRunner::sample_tokens_with_rejection(
   ModelRunnerOutput out;
   out.req_ids.reserve(static_cast<size_t>(num_reqs));
   out.sampled_token_ids.reserve(static_cast<size_t>(num_reqs));
+  // SPEC-DFLASH2 A2-4 (#3004): rebuilt per verify step, exactly like
+  // `prev_num_draft_len_`. Cleared HERE and not at the correction, because the
+  // correction runs at the START of the next step and a map that outlived its
+  // step would answer for a verify two steps old — the state `ProposedDraft
+  // Ledger` exists to make unrepresentable one seam over (prepare_inputs.h).
+  prev_valid_sampled_count_.clear();
   for (int i = 0; i < num_reqs; ++i) {
     const std::string& req_id = exec_state_.req_ids[static_cast<size_t>(i)];
     out.req_ids.push_back(req_id);
@@ -3578,6 +3635,15 @@ ModelRunnerOutput GPUModelRunner::sample_tokens_with_rejection(
     }
     const std::vector<int32_t>& toks = rs.sampled_token_ids[static_cast<size_t>(i)];
     out.sampled_token_ids.push_back(toks);
+    // SPEC-DFLASH2 A2-4 (#3004): `valid_sampled_token_count` for this row —
+    // how many tokens the accept walk emitted, which is upstream's
+    // `_get_valid_sampled_token_count()` (gpu_model_runner.py:1530 @ pin
+    // 5559679229). The NEXT step's deferred correction reads it, so it is keyed
+    // by req_id and not by slot: `condense` and `swap_states` move slots between
+    // the two steps. Written only for a row that ran the accept walk — a
+    // chunked-prefilling row `continue`s above and records nothing, which is
+    // what makes the correction's refusal on a missing entry meaningful.
+    prev_valid_sampled_count_[req_id] = static_cast<int>(toks.size());
 
     // Write-back: append every emitted token (accepted drafts + the bonus /
     // replacement) to slot i's token row, exactly as the non-spec path does for
@@ -3603,6 +3669,72 @@ ModelRunnerOutput GPUModelRunner::sample_tokens_with_rejection(
   return out;
 }
 
+// ─── SPEC-DFLASH2 A2-4 (#3004): apply_deferred_spec_decode_corrections ──────
+// See the header for what this replaces, where upstream calls it, and the one
+// host dependency it still carries.
+
+void GPUModelRunner::apply_deferred_spec_decode_corrections() {
+  if (deferred_spec_corrections_.empty()) return;
+  for (const DeferredSpecDecodeCorrection& c : deferred_spec_corrections_) {
+    const auto vit = prev_valid_sampled_count_.find(c.req_id);
+    // A request whose previous step scheduled drafts ran the accept walk, so it
+    // has a valid-sampled count. Refuse rather than skip: a skipped correction
+    // leaves an OPTIMISTIC position in `num_computed_tokens_cpu`, which
+    // re-attends the rejected drafts' positions and costs acceptance while
+    // emitting identical text — the class of defect no token gate here can see
+    // (#1366). A silent `continue` and a refusal are indistinguishable until
+    // something mutates them.
+    VT_CHECK(vit != prev_valid_sampled_count_.end() && vit->second >= 1,
+             "async spec deferred correction has no accept result for '" +
+                 c.req_id + "': its previous step scheduled " +
+                 std::to_string(c.optimistic_num_accepted) +
+                 " drafts and recorded no emitted-token count");
+    // num_accepted = valid_sampled_token_count - 1 (the trailing token is the
+    // bonus/replacement, not an accepted draft), and
+    // correction = optimistic_num_accepted - num_accepted, verbatim
+    // gpu_model_runner.py:1543-1546 @ pin 5559679229.
+    const int num_accepted = vit->second - 1;
+    const int correction = c.optimistic_num_accepted - num_accepted;
+    // The slot is the one the optimistic pass read, carried rather than looked
+    // up again. Upstream re-reads `req_id_to_index` here
+    // (gpu_model_runner.py:1547) because its closure runs after the model
+    // LAUNCH and after `condense()`; ours runs in the same step, between the
+    // splice and `prepare_inputs`, with no `condense` or `swap_states` in
+    // between, so a second lookup would return the same number and would add a
+    // second reading of a fact this step already established. When the call
+    // moves past the launch (A2-5), it moves back to the lookup.
+    const size_t s = static_cast<size_t>(c.req_index);
+    VT_CHECK(s < input_batch_.num_computed_tokens_cpu.size(),
+             "async spec deferred correction indexes outside the batch for '" +
+                 c.req_id + "'");
+    input_batch_.num_computed_tokens_cpu[s] -= correction;
+    // The next step's optimistic value extends the CORRECTED position, not the
+    // optimistic one the splice recorded a moment ago.
+    prev_num_computed_tokens_[c.req_id] = input_batch_.num_computed_tokens_cpu[s];
+
+    // THE CROSS-CHECK, and it is the reason this wave can replace W7's rule
+    // without moving a token. While the accept result is still host-visible in
+    // step, W7's structural value — the newest committed token's position,
+    // `num_tokens_no_spec - 1` — is computable right here, and the optimistic
+    // value minus this correction MUST equal it. It is an equality between two
+    // independent derivations of the same number, so it fires on an arithmetic
+    // slip in either half, and it is what makes the replacement checkable rather
+    // than argued. A2-5 removes the host-visible input this compares against; it
+    // does not remove the correction.
+    const int structural =
+        input_batch_.num_tokens_no_spec[s] - 1;
+    VT_CHECK(input_batch_.num_computed_tokens_cpu[s] == structural,
+             "async spec deferred correction disagrees with the structural "
+             "value for '" + c.req_id + "': corrected " +
+                 std::to_string(input_batch_.num_computed_tokens_cpu[s]) +
+                 ", structural " + std::to_string(structural) +
+                 " (optimistic accepted " +
+                 std::to_string(c.optimistic_num_accepted) + ", emitted " +
+                 std::to_string(vit->second) + ")");
+  }
+  deferred_spec_corrections_.clear();
+}
+
 // SPEC-MTP I5d: propose the next verify step's drafts after committing this
 // step's accepted tokens. The accept accounting lives in num_accepted_tokens
 // (num_sampled = accepted, seeded/overwritten there); num_rejected is derived.
@@ -3623,6 +3755,24 @@ void GPUModelRunner::propose_after_verify(int num_reqs) {
     num_sampled[static_cast<size_t>(i)] = acc;              // == accepted count
     num_rejected[static_cast<size_t>(i)] = k - (acc - 1);   // (1+k) - num_sampled
   }
+  propose_drafts(num_sampled, num_rejected);
+}
+
+// SPEC-MTP I5d: propose drafts after a plain (no-draft, e.g. FIRST) decode step
+// so the next step verifies them. Each generating row sampled exactly one token
+// (num_sampled=1, num_rejected=0); discarded prefill-chunk rows are skipped
+// inside propose_drafts.
+//
+// SPEC-DFLASH2 A2-4 (#2920) lifted this out of `sample_tokens` so
+// `sample_tokens_async`'s decode arm calls the SAME derivation rather than
+// writing a second copy of it — the shape A2-2 already established for
+// `propose_after_verify` above. Upstream needs neither, because its single
+// `if self.speculator is not None:` tail (gpu/model_runner.py:1524-1547 @ pin
+// 5559679229) runs after BOTH of `sample()`'s routes.
+void GPUModelRunner::propose_after_decode(int num_reqs) {
+  if (!spec_on()) return;
+  std::vector<int32_t> num_sampled(static_cast<size_t>(num_reqs), 1);
+  std::vector<int32_t> num_rejected(static_cast<size_t>(num_reqs), 0);
   propose_drafts(num_sampled, num_rejected);
 }
 
@@ -3985,15 +4135,12 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
     stage_upload(*dinp, dinp->last_sampled,
                  input_batch_.last_sampled_tokens.data(), num_reqs);
   }
-  // SPEC-MTP I5d: propose drafts after a plain (no-draft, e.g. first) decode step
-  // so the next step verifies them. Each generating row sampled exactly one token
-  // (num_sampled=1, num_rejected=0); discarded prefill-chunk rows are skipped
-  // inside propose_drafts. No-op unless a speculator is configured.
-  if (spec_on()) {
-    std::vector<int32_t> num_sampled(static_cast<size_t>(num_reqs), 1);
-    std::vector<int32_t> num_rejected(static_cast<size_t>(num_reqs), 0);
-    propose_drafts(num_sampled, num_rejected);
-  }
+  // SPEC-MTP I5d: propose drafts after a plain (no-draft, e.g. first) decode
+  // step so the next step verifies them. SPEC-DFLASH2 A2-4 (#2920) named the
+  // derivation `propose_after_decode` so `sample_tokens_async`'s decode arm
+  // applies it instead of writing it out a second time. No-op unless a
+  // speculator is configured.
+  propose_after_decode(num_reqs);
   return out;
 }
 
@@ -4961,6 +5108,30 @@ void GPUModelRunner::propose_drafts_block(
 }
 
 GPUModelRunner::~GPUModelRunner() {
+  // ─── SPEC-DFLASH2 A2-4 (#3004): THE DRAIN COMES FIRST ──────────────────────
+  //
+  // A2-3 put a drain in this destructor and scoped it to the mirror's buffers,
+  // and its own comment recorded that the copy queue and the two events were
+  // destroyed ABOVE it and therefore protected by nothing. That ordering smell
+  // was booked to this wave, and this is it: the drain is hoisted to the top, so
+  // everything the body releases below — the copy queue, the fork/ready pair,
+  // the mirror's device buffers — is released after the main queue is idle. The
+  // page-locked staging blocks are freed later still, by `~PinnedGrowStaging`
+  // running after this body, which is the order their retain rule needs.
+  //
+  // WHY IT IS NOT CONDITIONAL ON THE MIRROR. The queue and the events are used
+  // by the async COPY paths, which run whether or not the mirror is engaged
+  // (`DownloadCommittedIds` and the verify D2H both record `verify_fork_event_`
+  // on this queue), so gating the drain on `async_device_inputs_ != nullptr`
+  // would leave exactly the two objects the smell named unprotected. It costs
+  // one drain of an idle queue per runner destruction, at teardown, off every
+  // serving path — the same trade `RejectionSamplerDeviceOutput::Release` took.
+  //
+  // IT IS EXECUTED ON NEITHER TIER in the sense that matters: on the CPU build
+  // `vt::cpu::CpuBackend::Synchronize` is a no-op, so this line runs and proves
+  // nothing about CUDA. Stated here rather than implied, because the version
+  // this replaces read as coverage it did not have.
+  vt::GetBackend(queue_.device.type).Synchronize(queue_);
   // Release the lazily-created async-output copy queue (gpu_model_runner.py has
   // no explicit teardown; our vt::Queue owns a CUDA stream that must be freed).
   if (async_copy_queue_.id != 0) {
@@ -5006,12 +5177,13 @@ GPUModelRunner::~GPUModelRunner() {
     // path, `queue_` is the queue `stage_upload` and both combine launches use,
     // correctly scoped, no double drain, no deadlock.
     //
-    // PRE-EXISTING ORDERING SMELL, recorded and NOT repaired by this wave because
-    // it is not this repair's defect: `DestroyQueue(async_copy_queue_)` above and
-    // the two `DestroyEvent` calls above it run BEFORE this drain, so the drain
-    // protects the mirror's buffers and protects neither of them. Closing it
-    // needs the same GPU tier that would exercise the drain at all. It is filed
-    // under this row's spec `## Owed`.
+    // THE ORDERING SMELL A2-3 RECORDED HERE IS CLOSED (SPEC-DFLASH2 A2-4,
+    // #3004). `DestroyQueue(async_copy_queue_)` and the two `DestroyEvent` calls
+    // used to run BEFORE this drain, so the drain protected the mirror's buffers
+    // and neither of them. The drain now runs at the TOP of this destructor and
+    // covers all three; this call is kept because it is free on an already-idle
+    // queue and because deleting it would make the free below depend on a line
+    // thirty lines away for its safety.
     b.Synchronize(queue_);
     // `draft_tokens` and `cu_num_logits` are in the list because they are in the
     // struct; see the struct's declaration for why A2-4 must not move a free
@@ -5064,6 +5236,31 @@ int32_t* PinnedGrowStaging::Get(vt::Backend& backend, size_t elems) {
   blocks_.push_back(static_cast<int32_t*>(backend.AllocPinned(elems * sizeof(int32_t))));
   elems_ = elems;
   return blocks_.back();
+}
+
+// ─── DownloadCommittedIds (SPEC-DFLASH2 A2-4, #3004) ────────────────────────
+// See the header for why it is unconditional, and for the ownership contract.
+
+const int64_t* DownloadCommittedIds(vt::Backend& backend, vt::Queue& main_q,
+                                    vt::Queue& copy_q, vt::Event& fork,
+                                    vt::Event& ready, const void* dev_ids,
+                                    int num_reqs, PinnedGrowStaging& staging) {
+  if (num_reqs <= 0) return nullptr;
+  VT_CHECK(dev_ids != nullptr,
+           "DownloadCommittedIds: the step sampled " + std::to_string(num_reqs) +
+               " ids into no buffer");
+  // Two int32 elements per int64 id. `Get` returns a block at least this large
+  // and retains any block it grows past, so a copy already in flight into an
+  // older block is writing memory this object still owns.
+  const size_t elems = static_cast<size_t>(num_reqs) * 2;
+  int32_t* pinned = staging.Get(backend, elems);
+  backend.RecordEvent(fork, main_q);
+  backend.QueueWaitEvent(copy_q, fork);
+  backend.Copy(copy_q, pinned, dev_ids,
+               static_cast<size_t>(num_reqs) * sizeof(int64_t));
+  backend.RecordEvent(ready, copy_q);
+  backend.SynchronizeEvent(ready);
+  return reinterpret_cast<const int64_t*>(pinned);
 }
 
 void GPUModelRunner::ensure_verify_events() {
@@ -5394,6 +5591,26 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
   // scheduler's update_from_output when get_output() materializes).
   //
   skeleton.req_ids.reserve(static_cast<size_t>(num_reqs));
+
+  // SPEC-DFLASH2 A2-4 (#3004): WHERE THIS STEP'S COMMITTED IDS ENDED UP, AND
+  // WHY THE PROPOSE TAIL NO LONGER ASKS.
+  //
+  // The three write-back branches below differ in one way the propose tail used
+  // to care about: whether the ids this step committed are readable ON THE HOST
+  // when the tail runs. The host branch Synchronizes and writes
+  // `input_batch_.last_sampled_tokens` itself, so they are. Both CUDA branches
+  // scatter them with a kernel queued on the main queue and nothing waits it —
+  // the mirror branch deliberately leaves the host array's VALUES stale, and the
+  // UMA branch writes the host array from a kernel that has not run yet.
+  //
+  // #2920 asked the question with a `committed_ids_on_host` flag the branch set
+  // and the tail refused on. That refusal is what blocks A2-5: on GB10's
+  // integrated default the UMA branch runs and hits it. A2-4 DELETES THE
+  // QUESTION instead of answering it — the tail below downloads the ids itself,
+  // unconditionally and outside every branch, so no branch decides anything and
+  // a fourth one cannot forget to. The branches keep their write-backs (the
+  // mirror and the device array are what the NEXT step's combine reads); what
+  // they no longer own is the propose's view of them.
 #ifdef VLLM_CPP_CUDA
   // W4 device-resident scatter. Preferred whenever the mirror is engaged
   // (async_device_mirror(): CUDA + VT_ASYNC_DEVICE_MIRROR, INTEGRATED OR DISCRETE):
@@ -5474,6 +5691,60 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
           static_cast<int32_t>(ids[i]);
       input_batch_.num_tokens_no_spec[static_cast<size_t>(i)] += 1;
     }
+  }
+
+  // ─── SPEC-DFLASH2 A2-4 (#2920): PROPOSE AFTER A PLAIN DECODE STEP ──────────
+  //
+  // A2-2 gave this function a verify arm and put `propose_after_verify` inside
+  // it, so a step that DRAFTS proposed correctly and a step that did not
+  // proposed nothing at all. A speculative engine's FIRST step carries no
+  // drafts — there is no previous step to have proposed — so with the veto
+  // lifted that engine would sample, propose nothing, and every step after it
+  // would find nothing to verify: `pending_drafts_` stays empty, the async
+  // scheduler's `-1` placeholders have nothing to fill, and `FillDraftsForStep`
+  // refuses by name.
+  //
+  // Upstream cannot have this gap because it has ONE propose tail for both
+  // routes: `sample()` picks the sampler on `input_batch.num_draft_tokens == 0`
+  // (gpu/model_runner.py:1129 @ pin 5559679229) and the single
+  // `if self.speculator is not None:` at :1524-1547 proposes from whichever
+  // sampler ran. `propose_after_decode` is that tail's decode half, named once
+  // and applied here and in `sample_tokens`, so the two entry points cannot
+  // derive `num_sampled` / `num_rejected` differently. The ROUTE stays the one
+  // expression too: this is simply the fall-through of the
+  // `StepRoutesToVerify(...)` branch above, not a second reading of it.
+  if (spec_on()) {
+    // SPEC-DFLASH2 A2-4 (#3004): THE IDS, WHERE THEY LIVE. One download, on
+    // every write-back branch, on the copy queue, waited on its own event.
+    // #2920 asked which branch had left them host-readable and refused when the
+    // answer was "neither"; asking is what blocked A2-5, because on GB10's
+    // integrated default the answer is "neither" every step. There is no
+    // question left to answer here and therefore no refusal to remove later.
+    //
+    // The fork event is recorded on the MAIN queue at this point, so the copy is
+    // ordered after `sampler_.forward` AND after whichever write-back scatter
+    // ran; `dev_ids` is the sampler's own output buffer, which is what both
+    // scatters read. See `DownloadCommittedIds` (runner.h) for the ownership
+    // contract on the returned pointer.
+    ensure_verify_events();
+    const int64_t* committed = DownloadCommittedIds(
+        vt::GetBackend(dev.type), queue_, get_or_create_async_copy_queue(),
+        verify_fork_event_, verify_ready_event_, dev_ids, num_reqs,
+        committed_ids_staging_);
+    // THE HOST STATE EVERY PROPOSE ARM READS, written from that one array: the
+    // block drafters' `last_sampled_tokens` anchor and the token-row column
+    // `propose_drafts_ngram` matches over. #2920 restored only the second, from
+    // `last_sampled_tokens` — which is exactly the array the mirror branch
+    // leaves STALE, so that restore was correct only on the branch that did not
+    // need it. The rule is stated once in `prepare_inputs.h` over arrays, not
+    // looped here, because a per-request rule feeding a per-step route is how
+    // this row shipped a silent wrong answer (#2710).
+    ApplyCommittedIdsForPropose(committed, num_reqs, exec_state_.discard,
+                                input_batch_.num_tokens_no_spec,
+                                input_batch_.max_model_len,
+                                &input_batch_.last_sampled_tokens,
+                                &input_batch_.token_ids_cpu);
+    propose_after_decode(num_reqs);
   }
 
   // discard_request_mask (gpu_model_runner.py:3625-3628 -> outputs.py:303): the

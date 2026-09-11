@@ -485,7 +485,7 @@ reduction is not followed by a bias add that rounds the difference away.
 
 | Issue | Lever | State |
 |---|---|---|
-| [#1208](https://github.com/mudler/vllm.cpp/issues/1208) | this row | fixed by this row |
+| ISSUE-GH-1208 | this row | fixed by this row |
 
 * **The text tower runs on a hard-coded CPU queue** at
   `src/vllm/multimodal/ltx2_video.cpp:2085`, `:2799` and `:4479`, so `--device

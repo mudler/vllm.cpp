@@ -169,6 +169,59 @@ class SymbolAnchorTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("1 frozen files skipped", result.stdout)
 
+    def test_metadata_only_issue_history_is_skipped_but_full_issue_content_is_scanned(self):
+        metadata = (
+            f"ID: ISSUE-GH-{''}77\n"
+            "Title: stale `alpha/beta/a.cpp::Gadget`\n"
+            "Row: ROW-A\n"
+            "State: UNKNOWN\n"
+            "Kind: bug\n"
+            "GitHub: 77\n"
+            "Mirror: MISSING\n"
+            "Availability: METADATA_ONLY\n"
+            "Created: UNKNOWN\n"
+            "Updated: UNKNOWN\n"
+            "Closed: UNKNOWN\n\n"
+            "## Problem\n\n"
+            "### Frozen archive evidence\n\n"
+            "> stale `alpha/beta/a.cpp::Gadget`\n\n"
+            "## Resolution\n\n-\n"
+        )
+        authoritative = (
+            f"ID: ISSUE-GH-{''}78\n"
+            "Title: live `alpha/beta/a.cpp::Widget`\n"
+            "Row: ROW-A\n"
+            "State: OPEN\n"
+            "Kind: bug\n"
+            "GitHub: 78\n"
+            "Mirror: DIVERGED\n"
+            "Availability: FULL\n"
+            "Created: 2026-09-01\n"
+            "Updated: 2026-09-01\n"
+            "Closed: -\n\n"
+            "## Problem\n\nLive authority.\n\n"
+            "## Resolution\n\n-\n"
+        )
+        metadata_path = f".agents/issues/ROW-A/ISSUE-GH-{''}77.md"
+        authoritative_path = f".agents/issues/ROW-A/ISSUE-GH-{''}78.md"
+        with Tree(
+            "alpha/beta/a.cpp",
+            "struct Widget {};\n",
+            metadata,
+            citing_path=metadata_path,
+        ) as root:
+            target = root / authoritative_path
+            target.write_text(authoritative, encoding="utf-8")
+            init_repo(
+                root,
+                ["alpha/beta/a.cpp", metadata_path, authoritative_path],
+            )
+            result = run("--root", str(root))
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("1 frozen files skipped", result.stdout)
+        self.assertIn("1 citations", result.stdout)
+        self.assertIn("in-repo checked 1 (fresh 1, stale 0)", result.stdout)
+
     def test_prose_without_a_path_is_not_a_citation(self):
         with Tree("alpha/beta/a.cpp", "struct Widget {};\n",
                   "`Qwen3_5MTPKind::kMoe` and `alpha/beta/a.cpp::Widget`\n") as root:

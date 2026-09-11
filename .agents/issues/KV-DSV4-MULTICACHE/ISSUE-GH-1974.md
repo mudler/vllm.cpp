@@ -1,0 +1,23 @@
+ID: ISSUE-GH-1974
+Title: **`spec_equal`'s `default:` arm returns false for `kMlaAttention` and `kSlidingWindowMla`, so two identical MLA specs never merge into one `SpecGroup`.** Observed by W1 ([#1960](https://github.com/mudler/vllm.cpp/issues/1960)) from a read of the switch and correctly left alone unverified; verified and fixed in flow with W2 ([#1973](https://github.com/mudler/vllm.cpp/issues/1973)). `spec_equal` (`src/vllm/v1/core/kv_cache_coordinator.cpp:17-67`) is our port of the frozen-dataclass `__eq__` and carries arms for `kFullAttention`, `kSlidingWindow`, `kChunkedLocalAttention` and `kMamba` only; `HybridKVCacheCoordinator::verify_and_split_kv_cache_groups` (`:353-376`) uses it to batch groups sharing a spec. Upstream cannot answer `false` there: every spec class is `@dataclass(frozen=True, kw_only=True)` (`vllm/v1/kv_cache_interface.py:380-381`, `:610-611`), so `__eq__` is generated over all fields and two identical `MLAAttentionSpec`s are equal. **Latent rather than observed at runtime, and that is stated rather than implied:** the coordinator needs two groups, and every MLA model in the tree publishes exactly one MLA group (`deepseek_v2_registry.cpp`, `deepseek_v4_registry.cpp`, `glm4_moe_lite_registry.cpp`, `kimi_k3_registry.cpp`, `kimi_linear_registry.cpp`, `minicpm3_registry.cpp`, `dots3_note.cpp`), so the helper is never called on two of them today. It stops being latent with #1973, which publishes three `kMlaAttention` and four `kSlidingWindowMla` groups for DeepSeek-V4. The cost of a wrong `false` is a second `SpecGroup`, so `find_longest_cache_hit` runs per group instead of per distinct spec and the eagle-bit propagation (`:395-402`) is computed over a different partition than upstream's; a wrong `true` would be the dangerous direction, and this is the safe one, which is why it is a mirror divergence rather than a live miscompute. Fixed by adding both arms, comparing `FullAttentionSpec`'s / `SlidingWindowSpec`'s fields plus the four DeepSeek-V4 fields `cache_dtype_str`, `alignment`, `compress_ratio` and `model_version`; `default:` keeps returning `false` for the kinds with no ported struct
+Row: KV-DSV4-MULTICACHE
+State: UNKNOWN
+Kind: bug
+GitHub: 1974
+Mirror: MISSING
+Availability: METADATA_ONLY
+Created: UNKNOWN
+Updated: UNKNOWN
+Closed: UNKNOWN
+
+## Problem
+
+Archive: `.agents/completed/issue-index.md:789`
+
+### Frozen archive evidence
+
+> | [#1974](https://github.com/mudler/vllm.cpp/issues/1974) | `KV-DSV4-MULTICACHE` | **`spec_equal`'s `default:` arm returns false for `kMlaAttention` and `kSlidingWindowMla`, so two identical MLA specs never merge into one `SpecGroup`.** Observed by W1 ([#1960](https://github.com/mudler/vllm.cpp/issues/1960)) from a read of the switch and correctly left alone unverified; verified and fixed in flow with W2 ([#1973](https://github.com/mudler/vllm.cpp/issues/1973)). `spec_equal` (`src/vllm/v1/core/kv_cache_coordinator.cpp:17-67`) is our port of the frozen-dataclass `__eq__` and carries arms for `kFullAttention`, `kSlidingWindow`, `kChunkedLocalAttention` and `kMamba` only; `HybridKVCacheCoordinator::verify_and_split_kv_cache_groups` (`:353-376`) uses it to batch groups sharing a spec. Upstream cannot answer `false` there: every spec class is `@dataclass(frozen=True, kw_only=True)` (`vllm/v1/kv_cache_interface.py:380-381`, `:610-611`), so `__eq__` is generated over all fields and two identical `MLAAttentionSpec`s are equal. **Latent rather than observed at runtime, and that is stated rather than implied:** the coordinator needs two groups, and every MLA model in the tree publishes exactly one MLA group (`deepseek_v2_registry.cpp`, `deepseek_v4_registry.cpp`, `glm4_moe_lite_registry.cpp`, `kimi_k3_registry.cpp`, `kimi_linear_registry.cpp`, `minicpm3_registry.cpp`, `dots3_note.cpp`), so the helper is never called on two of them today. It stops being latent with #1973, which publishes three `kMlaAttention` and four `kSlidingWindowMla` groups for DeepSeek-V4. The cost of a wrong `false` is a second `SpecGroup`, so `find_longest_cache_hit` runs per group instead of per distinct spec and the eagle-bit propagation (`:395-402`) is computed over a different partition than upstream's; a wrong `true` would be the dangerous direction, and this is the safe one, which is why it is a mirror divergence rather than a live miscompute. Fixed by adding both arms, comparing `FullAttentionSpec`'s / `SlidingWindowSpec`'s fields plus the four DeepSeek-V4 fields `cache_dtype_str`, `alignment`, `compress_ratio` and `model_version`; `default:` keeps returning `false` for the kinds with no ported struct | bug |
+
+## Resolution
+
+-

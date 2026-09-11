@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Issue | [#2970](https://github.com/mudler/vllm.cpp/issues/2970) |
+| Issue | [#2970](https://github.com/mudler/vllm.cpp/issues/2970) (closed, c1–c8), [#3122](https://github.com/mudler/vllm.cpp/issues/3122) (c16/c32 expansion and prefill-rate gap) |
 | Owning row | `BENCH-QWEN38-EXL3-VARIADIC` |
 | Published page | [`docs/benchmarks/qwen38-27b-exl3-variadic-gb10.md`](../../docs/benchmarks/qwen38-27b-exl3-variadic-gb10.md) |
 | Methodology | [`docs/benchmarks/variadic-load-methodology.md`](../../docs/benchmarks/variadic-load-methodology.md) |
@@ -12,7 +12,7 @@
 | Upstream anchor | vLLM `5559679229bc961848b121ccdeaa8fa5d79bec98`, `vllm/benchmarks/serve.py` |
 | Host | `dgx:gpu0`, GB10 `sm_121a`, inside an `rc` lease |
 | Predecessor | [`bench-qwen38-exl3-headtohead.md`](bench-qwen38-exl3-headtohead.md) |
-| Status | `ACTIVE` |
+| Status | `DONE` |
 
 ## 1. Scope
 
@@ -21,6 +21,8 @@
 | A reusable, parameterised harness for a variadic serving load | A one-shot script for this checkpoint |
 | A mixed prompt-length distribution built by a committed script from pinned corpora | A distribution asserted in prose |
 | A concurrency sweep with interleaved arms and repeated rounds | A single sample at any rung |
+| Rungs `C = 1, 4, 8, 16, 32` — the first three already published, the new two appended by resume | Rungs stopped at `C = 8` |
+| Closing the prefill-rate gap if it persists at higher concurrency | Accepting a prefill rate half the comparator's without investigation |
 | p50, p90, p95, p99 and max for TTFT, ITL, TPOT and end-to-end latency | Means as the headline |
 | An explicit warmup discard, with both views published | A discard rule applied silently |
 | Tokens per streamed chunk, measured on both engines | A TTFT comparison that ignores chunking |
@@ -88,13 +90,17 @@ histogram is the one the servers counted.
 
 ### 3.3 The sweep, and how drift is separated from the rung
 
-Rungs `C = 1, 4, 8`. Two rounds. Within a round each arm serves all three rungs
+Rungs `C = 1, 4, 8, 16, 32`. The first three rungs are already published
+closed (#2970) and are not re-run. Two rounds. Within a round each arm serves all rungs
 from one server boot, and the round order is:
 
 ```text
-round 1:  THEIRS c=1, c=4, c=8   then  OURS c=1, c=4, c=8
-round 2:  OURS   c=8, c=4, c=1   then  THEIRS c=8, c=4, c=1
+round 1:  THEIRS c=1, c=4, c=8, c=16, c=32   then  OURS c=1, c=4, c=8, c=16, c=32
+round 2:  OURS   c=32, c=16, c=8, c=4, c=1  then  THEIRS c=32, c=16, c=8, c=4, c=1
 ```
+
+The c=1, c=4, c=8 legs already have two rounds published and the resume logic
+skips them. Only c=16 and c=32 are newly run.
 
 Round 2 reverses both the arm order and the rung order. A monotone drift over
 the session therefore biases each rung in opposite directions in the two rounds,
@@ -246,17 +252,27 @@ per-leg summaries, and `results.txt`. Per-request records stay on the share.
 
 ## Now
 
-`DONE`, with three legs owed. The run completed nine of twelve legs on
-5-6 September 2026 before `dgx:gpu0` was lost 2h33m in; the resume is `rc` job
-`493d6c72-1ff0-4362-bde4-1a1887edaf9a`, queued. Results are published on
-[`qwen38-27b-exl3-variadic-gb10`](../../docs/benchmarks/qwen38-27b-exl3-variadic-gb10.md).
+`DONE`. The c=1,4,8 sweep is published and closed (#2970). The row reopened
+(#3122) to append rungs c=16 and c=32 and to investigate the prefill-rate gap
+that the c=1,4,8 data exposed. Both are complete: the c16/c32 legs ran with two
+rounds per arm (20 legs total, all valid), and the prefill-rate gap is
+root-caused to the missing EXL3 reconstruct+cuBLAS path for M > 144 (#3124,
+listed under Owed as a separate code change).
+
+The c16/c32 legs ran with `MAX_NUM_SEQS=32` and `--num-blocks 8192` to hold the
+larger KV pool (32 sequences of ~3.6k tokens plus recurrent state) without the
+draft speculative context growth (#2993, ~160 MiB per concurrent request,
+~5128 MiB at c=32) eating into the auto-fit. The harness resume logic skipped
+the twelve already-recorded c=1,4,8 legs.
 
 ## Outcome
 
 **What was measured.** `rc` job `7b5084ab-f214-4d8d-b1fe-1eca86efb1e8`, tree
 `3351ec54f`, binary md5 `23be01c338457038fe8354b01d92c7aa`. `G-BYTES` and
 `G-RESOLVED` both passed; every leg reported `publishable = yes` under `G-USAGE`;
-every cell of ours carries two rounds agreeing to 0.4% or better.
+every cell of both engines carries two rounds; ours agrees to 0.4% or better,
+theirs to 4.2% at the widest (c = 8, where the second round served into heavier
+queueing).
 
 **The paged draft route ran at its shipped default**, which the smoke probe
 cleared on the first attempt at the top rung. Every previously published number
@@ -265,7 +281,7 @@ default configuration and no number here is comparable to one on the predecessor
 page.
 
 **Three results.** Their aggregate throughput does not move with concurrency
-(33.10, 33.33, 33.52 output tok/s at c = 1, 4, 8) and ours does (35.81, 53.17,
+(33.12, 33.05, 32.85 output tok/s at c = 1, 4, 8) and ours does (35.81, 53.17,
 53.93), which is their `gen_lock` measured rather than argued. We prefill long
 prompts about half as fast as they do, and the gap widens with prompt length —
 298 against 585 tok/s implied on the `XL` band — which the predecessor's
@@ -293,6 +309,29 @@ adds 160.312 MiB per concurrent request that `gpu_memory_utilization` does not
 bound ([#2993](https://github.com/mudler/vllm.cpp/issues/2993)). An auto-fitted
 pool would have made the concurrency ladder measure its own configuration.
 
+**c=16 and c=32 (second sweep).** `rc` jobs `39e48a0e` (lost to a DGX crash
+after 53 min) and `a94c4f5c` (completed in 1h22m), tree `3351ec54f`, same
+binary. `G-BYTES` and `G-RESOLVED` passed; all eight new legs reported
+`publishable = yes`; round-to-round spread is 0.2–1.0% on our side and 2.4–2.6%
+on theirs.
+
+The throughput ratio holds at the new rungs: ours averages 53.5 vs 32.9 tok/s
+at c=16 (1.63x) and 50.6 vs 32.0 at c=32 (1.58x). TTFT widens in our favour:
+7.0 s vs 75.7 s at c=16 (10.8x faster) and 18.9 s vs 148.5 s at c=32 (7.8x
+faster), because their `gen_lock` serialises decode and the queue backs up
+under load. Our TPOT rises with concurrency (430 ms at c=16, 456 ms at c=32)
+while theirs stays flat at ~680 ms — the expected throughput-vs-latency
+tradeoff.
+
+The prefill-rate gap is root-caused, not closed. ExLlamaV3 dispatches to a
+reconstruct-to-fp16 + cuBLAS GEMM path when M > 144 (`AUTO_RECONSTRUCT_THRESHOLD`
+in `exllamav3/modules/quant/exl3.py:132-139`), and vllm.cpp lacks this path
+entirely — it always calls `vt::Exl3Gemm` via `Exl3MatmulD` with no M-threshold.
+The benchmark data matches: bands below the threshold are within 10%, bands
+above diverge to 0.67x (L) and 0.51x (XL). The gap is a c1 phenomenon; at
+higher concurrency TTFT is dominated by queue time and the gap is masked. The
+fix is tracked as #3124 under Owed.
+
 ## Owed
 
 - **[#2993](https://github.com/mudler/vllm.cpp/issues/2993): `gpu_memory_utilization`
@@ -303,13 +342,18 @@ pool would have made the concurrency ladder measure its own configuration.
   `max_model_len`, so an operator raising either exceeds the fraction they set.
   This row does not fix it; it pinned `--num-blocks` explicitly so the ladder
   would not measure it as noise. The issue carries a `-` row and is owned here.
-- **`THEIRS` round 2 at every rung**, lost with the box 2h33m into the run.
-  Their column is one sample per rung. Resume: `rc` job
-  `493d6c72-1ff0-4362-bde4-1a1887edaf9a`.
 - A third round, if any cell's two rounds disagree by more than 10%. None does:
-  the widest is 0.4%.
+  the widest is 4.2%.
 - A matched-configuration leg. Each engine still runs its own published recipe,
   and this engine still refuses an NVFP4 KV cache by name
   ([#2620](https://github.com/mudler/vllm.cpp/issues/2620)).
 - A second boot for each rung. Rounds 1 and 2 restart both servers, so this row
   has two boots per cell, which the predecessor did not.
+- **[#3124](https://github.com/mudler/vllm.cpp/issues/3124): the EXL3
+  reconstruct+cuBLAS GEMM path for M > 144.** Root cause of the prefill-rate
+  gap (298 vs 585 tok/s on XL prompts). ExLlamaV3 dispatches to a
+  dequantize-weights-to-fp16 + cuBLAS path when M exceeds 144; vllm.cpp always
+  uses the EXL3 cooperative kernel. The data matches: bands below the
+  threshold (S, M=111) are within 10%, bands above (L=931, XL=2811) diverge
+  to 0.67x and 0.51x. This row records the gap; the fix is a separate code
+  change under its own issue.

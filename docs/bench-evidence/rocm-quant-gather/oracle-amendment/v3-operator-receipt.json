@@ -1,0 +1,139 @@
+{
+  "command": {
+    "row": "BACKEND-ROCM-QUANT-GATHER",
+    "argv": [
+      "docker",
+      "run",
+      "--rm",
+      "--device=/dev/kfd",
+      "--device=/dev/dri",
+      "--pull=never",
+      "--network=none",
+      "--ipc=private",
+      "--shm-size=2g",
+      "--user",
+      "1000:1000",
+      "--group-add",
+      "44",
+      "--group-add",
+      "992",
+      "--entrypoint",
+      "/home/vikash/oracle/gfx1100-active-2773/runtime/bin/python",
+      "-v",
+      "/home/vikash/oracle/gfx1100-active-2773:/home/vikash/oracle/gfx1100-active-2773:ro",
+      "-v",
+      "/home/vikash/.cache/rdna3-gather-impl:/home/vikash/.cache/rdna3-gather-impl",
+      "-e",
+      "PYTHONDONTWRITEBYTECODE=1",
+      "-e",
+      "PYTHONPATH=/home/vikash/.cache/rdna3-gather-impl/plugin-artifact:/home/vikash/.cache/rdna3-gather-impl/llama-stock-source/gguf-py",
+      "-e",
+      "HIP_VISIBLE_DEVICES=0",
+      "-e",
+      "ROCR_VISIBLE_DEVICES=0",
+      "-e",
+      "USER=vikash",
+      "-e",
+      "LOGNAME=vikash",
+      "-e",
+      "TMPDIR=/home/vikash/.cache/rdna3-gather-impl/tmp",
+      "-e",
+      "XDG_CACHE_HOME=/home/vikash/.cache/rdna3-gather-impl/plugin-cache",
+      "-v",
+      "/home/vikash/vllm.cpp-rdna3-gather-impl:/home/vikash/vllm.cpp-rdna3-gather-impl:ro",
+      "-e",
+      "PYTHONUNBUFFERED=1",
+      "-e",
+      "HF_HUB_OFFLINE=1",
+      "-e",
+      "TRANSFORMERS_OFFLINE=1",
+      "-e",
+      "VLLM_NO_USAGE_STATS=1",
+      "--name",
+      "rdna3-gather-primary-model-v3",
+      "-e",
+      "TRITON_CACHE_DIR=/home/vikash/.cache/rdna3-gather-impl/primary-model-v3/cache/triton",
+      "-e",
+      "VLLM_CACHE_ROOT=/home/vikash/.cache/rdna3-gather-impl/primary-model-v3/cache/vllm",
+      "-e",
+      "TORCHINDUCTOR_CACHE_DIR=/home/vikash/.cache/rdna3-gather-impl/primary-model-v3/cache/inductor",
+      "-e",
+      "HF_HOME=/home/vikash/.cache/rdna3-gather-impl/primary-model-v3/cache/hf",
+      "-e",
+      "NUMBA_CACHE_DIR=/home/vikash/.cache/rdna3-gather-impl/primary-model-v3/cache/numba",
+      "-e",
+      "MAX_JOBS=4",
+      "-e",
+      "TORCHINDUCTOR_COMPILE_THREADS=4",
+      "sha256:80aab4c182a1f3eeebe286173977e57fcaf10a049b41f475655b35d285de31dc",
+      "/home/vikash/.cache/rdna3-gather-impl/primary-model-v3/primary_model.py",
+      "/home/vikash/.cache/rdna3-gather-impl/primary-model-v1/model/Q4_0.gguf",
+      "/home/vikash/.cache/rdna3-gather-impl/primary-model-v1/model",
+      "/home/vikash/.cache/rdna3-gather-impl/primary-model-v3/report-p0-r0.json",
+      "--prompt-index",
+      "0",
+      "--repeat",
+      "0"
+    ],
+    "env": {},
+    "cwd": "/home/vikash/.cache/rdna3-gather-impl/primary-model-v3",
+    "log": "/home/vikash/.cache/rdna3-gather-impl/primary-model-v3/primary-model-p0-r0.log",
+    "files": {
+      "/home/vikash/.cache/rdna3-gather-impl/primary-model-v1/model/config.json": {
+        "bytes": 974,
+        "sha256": "919812c5a2a3cfae586873cc965f0f4b33179a7ca96b8d8b1afcdac88afca71e"
+      },
+      "/home/vikash/.cache/rdna3-gather-impl/primary-model-v1/model/Q4_0.gguf": {
+        "bytes": 944192,
+        "sha256": "663597e28852d64097f7a67542675e4575ee158d3c5e6e2143aadd1b4188f4af"
+      },
+      "/home/vikash/.cache/rdna3-gather-impl/plugin-artifact/vllm_gguf_plugin/_C_gguf.abi3.so": {
+        "bytes": 5175208,
+        "sha256": "592af79c210496e96eaa7bd409ae0a67e7de8c334aa9f782082c7639ba300138"
+      },
+      "/home/vikash/.cache/rdna3-gather-impl/evidence/plugin-artifact-sha256.json": {
+        "bytes": 16561,
+        "sha256": "b4def029f9693f89654fa2c60433c9a82dd9924909bced7b772ec609e648f5bf"
+      },
+      "/home/vikash/.cache/rdna3-gather-impl/primary-model-v3/primary.py": {
+        "bytes": 7227,
+        "sha256": "1ddd29da328db6817b5b15119c228cad55b1f2d4e5acc143c80d70966a5c2d75"
+      },
+      "/home/vikash/.cache/rdna3-gather-impl/primary-model-v3/primary_model.py": {
+        "bytes": 4294,
+        "sha256": "8fd8433d8b8ce41a490af00e9cb58c96ba5a199f250182ab2ed6255a818c7c23"
+      }
+    },
+    "fixture": {
+      "origin": "Frozen generated fixture from public native gate",
+      "gguf_sha256": "663597e28852d64097f7a67542675e4575ee158d3c5e6e2143aadd1b4188f4af",
+      "table": "Q4_0",
+      "geometry": "one full-attention layer, H256,4Q/1KV heads,D64,I256,V128"
+    },
+    "config_adaptation": "The unchanged HF text config and GGUF feed pinned Qwen3_5ForCausalLM through the public model_class_overrides argument. The plugin retains its architecture key and unmodified weight adapter. No vision metadata or weights are added.",
+    "authority": "Root only under GPU0 mutex; no oracle patch, pin change or eager override",
+    "acceptance": "This is first requestedp0r0. A load/refusal keeps model gatePENDING. On success compare exacttokens and schedule remaining5 fresh-engine requests.",
+    "version_reason": "v2 reached the renderer but the plugin maps qwen3_5_text to the multimodal architecture. v3 maps that key to the pinned registered text class in every process, using the upstream development/debug configuration option without source edits.",
+    "preparation": {
+      "baseline": {
+        "bytes": 4684,
+        "sha256": "d5a75fbbaa7bb03ca345b3ab66fd7d422ab6a497429851f82918c1d48fbb85e3"
+      },
+      "original_driver": {
+        "bytes": 3998,
+        "sha256": "a8bd0a4c815fb0df6934f69b15bf54179c5204630e617a3cd000bda5100aed2b"
+      },
+      "changes": [
+        "model_class_overrides argument selecting pinned text class",
+        "report harness_adaptations records selection"
+      ],
+      "validation": "AST parse, all retained input hashes, and original driver preservation passed; no GPU execution"
+    }
+  },
+  "exit_code": 1,
+  "seconds": 28.064705149037763,
+  "log": "/home/vikash/.cache/rdna3-gather-impl/primary-model-v3/operator-run.log",
+  "log_sha256": "c86ac57fd7e6aeb51f8035430bb67cc9bf2e46981c9d55e71993a1fc2a3cc44f",
+  "verified_inputs_before_after": 2500,
+  "input_audit_sha256": "27b8734aedc5be3e0be4432b92907f3f967557bf8281763f302468690559ef9b"
+}

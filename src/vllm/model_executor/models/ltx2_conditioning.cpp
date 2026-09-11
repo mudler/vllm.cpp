@@ -9,6 +9,8 @@
 // (tools.py:158-176, keyframe_cond.py:57-65), so this one is not a widening.
 #include "vllm/model_executor/models/ltx2_conditioning.h"
 
+#include "vllm/model_executor/models/ltx2_iclora_reference.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <string>
@@ -74,6 +76,27 @@ void AppendTokens(Ltx2LatentState* state, const std::vector<float>& tokens, int6
   // term to the wrong tokens.
   Ltx2ExtendKeyframesMask(state, token_count, /*marked=*/false);
 
+  // AND THE ATTENTION MASK, for the same reason and from the same pre-append
+  // state. Every appending item upstream calls `update_attention_mask` with a
+  // literal `attention_mask=None` (keyframe_cond.py:68-76,
+  // reference_video_cond.py:86-94), which returns None when the state carries no
+  // mask and otherwise pads the new tokens with FULL attention
+  // (mask_utils.py:141-156). Row LTX25-IC-LORA-REF-VIDEO (#3020) is what made
+  // the second branch reachable: before it no state could carry a mask at all.
+  //
+  // A stale mask is NOT a shape error downstream. `Ltx2ModalityInput` accepts
+  // both the dense [tokens, tokens] form and the key-only [1, tokens] broadcast,
+  // so a mask left at its pre-append size is read as a legal mask over a
+  // different axis, and the render comes out the right size with a trained term
+  // applied to the wrong tokens.
+  if (!state->attention_mask.empty()) {
+    VT_CHECK(state->noisy_tokens > 0,
+             "ltx2 conditioning: a state carrying an attention mask must know its own noisy-token "
+             "count, which is `latent_tools.target_shape.token_count()` upstream");
+    state->attention_mask = Ltx2PadAttentionMaskForUnmaskedTokens(
+        state->attention_mask, state->noisy_tokens, token_count, before);
+  }
+
   state->latent.resize(static_cast<size_t>(after * state->width), 0.0f);
   state->clean.insert(state->clean.end(), tokens.begin(), tokens.end());
   state->mask.insert(state->mask.end(), static_cast<size_t>(token_count),
@@ -126,6 +149,13 @@ Ltx2LatentState Ltx2CreateVideoLatentState(const Ltx2VideoLatentShape& shape, in
   if (out_keyframes_mask != nullptr) {
     *out_keyframes_mask = state.keyframes_mask;
   }
+  // `latent_tools.target_shape.token_count()` — what an appending item hands
+  // `update_attention_mask` as `num_noisy_tokens`. Recorded HERE, at the one
+  // moment it is knowable without searching: after the first append `tokens` is
+  // no longer it, and the rows between the two are prior REFERENCE tokens whose
+  // block in the mask differs from the noisy one (mask_utils.py:236 vs :242).
+  state.noisy_tokens = state.tokens;
+
   return state;
 }
 
@@ -487,6 +517,13 @@ Ltx2LatentState Ltx2CreateAudioLatentState(const Ltx2AudioLatentShape& shape,
   // The audio positions ARE the patch grid bounds, in seconds — there is no
   // get_pixel_coords and no fps division on this side (tools.py:271-279).
   state.positions = Ltx2AudioPatchTimings(shape, params);
+  // `latent_tools.target_shape.token_count()` — what an appending item hands
+  // `update_attention_mask` as `num_noisy_tokens`. Recorded HERE, at the one
+  // moment it is knowable without searching: after the first append `tokens` is
+  // no longer it, and the rows between the two are prior REFERENCE tokens whose
+  // block in the mask differs from the noisy one (mask_utils.py:236 vs :242).
+  state.noisy_tokens = state.tokens;
+
   return state;
 }
 

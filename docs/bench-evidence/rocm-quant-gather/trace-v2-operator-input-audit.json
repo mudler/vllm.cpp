@@ -1,0 +1,40 @@
+{
+  "manifest_sha256": "8bc6f8b8ced9848eb5dd575d5f77972778568b163548f586552d1233a8f37087",
+  "verified_input_count": 335,
+  "archived_sources": [
+    {
+      "path": "src/vt/rocm/rocm_embedding_quant.h",
+      "sha256": "1b2b31617d660b64f622e692089423ce1657df102322558a4ab731f521952bc5"
+    },
+    {
+      "path": "src/vt/rocm/rocm_embedding_quant.hip",
+      "sha256": "d3989353ece6a0c09e1f68ac16c5dbe8c949cd32c3831f41d4c2af835a3512e5"
+    },
+    {
+      "path": "src/vt/rocm/rocm_quant_dequant.h",
+      "sha256": "a00ad5d98ae63fbb37683c1e26aa5494ca48a95f10c98bb817b6e780de481546"
+    },
+    {
+      "path": "src/vt/rocm/rocm_quant_iq_tables.h",
+      "sha256": "d267d25ff1dd3f67749c251f87047f4b70c9650a99d04b524ff6c3313596a349"
+    },
+    {
+      "path": "src/vt/rocm/rocm_ops.hip",
+      "sha256": "650a7d033b3ce3fc7a6c9a2e6bcfa80963c172ad5ef58421e2956892aac80935"
+    },
+    {
+      "path": "tools/rocm_quant_gather/capture.cpp",
+      "sha256": "647167efc6da3e89157d888f7febd2a69ed1e8781fa0cd3c2439d99154d79b81"
+    },
+    {
+      "path": "tools/rocm_quant_gather/primary.py",
+      "sha256": "1ddd29da328db6817b5b15119c228cad55b1f2d4e5acc143c80d70966a5c2d75"
+    },
+    {
+      "path": "tools/rocm_quant_gather/primary_trace.py",
+      "sha256": "dfd4c7068ea117c89ae894d5cd0dadc5946b32476373c64684687f0c46cf6437"
+    }
+  ],
+  "profiler_contains_no_gpu_runtime": true,
+  "gpu_mutex": "/home/vikash/gpu.lock"
+}

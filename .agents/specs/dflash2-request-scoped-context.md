@@ -395,7 +395,7 @@ each result contradicts, and this row claims only that concurrency **works**.
   recurrent state allocated from two pools, which is why c=32 at k=8 is
   unservable. Interacts with the ladder above and is deliberately not widened
   into.
-- [**#2009**](https://github.com/mudler/vllm.cpp/issues/2009) — **the position
+- **ISSUE-GH-2009** — **the position
   invariant at `runner.cpp:2939-2945` is itself ungated.**
   Deleting it (mutation B′ above) leaves this row's own gate green, and this row
   does not close that. It is the guard the whole draft-context accumulation rests

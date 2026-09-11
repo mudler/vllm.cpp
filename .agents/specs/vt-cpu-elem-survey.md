@@ -599,7 +599,7 @@ measurement says take it, with `GdnDecodeKernel` excluded or accepted explicitly
   `CausalConv1dUpdateKernel` 33.01. `RmsNormGroupKernel` is the cheapest of them
   to take next: it is deliberately shaped as `RmsNormKernel` with the reduction
   extent narrowed, so the same helpers and the same gate structure apply.
-  Owner: unowned; #2416 stays open against this item.
+  Owner: unowned; ISSUE-GH-2416 stays open against this item.
 - **THE 13 UNMEASURED ENCLOSING FUNCTIONS.** `Mamba2ChunkScanKernel`,
   `GdnPackedDecodeKernel`, `GdnSpecDecodeKernel`, `KdaChunkPrefillKernel`,
   `DFlashPagedBlockAttentionKernel`, `Dflash2SelectorEdgesKernel`,

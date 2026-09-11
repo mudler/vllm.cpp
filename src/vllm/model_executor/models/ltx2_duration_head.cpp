@@ -32,10 +32,113 @@ void Require(bool condition, const std::string& message) {
   if (!condition) Refuse(message);
 }
 
+// ─── THE bf16 ARM (A24 wave 6, row LTX25-A24-DURATION-HEAD-BF16, #2955) ─────
+//
+// Upstream resolves ONE pipeline dtype and it is bfloat16 (distilled.py:109),
+// handed to `DurationPredictor.from_checkpoint` at :163-165. All fifteen of the
+// head's tensors narrow under `.to(dtype)`, so upstream's head is a bf16 module
+// and every store point in its forward rounds. Before this row the head read
+// every tensor through `Ltx2VaeWeights::Get`, which refuses a bf16 bag BY NAME,
+// so a head loaded at `kBF16` could not be run at all.
+//
+// EACH RULE BELOW WAS MEASURED BY EXECUTING THE PINNED MODULE, never read off
+// it, with the REJECTED hypothesis beside upstream's answer; the counts are in
+// `.agents/specs/ltx25-a24-duration-head-bf16.md` §3.1. The f64 accumulation
+// this file already uses is SAFE on this arm and that is the opposite polarity
+// from its f32 arm: at a bf16 store the f32-vs-f64 reduction difference sits far
+// below one ulp, measured bit-equal in 0 of 4096 at the widest shipped shape.
+// `GeluTanh`'s f64 pointwise expression is likewise bit-equal at bf16 in 0 of
+// 200, so this row neither narrows it nor needs to — it stays visible debt on
+// the f32 arm.
+
+// One value, narrowed the way `.to(torch.bfloat16)` does. `vt::F32ToBF16` is the
+// tree's own converter and is already round-to-nearest, ties to EVEN; the
+// connector's arm goes through the same pair (ltx2_connector.cpp:47-55).
+inline float NarrowOne(float v) { return vt::BF16ToF32(vt::F32ToBF16(v)); }
+
+// A STORE POINT, applied at exactly the sites §3.1 measured one and NOWHERE
+// else, because a narrowing upstream does not do is the same class of defect as
+// one it does.
+//
+// `widths` then counts what is left standing that could NOT have come out of a
+// bf16 store. Counting AFTER the narrowing rather than before is the whole
+// design: a pre-narrow count is non-zero on both arms and measures the fixture,
+// while a post-store count is 0 on this arm and essentially the whole buffer on
+// the f32 one, which makes the arm choice observable from outside the head.
+void StoreAt(vt::DType dtype, float* p, size_t count, Ltx2DurationWidthCounts* widths) {
+  if (dtype == vt::DType::kBF16) {
+    for (size_t i = 0; i < count; ++i) p[i] = NarrowOne(p[i]);
+  }
+  if (widths == nullptr) return;
+  widths->values += static_cast<int64_t>(count);
+  for (size_t i = 0; i < count; ++i) {
+    if (p[i] != NarrowOne(p[i])) ++widths->not_bf16;
+  }
+}
+
+// THE MODULE BOUNDARY, which is the caller's cast upstream and not a store point
+// of the forward's. Upstream's pipeline holds bf16 tensors throughout
+// (distilled.py:109) so the head is handed bf16 activations; this port's
+// conditioning buffers are f32 CONTAINERS whichever arm filled them, so a head
+// that did not narrow on entry would compute narrow weights against wide
+// activations, which is neither arm. Uncounted on purpose: these values are the
+// caller's data, not the head's product.
+std::vector<float> NarrowedInput(vt::DType dtype, const float* in, size_t count) {
+  std::vector<float> copy(in, in + count);
+  StoreAt(dtype, copy.data(), copy.size(), nullptr);
+  return copy;
+}
+
+// The bag carries exactly ONE arm and `Get` refuses the other by name, so this
+// resolves a tensor against whichever arm is populated — the same problem the
+// connector solved against the same bag with `RegisterAt`
+// (ltx2_connector.cpp:179-188). Widening a bf16 word is EXACT, so the resolved
+// values are upstream's narrowed parameters and not a re-rounding of them.
+class WeightRef {
+ public:
+  WeightRef(const Ltx2VaeWeights& weights, const std::string& name) {
+    if (weights.dtype == vt::DType::kBF16) {
+      const std::vector<uint16_t>& bits = weights.GetBf16(name);
+      owned_.resize(bits.size());
+      for (size_t i = 0; i < bits.size(); ++i) owned_[i] = vt::BF16ToF32(bits[i]);
+      view_ = &owned_;
+    } else {
+      view_ = &weights.Get(name);
+    }
+  }
+  WeightRef(const WeightRef&) = delete;
+  WeightRef& operator=(const WeightRef&) = delete;
+  const std::vector<float>& operator*() const { return *view_; }
+
+ private:
+  std::vector<float> owned_;
+  const std::vector<float>* view_ = nullptr;
+};
+
+// A THIRD WIDTH REFUSES BY NAME, on a token no other site in this tree emits.
+// Wave 4 of this gap established that asserting a SHARED refusal string gates a
+// different site than the one under test, so this one is unique to the head's
+// compute path. `Ltx2LoadDurationHeadWeights` makes the same check at LOAD; this
+// is what stops a bag hand-built at another width from being computed on.
+void RequireImplementedArm(vt::DType dtype) {
+  Require(dtype == vt::DType::kF32 || dtype == vt::DType::kBF16,
+          "ltx2 duration head: LTX2_DURATION_HEAD_ARM_UNIMPLEMENTED -- this head computes on "
+          "the f32 parity arm or on bf16, upstream's own model dtype (distilled.py:109). The "
+          "FP8 and NVFP4 arms are gap A22 and are owed by name in "
+          ".agents/specs/ltx25-a24-duration-head-bf16.md");
+}
+
 // `torch.nn.Linear`: out = in @ weight^T + bias, with `weight` [out, in].
+//
+// R1, AND ITS OBVIOUS WRONG SPELLING. Upstream's bf16 `F.linear` is bit-exactly
+// `bf16(f32(a) @ f32(w)^T + f32(b))`: the bias is added at the ACCUMULATOR's
+// width and there is exactly ONE rounding, on the store. Rounding the GEMM and
+// then adding the bias in bf16 type-checks identically and disagrees in a
+// quarter of all outputs (1024 of 4096 at the shipped width).
 std::vector<float> Linear(vt::Queue& q, const float* in, int64_t rows, int64_t in_features,
                           const std::vector<float>& weight, const std::vector<float>& bias,
-                          int64_t out_features) {
+                          int64_t out_features, vt::DType dtype,
+                          Ltx2DurationWidthCounts* widths) {
   Require(weight.size() == static_cast<size_t>(out_features * in_features),
           "ltx2 duration head: linear weight has the wrong element count");
   std::vector<float> out(static_cast<size_t>(rows * out_features));
@@ -51,6 +154,7 @@ std::vector<float> Linear(vt::Queue& q, const float* in, int64_t rows, int64_t i
       out[static_cast<size_t>(r * out_features + i)] += bias[static_cast<size_t>(i)];
     }
   }
+  StoreAt(dtype, out.data(), out.size(), widths);
   return out;
 }
 
@@ -102,8 +206,10 @@ std::vector<Ltx2DurationHeadTensorSpec> EnumerateLtx2DurationHeadTensors(
 
 std::vector<float> Ltx2DurationAttentionPool(const Ltx2DurationHeadConfig& config,
                                              const Ltx2VaeWeights& weights, const float* tokens,
-                                             int64_t batch, int64_t token_count) {
+                                             int64_t batch, int64_t token_count,
+                                             Ltx2DurationWidthCounts* widths) {
   Require(tokens != nullptr, "ltx2 duration pooler: `tokens` is required");
+  RequireImplementedArm(weights.dtype);
   const int64_t hidden = config.pooler_hidden_dim;
   const int64_t heads = config.num_pooler_heads;
   Require(hidden % heads == 0,
@@ -114,8 +220,25 @@ std::vector<float> Ltx2DurationAttentionPool(const Ltx2DurationHeadConfig& confi
   const std::string p = config.prefix + "attention_pooler.";
 
   vt::Queue q{vt::Device{}, nullptr};
-  const std::vector<float>& in_proj_weight = weights.Get(p + "cross_attn.in_proj_weight");
-  const std::vector<float>& in_proj_bias = weights.Get(p + "cross_attn.in_proj_bias");
+  const vt::DType arm = weights.dtype;
+  // NO NARROWING OF `tokens` HERE, AND THAT IS A MUTATION FINDING RATHER THAN AN
+  // OMISSION. `AttentionPooler` is a SUBMODULE: upstream hands it whatever the
+  // enclosing forward stored, and `torch.cat` of two bf16 tensors is bf16
+  // because the projections stored bf16 -- not because the pooler re-narrowed.
+  // An entry narrowing here stood for one round and it MASKED R2 exactly: with
+  // the rounding after the modality-embedding add deleted, this call re-rounded
+  // the same values and the whole suite stayed green, 5051 of 5051. A narrowing
+  // upstream does not do is the same class of defect as one it does, and this is
+  // what that costs when it lands on top of a real store point.
+  //
+  // The contract that replaces it: on the bf16 arm `tokens` are the caller's
+  // STORED activations and are already bf16-representable, which
+  // `Ltx2DurationPredict` guarantees by storing at the projection and again
+  // after the embedding add.
+  const WeightRef in_proj_weight_ref(weights, p + "cross_attn.in_proj_weight");
+  const WeightRef in_proj_bias_ref(weights, p + "cross_attn.in_proj_bias");
+  const std::vector<float>& in_proj_weight = *in_proj_weight_ref;
+  const std::vector<float>& in_proj_bias = *in_proj_bias_ref;
   Require(in_proj_weight.size() == static_cast<size_t>(3 * hidden * hidden),
           "ltx2 duration pooler: in_proj_weight must be [3 * E, E]");
 
@@ -133,7 +256,15 @@ std::vector<float> Ltx2DurationAttentionPool(const Ltx2DurationHeadConfig& confi
   };
 
   // The learnable queries, broadcast across the batch (duration_head.py:47).
-  const std::vector<float>& query_tokens = weights.Get(p + "query_tokens");
+  //
+  // THE ONE NARROWING HERE THAT NO VALUE GATE CAN SEE. `query_tokens` genuinely
+  // narrows -- 256 of 256 entries move under `.to(bfloat16)`, and the goldens
+  // carry that count as the control that the probe is not blind -- but holding it
+  // at f32 instead separates in 0 of 93 bit-exact pooler fixtures, because the
+  // difference is absorbed by the rounding of its own projection. It is gated by
+  // a COUNT and the value gate for it is owed by name in the row's spec.
+  const WeightRef query_tokens_ref(weights, p + "query_tokens");
+  const std::vector<float>& query_tokens = *query_tokens_ref;
   std::vector<float> expanded(static_cast<size_t>(batch * queries * hidden));
   for (int64_t b = 0; b < batch; ++b) {
     std::copy(query_tokens.begin(), query_tokens.end(),
@@ -148,9 +279,11 @@ std::vector<float> Ltx2DurationAttentionPool(const Ltx2DurationHeadConfig& confi
   const std::vector<float> vb = slice_bias(2);
 
   std::vector<float> qp =
-      Linear(q, expanded.data(), batch * queries, hidden, qw, qb, hidden);
-  std::vector<float> kp = Linear(q, tokens, batch * token_count, hidden, kw, kb, hidden);
-  std::vector<float> vp = Linear(q, tokens, batch * token_count, hidden, vw, vb, hidden);
+      Linear(q, expanded.data(), batch * queries, hidden, qw, qb, hidden, arm, widths);
+  std::vector<float> kp =
+      Linear(q, tokens, batch * token_count, hidden, kw, kb, hidden, arm, widths);
+  std::vector<float> vp =
+      Linear(q, tokens, batch * token_count, hidden, vw, vb, hidden, arm, widths);
 
   std::vector<float> attn(static_cast<size_t>(batch * queries * hidden));
   // torch SDPA's default scale is `E ** -0.5` with E = head_dim.
@@ -169,39 +302,75 @@ std::vector<float> Ltx2DurationAttentionPool(const Ltx2DurationHeadConfig& confi
     // position with a register and zeroed its mask (duration_head.py:15-16).
     vt::AttentionCross(q, to, tq, tk, tv, nullptr, args);
   }
+  // R5. The POOLED result is what upstream stores, and the scores and the
+  // softmax stay at the accumulator's width. Narrowing those instead separates in
+  // 3 of the 9 emitted fixtures, and it is the plausible wrong rule: torch's own
+  // bf16 attention core does not reproduce from an f32-accumulate reference at
+  // all (oneDNN routes it differently -- 18 of 32 elements), so the port keeps
+  // the core at f32 on narrowed inputs and rounds the result, which is the
+  // closest reachable mirror. The gate covers only the fixtures where that chain
+  // is bit-exact; §3.2 N2 of the row's spec bounds it rather than hiding it.
+  StoreAt(arm, attn.data(), attn.size(), widths);
 
-  return Linear(q, attn.data(), batch * queries, hidden,
-                weights.Get(p + "cross_attn.out_proj.weight"),
-                weights.Get(p + "cross_attn.out_proj.bias"), hidden);
+  const WeightRef out_proj_weight(weights, p + "cross_attn.out_proj.weight");
+  const WeightRef out_proj_bias(weights, p + "cross_attn.out_proj.bias");
+  return Linear(q, attn.data(), batch * queries, hidden, *out_proj_weight, *out_proj_bias, hidden,
+                arm, widths);
 }
 
 std::vector<float> Ltx2DurationPredict(const Ltx2DurationHeadConfig& config,
                                        const Ltx2VaeWeights& weights, const float* video_tokens,
                                        int64_t video_token_count, const float* audio_tokens,
-                                       int64_t audio_token_count, int64_t batch) {
+                                       int64_t audio_token_count, int64_t batch,
+                                       Ltx2DurationWidthCounts* widths) {
   // duration_head.py:104-105 — upstream's own ValueError.
   Require(video_tokens != nullptr || audio_tokens != nullptr,
           "ltx2 duration head: forward requires at least one of video_tokens / audio_tokens");
+  RequireImplementedArm(weights.dtype);
 
   const std::string p = config.prefix;
   const int64_t hidden = config.pooler_hidden_dim;
+  const vt::DType arm = weights.dtype;
   vt::Queue q{vt::Device{}, nullptr};
+
+  // The module boundary; see `NarrowedInput`. Held for the whole call because
+  // the projections read through these pointers.
+  std::vector<float> narrowed_video;
+  std::vector<float> narrowed_audio;
+  if (video_tokens != nullptr) {
+    narrowed_video = NarrowedInput(
+        arm, video_tokens,
+        static_cast<size_t>(batch * video_token_count * config.video_cross_attention_dim));
+    video_tokens = narrowed_video.data();
+  }
+  if (audio_tokens != nullptr) {
+    narrowed_audio = NarrowedInput(
+        arm, audio_tokens,
+        static_cast<size_t>(batch * audio_token_count * config.audio_cross_attention_dim));
+    audio_tokens = narrowed_audio.data();
+  }
 
   // The modality embedding is added AFTER the projection (:109, :111), which is
   // what lets the pooler tell the two streams apart.
   auto project = [&](const float* tokens, int64_t token_count, const std::string& stream) {
+    const WeightRef proj_weight(weights, p + stream + "_input_proj.weight");
+    const WeightRef proj_bias(weights, p + stream + "_input_proj.bias");
     std::vector<float> out =
         Linear(q, tokens, batch * token_count, stream == "video"
                                                    ? config.video_cross_attention_dim
                                                    : config.audio_cross_attention_dim,
-               weights.Get(p + stream + "_input_proj.weight"),
-               weights.Get(p + stream + "_input_proj.bias"), hidden);
-    const std::vector<float>& emb = weights.Get(p + stream + "_modality_emb");
+               *proj_weight, *proj_bias, hidden, arm, widths);
+    // R2. The modality embedding is a NARROWED Parameter and the add ROUNDS —
+    // the sum is not kept at the accumulator's width. Both halves separate: the
+    // narrowed embedding in 3 of the 9 emitted fixtures and the rounded add in 3.
+    const WeightRef emb_ref(weights, p + stream + "_modality_emb");
+    const std::vector<float>& emb = *emb_ref;
     for (int64_t row = 0; row < batch * token_count; ++row) {
       for (int64_t i = 0; i < hidden; ++i) {
         out[static_cast<size_t>(row * hidden + i)] += emb[static_cast<size_t>(i)];
       }
     }
+    StoreAt(arm, out.data(), out.size(), widths);
     return out;
   };
 
@@ -231,19 +400,26 @@ std::vector<float> Ltx2DurationPredict(const Ltx2DurationHeadConfig& config,
   }
 
   const std::vector<float> pooled =
-      Ltx2DurationAttentionPool(config, weights, tokens.data(), batch, token_count);
+      Ltx2DurationAttentionPool(config, weights, tokens.data(), batch, token_count, widths);
   // `pooled.reshape(pooled.shape[0], -1)` (:115) — every query's vector,
   // concatenated, which is why mlp_hidden's input width is hidden * num_queries.
+  const WeightRef mlp_hidden_weight(weights, p + "mlp_hidden.weight");
+  const WeightRef mlp_hidden_bias(weights, p + "mlp_hidden.bias");
   const std::vector<float> hidden_out =
-      Linear(q, pooled.data(), batch, hidden * config.num_queries,
-             weights.Get(p + "mlp_hidden.weight"), weights.Get(p + "mlp_hidden.bias"),
-             config.mlp_hidden);
+      Linear(q, pooled.data(), batch, hidden * config.num_queries, *mlp_hidden_weight,
+             *mlp_hidden_bias, config.mlp_hidden, arm, widths);
   std::vector<float> activated(hidden_out.size());
   for (size_t i = 0; i < hidden_out.size(); ++i) activated[i] = GeluTanh(hidden_out[i]);
+  // R3. `gelu(approximate="tanh")` is f32 opmath rounded ONCE on store. The wrong
+  // rule that type-checks is narrowing the TANH ARGUMENT before the multiply, and
+  // it separates in 2 of the 9 emitted fixtures.
+  StoreAt(arm, activated.data(), activated.size(), widths);
 
+  const WeightRef mlp_out_weight(weights, p + "mlp_out.weight");
+  const WeightRef mlp_out_bias(weights, p + "mlp_out.bias");
   const std::vector<float> log_duration =
-      Linear(q, activated.data(), batch, config.mlp_hidden, weights.Get(p + "mlp_out.weight"),
-             weights.Get(p + "mlp_out.bias"), 1);
+      Linear(q, activated.data(), batch, config.mlp_hidden, *mlp_out_weight, *mlp_out_bias, 1, arm,
+             widths);
 
   // :117-118 — the regression is trained in LOG-seconds and exponentiated here,
   // so callers always get seconds. Returning the raw regression gives a finite,
@@ -253,6 +429,14 @@ std::vector<float> Ltx2DurationPredict(const Ltx2DurationHeadConfig& config,
     seconds[static_cast<size_t>(b)] =
         static_cast<float>(std::exp(static_cast<double>(log_duration[static_cast<size_t>(b)])));
   }
+  // R4. THE LAST ROUNDING IS THE ONE A USER SEES. `exp` is f32 opmath stored once
+  // at bf16, and returning the seconds unrounded separates in ALL NINE emitted
+  // fixtures — the one rule the funnel cannot absorb. It is not a rounding
+  // curiosity either: swept across `mlp_out.bias` at 25 fps on the shipped
+  // widths, 10 of 1000 samples FLIP THE FRAME COUNT, by eight frames on the
+  // 8k+1 grid. A discrete selection has bimodal error, so the gate asserts frame
+  // count EQUALITY and never a band.
+  StoreAt(arm, seconds.data(), seconds.size(), widths);
   return seconds;
 }
 
@@ -353,7 +537,7 @@ int64_t Ltx2DurationPredictFrames(const Ltx2DurationHeadConfig& config,
                                   int64_t video_token_count, const float* audio_tokens,
                                   int64_t audio_token_count, double frame_rate, double min_seconds,
                                   double max_seconds, int64_t time_scale,
-                                  float* predicted_seconds) {
+                                  float* predicted_seconds, Ltx2DurationWidthCounts* widths) {
   // `DurationPredictor.__call__` (utils/blocks.py:850-889).
   //
   // UPSTREAM'S SINGLE-ITEM-BATCH REFUSAL (:857-861) IS EXPRESSED AS A CONTRACT
@@ -369,7 +553,7 @@ int64_t Ltx2DurationPredictFrames(const Ltx2DurationHeadConfig& config,
           "ltx2 duration: max_seconds must be >= min_seconds");
   const std::vector<float> seconds_pred =
       Ltx2DurationPredict(config, weights, video_tokens, video_token_count, audio_tokens,
-                          audio_token_count, /*batch=*/1);
+                          audio_token_count, /*batch=*/1, widths);
   Require(seconds_pred.size() == 1, "ltx2 duration: the head returned more than one prediction");
   const double seconds = static_cast<double>(seconds_pred[0]);
   if (predicted_seconds != nullptr) *predicted_seconds = seconds_pred[0];

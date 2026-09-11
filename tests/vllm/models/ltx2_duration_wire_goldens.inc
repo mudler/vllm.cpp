@@ -105,6 +105,81 @@ inline constexpr const char* kLtx2RequireNumFramesMessage =
 inline constexpr bool kLtx2RequireNumFramesAllowsExplicitWithoutHead = true;
 inline constexpr bool kLtx2RequireNumFramesAllowsAutoWithHead = true;
 
+
+// ── A24 WAVE 6: THE bf16 ARM ────────────────────────────────────────
+//
+// Upstream resolves ONE pipeline dtype and it is bfloat16
+// (distilled.py:109), handed to DurationPredictor.from_checkpoint at
+// :163-165. Every one of the head's fifteen parameters narrows under
+// `.to(bfloat16)`, so upstream's head IS a bf16 module.
+//
+// THE OUTPUT IS A FUNNEL AND THAT IS WHY THIS TABLE HAS NINE ROWS.
+// The head returns one bf16 scalar per batch row, through `exp`. Eight
+// mantissa bits applied once to a single number absorb almost every
+// intermediate difference: on the shipped widths at a QUIET amplitude
+// the correct chain reproduces upstream bit-exactly and so does every
+// wrong rule but the last. Row 4 below is exactly that fixture, kept
+// deliberately, and its `separating` mask is 1 -- it is the control
+// that says the funnel is real rather than a story.
+//
+// SO COVERAGE IS PER RULE ACROSS FIXTURES, NEVER PER FIXTURE, and the
+// generator REFUSES to emit when any rule reaches zero.
+struct Ltx2DurBf16Case {
+    int64_t video_dim; int64_t audio_dim; int64_t hidden;
+    int64_t queries; int64_t heads; int64_t mlp_hidden;
+    int64_t video_tokens; int64_t audio_tokens;
+    double amplitude; double token_scale;
+    // FNV-1a over the little-endian bf16 WORDS of the fifteen parameters
+    // in named_parameters() order, and of the video-then-audio tokens.
+    // The C++ gate rebuilds this closed form with glibc `sin`, which is
+    // NOT bit-equal to torch's float64 `sin` -- so these say the two
+    // sides hold the same weights BEFORE they are asked to agree on the
+    // answer. A libm that ever moved one bf16 word reds here, by name,
+    // instead of arriving as an unexplained value mismatch.
+    uint64_t weight_digest;
+    uint64_t token_digest;
+    // Upstream's own bf16 answer, and the seven rejected rules beside it
+    // in the order kLtx2DurBf16RuleNames gives.
+    float upstream;
+    float rejected[7];
+};
+inline constexpr const char* kLtx2DurBf16RuleNames[7] = {
+    "two_round",
+    "add_f32",
+    "emb_f32",
+    "soft_bf16",
+    "attn_f32",
+    "gelu_narrow",
+    "exp_f32",
+};
+inline constexpr Ltx2DurBf16Case kLtx2DurBf16Cases[] = {
+    {4096, 2048, 256, 1, 4, 256, 6, 4, 0.18, 0.5, 0x83ca89de8ade22daULL, 0x83adb692898a5319ULL, 4.78125f, {4.8125f, 4.78125f, 4.6875f, 4.8125f, 4.8125f, 4.8125f, 4.77073336f}},  // separates 6: two_round,emb_f32,soft_bf16,attn_f32,gelu_narrow,exp_f32
+    {4096, 2048, 256, 1, 4, 256, 7, 0, 0.18, 0.5, 0x83ca89de8ade22daULL, 0x409bcc428705810bULL, 5.5625f, {5.5f, 5.625f, 5.5625f, 5.5625f, 5.625f, 5.5625f, 5.57755232f}},  // separates 4: two_round,add_f32,attn_f32,exp_f32
+    {4096, 2048, 256, 1, 4, 256, 0, 5, 0.18, 0.5, 0x83ca89de8ade22daULL, 0x000ef454ae1bd9a8ULL, 4.71875f, {4.78125f, 4.65625f, 4.71875f, 4.8125f, 4.8125f, 4.71875f, 4.73360682f}},  // separates 5: two_round,add_f32,soft_bf16,attn_f32,exp_f32
+    {4096, 2048, 256, 1, 4, 256, 6, 4, 0.05, 0.5, 0x0c6c4e029788ccc4ULL, 0x83adb692898a5319ULL, 1.0859375f, {1.0859375f, 1.0859375f, 1.0859375f, 1.0859375f, 1.0859375f, 1.0859375f, 1.08390081f}},  // separates 1: exp_f32
+    {128, 64, 32, 1, 4, 24, 6, 4, 0.35, 0.5, 0x3fd5d0c31842f777ULL, 0x7e8e6a49789c88efULL, 2.09375f, {2.078125f, 2.09375f, 2.09375f, 2.09375f, 2.09375f, 2.09375f, 2.10052538f}},  // separates 2: two_round,exp_f32
+    {128, 64, 32, 1, 4, 24, 12, 8, 0.25, 0.5, 0xfe97d81f49ebef98ULL, 0xeeb9a1c815f9dff8ULL, 1.4375f, {1.4375f, 1.4375f, 1.4375f, 1.4375f, 1.4375f, 1.4453125f, 1.44085169f}},  // separates 2: gelu_narrow,exp_f32
+    {256, 128, 32, 1, 4, 32, 12, 8, 0.35, 0.5, 0xd81a9174d147ecb7ULL, 0x959eeb50b0ad495aULL, 2.484375f, {2.484375f, 2.46875f, 2.46875f, 2.46875f, 2.5f, 2.484375f, 2.48471069f}},  // separates 5: add_f32,emb_f32,soft_bf16,attn_f32,exp_f32
+    {256, 128, 32, 1, 4, 32, 6, 4, 0.4, 0.5, 0x76fc522e197f7b0bULL, 0xeeb9a1c815f9dff8ULL, 3.015625f, {2.9375f, 3.015625f, 2.984375f, 3.015625f, 2.984375f, 3.015625f, 3.00886369f}},  // separates 4: two_round,emb_f32,attn_f32,exp_f32
+    {128, 64, 32, 1, 4, 24, 12, 8, 0.4, 0.5, 0x400c825c8c3d30a8ULL, 0xeeb9a1c815f9dff8ULL, 2.46875f, {2.46875f, 2.46875f, 2.46875f, 2.46875f, 2.453125f, 2.46875f, 2.47502375f}},  // separates 2: attn_f32,exp_f32
+};
+// How many of the emitted fixtures separate each rule, in the order
+// kLtx2DurBf16RuleNames gives. The test asserts every entry is non-zero,
+// so this is the blast radius a mutation of that rule must produce -- it
+// named the count BEFORE the mutation was run.
+inline constexpr int kLtx2DurBf16RuleCoverage[7] = {5, 3, 3, 3, 6, 2, 9};
+inline constexpr int kLtx2DurBf16CaseCount = 9;
+
+// THE `query_tokens` NARROWING IS UNMEASURABLE BY ANY VALUE GATE HERE,
+// and it is recorded as a COUNT rather than pretended away. Holding the
+// pooler's learnable queries at f32 instead of narrowing them separates
+// in 0 of 93 bit-exact pooler fixtures: the difference is absorbed by the
+// rounding of its own projection. The parameter genuinely narrows, and
+// the entry count below is the control that says so -- a probe that
+// reported zero here would be blind rather than reassuring.
+inline constexpr int kLtx2DurBf16QueryTokensNarrowedEntries = 256;
+inline constexpr int kLtx2DurBf16QueryTokensCount = 256;
+
 // AutoDuration's defaults (utils/types.py:116-124), read off the class.
 inline constexpr double kLtx2AutoDurationMinSeconds = 1.0;
 inline constexpr double kLtx2AutoDurationMaxSeconds = 20.0;

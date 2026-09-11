@@ -1,0 +1,88 @@
+[
+  {
+    "name": "focused-v2",
+    "argv": [
+      "flock",
+      "-n",
+      "-F",
+      "/home/vikash/gpu.lock",
+      "env",
+      "HIP_VISIBLE_DEVICES=0",
+      "ROCR_VISIBLE_DEVICES=0",
+      "TMPDIR=/home/vikash/.cache/rdna3-gather-impl/tmp",
+      "VT_ROCM_GATHER_TEST_CORPUS=/home/vikash/.cache/rdna3-gather-impl/random-corpus-v2",
+      "timeout",
+      "180s",
+      "ctest",
+      "--test-dir",
+      "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather",
+      "--output-on-failure",
+      "-R",
+      "^(test_rocm_embedding_quant|test_capi_rocm_embedding_quant|test_gguf_keep_quant|test_ops_embedding_quant|test_gguf_dequant|test_backend_cross_device|test_gguf)$"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 21.807591438293457,
+    "manifest_sha256": "2928aa6cbc417a3993c86481cbdd6c3ba4e35072bbf703212976344bda57fed0",
+    "log_sha256": "90498bb132e941140e153a2634e8247c46faebad08172205cfed52806d612ca1",
+    "all_101_manifest_inputs_verified_before_after": true,
+    "core_dumps_disabled": true,
+    "summary": [
+      "100% tests passed, 0 tests failed out of 7"
+    ]
+  },
+  {
+    "name": "ambient-device-v2",
+    "argv": [
+      "flock",
+      "-n",
+      "-F",
+      "/home/vikash/gpu.lock",
+      "env",
+      "HIP_VISIBLE_DEVICES=0,1",
+      "ROCR_VISIBLE_DEVICES=0,1",
+      "VT_ROCM_GATHER_REQUIRE_TWO_DEVICES=1",
+      "TMPDIR=/home/vikash/.cache/rdna3-gather-impl/tmp",
+      "timeout",
+      "180s",
+      "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/tests/test_rocm_embedding_quant",
+      "--test-case=ROCm gather follows the queue device when the ambient device differs",
+      "--abort-after=1"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 0.5165746212005615,
+    "manifest_sha256": "2928aa6cbc417a3993c86481cbdd6c3ba4e35072bbf703212976344bda57fed0",
+    "log_sha256": "38fec7edbc44a0e557538088a130e98da012892fdec43f29234989d35718209e",
+    "all_101_manifest_inputs_verified_before_after": true,
+    "core_dumps_disabled": true,
+    "summary": [
+      "[doctest] test cases:  1 |  1 passed | 0 failed | 8 skipped",
+      "[doctest] assertions: 16 | 16 passed | 0 failed |"
+    ]
+  },
+  {
+    "name": "native-corpus-v2",
+    "argv": [
+      "flock",
+      "-n",
+      "-F",
+      "/home/vikash/gpu.lock",
+      "env",
+      "HIP_VISIBLE_DEVICES=0",
+      "ROCR_VISIBLE_DEVICES=0",
+      "TMPDIR=/home/vikash/.cache/rdna3-gather-impl/tmp",
+      "timeout",
+      "180s",
+      "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/tests/rocm_quant_gather_capture",
+      "capture",
+      "/home/vikash/.cache/rdna3-gather-impl/corpus/manifest.json",
+      "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 0.853466272354126,
+    "manifest_sha256": "2928aa6cbc417a3993c86481cbdd6c3ba4e35072bbf703212976344bda57fed0",
+    "log_sha256": "d28f0be34a2c630d52fc5096a805c200d04397f36517e47d186c0cfbfe2a604f",
+    "all_101_manifest_inputs_verified_before_after": true,
+    "core_dumps_disabled": true,
+    "summary": []
+  }
+]

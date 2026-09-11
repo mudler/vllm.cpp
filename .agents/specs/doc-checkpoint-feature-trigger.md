@@ -125,8 +125,8 @@ it.
 ## Owed
 
 - The capability-change-without-registration-change class above, which no gate
-  now covers. Owned by this row; tracked on #595.
-- #595 itself stays open. This change does not relocate the obligation to a
+  now covers. Owned by this row; tracked on ISSUE-GH-595.
+- ISSUE-GH-595 itself stays open. This change does not relocate the obligation to a
   per-row surface, which is what closes it.
 - #515 is the identical shape for `CMakeLists.txt` -> `docs/USAGE.md` and is not
   touched here.

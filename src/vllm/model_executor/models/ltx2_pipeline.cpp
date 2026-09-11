@@ -2121,6 +2121,48 @@ Ltx2PipelineRecipe KeyframeInterpolationRecipe(const Ltx2PipelineParams& params,
   return recipe;
 }
 
+// ICLoraPipeline (ltx-pipelines/ic_lora.py:60-402). Row LTX25-IC-LORA-REF-VIDEO,
+// issue #3020.
+//
+// THE SCHEDULE IS THE DISTILLED TWO-STAGE ONE, EXACTLY, and that is a finding
+// rather than a shortcut. `ICLoraPipeline.__call__` takes `stage_1_sigmas`
+// defaulting to `DISTILLED_SIGMAS` and `stage_2_sigmas` to
+// `STAGE_2_DISTILLED_SIGMAS` (the same two constants `distilled.py` imports),
+// runs stage 1 at `width // 2, height // 2` (`:260-266`), and re-noises stage 2
+// to `stage_2_sigmas[0]` (`:333-343`). Every one of those is what
+// `DistilledTwoStageRecipe` already carries. IC-LoRA differs from the distilled
+// two-stage pipeline in its CONDITIONING and in where its adapter rides, not in
+// its schedule — recorded here so a reader does not go looking for an IC-LoRA
+// sigma set upstream does not have.
+//
+// TWO FIELDS SEPARATE IT, and they are the two `ICLoraPipeline` was written for.
+Ltx2PipelineRecipe IcLoraRecipe(const std::string& version) {
+  Ltx2PipelineRecipe recipe = DistilledTwoStageRecipe(version);
+  if (recipe.phases.size() != 2) {
+    Refuse("The IC-LoRA recipe is the distilled two-stage recipe with IC-LoRA's adapter split, "
+           "and that recipe just returned " +
+           std::to_string(recipe.phases.size()) +
+           " phases. Stage 1 and stage 2 are addressed by INDEX below, so a changed phase count "
+           "would scope the adapter to the wrong one.");
+  }
+  recipe.phases[0].name = "ic_lora_lowres";
+  recipe.phases[1].name = "ic_lora_refine";
+  // `ic_lora.py:108` against `:119` — the MIRROR IMAGE of every other two-stage
+  // pipeline in this table. `A2VidTwoStageRecipe` and its siblings give stage 1
+  // `kNoAdapters` and stage 2 the adapters; here the adapter rides stage 1 and
+  // stage 2 runs BARE, because the IC-LoRA is what teaches the model to read the
+  // reference and stage 2 only refines an already-conditioned latent.
+  //
+  // Getting this backwards renders a video. Stage 2 would run a 3-step
+  // refinement under an adapter it was never given, and the clip comes out the
+  // right length at the right resolution.
+  recipe.phases[1].loras = Ltx2PhaseLoraScope::kNoAdapters;
+  // `_create_conditionings` (`:269-281`, calling `:381-402`) against stage 2's
+  // plain `combined_image_conditionings` (`:314-321`).
+  recipe.ic_lora_reference = true;
+  return recipe;
+}
+
 }  // namespace
 
 Ltx2PipelineRecipe ResolveLtx2PipelineRecipe(const std::string& pipeline_kind,
@@ -2149,6 +2191,14 @@ Ltx2PipelineRecipe ResolveLtx2PipelineRecipe(const std::string& pipeline_kind,
     // resolving DFR onto it would build a recipe whose first stage the engine
     // must then refuse at load. Refusing at the recipe table names the version.
     if (model_version == "2.5") return DfrRecipe(model_version);
+  } else if (pipeline_kind == "ic_lora") {
+    // 2.5 only, and 2.0 is refused rather than resolved. `ICLoraPipeline`'s
+    // reference item carries the adapter's `reference_downscale_factor` and
+    // `reference_temporal_scale_factor` (iclora_utils.py:30-49), which are
+    // LTX-2.5 IC-LoRA metadata keys; the 2.0 distilled row here exists for a
+    // generation that predates them, and resolving onto it would build a
+    // pipeline whose reference geometry is always the unscaled one.
+    if (model_version == "2.5") return IcLoraRecipe(model_version);
   } else if (pipeline_kind == "res2s_two_stage") {
     // 2.5 only — see `Res2sTwoStageRecipe`: `LTX_2_3_HQ_PARAMS` is a plain
     // constant with no `detect_params` lineage, so there is no second version to

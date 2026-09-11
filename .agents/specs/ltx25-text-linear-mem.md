@@ -185,7 +185,7 @@ paragraph describes the plan rather than what shipped.
 
 ## Owed
 
-- [#1317](https://github.com/mudler/vllm.cpp/issues/1317) — the harness compares
+- ISSUE-GH-1317 — the harness compares
   absolute system-wide peaks across runs with different starting occupancy, and
   something held 26.8 GiB on `dgx:gpu0` before the run began. Both halves are
   outside this repository — `runguard.py` and the fleet's job hygiene — so

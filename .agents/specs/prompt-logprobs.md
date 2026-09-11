@@ -610,12 +610,12 @@ M8 is the reason the split exists, gated rather than argued.
 
 ## Owed
 
-- [#1816](https://github.com/mudler/vllm.cpp/issues/1816) — `AsyncLLM` never fans
+- ISSUE-GH-1816 — `AsyncLLM` never fans
   out `n>1`, so every `n > 1` request to the production server is silently served
   as `n = 1`. Found here, not fixed here: it needs its own row, spec and fresh
   review rather than an in-flow repair. DISCHARGED by `SAMPLE-N-ASYNC`
   ([async-parallel-sampling.md](async-parallel-sampling.md)).
-- [#1817](https://github.com/mudler/vllm.cpp/issues/1817) — the
+- ISSUE-GH-1817 — the
   `ClampPromptLogprobs` call sites are reached but not measured (mutation M6 stays
   green). The function itself is gated directly; no CPU fixture here can produce
   the `-inf` the clamp exists for. **CLOSED** by

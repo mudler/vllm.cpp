@@ -195,7 +195,7 @@ change hidden in a move that this row's gate cannot see. Filed as
 
 ## Owed
 
-- [#974](https://github.com/mudler/vllm.cpp/issues/974) — the FP8 resident
+- ISSUE-GH-974 — the FP8 resident
   helpers upload without `load_stats::AddDeviceUpload` and without
   `AdoptDeviceBytesAsHost`, which every other resident-weight helper in the same
   file performs. Found here, carried across unchanged, and detailed under

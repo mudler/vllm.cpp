@@ -297,7 +297,7 @@ scripts/agent-preflight.sh --fail-on-skip
 - [#2119](https://github.com/mudler/vllm.cpp/issues/2119) — `/v1/completions`
   streaming dropped every `CompletionOutput` past the first. FIXED in this row's
   pull request; the issue exists because it is a distinct defect from #1816.
-- [#2120](https://github.com/mudler/vllm.cpp/issues/2120) — a REGRESSION this
+- ISSUE-GH-2120 — a REGRESSION this
   row causes, not a pre-existing gap it leaves alone. `/v1/chat/completions`
   streaming collapses `n > 1` onto one choice's parser and text state. BEFORE
   the fan-out that route ran ONE sequence and streamed its one choice; AFTER
@@ -305,9 +305,9 @@ scripts/agent-preflight.sh --fail-on-skip
   the client still sees one choice — so the row buys `n`x the decode compute
   and the KV blocks for no visible output. Deferred because per-index parser
   lifetimes are a separate review surface (see OUT of scope).
-- [#2121](https://github.com/mudler/vllm.cpp/issues/2121) —
+- ISSUE-GH-2121 —
   `AsyncLLM::add_request_wave` does not fan out `n > 1`.
-- [#2145](https://github.com/mudler/vllm.cpp/issues/2145) — the fan-out
+- ISSUE-GH-2145 — the fan-out
   DEEP-copies the prompt `n` times. `EngineCoreRequest::prompt_token_ids` is a
   `std::vector<int32_t>` by value (`types.h:79`), so `EngineCoreRequest child =
   request` copies the whole prompt per child and `FromEngineCoreRequest` copies
@@ -320,9 +320,9 @@ scripts/agent-preflight.sh --fail-on-skip
   `FanOutParallelSampling` — and the copy itself is NOT changed, because the cheap mirror is a shared immutable token
   buffer on `EngineCoreRequest` that every engine path reads.
 
-  DECIDED, on the multimodal path: #2145 is NOT widened, and no second issue is
+  DECIDED, on the multimodal path: ISSUE-GH-2145 is NOT widened, and no second issue is
   filed. The mm overload copies the same `EngineCoreRequest`, so its
-  `prompt_token_ids` copy is already #2145 — and it is #2145's WORST case, not
+  `prompt_token_ids` copy is already ISSUE-GH-2145 — and it is ISSUE-GH-2145's WORST case, not
   a new one, because an mm prompt is the placeholder-EXPANDED token list. The
   mm-only residual is the `mm_features` vector itself
   (`std::vector<MultiModalFeatureSpec>` by value, `types.h:93`), and that copy
@@ -334,7 +334,7 @@ scripts/agent-preflight.sh --fail-on-skip
   `EngineCoreRequest` closes the mm path with the text path; a separate issue
   for the residual would be filing noise.
 
-- [#2150](https://github.com/mudler/vllm.cpp/issues/2150) —
+- ISSUE-GH-2150 —
   `ParentRequest::get_outputs` indexes `output_aggregator_` with
   `completion_output.index` unchecked and drains it through `*slot` on a
   possibly-empty optional (`parallel_sampling.cpp:75-82`). A faithful 1:1 port

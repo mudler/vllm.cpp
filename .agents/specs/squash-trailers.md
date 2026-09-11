@@ -127,7 +127,7 @@ second widening this row exists to avoid.
 
 ## Owed
 
-- [#849](https://github.com/mudler/vllm.cpp/issues/849). An issue that is never
+- ISSUE-GH-849. An issue that is never
   appended to the index is invisible to the ownership gate this row's
   predecessor built. #829, #848 and #822 were all open with no row, which is how
   this was found. Closing it needs a GitHub query, and no gate here may use the

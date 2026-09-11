@@ -568,13 +568,16 @@ earlier reading of this row's history said writes were `403`; that was a
 generalisation from ONE hidden issue and it is wrong.
 
 - ~~The head on sm_121a~~ — **DISCHARGED**, and
-  [#2393](https://github.com/mudler/vllm.cpp/issues/2393) is closed. The head ran
+  ISSUE-GH-2393 is closed. The head ran
   green on GB10 with M5, and the two architectures agree on every verdict.
 - **METAL, VULKAN, ROCM and TENSTORRENT gather arms** —
-  [#2394](https://github.com/mudler/vllm.cpp/issues/2394). Each gather kernel
+  ISSUE-GH-2394. Each gather kernel
   asserts a float table by name and none registers `kEmbeddingQuant`, so each
   answers false to the residency gate and keeps expand-bf16; the `qwen4_exp`
   loader refuses them by name.
+  The ROCm child is [BACKEND-ROCM-QUANT-GATHER](rocm-quant-gather.md),
+  tracked by [#3093](https://github.com/mudler/vllm.cpp/issues/3093).
+  Its implementation and native gates remain `PENDING`.
 - **Performance.** This wave gates CORRECTNESS only. The decoders read byte-wise
   for alignment safety and one thread decodes a whole block. No throughput number
   is claimed, measured or implied, and no benchmark ID moves.

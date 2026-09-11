@@ -795,7 +795,7 @@ at `7ce8c77`.
 
 - The roadmap row. This spec is committed first, per "Spec before code"; the row
   is opened at claim.
-- [#1354](https://github.com/mudler/vllm.cpp/issues/1354) stays open until both
+- ISSUE-GH-1354 stays open until both
   halves land, because either alone leaves the other's defect in place.
 - The re-run of the Qwen3.8-27B bf16 c1 pairing, owned by
   [#915](https://github.com/mudler/vllm.cpp/issues/915) and

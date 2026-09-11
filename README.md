@@ -37,6 +37,12 @@
 
 ## News
 
+- **2026-09** **C ABI 26 exposes more engine controls.** Applications can select the KV cache
+  dtype, read speculative acceptance counters, and disable the model-level sliding window.
+  See the [C API reference](docs/reference/c-api.md#recent-abi-additions) for defaults and limits.
+- **2026-09** **EXL3 gains a native ROCm path.** Llama-3.2-1B-Instruct EXL3 generated on
+  gfx1151 with zero CPU fallbacks. Discrete AMD validation and competitive performance remain
+  unmeasured. See the [ROCm build guide](docs/BUILD.md#rocm-build-amd-gpus).
 - **2026-08** **EXL3 checkpoints now generate on CPU and CUDA.** A stock
   Llama-3.2-1B-Instruct EXL3 checkpoint loads through the shared dense model path and emits text.
   The current CUDA path supports its 3-bit body and 6-bit output head. No speed claim is available.
@@ -211,13 +217,14 @@ configs, token-for-token the same output. Switching to it should be boring. Ever
 you get on top, most of it borrowed from whichever engine does it best:
 
 - **One 66 MiB binary instead of a 9.1 GiB install.** A flat, exception-free, llama.cpp-style C ABI
-  ([`include/vllm.h`](include/vllm.h), ABI v23) for C, C++, Go, or Rust. No Python
+  ([`include/vllm.h`](include/vllm.h), ABI v26) for C, C++, Go, or Rust. No Python
   interpreter in the process.
 - **GGUF as a first-class citizen.** Load the same quantized files llama.cpp uses, and on CPU
   **compute directly on the compressed blocks** (Q4_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XS,
   and IQ4_XS) with no BF16 expansion. Byte-identical greedy output to llama.cpp on the gated paths.
 - **EXL3 trellis weights.** A stock 3.0 bpw Llama-3.2-1B-Instruct checkpoint generates on CPU and
-  CUDA through the shared dense model path. The DeepSeek-V4 rank-sliced layout remains partial.
+  CUDA through the shared dense model path. Native ROCm generation is measured on gfx1151.
+  The DeepSeek-V4 rank-sliced layout remains partial.
 - **SGLang's good ideas, as documented toggles.** RadixAttention / prefix caching, LPM cache-aware
   scheduling, jump-forward decoding, and custom logits processors, opt-in from the library, the C
   ABI, or server flags. Each defaults to today's behavior, so an engine that sets none of them is
@@ -346,7 +353,7 @@ hardware-blocked and why, is linked from [Project status](#project-status).
 | **CPU** | x86-64, arm64 | Correctness / CI reference. At or ahead of llama.cpp on every GGUF axis (SUPERSEDED, #1003), Arm i8mm tier |
 | **Metal** | Apple Silicon | Two models end to end, 18 of 75 ops native. Prefill ahead of MLX-LM, warm total 97.6% with the MLX provider |
 | **Vulkan** | Portable GPU | `opt-125m` STRICT token-exact; Qwen3.6-27B decode **matches llama.cpp Vulkan** (4.36 vs 4.35, denominator SUPERSEDED, #1003) |
-| **ROCm** | AMD GPUs | W0 skeleton, gfx1201/2xR9700 contrib-run ([#140](https://github.com/mudler/vllm.cpp/pull/140)); no board: [detail](docs/ROCM.md) |
+| **ROCm** | AMD GPUs | Native EXL3 generation on gfx1151, matching the CPU reference. Discrete GPU correctness and competitive performance remain unverified ([evidence](.agents/specs/backend-rocm-exl3.md)) |
 | **Tenstorrent** | Blackhole | OPT-125m strict 6/6; Qwen3 gate wired, full rerun pending |
 | **Intel XPU / ANE** | Intel, Apple NPU | Spiked or roadmap |
 
@@ -407,7 +414,7 @@ tokenizer). For SPEECH put the spoken line in the prompt. Recipe: [docs/USAGE.md
 ## OpenAI-compatible server
 
 ```sh
-build/examples/server --model /path/to/Qwen3.6-27B --port 8000 --max-num-seqs 32
+build/examples/vllm-server --model /path/to/Qwen3.6-27B --port 8000 --max-num-seqs 32
 ```
 
 ```python
@@ -428,7 +435,7 @@ behind a model gallery, multi-model serving, the full OpenAI API surface, auth, 
 ## Use it as a library (C API)
 
 Link `libvllm` and include [`include/vllm.h`](include/vllm.h): a flat, exception-free,
-llama.cpp-style C ABI (currently `VLLM_ABI_VERSION 23`) suitable for `dlopen` / FFI. Check the
+llama.cpp-style C ABI (currently `VLLM_ABI_VERSION 26`) suitable for `dlopen` / FFI. Check the
 header for the version that your build provides.
 
 ```c

@@ -16,8 +16,7 @@ The stale spelling is not confined to one driver, so the guard below SCANS for i
 rather than naming the files it already knows about: naming files is how #222's
 first repair (`2b262622`) missed the whole Python half, and how its second
 (`8fce04d3`) still left three live sites — a quick start in ``docs/USAGE.md`` and
-two in ``README.md``. README.md is not repaired here; ``SCAN_BLOCKED_ON_POLICY``
-records the exact blocker.
+two in ``README.md``. The scan includes the corrected README commands too.
 
 The repair on ``main`` does not hardcode the new name either: it resolves
 ``examples/<OUTPUT_NAME>`` and keeps the pre-rename path as a REPLAY FALLBACK, so
@@ -33,6 +32,7 @@ import pathlib
 import re
 import sys
 import unittest
+from unittest import mock
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 EXAMPLES_CMAKE = REPO_ROOT / "examples" / "CMakeLists.txt"
@@ -131,18 +131,6 @@ SCANNED_DIRECTORIES = (
     "tools",
 )
 SCANNED_ROOT_FILES = ("CMakeLists.txt", "CONTRIBUTING.md", "README.md")
-# VISIBLE DEBT, not an exemption. README.md:169 and :368 still tell users to run
-# `build/examples/server`, and correcting them is currently IMPOSSIBLE:
-# scripts/check-doc-checkpoint.py refuses any README change whose commit does not
-# also touch a landing source (.agents/mission.md, CMakeLists.txt, the three
-# benchmarks/demo JSONs, examples/cli/main.cpp, examples/server/main.cpp).
-# examples/CMakeLists.txt `OUTPUT_NAME` -- the file that decides the name the
-# quick start tells a user to type -- is not on that list, and this change has no
-# honest reason to edit one that is. A cosmetic edit to one, or relaxing the
-# checker, both weaken a gate to make a change pass. `4f24ff44` recorded this
-# exact class ("a gate that rejects a true statement is not protecting
-# anything") and repaired it by adding a REAL source. Awaiting the same here.
-SCAN_BLOCKED_ON_POLICY = frozenset({REPO_ROOT / "README.md"})
 SCANNED_SUFFIXES = frozenset(
     {"", ".cfg", ".cmake", ".cpp", ".cu", ".cuh", ".h", ".in", ".json",
      ".md", ".py", ".sh", ".toml", ".txt", ".yaml", ".yml"}
@@ -162,11 +150,10 @@ def _scanned_files() -> list[pathlib.Path]:
             for path in root.rglob("*")
             if path.is_file() and path.suffix in SCANNED_SUFFIXES
         )
-    blocked = {path.resolve() for path in SCAN_BLOCKED_ON_POLICY}
     return [
         path
         for path in files
-        if path.is_file() and path.resolve() not in SCAN_EXEMPT | blocked
+        if path.is_file() and path.resolve() not in SCAN_EXEMPT
     ]
 
 
@@ -423,24 +410,26 @@ class ServerBinaryNameContract(unittest.TestCase):
                     "examples/server, so a pre-W6 evidence tree cannot replay",
                 )
 
-    def test_the_policy_block_is_exactly_one_named_file(self) -> None:
-        """Debt has to stay one file with one reason, or it is just a hole."""
-        self.assertEqual(
-            {REPO_ROOT / "README.md"},
-            set(SCAN_BLOCKED_ON_POLICY),
-            "nothing may be parked in the policy-blocked set without its own "
-            "recorded blocker; the scan is the guard, not the exception list",
-        )
-        # And the debt is real: this is what a maintainer decision has to clear.
-        stale = _stale_lines(
-            (REPO_ROOT / "README.md").read_text(encoding="utf-8"),
-            declared_server_output_name(),
-        )
-        self.assertTrue(
-            stale,
-            "README no longer names the stale artifact -- delete "
-            "SCAN_BLOCKED_ON_POLICY and let the scan cover it",
-        )
+    def test_repository_scan_detects_a_stale_readme_command(self) -> None:
+        """Exercise README discovery and reporting without editing user files."""
+        if declared_server_output_name() == "server":
+            self.skipTest("the target name IS the output name; nothing to reject")
+        readme = REPO_ROOT / "README.md"
+        read_text = pathlib.Path.read_text
+
+        def with_stale_readme(path, *args, **kwargs):
+            if path == readme:
+                return "# Quick start\nbuild/examples/server --help\n"
+            return read_text(path, *args, **kwargs)
+
+        with mock.patch.object(pathlib.Path, "read_text", with_stale_readme):
+            self.assertIn(
+                "README.md:2: build/examples/server --help",
+                stale_server_artifact_references(),
+                "the repository scan must inspect README commands",
+            )
+            with self.assertRaises(AssertionError):
+                self.test_no_live_consumer_resolves_the_stale_artifact_path()
 
     def test_no_live_consumer_resolves_the_stale_artifact_path(self) -> None:
         expected = declared_server_output_name()

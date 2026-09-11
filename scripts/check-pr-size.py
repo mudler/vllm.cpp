@@ -195,6 +195,12 @@ COMPLETED = re.compile(r"\.agents/completed/[A-Za-z0-9_.-]+\.md\Z")
 # this. A claim in its own file has one writer and cannot collide. Classified
 # with the other per-row records it now resembles.
 CLAIM = re.compile(r"\.agents/claims/[A-Za-z0-9_.-]+\.md\Z")
+ISSUE_RECORD = re.compile(
+    r"\.agents/issues/(?:(?:[A-Z0-9][A-Za-z0-9_.-]*|_owed)/"
+    r"(?:ISSUE-GH-[1-9][0-9]*|ISSUE-LOCAL-[0-7][0-9A-HJKMNP-TV-Z]{25})"
+    r"|_intake/ISSUE-GH-[1-9][0-9]*)\.md\Z"
+)
+
 # One file per secondary oracle (AGENTS.md, "When vLLM has no implementation").
 # Same shape and therefore the same class as SPEC and CLAIM: a per-key record
 # globbed for reading, deliberately NOT a shared table every change must write.
@@ -296,6 +302,41 @@ BENCH_EVIDENCE = re.compile(r"(?:benchmarks/(?:demo|media)|docs/bench-evidence)/
 BENCH_EVIDENCE_RUN = re.compile(
     r"docs/bench-evidence/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
     r"\.(?:txt|log|gz|sh|cu|py|jsonl|rc)\Z"
+)
+# #3060: exact client stdout and the harness patch archived with two EXL3 runs.
+# The patch records an external server-wrapper adaptation, and the live
+# variadic recipe applies its staged copy. Keep this admission exact so an
+# uninspected log or patch cannot inherit the evidence class.
+# Source/history: .agents/specs/gate-pr-size-bench-evidence.md.
+RECORDED_BENCH_EVIDENCE = frozenset(
+    {
+        "docs/bench-evidence/qwen38-27b-exl3-headtohead-20260903/OURS-A.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-headtohead-20260903/OURS-B.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-headtohead-20260903/THEIRS-A.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-headtohead-20260903/THEIRS-B.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-headtohead-20260903/serve_openai-usage.patch",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r1-c1.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r1-c4.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r1-c8.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r2-c1.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r2-c4.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r2-c8.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r1-c16.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r1-c32.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r2-c16.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r2-c32.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/PROBE.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/THEIRS-r1-c1.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/THEIRS-r1-c4.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/THEIRS-r1-c8.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/THEIRS-r1-c16.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/THEIRS-r1-c32.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/THEIRS-r2-c1.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/THEIRS-r2-c4.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/THEIRS-r2-c8.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/THEIRS-r2-c16.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/THEIRS-r2-c32.clientlog",
+    }
 )
 # #2609. The lease RECIPES: the exact script a `rc` job ran to produce a number
 # a spec then cites. Same class and same reasoning as BENCH_EVIDENCE_RUN's `.sh`
@@ -528,6 +569,8 @@ def classify_path(path: str) -> str:
         return "append_only_record"
     if path in PROJECT_RECORD_FILES:
         return "project_record"
+    if ISSUE_RECORD.fullmatch(path):
+        return "project_record"
     if path == ".agents/upstream-inventory.json":
         return "project_record"
     if (
@@ -546,6 +589,7 @@ def classify_path(path: str) -> str:
         or SYNC_RECORD.fullmatch(path)
         or BENCH_EVIDENCE.fullmatch(path)
         or BENCH_EVIDENCE_RUN.fullmatch(path)
+        or path in RECORDED_BENCH_EVIDENCE
         or AGENT_RUN_SCRIPT.fullmatch(path)
     ):
         return "evidence"

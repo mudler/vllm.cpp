@@ -90,6 +90,12 @@ whole-run rate   = sum(completion_tokens) / wall clock of the whole leg
 
 ### The four legs
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/headtohead-throughput-dark.svg">
+  <img alt="Throughput by counting convention. Decode only, vllm.cpp 53.63 tok/s against exllamav3 44.82. Whole run, 37.35 against 33.26." src="assets/headtohead-throughput-light.svg" width="640">
+</picture>
+
+
 | leg | order | decode-only tok/s | whole-run tok/s | mean TTFT ms, all 164 | output tokens | wall s |
 |---|---|---|---|---|---|---|
 | `THEIRS-A` | 1 | 44.63 | 32.54 | 1021.7 | 19,680 | 604.9 |

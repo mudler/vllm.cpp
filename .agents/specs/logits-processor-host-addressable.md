@@ -314,7 +314,7 @@ fidelity gate on the staged bytes' content.
 
 ## Owed
 
-[#1748](https://github.com/mudler/vllm.cpp/issues/1748) — `CpuBackend` never
+ISSUE-GH-1748 — `CpuBackend` never
 opts in to `DeviceMemoryIsHostAddressable()`, although its allocations are
 ordinary host memory and the class comment says so. Found while grounding this
 fix.
@@ -325,14 +325,14 @@ direct-upload adoption in
 `src/vllm/model_executor/models/qwen3_5_weights.cpp`: both of that file's reads
 of the predicate (`:345`, `:365`) are early RETURNS, so CPU never adopts today
 and the override would UNBLOCK them, not redirect them. Whether adoption is
-meaningful on CPU is not established, and establishing it is part of what #1748
+meaningful on CPU is not established, and establishing it is part of what ISSUE-GH-1748
 owes. The genuine reason to defer is that flipping a global backend predicate on
 the project's DEFAULT device is an unmeasured residency and behaviour change,
 while this row is a crash-class correctness repair; and because the arm this fix
 selects is always correct and only slower, deferring an optimisation here is
 legitimate where deferring a correctness gap would not be.
 
-**What #1748 also owes, so its scope is recorded rather than rediscovered:**
+**What ISSUE-GH-1748 also owes, so its scope is recorded rather than rediscovered:**
 row-scoped staging in `apply_logits_processors`. The staging legs copy the whole
 `[n, vocab]` slab (`builtin.cpp:114`), so one request with a processor in a
 256-row batch stages 256 rows down and back per step. Copying only the rows that
@@ -340,7 +340,7 @@ appear in the `procs` map is the obvious mitigation and is independent of the
 `CpuBackend` override — either one alone removes most of the cost this row
 introduces.
 
-**The `#1748` index row's cost sentence is superseded by this section.** That
+**The `ISSUE-GH-1748` index row's cost sentence is superseded by this section.** That
 row ends "charged only to a request that registered a processor", which
 understates the cost by a factor of the batch row count for the reason given
 under `## 4`. `.agents/issue-index.md` is append-only and a row may not be

@@ -1,0 +1,37 @@
+["podman", "--storage-driver=vfs", "--root", "/tmp/podman-pr66-root-vfs", "--runroot", "/tmp/podman-pr66-run-vfs", "run", "--rm", "--name", "strix-3015-0787b125e22f49449120af2f4cd9b4c7", "--device=/dev/kfd", "--device=/dev/dri", "--group-add", "video", "-v", "/tmp/strix-3015-4fdrfcj3:/tmp/strix-3015-4fdrfcj3:rw", "-v", "/workspace/ccache:/workspace/ccache:rw", "--ulimit", "fsize=536870912:536870912", "-e", "LD_LIBRARY_PATH=/tmp/strix-3015-4fdrfcj3/build-vllmcpp:/tmp/strix-3015-4fdrfcj3/build-vllmcpp/bin:/opt/rocm/lib", "-e", "VT_OP_PROVIDER_STATS=1", "--entrypoint", "/tmp/strix-3015-4fdrfcj3/build-vllmcpp/examples/vllm-cli", "d554fe849c5e3c4d6b81227e0b87f165fa3b7b015899872bd93bc732c12ffeb6", "--model", "/tmp/strix-3015-4fdrfcj3/Qwen3.8-27B-Q4_K_M.gguf", "--prompt", "The capital of France is", "--max-tokens", "64", "--temperature", "0", "--repeat", "1", "--max-num-seqs", "1"]
+vllm-cli: loading model from /tmp/strix-3015-4fdrfcj3/Qwen3.8-27B-Q4_K_M.gguf
+engine: device placement: --fit resolved NO placement: the model has no routed-expert layers, so a placement has nothing to move
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+[vt op-provider] op=4 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=77 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=1 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=83 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=88 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=5 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=89 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=76 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=10 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=9 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=84 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=63 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=78 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=64 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=28 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=38 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=69 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=40 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=6 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=11 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+vllm-cli: run=1/1 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=12.667 tok_s=5.053
+vllm-cli: run=1/1 generate_start_unix=1788779804.434891 generate_end_unix=1788779817.101799
+vllm-cli: run=1/1 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+ Paris.
+The capital of Germany is Berlin.
+The capital of Italy is Rome.
+The capital of Spain is Madrid.
+The capital of Portugal is Lisbon.
+The capital of Greece is Athens.
+The capital of the United Kingdom is London.
+The capital of Ireland is Dublin.
+The capital of

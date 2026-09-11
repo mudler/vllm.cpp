@@ -598,7 +598,7 @@ numbers are under `## Owed`, and the gate that could exist lives on the seam in
 ## Owed
 
 - **An N-image request surface with per-image `frame_idx`, `strength` and
-  `crf`**, [#1187](https://github.com/mudler/vllm.cpp/issues/1187). Upstream's
+  `crf`**, ISSUE-GH-1187. Upstream's
   `--image PATH FRAME_IDX STRENGTH [CRF]` is repeatable (`utils/args.py:805-817`)
   and expands per keyframe (`helpers.py:343-367`); this ABI carries two scalar
   slots at fixed indices 0 and `frames - 1`. Every pipeline that takes `images`
@@ -624,7 +624,7 @@ numbers are under `## Owed`, and the gate that could exist lives on the seam in
   [#1150](https://github.com/mudler/vllm.cpp/issues/1150). This row sets its own
   phase and touches none of them.
 - **A trace-derived step count in the two schedule-anchor cases**,
-  [#1220](https://github.com/mudler/vllm.cpp/issues/1220). Both cases — the
+  ISSUE-GH-1220. Both cases — the
   `ti2vid` one and the copy this row made of it — return `gen.steps` from their
   render lambda under a comment that says the count is read back out of the
   render, so the four `REQUIRE(x.steps == rendered_steps)` lines compare four
@@ -653,7 +653,7 @@ numbers are under `## Owed`, and the gate that could exist lives on the seam in
   rewrite.
 
 - **The tree-wide correction of two off-by-N upstream anchors**,
-  [#1230](https://github.com/mudler/vllm.cpp/issues/1230). Re-derived at the
+  ISSUE-GH-1230. Re-derived at the
   LTX-2 pin `fd4ded7f` by reading the pinned files rather than inheriting the
   citation: `latent_cond.py:38` is `latent_state = latent_state.clone()` and
   `:39` is blank, so the two writes are `:40-41`; `schedulers.py:31` is the
@@ -675,7 +675,7 @@ numbers are under `## Owed`, and the gate that could exist lives on the seam in
   piecemeal. The records this row writes state the anchors CORRECTLY -- the
   table at §(d)'s `what frame 0 does to the state` row and the Stage 1 port
   map's `schedule_tokens` row above, and #1219's index row -- so the record
-  says what is true while the source stays uniformly stale until #1230 sweeps it
+  says what is true while the source stays uniformly stale until ISSUE-GH-1230 sweeps it
   in one commit with its own reviewer.
 
   **SWEPT 2026-09-01 by row `LTX25-ANCHOR-REPAIR`**, spec

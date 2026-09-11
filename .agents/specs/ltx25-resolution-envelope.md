@@ -548,7 +548,7 @@ takes a different path entirely.
   position to an unidentified serial phase
   ([#1087](https://github.com/mudler/vllm.cpp/issues/1087)). The 60 GiB loss did
   not reproduce on `0b0b8900f` under a 2 s guard, which is not an attribution:
-  [#1014](https://github.com/mudler/vllm.cpp/issues/1014) still owns it.
+  ISSUE-GH-1014 still owns it.
 - **The lcm form of the divisor** (§3.1). `max_spatial_downscale()` is the
   maximum where the correct quantity is the least common multiple of the phase
   downscales. The two agree on every shipped recipe and part on a recipe with

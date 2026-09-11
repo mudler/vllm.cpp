@@ -301,6 +301,205 @@ double MaxAbsDiff(const std::vector<float>& a, const std::vector<float>& b, size
 
 }  // namespace
 
+
+namespace {
+
+// ENG-QWEN35-FULL-ATTN-STATE (#3098). Enter the registered forward, with the
+// existing CPU fixture's f32 cache representation and unchanged tolerances.
+TEST_CASE("qwen35 full-attention registry accepts unused GDN metadata") {
+  HfConfig c = MakeConfig();
+  c.num_hidden_layers = 1;
+  c.layer_types = {"full_attention"};
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  CachePool pool(c, 4, 8);
+  REQUIRE(pool.gdn_state.empty());
+  bool runner_metadata = false;
+  SUBCASE("default-empty GDN metadata") {}
+  SUBCASE("unused runner GDN metadata") { runner_metadata = true; }
+  SUBCASE("the loaded layers determine consumers") {
+    // The loaded consumer wins over a stale configuration label.
+    c.layer_types = {"linear_attention"};
+    runner_metadata = true;
+  }
+  auto model = vllm::BorrowQwen3_5MoeLoadedModel(w);
+  vt::Queue q = Q();
+  const std::vector<int32_t> indices;
+  const auto host = [&](const vllm::ForwardLogits& logits) {
+    std::vector<float> out;
+    if (logits.on_device()) {
+      out.resize(static_cast<size_t>(logits.rows * logits.vocab));
+      auto& backend = vt::GetBackend(q.device.type);
+      backend.Copy(q, out.data(), logits.device_tensor.data, out.size() * sizeof(float));
+      backend.Synchronize(q);
+    } else {
+      out = logits.host;
+    }
+    for (float value : out) CHECK(std::isfinite(value));
+    return out;
+  };
+
+  const std::vector<int32_t> ids = {5, 9, 2};
+  const std::vector<int32_t> positions = {0, 1, 2};
+  const auto am = PrefillAttnMeta(3, {0}, 8, 0);
+  const auto gm = runner_metadata ? PrefillGdnMeta(3, 0) : GDNAttentionMetadata{};
+  ModelForwardInput prefill{ids, positions, am, gm, pool.attn_kv, pool.gdn_state,
+                            c, q, indices};
+  prefill.num_reqs = 1;
+  const auto prefill_logits = host(ModelRegistry::Forward(*model, prefill));
+  REQUIRE(prefill_logits.size() == static_cast<size_t>(3 * c.vocab_size));
+  const auto dense_prefill = Qwen3_5Model::ForwardDense(ids, positions, w, c, q);
+  CHECK(MaxAbsDiff(prefill_logits, dense_prefill, prefill_logits.size()) < 1e-2);
+
+  const std::vector<int32_t> next = {8}, next_positions = {3};
+  auto decode_am = PrefillAttnMeta(1, {0}, 8, 3);
+  decode_am.seq_lens = decode_am.seq_lens_cpu = {4};
+  decode_am.max_seq_len = 4;
+  GDNAttentionMetadata decode_gm;
+  if (runner_metadata) {
+    decode_gm.num_decodes = decode_gm.num_decode_tokens = 1;
+    decode_gm.num_actual_tokens = 1;
+    decode_gm.non_spec_state_indices_tensor = std::vector<int32_t>{0};
+    decode_gm.non_spec_query_start_loc = std::vector<int32_t>{0, 1};
+  }
+  ModelForwardInput decode{next, next_positions, decode_am, decode_gm, pool.attn_kv,
+                           pool.gdn_state, c, q, indices};
+  decode.num_reqs = 1;
+  decode.pure_decode = true;
+  const auto decode_logits = host(ModelRegistry::Forward(*model, decode));
+  REQUIRE(decode_logits.size() == static_cast<size_t>(c.vocab_size));
+  const auto dense_full = Qwen3_5Model::ForwardDense({5, 9, 2, 8}, {0, 1, 2, 3}, w, c, q);
+  const std::vector<float> last(dense_full.end() - c.vocab_size, dense_full.end());
+  CHECK(MaxAbsDiff(decode_logits, last, decode_logits.size()) < 2e-2);
+}
+
+TEST_CASE("qwen35 full-attention registry keeps generic counts") {
+  HfConfig c = MakeConfig();
+  c.num_hidden_layers = 1;
+  c.layer_types = {"full_attention"};
+  Qwen3_5MoeWeights w = MakeWeights(c);
+  CachePool pool(c, 4, 8);
+  const std::vector<int32_t> ids = {5}, indices;
+  std::vector<int32_t> positions = {0};
+  auto am = PrefillAttnMeta(1, {0}, 8, 0);
+  const GDNAttentionMetadata gm;
+  const char* expected = nullptr;
+  SUBCASE("positions") { positions.clear(); expected = "positions length"; }
+  SUBCASE("attention token count") {
+    am.num_actual_tokens = 2;
+    expected = "attn_meta.num_actual_tokens";
+  }
+  SUBCASE("layer count") { w.layers.clear(); expected = "weights.layers size"; }
+  SUBCASE("attention cache count") { pool.attn_kv.clear(); expected = "attn_kv count"; }
+  SUBCASE("unexpected recurrent cache") {
+    pool.gdn_state.emplace_back();
+    expected = "gdn_state count";
+  }
+  REQUIRE(expected != nullptr);
+  auto model = vllm::BorrowQwen3_5MoeLoadedModel(w);
+  vt::Queue q = Q();
+  ModelForwardInput input{ids, positions, am, gm, pool.attn_kv, pool.gdn_state, c, q, indices};
+  input.num_reqs = 1;
+  CHECK_THROWS_WITH_AS(ModelRegistry::Forward(*model, input),
+                       doctest::Contains(expected), std::runtime_error);
+}
+
+TEST_CASE("qwen35 registry preserves each hybrid GDN guard") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  CachePool pool(c, 3, 8);
+  REQUIRE(pool.gdn_state.size() == 3);
+  std::vector<int32_t> ids = {5, 9}, positions = {0, 0};
+  const std::vector<int32_t> indices;
+  auto am = PrefillAttnMeta(2, {0, 1}, 8, 0);
+  am.num_reqs = 2;
+  am.max_query_len = am.max_seq_len = 1;
+  am.query_start_loc = am.query_start_loc_cpu = {0, 1, 2};
+  am.seq_lens = am.seq_lens_cpu = {1, 1};
+  am.block_table_num_cols = 1;
+  am.slot_mapping = {0, 8};
+  GDNAttentionMetadata gm;
+  gm.num_actual_tokens = gm.num_decodes = gm.num_decode_tokens = 2;
+  gm.non_spec_state_indices_tensor = std::vector<int32_t>{0, 1};
+  gm.non_spec_query_start_loc = std::vector<int32_t>{0, 1, 2};
+  const char* expected = nullptr;
+  SUBCASE("valid hybrid") {}
+  SUBCASE("all GDN caches missing") {
+    pool.gdn_state.clear();
+    expected = "gdn_state count";
+  }
+  SUBCASE("wrong GDN cache count") {
+    pool.gdn_state.pop_back();
+    expected = "gdn_state count";
+  }
+  SUBCASE("invalid SSM rank") {
+    pool.gdn_state.back().ssm_state.rank = 3;
+    expected = "GDN SSM/conv state ranks";
+  }
+  SUBCASE("invalid convolution rank") {
+    pool.gdn_state.back().conv_state.rank = 4;
+    expected = "GDN SSM/conv state ranks";
+  }
+  SUBCASE("mismatched SSM and convolution slots") {
+    pool.gdn_state.back().conv_state.shape[0] = 2;
+    expected = "GDN conv/SSM state slot counts";
+  }
+  SUBCASE("inconsistent layer slots") {
+    pool.gdn_state.back().ssm_state.shape[0] = 2;
+    pool.gdn_state.back().conv_state.shape[0] = 2;
+    expected = "all GDN layers must use the same state slot count";
+  }
+  SUBCASE("missing metadata") {
+    gm = GDNAttentionMetadata{};
+    expected = "gdn_meta.num_actual_tokens";
+  }
+  SUBCASE("wrong GDN token count") {
+    gm.num_actual_tokens = 1;
+    expected = "gdn_meta.num_actual_tokens";
+  }
+  SUBCASE("missing indices") {
+    gm.non_spec_state_indices_tensor.reset();
+    expected = "missing non-spec GDN state indices";
+  }
+  SUBCASE("duplicate indices") {
+    gm.non_spec_state_indices_tensor = std::vector<int32_t>{0, 0};
+    expected = "duplicate live GDN state index";
+  }
+  SUBCASE("out-of-range indices") {
+    gm.non_spec_state_indices_tensor = std::vector<int32_t>{0, 3};
+    expected = "GDN state index out of range";
+  }
+  SUBCASE("incomplete prefill metadata") {
+    am = PrefillAttnMeta(2, {0}, 8, 0);
+    positions = {0, 1};
+    gm = PrefillGdnMeta(2, 0);
+    gm.prefill_has_initial_state.reset();
+    expected = "incomplete GDN prefill metadata";
+  }
+  auto model = vllm::BorrowQwen3_5MoeLoadedModel(w);
+  vt::Queue q = Q();
+  ModelForwardInput input{ids, positions, am, gm, pool.attn_kv, pool.gdn_state, c, q, indices};
+  input.num_reqs = am.num_reqs;
+  if (expected != nullptr) {
+    CHECK_THROWS_WITH_AS(ModelRegistry::Forward(*model, input),
+                         doctest::Contains(expected), std::runtime_error);
+  } else {
+    const auto logits = ModelRegistry::Forward(*model, input);
+    REQUIRE(logits.rows == 2);
+    REQUIRE(logits.vocab == c.vocab_size);
+    std::vector<float> host = logits.host;
+    if (logits.on_device()) {
+      host.resize(static_cast<size_t>(2 * c.vocab_size));
+      auto& backend = vt::GetBackend(q.device.type);
+      backend.Copy(q, host.data(), logits.device_tensor.data, host.size() * sizeof(float));
+      backend.Synchronize(q);
+    }
+    REQUIRE(host.size() == static_cast<size_t>(2 * c.vocab_size));
+    for (float value : host) CHECK(std::isfinite(value));
+  }
+}
+
+}  // namespace
+
 TEST_CASE("qwen35 paged: full-prefill batch-of-1 equals dense forward") {
   const HfConfig c = MakeConfig();
   const Qwen3_5MoeWeights w = MakeWeights(c);

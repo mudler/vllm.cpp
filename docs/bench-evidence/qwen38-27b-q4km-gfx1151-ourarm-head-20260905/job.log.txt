@@ -1,0 +1,915 @@
+
+===== 0. worker identity, inherited environment, contention state =====
+2026-09-05T20:27:18Z
+[hb] 20:27:18
+rc-worker-lcjhd
+Linux rc-worker-lcjhd 6.14.0-36-generic #36~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Wed Oct 15 15:45:17 UTC 2 x86_64 x86_64 x86_64 GNU/Linux
+nproc=32
+RC_JOB_ID=5c3d309a-d505-4bd4-a173-e9f46f9cf7e0 RC_DEVICE=strix:gpu0
+boot_id=a5bc8128-f6ad-4767-8614-6923f88032e1
+uptime_s=712125.51
+rocm_version=7.2.4
+               total        used        free      shared  buff/cache   available
+Mem:              62           3          33           0          25          58
+Swap:             15           0          15
+Filesystem             Size  Used Avail Use% Mounted on
+overlay                1.9T  689G  1.1T  39% /
+overlay                1.9T  689G  1.1T  39% /
+//192.168.68.102/Data  7.3T  6.6T  710G  91% /workspace
+HSA_OVERRIDE_GFX_VERSION=UNSET   <- must read UNSET
+inherited_env NONE
+--- who else is on this box, as this job sees it ---
+    PID ELAPSED COMMAND
+      1  708021 rc
+    930  707336 cmake
+   1030  707257 cmake
+   1111  707107 rsync
+   1112  707107 rsync
+   1113  707107 rsync
+  13077  686625 cp
+
+===== 1. the artifact, verified ON the worker before any timing =====
+2026-09-05T20:27:18Z
+already staged worker-locally at /tmp/strixarm2944/models/Qwen3.8-27B-Q4_K_M.gguf
+gguf_bytes=17106775008 gguf_sha256=7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169
+
+===== 2. the tree under test -- ASSERTED, three ways, fail-closed =====
+2026-09-05T20:27:27Z
+bundle 044dec44ebd8f153f25e13bfbeffd45ca7ba33d6342bdc99fdc63e348b6ca2b8  /workspace/strix-arm-2933/repo.bundle
+Note: switching to 'c796fea41f74fe90b8cf78190eeb2a5b4c977449'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+want_revision=c796fea41f74fe90b8cf78190eeb2a5b4c977449
+got_revision=c796fea41f74fe90b8cf78190eeb2a5b4c977449
+want_tree=018178f3bf1fca3983d9bc0cfd42f5ea4bf130b1
+got_tree=018178f3bf1fca3983d9bc0cfd42f5ea4bf130b1
+worktree_modified_files=0
+REVISION_ASSERTION=OK  TREE_ASSERTION=OK  CLEAN=OK  SOURCE_CARRIES_FIX=OK
+
+===== 3. build -- from a build directory that did not exist a moment ago =====
+2026-09-05T20:27:41Z
+build_start_unix=1788640061
+BUILD_ROUTE=podman
+[hb] 20:29:18
+[hb] 20:31:18
+container_or_subshell_rc=0 elapsed_s=264
+14:-- ROCm backend: ENABLED for arch(es) [gfx1151]
+15:-- ROCm backend: NEVER COMPILED UPSTREAM OF YOU — this skeleton has no build report from any machine. Please report success or failure on https://github.com/mudler/vllm.cpp/issues/41
+[ 95%] Building HIP object CMakeFiles/vllm.dir/src/vt/rocm/rocm_dense_basic.hip.o
+[ 95%] Building HIP object CMakeFiles/vllm.dir/src/vt/rocm/rocm_matmul_hipblaslt.hip.o
+[ 95%] Building HIP object CMakeFiles/vllm.dir/src/vt/rocm/rocm_paged_attn.hip.o
+[ 95%] Building HIP object CMakeFiles/vllm.dir/src/vt/rocm/rocm_gemma4_experts.hip.o
+[ 95%] Building HIP object CMakeFiles/vllm.dir/src/vt/rocm/rocm_gemma4_fused_experts.hip.o
+[ 95%] Building HIP object CMakeFiles/vllm.dir/src/vt/rocm/rocm_gemma4_expert_geglu.hip.o
+[ 96%] Building HIP object CMakeFiles/vllm.dir/src/vt/rocm/rocm_fp8_channel_gemv.hip.o
+[ 96%] Building HIP object CMakeFiles/vllm.dir/src/vt/rocm/rocm_moe_router.hip.o
+[ 96%] Building HIP object CMakeFiles/vllm.dir/src/vt/rocm/rocm_moe_chain.hip.o
+[ 96%] Building HIP object CMakeFiles/vllm.dir/src/vt/rocm/rocm_grouped_gemm.hip.o
+[ 96%] Building HIP object CMakeFiles/vllm.dir/src/vt/rocm/rocm_exl3.hip.o
+[ 96%] Building HIP object CMakeFiles/vllm.dir/src/vt/rocm/rocm_sample.hip.o
+[ 97%] Building HIP object CMakeFiles/vllm.dir/src/vt/rocm/rocm_gdn_state.hip.o
+[ 97%] Building HIP object CMakeFiles/vllm.dir/src/vt/rocm/rocm_gdn_conv.hip.o
+[ 97%] Building HIP object CMakeFiles/vllm.dir/src/vt/rocm/rocm_gdn_postconv.hip.o
+[ 97%] Building HIP object CMakeFiles/vllm.dir/src/vt/rocm/rocm_gdn_scan.hip.o
+[ 97%] Building HIP object CMakeFiles/vllm.dir/src/vt/rocm/rocm_gdn_fused.hip.o
+[ 97%] Building HIP object CMakeFiles/vllm.dir/src/vt/rocm/rocm_mla_fused_norm_rope.hip.o
+[ 97%] Building HIP object CMakeFiles/vllm.dir/src/vt/rocm/rocm_mla_ops.hip.o
+[ 98%] Building HIP object CMakeFiles/vllm.dir/src/vt/rocm/rocm_skinny_gemm.hip.o
+[ 98%] Building HIP object CMakeFiles/vllm.dir/src/vt/rocm/rocm_ops.hip.o
+[ 98%] Linking HIP static library libvllm.a
+[ 98%] Built target vllm
+[ 98%] Building CXX object CMakeFiles/vllm_shared.dir/vllm_shared_stub.cpp.o
+[ 98%] Linking HIP shared library libvllm.so
+[ 98%] Built target vllm_shared
+[ 98%] Building CXX object examples/CMakeFiles/vllm-cli.dir/cli/main.cpp.o
+[100%] Linking CXX executable vllm-cli
+[100%] Built target vllm-cli
+BUILD_TARGET_RC=0
+build_target_rc=0
+
+===== 4. the BUILT BYTES -- asserted, not printed =====
+2026-09-05T20:32:05Z
+CLI=/tmp/strixarm2944/build/examples/vllm-cli
+SO=/tmp/strixarm2944/build/libvllm.so.0.0.3
+built_vllm_cli 043166a823dad93d9c045895e2a7b9277d8c22729f5a7431fb470fd8616d3d24  /tmp/strixarm2944/build/examples/vllm-cli
+built_libvllm 92111f91182de38a68332596d7af561b5834343efad4f3329371a4d287233ef5  /tmp/strixarm2944/build/libvllm.so.0.0.3
+note: the kernels live in libvllm.so; vllm-cli is a thin client and its hash alone proves little
+mtime_check /tmp/strixarm2944/build/examples/vllm-cli mtime=1788640324 build_start=1788640061
+mtime_check /tmp/strixarm2944/build/libvllm.so.0.0.3 mtime=1788640323 build_start=1788640061
+BUILT_BYTES_ASSERTION=OK (post-dates the empty build dir, carries the narrowing, is not the pre-fix binary)
+
+===== 5. the legs: 4 rounds x 2 token counts = 8 legs BY DESIGN =====
+2026-09-05T20:32:05Z
+design: ROUNDS=4 REPEAT=4 COLD_RUNS=1 NGEN_A=64 NGEN_B=128
+design_legs=8  (the fold is told this; it counts nothing)
+the order of the two token counts rotates by round, so session drift is not read as a difference
+
+--- round 1 of 4 ---
+--- leg n64-r1 start 2026-09-05T20:32:06Z ---
+[hb] 20:33:18
+LEG n64-r1 ngen=64 repeat=4 rc=0 class=OK secs=76 clock_samples=306 reftier_lines=0
+n64-r1 vllm-cli: run=1/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=12.453 tok_s=5.139
+n64-r1 vllm-cli: run=1/4 generate_start_unix=1788640352.189667 generate_end_unix=1788640364.642609
+n64-r1 vllm-cli: run=1/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n64-r1 vllm-cli: run=2/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=11.977 tok_s=5.343
+n64-r1 vllm-cli: run=2/4 generate_start_unix=1788640364.642702 generate_end_unix=1788640376.620088
+n64-r1 vllm-cli: run=2/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n64-r1 vllm-cli: run=3/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=11.979 tok_s=5.343
+n64-r1 vllm-cli: run=3/4 generate_start_unix=1788640376.620127 generate_end_unix=1788640388.598952
+n64-r1 vllm-cli: run=3/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n64-r1 vllm-cli: run=4/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=12.007 tok_s=5.330
+n64-r1 vllm-cli: run=4/4 generate_start_unix=1788640388.598991 generate_end_unix=1788640400.606489
+n64-r1 vllm-cli: run=4/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+--- leg n128-r1 start 2026-09-05T20:33:24Z ---
+[hb] 20:35:18
+LEG n128-r1 ngen=128 repeat=4 rc=0 class=OK secs=129 clock_samples=503 reftier_lines=0
+n128-r1 vllm-cli: run=1/4 finish_reason=length prompt_tokens=5 completion_tokens=128 secs=24.199 tok_s=5.289
+n128-r1 vllm-cli: run=1/4 generate_start_unix=1788640430.207821 generate_end_unix=1788640454.406925
+n128-r1 vllm-cli: run=1/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n128-r1 vllm-cli: run=2/4 finish_reason=length prompt_tokens=5 completion_tokens=128 secs=23.855 tok_s=5.366
+n128-r1 vllm-cli: run=2/4 generate_start_unix=1788640454.406980 generate_end_unix=1788640478.262243
+n128-r1 vllm-cli: run=2/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n128-r1 vllm-cli: run=3/4 finish_reason=length prompt_tokens=5 completion_tokens=128 secs=23.885 tok_s=5.359
+n128-r1 vllm-cli: run=3/4 generate_start_unix=1788640478.262281 generate_end_unix=1788640502.147625
+n128-r1 vllm-cli: run=3/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n128-r1 vllm-cli: run=4/4 finish_reason=length prompt_tokens=5 completion_tokens=128 secs=23.906 tok_s=5.354
+n128-r1 vllm-cli: run=4/4 generate_start_unix=1788640502.147660 generate_end_unix=1788640526.053487
+n128-r1 vllm-cli: run=4/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+
+--- round 2 of 4 ---
+--- leg n128-r2 start 2026-09-05T20:35:36Z ---
+[hb] 20:37:18
+LEG n128-r2 ngen=128 repeat=4 rc=0 class=OK secs=128 clock_samples=503 reftier_lines=0
+n128-r2 vllm-cli: run=1/4 finish_reason=length prompt_tokens=5 completion_tokens=128 secs=24.251 tok_s=5.278
+n128-r2 vllm-cli: run=1/4 generate_start_unix=1788640561.863718 generate_end_unix=1788640586.114863
+n128-r2 vllm-cli: run=1/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n128-r2 vllm-cli: run=2/4 finish_reason=length prompt_tokens=5 completion_tokens=128 secs=23.905 tok_s=5.355
+n128-r2 vllm-cli: run=2/4 generate_start_unix=1788640586.114916 generate_end_unix=1788640610.019766
+n128-r2 vllm-cli: run=2/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n128-r2 vllm-cli: run=3/4 finish_reason=length prompt_tokens=5 completion_tokens=128 secs=23.903 tok_s=5.355
+n128-r2 vllm-cli: run=3/4 generate_start_unix=1788640610.019802 generate_end_unix=1788640633.922983
+n128-r2 vllm-cli: run=3/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n128-r2 vllm-cli: run=4/4 finish_reason=length prompt_tokens=5 completion_tokens=128 secs=23.958 tok_s=5.343
+n128-r2 vllm-cli: run=4/4 generate_start_unix=1788640633.923021 generate_end_unix=1788640657.881404
+n128-r2 vllm-cli: run=4/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+--- leg n64-r2 start 2026-09-05T20:37:46Z ---
+LEG n64-r2 ngen=64 repeat=4 rc=0 class=OK secs=77 clock_samples=307 reftier_lines=0
+n64-r2 vllm-cli: run=1/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=12.491 tok_s=5.124
+n64-r2 vllm-cli: run=1/4 generate_start_unix=1788640692.128133 generate_end_unix=1788640704.619228
+n64-r2 vllm-cli: run=1/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n64-r2 vllm-cli: run=2/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=12.057 tok_s=5.308
+n64-r2 vllm-cli: run=2/4 generate_start_unix=1788640704.619321 generate_end_unix=1788640716.675944
+n64-r2 vllm-cli: run=2/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n64-r2 vllm-cli: run=3/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=12.066 tok_s=5.304
+n64-r2 vllm-cli: run=3/4 generate_start_unix=1788640716.675987 generate_end_unix=1788640728.741802
+n64-r2 vllm-cli: run=3/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n64-r2 vllm-cli: run=4/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=12.062 tok_s=5.306
+n64-r2 vllm-cli: run=4/4 generate_start_unix=1788640728.741843 generate_end_unix=1788640740.803806
+n64-r2 vllm-cli: run=4/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+
+--- round 3 of 4 ---
+--- leg n64-r3 start 2026-09-05T20:39:06Z ---
+[hb] 20:39:18
+LEG n64-r3 ngen=64 repeat=4 rc=0 class=OK secs=77 clock_samples=307 reftier_lines=0
+n64-r3 vllm-cli: run=1/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=12.473 tok_s=5.131
+n64-r3 vllm-cli: run=1/4 generate_start_unix=1788640772.248203 generate_end_unix=1788640784.720767
+n64-r3 vllm-cli: run=1/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n64-r3 vllm-cli: run=2/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=12.051 tok_s=5.311
+n64-r3 vllm-cli: run=2/4 generate_start_unix=1788640784.720856 generate_end_unix=1788640796.771537
+n64-r3 vllm-cli: run=2/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n64-r3 vllm-cli: run=3/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=12.083 tok_s=5.297
+n64-r3 vllm-cli: run=3/4 generate_start_unix=1788640796.771595 generate_end_unix=1788640808.855007
+n64-r3 vllm-cli: run=3/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n64-r3 vllm-cli: run=4/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=12.078 tok_s=5.299
+n64-r3 vllm-cli: run=4/4 generate_start_unix=1788640808.855053 generate_end_unix=1788640820.933274
+n64-r3 vllm-cli: run=4/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+--- leg n128-r3 start 2026-09-05T20:40:25Z ---
+[hb] 20:41:18
+LEG n128-r3 ngen=128 repeat=4 rc=0 class=OK secs=125 clock_samples=491 reftier_lines=0
+n128-r3 vllm-cli: run=1/4 finish_reason=length prompt_tokens=5 completion_tokens=128 secs=24.257 tok_s=5.277
+n128-r3 vllm-cli: run=1/4 generate_start_unix=1788640851.177685 generate_end_unix=1788640875.434565
+n128-r3 vllm-cli: run=1/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n128-r3 vllm-cli: run=2/4 finish_reason=length prompt_tokens=5 completion_tokens=128 secs=23.917 tok_s=5.352
+n128-r3 vllm-cli: run=2/4 generate_start_unix=1788640875.434631 generate_end_unix=1788640899.351973
+n128-r3 vllm-cli: run=2/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n128-r3 vllm-cli: run=3/4 finish_reason=length prompt_tokens=5 completion_tokens=128 secs=23.913 tok_s=5.353
+n128-r3 vllm-cli: run=3/4 generate_start_unix=1788640899.352009 generate_end_unix=1788640923.265424
+n128-r3 vllm-cli: run=3/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n128-r3 vllm-cli: run=4/4 finish_reason=length prompt_tokens=5 completion_tokens=128 secs=23.945 tok_s=5.345
+n128-r3 vllm-cli: run=4/4 generate_start_unix=1788640923.265464 generate_end_unix=1788640947.210946
+n128-r3 vllm-cli: run=4/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+
+--- round 4 of 4 ---
+--- leg n128-r4 start 2026-09-05T20:42:38Z ---
+[hb] 20:43:18
+LEG n128-r4 ngen=128 repeat=4 rc=0 class=OK secs=126 clock_samples=493 reftier_lines=0
+n128-r4 vllm-cli: run=1/4 finish_reason=length prompt_tokens=5 completion_tokens=128 secs=24.265 tok_s=5.275
+n128-r4 vllm-cli: run=1/4 generate_start_unix=1788640984.359460 generate_end_unix=1788641008.624268
+n128-r4 vllm-cli: run=1/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n128-r4 vllm-cli: run=2/4 finish_reason=length prompt_tokens=5 completion_tokens=128 secs=23.926 tok_s=5.350
+n128-r4 vllm-cli: run=2/4 generate_start_unix=1788641008.624324 generate_end_unix=1788641032.550073
+n128-r4 vllm-cli: run=2/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n128-r4 vllm-cli: run=3/4 finish_reason=length prompt_tokens=5 completion_tokens=128 secs=23.942 tok_s=5.346
+n128-r4 vllm-cli: run=3/4 generate_start_unix=1788641032.550111 generate_end_unix=1788641056.491907
+n128-r4 vllm-cli: run=3/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n128-r4 vllm-cli: run=4/4 finish_reason=length prompt_tokens=5 completion_tokens=128 secs=23.975 tok_s=5.339
+n128-r4 vllm-cli: run=4/4 generate_start_unix=1788641056.491942 generate_end_unix=1788641080.467125
+n128-r4 vllm-cli: run=4/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+--- leg n64-r4 start 2026-09-05T20:44:49Z ---
+[hb] 20:45:18
+LEG n64-r4 ngen=64 repeat=4 rc=0 class=OK secs=77 clock_samples=306 reftier_lines=0
+n64-r4 vllm-cli: run=1/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=12.476 tok_s=5.130
+n64-r4 vllm-cli: run=1/4 generate_start_unix=1788641115.599576 generate_end_unix=1788641128.075424
+n64-r4 vllm-cli: run=1/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n64-r4 vllm-cli: run=2/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=12.057 tok_s=5.308
+n64-r4 vllm-cli: run=2/4 generate_start_unix=1788641128.075500 generate_end_unix=1788641140.132576
+n64-r4 vllm-cli: run=2/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n64-r4 vllm-cli: run=3/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=12.067 tok_s=5.304
+n64-r4 vllm-cli: run=3/4 generate_start_unix=1788641140.132611 generate_end_unix=1788641152.199410
+n64-r4 vllm-cli: run=3/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+n64-r4 vllm-cli: run=4/4 finish_reason=length prompt_tokens=5 completion_tokens=64 secs=12.069 tok_s=5.303
+n64-r4 vllm-cli: run=4/4 generate_start_unix=1788641152.199448 generate_end_unix=1788641164.268900
+n64-r4 vllm-cli: run=4/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+
+===== 6. the fold =====
+2026-09-05T20:46:15Z
+{
+  "arms": {
+    "n128": {
+      "fault_classes": [],
+      "fault_rate": "0 of 4",
+      "leg_spread_pct_of_median": 0.24283179228541887,
+      "legs_by_design": 4,
+      "legs_completed": 4,
+      "median_whole_completion_secs": 23.911,
+      "median_whole_completion_tok_s": 5.3535,
+      "per_leg_secs": [
+        23.885,
+        23.905,
+        23.917,
+        23.942
+      ],
+      "per_leg_whole_completion_tok_s": [
+        5.359,
+        5.355,
+        5.352,
+        5.346
+      ]
+    },
+    "n64": {
+      "fault_classes": [],
+      "fault_rate": "0 of 4",
+      "leg_spread_pct_of_median": 0.8294062205466465,
+      "legs_by_design": 4,
+      "legs_completed": 4,
+      "median_whole_completion_secs": 12.064499999999999,
+      "median_whole_completion_tok_s": 5.305,
+      "per_leg_secs": [
+        11.979,
+        12.062,
+        12.078,
+        12.067
+      ],
+      "per_leg_whole_completion_tok_s": [
+        5.343,
+        5.306,
+        5.299,
+        5.304
+      ]
+    }
+  },
+  "decode_derived": {
+    "median_decode_tok_s_derived": 5.3967549118511045,
+    "median_implied_fixed_cost_s": 0.2054999999999989,
+    "method": "slope between two token counts on the SAME prompt in the same lease; removes whatever fixed cost each call pays. DERIVED, not a direct decode reading.",
+    "pairs_by_design": 4,
+    "pairs_usable": 4,
+    "rows": [
+      {
+        "implied_fixed_cost_s": 0.07299999999999685,
+        "round": 1,
+        "slope_tok_s": 5.375440954140768,
+        "t_a_s": 11.979,
+        "t_b_s": 23.885
+      },
+      {
+        "implied_fixed_cost_s": 0.21899999999999764,
+        "round": 2,
+        "slope_tok_s": 5.404036139491682,
+        "t_a_s": 12.062,
+        "t_b_s": 23.905
+      },
+      {
+        "implied_fixed_cost_s": 0.23899999999999721,
+        "round": 3,
+        "slope_tok_s": 5.405861981586281,
+        "t_a_s": 12.078,
+        "t_b_s": 23.917
+      },
+      {
+        "implied_fixed_cost_s": 0.19200000000000017,
+        "round": 4,
+        "slope_tok_s": 5.389473684210526,
+        "t_a_s": 12.067,
+        "t_b_s": 23.942
+      }
+    ],
+    "spread_pct_of_median": 0.563691105903464
+  },
+  "design": {
+    "cold_runs": 1,
+    "legs_by_design": 8,
+    "n_source": "the design, passed in; this script tallies nothing",
+    "ngen_a": 64,
+    "ngen_b": 128,
+    "repeat": 4,
+    "rounds": 4
+  },
+  "fault_rate_all_legs": "0 of 8",
+  "legs": {
+    "128": [
+      {
+        "class": "OK",
+        "clock": {
+          "busy_percent": {
+            "max": 100,
+            "mean": 76.0,
+            "min": 0,
+            "n": 503
+          },
+          "samples": 503,
+          "sclk_mhz": {
+            "max": 2897,
+            "mean": 2337.6,
+            "min": 600,
+            "n": 503
+          }
+        },
+        "completion_tokens": 128,
+        "discarded_cold": 1,
+        "kept_completions": 3,
+        "rc": 0,
+        "read": true,
+        "reference_tier_lines": 0,
+        "repetitions": [
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 1,
+            "secs": 24.199,
+            "tok_s": 5.289
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 2,
+            "secs": 23.855,
+            "tok_s": 5.366
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 3,
+            "secs": 23.885,
+            "tok_s": 5.359
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 4,
+            "secs": 23.906,
+            "tok_s": 5.354
+          }
+        ],
+        "tag": "n128-r1",
+        "whole_completion_secs": 23.885,
+        "whole_completion_tok_s": 5.359
+      },
+      {
+        "class": "OK",
+        "clock": {
+          "busy_percent": {
+            "max": 100,
+            "mean": 75.1,
+            "min": 0,
+            "n": 503
+          },
+          "samples": 503,
+          "sclk_mhz": {
+            "max": 2896,
+            "mean": 2312.8,
+            "min": 600,
+            "n": 503
+          }
+        },
+        "completion_tokens": 128,
+        "discarded_cold": 1,
+        "kept_completions": 3,
+        "rc": 0,
+        "read": true,
+        "reference_tier_lines": 0,
+        "repetitions": [
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 1,
+            "secs": 24.251,
+            "tok_s": 5.278
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 2,
+            "secs": 23.905,
+            "tok_s": 5.355
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 3,
+            "secs": 23.903,
+            "tok_s": 5.355
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 4,
+            "secs": 23.958,
+            "tok_s": 5.343
+          }
+        ],
+        "tag": "n128-r2",
+        "whole_completion_secs": 23.905,
+        "whole_completion_tok_s": 5.355
+      },
+      {
+        "class": "OK",
+        "clock": {
+          "busy_percent": {
+            "max": 100,
+            "mean": 76.8,
+            "min": 0,
+            "n": 491
+          },
+          "samples": 491,
+          "sclk_mhz": {
+            "max": 2897,
+            "mean": 2350.7,
+            "min": 600,
+            "n": 491
+          }
+        },
+        "completion_tokens": 128,
+        "discarded_cold": 1,
+        "kept_completions": 3,
+        "rc": 0,
+        "read": true,
+        "reference_tier_lines": 0,
+        "repetitions": [
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 1,
+            "secs": 24.257,
+            "tok_s": 5.277
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 2,
+            "secs": 23.917,
+            "tok_s": 5.352
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 3,
+            "secs": 23.913,
+            "tok_s": 5.353
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 4,
+            "secs": 23.945,
+            "tok_s": 5.345
+          }
+        ],
+        "tag": "n128-r3",
+        "whole_completion_secs": 23.917,
+        "whole_completion_tok_s": 5.352
+      },
+      {
+        "class": "OK",
+        "clock": {
+          "busy_percent": {
+            "max": 100,
+            "mean": 77.4,
+            "min": 0,
+            "n": 493
+          },
+          "samples": 493,
+          "sclk_mhz": {
+            "max": 2895,
+            "mean": 2360.2,
+            "min": 600,
+            "n": 493
+          }
+        },
+        "completion_tokens": 128,
+        "discarded_cold": 1,
+        "kept_completions": 3,
+        "rc": 0,
+        "read": true,
+        "reference_tier_lines": 0,
+        "repetitions": [
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 1,
+            "secs": 24.265,
+            "tok_s": 5.275
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 2,
+            "secs": 23.926,
+            "tok_s": 5.35
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 3,
+            "secs": 23.942,
+            "tok_s": 5.346
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 4,
+            "secs": 23.975,
+            "tok_s": 5.339
+          }
+        ],
+        "tag": "n128-r4",
+        "whole_completion_secs": 23.942,
+        "whole_completion_tok_s": 5.346
+      }
+    ],
+    "64": [
+      {
+        "class": "OK",
+        "clock": {
+          "busy_percent": {
+            "max": 100,
+            "mean": 63.1,
+            "min": 0,
+            "n": 306
+          },
+          "samples": 306,
+          "sclk_mhz": {
+            "max": 2897,
+            "mean": 2050.6,
+            "min": 600,
+            "n": 306
+          }
+        },
+        "completion_tokens": 64,
+        "discarded_cold": 1,
+        "kept_completions": 3,
+        "rc": 0,
+        "read": true,
+        "reference_tier_lines": 0,
+        "repetitions": [
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 1,
+            "secs": 12.453,
+            "tok_s": 5.139
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 2,
+            "secs": 11.977,
+            "tok_s": 5.343
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 3,
+            "secs": 11.979,
+            "tok_s": 5.343
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 4,
+            "secs": 12.007,
+            "tok_s": 5.33
+          }
+        ],
+        "tag": "n64-r1",
+        "whole_completion_secs": 11.979,
+        "whole_completion_tok_s": 5.343
+      },
+      {
+        "class": "OK",
+        "clock": {
+          "busy_percent": {
+            "max": 100,
+            "mean": 63.2,
+            "min": 0,
+            "n": 307
+          },
+          "samples": 307,
+          "sclk_mhz": {
+            "max": 2895,
+            "mean": 2044.3,
+            "min": 600,
+            "n": 307
+          }
+        },
+        "completion_tokens": 64,
+        "discarded_cold": 1,
+        "kept_completions": 3,
+        "rc": 0,
+        "read": true,
+        "reference_tier_lines": 0,
+        "repetitions": [
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 1,
+            "secs": 12.491,
+            "tok_s": 5.124
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 2,
+            "secs": 12.057,
+            "tok_s": 5.308
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 3,
+            "secs": 12.066,
+            "tok_s": 5.304
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 4,
+            "secs": 12.062,
+            "tok_s": 5.306
+          }
+        ],
+        "tag": "n64-r2",
+        "whole_completion_secs": 12.062,
+        "whole_completion_tok_s": 5.306
+      },
+      {
+        "class": "OK",
+        "clock": {
+          "busy_percent": {
+            "max": 100,
+            "mean": 63.3,
+            "min": 0,
+            "n": 307
+          },
+          "samples": 307,
+          "sclk_mhz": {
+            "max": 2896,
+            "mean": 2045.2,
+            "min": 600,
+            "n": 307
+          }
+        },
+        "completion_tokens": 64,
+        "discarded_cold": 1,
+        "kept_completions": 3,
+        "rc": 0,
+        "read": true,
+        "reference_tier_lines": 0,
+        "repetitions": [
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 1,
+            "secs": 12.473,
+            "tok_s": 5.131
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 2,
+            "secs": 12.051,
+            "tok_s": 5.311
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 3,
+            "secs": 12.083,
+            "tok_s": 5.297
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 4,
+            "secs": 12.078,
+            "tok_s": 5.299
+          }
+        ],
+        "tag": "n64-r3",
+        "whole_completion_secs": 12.078,
+        "whole_completion_tok_s": 5.299
+      },
+      {
+        "class": "OK",
+        "clock": {
+          "busy_percent": {
+            "max": 100,
+            "mean": 63.3,
+            "min": 0,
+            "n": 306
+          },
+          "samples": 306,
+          "sclk_mhz": {
+            "max": 2895,
+            "mean": 2045.7,
+            "min": 600,
+            "n": 306
+          }
+        },
+        "completion_tokens": 64,
+        "discarded_cold": 1,
+        "kept_completions": 3,
+        "rc": 0,
+        "read": true,
+        "reference_tier_lines": 0,
+        "repetitions": [
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 1,
+            "secs": 12.476,
+            "tok_s": 5.13
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 2,
+            "secs": 12.057,
+            "tok_s": 5.308
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 3,
+            "secs": 12.067,
+            "tok_s": 5.304
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 4,
+            "secs": 12.069,
+            "tok_s": 5.303
+          }
+        ],
+        "tag": "n64-r4",
+        "whole_completion_secs": 12.067,
+        "whole_completion_tok_s": 5.304
+      }
+    ]
+  },
+  "quantity_of_our_figure": "whole completion (vllm-cli times the whole vllm_complete() call, prompt included). NOT decode. Comparable to vLLM's generate() leg; NOT comparable to llama-bench -p 0.",
+  "ratios": {
+    "REFUSED__llamacpp_decode_over_vllmcpp_whole_completion": "not computed: dividing pure decode by whole completion compares two different quantities. PR #2940 records that exact mistake emitting 1.814x.",
+    "like_for_like_decode__llamacpp_over_vllmcpp_derived": {
+      "definition": "decode against decode; our side is DERIVED and labelled so",
+      "denominator": "vllm.cpp 5.397 tok/s decode, DERIVED from the slope",
+      "numerator": "llama.cpp 12.219 tok/s decode (carried constant, llama-bench -p 0)",
+      "value": 2.2641383941982354
+    },
+    "like_for_like_whole_completion__vllm_over_vllmcpp": {
+      "definition": "both are whole completion; this ratio is like-for-like",
+      "denominator": "vllm.cpp 5.305 tok/s whole completion (measured here)",
+      "numerator": "vLLM 6.734 tok/s whole completion (carried constant)",
+      "value": 1.269368520263902
+    }
+  },
+  "reference": {
+    "llamacpp_b10451_decode_tok_s": 12.219,
+    "llamacpp_b10451_decode_tok_s_landed_denominator": 12.233,
+    "note": "constants carried from earlier evidence; no leg of this run re-measured them",
+    "source": "docs/benchmarks/qwen38-27b-q4km-gfx1151.md (PR #2940) and docs/bench-evidence/rocm-strix-llamacpp-denominator-20260902.md",
+    "vllm_5559679229_decode_derived_tok_s": 11.056,
+    "vllm_5559679229_whole_completion_tok_s": 6.734
+  },
+  "token_gate": {
+    "deterministic_denominator": "none established on this path",
+    "every_divergence": "a near-tie at about 0.125 nats, one bf16 ULP",
+    "note": "these counts are constants carried from earlier evidence, not measured here",
+    "state": "FAIL",
+    "vllmcpp_vs_llamacpp_divergent_prompts": "3 of 6",
+    "vllmcpp_vs_vllm_compiled_divergent_prompts": "5 of 6"
+  }
+}
+fold_rc=0
+
+===== 7. what a reader must carry away with any number above =====
+2026-09-05T20:46:34Z
+TOKEN_GATE=FAIL. This is a SURVEY arm, not a parity result.
+  vllm.cpp ROCm arm vs llama.cpp b10451   3 of 6 prompts divergent
+  vllm.cpp ROCm arm vs vLLM (compiled)    5 of 6 prompts divergent
+Every divergence is a near-tie at about 0.125 nats, one bf16 ULP. Those counts
+are CONSTANTS carried from earlier evidence; no leg of this job re-measured them.
+NO DETERMINISTIC DENOMINATOR EXISTS ON THIS PATH.
+The `vllm-cli` tok_s figure is WHOLE COMPLETION, not decode. It may not be
+divided by `llama-bench -p 0`, which is pure decode.
+OUT=/workspace/strix-arm-2933/out
+=== ARM JOB DONE ===

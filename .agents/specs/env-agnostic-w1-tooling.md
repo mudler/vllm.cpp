@@ -269,7 +269,7 @@ leg used these defaults verbatim", and `scripts/dgx-gdn-packed-bridge-ab.sh:4`
 dates its prerequisites. That is the same instrument-identity argument that makes
 `scripts/mtp-k-gt-1-neartie-gap.py` provenance here.
 
-Owner: [#1308](https://github.com/mudler/vllm.cpp/issues/1308). No row owns it
+Owner: ISSUE-GH-1308. No row owns it
 yet, so this spec owns it here, which is what `AGENTS.md` requires of an issue
 filed and not fixed in the same flow.
 

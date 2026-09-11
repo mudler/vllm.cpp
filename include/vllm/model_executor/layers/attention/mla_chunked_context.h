@@ -45,6 +45,8 @@
 #define VLLM_MODEL_EXECUTOR_LAYERS_ATTENTION_MLA_CHUNKED_CONTEXT_H_
 
 #include <algorithm>
+#include <optional>
+#include "vllm/model_executor/layers/attention/attention.h"
 #include <cstdint>
 #include <functional>
 #include <stdexcept>
@@ -359,9 +361,12 @@ inline void ForwardMlaPrefillMha(vt::Queue& q, vt::Tensor& output, const vt::Ten
   args.causal = true;
   args.max_seqlen_q = max_query_len;
   args.max_seqlen_k = max_query_len;
-  if (sliding_window > 0) {
-    args.window_size = vt::AttentionWindow{static_cast<int32_t>(sliding_window - 1), 0};
-  }
+  // ENG-ATTENTION-WINDOW W2 (#2388): see the sibling sites -- one window rule,
+  // one place, and this one now obeys `--disable-sliding-window` too.
+  args.window_size = vllm::ResolveAttentionWindow(
+      /*per_layer=*/std::nullopt,
+      sliding_window > 0 ? std::optional<int64_t>(sliding_window) : std::nullopt,
+      vllm::v1::AttentionType::kDecoder, vllm::DisableSlidingWindowActive());
   vt::Tensor& new_out = has_context ? suffix_output : output;
   vt::MlaPrefillAttention(q, new_out, has_context ? &suffix_lse : nullptr, query, key, value,
                           cu_seqlens_q, cu_seqlens_q, args);

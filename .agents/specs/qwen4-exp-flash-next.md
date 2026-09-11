@@ -4069,6 +4069,39 @@ All six mutations were re-run after this refactor.
 
 ## Owed
 
+### The CAUSE of the three disagreeing token ids ([#2999](https://github.com/mudler/vllm.cpp/issues/2999))
+
+**Narrowed on 2026-09-06, not closed.** `qwen4_exp` emits three different ids at
+indices 4, 6 and 7 between `--device cpu` and `--device cuda`, from one binary,
+one set of weights and — since #2612 — one algorithm on both sides. **Nothing
+measured on this row explains why those three.**
+
+Wave MOESEL-RESULT
+([reading](../../docs/bench-evidence/qwen4exp-moe-selection-fwd-20260906.md), `rc`
+job `9e0864da`) removed two candidate explanations from the unknown column and
+added none:
+
+- Expert selection at the disagreeing forwards **has now been read**, so the
+  standing "no instrument has observed a disagreeing step" clause is discharged.
+- The selection **does** flip between the arms, 296 of 576 slots, on a comparator
+  whose negative control flips nothing.
+- **The flips do not separate the two groups.** Forward 5 flips 48 of 48 slots and
+  its id agrees; forward 7 flips 48 of 48 and its id disagrees; forward 4
+  disagrees while flipping 33 of 48. A per-forward flip count is therefore not the
+  cause, in either direction.
+
+**The next traceable step.** The selection tap answers "did the chosen experts
+change". It does not answer "did the change move the logit `argmax` reads".
+Separating those needs a tap on the routed output or the final logit row at
+forwards 4, 6 and 7, compared against the four agreeing forwards, on the same
+matched pair. It needs the 68 GB released UD-IQ1_S artifact and a GPU for the CUDA
+arm, so it is a lease.
+
+**Two constraints on whoever takes it.** Do not read a flip count as a cause; that
+is the error this entry exists to prevent. Do not publish a `rel(sumabs)` ratio for
+any of it, because that axis is a difference of norms and cannot rank magnitudes
+(§"needs a DIFFERENCE-NORM axis").
+
 ### The CPU-vs-CUDA TOKEN-IDENTITY objective is UNREACHABLE AS WRITTEN (#2831)
 
 ### The `VT_Q4EXP_LAYER_FP` tap needs a DIFFERENCE-NORM axis ([#2877](https://github.com/mudler/vllm.cpp/issues/2877))
@@ -4169,7 +4202,11 @@ The instrument did not stop short.
 
 Reaching a disagreeing step with `VT_MOE_SEL_FP` therefore needs no code change
 and no budget larger than MOEDIV already spent. What it needs is a non-degenerate
-CUDA arm, which #2550 and #2612 have since supplied.
+CUDA arm, which #2550 and #2612 have since supplied. **That run was taken on
+2026-09-06** ([#2998](https://github.com/mudler/vllm.cpp/issues/2998),
+[reading](../../docs/bench-evidence/qwen4exp-moe-selection-fwd-20260906.md)): 384
+calls again, `HIGHEST FORWARD REACHED = 7`, and 296 of 576 flipped slots against a
+negative control that flips none.
 
 ### The ARMTOKENS raw fingerprints survive on the fleet share ([#2877](https://github.com/mudler/vllm.cpp/issues/2877), [#2969](https://github.com/mudler/vllm.cpp/issues/2969))
 
@@ -4199,32 +4236,71 @@ record surface. A reading taken from those files must still respect
 re-render may state which taps are bit-identical and in what order they stop
 being so, and it may not publish a ratio.
 
-### The MoE residue is NOT closed: the layer-0 flip question is unmeasured ([#2877](https://github.com/mudler/vllm.cpp/issues/2877))
+### The layer-0 flip question is ANSWERED; the residue is still NOT closed ([#2877](https://github.com/mudler/vllm.cpp/issues/2877), [#2998](https://github.com/mudler/vllm.cpp/issues/2998))
 
-[#2552](https://github.com/mudler/vllm.cpp/issues/2552) brackets the layer-0
+[#2552](https://github.com/mudler/vllm.cpp/issues/2552) bracketed the layer-0
 expert-flip threshold between `2.139e-05` (selections agree on all five tokens) and
 `4.999e-04` (layer 0 already flips at token 2). The algorithm-matched pair that
 #2870 measured — CPU-chunked vs CUDA-chunked — has `L00 mhc.mix` at **`4.324e-05`,
-inside that bracket**, and `VT_MOE_SEL_FP` was **not run on it**. So it is unknown
-whether the `2.289e-04` reading contains a layer-0 selection flip at all, which is
-what would separate the bimodal top-k term from the keep-quant expert GEMM's
-reassociation term. **One `VT_MOE_SEL_FP` run on that pair is the next traceable
-step.** It needs the 68 GB artifact and a GPU for the CUDA arm; it was deliberately
-not spent from a contended fleet on a refinement no published headline depends on.
-Nothing here treats the residue as diagnosed: #2552 named both floor terms and
-found both to be faithful mirrors, and **the three disagreeing token ids at indices
-4, 6 and 7 remain unexplained by anything measured on this row.**
+inside that bracket**. **`VT_MOE_SEL_FP` HAS NOW BEEN RUN ON IT**
+([evidence](../../docs/bench-evidence/qwen4exp-moe-selection-fwd-20260906.md), `rc`
+job `9e0864da`, `thor:gpu0`, 2026-09-06T02:21:41Z, `exit_code = 0`, every stage
+`SUM ..._RC=0`).
+
+**The answer is NO FLIP.** All five prefill tokens select the same ten experts on
+both arms with an equal `sel` digest, at boundary margins of 4, 2, 1, 1 and 0 ulps,
+with the pair identity asserted at call 0 (`x` 3615.47142 against 3615.62777) so a
+run on the wrong pair would report as such. **The no-flip bound therefore lifts
+from `2.139e-05` to `4.324e-05`**, and the threshold now sits between `4.324e-05`
+(no flip) and `4.999e-04` (flip).
+
+**That makes the separation #2877 recorded as unknown, at layer 0.** The matched
+pair's layer-0 MoE residue contains no selection flip, so the bimodal top-k term is
+not what produces it there; the keep-quant grouped expert GEMM's scale-sum
+reassociation is what remains. **Read the scope exactly**: layer 0, this pair, the
+prefill. The other 47 layers flip heavily from forward 0 onward — forward 0's first
+flip is at layer 4 — so this is not a claim that the top-k term is inert anywhere
+else.
 
 **Wave MOESEL ([#2969](https://github.com/mudler/vllm.cpp/issues/2969)) narrowed
-what that run costs, and did not take the reading.** The same budget answers both
+what that run costs; wave MOESEL-RESULT read it.** The same budget answered both
 open questions at once, because 384 MoE calls is eight forwards and forward 4
-begins at call 192. So one lease returns the layer-0 bracket placement and the
-selection state at forwards 4, 6 and 7 together, rather than the bracket alone.
-The wave qualified the comparator against committed MOEDIV output first, where it
-reproduces both the `L00 mhc.mix` pair 3613.82031 against 3615.62777 and the
-recorded flip at token 2. The run against a non-degenerate CUDA arm is
-[submitted and its state is recorded in the evidence](../../docs/bench-evidence/qwen4exp-moe-selection-forward4-20260905.md).
-**No reading on the matched pair is claimed by that wave.**
+begins at call 192, so one lease returned the layer-0 bracket placement and the
+selection state at forwards 4, 6 and 7 together. MOESEL qualified the comparator
+against committed MOEDIV output first, where it reproduces both the `L00 mhc.mix`
+pair 3613.82031 against 3615.62777 and the recorded flip at token 2, and that
+qualification is what licenses the reading.
+
+**THE INSTRUMENT HAS NOW OBSERVED THE DISAGREEING FORWARDS.** `HIGHEST FORWARD
+REACHED = 7`, on a comparator whose negative control (the same CPU arm run twice)
+flips **0** slots on all 8 forwards. The selection flips extensively between the
+arms: **296 of 576 slots**.
+
+**AND THE FLIPS DO NOT EXPLAIN THE DISAGREEING IDS.** This is the result's most
+important limit, and it is an inversion rather than a weak signal:
+
+| fwd | 0 | 1 | 2 | 3 | **4** | 5 | **6** | **7** |
+|---|---|---|---|---|---|---|---|---|
+| flipped slots | 53/240 | 22/48 | 29/48 | 17/48 | **33/48** | 48/48 | **46/48** | **48/48** |
+| sampled ids agree | yes | yes | yes | yes | **no** | yes | **no** | **no** |
+
+**Forward 5 flips every expert slot in all 48 layers and its id AGREES. Forward 7
+flips every slot and its id DISAGREES.** Two forwards with an identical selection
+verdict land on opposite sides of the token verdict, and the least-flipping
+disagreeing forward (4, at 33/48) flips less than agreeing forward 5. Grouped, the
+disagreeing forwards flip 127 of 144 slots and the agreeing ones 116 of 192. **A
+flip count separates nothing here, in either direction.** The flip rate rises
+roughly with decode depth on both populations, which is consistent with divergence
+accumulating in the recurrent and KV state, but that is an observation and not a
+mechanism.
+
+**So the residue is still NOT closed and the position is unchanged: the three
+disagreeing token ids at indices 4, 6 and 7 remain unexplained by anything measured
+on this row.** They are narrowed, not explained. The next traceable step is a tap on
+the routed output or the final logit row at the disagreeing forwards on the same
+matched pair, because the selection tap reads which experts were chosen and not
+whether the choice moved the value `argmax` reads. It needs the 68 GB artifact and a
+GPU. Owed under [#2999](https://github.com/mudler/vllm.cpp/issues/2999).
 
 **The position.** The standing objective — `qwen4_exp` emits the CPU control
 sequence `11751 13 15767 411 2029 11 1092 369` on a GPU, in the production
@@ -4274,9 +4350,14 @@ simply never observe it. **CORRECTION
 ([#2969](https://github.com/mudler/vllm.cpp/issues/2969)): this sentence said "no
 instrument", and that is wrong for the other tap.** `VT_MOE_SEL_FP` counts MoE
 block invocations and not forwards, so its 384-call window does reach forwards 4,
-6 and 7. The reading taken there is still VOID, because that run's CUDA arm
-answered the degenerate pre-#2550 sequence `11751 271 271 271 271 271 0 0`.
-**What is missing is a non-degenerate arm, not a wider window.** **(b)** `rel(sumabs)` is a difference of NORMS, not a norm of
+6 and 7. MOEDIV's reading there is VOID, because that run's CUDA arm answered the
+degenerate pre-#2550 sequence `11751 271 271 271 271 271 0 0`. What was missing
+was a non-degenerate arm, not a wider window. **SECOND CORRECTION 2026-09-06
+([#2998](https://github.com/mudler/vllm.cpp/issues/2998)): the non-degenerate arm
+has been run and forwards 4, 6 and 7 are read.** They flip 127 of 144 expert
+slots, and the four agreeing forwards flip 116 of 192, so **the observation does
+not restore the attribution this bullet withdrew** — see §"The layer-0 flip
+question is ANSWERED" above for why a flip count separates nothing. **(b)** `rel(sumabs)` is a difference of NORMS, not a norm of
 DIFFERENCES, and its under-report is a DISTRIBUTION rather than the `~122x` single
 seed draw this line first quoted: over 400 seeds at `n = 12800` the median is
 75x (sigma 1e-3) to 140x (sigma 1e-4), p05..p95 34..1500, and at a **fixed**
@@ -4301,11 +4382,19 @@ sequential lands `1.15e-08` — and it is not a defect. The residue's mechanism 
 already named by
 [#2552](https://github.com/mudler/vllm.cpp/issues/2552) — the keep-quant grouped
 expert GEMM's reassociation plus a bimodal top-k term at a 32.9% exact-tie rate,
-both floors, both faithful mirrors and neither a defect. **NOT CLOSED:** the
-matched pair's `4.324e-05` lands inside #2552's layer-0 flip bracket
-(2.139e-05 no flip .. 4.999e-04 flip) and `VT_MOE_SEL_FP` was never run on it.
-That run, and a fingerprint budget that reaches forward 7, are the next two
-measurements; both need the 68 GB artifact and a GPU.
+both floors, both faithful mirrors and neither a defect. **STILL NOT CLOSED, for
+a narrower reason since 2026-09-06** ([#2998](https://github.com/mudler/vllm.cpp/issues/2998),
+[the reading](../../docs/bench-evidence/qwen4exp-moe-selection-fwd-20260906.md)):
+this sentence said the matched pair's `4.324e-05` lands inside #2552's layer-0
+flip bracket (2.139e-05 no flip .. 4.999e-04 flip) and that `VT_MOE_SEL_FP` was
+never run on it. **It has been run: layer 0 does NOT flip, so the no-flip bound
+lifts to `4.324e-05`, and the layer-0 residue at this pair is the keep-quant
+expert GEMM's reassociation rather than the top-k term.** What remains open is the
+cause of the three disagreeing ids, and this reading does not supply it: selection
+flipping is pervasive on the agreeing forwards too, and forward 5 flips 48 of 48
+slots while its id agrees. Owed under
+[#2999](https://github.com/mudler/vllm.cpp/issues/2999); it needs the 68 GB
+artifact and a GPU.
 
 **Why this section exists at all.** The *cause* was already recorded (§Wave
 PREFILLDIV, and the evidence file above). The two dead-end *routes* were not, and
@@ -4636,13 +4725,13 @@ needs to claim bit-identity should compare bytes, not an aggregate.
   and the reconciliation NEITHER branch contains: what now blocks a CUDA forward
   is the QSA block's three host reads, not op registration and not the loader.
 
-- **A CI DEFECT FOUND IN FLOW, AND MAIN FIXED IT BETTER. #2407 IS A DUPLICATE.**
+- **A CI DEFECT FOUND IN FLOW, AND MAIN FIXED IT BETTER. ISSUE-GH-2407 IS A DUPLICATE.**
   `agent-record` failed on EVERY pull request: `.github/workflows/ci.yml` still
   ran `tests/scripts/test_check_issue_index_append_only.py`, which `7dc2ef1ea`
   deleted when it retired the append-only index, so the job printed
   `agent record OK: ENGINE=173 MODEL=379 ...` and then exited 2 on a missing
   file -- the gate green, the check red. This wave filed
-  [#2407](https://github.com/mudler/vllm.cpp/issues/2407) and DELETED the line.
+  ISSUE-GH-2407 and DELETED the line.
   **`origin/main` `df2ad6d84` ([#2371](https://github.com/mudler/vllm.cpp/issues/2371),
   #2373) had independently REDIRECTED it instead**, to
   `tests/scripts/test_agent_issue_index.py`.
@@ -4652,7 +4741,7 @@ needs to claim bit-identity should compare bytes, not an aggregate.
   `scripts/agent-issue-index.py` -- the derived renderer that REPLACED the
   retired index. So main's fix is BROADER than this wave's, not narrower. The
   merged `ci.yml` is byte-identical to main's, this branch carries no CI change,
-  and #2407 closes as a duplicate of #2371 rather than as work this row did.
+  and ISSUE-GH-2407 closes as a duplicate of #2371 rather than as work this row did.
 
 - **W6-CUDA-B LANDS FOUR CUDA ARMS THAT NOTHING REACHES, AND ONE BLOCKER
   REMAINS. ISSUE OWED.** `vt::Qwen4ExpGatedResidual`, `vt::RmsNormGroup`,
@@ -4664,13 +4753,13 @@ needs to claim bit-identity should compare bytes, not an aggregate.
   step can reach a CUDA queue. The wiring is owned by row `MODEL-MM-QWEN4-EXP`
   under campaign [#1978](https://github.com/mudler/vllm.cpp/issues/1978),
   tracked by [#2031](https://github.com/mudler/vllm.cpp/issues/2031) and by
-  this wave's own [#2380](https://github.com/mudler/vllm.cpp/issues/2380).
+  this wave's own ISSUE-GH-2380.
   **THAT ISSUE EXISTS, WHICH THE PREVIOUS FIVE WAVES ON THIS ROW COULD NOT
   MANAGE, AND THE REASON IS WORTH RECORDING.** Every entry above says the `gh`
   token is invalid on this host and cites `gh api user` returning 403. On
   2026-08-31 it returns **200** for `localai-org-maint-bot` and `gh issue create`
   succeeds. What is still true is the OTHER half of that story: `gh issue view
-  2031` returns "Could not resolve to an issue", and #2379 explains why — those
+  2031` returns "Could not resolve to an issue", and ISSUE-GH-2379 explains why — those
   issues were created by an account that has since been suspended, and GitHub
   HIDES a suspended account's content rather than deleting it. So the numbers
   this spec cites dangle for a reader even though the API is writable again.

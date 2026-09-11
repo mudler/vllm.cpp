@@ -1,0 +1,8 @@
+{
+  "image_id": "828575f512a17ddbf74d140737b1a6434be192e62c900bc804379c6f5f875e7f",
+  "env": [
+    "container=podman",
+    "DEBIAN_FRONTEND=noninteractive",
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  ]
+}

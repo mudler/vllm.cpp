@@ -1,0 +1,52 @@
+Hit:1 http://archive.ubuntu.com/ubuntu noble InRelease
+Hit:2 http://archive.ubuntu.com/ubuntu noble-updates InRelease
+Hit:3 http://security.ubuntu.com/ubuntu noble-security InRelease
+Hit:4 http://archive.ubuntu.com/ubuntu noble-backports InRelease
+Hit:5 https://repo.radeon.com/rocm/apt/7.2.4 noble InRelease
+Reading package lists...
+Reading package lists...
+Building dependency tree...
+Reading state information...
+The following NEW packages will be installed:
+  hsa-amd-aqlprofile libdw1t64
+0 upgraded, 2 newly installed, 0 to remove and 38 not upgraded.
+Need to get 477 kB of archives.
+After this operation, 2558 kB of additional disk space will be used.
+Get:1 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libdw1t64 amd64 0.190-1.1ubuntu0.1 [261 kB]
+Get:2 https://repo.radeon.com/rocm/apt/7.2.4 noble/main amd64 hsa-amd-aqlprofile amd64 1.0.0.70204-93~24.04 [216 kB]
+debconf: delaying package configuration, since apt-utils is not installed
+Fetched 477 kB in 1s (837 kB/s)
+Selecting previously unselected package hsa-amd-aqlprofile.
+(Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 24217 files and directories currently installed.)
+Preparing to unpack .../hsa-amd-aqlprofile_1.0.0.70204-93~24.04_amd64.deb ...
+Unpacking hsa-amd-aqlprofile (1.0.0.70204-93~24.04) ...
+Selecting previously unselected package libdw1t64:amd64.
+Preparing to unpack .../libdw1t64_0.190-1.1ubuntu0.1_amd64.deb ...
+Unpacking libdw1t64:amd64 (0.190-1.1ubuntu0.1) ...
+Setting up hsa-amd-aqlprofile (1.0.0.70204-93~24.04) ...
+Setting up libdw1t64:amd64 (0.190-1.1ubuntu0.1) ...
+Processing triggers for libc-bin (2.39-0ubuntu8.8) ...
+	linux-vdso.so.1 (0x00007ecaff1d0000)
+	libamd_comgr.so.3 => /opt/rocm/lib/libamd_comgr.so.3 (0x00007ecaf5053000)
+	libhsa-amd-aqlprofile64.so.1 => /opt/rocm/lib/libhsa-amd-aqlprofile64.so.1 (0x00007ecaf4fc2000)
+	libdrm.so.2 => /lib/x86_64-linux-gnu/libdrm.so.2 (0x00007ecaf4fa8000)
+	libdrm_amdgpu.so.1 => /lib/x86_64-linux-gnu/libdrm_amdgpu.so.1 (0x00007ecaf4f9b000)
+	libdw.so.1 => /lib/x86_64-linux-gnu/libdw.so.1 (0x00007ecaf4ee7000)
+	libstdc++.so.6 => /lib/x86_64-linux-gnu/libstdc++.so.6 (0x00007ecaf4c67000)
+	libgcc_s.so.1 => /lib/x86_64-linux-gnu/libgcc_s.so.1 (0x00007ecaf4c39000)
+	libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007ecaf4a27000)
+	/lib64/ld-linux-x86-64.so.2 (0x00007ecaff1d2000)
+	libz.so.1 => /lib/x86_64-linux-gnu/libz.so.1 (0x00007ecaf4a0b000)
+	libzstd.so.1 => /lib/x86_64-linux-gnu/libzstd.so.1 (0x00007ecaf4951000)
+	libm.so.6 => /lib/x86_64-linux-gnu/libm.so.6 (0x00007ecaf4868000)
+	libhsa-runtime64.so.1 => /opt/rocm/lib/libhsa-runtime64.so.1 (0x00007ecaf4456000)
+	libelf.so.1 => /lib/x86_64-linux-gnu/libelf.so.1 (0x00007ecaf4437000)
+	liblzma.so.5 => /lib/x86_64-linux-gnu/liblzma.so.5 (0x00007ecaf4405000)
+	libbz2.so.1.0 => /lib/x86_64-linux-gnu/libbz2.so.1.0 (0x00007ecaf43f1000)
+	librocprofiler-register.so.0 => /opt/rocm/lib/librocprofiler-register.so.0 (0x00007ecaf4362000)
+	libnuma.so.1 => /lib/x86_64-linux-gnu/libnuma.so.1 (0x00007ecaf4352000)
+W20260907 10:29:24.059242 123885109760512 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000567 sec
+W20260907 10:29:24.059295 123885109760512 simple_timer.cpp:55] [rocprofv3] '/bin/true' ::     0.000000 sec
+W20260907 10:29:24.059299 123885109760512 simple_timer.cpp:55] [rocprofv3] '/bin/true' ::     0.000004 sec
+W20260907 10:29:24.059567 123885109760512 simple_timer.cpp:55] [rocprofv3] output generation ::     0.000154 sec
+W20260907 10:29:24.059580 123885109760512 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.000257 sec

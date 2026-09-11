@@ -521,7 +521,7 @@ mistake the silence for absence, and contradicts none of it.
   [`.agents/kernel-matrix.md`](../kernel-matrix.md) — *"the launcher guard rejects
   its `Hv=32` shape anyway"* — stays wrong, because `TryTritonPackedDecode` accepts
   `Hv=32` and dispatches `gdn_decode_h32_default` (`cuda_gdn.cu:5207`, `:5239`).
-- [#1170](https://github.com/mudler/vllm.cpp/issues/1170) — all four GDN Triton
+- ISSUE-GH-1170 — all four GDN Triton
   AOT arms are pinned to 48 or 32 linear V-heads, so `Qwen3.8-2.4T-A95B` (128)
   runs the hand CUDA kernels the vendoring exists to replace. Not measurable on
   this hardware.

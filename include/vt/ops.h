@@ -3021,9 +3021,20 @@ void QuantFp8Group(Queue& q, Tensor& out_fp8, Tensor& out_scale, const Tensor& x
 // (scaled_mm_helper.hpp:54), so this mirrors a refusal rather than deferring a
 // feature.
 //
-// CPU only. A CORRECTNESS REFERENCE, NOT A PERFORMANCE PATH — it is the
-// numerical oracle #1189 milestone M5's CUTLASS kernel is measured against, and
-// it makes no speed claim. M5 owns the CUDA arm.
+// CPU + CUDA, and the CUDA arm is NARROW. This line read "CPU only" until W9d
+// (#2881) and had been stale since #1189 milestone M5 (`489a9a4c0`) landed
+// `src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu`. That TU is compiled only for
+// the `cutlass-fp8` arch cell `12.0a,12.1a` (cmake/CudaArchFeatures.cmake), so
+// its registrar runs only there and the op is genuinely UNREGISTERED on every
+// other CUDA arch — sm_110 and sm_87 among them. `dense_fp8_block::
+// BlockFp8Runnable` is the runtime question and `RefuseUnrunnableFp8BlockWeight`
+// is the message; neither reads this comment, which is why the comment could
+// drift for as long as it did.
+//
+// The CPU arm is A CORRECTNESS REFERENCE, NOT A PERFORMANCE PATH — it is the
+// numerical oracle the CUTLASS kernel is measured against, and it makes no
+// speed claim. That kernel has still never executed on hardware
+// (.agents/specs/vt-matmul-fp8-block-cuda.md).
 void MatmulFp8BlockScaled(Queue& q, Tensor& out, const Tensor& a_fp8, const Tensor& a_scale,
                           const Tensor& b_fp8, const Tensor& b_scale, int block_n,
                           int block_k);

@@ -1,0 +1,237 @@
+W20260907 10:53:32.378475 131853560036544 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.002723 sec
+W20260907 10:53:32.388447 131853560036544 tool.cpp:2422] HIP (runtime) version 7.2.0 initialized (instance=0)
+W20260907 10:53:32.398043 131853560036544 tool.cpp:2422] HSA version 8.20.4 initialized (instance=0)
+W20260907 10:53:32.404868 131853560036544 simple_timer.cpp:55] [rocprofv3] '/tmp/strix-3015-4fdrfcj3/build-vllmcpp/examples/vllm-cli --model /tmp/strix-3015-4fdrfcj3/Qwen3.8-27B-Q4_K_M.gguf --prompt The capital of France is --max-tokens 64 --temperature 0 --repeat 1 --max-num-seqs 1' ::     0.000000 sec
+vllm-cli: loading model from /tmp/strix-3015-4fdrfcj3/Qwen3.8-27B-Q4_K_M.gguf
+engine: device placement: --fit resolved NO placement: the model has no routed-expert layers, so a placement has nothing to move
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+E20260907 10:54:01.458515 131853514176192 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (850555227830954 > 850555227828417) :: difference=2537. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E20260907 10:54:01.458730 131853514176192 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (850555228047684 > 850555228043630) :: difference=4054. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E20260907 10:54:01.459958 131853514176192 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (850555229282645 > 850555229273723) :: difference=8922. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+[vt op-provider] op=4 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=77 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=1 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=83 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=88 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=5 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=89 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=76 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=10 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=9 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=84 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=63 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=78 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=64 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=28 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=38 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=69 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+E20260907 10:54:02.269317 131853514176192 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (850556038636305 > 850556038634002) :: difference=2303. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+[vt op-provider] op=40 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=6 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=11 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+E20260907 10:54:02.814199 131853514176192 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (850556583460128 > 850556583446565) :: difference=13563. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E20260907 10:54:03.025542 131853514176192 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (850556794856153 > 850556794854743) :: difference=1410. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E20260907 10:54:03.034534 131853514176192 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (850556803847921 > 850556803843271) :: difference=4650. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E20260907 10:54:03.068541 131853514176192 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (850556837848141 > 850556837847247) :: difference=894. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E20260907 10:54:03.270195 131853514176192 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (850557039496496 > 850557039491683) :: difference=4813. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E20260907 10:54:03.270319 131853514176192 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (850557039640188 > 850557039637122) :: difference=3066. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E20260907 10:54:03.412547 131853514176192 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (850557181859507 > 850557181858510) :: difference=997. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E20260907 10:54:03.605848 131853514176192 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (850557375141742 > 850557375138829) :: difference=2913. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E20260907 10:54:03.641543 131853514176192 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (850557410859222 > 850557410856259) :: difference=2963. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E20260907 10:54:03.737432 131853514176192 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (850557506737691 > 850557506733524) :: difference=4167. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E20260907 10:54:03.905868 131853514176192 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (850557675170509 > 850557675168062) :: difference=2447. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+E20260907 10:54:04.113583 131853514176192 profiling_time.hpp:124] hsa_amd_profiling_get_dispatch_time returned dispatch times where the start time is after end time (850557882880208 > 850557882873364) :: difference=6844. Swapping the values. Set the environment variable ROCPROFILER_CI_STRICT_TIMESTAMPS=1 to cause a failure instead
+HW Exception by GPU node-1 (Agent handle: 0x61f55dc25f80) reason :GPU Hang
+W20260907 10:54:06.444157 131853505783488 tool.cpp:3104] [PPID=0][PID=1][TID=8][rocprofv3_error_signal_handler] rocprofv3 caught signal 6...
+W20260907 10:54:06.444697 131853505783488 tool.cpp:3127] [PPID=0][PID=1][TID=8][rocprofv3_error_signal_handler] rocprofv3 will wait for 0 children to exit
+W20260907 10:54:06.444717 131853505783488 tool.cpp:3142] [PPID=0][PID=1][TID=8][rocprofv3_error_signal_handler] rocprofv3 finalizing after signal 6...
+W20260907 10:54:11.444730 131853505783488 queue.cpp:938] Timeout while waiting for queue sync: 88 kernels still active
+W20260907 10:54:11.445339 131853505783488 pool.hpp:201] Pool object at index 2871 is still in use during pool clear
+W20260907 10:54:11.445342 131853505783488 pool.hpp:201] Pool object at index 2872 is still in use during pool clear
+W20260907 10:54:11.445343 131853505783488 pool.hpp:201] Pool object at index 2873 is still in use during pool clear
+W20260907 10:54:11.445344 131853505783488 pool.hpp:201] Pool object at index 2874 is still in use during pool clear
+W20260907 10:54:11.445345 131853505783488 pool.hpp:201] Pool object at index 2875 is still in use during pool clear
+W20260907 10:54:11.445346 131853505783488 pool.hpp:201] Pool object at index 2876 is still in use during pool clear
+W20260907 10:54:11.445347 131853505783488 pool.hpp:201] Pool object at index 2877 is still in use during pool clear
+W20260907 10:54:11.445347 131853505783488 pool.hpp:201] Pool object at index 2878 is still in use during pool clear
+W20260907 10:54:11.445348 131853505783488 pool.hpp:201] Pool object at index 2879 is still in use during pool clear
+W20260907 10:54:11.445349 131853505783488 pool.hpp:201] Pool object at index 2880 is still in use during pool clear
+W20260907 10:54:11.445350 131853505783488 pool.hpp:201] Pool object at index 2881 is still in use during pool clear
+W20260907 10:54:11.445351 131853505783488 pool.hpp:201] Pool object at index 2882 is still in use during pool clear
+W20260907 10:54:11.445352 131853505783488 pool.hpp:201] Pool object at index 2883 is still in use during pool clear
+W20260907 10:54:11.445353 131853505783488 pool.hpp:201] Pool object at index 2884 is still in use during pool clear
+W20260907 10:54:11.445354 131853505783488 pool.hpp:201] Pool object at index 2885 is still in use during pool clear
+W20260907 10:54:11.445354 131853505783488 pool.hpp:201] Pool object at index 2886 is still in use during pool clear
+W20260907 10:54:11.445355 131853505783488 pool.hpp:201] Pool object at index 2887 is still in use during pool clear
+W20260907 10:54:11.445356 131853505783488 pool.hpp:201] Pool object at index 2888 is still in use during pool clear
+W20260907 10:54:11.445357 131853505783488 pool.hpp:201] Pool object at index 2889 is still in use during pool clear
+W20260907 10:54:11.445357 131853505783488 pool.hpp:201] Pool object at index 2890 is still in use during pool clear
+W20260907 10:54:11.445358 131853505783488 pool.hpp:201] Pool object at index 2891 is still in use during pool clear
+W20260907 10:54:11.445359 131853505783488 pool.hpp:201] Pool object at index 2892 is still in use during pool clear
+W20260907 10:54:11.445360 131853505783488 pool.hpp:201] Pool object at index 2893 is still in use during pool clear
+W20260907 10:54:11.445361 131853505783488 pool.hpp:201] Pool object at index 2894 is still in use during pool clear
+W20260907 10:54:11.445361 131853505783488 pool.hpp:201] Pool object at index 2895 is still in use during pool clear
+W20260907 10:54:11.445362 131853505783488 pool.hpp:201] Pool object at index 2896 is still in use during pool clear
+W20260907 10:54:11.445363 131853505783488 pool.hpp:201] Pool object at index 2897 is still in use during pool clear
+W20260907 10:54:11.445364 131853505783488 pool.hpp:201] Pool object at index 2898 is still in use during pool clear
+W20260907 10:54:11.445364 131853505783488 pool.hpp:201] Pool object at index 2899 is still in use during pool clear
+W20260907 10:54:11.445365 131853505783488 pool.hpp:201] Pool object at index 2900 is still in use during pool clear
+W20260907 10:54:11.445366 131853505783488 pool.hpp:201] Pool object at index 2901 is still in use during pool clear
+W20260907 10:54:11.445367 131853505783488 pool.hpp:201] Pool object at index 2902 is still in use during pool clear
+W20260907 10:54:11.445367 131853505783488 pool.hpp:201] Pool object at index 2903 is still in use during pool clear
+W20260907 10:54:11.445368 131853505783488 pool.hpp:201] Pool object at index 2904 is still in use during pool clear
+W20260907 10:54:11.445369 131853505783488 pool.hpp:201] Pool object at index 2905 is still in use during pool clear
+W20260907 10:54:11.445370 131853505783488 pool.hpp:201] Pool object at index 2906 is still in use during pool clear
+W20260907 10:54:11.445371 131853505783488 pool.hpp:201] Pool object at index 2907 is still in use during pool clear
+W20260907 10:54:11.445371 131853505783488 pool.hpp:201] Pool object at index 2908 is still in use during pool clear
+W20260907 10:54:11.445372 131853505783488 pool.hpp:201] Pool object at index 2909 is still in use during pool clear
+W20260907 10:54:11.445373 131853505783488 pool.hpp:201] Pool object at index 2910 is still in use during pool clear
+W20260907 10:54:11.445374 131853505783488 pool.hpp:201] Pool object at index 2911 is still in use during pool clear
+W20260907 10:54:11.445375 131853505783488 pool.hpp:201] Pool object at index 2912 is still in use during pool clear
+W20260907 10:54:11.445376 131853505783488 pool.hpp:201] Pool object at index 2913 is still in use during pool clear
+W20260907 10:54:11.445376 131853505783488 pool.hpp:201] Pool object at index 2914 is still in use during pool clear
+W20260907 10:54:11.445377 131853505783488 pool.hpp:201] Pool object at index 2915 is still in use during pool clear
+W20260907 10:54:11.445378 131853505783488 pool.hpp:201] Pool object at index 2916 is still in use during pool clear
+W20260907 10:54:11.445379 131853505783488 pool.hpp:201] Pool object at index 2917 is still in use during pool clear
+W20260907 10:54:11.445380 131853505783488 pool.hpp:201] Pool object at index 2918 is still in use during pool clear
+W20260907 10:54:11.445380 131853505783488 pool.hpp:201] Pool object at index 2919 is still in use during pool clear
+W20260907 10:54:11.445381 131853505783488 pool.hpp:201] Pool object at index 2920 is still in use during pool clear
+W20260907 10:54:11.445382 131853505783488 pool.hpp:201] Pool object at index 2921 is still in use during pool clear
+W20260907 10:54:11.445383 131853505783488 pool.hpp:201] Pool object at index 2922 is still in use during pool clear
+W20260907 10:54:11.445383 131853505783488 pool.hpp:201] Pool object at index 2923 is still in use during pool clear
+W20260907 10:54:11.445384 131853505783488 pool.hpp:201] Pool object at index 2924 is still in use during pool clear
+W20260907 10:54:11.445385 131853505783488 pool.hpp:201] Pool object at index 2925 is still in use during pool clear
+W20260907 10:54:11.445386 131853505783488 pool.hpp:201] Pool object at index 2926 is still in use during pool clear
+W20260907 10:54:11.445386 131853505783488 pool.hpp:201] Pool object at index 2927 is still in use during pool clear
+W20260907 10:54:11.445387 131853505783488 pool.hpp:201] Pool object at index 2928 is still in use during pool clear
+W20260907 10:54:11.445388 131853505783488 pool.hpp:201] Pool object at index 2929 is still in use during pool clear
+W20260907 10:54:11.445389 131853505783488 pool.hpp:201] Pool object at index 2930 is still in use during pool clear
+W20260907 10:54:11.445390 131853505783488 pool.hpp:201] Pool object at index 2931 is still in use during pool clear
+W20260907 10:54:11.445390 131853505783488 pool.hpp:201] Pool object at index 2932 is still in use during pool clear
+W20260907 10:54:11.445391 131853505783488 pool.hpp:201] Pool object at index 2933 is still in use during pool clear
+W20260907 10:54:11.445392 131853505783488 pool.hpp:201] Pool object at index 2934 is still in use during pool clear
+W20260907 10:54:11.445393 131853505783488 pool.hpp:201] Pool object at index 2935 is still in use during pool clear
+W20260907 10:54:11.445394 131853505783488 pool.hpp:201] Pool object at index 2936 is still in use during pool clear
+W20260907 10:54:11.445395 131853505783488 pool.hpp:201] Pool object at index 2937 is still in use during pool clear
+W20260907 10:54:11.445395 131853505783488 pool.hpp:201] Pool object at index 2938 is still in use during pool clear
+W20260907 10:54:11.445396 131853505783488 pool.hpp:201] Pool object at index 2939 is still in use during pool clear
+W20260907 10:54:11.445397 131853505783488 pool.hpp:201] Pool object at index 2940 is still in use during pool clear
+W20260907 10:54:11.445398 131853505783488 pool.hpp:201] Pool object at index 2941 is still in use during pool clear
+W20260907 10:54:11.445399 131853505783488 pool.hpp:201] Pool object at index 2942 is still in use during pool clear
+W20260907 10:54:11.445400 131853505783488 pool.hpp:201] Pool object at index 2943 is still in use during pool clear
+W20260907 10:54:11.445401 131853505783488 pool.hpp:201] Pool object at index 2944 is still in use during pool clear
+W20260907 10:54:11.445402 131853505783488 pool.hpp:201] Pool object at index 2945 is still in use during pool clear
+W20260907 10:54:11.445403 131853505783488 pool.hpp:201] Pool object at index 2946 is still in use during pool clear
+W20260907 10:54:11.445404 131853505783488 pool.hpp:201] Pool object at index 2947 is still in use during pool clear
+W20260907 10:54:11.445404 131853505783488 pool.hpp:201] Pool object at index 2948 is still in use during pool clear
+W20260907 10:54:11.445405 131853505783488 pool.hpp:201] Pool object at index 2949 is still in use during pool clear
+W20260907 10:54:11.445406 131853505783488 pool.hpp:201] Pool object at index 2950 is still in use during pool clear
+W20260907 10:54:11.445406 131853505783488 pool.hpp:201] Pool object at index 2951 is still in use during pool clear
+W20260907 10:54:11.445407 131853505783488 pool.hpp:201] Pool object at index 2952 is still in use during pool clear
+W20260907 10:54:11.445408 131853505783488 pool.hpp:201] Pool object at index 2953 is still in use during pool clear
+W20260907 10:54:11.445409 131853505783488 pool.hpp:201] Pool object at index 2954 is still in use during pool clear
+W20260907 10:54:11.445410 131853505783488 pool.hpp:201] Pool object at index 2955 is still in use during pool clear
+W20260907 10:54:11.445410 131853505783488 pool.hpp:201] Pool object at index 2956 is still in use during pool clear
+W20260907 10:54:11.445411 131853505783488 pool.hpp:201] Pool object at index 2957 is still in use during pool clear
+W20260907 10:54:11.445412 131853505783488 pool.hpp:201] Pool object at index 2958 is still in use during pool clear
+W20260907 10:54:11.450634 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91075 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450639 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91084 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450640 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91092 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450641 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91101 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450642 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91114 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450643 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91115 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450644 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91127 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450645 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91128 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450645 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91134 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450646 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91146 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450647 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91148 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450648 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91155 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450649 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91164 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450649 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91173 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450650 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91181 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450651 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91183 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450652 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91192 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450653 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91194 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450653 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91196 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450654 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91205 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450655 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91207 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450656 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91216 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450656 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91224 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450657 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91233 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450658 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91246 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450659 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91247 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450660 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91259 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450660 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91260 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450661 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91266 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450662 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91278 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450663 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91280 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450664 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91287 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450665 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91296 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450665 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91305 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450666 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91313 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450667 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91315 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450668 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91324 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450669 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91326 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450669 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91328 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450670 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91337 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450671 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91339 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450672 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91348 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450673 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91356 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450674 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91365 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450675 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91378 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450676 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91379 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450676 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91391 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450677 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91392 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450678 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91398 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450679 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91410 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450680 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91412 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450680 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91419 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450681 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91428 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450682 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91437 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450683 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91445 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450684 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91447 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450684 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91456 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450686 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91458 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450686 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91460 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450687 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91469 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450688 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91471 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450689 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91480 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450690 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91488 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450690 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91490 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450691 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91499 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450692 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91501 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450693 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91510 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450693 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91512 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450694 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91514 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450695 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91516 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450696 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91518 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450696 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91520 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450697 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91522 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450698 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91531 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450699 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91533 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450700 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91542 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450701 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91550 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450702 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91552 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450703 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91561 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450704 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91563 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450705 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91565 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450706 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91574 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450707 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91576 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450708 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91585 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450709 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91593 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450710 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91595 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450710 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91597 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450711 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91599 from thread 10 :: remaining reference count: 1
+W20260907 10:54:11.450712 131853505783488 correlation_id.cpp:231] retiring dangling correlation ID 91600 from thread 10 :: remaining reference count: 1
+W20260907 10:54:16.450683 131853505783488 queue.cpp:938] Timeout while waiting for queue sync: 88 kernels still active
+E20260907 10:54:16.462420 131853505783488 output_stream.cpp:111] Opened result file: /tmp/strix-3015-4fdrfcj3/trace-vllmcpp/trace/c3bbb490546b/1_kernel_trace.csv
+E20260907 10:54:16.489135 131853505783488 output_stream.cpp:111] Opened result file: /tmp/strix-3015-4fdrfcj3/trace-vllmcpp/trace/c3bbb490546b/1_hip_api_trace.csv
+E20260907 10:54:16.569582 131853505783488 output_stream.cpp:111] Opened result file: /tmp/strix-3015-4fdrfcj3/trace-vllmcpp/trace/c3bbb490546b/1_memory_copy_trace.csv
+E20260907 10:54:16.574907 131853505783488 output_stream.cpp:111] Opened result file: /tmp/strix-3015-4fdrfcj3/trace-vllmcpp/trace/c3bbb490546b/1_scratch_memory_trace.csv
+E20260907 10:54:16.576342 131853505783488 output_stream.cpp:111] Opened result file: /tmp/strix-3015-4fdrfcj3/trace-vllmcpp/trace/c3bbb490546b/1_agent_info.csv
+W20260907 10:54:16.581105 131853505783488 simple_timer.cpp:55] [rocprofv3] output generation ::     0.129885 sec
+W20260907 10:54:16.581331 131853505783488 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.130609 sec
+W20260907 10:54:16.582291 131853505783488 tool.cpp:3184] [PPID=0][PID=1][TID=8][rocprofv3_error_signal_handler] rocprofv3 found chained signal handler for 6... executing chained sigaction (SIGINFO)
+W20260907 10:54:16.582368 131853505783488 tool.cpp:3104] [PPID=0][PID=1][TID=8][rocprofv3_error_signal_handler] rocprofv3 caught signal 6...
+W20260907 11:13:28.001709 131853560036544 tool.cpp:3104] [PPID=0][PID=1][TID=1][rocprofv3_error_signal_handler] rocprofv3 caught signal 15...

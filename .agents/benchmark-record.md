@@ -29538,3 +29538,298 @@ process and UMD refused device 0 ("Query mappings failed",
 `pci_device.cpp:452`). The fix is the full path
 `$HOME/Sources/tt/.venv/bin/tt-smi -r 0` plus an abort-guard on the reset's
 exit status; every script that resets a card needs the full path.
+
+## SPEC-DFLASH2 G4 — the decode GPU reads **96.01% busy** in node mode and **96.53%** in graph mode, and the decomposition built on it ranks three levers under a **10.06%** ceiling (2026-09-05, `dgx:gpu0`, measured tree `ecf580ce954dc7e38abddf360fe8b9b55a435a75`, [#3014](https://github.com/mudler/vllm.cpp/issues/3014), [#3004](https://github.com/mudler/vllm.cpp/issues/3004))
+
+**This reading stopped two waves, was amended in part, and made
+[#2964](https://github.com/mudler/vllm.cpp/issues/2964) the throughput lever,
+and until now a reader of the tree could find the 96.01% only in a job log and
+the arithmetic built on it nowhere.** The spec's `## Owed` says the run's
+recipe, revisions and contention state are owed beside the number. This entry
+folds them. Every figure is re-derivable from
+`/mnt/nas_share/rc/dflash2-staged/`, which is READ-ONLY evidence. Every path
+below is relative to that directory, and the command that produces each figure
+is beside it. Every command and every output block was executed against those
+files before this entry was committed.
+
+**READ THE TWO CAVEATS BEFORE ANY FIGURE.**
+
+1. **The vLLM arm did NOT profile in this run, so 96.01% is OURS ALONE.** The
+   oracle harness refused in under a second on two missing preconditions and
+   `nsys` profiled the refusal, which is why `out-g4/vllm-*.nsys-rep` are 39 kB
+   and every `vLLM ...-mode` line in `out-g4/RESULTS.txt` is empty. The busy
+   fraction still settles the async question, because that refutation is about
+   OUR OWN idle and needs no oracle. **There is NO cross-arm kernel comparison
+   in this evidence, and none may be inferred from it.**
+2. **`--gpu-metrics-devices` is refused on this fleet**, so no DRAM byte counter
+   exists here and the metrics legs never ran on EITHER arm. Bytes per step are
+   not derivable from this instrument. The kernel trace is the evidence.
+
+```sh
+head -3 out-g4/vllm-node.log && grep -E "^vLLM|^OURS" out-g4/RESULTS.txt
+head -2 out-g4/ours-metrics.log && grep -c "metrics-mode: last_leg_secs= tok_s=$" out-g4/RESULTS.txt
+```
+
+```text
+REFUSED: DFlash2 oracle capture REFUSED, 2 precondition(s) unmet:
+  - build: the ours arm recorded no revision; an axis measured against a build nobody can reconstruct is not reproducible
+  - build: the ours arm recorded no build_recipe; an axis measured against a build nobody can reconstruct is not reproducible
+OURS unprofiled: last_leg_secs=4.882 tok_s=13.108 (gate read 14.914 over 4 prompts x 4 warm legs)
+OURS graph-mode: last_leg_secs=4.751 tok_s=13.470
+OURS node-mode: last_leg_secs=4.767 tok_s=13.427
+vLLM unprofiled: last_leg_secs= tok_s= (gate read 16.323)
+vLLM graph-mode: last_leg_secs= tok_s=
+vLLM node-mode: last_leg_secs= tok_s=
+OURS metrics-mode: last_leg_secs= tok_s=
+vLLM metrics-mode: last_leg_secs= tok_s=
+Illegal --gpu-metrics-devices usage.
+None of the installed GPUs are supported:
+2
+```
+
+**The measurement.** Both modes read the decode window of the same profiled
+leg, with the first step dropped as prefill.
+
+| | node mode | graph mode |
+|---|---:|---:|
+| DECODE GPU busy % of wall | **96.01** | **96.53** |
+| window | 4.765 s | 4.497 s |
+| busy | 4.575 s | 4.340 s |
+| idle | 190.3 ms | 156.2 ms |
+| steps | 33 | 17 |
+| idle per step | 5.77 ms | 9.19 ms |
+
+```sh
+python3 -c "
+import json
+for f in ('out-g4/ours-node.json','out-g4/ours-graph.json'):
+    d=json.load(open(f))
+    print('%-10s wall %.3fs busy %.3fs busy%% %.2f idle %.1fms steps %2d idle/step %.2fms'%(
+        d['label'], d['decode_window_s'], d['decode_busy_s'], d['decode_busy_pct'],
+        d['decode_idle_s']*1e3, d['steps_detected'], d['mean_idle_per_step_ms']))"
+```
+
+```text
+ours-node  wall 4.765s busy 4.575s busy% 96.01 idle 190.3ms steps 33 idle/step 5.77ms
+ours-graph wall 4.497s busy 4.340s busy% 96.53 idle 156.2ms steps 17 idle/step 9.19ms
+```
+
+**The two modes count different things and neither is the other's check.**
+`--cuda-graph-trace=node` reports each kernel inside a captured graph, which is
+the flag G4 names, because in graph mode a captured decode step is ONE opaque
+GPU range and its interior idle is invisible. Node mode therefore detects 33
+steps where graph mode detects 17, and its 5.77 ms idle per step is the smaller
+figure precisely because it can see inside the graph. Both land above the
+spec's 95% threshold, which is the only reading its stop condition turns on.
+
+**The decomposition, and one figure in it does NOT reproduce as published.**
+
+| lever | published | re-derived here |
+|---|---:|---:|
+| remove all idle | 3.99% | **3.9932%** |
+| remove all non-GEMM kernel time | 3.46% | **3.4548%** |
+| every GEMM at the best observed rate | 2.61% | **2.6071%** |
+| total ceiling | 10.06% | **10.0551%** |
+
+```sh
+python3 -c "
+import json
+d=json.load(open('out-g4/ours-node.json'))
+wall,busy,idle=d['decode_window_s'],d['decode_busy_s'],d['decode_idle_s']
+k2=[k for k in d['top_kernels'] if k['name']=='Kernel2'][0]['total_ms']/1e3
+print('wall %.6f  busy %.6f  idle %.6f  Kernel2 %.6f  non-GEMM %.6f'%(wall,busy,idle,k2,busy-k2))
+L1,L2=idle/wall,(busy-k2)/wall; L3=(k2/wall)*(1-220.8/227.2)
+print('idle          %.4f%%'%(100*L1)); print('non-GEMM      %.4f%%'%(100*L2))
+print('GEMM rate     %.4f%%  (220.8 -> 227.2 GB/s: INPUTS, not in this directory)'%(100*L3))
+print('sum           %.4f%%'%(100*(L1+L2+L3)))"
+```
+
+```text
+wall 4.764979  busy 4.574702  idle 0.190276  Kernel2 4.410082  non-GEMM 0.164621
+idle          3.9932%
+non-GEMM      3.4548%
+GEMM rate     2.6071%  (220.8 -> 227.2 GB/s: INPUTS, not in this directory)
+sum           10.0551%
+```
+
+**The non-GEMM lever is 3.45%, not 3.46%.** Non-GEMM kernel time is
+`busy - Kernel2 = 0.164621 s`, and against a 4.764979 s wall that is 3.4548%.
+The published 3.46% follows from rounding the numerator to 0.165 s before
+dividing. The error is one hundredth of a point, it does not move the total
+(10.0551% still rounds to 10.06%), and it changes no conclusion. It is recorded
+because the value of this entry is that the next reader can check the
+arithmetic instead of inheriting it.
+
+**Two inputs to that table are NOT in this evidence directory, and no command
+here derives them.**
+
+- **The 220.8 and 227.2 GB/s rates.** Neither string appears in
+  `out-g4/RESULTS.txt` or `out-g5b/RESULTS-G5B.txt`, and no byte model for any
+  GEMM is recorded anywhere in the run. A rate needs bytes, and caveat 2 says
+  why this run has no byte counter. What IS reproducible is that the third
+  lever equals `(Kernel2/wall) * (1 - 220.8/227.2)` to four decimals, so the
+  arithmetic is checkable ONCE the pair is supplied and the pair itself is not.
+  **Anyone re-deriving the ceiling must source that pair before quoting
+  2.61%.**
+- **The 11.1% gap to vLLM.** It is quoted from
+  `.agents/specs/dflash2-async-spec-sampler.md` `## Stop conditions` and rests
+  on a per-step measurement taken elsewhere. This directory carries a DIFFERENT
+  and weaker cross-arm figure: the gate readings noted in `out-g4/RESULTS.txt`
+  are ours 14.914 and the oracle 16.323 tok/s, a 0.9137x ratio, so the oracle is
+  **9.45%** faster per token there. That is an output-throughput ratio and not a
+  per-step cost, the two arms' profiled legs are not comparable at all (caveat
+  1), and neither number is offered as a check on the other.
+
+```sh
+grep -cE "220\.8|227\.2" out-g4/RESULTS.txt out-g5b/RESULTS-G5B.txt
+python3 -c "
+o,v=14.914,16.323
+print('gate read ours %.3f vLLM %.3f -> ratio %.4fx, oracle faster per token by %.2f%%'%(o,v,o/v,100*(v-o)/o))"
+```
+
+```text
+out-g4/RESULTS.txt:0
+out-g5b/RESULTS-G5B.txt:0
+gate read ours 14.914 vLLM 16.323 -> ratio 0.9137x, oracle faster per token by 9.45%
+```
+
+**Six launch geometries are 94.4% of decode busy time, and all six are GEMMs.**
+`Kernel2` alone is 96.40% of busy. The shares below are of the decode window's
+busy time, from `out-g4/ours-node.json`.
+
+```sh
+python3 -c "
+import json
+for s in json.load(open('out-g4/ours-node.json'))['top_shapes'][:6]:
+    print('%6.2f%% %9.2f ms n=%-5d grid=%s block=%s %s'%(s['pct_of_busy'],s['total_ms'],s['count'],s['geometry'][:3],s['geometry'][3:],s['name']))"
+```
+
+```text
+ 40.45%   1850.29 ms n=1178  grid=[8, 272, 1] block=[32, 1, 1] Kernel2
+ 29.01%   1327.06 ms n=2373  grid=[8, 40, 1] block=[32, 1, 1] Kernel2
+ 13.20%    604.05 ms n=816   grid=[8, 128, 1] block=[32, 1, 1] Kernel2
+  4.48%    204.92 ms n=18    grid=[8, 1940, 1] block=[32, 1, 1] Kernel2
+  3.90%    178.50 ms n=16    grid=[8, 122, 1] block=[128, 1, 1] Kernel2
+  3.32%    151.76 ms n=272   grid=[8, 96, 1] block=[32, 1, 1] Kernel2
+```
+
+**EVERY decode GEMM runs an AMPERE tactic on a BLACKWELL part.** The demangled
+names come from the `out-g5b` re-export of this SAME `out-g4/ours-node.nsys-rep`
+(2026-09-05, `dgx:gpu0`, lease `83d32fb4-81a0-44e4-b6b5-c7718e27c457`, nsys
+2025.3.2). **Its percentages have a different denominator**: `out-g5b` shares
+are of the whole exported trace and `out-g4` shares are of the decode window's
+busy time, which is why the top row reads 40.44% there and 40.45% above. The
+tactic identities are unaffected by that.
+
+```sh
+awk '/^===== ours-node =====/,/^  distinct/' out-g5b/RESULTS-G5B.txt | awk '
+/grid=/ {pct=$1; geo=$0; sub(/.*grid=/,"grid=",geo); sub(/ regs=.*/,"",geo)}
+/demangled=void cutlass/ {t=$0; sub(/.*Kernel2</,"",t); sub(/>\(T1::Params\)/,"",t); if (pct+0>=3) print pct, geo, t}'
+```
+
+```text
+40.44% grid=[8, 272, 1] block=[32, 1, 1] cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x1_tn_align8
+29.01% grid=[8, 40, 1] block=[32, 1, 1] cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x1_tn_align8
+13.21% grid=[8, 128, 1] block=[32, 1, 1] cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x2_tn_align8
+4.46% grid=[8, 1940, 1] block=[32, 1, 1] cutlass_80_wmma_tensorop_s161616gemm_bf16_16x16_128x1_tn_align8
+3.90% grid=[8, 122, 1] block=[128, 1, 1] cutlass_80_tensorop_s16816gemm_bf16_256x64_32x4_nn_align2
+3.32% grid=[8, 96, 1] block=[32, 1, 1] cutlass_80_wmma_tensorop_bf16_s161616gemm_bf16_16x16_128x1_tn_align8
+```
+
+**The "no Blackwell tactic anywhere" claim is TRUE but BOUNDED, and the bound is
+part of the claim.** `cutlass_80` is the only CUTLASS family in the listing, and
+no `nvjet`, `sm120`, `sm121` or `tcgen05` string appears anywhere in
+`out-g5b/RESULTS-G5B.txt`. That listing prints 40 rows of the 102 distinct
+`(name, geometry)` rows the trace holds, covering 99.88% of its GPU time, so the
+absence is established over 99.88% of the time and not over every launch. The
+remaining 62 rows are 0.12% and were never exported by name. **A `strings` scan
+of the `.nsys-rep` is not a substitute**: the container is compressed and yields
+no kernel names at all, so a null result from it means nothing.
+
+```sh
+awk '/^===== ours-node =====/,/^  distinct/' out-g5b/RESULTS-G5B.txt > /tmp/g4-ournode.txt
+grep -oE "cutlass_[0-9]+" /tmp/g4-ournode.txt | sort -u
+echo "Blackwell tactics in the whole G5B file: $(grep -ciE 'nvjet|sm_?12[01]|tcgen05' out-g5b/RESULTS-G5B.txt)"
+echo "rows printed: $(grep -c 'demangled=' /tmp/g4-ournode.txt)  $(grep 'distinct' /tmp/g4-ournode.txt)  covering $(grep -oE '^ +[0-9]+\.[0-9]+%' /tmp/g4-ournode.txt | tr -d ' %' | paste -sd+ | bc)% of trace GPU time"
+```
+
+```text
+cutlass_80
+Blackwell tactics in the whole G5B file: 0
+rows printed: 40    distinct (name,geometry) rows: 102  covering 99.88% of trace GPU time
+```
+
+**The part.** `NVIDIA GB10`, compute capability 12.1, 48 SMs, 24 MiB L2
+(`l2CacheSize 25165824`), reported by `nsys` itself and identical in all four
+`out-g5b` sections.
+
+```sh
+grep -m1 "gpu=" out-g5b/RESULTS-G5B.txt
+```
+
+```text
+  gpu={'name': 'NVIDIA GB10', 'smCount': 48, 'computeMajor': 12, 'computeMinor': 1, 'maxThreadsPerBlock': 1024, 'clockRate': 2418000000, 'l2CacheSize': 25165824}
+```
+
+**The recipe, the revisions and the contention state**, which is what the spec's
+`## Owed` asked for. The tree is `ecf580ce954dc7e38abddf360fe8b9b55a435a75`,
+built in the leased container with
+`cmake -S <src> -B <build> -G Ninja -DVLLM_CPP_BUILD_TESTS=OFF -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUTLASS_FETCH=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a`
+plus ccache, then `cmake --build <build> -j 4 --target vllm-cli`
+(`g4-nsys.sh:214-221`; `-j 4` because unconstrained parallelism OOM-reboots this
+box). The profiled command is
+`nsys profile --force-overwrite=true -o <tag> --trace=cuda --cuda-graph-trace=<graph|node> --sample=none --cpuctxsw=none env VT_SERVER_SSE_PING_S=0 vllm-cli --model <target> --prompt 'The capital of France is' --max-tokens 64 --temperature 0 --repeat 3 --max-num-seqs 1 --speculative-config '{"method":"dflash","model":<draft>,"num_speculative_tokens":7}' --device cuda`
+(`g4-nsys.sh:297-301`). The oracle arm would have run the committed
+`tools.bench.dflash2_oracle_capture` on the same prompt; it refused, per caveat
+1.
+
+```sh
+head -8 out-g4/RESULTS.txt && grep COMPUTE_APPS out-g4/RESULTS.txt
+python3 -c "
+import json;d=json.load(open('out-g4/ours-smi.json'))
+print('smi %.3fs %d samples: util mean %.2f%% median %.1f%% min %.1f%%; sm clock mean %.1f MHz (%.0f..%.0f)'%(
+ d['window_s'],d['samples_in_window'],d['utilization_gpu_pct']['mean'],d['utilization_gpu_pct']['median'],
+ d['utilization_gpu_pct']['min'],d['sm_clock_mhz']['mean'],d['sm_clock_mhz']['min'],d['sm_clock_mhz']['max']))"
+```
+
+```text
+REVISION_MEASURED=ecf580ce954dc7e38abddf360fe8b9b55a435a75
+BINARY=/tmp/df2s/build/examples/vllm-cli sha256=f490b3c0dd98ed10cf01a7e0adc1287e29102e1154603bbdd1fbda05d1c3a840 mtime=2026-09-04 07:37:45.302027189 +0000
+TREE_REUSED_FROM_GATE_LEASE=1
+LIBVLLM=/tmp/df2s/build/libvllm.so sha256=abc0b059b27c44bba9f3e5d22d8252b1cac78e08d1057085bf3e068bceed337c flash_fwd_syms=3611
+ORACLE_VERSION=0.1.dev1+g66e5414c6
+SHA_TARGET=ba0ce20aae489ad196733da5064bcdf159a1fe84f53336648196e1ebb7751b1c
+SHA_DRAFT=67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c
+WORKLOAD: prompt='The capital of France is' max_tokens=64 temperature=0 max_num_seqs=1 repeat=3 k=7
+COMPUTE_APPS_AFTER=0
+smi 4.882s 41 samples: util mean 92.68% median 96.0% min 85.0%; sm clock mean 2531.9 MHz (2528..2535)
+```
+
+**The contention record is partial, and the missing half is named rather than
+implied.** `COMPUTE_APPS_AFTER=0` says nothing else held the device when the job
+finished, and the script aborts rather than measure a busy box
+(`g4-nsys.sh:114-122`), but the start-of-run count and the G4 lease id went to
+the job's stdout and are NOT in `out-g4/`. The lease quoted above is `out-g5b`'s
+own, taken 18 hours later for the re-export, and it is not G4's. **G4's lease id
+is unrecorded in this evidence and this entry does not invent one.** What the
+evidence does carry is an independent `nvidia-smi` sampler over the unprofiled
+leg: 41 samples in 4.882 s reading a 96.0% median GPU utilisation on a clock
+held between 2528 and 2535 MHz. That third instrument agrees with both `nsys`
+modes to within a point, on a leg neither of them perturbed.
+
+**The instrument's cost is small here, against the run that motivated the
+warning.** The unprofiled leg reads 13.108 tok/s, graph mode 13.470 and node
+mode 13.427, so `--cuda-graph-trace=node` costs nothing measurable on this
+build. The 2026-08-30 run under the same flag read 3.536 tok/s where the gate
+read 14.914 (`g4-nsys.sh:17-21`), and that collapse did not recur. All three
+legs sit below the gate's own 14.914, which folds four prompts and four warm
+legs rather than the single prompt this run profiles, so the two are not the
+same measurement and their difference is not an instrument cost.
+
+**NO THROUGHPUT RESULT IS CLAIMED HERE AND NONE MAY BE READ OUT OF THIS
+ENTRY.** The 10.06% ceiling bounds what three perfect-case levers could return
+against our own wall. It is not a measured gain, and no wave in A2 may quote a
+throughput result against this reading. The reading refutes the async chain as a
+SUFFICIENT fix and not as a contributing one; the decision and its basis are in
+`.agents/specs/dflash2-async-spec-sampler.md` `## Stop conditions`, amended
+2026-09-06 under #3004, and this entry does not restate or revisit them.

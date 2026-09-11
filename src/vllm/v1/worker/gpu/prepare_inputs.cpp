@@ -617,4 +617,50 @@ bool AnyRowSplicedByCombine(const std::vector<int32_t>& seq_lens,
   return false;
 }
 
+// SPEC-DFLASH2 A2-4 (#3004). See the header for what this replaces and why the
+// rule is stated once over arrays instead of looped at the call site.
+void ApplyCommittedIdsForPropose(const int64_t* committed_ids, int num_reqs,
+                                 const std::vector<uint8_t>& discard,
+                                 const std::vector<int32_t>& num_tokens_no_spec,
+                                 int max_model_len,
+                                 std::vector<int32_t>* last_sampled_tokens,
+                                 std::vector<int32_t>* token_ids_cpu) {
+  if (num_reqs <= 0) return;
+  VT_CHECK(committed_ids != nullptr,
+           "ApplyCommittedIdsForPropose: the propose was handed no committed "
+           "ids — the write-back branch did not materialize them (row "
+           "SPEC-DFLASH2, #3004)");
+  VT_CHECK(last_sampled_tokens != nullptr && token_ids_cpu != nullptr,
+           "ApplyCommittedIdsForPropose: null destination array");
+  VT_CHECK(max_model_len > 0,
+           "ApplyCommittedIdsForPropose: max_model_len must be positive");
+  const size_t nr = static_cast<size_t>(num_reqs);
+  VT_CHECK(last_sampled_tokens->size() >= nr && num_tokens_no_spec.size() >= nr,
+           "ApplyCommittedIdsForPropose: a per-slot array is shorter than the "
+           "step's request count");
+  for (int i = 0; i < num_reqs; ++i) {
+    const size_t s = static_cast<size_t>(i);
+    // A still-prefilling row produced no output token this step: its write-back
+    // was skipped and its counter was not advanced. Leave BOTH arrays alone.
+    if (s < discard.size() && discard[s] != 0) continue;
+    const int n = num_tokens_no_spec[s];
+    VT_CHECK(n > 0,
+             "ApplyCommittedIdsForPropose: request row " + std::to_string(i) +
+                 " committed a token this step but its num_tokens_no_spec is " +
+                 std::to_string(n) +
+                 " — the write-back and the counter disagree about what this "
+                 "step committed");
+    const size_t idx = s * static_cast<size_t>(max_model_len) +
+                       static_cast<size_t>(n - 1);
+    VT_CHECK(n <= max_model_len && idx < token_ids_cpu->size(),
+             "ApplyCommittedIdsForPropose: request row " + std::to_string(i) +
+                 " writes its committed token at column " +
+                 std::to_string(n - 1) + " of a row " +
+                 std::to_string(max_model_len) + " wide — out of range");
+    const int32_t id = static_cast<int32_t>(committed_ids[s]);
+    (*last_sampled_tokens)[s] = id;
+    (*token_ids_cpu)[idx] = id;
+  }
+}
+
 }  // namespace vllm::v1

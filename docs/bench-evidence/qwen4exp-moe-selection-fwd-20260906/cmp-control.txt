@@ -1,0 +1,42 @@
+=== CONTROL-A-vs-C ===
+RESULT SELFWD CONTROL-A-vs-C COUNT base_digests=384 other_digests=384 base_tok=576 other_tok=576
+RESULT SELFWD CONTROL-A-vs-C COUNTED-PROPERTY base last_digest_lines=576 value_lines_seen=576 agree=True
+RESULT SELFWD CONTROL-A-vs-C COUNTED-PROPERTY other last_digest_lines=576 value_lines_seen=576 agree=True
+RESULT SELFWD CONTROL-A-vs-C STRUCTURE calls_common=384 prefill_calls(L)=48 decode_calls=336 T_prefill=5
+RESULT SELFWD CONTROL-A-vs-C STRUCTURE contiguous_and_uniform=True
+RESULT SELFWD CONTROL-A-vs-C STRUCTURE forwards=8 moe_blocks_per_forward=48
+fwd  phase   calls  slots     FLIPPED   hash_mism  first_L  
+0    prefill 48     240       0         0          -        
+RESULT SELFWD CONTROL-A-vs-C FWD 0 prefill calls=48 slots=240 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+1    decode  48     48        0         0          -        
+RESULT SELFWD CONTROL-A-vs-C FWD 1 decode calls=48 slots=48 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+2    decode  48     48        0         0          -        
+RESULT SELFWD CONTROL-A-vs-C FWD 2 decode calls=48 slots=48 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+3    decode  48     48        0         0          -        
+RESULT SELFWD CONTROL-A-vs-C FWD 3 decode calls=48 slots=48 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+4    decode  48     48        0         0          -        
+RESULT SELFWD CONTROL-A-vs-C FWD 4 decode calls=48 slots=48 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+5    decode  48     48        0         0          -        
+RESULT SELFWD CONTROL-A-vs-C FWD 5 decode calls=48 slots=48 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+6    decode  48     48        0         0          -        
+RESULT SELFWD CONTROL-A-vs-C FWD 6 decode calls=48 slots=48 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+7    decode  48     48        0         0          -        
+RESULT SELFWD CONTROL-A-vs-C FWD 7 decode calls=48 slots=48 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+RESULT SELFWD CONTROL-A-vs-C GROUP DIVERGING forwards=[4, 6, 7] slots=144 FLIPPED=0
+RESULT SELFWD CONTROL-A-vs-C GROUP AGREEING forwards=[1, 2, 3, 5] slots=192 FLIPPED=0
+RESULT SELFWD CONTROL-A-vs-C HIGHEST FORWARD REACHED = 7 (the open clause needs >= 7)
+RESULT SELFWD CONTROL-A-vs-C CALL0 x_base=3615.47142 x_other=3615.47142 (compare with the recorded L00 mhc.mix pair)
+RESULT SELFWD CONTROL-A-vs-C CALL0 sel_base=5bbd84f0b21b362b sel_other=5bbd84f0b21b362b hash_equal=True
+RESULT SELFWD CONTROL-A-vs-C CALL0 LAYER-0 VERDICT: tokens=5 FLIPPED=0 -> NO FLIP (layer 0 agrees on every token)
+RESULT SELFWD CONTROL-A-vs-C CALL0 tok=0 equal=True base_ulps=4 other_ulps=4 base_ids=32,46,71,130,160,215,226,286,309,342 other_ids=32,46,71,130,160,215,226,286,309,342
+RESULT SELFWD CONTROL-A-vs-C CALL0 tok=1 equal=True base_ulps=2 other_ulps=2 base_ids=68,119,289,293,338,369,386,441,471,492 other_ids=68,119,289,293,338,369,386,441,471,492
+RESULT SELFWD CONTROL-A-vs-C CALL0 tok=2 equal=True base_ulps=1 other_ulps=1 base_ids=21,76,101,265,293,301,314,338,361,369 other_ids=21,76,101,265,293,301,314,338,361,369
+RESULT SELFWD CONTROL-A-vs-C CALL0 tok=3 equal=True base_ulps=1 other_ulps=1 base_ids=211,226,366,367,386,414,434,441,446,503 other_ids=211,226,366,367,386,414,434,441,446,503
+RESULT SELFWD CONTROL-A-vs-C CALL0 tok=4 equal=True base_ulps=0 other_ulps=0 base_ids=21,88,96,148,265,337,378,406,462,463 other_ids=21,88,96,148,265,337,378,406,462,463
+RESULT SELFWD CONTROL-A-vs-C TIE-RATE base exact_bf16_ties=143 of 576 boundaries = 24.8%
+RESULT SELFWD CONTROL-A-vs-C TIE-RATE other exact_bf16_ties=143 of 576 boundaries = 24.8%
+RESULT SELFWD CONTROL-A-vs-C AXIS x     first_call_not_bit_identical=None (forward=-) [ORDERING ONLY]
+RESULT SELFWD CONTROL-A-vs-C AXIS logit first_call_not_bit_identical=None (forward=-) [ORDERING ONLY]
+RESULT SELFWD CONTROL-A-vs-C AXIS exp   first_call_not_bit_identical=None (forward=-) [ORDERING ONLY]
+RESULT SELFWD CONTROL-A-vs-C AXIS shr   first_call_not_bit_identical=None (forward=-) [ORDERING ONLY]
+RESULT SELFWD CONTROL-A-vs-C VERDICT total_flipped_slots=0 over_forwards=8

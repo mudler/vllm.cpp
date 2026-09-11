@@ -1,0 +1,578 @@
+[
+  {
+    "switch": "VT_ROCM_Q8K_BLOCK",
+    "pair": 0,
+    "arm": "default",
+    "runs": [
+      {
+        "run": 1,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.447,
+        "start": 1788780904.387536,
+        "end": 1788780916.834176
+      },
+      {
+        "run": 2,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 11.987,
+        "start": 1788780916.834243,
+        "end": 1788780928.821498
+      },
+      {
+        "run": 3,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.001,
+        "start": 1788780928.821545,
+        "end": 1788780940.822864
+      },
+      {
+        "run": 4,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.01,
+        "start": 1788780940.822901,
+        "end": 1788780952.832854
+      }
+    ],
+    "clocks": {
+      "window": "warm whole generations 2 through 4, Unix epoch timestamps",
+      "sample_count": 143,
+      "sclk_mhz_median": 2894,
+      "sclk_mhz_min": 2843,
+      "sclk_mhz_max": 2897
+    },
+    "output_sha256": "54686e829a9b584c8ba291706aa81f481a15b32bfeefc255bdb16d0a2ce9efef",
+    "returncode": 0
+  },
+  {
+    "switch": "VT_ROCM_Q8K_BLOCK",
+    "pair": 0,
+    "arm": "candidate",
+    "runs": [
+      {
+        "run": 1,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 11.693,
+        "start": 1788780982.17268,
+        "end": 1788780993.865405
+      },
+      {
+        "run": 2,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 11.282,
+        "start": 1788780993.8655,
+        "end": 1788781005.14795
+      },
+      {
+        "run": 3,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 11.303,
+        "start": 1788781005.147983,
+        "end": 1788781016.451145
+      },
+      {
+        "run": 4,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 11.336,
+        "start": 1788781016.451191,
+        "end": 1788781027.787298
+      }
+    ],
+    "clocks": {
+      "window": "warm whole generations 2 through 4, Unix epoch timestamps",
+      "sample_count": 135,
+      "sclk_mhz_median": 2858,
+      "sclk_mhz_min": 2796,
+      "sclk_mhz_max": 2873
+    },
+    "output_sha256": "54686e829a9b584c8ba291706aa81f481a15b32bfeefc255bdb16d0a2ce9efef",
+    "returncode": 0
+  },
+  {
+    "switch": "VT_ROCM_Q8K_BLOCK",
+    "pair": 1,
+    "arm": "candidate",
+    "runs": [
+      {
+        "run": 1,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 11.686,
+        "start": 1788781056.638621,
+        "end": 1788781068.324427
+      },
+      {
+        "run": 2,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 11.31,
+        "start": 1788781068.324503,
+        "end": 1788781079.634978
+      },
+      {
+        "run": 3,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 11.329,
+        "start": 1788781079.635015,
+        "end": 1788781090.964229
+      },
+      {
+        "run": 4,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 11.338,
+        "start": 1788781090.964264,
+        "end": 1788781102.302236
+      }
+    ],
+    "clocks": {
+      "window": "warm whole generations 2 through 4, Unix epoch timestamps",
+      "sample_count": 136,
+      "sclk_mhz_median": 2854.0,
+      "sclk_mhz_min": 2796,
+      "sclk_mhz_max": 2865
+    },
+    "output_sha256": "54686e829a9b584c8ba291706aa81f481a15b32bfeefc255bdb16d0a2ce9efef",
+    "returncode": 0
+  },
+  {
+    "switch": "VT_ROCM_Q8K_BLOCK",
+    "pair": 1,
+    "arm": "default",
+    "runs": [
+      {
+        "run": 1,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.491,
+        "start": 1788781130.814589,
+        "end": 1788781143.305807
+      },
+      {
+        "run": 2,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.078,
+        "start": 1788781143.305889,
+        "end": 1788781155.383839
+      },
+      {
+        "run": 3,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.101,
+        "start": 1788781155.383878,
+        "end": 1788781167.48484
+      },
+      {
+        "run": 4,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.116,
+        "start": 1788781167.484875,
+        "end": 1788781179.601068
+      }
+    ],
+    "clocks": {
+      "window": "warm whole generations 2 through 4, Unix epoch timestamps",
+      "sample_count": 144,
+      "sclk_mhz_median": 2868.0,
+      "sclk_mhz_min": 2812,
+      "sclk_mhz_max": 2888
+    },
+    "output_sha256": "54686e829a9b584c8ba291706aa81f481a15b32bfeefc255bdb16d0a2ce9efef",
+    "returncode": 0
+  },
+  {
+    "switch": "VT_ROCM_Q8K_BLOCK",
+    "pair": 2,
+    "arm": "default",
+    "runs": [
+      {
+        "run": 1,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.52,
+        "start": 1788781208.249012,
+        "end": 1788781220.768775
+      },
+      {
+        "run": 2,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.093,
+        "start": 1788781220.768846,
+        "end": 1788781232.86179
+      },
+      {
+        "run": 3,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.116,
+        "start": 1788781232.861826,
+        "end": 1788781244.978302
+      },
+      {
+        "run": 4,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.144,
+        "start": 1788781244.978338,
+        "end": 1788781257.122308
+      }
+    ],
+    "clocks": {
+      "window": "warm whole generations 2 through 4, Unix epoch timestamps",
+      "sample_count": 144,
+      "sclk_mhz_median": 2865.0,
+      "sclk_mhz_min": 2795,
+      "sclk_mhz_max": 2882
+    },
+    "output_sha256": "54686e829a9b584c8ba291706aa81f481a15b32bfeefc255bdb16d0a2ce9efef",
+    "returncode": 0
+  },
+  {
+    "switch": "VT_ROCM_Q8K_BLOCK",
+    "pair": 2,
+    "arm": "candidate",
+    "runs": [
+      {
+        "run": 1,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 11.707,
+        "start": 1788781285.568609,
+        "end": 1788781297.275824
+      },
+      {
+        "run": 2,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 11.351,
+        "start": 1788781297.275905,
+        "end": 1788781308.626658
+      },
+      {
+        "run": 3,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 11.351,
+        "start": 1788781308.626695,
+        "end": 1788781319.978114
+      },
+      {
+        "run": 4,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 11.365,
+        "start": 1788781319.978151,
+        "end": 1788781331.343213
+      }
+    ],
+    "clocks": {
+      "window": "warm whole generations 2 through 4, Unix epoch timestamps",
+      "sample_count": 136,
+      "sclk_mhz_median": 2836.0,
+      "sclk_mhz_min": 2783,
+      "sclk_mhz_max": 2855
+    },
+    "output_sha256": "54686e829a9b584c8ba291706aa81f481a15b32bfeefc255bdb16d0a2ce9efef",
+    "returncode": 0
+  },
+  {
+    "switch": "VT_ROCM_Q6K_SMALL_PRIVATE",
+    "pair": 0,
+    "arm": "default",
+    "runs": [
+      {
+        "run": 1,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.502,
+        "start": 1788781359.620758,
+        "end": 1788781372.123186
+      },
+      {
+        "run": 2,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.085,
+        "start": 1788781372.123265,
+        "end": 1788781384.208596
+      },
+      {
+        "run": 3,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.134,
+        "start": 1788781384.208632,
+        "end": 1788781396.342441
+      },
+      {
+        "run": 4,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.129,
+        "start": 1788781396.342478,
+        "end": 1788781408.471816
+      }
+    ],
+    "clocks": {
+      "window": "warm whole generations 2 through 4, Unix epoch timestamps",
+      "sample_count": 145,
+      "sclk_mhz_median": 2865,
+      "sclk_mhz_min": 2790,
+      "sclk_mhz_max": 2882
+    },
+    "output_sha256": "54686e829a9b584c8ba291706aa81f481a15b32bfeefc255bdb16d0a2ce9efef",
+    "returncode": 0
+  },
+  {
+    "switch": "VT_ROCM_Q6K_SMALL_PRIVATE",
+    "pair": 0,
+    "arm": "candidate",
+    "runs": [
+      {
+        "run": 1,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 13.863,
+        "start": 1788781437.016471,
+        "end": 1788781450.87942
+      },
+      {
+        "run": 2,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 13.506,
+        "start": 1788781450.879495,
+        "end": 1788781464.385197
+      },
+      {
+        "run": 3,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 13.589,
+        "start": 1788781464.385235,
+        "end": 1788781477.974401
+      },
+      {
+        "run": 4,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 13.585,
+        "start": 1788781477.974438,
+        "end": 1788781491.559087
+      }
+    ],
+    "clocks": {
+      "window": "warm whole generations 2 through 4, Unix epoch timestamps",
+      "sample_count": 162,
+      "sclk_mhz_median": 2865.5,
+      "sclk_mhz_min": 2803,
+      "sclk_mhz_max": 2881
+    },
+    "output_sha256": "54686e829a9b584c8ba291706aa81f481a15b32bfeefc255bdb16d0a2ce9efef",
+    "returncode": 0
+  },
+  {
+    "switch": "VT_ROCM_Q6K_SMALL_PRIVATE",
+    "pair": 1,
+    "arm": "candidate",
+    "runs": [
+      {
+        "run": 1,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 13.899,
+        "start": 1788781520.009246,
+        "end": 1788781533.908705
+      },
+      {
+        "run": 2,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 13.539,
+        "start": 1788781533.908789,
+        "end": 1788781547.44763
+      },
+      {
+        "run": 3,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 13.556,
+        "start": 1788781547.447667,
+        "end": 1788781561.003223
+      },
+      {
+        "run": 4,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 13.574,
+        "start": 1788781561.003264,
+        "end": 1788781574.577213
+      }
+    ],
+    "clocks": {
+      "window": "warm whole generations 2 through 4, Unix epoch timestamps",
+      "sample_count": 162,
+      "sclk_mhz_median": 2869.5,
+      "sclk_mhz_min": 2806,
+      "sclk_mhz_max": 2879
+    },
+    "output_sha256": "54686e829a9b584c8ba291706aa81f481a15b32bfeefc255bdb16d0a2ce9efef",
+    "returncode": 0
+  },
+  {
+    "switch": "VT_ROCM_Q6K_SMALL_PRIVATE",
+    "pair": 1,
+    "arm": "default",
+    "runs": [
+      {
+        "run": 1,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.493,
+        "start": 1788781603.699288,
+        "end": 1788781616.191797
+      },
+      {
+        "run": 2,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.11,
+        "start": 1788781616.191886,
+        "end": 1788781628.301846
+      },
+      {
+        "run": 3,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.128,
+        "start": 1788781628.301882,
+        "end": 1788781640.429704
+      },
+      {
+        "run": 4,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.135,
+        "start": 1788781640.429742,
+        "end": 1788781652.564844
+      }
+    ],
+    "clocks": {
+      "window": "warm whole generations 2 through 4, Unix epoch timestamps",
+      "sample_count": 145,
+      "sclk_mhz_median": 2863,
+      "sclk_mhz_min": 2795,
+      "sclk_mhz_max": 2878
+    },
+    "output_sha256": "54686e829a9b584c8ba291706aa81f481a15b32bfeefc255bdb16d0a2ce9efef",
+    "returncode": 0
+  },
+  {
+    "switch": "VT_ROCM_Q6K_SMALL_PRIVATE",
+    "pair": 2,
+    "arm": "default",
+    "runs": [
+      {
+        "run": 1,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.508,
+        "start": 1788781680.926083,
+        "end": 1788781693.434456
+      },
+      {
+        "run": 2,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.103,
+        "start": 1788781693.434572,
+        "end": 1788781705.537767
+      },
+      {
+        "run": 3,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.136,
+        "start": 1788781705.537804,
+        "end": 1788781717.673358
+      },
+      {
+        "run": 4,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 12.137,
+        "start": 1788781717.673404,
+        "end": 1788781729.810038
+      }
+    ],
+    "clocks": {
+      "window": "warm whole generations 2 through 4, Unix epoch timestamps",
+      "sample_count": 145,
+      "sclk_mhz_median": 2862,
+      "sclk_mhz_min": 2802,
+      "sclk_mhz_max": 2879
+    },
+    "output_sha256": "54686e829a9b584c8ba291706aa81f481a15b32bfeefc255bdb16d0a2ce9efef",
+    "returncode": 0
+  },
+  {
+    "switch": "VT_ROCM_Q6K_SMALL_PRIVATE",
+    "pair": 2,
+    "arm": "candidate",
+    "runs": [
+      {
+        "run": 1,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 13.864,
+        "start": 1788781758.162686,
+        "end": 1788781772.02692
+      },
+      {
+        "run": 2,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 13.538,
+        "start": 1788781772.027009,
+        "end": 1788781785.565337
+      },
+      {
+        "run": 3,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 13.603,
+        "start": 1788781785.565375,
+        "end": 1788781799.168612
+      },
+      {
+        "run": 4,
+        "prompt_tokens": 5,
+        "completion_tokens": 64,
+        "seconds": 13.614,
+        "start": 1788781799.168647,
+        "end": 1788781812.782503
+      }
+    ],
+    "clocks": {
+      "window": "warm whole generations 2 through 4, Unix epoch timestamps",
+      "sample_count": 162,
+      "sclk_mhz_median": 2862.0,
+      "sclk_mhz_min": 2798,
+      "sclk_mhz_max": 2879
+    },
+    "output_sha256": "54686e829a9b584c8ba291706aa81f481a15b32bfeefc255bdb16d0a2ce9efef",
+    "returncode": 0
+  }
+]

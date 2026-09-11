@@ -19,7 +19,10 @@ FRAMING_RULE = "framing"
 # rejected, and only under --filled, so a real value containing it cannot exist.
 PLACEHOLDER_ASSISTED_BY = "AGENT:MODEL [TOOL]"
 ASSISTED_BY = re.compile(
-    r"[A-Za-z0-9][A-Za-z0-9_.-]*:[A-Za-z0-9][A-Za-z0-9_.+-]*"
+    # The MODEL slot accepts `/` because provider/model identifiers use it as
+    # the separator (regolo/glm5.2, meta-llama/Llama-3, openai/gpt-4). The
+    # TOOL slot below already accepts `/` for the same reason (#3132).
+    r"[A-Za-z0-9][A-Za-z0-9_.-]*:[A-Za-z0-9][A-Za-z0-9_./+-]*"
     r"(?: \[[A-Za-z0-9][A-Za-z0-9_. +:/-]*\])+\Z"
 )
 # Closed, reviewable vocabulary for obvious agent/vendor/model/tool authorship.

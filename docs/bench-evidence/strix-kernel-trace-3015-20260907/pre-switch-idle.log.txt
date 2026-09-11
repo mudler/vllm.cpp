@@ -1,0 +1,7 @@
+Error: open /proc/315325/ns/mnt: no such file or directory
+Error: top can only be used on running containers
+{"gpu_busy_percent": "0", "mem_info_vram_used": "163110912", "mem_info_vram_total": "68719476736", "pp_dpm_sclk": "0: 600Mhz *\n1: 1100Mhz \n2: 2900Mhz"}
+{"gpu_busy_percent": "0", "mem_info_vram_used": "163110912", "mem_info_vram_total": "68719476736", "pp_dpm_sclk": "0: 600Mhz *\n1: 1100Mhz \n2: 2900Mhz"}
+{"gpu_busy_percent": "0", "mem_info_vram_used": "163110912", "mem_info_vram_total": "68719476736", "pp_dpm_sclk": "0: 600Mhz *\n1: 1100Mhz \n2: 2900Mhz"}
+{"gpu_busy_percent": "0", "mem_info_vram_used": "163110912", "mem_info_vram_total": "68719476736", "pp_dpm_sclk": "0: 600Mhz *\n1: 1100Mhz \n2: 2900Mhz"}
+{"gpu_busy_percent": "0", "mem_info_vram_used": "163110912", "mem_info_vram_total": "68719476736", "pp_dpm_sclk": "0: 600Mhz *\n1: 1100Mhz \n2: 2900Mhz"}

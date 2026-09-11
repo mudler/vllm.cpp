@@ -1,0 +1,23 @@
+ID: ISSUE-GH-1230
+Title: Twenty-two LTX-2.5 source citations name two upstream anchors short, and the SAME FILES already carry the corrected form beside the stale one, so a reader who greps either string finds both and has nothing that says which is right. Re-derived at the LTX-2 pin `fd4ded7f` by reading the pinned files: `latent_cond.py:38` is `latent_state = latent_state.clone()` and `:39` is blank, so the two writes every citation means are `:40-41`; `schedulers.py:31` is the return annotation `) -> torch.FloatTensor:`, so the `tokens = math.prod(latent.shape[2:])` read is `:32`. Eleven citations of each stale form, across `src/vllm/multimodal/ltx2_video.cpp`, `src/vllm/model_executor/models/ltx2_pipeline.cpp`, `include/vllm/model_executor/models/ltx2_pipeline.h`, `include/vllm/model_executor/models/ltx2_conditioning.h`, four test files and two specs; the corrected form is already landed in eight more, including `include/vllm/multimodal/ltx2_video.h:625` and `include/vllm/model_executor/models/ltx2_samplers.h:32`. The disagreement is INSIDE single files: `ltx2_video.cpp` cites `schedulers.py:31` at `:3618` and `:32` at `:3017` and `:3600`. **A partial correction is strictly worse than none**, which is why this is a row rather than an in-flow fix and why PR #1209's review-repair commit had its seven anchor corrections REVERTED rather than extended. Those seven left `ltx2_video.cpp` reading both forms a hundred lines apart with nothing recording which to believe -- correctable by a grep while uniform, not correctable while mixed -- and one of them lived in `include/vllm/`, a `USER_USAGE_PREFIXES` path in `scripts/check-doc-checkpoint.py:99`, which is a pure path match with no content analysis, so a comment-only anchor edit in a public header demanded a `docs/USAGE.md` edit the change did not owe. Both consequences are properties of doing it piecemeal and neither arises from one sweep over all 22. Filed by the review-repair flow of `LTX25-KEYFRAME-INTERP` ([#1096](https://github.com/mudler/vllm.cpp/issues/1096)), which owes it under `## Owed` rather than fixing it in flow: the sweep opens five files that row does not otherwise touch and a 22-site mechanical edit owes its own reviewer
+Row: -
+State: UNKNOWN
+Kind: bug
+GitHub: 1230
+Mirror: MISSING
+Availability: METADATA_ONLY
+Created: UNKNOWN
+Updated: UNKNOWN
+Closed: UNKNOWN
+
+## Problem
+
+Archive: `.agents/completed/issue-index.md:392`
+
+### Frozen archive evidence
+
+> | [#1230](https://github.com/mudler/vllm.cpp/issues/1230) | — | Twenty-two LTX-2.5 source citations name two upstream anchors short, and the SAME FILES already carry the corrected form beside the stale one, so a reader who greps either string finds both and has nothing that says which is right. Re-derived at the LTX-2 pin `fd4ded7f` by reading the pinned files: `latent_cond.py:38` is `latent_state = latent_state.clone()` and `:39` is blank, so the two writes every citation means are `:40-41`; `schedulers.py:31` is the return annotation `) -> torch.FloatTensor:`, so the `tokens = math.prod(latent.shape[2:])` read is `:32`. Eleven citations of each stale form, across `src/vllm/multimodal/ltx2_video.cpp`, `src/vllm/model_executor/models/ltx2_pipeline.cpp`, `include/vllm/model_executor/models/ltx2_pipeline.h`, `include/vllm/model_executor/models/ltx2_conditioning.h`, four test files and two specs; the corrected form is already landed in eight more, including `include/vllm/multimodal/ltx2_video.h:625` and `include/vllm/model_executor/models/ltx2_samplers.h:32`. The disagreement is INSIDE single files: `ltx2_video.cpp` cites `schedulers.py:31` at `:3618` and `:32` at `:3017` and `:3600`. **A partial correction is strictly worse than none**, which is why this is a row rather than an in-flow fix and why PR #1209's review-repair commit had its seven anchor corrections REVERTED rather than extended. Those seven left `ltx2_video.cpp` reading both forms a hundred lines apart with nothing recording which to believe -- correctable by a grep while uniform, not correctable while mixed -- and one of them lived in `include/vllm/`, a `USER_USAGE_PREFIXES` path in `scripts/check-doc-checkpoint.py:99`, which is a pure path match with no content analysis, so a comment-only anchor edit in a public header demanded a `docs/USAGE.md` edit the change did not owe. Both consequences are properties of doing it piecemeal and neither arises from one sweep over all 22. Filed by the review-repair flow of `LTX25-KEYFRAME-INTERP` ([#1096](https://github.com/mudler/vllm.cpp/issues/1096)), which owes it under `## Owed` rather than fixing it in flow: the sweep opens five files that row does not otherwise touch and a 22-site mechanical edit owes its own reviewer | bug |
+
+## Resolution
+
+-

@@ -1,0 +1,28 @@
+["podman", "--storage-driver=vfs", "--root", "/tmp/podman-pr66-root-vfs", "--runroot", "/tmp/podman-pr66-run-vfs", "run", "--rm", "--name", "strix-3015-c9803c1bf92142bc970dc8bd02651fc6", "--device=/dev/kfd", "--device=/dev/dri", "--group-add", "video", "-v", "/tmp/strix-3015-4fdrfcj3:/tmp/strix-3015-4fdrfcj3:rw", "-v", "/workspace/ccache:/workspace/ccache:rw", "-e", "CCACHE_DIR=/workspace/ccache", "-e", "CCACHE_BASEDIR=/tmp/strix-3015-4fdrfcj3/vllmcpp", "--entrypoint", "cmake", "d554fe849c5e3c4d6b81227e0b87f165fa3b7b015899872bd93bc732c12ffeb6", "-S", "/tmp/strix-3015-4fdrfcj3/vllmcpp", "-B", "/tmp/strix-3015-4fdrfcj3/build-vllmcpp", "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_C_COMPILER_LAUNCHER=ccache", "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache", "-DCMAKE_HIP_COMPILER_LAUNCHER=ccache", "-DVLLM_CPP_CUDA=OFF", "-DVLLM_CPP_HIP=ON", "-DVLLM_CPP_HIP_ARCHITECTURES=gfx1151", "-DROCM_PATH=/opt/rocm", "-DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang++", "-DCMAKE_HIP_COMPILER_ROCM_ROOT=/opt/rocm-7.2.4", "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath-link,/opt/rocm/lib", "-DVLLM_CPP_TRITON=OFF", "-DVLLM_CPP_SERVER=OFF", "-DVLLM_CPP_BUILD_EXAMPLES=ON", "-DVLLM_CPP_BUILD_TESTS=OFF"]
+-- The CXX compiler identification is GNU 13.3.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- The HIP compiler identification is Clang 22.0.0
+-- Detecting HIP compiler ABI info
+-- Detecting HIP compiler ABI info - done
+-- Check for working HIP compiler: /opt/rocm/lib/llvm/bin/clang++ - skipped
+-- Detecting HIP compile features
+-- Detecting HIP compile features - done
+-- ROCm backend: ENABLED for arch(es) [gfx1151]
+-- ROCm backend: NEVER COMPILED UPSTREAM OF YOU — this skeleton has no build report from any machine. Please report success or failure on https://github.com/mudler/vllm.cpp/issues/41
+-- Triton AOT: default OFF — the vendored artifacts are CUDA cubins and VLLM_CPP_CUDA is OFF
+-- The C compiler identification is GNU 13.3.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- ROCm hipBLAS: /opt/rocm/lib/libhipblas.so
+-- ROCm hipBLASLt: /opt/rocm/lib/libhipblaslt.so
+-- CUDA FA2 compiled-arch manifest: []
+-- Configuring done (1.0s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/strix-3015-4fdrfcj3/build-vllmcpp

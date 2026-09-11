@@ -1,6 +1,7 @@
 // ROCm op-table registration (BACKEND-ROCM).
 #include "vt/op_provider.h"
 #include "vt/ops.h"
+#include "vt/rocm/rocm_embedding_quant.h"
 
 namespace vt::rocm {
 
@@ -96,6 +97,12 @@ void MoeCombineGateKernelRocm(Queue& q, Tensor& out, const Tensor& expert_out,
 void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
 void MatmulBTQuantGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
                                     const Tensor& weight, const Tensor& expert_ids);
+// The fused MoE gate+up+clamped-SwiGLU grouped GEMM (rocm_moe_gate_up_swiglu.hip).
+// GLM-5.3-Flash reads this and kMatmulBTQuantGrouped through `vt::OpRegistered`
+// before it takes a device queue (glm5_next_forward.cpp:307-311, #2942).
+void MoeGateUpSwiGLUGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
+                                      const Tensor& gate_w, const Tensor& up_w,
+                                      const Tensor& expert_ids, float limit);
 // BACKEND-ROCM-GDN-KERNELS family 1 (rocm_gdn_state.hip): the indexed state I/O
 // pair `IndexedGdnOpsNative()` requires (issue #41, spec rocm-gdn-kernels.md).
 void GdnStateGatherKernelRocm(Queue& q, Tensor& working, const Tensor& cache,
@@ -125,6 +132,27 @@ void GdnPrefillKernelRocm(Queue& q, Tensor& out, const Tensor& q_in, const Tenso
 void GdnDecodeKernelRocm(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
                          const Tensor& v, const Tensor& g, const Tensor& beta,
                          Tensor& state, const Tensor* state_idx, const GdnArgs& args);
+// BACKEND-ROCM-KDA (#2942, rocm_kda_scan.hip): per-K-channel-decay gated-delta
+// recurrence. Same shape as GdnPrefillFn; the only difference is g is [T,Hv,Dk]
+// (per-channel) not [T,Hv] (per-head). Staged slice: unreached by the model
+// forward until the CPU-only refusal at glm5_next_kda.cpp:322 lifts (W9c-2).
+void KdaGatedDeltaRuleKernelRocm(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                                 const Tensor& v, const Tensor& g, const Tensor& beta,
+                                 Tensor& state, const Tensor& qsl, const GdnArgs& args);
+// BACKEND-ROCM-KPOOL (#2942, rocm_glm5_next_kpool.hip): the GLM-5.3-Flash
+// k-pool DSA indexer pair. Staged slice: unreached by the model forward until
+// the compose (W9c-0, #2415) that would call them exists. No CPU provider by
+// design — the host reference glm5_next_dsa.cpp is the oracle, not a second
+// registration under the same OpId.
+void Glm5NextKpoolCompressRocm(Queue& q, Tensor& pool_keys, Tensor& pool_indices,
+                               Tensor& pool_valid, Tensor& num_pools, const Tensor& packed,
+                               const Tensor& ape);
+void Glm5NextKpoolSelectRocm(Queue& q, Tensor& topk_indices, Tensor& index_scores,
+                             const Tensor& q_states, const Tensor& head_weights,
+                             const Tensor& pool_keys, const Tensor& pool_indices,
+                             const Tensor& pool_valid, const Tensor& num_pools,
+                             const Tensor& valid_keys, const Tensor& q_mask,
+                             const Glm5NextKpoolSelectArgs& args);
 // BACKEND-ROCM-GDN-KERNELS family 5 (rocm_gdn_fused.hip): gated RMSNorm,
 // sigmoid gate, and the fused full-attention preamble.
 void RmsNormGatedKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
@@ -159,6 +187,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<RmsNormFn>(&RmsNormKernelRocm)));
     RegisterOp(OpId::kEmbedding, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernelRocm)));
+    RegisterOp(OpId::kEmbeddingQuant, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingQuantKernelRocm)));
     RegisterOp(OpId::kMulScalar, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<MulScalarFn>(&MulScalarKernelRocm)));
     RegisterOp(OpId::kSoftCap, DeviceType::kROCM,
@@ -255,6 +285,9 @@ struct Registrar {
     RegisterOp(OpId::kMatmulBTQuantGrouped, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<MatmulBTQuantGroupedFn>(&MatmulBTQuantGroupedKernelRocm)));
+    RegisterOp(OpId::kMoeGateUpSwiGLUGrouped, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<MoeGateUpSwiGLUGroupedFn>(
+                   &MoeGateUpSwiGLUGroupedKernelRocm)));
     RegisterOp(OpId::kGdnStateGather, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<GdnStateGatherFn>(&GdnStateGatherKernelRocm)));
@@ -274,6 +307,15 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<GdnPrefillFn>(&GdnPrefillKernelRocm)));
     RegisterOp(OpId::kGdnDecode, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<GdnDecodeFn>(&GdnDecodeKernelRocm)));
+    RegisterOp(OpId::kKdaGatedDeltaRule, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<KdaGatedDeltaRuleFn>(
+                   &KdaGatedDeltaRuleKernelRocm)));
+    RegisterOp(OpId::kGlm5NextKpoolCompress, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<Glm5NextKpoolCompressFn>(
+                   &Glm5NextKpoolCompressRocm)));
+    RegisterOp(OpId::kGlm5NextKpoolSelect, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<Glm5NextKpoolSelectFn>(
+                   &Glm5NextKpoolSelectRocm)));
     RegisterOp(OpId::kRmsNormGated, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<RmsNormGatedFn>(&RmsNormGatedKernelRocm)));

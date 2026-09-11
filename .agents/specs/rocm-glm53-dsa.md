@@ -84,15 +84,14 @@ This is the finding that removes the presumed keep-quant blocker.
 | **Resident** | Q5_K (312, 7.1543 GiB), Q8_0 (476, 4.8517 GiB), Q6_K (82, 0.9998 GiB), Q4_K (2, 0.9970 GiB), F32 (709, 0.5078 GiB) |
 | **Expert only** | IQ3_XXS (71, 81.5391 GiB), IQ1_S (106, 62.1094 GiB), IQ2_XXS (44, 34.0312 GiB), IQ4_XS (4, 6.3750 GiB), Q2_K (2, 1.9688 GiB), Q3_K (1, 1.2891 GiB) |
 
-ROCm keep-quant serves exactly {Q8_0, Q4_K, Q5_K, Q6_K}
-(`.agents/specs/rocm-gg-keep-quant.md`, `src/vt/rocm/rocm_grouped_gemm.hip`).
-That set **covers the resident class exactly**; F32 needs no keep-quant path.
-Every i-quant in this checkpoint is expert-side, and the experts reach the GEMM
-through the streaming lane rather than the resident path.
+ROCm keep-quant serves eleven formats
+(`.agents/specs/rocm-gg-keep-quant.md`, `src/vt/rocm/rocm_quant_dot.hip`).
+That set covers the resident class and five expert-only encodings: IQ3_XXS,
+IQ1_S, IQ2_XXS, Q2_K, and Q3_K. F32 needs no keep-quant path. IQ4_XS remains
+the only expert encoding in this artifact that expands on ROCm.
 
-So `.agents/specs/rocm-gg-keep-quant.md`'s owed formats and #1940's "ROCm ports
-zero I-quant formats" are **not blockers for this model's resident arm**. They
-remain owed for the expert arm.
+The remaining #1940 formats are not blockers for this model's resident arm.
+IQ4_XS remains a gap for its expert arm.
 
 ## W1.3 Arm-by-arm map
 

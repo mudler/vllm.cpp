@@ -1011,8 +1011,15 @@ Not done, and each is a gate rather than a nicety:
   block invocations and not forwards, and `qwen4_exp` runs 48 MoE blocks in each
   forward, so wave MOEDIV's 384 calls reached forwards 4, 6 and 7. That reading is
   VOID for a different reason: its CUDA arm answered the degenerate pre-#2550
-  sequence `11751 271 271 271 271 271 0 0`. **A non-degenerate arm is what is
-  missing, not a wider window.** (b) `rel(sumabs)`
+  sequence `11751 271 271 271 271 271 0 0`. A non-degenerate arm was what was
+  missing, not a wider window. **SECOND CORRECTION 2026-09-06
+  ([#2998](https://github.com/mudler/vllm.cpp/issues/2998)): that arm has been
+  run, and forwards 4, 6 and 7 are read**
+  ([evidence](../../docs/bench-evidence/qwen4exp-moe-selection-fwd-20260906.md)).
+  It does NOT restore the attribution this bullet withdrew: the disagreeing
+  forwards flip 127 of 144 expert slots and the agreeing ones 116 of 192, and
+  agreeing forward 5 flips 48 of 48 while disagreeing forward 4 flips 33 of 48, so
+  a flip count separates nothing in either direction. (b) `rel(sumabs)`
   is a difference of NORMS, not a norm of DIFFERENCES, and its under-report is a
   DISTRIBUTION rather than the `~122x` single seed draw this line first quoted: at
   `n = 12800` over 400 seeds the median is 75x (sigma 1e-3) to 140x (sigma 1e-4),
@@ -1041,10 +1048,18 @@ Not done, and each is a gate rather than a nicety:
   residue's mechanism was already named by
   [#2552](https://github.com/mudler/vllm.cpp/issues/2552) — the keep-quant grouped
   expert GEMM's reassociation plus a bimodal top-k term at a 32.9% exact-tie rate,
-  both floors, both faithful mirrors and neither a defect. **NOT CLOSED:** the
-  matched pair's `4.324e-05` lands inside #2552's layer-0 flip bracket
-  (2.139e-05 no flip .. 4.999e-04 flip) and `VT_MOE_SEL_FP` was never run on it.
-  That run is the next traceable step; it needs the 68 GB artifact and a GPU.
+  both floors, both faithful mirrors and neither a defect. **STILL NOT CLOSED, for
+  a narrower reason since 2026-09-06**
+  ([#2998](https://github.com/mudler/vllm.cpp/issues/2998),
+  [reading](../../docs/bench-evidence/qwen4exp-moe-selection-fwd-20260906.md)):
+  this line said the matched pair's `4.324e-05` lands inside #2552's layer-0 flip
+  bracket (2.139e-05 no flip .. 4.999e-04 flip) and that `VT_MOE_SEL_FP` was never
+  run on it. **It has been run, and layer 0 does NOT flip**, so the no-flip bound
+  lifts to `4.324e-05` and the layer-0 residue at this pair is the keep-quant
+  expert GEMM's reassociation rather than the top-k term. The cause of the three
+  disagreeing ids is what stays open, under
+  [#2999](https://github.com/mudler/vllm.cpp/issues/2999); it needs the 68 GB
+  artifact and a GPU.
 
 - **`main` did not compile with CUDA, and that is how this wave found out**
   ([#2861](https://github.com/mudler/vllm.cpp/issues/2861), fixed in the same

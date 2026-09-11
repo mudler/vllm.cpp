@@ -384,7 +384,7 @@ conversion that also tells the reader where to look is the point.
   to 353 fresh, with stale still zero. The edit is a CELL inside an existing
   row: it adds no row and moves no counter, so `check-agent-record.py` reports
   the same ENGINE=162 before and after.
-- [#1198](https://github.com/mudler/vllm.cpp/issues/1198) - now FOUR specs
+- ISSUE-GH-1198 - now FOUR specs
   assert loader behaviour the loader no longer has, found while verifying
   anchors for conversion. The fourth is
   `.agents/specs/gguf-mtp-spec-decode.md`, which says in the present tense that
@@ -392,7 +392,7 @@ conversion that also tells the reader where to look is the point.
   `model_loader.cpp:717-723` - the same removed refusal and the same stale range
   as the `gguf-dflash-draft.md` row already on that issue. `717-723` is
   `ResolveEnablePrefixCaching`.
-- [#1199](https://github.com/mudler/vllm.cpp/issues/1199) - 11 upstream symbol
+- ISSUE-GH-1199 - 11 upstream symbol
   citations, deduping to 10 reported lines, name vLLM files absent at the pin;
   six of them are `.agents/model-matrix.md` rows whose repair is a claim about
   vLLM, not a path edit.

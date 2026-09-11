@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "vllm/model_executor/model_loader/gguf_dequant.h"
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vt/device.h"
 #include "vt/dtype.h"
@@ -130,12 +131,15 @@ TEST_CASE("vt block geometry agrees with the GGUF reader's GgmlTraits") {
     CHECK(vt::GgmlTypeId(c.dtype) == c.ggml_type);
     CHECK(std::string(vt::Name(c.dtype)) == c.name);
 
-    // Q8_K (id 15) is activation-only: it never appears in a GGUF file, so the
-    // reader's table deliberately does not carry it. Every FILE type must.
-    if (c.dtype == vt::DType::kQ8_K) {
-      CHECK_THROWS(vllm::GgmlTraits(c.ggml_type));
-      continue;
-    }
+    // Q8_K (id 15) is a FILE type the reader carries like any other, so the
+    // cross-check below runs for it too. Q8_K is the K-quants' ACTIVATION
+    // encoding, and llama.cpp still declares its file geometry: a real traits
+    // row with a nonzero `type_size` and deliberately with NO `.vec_dot` and NO
+    // `.to_float` (ggml/src/ggml.c:879-884 at the pinned llama.cpp `10bf611e`,
+    // tag `b10451`), whose row data the file loader validates as it reads the
+    // tensor (src/llama-model-loader.cpp:1416 into
+    // ggml/src/ggml-quants.c:5590-5598). This case asserted the OPPOSITE -- an
+    // absence -- until #3097, and no test pins that absence any more.
     const vllm::GgmlTypeTraits& g = vllm::GgmlTraits(c.ggml_type);
     CHECK(g.block_elems == vt::BlockElems(c.dtype));
     CHECK(g.block_bytes == vt::BlockBytes(c.dtype));
@@ -144,6 +148,18 @@ TEST_CASE("vt block geometry agrees with the GGUF reader's GgmlTraits") {
     vt::DType back = vt::DType::kF32;
     REQUIRE(vt::BlockDTypeFromGgmlTypeId(c.ggml_type, &back));
     CHECK(back == c.dtype);
+
+    if (c.dtype == vt::DType::kQ8_K) {
+      // FILE GEOMETRY IS NOT KEEP-QUANT CAPABILITY. The reader names the block
+      // size, and the loader still refuses to keep Q8_K resident through a GEMM:
+      // the encoding has no weight-side dot kernel, so the public predicate the
+      // production loader itself calls answers false, and the embedding role
+      // preserves the blocks packed through the decode-only gather arm.
+      CHECK(vt::cpu::BlockVecDot(vt::DType::kQ8_K) == nullptr);
+      CHECK_FALSE(vt::cpu::HasQuantDotKernel(vt::DType::kQ8_K));
+      vt::DType kept = vt::DType::kF32;
+      CHECK_FALSE(vllm::KeepQuantDType(c.ggml_type, &kept));
+    }
   }
 }
 
@@ -401,7 +417,9 @@ TEST_CASE("quant traits mirror type_traits_cpu (ggml-cpu.c:211-406)") {
 TEST_CASE("BlockToFloat matches the GGUF loader's dequant byte-for-byte") {
   for (const BlockCase& c : kBlockCases) {
     CAPTURE(c.name);
-    if (c.dtype == vt::DType::kQ8_K) continue;  // not a file type
+    // Q8_K has no arm in the loader's expansion path: `DequantGgufRowToF32`
+    // refuses it there, while the decode-only embedding gather takes it packed.
+    if (c.dtype == vt::DType::kQ8_K) continue;
     constexpr int64_t kBlocks = 5;
     const std::vector<uint8_t> bytes = RandomBlocks(c, kBlocks, 1234U);
     const int64_t numel = kBlocks * c.block_elems;
@@ -471,8 +489,8 @@ TEST_CASE("MatmulBTQuant generic-composite fallback == dequant-then-matmul") {
     for (float& v : a) v = dist(rng);
 
     // The reference decodes the SAME bytes through the traits `to_float`.
-    // (Q8_K never appears in a GGUF file, so the loader's DequantGgufRowToF32
-    // correctly refuses it — see the GgmlTraits cross-check above.)
+    // (The loader's DequantGgufRowToF32 has no Q8_K arm and refuses it there,
+    // while the reader carries its file geometry — see the cross-check above.)
     std::vector<float> w(static_cast<size_t>(n * k));
     vt::cpu::BlockToFloat(c.dtype)(wq.data(), w.data(), n * k);
     const std::vector<float> expected = ReferenceMatmul(a, w, m, k, n);

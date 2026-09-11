@@ -1,0 +1,23 @@
+ID: ISSUE-GH-2076
+Title: **`ENG-MOE-LOADSTREAM` cites `src/vllm/model_executor/models/model_registry.cpp:411` for `ModelSource::FromSafetensorsOwned`, which is 19 lines past the end of that file.** Found while gating [#2068](https://github.com/mudler/vllm.cpp/issues/2068) (`KV-DSV4-MULTICACHE` W3); PRE-EXISTING and not that wave's defect. The file has **392** lines at base `c714b0234` and the symbol is at **line 211** there; W3's own `#include` and blank line move it to **line 213**, which is the value the repaired citation carries. (198 is the distance from the symbol at W3's head to 411, not a distance to the end of the file.) `scripts/check-agent-record.py` sorts a bad citation into `broken` when the line is out of range and `stale` when the line exists and holds something else, and ratchets both against `scripts/record-anchor-baseline.json`, which stood at `stale: 28, broken: 6, total: 34` -- so an anchor inside its bucket's budget is invisible, and this one was part of that budget. **What made it visible is a general property of the ratchet rather than a coincidence:** #2068 adds 63 lines to `model_registry.cpp`, which pushes the file past line 411; the anchor did not change and its target did not move, but the line it names started EXISTING, so it moved from `broken` to `stale` and the checker fired twice at once -- `RECORD ANCHOR REGRESSION in bucket 'stale': 29 > baseline 28` AND `record-anchor baseline STALE in bucket 'broken': 5 < baseline 6`. **A broken anchor becomes a stale one as soon as anyone lengthens the file it points into**, and the change that lengthens the file is charged for it; a single total would have absorbed the move silently, which is the argument for the two buckets. FIXED IN FLOW: the citation is repaired to `:213` and the baseline lowered to `stale: 28, broken: 5, total: 33` in the same commit, which is what the checker's own message prescribes. Nothing else in that record moved -- `include/vllm/model_executor/models/model_registry.h:60` still holds the shards-owner field, and `src/vllm/entrypoints/model_loader.cpp:365` (`LoadFromDir`) stays in the `stale` budget as unrelated pre-existing drift, untouched rather than silently swept in
+Row: KV-DSV4-MULTICACHE
+State: UNKNOWN
+Kind: bug
+GitHub: 2076
+Mirror: MISSING
+Availability: METADATA_ONLY
+Created: UNKNOWN
+Updated: UNKNOWN
+Closed: UNKNOWN
+
+## Problem
+
+Archive: `.agents/completed/issue-index.md:797`
+
+### Frozen archive evidence
+
+> | [#2076](https://github.com/mudler/vllm.cpp/issues/2076) | `KV-DSV4-MULTICACHE` | **`ENG-MOE-LOADSTREAM` cites `src/vllm/model_executor/models/model_registry.cpp:411` for `ModelSource::FromSafetensorsOwned`, which is 19 lines past the end of that file.** Found while gating [#2068](https://github.com/mudler/vllm.cpp/issues/2068) (`KV-DSV4-MULTICACHE` W3); PRE-EXISTING and not that wave's defect. The file has **392** lines at base `c714b0234` and the symbol is at **line 211** there; W3's own `#include` and blank line move it to **line 213**, which is the value the repaired citation carries. (198 is the distance from the symbol at W3's head to 411, not a distance to the end of the file.) `scripts/check-agent-record.py` sorts a bad citation into `broken` when the line is out of range and `stale` when the line exists and holds something else, and ratchets both against `scripts/record-anchor-baseline.json`, which stood at `stale: 28, broken: 6, total: 34` -- so an anchor inside its bucket's budget is invisible, and this one was part of that budget. **What made it visible is a general property of the ratchet rather than a coincidence:** #2068 adds 63 lines to `model_registry.cpp`, which pushes the file past line 411; the anchor did not change and its target did not move, but the line it names started EXISTING, so it moved from `broken` to `stale` and the checker fired twice at once -- `RECORD ANCHOR REGRESSION in bucket 'stale': 29 > baseline 28` AND `record-anchor baseline STALE in bucket 'broken': 5 < baseline 6`. **A broken anchor becomes a stale one as soon as anyone lengthens the file it points into**, and the change that lengthens the file is charged for it; a single total would have absorbed the move silently, which is the argument for the two buckets. FIXED IN FLOW: the citation is repaired to `:213` and the baseline lowered to `stale: 28, broken: 5, total: 33` in the same commit, which is what the checker's own message prescribes. Nothing else in that record moved -- `include/vllm/model_executor/models/model_registry.h:60` still holds the shards-owner field, and `src/vllm/entrypoints/model_loader.cpp:365` (`LoadFromDir`) stays in the `stale` budget as unrelated pre-existing drift, untouched rather than silently swept in | bug |
+
+## Resolution
+
+-

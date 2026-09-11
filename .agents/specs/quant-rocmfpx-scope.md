@@ -392,21 +392,18 @@ Items 1, 3, 5 and 9 alone would let the artifacts **load** and expand to bf16 on
 every backend, which is a real capability and a legitimately small change.
 
 **Item 7 is the one that decides the row, and it is bigger than it looks.**
-`DeviceKeepQuantSupported` (`gguf_keep_quant.cpp:128-141`) returns true on
-`kROCM` for exactly `{Q8_0, Q4_K, Q5_K, Q6_K}`, and `rocm_grouped_gemm.hip`
-implements exactly those four dots. `MXFP4` does appear in that file, but only
-inside a refusal — `rocm_grouped_gemm.hip:692` and `:763`:
+`DeviceKeepQuantSupported` now admits eleven formats on `kROCM`. The internal
+GDN provider owns Q8_0/Q4_K/Q5_K/Q6_K, and `rocm_quant_dot.hip` owns seven
+Q8_K-activation formats. `MXFP4` still appears only in the unsupported set:
 
 ```
-vt rocm: matmul_bt_quant: unsupported weight dtype
-(ported: Q8_0/Q4_K/Q5_K/Q6_K; owed: Q4_0/Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ2_S/MXFP4
- -- the loader pre-filters to the ported set, so reaching here is a bug)
+unimplemented: Q4_0/Q5_0/IQ2_XS/IQ4_NL/IQ3_S/IQ4_XS/MXFP4
 ```
 
 **Our ROCm arm therefore has no FP4 compute kernel of any kind** — not even for
 `MXFP4`, a mainline ggml FP4 type we already decode, which that message and
-`.agents/specs/rocm-gg-keep-quant.md` both record as owed alongside Q2_K, Q3_K,
-IQ2_* and IQ3_*. A ROCmFP4 dot kernel would be the **first** FP4 ROCm
+`.agents/specs/rocm-gg-keep-quant.md` both record as owed. A ROCmFP4 dot kernel
+would be the **first** FP4 ROCm
 compute path in this tree, ahead of a format vLLM actually references.
 
 Without item 7, a ROCmFPX model on `strix:gpu0` expands to bf16 and consumes

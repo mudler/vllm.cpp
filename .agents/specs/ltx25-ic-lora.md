@@ -353,9 +353,9 @@ Each is owed by this row and named in the commit and pull request bodies.
 
 | owed | issue |
 |---|---|
-| serving the reference-image and reference-video arms: the reference CLIP's own pixel path (read, resize to `height // scale`, temporal subsample, multi-frame encode) and the stage split that gives stage 2 no adapter. §6 derives both. Token-append is NOT part of it any more — #930 landed in `c7cb59fbb` | [#975](https://github.com/mudler/vllm.cpp/issues/975) |
-| the `conditioning_attention_mask` / `conditioning_attention_strength < 1.0` arm, which needs `Ltx2LatentState` to carry a mask and `build_attention_mask`'s block structure (`mask_utils.py:170-243`) | [#932](https://github.com/mudler/vllm.cpp/issues/932) |
-| ~~N-adapter fusion, which additionally needs upstream's SECOND rounding pattern (`addmm_` with `alpha`, `fuse_loras.py:115`) that this row refuses rather than guesses~~ **DISCHARGED by row `LTX25-LORA-FUSION`** ([`ltx25-lora-fusion.md`](ltx25-lora-fusion.md)), which ported that second form and gated it as byte equality against the EXECUTED pinned module rather than against a transcription. The arity refusal is gone and `--lora` is repeatable. Lifting it made ONE new arm expressible — N adapters on a recipe with a `kNoAdapters` phase, whose stage 1 upstream gives a proper SUBSET — and that arm refuses by name and is owed in THAT row's `## Owed`, not here. **#932 itself stays OPEN**, because the row above is its other half and nothing has landed it | [#932](https://github.com/mudler/vllm.cpp/issues/932) |
+| ~~serving the reference-image and reference-video arms: the reference CLIP's own pixel path (read, resize to `height // scale`, temporal subsample, multi-frame encode) and the stage split that gives stage 2 no adapter~~ **DISCHARGED for the reference VIDEO arm by row `LTX25-IC-LORA-REF-VIDEO`** ([`ltx25-ic-lora-ref-video.md`](ltx25-ic-lora-ref-video.md), [#3020](https://github.com/mudler/vllm.cpp/issues/3020)), which found that the pixel path was already here — `Ltx2ReadFrameDirectory` IS `video_preprocess` over a frame directory and `Ltx2ConvVideoEncode` already runs multi-frame for retake — so what was missing was the reference item's own geometry and the stage split, both of which now land on a new `ic_lora` pipeline kind. The reference-IMAGE arm is NOT discharged and never will be: upstream has no such flag, and it is refused by name. #975 is one of the three issue numbers that 404 (tracked by #2899); the live record is #3020 | [#3020](https://github.com/mudler/vllm.cpp/issues/3020) |
+| ~~the `conditioning_attention_mask` / `conditioning_attention_strength < 1.0` arm, which needs `Ltx2LatentState` to carry a mask and `build_attention_mask`'s block structure (`mask_utils.py:170-243`)~~ **DISCHARGED for the MASK arm by row `LTX25-IC-LORA-REF-VIDEO`** ([#3020](https://github.com/mudler/vllm.cpp/issues/3020)). `Ltx2LatentState` carries a mask, the block structure is ported and gated against the executed module, and the mask reaches the DiT — which also retired a seam that was built and dead: nothing in `src/` assigned `Ltx2ModalityInput::attention_mask` before that row. The `strength < 1.0` arm WITHOUT a mask stays owed and is refused by name, because upstream's own CLI cannot reach it either (`ic_lora.py:452-455`). #932 is one of the three issue numbers that 404 (tracked by #2899); the live record is #3020 | [#3020](https://github.com/mudler/vllm.cpp/issues/3020) |
+| ~~N-adapter fusion, which additionally needs upstream's SECOND rounding pattern (`addmm_` with `alpha`, `fuse_loras.py:115`) that this row refuses rather than guesses~~ **DISCHARGED by row `LTX25-LORA-FUSION`** ([`ltx25-lora-fusion.md`](ltx25-lora-fusion.md)), which ported that second form and gated it as byte equality against the EXECUTED pinned module rather than against a transcription. The arity refusal is gone and `--lora` is repeatable. Lifting it made ONE new arm expressible — N adapters on a recipe with a `kNoAdapters` phase, whose stage 1 upstream gives a proper SUBSET — and that arm refuses by name and is owed in THAT row's `## Owed`, not here. **ISSUE-GH-932 itself stays OPEN**, because the row above is its other half and nothing has landed it | ISSUE-GH-932 |
 | GGUF k-quant LoRA fusion — **not applicable** rather than owed: the LTX-2.5 DiT ships FP8 and NVFP4, and no GGUF LTX DiT exists to fuse into | n/a |
 | a real-weights IC-LoRA fusion measurement | blocked on GPU authority; `dgx.casa` was under a long render for this row's duration and this row had no GPU authority |
 
@@ -376,6 +376,10 @@ Each is owed by this row and named in the commit and pull request bodies.
 
 ## Now
 
-`ACTIVE` — the adapter path is implemented and gated; the reference arm stays
-refused on the two causes §6 derives, which are #975 and are neither of the two
-this refusal has previously given.
+`DONE` — the adapter path is implemented and gated. The reference arm that §6
+left refused was SERVED by row `LTX25-IC-LORA-REF-VIDEO`
+([#3020](https://github.com/mudler/vllm.cpp/issues/3020)), together with the
+conditioning attention mask; §6's derivation was correct about what was missing
+and wrong about how much of it was, because the pixel path it named already
+existed as `Ltx2ReadFrameDirectory`. What that row left owed is in its own
+`## Owed`.

@@ -1593,9 +1593,14 @@ def _validate_execution(evidence: pathlib.Path, vllm_cpp_sha: str) -> dict[str, 
         oracle.get("bench_dependencies") != execution["bench_dependencies"]
         or oracle.get("client_contract_source_commit") != VLLM_COMMIT
         or oracle.get("cutlass_source_tree") != cutlass_record
-        # `oracle_version` is the DISTRIBUTION metadata string, which differs
-        # from the runtime one on the pin (#520); they were both compared to the
-        # runtime constant while the two happened to be equal at 0.25.0.
+        # `oracle_version` is the DISTRIBUTION metadata string and
+        # `runtime_version` is the runtime one.  TWO fields because they are two
+        # observations, not because they always differ: today's pin is a SOURCE
+        # build (`5d97007c2`, #2896), which appends nothing, so they are equal
+        # here, while under `VLLM_USE_PRECOMPILED=1` the distribution string
+        # appends a suffix and they do not.  Each is compared against its OWN
+        # constant either way; the shape this replaced compared both to the
+        # runtime one while the two happened to be equal at 0.25.0 (#520).
         or oracle.get("oracle_version") != VLLM_DISTRIBUTION_VERSION
         or oracle.get("runtime_version") != VLLM_ORACLE_VERSION
     ):

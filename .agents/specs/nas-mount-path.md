@@ -133,7 +133,7 @@ where a past measurement read its bytes.
 
 ## Owed
 
-[#1077](https://github.com/mudler/vllm.cpp/issues/1077): `.env.example:37`,
+ISSUE-GH-1077: `.env.example:37`,
 `.agents/environment.md:29` and `tests/vllm/multimodal/test_ltx2_video.cpp:2129`
 each state that nothing in the tree reads `CHECKPOINT_ROOT`. Six gates read it
 today, listed in §5. This row does not repair that claim, because

@@ -9,16 +9,16 @@ Base SHA: `d023e3357b907927fb6d459f83d21b4729b78d84`
 
 ## Now
 
-`ACTIVE`. The kernels are registered, native, gated and REACHED on the model
-(`op=33 ... selected=vt-native`, and MUT-R1 reproduces `main`'s refusal by
-name), and all FIVE numeric guarantees are now killed by the gate rather than
-by the compiler. **Generation is NOT re-established**: no token has been
-observed on a post-`6b97a6800` tree. The allocator explanation is now REFUTED
-rather than untested -- the managed-allocator leg the refusal message names
-loaded, entered the forward, and dumped core at 4118 s -- so the open question
-has moved from the loader to a crash inside the forward. No default-allocator
-control has run beside it, so the allocator is still not isolated. See
-`## Evidence` and `## Owed`.
+`ACTIVE`. The kernels are registered, native, gated and REACHED on the model,
+and all FIVE numeric guarantees are killed by the gate rather than by the
+compiler. **GENERATION IS RE-ESTABLISHED**: rc job `499b30ae` emitted
+` Paris, which is` at exit 0 with `reference-tier hits: 0` and all eighteen
+reached ops native -- byte-identical to the pre-#2511 output. Read the
+configuration with the result: that leg needed
+`VT_ROCM_MANAGED_ALLOC=1 AMD_SERIALIZE_KERNEL=3 HSA_ENABLE_SDMA=0`, which is
+DIAGNOSTIC and not the shipping default, and the default-allocator arm still
+times out. NO speed number, and the `tok_s=0.001` the leg prints must never be
+quoted. See `## Generation is re-established` and `## Owed`.
 
 ## Scope
 
@@ -498,6 +498,77 @@ the raw file into the job's own log, and a re-echo of its tail. It also prints
 `RAW BYTES CAPTURED`, so a zero reads as a CAPTURE failure rather than as
 silence from the program.
 
+## Generation is re-established on `gfx1151` (rc job `499b30ae`, 2026-09-06)
+
+**GLM-5.3 non-flash emits a token on this board again.** This is the first one
+since `6b97a6800` (#2511) withdrew the reference tier, and it closes the
+question this row and #2965 were opened around.
+
+```text
+LEG[serial2] rc=0 wall=3949s
+RAW BYTES CAPTURED: 3129
+ Paris, which is
+vllm-cli: run=1/1 finish_reason=length prompt_tokens=5 completion_tokens=4
+Script done on 2026-09-06 05:01:24+00:00 [COMMAND_EXIT_CODE="0"]
+--- reference-tier hits (must be ZERO on this board) ---
+0
+```
+
+**The output is byte-identical to the pre-#2511 run** that `docs/FEATURES.md`
+records for this artifact: ` Paris, which is`. So the model is not merely
+running, it is producing the same continuation it produced before the allocator
+change, on a tree carrying the native MLA kernels.
+
+**Every op the forward reached resolved NATIVE.** Eighteen unique
+`[vt op-provider]` lines, all `selected=vt-native registered=1`, and
+`reference-tier hits: 0`. Among them `op=33` (`kMlaPrefillAttention`), `op=29`
+(`ConcatAndCacheMla`) and `op=99` (`ConcatMlaNopeRope`) -- the ops #2954 and
+#2715 W1 landed. Nothing was served from the portable CPU tier, which on this
+board could not have happened anyway since the tier is withdrawn, and the zero
+is the assertion that proves it rather than the assumption.
+
+### The configuration, and why it is not a shipping claim
+
+The leg ran under `VT_ROCM_MANAGED_ALLOC=1 AMD_SERIALIZE_KERNEL=3
+HSA_ENABLE_SDMA=0`, with `VT_CPU_MOE=1` placing all 78 layers' routed experts on
+the host. **That is a DIAGNOSTIC combination and not the shipping default.**
+#2511 measured 17 GPU faults in 21 managed legs against 0 in 21 without, so
+`VT_ROCM_MANAGED_ALLOC=1` remains a lever for debugging and never a default.
+
+**The default-allocator arm still does not finish.** job8 leg 1 ran the shipping
+configuration for the full 9000 s and timed out (`rc=124`), neither crashing nor
+completing. So what is established is that the MODEL and the KERNELS can produce
+a correct token on this board; what is NOT established is that the shipping
+configuration can.
+
+### NO SPEED NUMBER, and the reason is stronger than usual
+
+The leg reports `secs=3476.252 tok_s=0.001`. **That figure is meaningless as
+performance and must never be quoted.** `AMD_SERIALIZE_KERNEL=3` makes every
+kernel launch synchronous and `HSA_ENABLE_SDMA=0` removes the copy engine; the
+run was configured to make a fault attributable, not to go fast. The ROCm
+GLM-5.3 speed axis stays **VOID**, and it would stay void even with a plausible
+number, because the DSA indexer pair is still unregistered and a benchmark
+prompt drives sparse steps.
+
+### What this narrows
+
+The crash and the timeout are now bracketed by a success:
+
+| Leg | Allocator | Serialised | SDMA | Result |
+|---|---|---|---|---|
+| job7 | managed | no | on | **core dump** at 4118 s |
+| job8-1 | default | no | on | **timeout** at 9001 s |
+| job8-2 / job10 | managed | **yes** | **off** | **generates**, 6942 s / 3949 s |
+
+Two variables still move together between the crashing and the generating leg,
+so neither `AMD_SERIALIZE_KERNEL=3` nor `HSA_ENABLE_SDMA=0` is isolated. One leg
+each is owed and is recorded below. But the direction is now measured rather
+than hypothesised: the fault is in ASYNCHRONY -- serialise the launches and
+remove the copy engine and a crash becomes a correct token -- and not in the
+allocator alone, which was the original hypothesis and is refuted, nor in the
+kernels, which produce the right answer when they are allowed to run in order.
+
 ## Owed
 
 - **Whether GLM-5.3 generates on `gfx1151` at all after #2511.** No token has
@@ -517,12 +588,11 @@ silence from the program.
   DOING: its captured output is zero bytes, so "wedged" and "loading slowly"
   are not separated. Owner `BACKEND-ROCM`, issue
   [#2965](https://github.com/mudler/vllm.cpp/issues/2965).
-- **A token, actually observed.** Job `8c458a73` leg 2 exited `rc=0` in 6942 s
-  under managed allocation with `AMD_SERIALIZE_KERNEL=3` and
-  `HSA_ENABLE_SDMA=0`, which for `vllm-cli` means a completed generation rather
-  than a refusal -- but the capture was empty, so the token is inferred from an
-  exit code and NOT observed. job10 repeats that leg with four capture paths.
-  Until it returns, this row claims no token. Owner `BACKEND-ROCM`, issue
+- **A token was OBSERVED, and this entry is discharged.** Job `499b30ae`
+  (job10) repeated job8's leg 2 with a working capture and emitted
+  ` Paris, which is` at `COMMAND_EXIT_CODE=0`. See `## Generation is
+  re-established` below. What remains owed from it is the DEFAULT-allocator
+  arm, which still times out. Owner `BACKEND-ROCM`, issue
   [#2965](https://github.com/mudler/vllm.cpp/issues/2965).
 - **Serialisation and SDMA are confounded.** job8 leg 2 moved
   `AMD_SERIALIZE_KERNEL=3` and `HSA_ENABLE_SDMA=0` together against job7's

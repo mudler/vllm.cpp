@@ -1,0 +1,5 @@
+{
+  "status": "PENDING #3040: trace not run in switches phase",
+  "trace_run": false,
+  "token_gate": "FAIL (carried, not remeasured)"
+}

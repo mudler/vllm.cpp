@@ -435,7 +435,7 @@ loud failure, which is the protection #577 asked for and did not get.
 - Whether dropping the page cache before every leg makes the first request fault
   in the weights is UNVERIFIED. Stated as a hypothesis; not used by any claim
   above.
-- [#952](https://github.com/mudler/vllm.cpp/issues/952) — `--max-num-seqs` also
+- ISSUE-GH-952 — `--max-num-seqs` also
   bounds our HTTP concurrency, where upstream bounds only the scheduler batch.
   Found here while refuting worker-pool starvation as this bug's cause, and
   refuted as that cause: the pool was 36 against an offered concurrency of 8. It

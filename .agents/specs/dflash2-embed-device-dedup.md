@@ -490,7 +490,7 @@ agents at loadavg 18-35 throughout, and `-j 2` on the same binary is
 
 - **O1** — the `lm_head` device dedup, ~0.715 GB each side. Owned by the parent spec's `## Owed`
   O3 (the O29 Marlin-body convergence), untouched here.
-- **O2** — [#1951](https://github.com/mudler/vllm.cpp/issues/1951): the DSpark lane's shared
+- **O2** — ISSUE-GH-1951: the DSpark lane's shared
   embed (`LoadDsparkDraft`'s shared fallback) takes the same second copy when the DSpark
   checkpoint omits its own table. The bind skips a DSpark draft explicitly and
   `test_dflash2_embed_dedup` pins the skip, so this is a named gap rather than an accident. It

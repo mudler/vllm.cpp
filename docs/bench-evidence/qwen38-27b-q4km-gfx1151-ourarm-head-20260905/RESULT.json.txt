@@ -1,0 +1,652 @@
+{
+  "arms": {
+    "n128": {
+      "fault_classes": [],
+      "fault_rate": "0 of 4",
+      "leg_spread_pct_of_median": 0.24283179228541887,
+      "legs_by_design": 4,
+      "legs_completed": 4,
+      "median_whole_completion_secs": 23.911,
+      "median_whole_completion_tok_s": 5.3535,
+      "per_leg_secs": [
+        23.885,
+        23.905,
+        23.917,
+        23.942
+      ],
+      "per_leg_whole_completion_tok_s": [
+        5.359,
+        5.355,
+        5.352,
+        5.346
+      ]
+    },
+    "n64": {
+      "fault_classes": [],
+      "fault_rate": "0 of 4",
+      "leg_spread_pct_of_median": 0.8294062205466465,
+      "legs_by_design": 4,
+      "legs_completed": 4,
+      "median_whole_completion_secs": 12.064499999999999,
+      "median_whole_completion_tok_s": 5.305,
+      "per_leg_secs": [
+        11.979,
+        12.062,
+        12.078,
+        12.067
+      ],
+      "per_leg_whole_completion_tok_s": [
+        5.343,
+        5.306,
+        5.299,
+        5.304
+      ]
+    }
+  },
+  "decode_derived": {
+    "median_decode_tok_s_derived": 5.3967549118511045,
+    "median_implied_fixed_cost_s": 0.2054999999999989,
+    "method": "slope between two token counts on the SAME prompt in the same lease; removes whatever fixed cost each call pays. DERIVED, not a direct decode reading.",
+    "pairs_by_design": 4,
+    "pairs_usable": 4,
+    "rows": [
+      {
+        "implied_fixed_cost_s": 0.07299999999999685,
+        "round": 1,
+        "slope_tok_s": 5.375440954140768,
+        "t_a_s": 11.979,
+        "t_b_s": 23.885
+      },
+      {
+        "implied_fixed_cost_s": 0.21899999999999764,
+        "round": 2,
+        "slope_tok_s": 5.404036139491682,
+        "t_a_s": 12.062,
+        "t_b_s": 23.905
+      },
+      {
+        "implied_fixed_cost_s": 0.23899999999999721,
+        "round": 3,
+        "slope_tok_s": 5.405861981586281,
+        "t_a_s": 12.078,
+        "t_b_s": 23.917
+      },
+      {
+        "implied_fixed_cost_s": 0.19200000000000017,
+        "round": 4,
+        "slope_tok_s": 5.389473684210526,
+        "t_a_s": 12.067,
+        "t_b_s": 23.942
+      }
+    ],
+    "spread_pct_of_median": 0.563691105903464
+  },
+  "design": {
+    "cold_runs": 1,
+    "legs_by_design": 8,
+    "n_source": "the design, passed in; this script tallies nothing",
+    "ngen_a": 64,
+    "ngen_b": 128,
+    "repeat": 4,
+    "rounds": 4
+  },
+  "fault_rate_all_legs": "0 of 8",
+  "legs": {
+    "128": [
+      {
+        "class": "OK",
+        "clock": {
+          "busy_percent": {
+            "max": 100,
+            "mean": 76.0,
+            "min": 0,
+            "n": 503
+          },
+          "samples": 503,
+          "sclk_mhz": {
+            "max": 2897,
+            "mean": 2337.6,
+            "min": 600,
+            "n": 503
+          }
+        },
+        "completion_tokens": 128,
+        "discarded_cold": 1,
+        "kept_completions": 3,
+        "rc": 0,
+        "read": true,
+        "reference_tier_lines": 0,
+        "repetitions": [
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 1,
+            "secs": 24.199,
+            "tok_s": 5.289
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 2,
+            "secs": 23.855,
+            "tok_s": 5.366
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 3,
+            "secs": 23.885,
+            "tok_s": 5.359
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 4,
+            "secs": 23.906,
+            "tok_s": 5.354
+          }
+        ],
+        "tag": "n128-r1",
+        "whole_completion_secs": 23.885,
+        "whole_completion_tok_s": 5.359
+      },
+      {
+        "class": "OK",
+        "clock": {
+          "busy_percent": {
+            "max": 100,
+            "mean": 75.1,
+            "min": 0,
+            "n": 503
+          },
+          "samples": 503,
+          "sclk_mhz": {
+            "max": 2896,
+            "mean": 2312.8,
+            "min": 600,
+            "n": 503
+          }
+        },
+        "completion_tokens": 128,
+        "discarded_cold": 1,
+        "kept_completions": 3,
+        "rc": 0,
+        "read": true,
+        "reference_tier_lines": 0,
+        "repetitions": [
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 1,
+            "secs": 24.251,
+            "tok_s": 5.278
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 2,
+            "secs": 23.905,
+            "tok_s": 5.355
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 3,
+            "secs": 23.903,
+            "tok_s": 5.355
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 4,
+            "secs": 23.958,
+            "tok_s": 5.343
+          }
+        ],
+        "tag": "n128-r2",
+        "whole_completion_secs": 23.905,
+        "whole_completion_tok_s": 5.355
+      },
+      {
+        "class": "OK",
+        "clock": {
+          "busy_percent": {
+            "max": 100,
+            "mean": 76.8,
+            "min": 0,
+            "n": 491
+          },
+          "samples": 491,
+          "sclk_mhz": {
+            "max": 2897,
+            "mean": 2350.7,
+            "min": 600,
+            "n": 491
+          }
+        },
+        "completion_tokens": 128,
+        "discarded_cold": 1,
+        "kept_completions": 3,
+        "rc": 0,
+        "read": true,
+        "reference_tier_lines": 0,
+        "repetitions": [
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 1,
+            "secs": 24.257,
+            "tok_s": 5.277
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 2,
+            "secs": 23.917,
+            "tok_s": 5.352
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 3,
+            "secs": 23.913,
+            "tok_s": 5.353
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 4,
+            "secs": 23.945,
+            "tok_s": 5.345
+          }
+        ],
+        "tag": "n128-r3",
+        "whole_completion_secs": 23.917,
+        "whole_completion_tok_s": 5.352
+      },
+      {
+        "class": "OK",
+        "clock": {
+          "busy_percent": {
+            "max": 100,
+            "mean": 77.4,
+            "min": 0,
+            "n": 493
+          },
+          "samples": 493,
+          "sclk_mhz": {
+            "max": 2895,
+            "mean": 2360.2,
+            "min": 600,
+            "n": 493
+          }
+        },
+        "completion_tokens": 128,
+        "discarded_cold": 1,
+        "kept_completions": 3,
+        "rc": 0,
+        "read": true,
+        "reference_tier_lines": 0,
+        "repetitions": [
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 1,
+            "secs": 24.265,
+            "tok_s": 5.275
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 2,
+            "secs": 23.926,
+            "tok_s": 5.35
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 3,
+            "secs": 23.942,
+            "tok_s": 5.346
+          },
+          {
+            "completion_tokens": 128,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 4,
+            "secs": 23.975,
+            "tok_s": 5.339
+          }
+        ],
+        "tag": "n128-r4",
+        "whole_completion_secs": 23.942,
+        "whole_completion_tok_s": 5.346
+      }
+    ],
+    "64": [
+      {
+        "class": "OK",
+        "clock": {
+          "busy_percent": {
+            "max": 100,
+            "mean": 63.1,
+            "min": 0,
+            "n": 306
+          },
+          "samples": 306,
+          "sclk_mhz": {
+            "max": 2897,
+            "mean": 2050.6,
+            "min": 600,
+            "n": 306
+          }
+        },
+        "completion_tokens": 64,
+        "discarded_cold": 1,
+        "kept_completions": 3,
+        "rc": 0,
+        "read": true,
+        "reference_tier_lines": 0,
+        "repetitions": [
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 1,
+            "secs": 12.453,
+            "tok_s": 5.139
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 2,
+            "secs": 11.977,
+            "tok_s": 5.343
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 3,
+            "secs": 11.979,
+            "tok_s": 5.343
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 4,
+            "secs": 12.007,
+            "tok_s": 5.33
+          }
+        ],
+        "tag": "n64-r1",
+        "whole_completion_secs": 11.979,
+        "whole_completion_tok_s": 5.343
+      },
+      {
+        "class": "OK",
+        "clock": {
+          "busy_percent": {
+            "max": 100,
+            "mean": 63.2,
+            "min": 0,
+            "n": 307
+          },
+          "samples": 307,
+          "sclk_mhz": {
+            "max": 2895,
+            "mean": 2044.3,
+            "min": 600,
+            "n": 307
+          }
+        },
+        "completion_tokens": 64,
+        "discarded_cold": 1,
+        "kept_completions": 3,
+        "rc": 0,
+        "read": true,
+        "reference_tier_lines": 0,
+        "repetitions": [
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 1,
+            "secs": 12.491,
+            "tok_s": 5.124
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 2,
+            "secs": 12.057,
+            "tok_s": 5.308
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 3,
+            "secs": 12.066,
+            "tok_s": 5.304
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 4,
+            "secs": 12.062,
+            "tok_s": 5.306
+          }
+        ],
+        "tag": "n64-r2",
+        "whole_completion_secs": 12.062,
+        "whole_completion_tok_s": 5.306
+      },
+      {
+        "class": "OK",
+        "clock": {
+          "busy_percent": {
+            "max": 100,
+            "mean": 63.3,
+            "min": 0,
+            "n": 307
+          },
+          "samples": 307,
+          "sclk_mhz": {
+            "max": 2896,
+            "mean": 2045.2,
+            "min": 600,
+            "n": 307
+          }
+        },
+        "completion_tokens": 64,
+        "discarded_cold": 1,
+        "kept_completions": 3,
+        "rc": 0,
+        "read": true,
+        "reference_tier_lines": 0,
+        "repetitions": [
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 1,
+            "secs": 12.473,
+            "tok_s": 5.131
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 2,
+            "secs": 12.051,
+            "tok_s": 5.311
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 3,
+            "secs": 12.083,
+            "tok_s": 5.297
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 4,
+            "secs": 12.078,
+            "tok_s": 5.299
+          }
+        ],
+        "tag": "n64-r3",
+        "whole_completion_secs": 12.078,
+        "whole_completion_tok_s": 5.299
+      },
+      {
+        "class": "OK",
+        "clock": {
+          "busy_percent": {
+            "max": 100,
+            "mean": 63.3,
+            "min": 0,
+            "n": 306
+          },
+          "samples": 306,
+          "sclk_mhz": {
+            "max": 2895,
+            "mean": 2045.7,
+            "min": 600,
+            "n": 306
+          }
+        },
+        "completion_tokens": 64,
+        "discarded_cold": 1,
+        "kept_completions": 3,
+        "rc": 0,
+        "read": true,
+        "reference_tier_lines": 0,
+        "repetitions": [
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 1,
+            "secs": 12.476,
+            "tok_s": 5.13
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 2,
+            "secs": 12.057,
+            "tok_s": 5.308
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 3,
+            "secs": 12.067,
+            "tok_s": 5.304
+          },
+          {
+            "completion_tokens": 64,
+            "finish_reason": "length",
+            "of": 4,
+            "prompt_tokens": 5,
+            "run": 4,
+            "secs": 12.069,
+            "tok_s": 5.303
+          }
+        ],
+        "tag": "n64-r4",
+        "whole_completion_secs": 12.067,
+        "whole_completion_tok_s": 5.304
+      }
+    ]
+  },
+  "quantity_of_our_figure": "whole completion (vllm-cli times the whole vllm_complete() call, prompt included). NOT decode. Comparable to vLLM's generate() leg; NOT comparable to llama-bench -p 0.",
+  "ratios": {
+    "REFUSED__llamacpp_decode_over_vllmcpp_whole_completion": "not computed: dividing pure decode by whole completion compares two different quantities. PR #2940 records that exact mistake emitting 1.814x.",
+    "like_for_like_decode__llamacpp_over_vllmcpp_derived": {
+      "definition": "decode against decode; our side is DERIVED and labelled so",
+      "denominator": "vllm.cpp 5.397 tok/s decode, DERIVED from the slope",
+      "numerator": "llama.cpp 12.219 tok/s decode (carried constant, llama-bench -p 0)",
+      "value": 2.2641383941982354
+    },
+    "like_for_like_whole_completion__vllm_over_vllmcpp": {
+      "definition": "both are whole completion; this ratio is like-for-like",
+      "denominator": "vllm.cpp 5.305 tok/s whole completion (measured here)",
+      "numerator": "vLLM 6.734 tok/s whole completion (carried constant)",
+      "value": 1.269368520263902
+    }
+  },
+  "reference": {
+    "llamacpp_b10451_decode_tok_s": 12.219,
+    "llamacpp_b10451_decode_tok_s_landed_denominator": 12.233,
+    "note": "constants carried from earlier evidence; no leg of this run re-measured them",
+    "source": "docs/benchmarks/qwen38-27b-q4km-gfx1151.md (PR #2940) and docs/bench-evidence/rocm-strix-llamacpp-denominator-20260902.md",
+    "vllm_5559679229_decode_derived_tok_s": 11.056,
+    "vllm_5559679229_whole_completion_tok_s": 6.734
+  },
+  "token_gate": {
+    "deterministic_denominator": "none established on this path",
+    "every_divergence": "a near-tie at about 0.125 nats, one bf16 ULP",
+    "note": "these counts are constants carried from earlier evidence, not measured here",
+    "state": "FAIL",
+    "vllmcpp_vs_llamacpp_divergent_prompts": "3 of 6",
+    "vllmcpp_vs_vllm_compiled_divergent_prompts": "5 of 6"
+  }
+}

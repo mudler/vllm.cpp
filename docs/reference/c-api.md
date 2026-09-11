@@ -14,32 +14,40 @@ therefore resolves the exported symbols through `LoadLibraryA` /
 `GetProcAddress` on Windows and `dlopen` / `dlsym` on POSIX.
 
 ```c
+#include <stdio.h>
 #include "vllm.h"
 
-vllm_model_params mp = vllm_model_params_default();
-mp.model_path = "/path/to/model";
+int main(void) {
+    vllm_model_params mp = vllm_model_params_default();
+    mp.model_path = "/path/to/model";
 
-vllm_engine *engine = NULL;
-if (vllm_engine_load(&mp, &engine) != VLLM_OK) {
-    fprintf(stderr, "%s\n", vllm_last_error());
-    return 1;
-}
+    vllm_engine *engine = NULL;
+    if (vllm_engine_load(&mp, &engine) != VLLM_OK) {
+        fprintf(stderr, "%s\n", vllm_last_error());
+        return 1;
+    }
 
-vllm_sampling_params sp = vllm_sampling_params_default();
-sp.max_tokens = 64;               /* sp.temperature = 0.0 means greedy */
+    vllm_sampling_params sp = vllm_sampling_params_default();
+    sp.max_tokens = 64;
+    sp.temperature = 0.0;  /* Greedy decoding. */
 
-vllm_completion out;
-if (vllm_complete(engine, "The capital of France is", &sp, &out) == VLLM_OK) {
+    vllm_completion out;
+    if (vllm_complete(engine, "The capital of France is", &sp, &out) != VLLM_OK) {
+        fprintf(stderr, "%s\n", vllm_last_error());
+        vllm_engine_free(engine);
+        return 1;
+    }
     printf("%s\n", out.text);
     vllm_completion_free(&out);
+    vllm_engine_free(engine);
+    return 0;
 }
-vllm_engine_free(engine);
 ```
 
 The ABI covers engine lifecycle, completion, chat, embeddings, transcription,
 media generation, speech generation, memory helpers, and diagnostics. It also
 exposes blocking, streaming, and concurrent request interfaces. The current
-version is `VLLM_ABI_VERSION 23`.
+version is `VLLM_ABI_VERSION 26`.
 
 Read [`include/vllm.h`](../../include/vllm.h) for the fields and functions in
 the current ABI. Call `vllm_abi_version()` at runtime to detect a header and
@@ -47,6 +55,25 @@ library mismatch.
 
 Chat templates render through the vendored google/minja engine, the same
 renderer llama.cpp ships.
+
+## Recent ABI additions
+
+Initialize model parameters with `vllm_model_params_default()` before setting
+individual fields.
+
+- **ABI 24: `vllm_model_params.kv_cache_dtype`.** `NULL` or `"auto"` uses the
+  model dtype. `"fp8"` or `"fp8_e4m3"` selects 1-byte E4M3 KV storage on
+  [routed model families](../USAGE.md#halve-the-kv-cache-with---kv-cache-dtype-fp8).
+- **ABI 25: `vllm_engine_spec_acceptance()`.** Read cumulative counts of
+  verified draft tokens, accepted draft tokens, and request steps that carried a draft.
+  Accepted counts exclude bonus tokens. Request steps count each request separately,
+  including within a batch. The query changes no decoding decisions.
+  A text engine that never speculated returns zero counters.
+  Null arguments or a handle without text generation return `VLLM_ERR_INVALID_ARGUMENT`.
+- **ABI 26: `vllm_model_params.disable_sliding_window`.** `0` keeps the default,
+  `1` disables the model-level window, and `2` explicitly enables it.
+  Other values return `VLLM_ERR_INVALID_ARGUMENT` during loading.
+  Per-layer windows take precedence. Models without a window ignore this control.
 
 ## Consuming it from C++
 

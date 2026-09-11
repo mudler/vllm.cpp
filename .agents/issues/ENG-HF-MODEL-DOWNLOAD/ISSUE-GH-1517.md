@@ -1,0 +1,23 @@
+ID: ISSUE-GH-1517
+Title: **Every container image this tree produced, and every published CUDA archive, shipped the HuggingFace fetch silently downgraded to plain http.** `docker/Dockerfile` added `libssl3` to the RUNTIME stage for #1280 and never added `libssl-dev` to a BUILDER stage, so `builder-toolchain` and `builder-cuda` installed `binutils build-essential ca-certificates cmake curl file git ninja-build python3` and nothing else. `CMakeLists.txt:2440-2482` answers a failed `find_package(OpenSSL)` with a DOWNGRADE rather than a failure -- `Could NOT find OpenSSL (missing: OPENSSL_CRYPTO_LIBRARY OPENSSL_INCLUDE_DIR)`, then `VLLM_CPP_OPENSSL=ON but OpenSSL was not found; HTTPS support is disabled` and `VLLM_CPP_HF_DOWNLOAD=ON but no transport layer security is available` -- so the build stayed green and `ldd` on the shipped `vllm-server` named only `libstdc++ libm libgcc_s libc`. The runtime `libssl3` was installed and nothing linked it, and the comment at `docker/Dockerfile:175` claiming the server links libssl and libcrypto was false for every image the file produced. NOT a network defect: from inside that same container `ffmpeg -i https://huggingface.co/api/models/does-not-exist/nope/refs` completed a TLS handshake and returned HTTP 401. `.github/workflows/release.yml`'s `cuda_x86` and `cuda_arm64` build inside `nvidia/cuda:13.3.0-devel-ubuntu24.04` with the identical package list, so the PUBLISHED CUDA archives were in the same state; `cpu_x86`, `cpu_arm64` and `vulkan_x86` had transport layer security only because the `ubuntu-latest` runner image happens to preinstall `libssl-dev`, which is an accident nothing defended. Found by `scripts/validate-container-image.py` on its first ever real execution (`hub reach: this image cannot speak HTTPS`), which is the measurement `.agents/specs/hf-model-download.md` recorded as owed from W5. Fixed in flow: `libssl-dev` named in both builder stages and in all five apt-based release lanes, and `scripts/check-build-runtime-deps.py` added to refuse the class -- a stage or lane that compiles the server without the development files, or a runtime that carries `libssl3` with no builder half
+Row: ENG-HF-MODEL-DOWNLOAD
+State: UNKNOWN
+Kind: bug
+GitHub: 1517
+Mirror: MISSING
+Availability: METADATA_ONLY
+Created: UNKNOWN
+Updated: UNKNOWN
+Closed: UNKNOWN
+
+## Problem
+
+Archive: `.agents/completed/issue-index.md:536`
+
+### Frozen archive evidence
+
+> | [#1517](https://github.com/mudler/vllm.cpp/issues/1517) | `ENG-HF-MODEL-DOWNLOAD` | **Every container image this tree produced, and every published CUDA archive, shipped the HuggingFace fetch silently downgraded to plain http.** `docker/Dockerfile` added `libssl3` to the RUNTIME stage for #1280 and never added `libssl-dev` to a BUILDER stage, so `builder-toolchain` and `builder-cuda` installed `binutils build-essential ca-certificates cmake curl file git ninja-build python3` and nothing else. `CMakeLists.txt:2440-2482` answers a failed `find_package(OpenSSL)` with a DOWNGRADE rather than a failure -- `Could NOT find OpenSSL (missing: OPENSSL_CRYPTO_LIBRARY OPENSSL_INCLUDE_DIR)`, then `VLLM_CPP_OPENSSL=ON but OpenSSL was not found; HTTPS support is disabled` and `VLLM_CPP_HF_DOWNLOAD=ON but no transport layer security is available` -- so the build stayed green and `ldd` on the shipped `vllm-server` named only `libstdc++ libm libgcc_s libc`. The runtime `libssl3` was installed and nothing linked it, and the comment at `docker/Dockerfile:175` claiming the server links libssl and libcrypto was false for every image the file produced. NOT a network defect: from inside that same container `ffmpeg -i https://huggingface.co/api/models/does-not-exist/nope/refs` completed a TLS handshake and returned HTTP 401. `.github/workflows/release.yml`'s `cuda_x86` and `cuda_arm64` build inside `nvidia/cuda:13.3.0-devel-ubuntu24.04` with the identical package list, so the PUBLISHED CUDA archives were in the same state; `cpu_x86`, `cpu_arm64` and `vulkan_x86` had transport layer security only because the `ubuntu-latest` runner image happens to preinstall `libssl-dev`, which is an accident nothing defended. Found by `scripts/validate-container-image.py` on its first ever real execution (`hub reach: this image cannot speak HTTPS`), which is the measurement `.agents/specs/hf-model-download.md` recorded as owed from W5. Fixed in flow: `libssl-dev` named in both builder stages and in all five apt-based release lanes, and `scripts/check-build-runtime-deps.py` added to refuse the class -- a stage or lane that compiles the server without the development files, or a runtime that carries `libssl3` with no builder half | bug |
+
+## Resolution
+
+-

@@ -1000,7 +1000,7 @@ ran out of space, so §7.5.1 does not apply to either red.
 
 ## Owed
 
-- [#999](https://github.com/mudler/vllm.cpp/issues/999): `scripts/check-commit-style.py`
+- ISSUE-GH-999: `scripts/check-commit-style.py`
   `validate_range` still refuses a base that is not an ancestor of head, so it
   never received the merge base repair that `GATE-FORK-ANCESTRY` (#773) applied
   to `scripts/check-commit-trailers.py`. Found while auditing this script's

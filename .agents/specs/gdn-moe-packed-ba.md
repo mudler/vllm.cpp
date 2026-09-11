@@ -540,17 +540,17 @@ byte-identical in every comparison, and the 16-token oracle golden sits far
 above both effects.
 
 ## Owed
-- [#1877](https://github.com/mudler/vllm.cpp/issues/1877) -- NVFP4 35B greedy
+- ISSUE-GH-1877 -- NVFP4 35B greedy
   c1 is not run-to-run reproducible for requests after the first (found by
   this row's A/B; not this row's defect; owed an owner).
-- [#1878](https://github.com/mudler/vllm.cpp/issues/1878) -- packed-vs-rollback
+- ISSUE-GH-1878 -- packed-vs-rollback
   token divergence at depth on the bf16 35B with a clean null; disposition
   needs a quality-at-depth or oracle-continuation measurement.
 
-- [#1793](https://github.com/mudler/vllm.cpp/issues/1793) — the GGUF MoE loader
+- ISSUE-GH-1793 — the GGUF MoE loader
   keeps `in_proj_b`/`in_proj_a` split across three residency routes, so packed
   GDN decode stays unreached on GGUF MoE. Owed here until a row claims it.
-- The `in_proj_qkvz` merged owner on the MoE arm (noted in #1169, not a
+- The `in_proj_qkvz` merged owner on the MoE arm (noted in ISSUE-GH-1169, not a
   reachability term for the packed leg). Not owed by this row; recorded so the
   next reader does not expect it here.
 

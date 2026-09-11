@@ -1,0 +1,557 @@
+{
+  "row": "BACKEND-ROCM-QUANT-GATHER",
+  "argv": [
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/bin/rocprofv3",
+    "--hip-trace",
+    "--kernel-trace",
+    "--memory-allocation-trace",
+    "--output-format",
+    "csv",
+    "--output-file",
+    "trace_%pid%",
+    "--rocm-root",
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix",
+    "--output-directory",
+    "/home/vikash/.cache/rdna3-gather-impl/public-model-trace-v1/profiler",
+    "--",
+    "/home/vikash/.cache/rdna3-gather-impl/public-model-trace-v1/test_capi_rocm_embedding_quant"
+  ],
+  "env": {
+    "HIP_VISIBLE_DEVICES": "0",
+    "ROCR_VISIBLE_DEVICES": "0",
+    "TMPDIR": "/home/vikash/.cache/rdna3-gather-impl/tmp",
+    "VT_ROCM_GATHER_PUBLIC_EVIDENCE": "/home/vikash/.cache/rdna3-gather-impl/public-model-trace-v1/public-captures"
+  },
+  "cwd": "/home/vikash/.cache/rdna3-gather-impl/public-model-trace-v1",
+  "log": "/home/vikash/.cache/rdna3-gather-impl/public-model-trace-v1/public.log",
+  "files": {
+    "/home/vikash/.cache/rdna3-gather-impl/public-model-trace-v1/test_capi_rocm_embedding_quant": {
+      "bytes": 30926000,
+      "sha256": "6a8f7e1029b904c94c0d76561f0291cd17fd7b3e4db29e2d95e3b33894c74efd"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/public-model-trace-v1/source.tar": {
+      "bytes": 1013760,
+      "sha256": "77601cd1020533ecbf080fe73a5bfb6020611f0dbe762b07dce3c05d45a36de5"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/native-final-v3/commands.json": {
+      "bytes": 9311,
+      "sha256": "2d05f18ea3a17739b441cd28f2c3b32c580f5cb48ff220ef547caa4148ef8f7d"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/librocprofiler-sdk-attach.so": {
+      "bytes": 897296,
+      "sha256": "742848d814c8c852aba6e5df960c7797968bcf19ce6a546ffde29c9f5a21ae4e"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/librocprof-trace-decoder.so.0.2": {
+      "bytes": 407656,
+      "sha256": "f4c158cdf49b46c15392decb3fef4065fc0654867de6ed26ffbcd1303e8301b2"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/librocprofiler-sdk-rocpd.so.1": {
+      "bytes": 1325128,
+      "sha256": "378e816d72ce4b0d7f0958b574be85e51b491cd1067e80372f27491f07081d6a"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/libamd_comgr.so": {
+      "bytes": 13181720,
+      "sha256": "ff98e63e6b8677eb51376816f3e1169e377ac446e7bf4c5d247683a72f2f59eb"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/librocprof-trace-decoder.so": {
+      "bytes": 407656,
+      "sha256": "f4c158cdf49b46c15392decb3fef4065fc0654867de6ed26ffbcd1303e8301b2"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/librocprofiler-register.so": {
+      "bytes": 967760,
+      "sha256": "7166282aacab9f6c8fdcc28ad884e57b6b09cd4e08aead98b8e862a61010e85c"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/librocprofiler-sdk-attach.so.1": {
+      "bytes": 897296,
+      "sha256": "742848d814c8c852aba6e5df960c7797968bcf19ce6a546ffde29c9f5a21ae4e"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/librocprofiler-sdk-rocattach.so": {
+      "bytes": 1076520,
+      "sha256": "e86594e2368aacbecc77d39da44323150fb39f1a346862f264cfcf6a0645a99d"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/librocprofiler-sdk.so": {
+      "bytes": 15823336,
+      "sha256": "807f890e2cb6661000845250358c3939f41573e88fc3aac6d529bb2d5fa6b55c"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/librocprofiler-sdk-rocpd.so": {
+      "bytes": 1325128,
+      "sha256": "378e816d72ce4b0d7f0958b574be85e51b491cd1067e80372f27491f07081d6a"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/libamd_comgr.so.3.3.0": {
+      "bytes": 13181720,
+      "sha256": "ff98e63e6b8677eb51376816f3e1169e377ac446e7bf4c5d247683a72f2f59eb"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/librocprofiler-sdk-rocpd.so.1.3.5": {
+      "bytes": 1325128,
+      "sha256": "378e816d72ce4b0d7f0958b574be85e51b491cd1067e80372f27491f07081d6a"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/librocprofiler-sdk-roctx.so.1": {
+      "bytes": 845320,
+      "sha256": "07ab9ebdd0785c8a2f01b06c54bdebfcd70a9aa3ac7f6fb791045362dce6395c"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/libamd_comgr.so.3": {
+      "bytes": 13181720,
+      "sha256": "ff98e63e6b8677eb51376816f3e1169e377ac446e7bf4c5d247683a72f2f59eb"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/librocprofiler-sdk-rocattach.so.1.3.5": {
+      "bytes": 1076520,
+      "sha256": "e86594e2368aacbecc77d39da44323150fb39f1a346862f264cfcf6a0645a99d"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/librocprofiler-sdk-roctx.so.1.3.5": {
+      "bytes": 845320,
+      "sha256": "07ab9ebdd0785c8a2f01b06c54bdebfcd70a9aa3ac7f6fb791045362dce6395c"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/librocprofiler-sdk-roctx.so": {
+      "bytes": 845320,
+      "sha256": "07ab9ebdd0785c8a2f01b06c54bdebfcd70a9aa3ac7f6fb791045362dce6395c"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/librocprofiler-register.so.0.6.0": {
+      "bytes": 967760,
+      "sha256": "7166282aacab9f6c8fdcc28ad884e57b6b09cd4e08aead98b8e862a61010e85c"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/librocprofiler-sdk.so.1": {
+      "bytes": 15823336,
+      "sha256": "807f890e2cb6661000845250358c3939f41573e88fc3aac6d529bb2d5fa6b55c"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/librocprofiler-register.so.0": {
+      "bytes": 967760,
+      "sha256": "7166282aacab9f6c8fdcc28ad884e57b6b09cd4e08aead98b8e862a61010e85c"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/librocprofiler-sdk-rocattach.so.1": {
+      "bytes": 1076520,
+      "sha256": "e86594e2368aacbecc77d39da44323150fb39f1a346862f264cfcf6a0645a99d"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/librocprofiler-sdk.so.1.3.5": {
+      "bytes": 15823336,
+      "sha256": "807f890e2cb6661000845250358c3939f41573e88fc3aac6d529bb2d5fa6b55c"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/librocprof-trace-decoder.so.0.2.0": {
+      "bytes": 407656,
+      "sha256": "f4c158cdf49b46c15392decb3fef4065fc0654867de6ed26ffbcd1303e8301b2"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/librocprofiler-sdk-attach.so.1.3.5": {
+      "bytes": 897296,
+      "sha256": "742848d814c8c852aba6e5df960c7797968bcf19ce6a546ffde29c9f5a21ae4e"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/bin/rocprofv3": {
+      "bytes": 95727,
+      "sha256": "2d220ded2167097e480e6866a916b575548d56bed8a823a4e505f7133868f0a6"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocprofiler-sdk/librocprofv3-list-avail.so": {
+      "bytes": 1270072,
+      "sha256": "acee4c6e3ea5cb365b4cc65ee3dc5ce07412aa75f5211cb58edf13d962de7fb6"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocprofiler-sdk/librocprofiler-sdk-tool.so.1.3.5": {
+      "bytes": 11752584,
+      "sha256": "5c4bf4f4bff332fd7713f2c25fd7605bc80b1a5befdee7949b845b57cee87b0e"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocprofiler-sdk/librocprofiler-sdk-tool.so.1": {
+      "bytes": 11752584,
+      "sha256": "5c4bf4f4bff332fd7713f2c25fd7605bc80b1a5befdee7949b845b57cee87b0e"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocprofiler-sdk/librocprofiler-sdk-tool.so": {
+      "bytes": 11752584,
+      "sha256": "5c4bf4f4bff332fd7713f2c25fd7605bc80b1a5befdee7949b845b57cee87b0e"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocprofiler-sdk/librocprofiler-sdk-tool-kokkosp.so": {
+      "bytes": 796176,
+      "sha256": "cd3c7cbed051159d3966a71be00934c7a7de1963233a891684b2484007845c1a"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocprofiler-sdk/librocprofv3-list-avail.so.1": {
+      "bytes": 1270072,
+      "sha256": "acee4c6e3ea5cb365b4cc65ee3dc5ce07412aa75f5211cb58edf13d962de7fb6"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocprofiler-sdk/librocprofv3-list-avail.so.1.3.5": {
+      "bytes": 1270072,
+      "sha256": "acee4c6e3ea5cb365b4cc65ee3dc5ce07412aa75f5211cb58edf13d962de7fb6"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocprofiler-sdk/librocprofiler-sdk-tool-kokkosp.so.1.3.5": {
+      "bytes": 796176,
+      "sha256": "cd3c7cbed051159d3966a71be00934c7a7de1963233a891684b2484007845c1a"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocprofiler-sdk/librocprofiler-sdk-tool-kokkosp.so.1": {
+      "bytes": 796176,
+      "sha256": "cd3c7cbed051159d3966a71be00934c7a7de1963233a891684b2484007845c1a"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/llvm/lib/libclang-cpp.so.23.0git": {
+      "bytes": 89897976,
+      "sha256": "0119f76826759e3f0534bb95bcc28e3e788e3a041e47b89310b3d324197b8ad3"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/llvm/lib/libLLVM.so.23.0git": {
+      "bytes": 132274504,
+      "sha256": "1f258534e3b14393fb2d65d6cb6a93fac239727cc1df5b698b6d2b51f78a65d9"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/llvm/lib/libclang-cpp.so": {
+      "bytes": 89897976,
+      "sha256": "0119f76826759e3f0534bb95bcc28e3e788e3a041e47b89310b3d324197b8ad3"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/llvm/lib/libLLVM-23git.so": {
+      "bytes": 132274504,
+      "sha256": "1f258534e3b14393fb2d65d6cb6a93fac239727cc1df5b698b6d2b51f78a65d9"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/llvm/lib/libLLVM.so": {
+      "bytes": 132274504,
+      "sha256": "1f258534e3b14393fb2d65d6cb6a93fac239727cc1df5b698b6d2b51f78a65d9"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocm_sysdeps/lib/librocm_sysdeps_dw.so.1": {
+      "bytes": 5679360,
+      "sha256": "f9ad555cea1480082fd89dedaf5e0626a6deea0cb296c39d44b020adb56a0c49"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocm_sysdeps/lib/librocm_sysdeps_elf.so.1": {
+      "bytes": 1198616,
+      "sha256": "a51543f71efce0c552ae606fe103b6e4fa4f6b283ba48a762f6d57b880401832"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so.1": {
+      "bytes": 879168,
+      "sha256": "5fc4ab0e6899318ece9bea43d3d397d20053418a5e40cb6bc86efe19a801c75e"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocm_sysdeps/lib/libdw.so": {
+      "bytes": 5679360,
+      "sha256": "f9ad555cea1480082fd89dedaf5e0626a6deea0cb296c39d44b020adb56a0c49"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocm_sysdeps/lib/librocm_sysdeps_zstd.so.1.5.7": {
+      "bytes": 879168,
+      "sha256": "5fc4ab0e6899318ece9bea43d3d397d20053418a5e40cb6bc86efe19a801c75e"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocm_sysdeps/lib/libelf.so": {
+      "bytes": 1198616,
+      "sha256": "a51543f71efce0c552ae606fe103b6e4fa4f6b283ba48a762f6d57b880401832"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocm_sysdeps/lib/libzstd.so": {
+      "bytes": 879168,
+      "sha256": "5fc4ab0e6899318ece9bea43d3d397d20053418a5e40cb6bc86efe19a801c75e"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocm_sysdeps/lib/libdrm.so": {
+      "bytes": 360336,
+      "sha256": "f1b274ac80ac1bcd241d70e1f13f9586e3fc83545a357b312890c1722ca68dcf"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocm_sysdeps/lib/liblzma.so": {
+      "bytes": 218464,
+      "sha256": "15402b36e2fdb0762e0b6590c3470fccec5e80cc8010c84ac4835573d592c02d"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocm_sysdeps/lib/libsqlite3.so": {
+      "bytes": 1479528,
+      "sha256": "44234a62c1ca345fd1a7886b4eeb82b6396ff7737967446c1627d4154c69a69a"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocm_sysdeps/lib/libdrm_amdgpu.so": {
+      "bytes": 251416,
+      "sha256": "78c1af14962d9ee0e43602d422eb8619b6c825a9b7c8f532308ea1f4108a466f"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocm_sysdeps/lib/librocm_sysdeps_liblzma.so.5.8.1": {
+      "bytes": 218464,
+      "sha256": "15402b36e2fdb0762e0b6590c3470fccec5e80cc8010c84ac4835573d592c02d"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocm_sysdeps/lib/libbz2.so": {
+      "bytes": 104016,
+      "sha256": "628d4871ea18e82dcc73b28f45a587f00a7abd4b208b371a713eb2e9d5b95dec"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocm_sysdeps/lib/librocm_sysdeps_bz2.so": {
+      "bytes": 104016,
+      "sha256": "628d4871ea18e82dcc73b28f45a587f00a7abd4b208b371a713eb2e9d5b95dec"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocm_sysdeps/lib/librocm_sysdeps_liblzma.so.5": {
+      "bytes": 218464,
+      "sha256": "15402b36e2fdb0762e0b6590c3470fccec5e80cc8010c84ac4835573d592c02d"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocm_sysdeps/lib/librocm_sysdeps_drm_amdgpu.so.1": {
+      "bytes": 251416,
+      "sha256": "78c1af14962d9ee0e43602d422eb8619b6c825a9b7c8f532308ea1f4108a466f"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocm_sysdeps/lib/librocm_sysdeps_z.so.1.3.2": {
+      "bytes": 129576,
+      "sha256": "27361c0c552d2afd5ecf9079f356309ed827e9a27d35f2fc68c7b5e6b5c83199"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocm_sysdeps/lib/librocm_sysdeps_drm.so.2": {
+      "bytes": 360336,
+      "sha256": "f1b274ac80ac1bcd241d70e1f13f9586e3fc83545a357b312890c1722ca68dcf"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocm_sysdeps/lib/librocm_sysdeps_sqlite3.so": {
+      "bytes": 1479528,
+      "sha256": "44234a62c1ca345fd1a7886b4eeb82b6396ff7737967446c1627d4154c69a69a"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocm_sysdeps/lib/libz.so": {
+      "bytes": 129576,
+      "sha256": "27361c0c552d2afd5ecf9079f356309ed827e9a27d35f2fc68c7b5e6b5c83199"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/lib/rocm_sysdeps/lib/librocm_sysdeps_z.so.1": {
+      "bytes": 129576,
+      "sha256": "27361c0c552d2afd5ecf9079f356309ed827e9a27d35f2fc68c7b5e6b5c83199"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/config.yaml": {
+      "bytes": 443032,
+      "sha256": "63542b5a2a285098f6ccb1d355574c8559ca75d3d5f80c82c5f02be7e3c8f960"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/convert-counters-collection-format.py": {
+      "bytes": 6513,
+      "sha256": "933afa0416346c97755e1895cd4c482fe3414eca02401885842e8a8f4963edc3"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/setup-env.sh": {
+      "bytes": 1384,
+      "sha256": "bcfd4c15a443cfa4e11f064e5dee1ee3e8793b7dc61513c1f2c5a9bf44c1b89f"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/derived_counters.xml": {
+      "bytes": 95217,
+      "sha256": "774ba31a494d9135faf2ac876d0c1e6222358166c7a2b2019bb34e1e546095dc"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/basic_counters.xml": {
+      "bytes": 107538,
+      "sha256": "510cb2f0bd7400b5e2ac7dd3ff473d39ecb77d126042b99c1fcd4b0a38ea39f9"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/CMakeLists.txt": {
+      "bytes": 1459,
+      "sha256": "809258de222cffb7e49af96c68a93f449a916d35a1a6f8868cf25f06add41cc0"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/thread_trace/agent.cpp": {
+      "bytes": 15667,
+      "sha256": "6d2eee1aea16dc7c851a7ccd9b8ebe50cdbbf5a512db15646334f42bdb39dba6"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/thread_trace/CMakeLists.txt": {
+      "bytes": 2492,
+      "sha256": "4c2f34441922ef0c55eaf486af8303f24987f9ae23594262a2183c368775c007"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/thread_trace/main.cpp": {
+      "bytes": 5386,
+      "sha256": "cd7dd11518b692aa2982a74984eb1a0953a1f3131e2d8eb24b7211a294a41903"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/thread_trace/README.md": {
+      "bytes": 1081,
+      "sha256": "a88cc99102c22045939f37d1eab4bda802ba9b6cbfe5271c6c652dddfe8c2614"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/code_object_tracing/client.cpp": {
+      "bytes": 13389,
+      "sha256": "ef5c1d5768b8566bad9299d03ee619d744d1ed4bf12e70fda9aece8a9345876b"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/code_object_tracing/CMakeLists.txt": {
+      "bytes": 1732,
+      "sha256": "672138d4cb7014418a91e5e8caf615cbf93df765647cd8e52de78cb5523f2f33"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/code_object_tracing/main.cpp": {
+      "bytes": 9024,
+      "sha256": "cbb02ba874c4c20ce2c00d42d57113f20625eacbe1e7f04dbdd0003000443819"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/code_object_tracing/README.md": {
+      "bytes": 551,
+      "sha256": "f25e5590cb1860609e9c761257155c9901e0fab218a9e0ecd4cdc8b3c0a1687e"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/intercept_table/client.cpp": {
+      "bytes": 11294,
+      "sha256": "6267a50614de3307b9c0b0623b16645b1d09733d9f930a02276d5ed0a300df8f"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/intercept_table/CMakeLists.txt": {
+      "bytes": 2048,
+      "sha256": "48e08db456719fba451da3b73034c08089d9c83061a7916762d4265decd431a9"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/intercept_table/main.cpp": {
+      "bytes": 8659,
+      "sha256": "1807978bb1f4ec6bcfdffb9a18367557364b926d25d5f6e79688e44397b1b32d"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/intercept_table/client.hpp": {
+      "bytes": 1418,
+      "sha256": "1d37987fd6f8f34bb9f9f1df5188b0ecaee5ee2f1a99b2b3fc4fa0cb3cfca19e"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/intercept_table/README.md": {
+      "bytes": 356,
+      "sha256": "d569ac790862a3699175f097d29d9725bbfa662b84d50cc5b7a74e13306e87c7"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/common/CMakeLists.txt": {
+      "bytes": 3539,
+      "sha256": "b554903b80d735b5488a4dc2a80b81928d3758678037d3d72f20b8bd85d8aad5"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/common/call_stack.hpp": {
+      "bytes": 2937,
+      "sha256": "bc95aaada5e341c82eb5213df84d81068d2fbca2ed506d5c2c2cabfb54d3131e"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/common/filesystem.hpp": {
+      "bytes": 3096,
+      "sha256": "5fc38fcabffcec84d87fbc2be55ab528ea7b4328e53aa885a9340aa4948691a5"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/common/name_info.hpp": {
+      "bytes": 1849,
+      "sha256": "9f8bb3663608c13f8844da6322b13f8154f74842e7d58a38ee8a3764eb55651c"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/common/defines.hpp": {
+      "bytes": 5493,
+      "sha256": "ee3401d2ef7131b3a2523e254653a9317e19aa2be00f5a796ff8afe90c7104cb"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/code_object_isa_decode/client.cpp": {
+      "bytes": 9503,
+      "sha256": "7937856b638b1b24060aaab7441f09e85c8746a95b19704952ab9156ec0dc14a"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/code_object_isa_decode/CMakeLists.txt": {
+      "bytes": 1679,
+      "sha256": "71d1bb17f48511ffa43b7b844d15c8e7c7f4fe60f182af9420c94c67f49b4d61"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/code_object_isa_decode/main.cpp": {
+      "bytes": 7927,
+      "sha256": "8c09efef58659fa03823f4b30fbd3b94a712fee31fa6cca2edcce751256c6929"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/code_object_isa_decode/transpose_kernels.hpp": {
+      "bytes": 4643,
+      "sha256": "90175f330ec0f40a83bf1528f768f0c2aba21810a0ee12063f6da8aa21f4cfcd"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/code_object_isa_decode/README.md": {
+      "bytes": 423,
+      "sha256": "dc1813f6980788e01498d4b4b7a9cab4ca857a68948c7b2e3970783011409c92"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/counter_collection/print_functional_counters_client.cpp": {
+      "bytes": 17500,
+      "sha256": "cda871f9bce62f0fca2294b324ce7e6e30fef6450ac7e571aa6d836c9a4452ed"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/counter_collection/CMakeLists.txt": {
+      "bytes": 10081,
+      "sha256": "ea491ec6f527f73551f6b31b5fde27ee5f777b9c645621656416c641ba78243a"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/counter_collection/main.cpp": {
+      "bytes": 5632,
+      "sha256": "ecf46f16fa6243db4d51b5021b533f63ec451bf4f4aae44af89471a641c5e3ed"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/counter_collection/device_counting_async_client.cpp": {
+      "bytes": 14612,
+      "sha256": "e2df28c4ce6253ec1a9d56def57f3d4b3830bb887b9efdbe26fb584a799f7b54"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/counter_collection/device_serialized_main.cpp": {
+      "bytes": 3516,
+      "sha256": "459bc84019b9ed6df32a1fe850187a12562fe74a4b212269f321ae22ae9ae39c"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/counter_collection/client.hpp": {
+      "bytes": 1289,
+      "sha256": "2fd28605c5ad6616ca882444e8085c2c717da2d99ca98dc61e3d6f874462e792"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/counter_collection/callback_client.cpp": {
+      "bytes": 10883,
+      "sha256": "56a6a787c30b9124cc242480e0bb11f061eff3f07b39ffdf8d9288849f49fa3b"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/counter_collection/README.md": {
+      "bytes": 739,
+      "sha256": "39a6d215564afd103ebe7a2eb3a1b483af5211b4c9775f22a4ce5a76bcbbd149"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/counter_collection/device_counting_sync_client.cpp": {
+      "bytes": 19505,
+      "sha256": "0d6d5e573dedcf5d00b2fdcd672e4ea76ab835093dc47a403dd9f9ec5734f793"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/counter_collection/buffered_client.cpp": {
+      "bytes": 18653,
+      "sha256": "cb9292901935ada027dc63586ee1c898be34909e4e1c5c40b477a9c0c7fae9d2"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/openmp_target/client.cpp": {
+      "bytes": 27153,
+      "sha256": "45a54e1af1a2aa0ea0cc99e9382d417472334f6df7d6b4465efaa8b5c57237a4"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/openmp_target/CMakeLists.txt": {
+      "bytes": 3359,
+      "sha256": "fb7e7988e4976e06d428100390de9b9eaf44dc1a825ff00ef467dbd2663d4ec7"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/openmp_target/main.cpp": {
+      "bytes": 4408,
+      "sha256": "63ef6ca870fecbd2911c67fb73715323abbc6de700728e6c6dd2b0bdd9d98638"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/openmp_target/client.hpp": {
+      "bytes": 1474,
+      "sha256": "1d62c3450c2830b7f711563ae48d088ddac82259430e6f2dddef22500d635e32"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/openmp_target/README.md": {
+      "bytes": 418,
+      "sha256": "2f9722fc01ad229cabae82a11d9e3141d96942a95141443361e8b2039430f230"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/pc_sampling/utils.hpp": {
+      "bytes": 1391,
+      "sha256": "339eb666c0c1d9e803186263ad705c68c59c92549c23113c10be5b15874e46cb"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/pc_sampling/client.cpp": {
+      "bytes": 7641,
+      "sha256": "4558e1e2d6aab085ef4fbfcfd6c4f433908acaf32511d3d71ab7621fd6df4510"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/pc_sampling/CMakeLists.txt": {
+      "bytes": 2247,
+      "sha256": "c5ea84e14d54ab79f6e573f9bb1702a86d37ffe3506c89c88086b159370127a9"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/pc_sampling/main.cpp": {
+      "bytes": 13378,
+      "sha256": "6e215e947a9d034e352bce5a8518b233dea45fb9e0848a7338f92874cde1b4d8"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/pc_sampling/pcs.hpp": {
+      "bytes": 3389,
+      "sha256": "ad2225d4adee003b0fd78ffc9b59d8c96a0c96253bbc9d6c43d5e350066f4e5a"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/pc_sampling/README.md": {
+      "bytes": 691,
+      "sha256": "e3c906783a57916c30bfd0667e42b1b4638999099d0428c9cbaca04e5b7922bb"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/pc_sampling/utils.cpp": {
+      "bytes": 1656,
+      "sha256": "3442d1c93882b1798adc5d9120c1e17a675460ab28c36d674ab483bf41456cb1"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/pc_sampling/pcs.cpp": {
+      "bytes": 18676,
+      "sha256": "d09f3f28eba6ad68a30825fa21f33f96f0062bc466761e9889bcb429b7ff8e24"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/api_callback_tracing/client.cpp": {
+      "bytes": 13875,
+      "sha256": "cb3fb9f13e4f263eab0037d6bc66e9b03be56f6916dc662fad6663dbe5cc0884"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/api_callback_tracing/CMakeLists.txt": {
+      "bytes": 2089,
+      "sha256": "b5fa1810951a7afbcf817a07749edbcc2a790f1f1933546a85db771c480e62ca"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/api_callback_tracing/main.cpp": {
+      "bytes": 9807,
+      "sha256": "6fb5c5e9b416842df480470af4307b9571ec0fb95c2f1e9fad1fa879ccfc7d0d"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/api_callback_tracing/client.hpp": {
+      "bytes": 1474,
+      "sha256": "51d1b853f62a7bbf4d18854a071c1378e57b527605f27b563d1b3cc9cc5d3718"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/api_callback_tracing/README.md": {
+      "bytes": 431,
+      "sha256": "1adfbb032bd9f3ed877d35216952018ceb63d6070b00848da9fc3f5300ac3726"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/external_correlation_id_request/client.cpp": {
+      "bytes": 27923,
+      "sha256": "8b22ae1af6673ccf4c28a8ff9e5b57826e04447f83fb9cddd5cb7e201cf8538e"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/external_correlation_id_request/CMakeLists.txt": {
+      "bytes": 4630,
+      "sha256": "130a15dc43bdf117a58fd4cfbf65f7806a1325bcf31b71fe6ddc6fe1b793c0af"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/external_correlation_id_request/main.cpp": {
+      "bytes": 13378,
+      "sha256": "6e215e947a9d034e352bce5a8518b233dea45fb9e0848a7338f92874cde1b4d8"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/external_correlation_id_request/client.hpp": {
+      "bytes": 1539,
+      "sha256": "726d87b15436e2b3192f4468f8678d209ada3a7c4ca2b353bbde1ad705244f6f"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/external_correlation_id_request/README.md": {
+      "bytes": 894,
+      "sha256": "037a6c03ab82a3dee1bb91a7f687c6e38c29bd1f93e0dbe24d64cd1da530c2e0"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/api_buffered_tracing/client.cpp": {
+      "bytes": 24708,
+      "sha256": "9067a403adb0db206c0d94bc2baea3d568f8a26d6ef0bd2d61112d85330f4660"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/api_buffered_tracing/CMakeLists.txt": {
+      "bytes": 1961,
+      "sha256": "b8e7c7e91a8dd46c6f6ec780da4e29c0aaf4ee14c696de8ed283b3bb15ac8215"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/api_buffered_tracing/main.cpp": {
+      "bytes": 13671,
+      "sha256": "3fe9ca538bac7db58a8e51bce8a805d63c02c3ca0160bdf31904a4d21bac3018"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/api_buffered_tracing/client.hpp": {
+      "bytes": 1539,
+      "sha256": "726d87b15436e2b3192f4468f8678d209ada3a7c4ca2b353bbde1ad705244f6f"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/samples/api_buffered_tracing/README.md": {
+      "bytes": 529,
+      "sha256": "b26868a670abe00bc06c66f866271908ea485978f24a772ec7945a68c87f8b9c"
+    },
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/share/rocprofiler-sdk/tests/cmake/rocprofiler_test_gpu_targets.cmake": {
+      "bytes": 563,
+      "sha256": "586a3b79e5a2823511e87a74ad3c3b042ce9c8ed696022983a48604d5874b145"
+    }
+  },
+  "scope": "Native model KV dtype/allocation evidence through unchanged complete public test;228engines, no filter, no performanceclaim",
+  "source_version": "Exactly native-final-v3 candidate preserved before trailing-space-only table cleanup; frozen source.tar and binary",
+  "authority": "Root operator underGPU0 mutex",
+  "expected": "Publictestpasses all19codecs2prompts3repeats2arms; check executedBF16KVtemplates andcacheallocation sizes through sourcechain; oraclemodelparityremainsPENDING"
+}

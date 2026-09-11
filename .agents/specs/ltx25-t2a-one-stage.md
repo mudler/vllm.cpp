@@ -852,7 +852,7 @@ Green after: `--test-case=ltx2 t2a*` at 10 cases / **548** assertions / 0 failed
   binary. This branch touches no file under `tests/vllm/v1/` or `src/vllm/v1/`.
   The earlier revision of the PR body attributed it to #294, which is a
   DIFFERENT defect in `test_async_llm`. Tracked by
-  [#1052](https://github.com/mudler/vllm.cpp/issues/1052).
+  ISSUE-GH-1052.
 - **The guider rescale's `std` comment states an impossible consequence.**
   `ltx2_pipeline.cpp:505-506` and `ltx2_pipeline.h:319-322` say torch's unbiased
   (N-1) `std` matters and the biased one "would be a small, everywhere,
@@ -863,7 +863,7 @@ Green after: `--test-case=ltx2 t2a*` at 10 cases / **548** assertions / 0 failed
   worth writing down, because a survivor at that site otherwise reads as a blind
   instrument and costs another investigation. The CODE is right; the COMMENT is
   the defect. Pre-existing from `cefacd2d0` (#641) and out of this row's scope.
-  Tracked by [#1050](https://github.com/mudler/vllm.cpp/issues/1050).
+  Tracked by ISSUE-GH-1050.
 - **Value goldens from executed upstream for the T2A COMPOSITION.** The bricks
   either side have them; the chain does not. What would close it is a section in
   `scripts/gen-ltx2-pipeline-goldens.py` that instantiates

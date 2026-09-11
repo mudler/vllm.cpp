@@ -2,8 +2,9 @@
 
 Assign a model's tensor groups to *different devices in one engine* — routed-MoE
 experts on the CPU while attention, dense projections, router and norms stay on
-the GPU. Issue [#149](https://github.com/mudler/vllm.cpp/issues/149), the
-highest-upvoted request from the r/LocalLLaMA launch thread. Design grounded in
+the GPU. Asked for as #149, the highest-upvoted request from the r/LocalLLaMA
+launch thread — that issue has since been DELETED and is kept here as provenance
+rather than as a link, because it is why the row exists. Design grounded in
 a source scan of llama.cpp at the pinned oracle `237ad9b96`
 ([`../oracles/llama-cpp.md`](../oracles/llama-cpp.md), `gateable = yes`) plus
 the pinned vLLM `555967922`.
@@ -32,7 +33,7 @@ device selection*. Three findings decide the shape:
 
 | Field | Content |
 |---|---|
-| Row ID | `ENG-HYBRID-PLACEMENT` (engine-matrix). Issue [#149](https://github.com/mudler/vllm.cpp/issues/149) |
+| Row ID | `ENG-HYBRID-PLACEMENT` (engine-matrix). Issue [#3013](https://github.com/mudler/vllm.cpp/issues/3013) — it replaces **#149**, which was this row's campaign issue and has been DELETED (404 unauthenticated, against a live control returning 200). #147, cited below as the multi-GPU half, is deleted too |
 | In | A per-tensor-group device-placement seam resolved at model build, plus its first and only in-scope client: routed-MoE expert compute on the CPU backend with the rest of the model on GPU. Pattern→device override surface, an auto-fit resolver that places by measured free device memory, honest reporting of the resolved placement, and the activation round-trip at each MoE layer boundary |
 | Out | Dense-layer CPU offload (that is `ENG-WEIGHT-OFFLOAD`, the vLLM `cpu_offload_gb` mirror — INVENTORIED); disk-tier expert paging (`ENG-EXPERT-STREAM`, READY); multi-GPU placement across two devices ([#147](https://github.com/mudler/vllm.cpp/issues/147) / `BACKEND-DISTRIBUTED-TP`, ACTIVE); EPLB; phase-aware placement that splits prefill and decode across devices (recorded as a surpass hypothesis under Surpass hypothesis, not built here) |
 | Supported modes | Absent (default — unchanged single-device engine, byte-identical); `overrides` (the general pattern→device form, our `-ot`); `cpu_moe` (all routed experts on CPU, our `-cmoe`); `n_cpu_moe: N` (first N layers' experts on CPU, our `-ncmoe`); `fit` (resolver places by measured free device memory, our `--fit`). All four live under `--offload-config`'s `vllm_cpp` key — see `## Configuration surface` |
@@ -753,7 +754,7 @@ lands.
 **Still owed, unchanged by this pass:** the SPEED axis. GB10 is unified memory,
 so CPU and GPU memory are the same silicon and a placement's throughput benefit
 cannot be measured there at all. That needs a discrete CPU/GPU rig
-([#149](https://github.com/mudler/vllm.cpp/issues/149)). This gate establishes
+([#3013](https://github.com/mudler/vllm.cpp/issues/3013)). This gate establishes
 CORRECTNESS only.
 
 ### W3g — the seam assumed bf16, and the placed branch is untestable on CPU ([#2383](https://github.com/mudler/vllm.cpp/issues/2383))
@@ -918,11 +919,25 @@ community test rigs offered, and [#147](https://github.com/mudler/vllm.cpp/issue
 records the same offer; that is the path to unblocking, and until it opens the
 bandwidth table stays an assumption that no gate may cite.
 
-Issue [#149](https://github.com/mudler/vllm.cpp/issues/149) is the campaign issue
-and stays OPEN — this row covers only its CPU-MoE half. The dense layer-offload
-half belongs to `ENG-WEIGHT-OFFLOAD` (`ACTIVE`, config-only, refuses at startup)
-and the multi-GPU half to #147 / `BACKEND-DISTRIBUTED-TP` (`ACTIVE`); #149 closes
-when all three have landed, not when this one does.
+**The campaign issue this paragraph described is gone.** It said #149 "stays
+OPEN" and closes when three halves land — the CPU-MoE half here, the dense
+layer-offload half under `ENG-WEIGHT-OFFLOAD`, and the multi-GPU half under #147 /
+`BACKEND-DISTRIBUTED-TP`. #149 and #147 both now return 404 to an unauthenticated
+reader, against a live control that returns 200, so neither is a tracker any more
+and the three-way close condition has no owner.
+
+The split itself is still the right description of the work, and the two sibling
+rows are unaffected — only the issue that joined them is missing.
+[#3013](https://github.com/mudler/vllm.cpp/issues/3013) replaces #149 for THIS
+row's blocked waves and claims nothing about the other two; whoever owns
+`ENG-WEIGHT-OFFLOAD` and `BACKEND-DISTRIBUTED-TP` decides whether their halves
+need a tracker of their own.
+
+Five other files still cite #149 — `weight-offload-uva.md`, `engine-matrix.md`,
+`roadmap_v1.md`, `docs/ENVIRONMENT.md` and the archived
+`completed/issue-index.md`. They are deliberately NOT swept here: three are keyed
+record surfaces or other rows' specs, and one is an archive that must keep its
+provenance. Repointing them belongs to their owners.
 
 ## W4/W3 outcome — the device gate RAN, and both arms are within the bar
 
@@ -956,37 +971,14 @@ nothing moved. The gate now refuses that case by name.
 
 ## Owed
 
-- **`qwen4_exp` is WIRED to the seam and now REACHED.** The entry below recorded
-  it as unreached, which was accurate until this gate ran: the wiring is
-  `qwen4_exp_forward.cpp` routing its MoE step through `RunMoePlacedPair` with
-  the `qwen3_moe.cpp` adapter verbatim, and the `cpu_moe` arm above executes it
-  on a real checkpoint at 5.239e-06. What made that possible was three CUDA fixes
-  landing meanwhile — `#2449` (inject-weight residency), `a4ced1b13` (rmsnorm
-  widened gamma) and `a578705e9` (device-aware `quant_repack`) — after which the
-  `cudaMemcpyAsync: illegal memory access` seen earlier did not recur, so it was
-  a symptom of those rather than a fourth defect.
-
-  What is NOT proven is that anything reaches it. The forward needs a
-  `qwen4_exp` GGUF, and the only one available is `Qwen3.8-2.4T-A95B UD-Q1_0` at
-  369 GiB, which fits no host this project reaches. So the deletion mutation
-  `reachability.md` asks for cannot be run, and no gate here holds the call site
-  in either direction.
-
-  This is the same position `scripts/runner-routing-allowlist.txt` records for
-  Nemotron-H, and it is recorded the same way rather than being dressed up: a
-  seam checker never proved reachability and was never meant to. The wiring is
-  correct BY CONSTRUCTION (shape match, compile), which is weaker than reached
-  and is not claimed as more.
-
-  It also unblocks something: `--fit` has no device gate because every GGUF on
-  the NAS is either off the seam (`laguna`), has no reachable MoE forward
-  (`glm5next`), or does not fit. A runnable `qwen4_exp` GGUF would be the first
-  checkpoint that is both GGUF and seam-wired, which is what a `--fit` NMSE gate
-  needs.
-
+- **ISSUE-GH-2424 is CLOSED and completed.** This specification retains stable
+  ownership of the migrated record. Commit `1444c4fb8` wired `qwen4_exp` to the
+  placement seam, and commit `85bd19578` records the device gate that reached
+  it. This entry records completed history only; it does not reopen or restore
+  any work.
 
 - W5, the speed floor against llama.cpp `-ncmoe` at `b10451`. Blocked on a
-  discrete-GPU rig, tracked by [#149](https://github.com/mudler/vllm.cpp/issues/149).
+  discrete-GPU rig, tracked by [#3013](https://github.com/mudler/vllm.cpp/issues/3013).
 - W0, the measured DDR:PCIe ratio and per-MoE-layer round-trip cost that the
   bandwidth table currently assumes. Same blocker, same issue.
 - **Placement reaches FIVE architectures, and the earlier entry here undercounted

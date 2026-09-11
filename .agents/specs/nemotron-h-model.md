@@ -2108,7 +2108,7 @@ the `input.num_reqs <= 1` refusal.
   append-only `.agents/issue-index.md` names no owning row, so a spec must keep
   claiming it; GitHub holds the closed state. Do not read it as open work.
 
-- [#1080](https://github.com/mudler/vllm.cpp/issues/1080) — `scripts/check-doc-checkpoint.py:153`
+- ISSUE-GH-1080 — `scripts/check-doc-checkpoint.py:153`
   matches a spec's live-position section with `^##\s+Now\s*$`, and specs in this
   tree write it as `## N. Now`, so `spec_now_errors` reports "has no `## Now`
   section" about a section that is present and current. It fires only when a row
@@ -2122,7 +2122,7 @@ the `input.num_reqs <= 1` refusal.
   `nas-mount-path`, `nemotron-h-a2p-paged-forward`, `nemotron-h-a2q1-fp8-mamba`,
   `nemotron-h-a2q2b-realckpt-lmhead`, `nemotron-h-a2q2-nvfp4-moe-lmhead`,
   `nemotron-h-abi-e2e`, `offload-docs-refusal`, `registry-downcast-sweep`. The
-  population GREW since #1080 was filed against twelve, which is the argument for
+  population GREW since ISSUE-GH-1080 was filed against twelve, which is the argument for
   the checker-semantics fix over a rename sweep: a rename repairs today's files and
   the next spec written to the numbered spelling reintroduces it. Either close needs
   its own spec and a red-before test, so neither rides in a records reconcile.

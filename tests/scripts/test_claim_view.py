@@ -43,6 +43,40 @@ def pr(number: int, task: str, *, state: str = "OPEN", head: str | None = None) 
     }
 
 
+
+class AgentRecordDynamicLoader(unittest.TestCase):
+    def test_checker_loads_without_scripts_on_sys_path(self) -> None:
+        checker = ROOT / "scripts/check-agent-record.py"
+        scripts = checker.parent.resolve()
+        original_path = sys.path[:]
+        original_issue_records = sys.modules.pop("issue_records", None)
+        module_name = "agent_record_without_scripts_path"
+        try:
+            sys.path[:] = [
+                entry
+                for entry in sys.path
+                if Path(entry or ".").resolve() != scripts
+            ]
+            spec = importlib.util.spec_from_file_location(module_name, checker)
+            self.assertIsNotNone(spec)
+            self.assertIsNotNone(spec.loader)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+
+            errors = []
+            rows = module.parse_claim_rows(ROOT / ".agents/engine-matrix.md", errors)
+            self.assertEqual(errors, [])
+            self.assertTrue(rows)
+        finally:
+            sys.modules.pop(module_name, None)
+            if original_issue_records is None:
+                sys.modules.pop("issue_records", None)
+            else:
+                sys.modules["issue_records"] = original_issue_records
+            sys.path[:] = original_path
+
+
 class KnownTasks(unittest.TestCase):
     def test_shared_adapter_reads_canonical_matrix_ids(self) -> None:
         ids = view.known_task_ids(ROOT)

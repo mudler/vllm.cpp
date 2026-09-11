@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "head": "2e5adfb85a255528bffa5d3cdb016efb2bab70d8",
+  "argv": [
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/tests/test_gguf_keep_quant",
+    "--test-case=Q8_K GGUF reader preserves block geometry and packed bytes"
+  ],
+  "env": {
+    "HIP_VISIBLE_DEVICES": "-1",
+    "ROCR_VISIBLE_DEVICES": "-1"
+  },
+  "exit": 1,
+  "failure": "GgufFile::Open rejects token_embd.weight GGML type15 before any value assertion",
+  "files": {
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/src/vllm/model_executor/model_loader/gguf_reader.cpp": {
+      "bytes": 29750,
+      "sha256": "fe7e9033ea40452c96a66d6e71080ebb422edcad38c56845ed2769bdb3eecb77"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/tests/vllm/test_gguf_keep_quant.cpp": {
+      "bytes": 134876,
+      "sha256": "65a5e5a40f19d8e264bc1bb341c2a8276a3719c59c7faa2c91b4f4b7bfe9dd92"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/libvllm.a": {
+      "bytes": 95078628,
+      "sha256": "6cdf9bf1e69b9061e798eb0f6a44675a96158e4473d53b3badebd9bef04789b0"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/tests/test_gguf_keep_quant": {
+      "bytes": 31354464,
+      "sha256": "196026cc9e0a5f90ce90bc3a4f9d2e23ba34b0822df3e8be108e4e29e0030c96"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/evidence/q8k-reader-red.log": {
+      "bytes": 751,
+      "sha256": "b11156a6174c030ddf8deccb4df8e809bd2c2d107c7fec1f9c9bdfae529eeea8"
+    }
+  }
+}

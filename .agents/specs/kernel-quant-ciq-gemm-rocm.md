@@ -35,8 +35,10 @@ unchanged. Out of scope, and not attempted:
   WMMA/row-packing/MoE work `## Owed`. This row is the GEMM/n>1 (prefill) arm
   only.
 - **MFMA and hipBLASLt.** Neither is reachable on this hardware; see below.
-- **Q4_0/Q2_K/Q3_K/IQ2_\*/IQ3_\*/MXFP4 keep-quant formats.** Unrelated gap
-  (#1940), untouched by this row.
+- **Q4_0/Q5_0/IQ2_XS/IQ4_NL/IQ3_S/IQ4_XS/MXFP4 keep-quant formats.** The GFX1100
+  reconstruction lands Q2_K, Q3_K, IQ2_XXS, IQ3_XXS, IQ2_S, IQ1_S, and
+  IQ1_XXXS. The remaining formats are an unrelated gap (#1940), untouched by
+  this row.
 - **`GFX1100-TG200`'s campaign** (external fork `ghazni101/vllm.cpp`, its own
   GPU lock). That campaign targets gfx1100 and already owns the correctness
   half of this kernel (`kROCM` provider registration, landed via its F1
@@ -88,11 +90,15 @@ pattern: `src/vt/rocm/rocm_paged_attn.hip` already uses
 `fragment<matrix_a, WM, WN, WK, bfloat16_t, row_major>` for attention. The
 new int8 kernel follows that pattern rather than introducing a second one.
 
-## Upstream anchor
+## Upstream chain
 
 llama.cpp, pin `b10451` per `.agents/upstream-sync.md`. Line numbers below
 are cross-checked against a local checkout at tag `b10688`; the conditional
-compilation this cites has not changed across that span.
+compilation this cites has not changed across that span. This is the
+COMPLETE chain from source to the executed instruction: the arch-detection
+macros, the tile-selection branch they feed, and the MMQ call site that
+reaches it — every link a change here has to reconcile against, not only the
+kernel this row ports.
 
 - `ggml/src/ggml-cuda/common.cuh:265` — `AMD_MFMA_AVAILABLE` gates on
   `defined(GGML_USE_HIP) && defined(CDNA) && !defined(GGML_HIP_NO_MMQ_MFMA)`.
@@ -110,6 +116,24 @@ compilation this cites has not changed across that span.
   `__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12`).
 - `ggml/src/ggml-cuda/mmq.cuh:181,197,472` — the quantized matmul kernel
   selects on the same `AMD_MFMA_AVAILABLE`/`AMD_WMMA_AVAILABLE` pair.
+
+## Our baseline
+
+`KQuantGemmK<OutT, Fmt>` (`src/vt/rocm/rocm_grouped_gemm.hip:446-482` at this
+row's base SHA) — a scalar warp-per-output-element GEMM: one warp owns one
+`(i,j)` output cell, strides its 32 lanes over the row's superblocks, and
+reduces each superblock's dot product with the `__ockl_sdot4`-backed `Dp4a()`
+helper (four signed `int8` multiply-adds per instruction, not a tensor-core
+op). Measured baseline (issue #2109, same-tool `rocprofv3` attribution,
+`Ornith-1.5-9B-Q4_K_M`, `-n 128 -ngl 99`, this same RX 9060 XT): prefill
+(pp512) 73.7 tok/s against the oracle's 1691 (22.9x slower); decode (tg128)
+17.44 against 48.51 (2.78x slower); total GPU time 108,817 ms against the
+oracle's 18,812 ms. This row targets the prefill (`m>1`) arm of that gap;
+the decode (`m==1`) arm already has its own row
+(`ROCM-KQUANT-NWARPS-DECODE`, PR #2086, merged) and is untouched here. Own
+measured op-level baseline (`examples/quant-gemm-bench`, RX 9060 XT): Q6_K
+115-122 GFLOP/s, Q4_K 302-448 GFLOP/s — see `## Now` for the WMMA arm's
+numbers against each.
 
 ## Design
 
@@ -129,6 +153,51 @@ accumulation, following the same shape as the existing scalar path
 because the risk below is that no library path carries the per-superblock
 scale layout through the tile op.
 
+## Port map
+
+| Upstream | Local |
+|---|---|
+| `mma.cuh:697` RDNA4 tile branch (`_gfx12` WMMA builtins) | `KQuantGemmKWmmaQ6K`/`KQuantGemmKWmmaQ4K` (`rocm_grouped_gemm.hip`), via `rocwmma`'s `fragment`/`mma_sync` rather than the raw builtins — this project's own in-tree precedent (`rocm_paged_attn.hip`), not a second pattern |
+| `common.cuh:265,269`, `vendors/hip.h:189-221` arch macros | `Gfx12QuantWmmaHostOk` (`rocm_grouped_gemm.hip`) at the host call site, reusing `vt::rocm::GcnArchNameIsGfx12PrefillWmma` (`include/vt/rocm/rocm_arch.h`) rather than the compile-time macro (issue #785's trap for a host-side WMMA gate) |
+| `DotQ4K`/`DotQ6K` block-dequant math (already ported 1:1, unchanged by this row) | `src/vt/rocm/rocm_grouped_gemm.hip:230-321` |
+| Q6_K's 16-wide scale group | `DequantQ6KGroup16` |
+| Q4_K's 32-wide scale/min sub-block | `DequantQ4KTile16` + `UnpackQ4KScalesMins` |
+
+## Dependencies
+
+- `rocwmma` (already vendored in this project's ROCm toolchain; no new
+  external dependency).
+- gfx1200/gfx1201 hardware to compile the device-pass WMMA branch and to
+  runtime-gate the host dispatch; every other ROCm target is unaffected and
+  untested by this row.
+- ROCm 7.2 / HIP 7.2.53211 / clang 22, the toolchain W0 was proven against;
+  not verified on another ROCm release.
+- The in-tree WMMA precedent `rocm_paged_attn.hip` (include/namespace
+  pattern, and the `#785` host-vs-device-macro fix this row's host gate
+  reuses directly rather than re-deriving).
+
+## Work breakdown
+
+- **W0** (done): mechanism verified on target — rocwmma int8 tile produces
+  the exact integer dot product on gfx1200.
+- **W1** (done): `KQuantGemmKWmmaQ6K`, hardware-verified, mutation-proven.
+- **W1.1/W1.2** (done): two performance passes on the same kernel (fill-once
+  staging, then batched store/fold), 11.7x-16.3x over scalar.
+- **W1.3** (done): `KQuantGemmKWmmaQ4K`, hardware-verified, mutation-proven
+  on both its correction terms.
+- **W1.4** (done): the issue's own gate (c) recipe run against the pinned
+  oracle; narrowly satisfied against its stated threshold, oracle-figure
+  reconciliation left open.
+- **W1.5** (done): `M`/`N` tail handling for a non-16-multiple row count —
+  see `## Now`. Closes the gap where a real (essentially never 16-aligned)
+  prompt fell back to scalar for the whole call, not only its ragged edge.
+- **W2 does not exist as originally framed.** The pre-W1.5 spec named a W2
+  ("launch-site replacement", the scalar arm's eventual retirement once
+  every format is covered). W1.5's tail-fill design makes the scalar kernel
+  a PERMANENT dependency (the remainder cells, and every `m<16`/decode
+  shape) rather than a stopgap awaiting format coverage, so that framing no
+  longer applies — see `## Now`.
+
 ## Risks
 
 - **hipBLASLt may not support the per-superblock Q8_K block-scale layout**
@@ -140,20 +209,41 @@ scale layout through the tile op.
   low bits. Record near-tie adjudication per the ratified band doctrine
   (`.agents/specs/rocm-m4-oracle.md`) if bit-exactness cannot be shown
   directly, rather than asserting identity the change cannot prove.
-- **Row-count tail handling** (`M`/`N` not a multiple of 16) is unresolved in
-  this spec and must be designed in the implementation wave before any
-  launch-site change lands.
+- **Row-count tail handling** (`M`/`N` not a multiple of 16) — RESOLVED in
+  the implementation wave: see `## Now`. The host gate relaxed from exact
+  alignment to `m >= 16 && n >= 16`, and the scalar `KQuantGemmK` grew a
+  `skip_m`/`skip_n` guard so it fills in the WMMA corner's remainder without
+  recomputing it.
 
-## Tests
+## Tests to port
 
-- `test_rocm_quant_dot.cpp` (mirrors `test_cuda_quant_dot`), NMSE <= 5e-4,
-  unchanged as the correctness gate for every quant-path lever on this
-  kernel (issue #2109 gate (b)).
-- `test_backend_cross_device`, NMSE <= 5e-4 vs the CPU oracle (gate (a)).
-- `rocprofv3 --kernel-trace` on the Ornith-1.5-9B-Q4_K_M trace workload
-  (gate (c)): target total kernel time <= 20,000 ms (oracle 18,812 ms;
-  current scalar arm 108,817 ms).
-- `ctest -R 'rocm|cross_device'`, zero regression (gate (d)).
+- `test_rocm_quant_dot.cpp` (mirrors `test_cuda_quant_dot`): named by the
+  issue as gate (b)'s vehicle; not authored — the row's actual correctness
+  coverage landed instead as two new `TEST_CASE`s in the existing
+  `test_backend_cross_device.cpp` (one per format, f32 and bf16 out each,
+  CPU-oracle NMSE and dispatch-count reachability), which already exercises
+  this kernel end-to-end and did not need a second, format-mirrored file.
+- `test_backend_cross_device.cpp` — the CPU-oracle NMSE cases above (gate
+  (a)), plus the pre-existing non-grouped/grouped keep-quant suites this row
+  does not modify.
+- `examples/quant-gemm-bench` (extended this wave to run any registered
+  device, not only CPU) — the op-level GFLOP/s A/B, not a `ctest` gate but
+  the vehicle for every performance table in `## Now`.
+
+## Gates
+
+- (a) `test_backend_cross_device` NMSE <= 5e-4 vs the CPU oracle: MET (both
+  formats, f32 and bf16 out).
+- (b) Correctness coverage for every quant-path lever on this kernel: MET,
+  via the cases named above rather than a separate mirrored file.
+- (c) `rocprofv3 --kernel-trace` on the Ornith-1.5-9B-Q4_K_M trace workload,
+  target total kernel time <= 20,000 ms (oracle 18,812 ms; scalar arm
+  108,817 ms): narrowly SATISFIED against the stated absolute threshold on
+  a faithful same-tool same-checkpoint same-pinned-oracle reproduction (see
+  `## Gate (c), the issue's own recipe` below) — NOT reconciled against the
+  issue's original absolute figures, which stay an open question.
+- (d) `ctest -R 'rocm|cross_device'`, zero regression: MET (one pre-existing
+  unrelated failure, #1513/#1954, present before and after this row).
 
 ## Owed
 
@@ -161,11 +251,15 @@ scale layout through the tile op.
   and spec.
 - gfx1151 (RDNA3.5) WMMA tile: needs Strix Halo hardware to verify; a
   separate row and spec.
-- `M`/`N` tail handling for a non-16-multiple row count: unresolved here,
-  owed to the implementation wave.
 - hipBLASLt per-superblock scale support: unmeasured; recorded as an open
   question for whoever implements W1, not assumed either way beyond the
   Risks section above.
+- Q5_K WMMA tile: same 32-wide scale/min shape `KQuantGemmKWmmaQ4K` already
+  carries, plus a high-bit plane (like Q6_K's `qh`) neither existing kernel
+  handles. Deprioritized below Q4_K by real-model evidence: the checkpoint
+  this row gates against (`Q4_K_M`) never invokes Q5_K at all — it is a
+  `Q5_K_M`/`Q5_K_S`-only format — so porting it would not move this row's own
+  gate (c) measurement, only a differently-quantized checkpoint's.
 
 ## Stop conditions
 
@@ -176,7 +270,284 @@ scale layout through the tile op.
 
 ## Now
 
-`SPIKE`. W0 (mechanism verified on target, gfx1200) is done and reproduced
-fresh in this spec. W1 (the WMMA tile kernel with the fused scale epilogue)
-and W2 (launch-site replacement) are not started. This pull request lands
-the spec only; no product code changes in this change.
+`ACTIVE` (moved from `SPIKE`: real, hardware-verified kernels now sit on the
+production `MatmulBTQuant` dispatch path, not only a mechanism probe).
+W0 (mechanism verified on target, gfx1200) is done. W1 has landed on
+`row/KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4-w1`: `KQuantGemmKWmmaQ6K`, a rocWMMA
+int8 tile arm for the Q6_K prefill GEMM, gated to gfx1200/gfx1201 and to
+tile-aligned M/N (both multiples of 16); every other shape and architecture
+keeps the scalar arm. Hardware-verified on the RX 9060 XT (gfx1200):
+correct against the CPU oracle (f32 and bf16 out), reachability-witnessed,
+mutation-proven RED-before-GREEN, zero regression on `ctest -R
+'rocm|cross_device'` (one pre-existing unrelated failure, #1513/#1954, not
+touched by this row).
+
+**Op-level A/B, same tool both arms (`examples/quant-gemm-bench`, extended in
+this wave to run on any registered device, not only CPU), RX 9060 XT
+(gfx1200), Q6_K prefill (M=128, tile-aligned N/K), best-of-6, idle host:**
+
+| Shape | scalar (`VT_ROCM_QUANT_WMMA=0`) | WMMA v1 (per-group shared-mem bounce) | WMMA v2 (fill once per superblock) |
+|---|---|---|---|
+| N=3072 K=2048 | 120.41 GFLOP/s | 630.42 GFLOP/s (5.24x) | 1439.55 GFLOP/s (11.95x) |
+| N=12288 K=2048 | 122.48 GFLOP/s | 558.44 GFLOP/s (4.56x) | 1514.70 GFLOP/s (12.37x) |
+| N=2048 K=6144 | 115.38 GFLOP/s | 833.77 GFLOP/s (7.23x) | 1467.55 GFLOP/s (12.72x) |
+
+v1 staged one scale-group's dequantized tile per iteration (16 barriers/
+superblock for that step alone, only 16 of 32 lanes active while filling). v2
+fills all 16 groups' tiles once per superblock, spread over all 32 lanes, and
+removes those 16 barriers down to 1. That single change bought a further
+~2.3-2.7x on top of v1's already-measured 4.5-7.2x, and the WMMA arm now
+EXCEEDS this card's own Q8_0 scalar dp4a ceiling (1258-1339 GFLOP/s) — a
+result v1 did not reach.
+
+**Batching the remaining per-group store-sync-fold-sync round trip, same
+tool and shapes, RX 9060 XT, best-of-6:**
+
+| Batch width | N=3072 K=2048 | N=12288 K=2048 | N=2048 K=6144 |
+|---|---|---|---|
+| 1 (v2, above) | 1439.55 GFLOP/s | 1514.70 GFLOP/s | 1467.55 GFLOP/s |
+| 2 | 1709.58 GFLOP/s (+18.8%) | 1995.02 GFLOP/s (+31.7%) | 1689.45 GFLOP/s (+15.1%) |
+| 4 | 1335.06-1347.51 GFLOP/s (-6-7%) | 1408.20-1409.09 GFLOP/s (-7%) | 1419.29-1424.70 GFLOP/s (-3%) |
+| 8 | 768.51 GFLOP/s (-47%) | 888.49 GFLOP/s (-41%) | 791.03 GFLOP/s (-46%) |
+
+Batching 2 groups' WMMA compute+store per barrier (instead of 1) is a real
+further win on top of v2; batching 4 or 8 REGRESSES relative to 2, and 8 is
+worse than not batching at all. Widening `raw_tile` to hold more groups grows
+shared-memory occupancy pressure faster than it saves barriers — the
+regression at 4 and 8 is evidence for that shape, not measured to a specific
+cause. **v3 (batch=2) is the row's current state**, RED-before-GREEN mutation-
+proven and `ctest`-clean identically to v1/v2 above; batch=4 and batch=8 were
+measured, rejected, and are not carried forward — this table is why, so the
+same two shapes are not retried without new evidence.
+
+Total measured gain over the original scalar arm on this card: **11.7x to
+16.3x** (1689-1995 GFLOP/s vs 115-122 GFLOP/s), depending on shape.
+
+**First real-model measurement, `rocprofv3 --kernel-trace --stats`, the
+actual `Ornith-1.5-9B-Q4_K_M.gguf` checkpoint, RX 9060 XT, `vllm-cli --device
+auto --max-tokens 1`, a 288-token prompt (16-aligned, so every layer's Q6_K
+prefill call takes the WMMA arm), same prompt both legs, `VT_ROCM_QUANT_WMMA`
+the only variable:**
+
+| | scalar (`=0`) | WMMA (v3, batch=2) | ratio |
+|---|---:|---:|---:|
+| `KQuantGemmK<uint16_t, 2>` / `KQuantGemmKWmmaQ6K` (20 calls, this row's kernel) | 4322.5 ms | 201.3 ms | **21.5x** |
+| Total kernel time, whole forward pass | 11973.9 ms | 7795.1 ms | **1.54x** |
+
+This is the row's own kernel, isolated by same-prompt/same-tool/only-the-
+env-toggle-differs A/B, at the exact production call site (`MatmulBTQuant`
+reached through the model's real forward pass, not a synthetic harness). It
+is NOT yet the issue's own gate (c) recipe: that recipe is `-n 128 -ngl 99`
+against a longer, differently-shaped prompt (llama.cpp's own pp512/tg128
+convention) whose absolute totals (108,817 ms scalar / 18,812 ms oracle) are
+a different workload and are not directly comparable to the 11973.9/7795.1 ms
+above — reporting the two side by side would compare different quantities.
+The 1.54x total-kernel-time reduction is strong, additional, real-model
+evidence toward gate (c); replicating the issue's own exact recipe (its
+prompt, its `-n 128 -ngl 99`, and the oracle side) is the remaining step to
+close it and is not done in this paragraph.
+
+**Q4_K WMMA tile (`KQuantGemmKWmmaQ4K`) landed in the same wave**, at the
+developer's direction after the real-model trace above showed Q4_K carrying
+59.2% of this checkpoint's total kernel time (7090.3 ms of 11973.9 ms
+scalar-arm total across 108 calls) against Q6_K's 36.1% (20 calls) — bigger
+in absolute terms than the kernel this row started with, so closing it
+mattered more than tuning Q6_K further. Q4_K's layout differs from Q6_K's in
+two ways this kernel carries: its nibbles are UNSIGNED (no -32 recentering —
+the scalar `DotQ4K` has none either), and its scale granularity is 32-wide
+(twice the 16-wide WMMA tile) with a SECOND per-sub-block correction
+(`dmin * sumi`, using the activation's precomputed `bsums` against the
+weight's mins) that needs no tensor-core work at all and is folded into the
+same one-f32-expression-per-superblock epilogue as a separate integer
+accumulator. `kGroupGemmBatch == 2` batches exactly one Q4_K sub-block (two
+16-wide K-tiles) per barrier, by construction rather than by re-tuning.
+
+Same hardware-verification shape as Q6_K: correct against the CPU oracle
+(f32 and bf16 out), and BOTH correction terms mutation-proven separately
+(breaking the scale term reds NMSE 0.639; breaking the min term reds NMSE
+0.0027 — smaller because the min term is the smaller correction, but still
+~5.5x over the 5e-4 bound) — reverting each restores an identical source
+hash. `ctest -R 'rocm|cross_device'` carries the same single pre-existing
+failure as every commit in this row.
+
+**Op-level A/B (`examples/quant-gemm-bench`), Q4_K prefill:**
+
+| Shape | scalar | WMMA | ratio |
+|---|---:|---:|---:|
+| N=3072 K=2048 | 390.5 GFLOP/s | 1134.4 GFLOP/s | 2.91x |
+| N=12288 K=2048 | 447.5 GFLOP/s | 1331.1 GFLOP/s | 2.97x |
+| N=2048 K=6144 | 302.7 GFLOP/s | 1094.9 GFLOP/s | 3.62x |
+
+Smaller than Q6_K's ratio: Q4_K's scalar arm was already lighter per element
+(a plain nibble mask, versus Q6_K's heavier ql+qh reconstruction) and the
+WMMA arm carries extra per-cell work (the min-correction loop, the scale/min
+unpack) that Q6_K's does not. Real, still substantial in absolute terms given
+Q4_K's share of total kernel time.
+
+**Second real-model measurement, same recipe as above, same 288-token
+prompt, same binary, both kernels active:**
+
+| | scalar (`=0`) | WMMA (both kernels) | ratio |
+|---|---:|---:|---:|
+| `KQuantGemmKWmmaQ4K<float>` (64 calls) | 4700.3 ms | 1199.5 ms | 3.92x |
+| `KQuantGemmKWmmaQ4K<uint16_t>` (44 calls) | 2380.2 ms | 475.9 ms | 5.00x |
+| `KQuantGemmKWmmaQ6K<uint16_t>` (20 calls) | 4311.9 ms | 203.5 ms | 21.2x |
+| Total kernel time, whole forward pass | 11954.5 ms | 2447.1 ms | **4.89x** |
+| Wall clock (`vllm-cli`, includes model load) | 12.358 s | 2.844 s | 4.35x |
+
+Same caveat as the Q6_K-only measurement: this is not the issue's own `-n 128
+-ngl 99` recipe, so the absolute totals are not directly comparable to its
+108,817 ms / 18,812 ms figures. It is the strongest real-model evidence this
+row has produced toward gate (c) — closing gate (c) itself still needs the
+issue's exact recipe run, oracle side included.
+
+## Gate (c), the issue's own recipe
+
+**Built and ran the pinned oracle at the exact SHA the spec's `## Upstream
+chain` cites** (`10bf611e533d81f739128304991c5e133c6aebd8`, tag `b10451`),
+in a linked worktree (`/tmp/llama-cpp-b10451`) so the developer's own
+checkout was never touched, `-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1200`, on the
+same RX 9060 XT. `llama-bench -m Ornith-1.5-9B-Q4_K_M.gguf -p 512 -n 128
+-ngl 99` reproduces the issue's own numbers closely: pp512 1773-1862 tok/s
+(issue: 1691), tg128 48.65-49.05 tok/s (issue: 48.51) — same tool, same
+checkpoint, same recipe, and the oracle stands.
+
+**`rocprofv3 --kernel-trace --stats` total kernel time, `-r 5` (llama-bench's
+own default rep count), idle host verified (`rocm-smi`: 44°C, 0% GPU, no
+other `/dev/kfd` holder; `uptime` load average 2.66-3.14, which is this
+project's own recorded honest-caveat shape for "idle GPU, busy host" rather
+than a fully quiet machine):**
+
+| | Oracle (llama.cpp `b10451`) | Ours, scalar (`VT_ROCM_QUANT_WMMA=0`) | Ours, WMMA (this row) |
+|---|---:|---:|---:|
+| Total (`-r 5`) | 13,581.8 ms | 179,037.6 ms | 93,576.5 ms |
+| Per-run average | 2,716.4 ms | 35,807.5 ms | 18,715.3 ms |
+| Ratio vs oracle | 1.00x | 13.18x slower | 6.89x slower |
+
+Single-run (`-r 1`, closer in shape to how the issue's own table reads):
+oracle 2,972.3 ms, scalar 36,352.0 ms, WMMA 19,128.8 ms. **This row's WMMA
+total is under the gate's stated 20,000 ms threshold on both single-run and
+per-run-average readings, on the real checkpoint, the pinned oracle
+revision, and the production call site** — the strongest form of evidence
+this spec has for gate (c). Scalar-to-WMMA improvement on this full `-p 512
+-n 128` workload (prefill AND decode combined, so Q4_K/Q6_K's isolated
+kernel gains are diluted by every OTHER kernel in the forward pass): 1.90x
+(`-r 1`) to 1.91x (`-r 5`), consistent between the two.
+
+**What does NOT reconcile, stated rather than elided:** the oracle side
+measured here (2,716-2,972 ms) is 6.3-6.9x SMALLER than the issue's cited
+18,812 ms, and the scalar side (35,807-36,352 ms) is 3.0-3.1x smaller than
+its cited 108,817 ms — different ratios, so this is not simply "the issue
+used more repetitions" (that would scale both sides by the same factor).
+Candidates not distinguished here: a different exact prompt (the issue does
+not record one; this measurement's is a real 512-token English paragraph,
+built and pinned to exactly 512 tokens against this checkpoint's own
+tokenizer, `/tmp/prompt512.txt`, not preserved in this commit), ROCm/driver
+drift on this box between 2026-08-27 and this measurement, or a recipe
+detail the issue's one-line citation does not carry. Closing this gap is
+follow-up work, not assumed away: **gate (c) is reported here as narrowly
+SATISFIED against its own stated absolute threshold, on a faithful same-tool
+same-checkpoint same-pinned-oracle reproduction — not as reconciled against
+the issue's original absolute figures**, which stay an open question this
+paragraph names rather than answers.
+
+**M/N tail (W1.5) landed.** The host gate relaxed from exact 16-alignment to
+`m >= 16 && n >= 16`; the WMMA kernels already floored `m`/`n` internally
+and needed no change. `KQuantGemmK` grew a `skip_m`/`skip_n` guard (every
+pre-existing call site passes `0, 0`, an always-false guard — unchanged
+behavior there) so the tail-fill pass computes only the remainder the WMMA
+corner left untouched, never recomputing it. Hardware-verified on a
+deliberately doubly-misaligned shape (M=37, N=50, neither a multiple of
+16) for both formats: correct against the CPU oracle, WMMA reachability
+still holds for the aligned corner, and RED-first mutation-proven (`&&` to
+`||` in the skip guard leaves real cells unwritten — NMSE explodes to
+0.17/3.6e65 — and reverting restores an identical source hash). Real-model
+confirmation: the ORIGINAL 291-token prompt (`prompt_tokens=291`, not a
+multiple of 16, the exact shape that fell back to scalar entirely before
+this change) now measures 2704.7 ms total kernel time — within 10.5% of
+the perfectly-aligned 288-token result (2447.1 ms) and a 4.4x improvement
+over the pre-fix scalar total for this same prompt. **W2 is not this row's
+retirement of the scalar arm** — the tail-fill pass and the `m<16`/decode
+paths need the scalar kernel permanently, by design, not as a stopgap
+awaiting format coverage; that framing predates the tail fix and no longer
+applies. `## Owed` above is current: Q5_K (a separate row) and the
+gfx1100/gfx1151 WMMA tiles (separate rows) are what remains.
+
+**Independent review repair (two LOW findings, both closed on
+`row/KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4-w1`).** An independent review of this
+row's implementation wave (PR #2991) found two non-blocking gaps in the
+W1.5 tail-fill landing, both fixed in the same follow-up commit:
+
+1. **Stale `docs/ENVIRONMENT.md` row.** `VT_ROCM_QUANT_WMMA`'s doc entry
+   still described the Q6_K-only, exact-16-alignment gate from before the
+   Q4_K and W1.5 commits in this same branch. Corrected to name both
+   kernels (`KQuantGemmKWmmaQ6K`/`KQuantGemmKWmmaQ4K`) and the actual gate
+   (`m >= 16 && n >= 16`, not exact alignment). A stale comment making the
+   same claim at `QuantWmmaEnabled`'s definition (`rocm_grouped_gemm.hip`)
+   was corrected alongside it — same fact, same staleness, same file
+   already in scope.
+
+2. **Tail-fill launch grid sized to the full domain.** Both tail-fill call
+   sites in `MatmulBTQuantKernelRocm` launched `KQuantGemmK` over the
+   entire `m*n` grid and relied on an `i < skip_m && j < skip_n` guard to
+   no-op every warp landing inside the WMMA corner. For a wide production
+   `N` (this row's own `N=12288` shape) and a large aligned corner, the
+   no-op warps outnumber the real ones by roughly the corner's own area —
+   an unmeasured, real launch-overhead cost the row had not isolated.
+   Fixed by replacing the skip guard with an index remap: a launched
+   index `t` now enumerates ONLY the remainder — the bottom strip
+   `[skip_m,m)x[0,n)` (contiguous at the buffer's own row stride `n`, so
+   no separate stride parameter), then the right strip
+   `[0,skip_m)x[skip_n,n)` — and the host sizes the tail-fill grid to
+   `bottom_strip + right_strip`, not `m*n`. The pre-existing full-grid path
+   (`skip_m == 0 && skip_n == 0`, every call site outside the tail arm)
+   takes an unchanged branch in the same kernel.
+
+   Hardware-verified on the RX 9060 XT: the existing M=37/N=50
+   (both-misaligned) case still passes, plus two NEW asymmetric cases this
+   row had not isolated — M=37/N=48 (bottom-strip-only remainder, N exactly
+   aligned) and M=32/N=50 (right-strip-only remainder, M exactly aligned)
+   — both formats, CPU-oracle NMSE (measured 0.0 for every shape and
+   format against the fixed kernel — bit-identical to the CPU oracle, not
+   merely under tolerance) plus the existing dispatch-count reachability
+   check.
+
+   **Mutation-proving the new mechanism, not the retired guard.** The
+   guard-based guarantee this row's spec already recorded (`&&` to `||`)
+   no longer applies once the mechanism changed; re-asserting it would
+   have proven nothing. Two mutations were tried against the NEW
+   index-remap, and the first is recorded because it under-proves rather
+   than over-proves: an off-by-one at the bottom/right boundary
+   (`t < bottom_strip` to `t <= bottom_strip`) reds only 0 to 3.18e-4 NMSE
+   depending on shape — under this suite's 5e-4 bound — because it
+   miscomputes exactly ONE cell out of the FULL `m*n` output the whole-
+   buffer NMSE is normalized against (and on the M=37/N=48 shape, whose
+   remainder is bottom-strip-only, it reds NOTHING at all: that shape's
+   `right_strip` is 0, so `t` never reaches the mutated boundary). That
+   result is evidence about this test's proof strength at this scale, not
+   a clean pass — recorded rather than discarded. The second mutation —
+   the right-strip remap's divisor (`t2 / (n - skip_n)` to `t2 / n`,
+   `t2 % (n - skip_n)` to `t2 % n`, a forgot-to-narrow-the-divisor bug in
+   the same class) — reds unambiguously: NMSE `nan`/`-nan` on both the
+   combined M=37/N=50 case and the N-misaligned M=32/N=50 case, all
+   formats (out-of-bounds device reads through a corrupted `i`/`j`).
+   Reverting either mutation restores an identical source hash
+   (`sha256sum` verified) and an identical GREEN result.
+
+   **Op-level A/B, same tool, `examples/quant-gemm-bench` extended with a
+   `M=132, N=12288, K=2048` shape** (M=132 deliberately un-aligns M by one
+   tile past 8*16 at this row's own widest production N), same-binary
+   toggle by reverting only `rocm_grouped_gemm.hip` to its pre-repair
+   content and rebuilding (not `VT_ROCM_QUANT_WMMA`, which selects the
+   scalar arm entirely rather than isolating the tail-fill launch), best-
+   of-6, idle host:
+
+   | Format | before (full-grid tail launch) | after (remainder-sized tail launch) | ratio |
+   |---|---:|---:|---:|
+   | Q6_K | 1449.0-1449.8 GFLOP/s | 1678.1-1680.0 GFLOP/s | +15.8-15.9% |
+   | Q4_K | 1809.3-1826.7 GFLOP/s | 2179.7-2187.6 GFLOP/s | +19.3-20.9% |
+
+   Real, not negligible, and reported at the actual measured range rather
+   than a single cherry-picked run. Q8_0 (a different, unrelated launch
+   path that carries no tail-fill mechanism) was measured alongside as a
+   control and is flat before/after (~2065-2083 GFLOP/s), as expected.

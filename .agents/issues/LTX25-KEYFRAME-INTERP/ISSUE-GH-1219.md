@@ -1,0 +1,23 @@
+ID: ISSUE-GH-1219
+Title: Pinning BOTH keyframes aborts the render on every recipe whose frame-0 item APPENDS, which is `keyframe_interpolation` -- the one pipeline that exists to interpolate between two pinned ends, whose `docs/USAGE.md` worked example passes `--first-frame open.ppm --last-frame close.ppm` and whose `ltx2-gen --help` says to use the two together. Reachable from the shipped CLI and from `vllm_video_engine_load` / `Generate`. The defect is a derived index that was correct only by APPEND ORDER: the last-frame arm of `src/vllm/multimodal/ltx2_video.cpp` located its own appended tokens at `video.positions[target_tokens * 2]`, and `target_tokens` is the phase's fixed target grid, so that index names the first token PAST THE GRID -- the first appended token in the sequence, whichever item appended it. Row `LTX25-KEYFRAME-INTERP` ([#1096](https://github.com/mudler/vllm.cpp/issues/1096)) put a second appending item in front of it, because `image_conditionings_by_adding_guiding_latent` sends frame 0 to `VideoConditionByKeyframeIndex`, which APPENDS (`keyframe_cond.py:79-82`), rather than to `VideoConditionByLatentIndex`, which replaces (`latent_cond.py:40-41`). With both ends pinned the index named the FIRST frame's keyframe at temporal 0 and the arm's own positional assertion threw `must carry the temporal position of pixel frame frames - 1 (0.333333), but the first appended token starts at 0.000000`. The `ti2vid_two_stage` control -- replace at frame 0, one append -- never reached it and stayed green, which is what says ordering rather than keyframes. The generated-keyframe-slot arm carried the same shape in its growth check. Neither assertion is weakened: fixed in flow by capturing the sequence length at the moment of each append and locating each item's tokens from that, plus a new assertion that the recorded `generated_keyframe_layout.first_token` equals that pre-append count. Gated by a permanent `test_ltx2_video` case pinning both ends on both builders with the bare grid and each single end as controls, captured RED at the pre-fix source with that exact message. Found by the fresh review of #1096
+Row: LTX25-KEYFRAME-INTERP
+State: UNKNOWN
+Kind: bug
+GitHub: 1219
+Mirror: MISSING
+Availability: METADATA_ONLY
+Created: UNKNOWN
+Updated: UNKNOWN
+Closed: UNKNOWN
+
+## Problem
+
+Archive: `.agents/completed/issue-index.md:390`
+
+### Frozen archive evidence
+
+> | [#1219](https://github.com/mudler/vllm.cpp/issues/1219) | `LTX25-KEYFRAME-INTERP` | Pinning BOTH keyframes aborts the render on every recipe whose frame-0 item APPENDS, which is `keyframe_interpolation` -- the one pipeline that exists to interpolate between two pinned ends, whose `docs/USAGE.md` worked example passes `--first-frame open.ppm --last-frame close.ppm` and whose `ltx2-gen --help` says to use the two together. Reachable from the shipped CLI and from `vllm_video_engine_load` / `Generate`. The defect is a derived index that was correct only by APPEND ORDER: the last-frame arm of `src/vllm/multimodal/ltx2_video.cpp` located its own appended tokens at `video.positions[target_tokens * 2]`, and `target_tokens` is the phase's fixed target grid, so that index names the first token PAST THE GRID -- the first appended token in the sequence, whichever item appended it. Row `LTX25-KEYFRAME-INTERP` ([#1096](https://github.com/mudler/vllm.cpp/issues/1096)) put a second appending item in front of it, because `image_conditionings_by_adding_guiding_latent` sends frame 0 to `VideoConditionByKeyframeIndex`, which APPENDS (`keyframe_cond.py:79-82`), rather than to `VideoConditionByLatentIndex`, which replaces (`latent_cond.py:40-41`). With both ends pinned the index named the FIRST frame's keyframe at temporal 0 and the arm's own positional assertion threw `must carry the temporal position of pixel frame frames - 1 (0.333333), but the first appended token starts at 0.000000`. The `ti2vid_two_stage` control -- replace at frame 0, one append -- never reached it and stayed green, which is what says ordering rather than keyframes. The generated-keyframe-slot arm carried the same shape in its growth check. Neither assertion is weakened: fixed in flow by capturing the sequence length at the moment of each append and locating each item's tokens from that, plus a new assertion that the recorded `generated_keyframe_layout.first_token` equals that pre-append count. Gated by a permanent `test_ltx2_video` case pinning both ends on both builders with the bare grid and each single end as controls, captured RED at the pre-fix source with that exact message. Found by the fresh review of #1096 | bug |
+
+## Resolution
+
+-

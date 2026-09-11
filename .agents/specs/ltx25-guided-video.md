@@ -520,7 +520,7 @@ Stop and report `NEEDS_DECISION` rather than narrowing silently if:
   `ti2vid_two_stages_hq` (#921),
   `keyframe_interpolation` ([#1096](https://github.com/mudler/vllm.cpp/issues/1096)).
   Each needs its own row; none is blocked on this seam any more.
-- **#1049's remaining three symbols** — see §6c.
+- **ISSUE-GH-1049's remaining three symbols** — see §6c.
 - **[#1111](https://github.com/mudler/vllm.cpp/issues/1111) — the T2A arm still
   refuses an EMPTY `audio_stg_blocks`.** The same divergence this row's review
   found on the video path, in `ltx2_t2a.cpp:203-214`, which landed with #1032 and

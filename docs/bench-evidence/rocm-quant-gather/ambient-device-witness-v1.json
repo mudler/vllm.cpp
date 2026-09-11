@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "row": "BACKEND-ROCM-QUANT-GATHER",
+  "head": "376223f000f85683f2881136e38ee52892d8d3a8",
+  "cwd": "/home/vikash/vllm.cpp-rdna3-gather-impl",
+  "env": {
+    "HIP_VISIBLE_DEVICES": "0,1",
+    "ROCR_VISIBLE_DEVICES": "0,1",
+    "VT_ROCM_GATHER_REQUIRE_TWO_DEVICES": "1",
+    "TMPDIR": "/home/vikash/.cache/rdna3-gather-impl/tmp"
+  },
+  "argv": [
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/tests/test_rocm_embedding_quant",
+    "--test-case=ROCm gather follows the queue device when the ambient device differs",
+    "--abort-after=1"
+  ],
+  "log": "/home/vikash/.cache/rdna3-gather-impl/evidence/ambient-device-witness-v1.log",
+  "authority": "Operator runs this bounded witness under the recorded global GPU mutex with devices0 and1 visible",
+  "expectation": "Require two devices. Queue/table/output reside on0; ambient device switches to1 before shared vt::Embedding. Check correct rows, bounds exception, and immediate recovery. No device-binding implementation change precedes this witness.",
+  "files": {
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/tests/vt/test_rocm_embedding_quant.cpp": {
+      "bytes": 17542,
+      "sha256": "7026334d9ab70b3fa56cf0c4af4012f054e539ba37a48c586732742d7278a927"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/tests/CMakeLists.txt": {
+      "bytes": 275318,
+      "sha256": "45ee683859f89aa7c4c8d5ec253e46a0cf4d8de5eb33ac5f196c8fd413d3cba1"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/src/vt/rocm/rocm_embedding_quant.hip": {
+      "bytes": 7556,
+      "sha256": "5934d1727c96ec8e76f4e7dc3805e15d271fb528b7c0ad6c3a5d2863a179686b"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/src/vt/rocm/rocm_embedding_quant.h": {
+      "bytes": 554,
+      "sha256": "1b2b31617d660b64f622e692089423ce1657df102322558a4ab731f521952bc5"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/src/vt/rocm/rocm_quant_dequant.h": {
+      "bytes": 25507,
+      "sha256": "413dc138254cc72f8dccbc87268581217c93dec8f8acaea159f3f39569c37e62"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/src/vt/rocm/rocm_quant_iq_tables.h": {
+      "bytes": 110865,
+      "sha256": "d267d25ff1dd3f67749c251f87047f4b70c9650a99d04b524ff6c3313596a349"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/libvllm.a": {
+      "bytes": 95078500,
+      "sha256": "acbf7ceb5c2efa04ff56189e04de549ebe760ba70f3d7967f684f2e7709431cb"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/tests/test_rocm_embedding_quant": {
+      "bytes": 30954024,
+      "sha256": "f2dd2bfa912713cd7e6599dd868a1f347487fcf4b8da537b464a31f5cb576eae"
+    }
+  }
+}

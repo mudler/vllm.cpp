@@ -181,6 +181,50 @@ class PinnedGrowStaging {
   size_t elems_ = 0;
 };
 
+// ─── SPEC-DFLASH2 A2-4 (#3004): THE COMMITTED-ID DOWNLOAD ───────────────────
+//
+// Brings ONE step's committed sampled ids to host memory the propose arms can
+// read, from wherever the async decode arm left them, and returns a pointer to
+// them. The shape is `AsyncOutput`'s (async_utils.py:29-44 @ pin
+// 5559679229bc961848b121ccdeaa8fa5d79bec98) and the same one A2-2 gave the
+// verify download: record a fork event on the MAIN queue so the copy is ordered
+// after the sampler and after the write-back scatter, make the COPY queue wait
+// it, issue the D2H there into PAGE-LOCKED memory, record a completion event on
+// the copy queue, and block the host on that event alone. The main queue is
+// never synchronized.
+//
+// WHY IT IS UNCONDITIONAL, and this is the point of the wave. `sample_tokens_
+// async` has three write-back branches and #2920 had to ask WHICH one ran,
+// because the two CUDA ones leave the step's committed ids unreadable on the
+// host — the device-mirror branch leaves the host array's VALUES stale on
+// purpose, the UMA branch writes it from a `LaunchScatterLastSampled` that
+// nothing waits. That question was a `committed_ids_on_host` flag and a refusal
+// by name, and on GB10's integrated default the UMA branch runs and hits it,
+// which is what blocks A2-5. Calling this on EVERY branch deletes the question
+// instead of answering it: there is no residence to read, and a FOURTH write-back
+// branch cannot forget to set a flag that no longer exists. On the host branch
+// the copy is a host-to-host memcpy of `num_reqs` int64s — paid only under
+// `spec_on()`, and cheaper than the read-back it replaces being wrong.
+//
+// OWNERSHIP AND LIFETIME, stated because this row has conflated "owns
+// everything" with "freed in the destructor" twice. The returned pointer is
+// INTO `staging`, which owns it; the caller owns nothing and frees nothing. It
+// is valid until `staging` is destroyed — a grow RETAINS the block it replaces
+// (PinnedGrowStaging above), so even a later, larger call does not invalidate
+// it. `staging` must outlive every copy issued into it; the runner's member is
+// runner-lifetime and its blocks are released by `~PinnedGrowStaging`, which
+// runs after `~GPUModelRunner`'s body and therefore after that body's drain.
+// The host read below is well-defined because `SynchronizeEvent` has completed
+// the copy before this returns; the block is not being written when it is read.
+//
+// `dev_ids` is `AsyncOutputSlot::device_sampled_ids`, the sampler's int64
+// output. The page-locked block is measured in int32 elements, so an id costs
+// two of them.
+const int64_t* DownloadCommittedIds(vt::Backend& backend, vt::Queue& main_q,
+                                    vt::Queue& copy_q, vt::Event& fork,
+                                    vt::Event& ready, const void* dev_ids,
+                                    int num_reqs, PinnedGrowStaging& staging);
+
 // The batched paged model runner (upstream GPUModelRunner, T0 slice).
 class GPUModelRunner final : public ModelRunnerBase {
  public:
@@ -863,12 +907,46 @@ class GPUModelRunner final : public ModelRunnerBase {
   // LoadedEngine calls it once after ResolveAsyncEnabled). Gates the
   // draft-placeholder fill + computed-token correction in execute_model.
   bool use_async_scheduling_ = false;
-  // W7 (#1824): req_id -> the draft count the PREVIOUS step scheduled for it,
-  // recorded at splice time under async scheduling. The computed-token
-  // correction applies only to requests with an entry here (the scheduler's
-  // num_computed_tokens can carry that step's not-yet-rolled-back rejected
-  // drafts). Rebuilt every spec step; empty otherwise.
-  std::map<std::string, int> prev_sched_draft_counts_;
+  // ─── SPEC-DFLASH2 A2-4 (#3004): prev_num_draft_len AND ITS CORRECTION ──────
+  //
+  // `prev_num_draft_len` is upstream's name and upstream's value: the draft
+  // count the PREVIOUS step scheduled for a request, written where the drafts
+  // are spliced (`gpu_input_batch.py:517` @ pin
+  // 5559679229bc961848b121ccdeaa8fa5d79bec98, `request.prev_num_draft_len =
+  // num_spec_tokens`) and read at the next `_update_states` (`:1356`). W7
+  // carried the same value under the name `prev_sched_draft_counts_`; the rename
+  // is not cosmetic, because the three maps below are one mechanism and had to
+  // be named after the mechanism upstream has.
+  //
+  // Keyed by req_id rather than by req_state slot, deliberately: these are
+  // one-step facts about a REQUEST, so they neither move through `condense` nor
+  // swap through `swap_states`. Upstream keeps them on `CachedRequestState` for
+  // the same reason. All three are rebuilt every spec step and are empty
+  // otherwise.
+  std::map<std::string, int> prev_num_draft_len_;
+  // req_id -> the `num_computed_tokens` THIS RUNNER wrote for it last step, so
+  // the optimistic value below needs no accept result. Upstream's
+  // `prev_positions` (`gpu_model_runner.py:2155`), which its GPU correction
+  // kernel reads for exactly this.
+  std::map<std::string, int> prev_num_computed_tokens_;
+  // req_id -> `valid_sampled_token_count` for its last verify step: how many
+  // tokens the accept walk emitted (accepted drafts plus the bonus). Upstream's
+  // `_get_valid_sampled_token_count()` (`gpu_model_runner.py:1530`), which it
+  // reads back from the device; ours is written on the host in
+  // `sample_tokens_with_rejection` and that is the ONE remaining host-visibility
+  // dependency of the correction — see `apply_deferred_spec_decode_corrections`.
+  std::map<std::string, int> prev_valid_sampled_count_;
+  // One entry per request whose `num_computed_tokens_cpu` this step set
+  // OPTIMISTICALLY — assuming every one of last step's drafts was accepted —
+  // and that therefore owes a correction. Upstream's
+  // `deferred_spec_decode_corrections` list (`gpu_model_runner.py:1256,
+  // 1379-1381`), carrying the same three fields.
+  struct DeferredSpecDecodeCorrection {
+    std::string req_id;
+    int req_index = 0;
+    int optimistic_num_accepted = 0;
+  };
+  std::vector<DeferredSpecDecodeCorrection> deferred_spec_corrections_;
   // ENG-ASYNC-SCHED depth-2 LIFETIME GUARD. sample_tokens_async DEFERS the main
   // queue's completion to the consuming step's get_output() (one step_with_batch_
   // queue call later), so when it returns the previous step's forward / sample /
@@ -899,6 +977,16 @@ class GPUModelRunner final : public ModelRunnerBase {
   // memory would make the copy host-synchronous and the events above decorative
   // (see PinnedGrowStaging). Grown, never shrunk, and freed in the dtor.
   PinnedGrowStaging verify_download_staging_;
+  // SPEC-DFLASH2 A2-4 (#3004): the DECODE arm's D2H destination — one
+  // page-locked block holding this step's committed sampled ids (int64, so two
+  // int32 elements each). Separate from the verify staging above because the two
+  // downloads carry different payloads; the fork/ready EVENT pair is shared,
+  // which is safe because `sample_tokens_async` takes exactly one of the two
+  // routes per step (the verify arm returns before the decode arm can be
+  // reached) and each route synchronizes its ready event before it returns.
+  // Grown, never shrunk, and freed by `~PinnedGrowStaging` — after the
+  // destructor body's drain, which is why that drain was moved to the top.
+  PinnedGrowStaging committed_ids_staging_;
   // Persistent pool of the per-step overlap resources (device sampled-id buffer +
   // pinned host buffer + events), so sample_tokens_async does NO per-step
   // cudaMalloc/cudaHostAlloc/cudaEventCreate (each of which device-syncs and
@@ -1075,6 +1163,58 @@ class GPUModelRunner final : public ModelRunnerBase {
   // propose_drafts. Shared by both sampling entry points so the two cannot
   // derive the same two vectors differently. Inert unless spec_on().
   void propose_after_verify(int num_reqs);
+
+  // The PROPOSE that follows a PLAIN DECODE step (SPEC-MTP I5d), lifted out of
+  // `sample_tokens` by SPEC-DFLASH2 A2-4 (#2920) for exactly the reason A2-2
+  // lifted `propose_after_verify` out: `sample_tokens_async` needs the SAME
+  // derivation, and a second hand-written copy of "every generating row sampled
+  // one token, rejected none" is a rule with two expressions.
+  //
+  // Upstream has ONE propose tail for both routes — `sample()` picks the
+  // sampler on `input_batch.num_draft_tokens == 0`
+  // (gpu/model_runner.py:1129 @ pin 5559679229) and returns that sampler's own
+  // `num_sampled` / `num_rejected`, which the single
+  // `if self.speculator is not None:` tail at :1524-1547 then proposes from.
+  // We have two entry points and two arms, so the pair of derivations is named
+  // once each and APPLIED four times rather than written four times.
+  //
+  // Inert unless spec_on().
+  void propose_after_decode(int num_reqs);
+
+  // ─── SPEC-DFLASH2 A2-4 (#3004): THE DEFERRED HALF OF THE CORRECTION ────────
+  //
+  // Applies every correction `execute_model`'s optimistic pass queued, and is
+  // upstream's `correct_spec_decode_token_counts` closure
+  // (`gpu_model_runner.py:1529-1555` @ pin 5559679229) with its arithmetic
+  // unchanged: `correction = optimistic_num_accepted - num_accepted`, then
+  // `num_computed_tokens -= correction`.
+  //
+  // WHAT W7 DID INSTEAD, and why it had to be replaced. W7 wrote the EXACT value
+  // at schedule time — `num_tokens_no_spec - 1`, the newest committed token's
+  // position — which is only computable because the previous step's accept walk
+  // ran on the host before this step was scheduled. That is precisely the
+  // property A2-2 started removing and A2-5 finishes removing, so the rule was
+  // correct and self-invalidating. The optimistic value below needs NO accept
+  // result: it is `prev_num_computed_tokens + 1 + prev_num_draft_len`, all of it
+  // this runner's own bookkeeping.
+  //
+  // WHERE IT IS CALLED, AND WHERE UPSTREAM CALLS IT. Upstream calls it AFTER the
+  // model launch (`:4524-4525`, "now the batch has been launched we can wait for
+  // corrections from the previous model forward without breaking async
+  // scheduling") and keeps the in-step positions right with a DEVICE correction
+  // inside `_prepare_inputs` (`update_num_computed_tokens_for_batch_change`,
+  // `:2148-2166`). We compute positions on the host, so this must run before
+  // `prepare_inputs` reads `num_computed_tokens_cpu` and it does. Moving it past
+  // the launch needs that device kernel and is listed under the row spec's
+  // `## Owed` for A2-5; nothing here claims the wait has moved.
+  //
+  // THE ONE REMAINING HOST DEPENDENCY, named so A2-5 knows what to replace:
+  // `prev_valid_sampled_count_`, which `sample_tokens_with_rejection` writes on
+  // the host. Upstream reads the same number off the device
+  // (`valid_sampled_token_count_gpu`). What A2-4 buys is that the dependency is
+  // now one input to one function instead of a value the schedule-time rewrite
+  // could not run without.
+  void apply_deferred_spec_decode_corrections();
 
   // Lazily create the two persistent events the kCopyQueueEvent route records
   // (fork: copy-queue-waits-main; ready: D2H completion). Created ONCE and

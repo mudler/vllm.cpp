@@ -173,7 +173,10 @@ class OracleCommitAssertionTests(unittest.TestCase):
 
     def test_the_pin_is_accepted(self) -> None:
         assert_oracle_commit(VLLM_ORACLE_VERSION)
-        # The distribution string carries the same segment plus a suffix.
+        # The distribution string carries the same `+g<sha>` segment. At this pin
+        # it IS the same string (a source build appends nothing); under
+        # `VLLM_USE_PRECOMPILED=1` it carried a further suffix. Both are accepted
+        # here, which is the point: the commit term reads the segment, not the tail.
         assert_oracle_commit(VLLM_DISTRIBUTION_VERSION)
 
     def test_the_rollback_is_refused(self) -> None:
@@ -258,6 +261,66 @@ class OracleIdentityIsWiredIntoEveryEntryPointTests(unittest.TestCase):
             self._record_oracle_manifest(
                 metadata_version=ROLLBACK_RUNTIME_VERSION,
                 runtime_version=VLLM_ORACLE_VERSION,
+            )
+
+    def test_record_oracle_compares_each_string_against_its_own_constant(self) -> None:
+        """THE #520 MUTATION, executed. Red against `metadata == runtime == CONST`.
+
+        `git show 356fa7750^:tools/bench/online_gate.py` lines 3509-3510 is the
+        shape #520 replaced: one constant, `VLLM_ORACLE_VERSION`, compared
+        against BOTH the distribution metadata and the runtime string. The two
+        cases above cannot see the difference, and that is not an oversight in
+        them -- at today's pin the two recorded strings are EQUAL, so the correct
+        code's two comparisons are against the same value and no real input
+        separates the two shapes.
+
+        Patching the distribution constant restores the separation, exactly as
+        this class's docstring already describes for the commit term. The value
+        patched in is not a literal and not a pin value: it is
+        `VLLM_ORACLE_VERSION + ".precompiled"`, the shape that was REAL at this
+        pin until `5d97007c2`, derived at test time so a future pin advance
+        carries it along.
+
+        Under the correct code the metadata string then mismatches its own
+        constant and the entry point refuses. Under `metadata == runtime ==
+        CONST` both inputs equal `VLLM_ORACLE_VERSION`, nothing refuses, and this
+        case is red.
+        """
+
+        with (
+            mock.patch(
+                "tools.bench.online_gate.VLLM_DISTRIBUTION_VERSION",
+                VLLM_ORACLE_VERSION + ".precompiled",
+            ),
+            self.assertRaisesRegex(HarnessError, "oracle version drift"),
+        ):
+            self._record_oracle_manifest(
+                metadata_version=VLLM_ORACLE_VERSION,
+                runtime_version=VLLM_ORACLE_VERSION,
+            )
+
+    def test_record_oracle_compares_the_runtime_string_against_the_runtime_constant(
+        self,
+    ) -> None:
+        """The opposite polarity, so neither term can be deleted or re-pointed.
+
+        Same patched pin shape. Here the DISTRIBUTION string is the one that
+        matches, and the runtime string carries the suffix a runtime never has.
+        Deleting the `runtime_version != VLLM_ORACLE_VERSION` term, or pointing
+        it at `VLLM_DISTRIBUTION_VERSION`, turns this red while leaving the case
+        above green.
+        """
+
+        with (
+            mock.patch(
+                "tools.bench.online_gate.VLLM_DISTRIBUTION_VERSION",
+                VLLM_ORACLE_VERSION + ".precompiled",
+            ),
+            self.assertRaisesRegex(HarnessError, "oracle version drift"),
+        ):
+            self._record_oracle_manifest(
+                metadata_version=VLLM_ORACLE_VERSION + ".precompiled",
+                runtime_version=VLLM_ORACLE_VERSION + ".precompiled",
             )
 
     def test_record_oracle_asserts_the_commit_behind_the_version(self) -> None:

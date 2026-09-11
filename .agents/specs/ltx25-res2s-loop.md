@@ -737,7 +737,7 @@ the server takes `--video-extra pipeline_kind=res2s_two_stage`.
 
 ## Owed
 
-* [#921](https://github.com/mudler/vllm.cpp/issues/921) is closed by this row.
+* ISSUE-GH-921 is closed by this row.
 * A real-checkpoint HQ render on `dgx.casa`, and a rendered-clip comparison
   against the Euler arm at the same preset. Not attempted here (§0).
 * `legacy_mode=False` (`samplers.py:188-192`) — the `timesteps_from_mask`

@@ -387,12 +387,63 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
 - **R4 — no GPU in CI.** A2-2 through A2-4 have device arms that the CPU tier
   degenerates. Each device case must be a VISIBLE skip with a non-zero
   assertion count on the arm that does run.
+- **R5 — the runner suite cannot see the discarded-row rule, and A2-4 measured
+  that it cannot.** #2920's mixed `num_reqs > 1` runner case does not assert
+  that a DISCARDED row's token column is left untouched, so it cannot see a
+  rule that writes one. Dropping the `discard` guard reds `test_committed_ids`
+  7 of 9 while `test_runner` stays **GREEN**, so
+  `tests/vllm/v1/worker/test_committed_ids.cpp` is the only instrument in this
+  tree for that rule. A wave that changes the committed-id apply and gates it
+  on `test_runner` alone has no instrument for its own defect. This is R1's
+  class — a guarantee that no test could red — which three separate A2-3
+  reviews each found independently. It is recorded here, and not only in the
+  A2-4 commit body, because the next wave reads `## Risks` and the mutation
+  table in `## Now` is rewritten at every landing.
 
 ## Stop conditions
 
 - G4 reading GPU busy at or above 95% turns this into a parity-only row. The
   mirror obligation stands, the throughput ceiling is zero, and the waves are
   scheduled accordingly rather than dropped.
+
+  **AMENDED IN PART on 2026-09-06 by the operator, on the decomposition of
+  G4's own trace** ([#3004](https://github.com/mudler/vllm.cpp/issues/3004)).
+  The measurement is untouched and the reading stands: the decode GPU is
+  **96.01% busy** in `--cuda-graph-trace=node` mode and **96.53%** in graph
+  mode, against this spec's own threshold that at or above 95% refutes the
+  throughput half outright. With about 4% idle, no async chain delivers the
+  11.1% per-step gap against vLLM on its own.
+
+  The clause that is superseded is **"the throughput ceiling is zero"**, and
+  only that clause. G4 refuted the async chain as a SUFFICIENT fix. It did not
+  refute it as a CONTRIBUTING one, and the original stop condition drew the
+  second conclusion from evidence that supports only the first. The
+  decomposition of the same trace ranks idle as the LARGEST single lever
+  available:
+
+  | lever | perfect-case gain |
+  |---|---:|
+  | **remove all idle** | **3.99%** |
+  | remove all non-GEMM kernel time | 3.46% |
+  | every GEMM at our best observed rate (220.8 -> 227.2 GB/s) | 2.61% |
+  | **total ceiling** | **10.06%** |
+  | **gap to vLLM** | **11.1%** |
+
+  No single lever closes the gap. All three together are still about one point
+  short, and that missing point belongs to
+  [#2964](https://github.com/mudler/vllm.cpp/issues/2964) and not to this row.
+  "Async cannot close the gap alone" is true. "Async is worthless" is what the
+  superseded clause implied, and it is false.
+
+  **The amended condition.** A2-4 proceeds as a necessary-but-not-sufficient
+  contributor and claims **NO** throughput result. A2-5 remains gated on its
+  own G3/G4 evidence and is **NOT** authorized by this amendment. Every
+  sentence in this spec that forbids a wave in A2 from quoting a throughput
+  result keeps its full force; the amendment changes whether these waves may
+  exist, not what they may claim. The original text above is kept because the
+  reading it rests on is correct on its own terms and because this project
+  does not delete evidence to reduce context. What changed is the conclusion,
+  not the number.
 - A wave needing V2-runner semantics this tree does not have,
   `NEEDS_DECISION` naming the dependency.
 - Any correctness gate red that a scoped fix cannot green, `BLOCKED` with the
@@ -531,7 +582,22 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
   as the `Release` repair: an observable stall instead of an unobservable wrong
   answer. Owner: row `SPEC-DFLASH2`, issue #2911.
 - **`sample_tokens_async`'s DECODE arm never proposes, and A2-5 is blocked on
-  it.** FOUND BY A2-3 (#2911), which is the first wave whose measurement could
+  it. FIXED BY A2-4** ([#2920](https://github.com/mudler/vllm.cpp/issues/2920)).
+  The arm now ends in `propose_after_decode`, the `num_sampled = 1` /
+  `num_rejected = 0` derivation lifted out of `sample_tokens` so the two entry
+  points APPLY one rule instead of writing it twice — the shape A2-2 established
+  for `propose_after_verify`. Upstream needs neither, because `sample()` picks
+  the sampler on `input_batch.num_draft_tokens == 0`
+  (`vllm/v1/worker/gpu/model_runner.py:1129` @ pin 5559679229) and the single
+  `if self.speculator is not None:` tail at `:1524-1547` proposes from whichever
+  sampler ran. The route stays ONE expression: the new branch is the
+  fall-through of the `StepRoutesToVerify(...)` arm, not a second reading of it.
+  Two `test_runner` cases gate it, one of them a MIXED `num_reqs == 2` step with
+  a committed row and a discarded chunked-prefill row, and both are red before
+  the change on `REQUIRE( drafts.has_value() )`. The entry stays because the
+  paragraph below it is the record of what A2-3 could see and A2-4 could not
+  reach; the residency half it did not close is the entry that follows.
+  FOUND BY A2-3 (#2911), which is the first wave whose measurement could
   see it. A2-2 gave the async sampler a verify arm and put
   `propose_after_verify` inside it, so a step that DRAFTS proposes correctly. The
   arm that runs when `StepRoutesToVerify` is false has no `spec_on()` branch at
@@ -549,6 +615,59 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
   and the fill. **A2-5 cannot flip the veto until this is closed**, and whichever
   wave closes it owes the mixed-step coverage the fill's own rule now has.
   Owner: row `SPEC-DFLASH2`, issue #2911.
+- **A2-4's decode propose REFUSES on both CUDA write-back branches, and that
+  refusal is A2-5's to remove. DISCHARGED by A2-4** (#3004): the flag and the
+  refusal are deleted, because the decode arm now downloads the ids itself on
+  every branch and there is no residence left to ask about. The entry stays
+  because the reasoning below is what the fix had to answer.
+
+  The propose arms read host state — the block
+  drafters take their anchor from `input_batch_.last_sampled_tokens`
+  (`runner.cpp`, `propose_drafts_block`), the n-gram matcher reads
+  `token_ids_cpu` — and only ONE of `sample_tokens_async`'s three write-back
+  branches leaves that state readable when the tail runs. The host branch
+  Synchronizes and writes the array itself. The device-mirror branch leaves the
+  host array's VALUES stale ON PURPOSE, and its own comment says so. The UMA
+  branch writes the host array from a `LaunchScatterLastSampled` queued on the
+  main queue with nothing waiting it, so a host read at the tail races the
+  kernel. Proposing off either would draft from an id this step did not commit,
+  which — verify being lossless — costs acceptance and raises NOTHING, reason
+  A's class exactly (#1366). So the arm sets one `committed_ids_on_host` flag,
+  the tail refuses by name on it, and the refusal names this row.
+
+  **THE REFUSAL IS BUILT AND ITS FALSE LEG IS UNREACHABLE HERE.** The flag is
+  declared and read OUTSIDE `#ifdef VLLM_CPP_CUDA`, so the CPU tier compiles the
+  check; but only the host branch is compiled here, so nothing on this tier can
+  make it false. It was measured by mutation instead — forcing the flag false
+  reds both new `test_runner` cases on the refusal's own message — and that is
+  the whole instrument. A refusal was preferred to a repair because the repair is
+  a device-resident propose, which is the wave A2-4 names and not a line this
+  change could write unbuilt.
+
+  **A2-5 CANNOT FLIP THE VETO BY DELETING ONE CONDITION.** On GB10's integrated
+  default the UMA branch is the one that runs, so the first speculative async
+  step after the flip hits this refusal. Making the propose read the ids where
+  they live is the work; deleting the check is not. Owner: row `SPEC-DFLASH2`,
+  issue #2920.
+- **The async decode arm's TOKEN-ROW restore is a divergence from that arm's own
+  design, and it is scoped to `spec_on()`.** `sample_tokens` appends the sampled
+  id to `token_ids_cpu`; the async arm deletes that append on purpose and
+  advances `num_tokens_no_spec` alone, because the scheduler's
+  `update_from_output` feeds detok and penalties when `get_output()`
+  materializes. `propose_drafts_ngram` matches over
+  `token_ids_cpu[:num_tokens_no_spec]`, so with the counter advanced past a
+  column nobody wrote the matcher drafts off a zero. A2-4 writes that one column
+  back, from the `last_sampled_tokens` the same branch just wrote, under
+  `spec_on()` only, so the production async path is byte-identical. The proper
+  fix is a device-resident token row the propose reads directly, which is
+  upstream's shape (`req_states.token_ids`) and is A2-4's own wave.
+
+  **PARTLY DISCHARGED by A2-4** (#3004). The restore is no longer conditional on
+  a branch and no longer reads `last_sampled_tokens`: both arrays are written
+  from the ids A2-4 downloads, which is what makes the mirror branch correct
+  rather than merely unrefused. It is STILL scoped to `spec_on()` and still
+  writes a HOST row. The device-resident row is now a separate `## Owed` entry
+  below, owned by A2-5. Owner: row `SPEC-DFLASH2`, issues #2920 and #3004.
 - **A2-1's draft lane is STILL UNREACHED after A2-3, and A2-5 owns the last
   step.** A2-3 (#2911) made the scatter's `draft_tokens` argument REAL — every
   call site now passes the per-req_state `InputBatch::draft_tokens` and its
@@ -852,21 +971,64 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
   where the kernels have already finished. Owner: no row yet; tracked by issue
   [#2916](https://github.com/mudler/vllm.cpp/issues/2916).
 - **`~GPUModelRunner` destroys the copy queue and the two verify events BEFORE
-  it drains.** `DestroyQueue(async_copy_queue_)` and the two `DestroyEvent` calls
-  run ahead of the mirror's `b.Synchronize(queue_)`, so A2-3's drain protects the
-  mirror's buffers and protects neither of them. PRE-EXISTING and untouched here:
-  A2-3's round-3 repair owns the drain's CLAIM, not the destructor's ordering,
-  and reordering the teardown is a separate change with its own mutation. It is
-  the same class as the `#2916` entry above and closing it needs the same GPU
-  tier, because on the CPU build `async_device_inputs_` is always null and the
-  block never executes at all. Owner: this row, wave A2-4, which is the wave that
-  moves waits in this destructor.
+  it drains. DISCHARGED by A2-4** (#3004), and the entry stays because the entry
+  is what booked it here. `DestroyQueue(async_copy_queue_)` and the two
+  `DestroyEvent` calls ran ahead of the mirror's `b.Synchronize(queue_)`, so
+  A2-3's drain protected the mirror's buffers and protected neither of them. The
+  drain is now the FIRST statement of the destructor and is unconditional, so it
+  covers the queue, the event pair and the mirror's buffers alike; the
+  mirror-scoped `Synchronize` is kept where it was, because deleting it would
+  make the free beneath it depend for its safety on a line thirty lines away.
+  Unconditional matters: `DownloadCommittedIds` and the verify D2H both record
+  `verify_fork_event_` on the main queue whether or not the mirror is engaged, so
+  a drain gated on `async_device_inputs_ != nullptr` would still leave exactly
+  the two objects this entry named unprotected.
+
+  **WHAT IS STILL OWED HERE IS THE EXECUTION**, and it is the same debt the
+  entry below records for A2-3's drain. On the CPU build
+  `vt::cpu::CpuBackend::Synchronize` is a no-op, so the hoisted line runs and
+  proves nothing about CUDA, and this box has no `nvcc`. It rests on reading —
+  sole destruction path, the queue every async copy path records against, no
+  double drain, no deadlock — and it stays owed a device run. Owner: this row,
+  A2-5, together with the G3/G4 device work.
 - **The drain is COMPILED here and EXECUTED on neither tier.** Deleting it leaves
   all eleven G1 targets green, on the CPU build because
   `async_device_mirror()`'s body is inside `#ifdef VLLM_CPP_CUDA` and on the CUDA
   build because this box has no `nvcc`. Its correctness rests on reading — sole
   destruction path, right queue, correctly scoped, no double drain, no deadlock —
   and it stays owed a device run.
+- **A2-4's committed-id materialization is REACHED ONLY THROUGH THE RUNNER API,
+  not on the production default** (#3004). `ApplyCommittedIdsForPropose` and
+  `DownloadCommittedIds` are called from `sample_tokens_async`'s decode arm, and
+  the veto keeps `async_input_combine_` false whenever a `SpeculativeConfig` is
+  present, so no production configuration takes that arm today. It is reached in
+  the sense the reachability guide separates from "a unit test constructs the
+  type": deleting the `ApplyCommittedIdsForPropose` call site reds two cases in
+  `test_runner` — `runner: sample_tokens_async's decode arm proposes on the first
+  step` (`:1806`, `CHECK( 0 == 14 )`) and `runner: the async decode arm's propose
+  covers a mixed num_reqs > 1 step` (`:1876`, `CHECK( 0 == 28 )`) — and both drive
+  a real `GPUModelRunner` through `execute_model` and `sample_tokens_async`, with
+  `set_async_input_combine(true)` standing in for the flip. What is owed is the
+  flip itself. Owner: this row, wave A2-5; issue
+  [#3004](https://github.com/mudler/vllm.cpp/issues/3004).
+- **The deferred correction still reads a HOST accept result** (#3004). A2-4
+  replaced W7's structural rule with upstream's two halves, and the optimistic
+  half now needs no accept result at all: it is `prev_num_computed_tokens + 1 +
+  prev_num_draft_len`, all of it the runner's own bookkeeping. The DEFERRED half
+  still reads `prev_valid_sampled_count_`, which `sample_tokens_with_rejection`
+  writes on the host, where upstream reads `valid_sampled_token_count_gpu` off the
+  device (`gpu_model_runner.py:1530`). Two things are owed with it: that device
+  read, and moving the correction PAST the model launch, which upstream can do
+  because `update_num_computed_tokens_for_batch_change`
+  (`gpu_model_runner.py:2148-2166`) fixes the in-step positions on the device
+  while ours are computed on the host. Owner: this row, wave A2-5.
+- **The device-resident token row is NOT what A2-4 landed** (#3004). #2920's
+  token-row restore is no longer conditional on which write-back branch ran and
+  no longer reads the stale `last_sampled_tokens`, but the row it writes is still
+  `InputBatch::token_ids_cpu` on the host. Upstream's `req_states.token_ids` is
+  device-resident and its n-gram proposer reads a GPU tensor
+  (`gpu_model_runner.py:1519-1525`). Landing that is what removes the download
+  A2-4 added rather than making it cheaper. Owner: this row, wave A2-5.
 - **The `nsys` read (G4).** RUN, by the operator holding the device; this wave
   took no lease and measured no device, so the number below is recorded from that
   run and not from this one, and the run's own recipe and evidence belong with it.
@@ -876,6 +1038,33 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
   discharges A2-1's `## Owed` and removes a reason-A hazard. No wave in A2 may
   quote a throughput result against this reading. What is still owed here is the
   run's recorded recipe, revisions and contention state beside the number.
+
+  **AMENDED IN PART on 2026-09-06; read `## Stop conditions` for the decision
+  and its basis** (#3004). The number, the threshold and the reading are
+  unchanged. The superseded sentence is "**A2-4 and A2-5 are STOPPED on it**":
+  the decomposition of this same trace ranks idle as the largest of three
+  levers (3.99% of a 10.06% total ceiling against an 11.1% gap), so the reading
+  refutes async as a sufficient fix and not as a contributing one. A2-4
+  proceeds as a necessary-but-not-sufficient contributor and A2-5 stays gated
+  on its own G3/G4 evidence. The last two sentences above are NOT amended: no
+  wave in A2 may quote a throughput result against this reading, and the run's
+  recipe, revisions and contention state are still owed beside the number.
+
+  **The recipe, revisions and contention state are now RECORDED**
+  ([#3014](https://github.com/mudler/vllm.cpp/issues/3014)), which discharges
+  the second of those two sentences and leaves the first standing. They live in
+  `.agents/benchmark-record.md` under `## SPEC-DFLASH2 G4`, with the command
+  that re-derives each figure from `/mnt/nas_share/rc/dflash2-staged/` beside
+  it. Three things that entry establishes and this one does not say. The vLLM
+  arm did NOT profile in that run, so 96.01% is OURS ALONE and no cross-arm
+  kernel comparison exists in the evidence at all. The non-GEMM lever
+  re-derives as **3.4548%** rather than 3.46%, which is a rounding of the
+  numerator to 0.165 s and moves neither the 10.06% total nor any conclusion.
+  The 220.8 and 227.2 GB/s pair and the 11.1% gap are inputs from elsewhere:
+  neither string is in the evidence, so the third lever is checkable only once
+  the pair is sourced. G4's own lease id went to the job's stdout and is
+  likewise not in the evidence directory, so it stays unrecorded rather than
+  reconstructed.
 
 ## Now
 
@@ -1006,7 +1195,8 @@ no throughput result.** Gate G4 has run on the operator's device — 96.01% busy
 the decode GPU, against this spec's own threshold that a reading at or above 95%
 refutes the throughput half outright — and A2-4 and A2-5 are STOPPED on it. The
 round-3 repair took no lease and measured no device; every number below is from
-the CPU tier. A2-3 lands for structural value only: it discharges A2-1's
+the CPU tier. (That STOPPED sentence was the position when A2-3 landed. It was
+amended in part on 2026-09-06; see `## Stop conditions`.) A2-3 lands for structural value only: it discharges A2-1's
 `## Owed` and removes a reason-A hazard, and nothing in it is offered as a step
 toward the row's 11% gap.
 
@@ -1053,4 +1243,137 @@ Three of the round-3 findings changed the code.
   `dev->cu_num_logits`, which is correct only while its `stage_upload` is present
   and correctly sized.
 
-A2-4 is the next wave, and the decode-arm gap above is what A2-5 is blocked on.
+**A2-4's first piece has landed** (#2920): `sample_tokens_async`'s DECODE arm
+proposes. The arm ends in `propose_after_decode`, the decode derivation lifted
+out of `sample_tokens` so both entry points apply one rule, mirroring upstream's
+single `if self.speculator is not None:` tail (`model_runner.py:1524-1547` @ pin
+5559679229) which runs after BOTH of `sample()`'s routes. The route predicate is
+untouched: the new branch is the fall-through of the same
+`StepRoutesToVerify(...)` arm.
+
+**IT IS STILL UNREACHED, and the mutation says so rather than the prose.** The
+veto stands at both construction sites, so no speculative engine reaches
+`sample_tokens_async` at all. The two `test_runner` cases that gate the arm
+supply `set_async_input_combine(true)` by hand — which is precisely what the
+veto withholds — and say so in the file.
+
+WHAT WAS MUTATED, on the CPU tier
+(`-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_BUILD_TESTS=ON`, Release), each restored
+byte-for-byte afterwards (`md5sum src/vllm/v1/worker/gpu/runner.cpp` reads
+`d4ff6bbd28e25d74a58ee15295076fe6` before and after every one, and the eleven G1
+targets are green at that md5):
+
+| mutation | result |
+|---|---|
+| delete `propose_after_decode` at the ASYNC call site | `test_runner` 39 of 41, both new cases red on `REQUIRE( drafts.has_value() )`; the other TEN G1 targets green, exit 0 |
+| force `committed_ids_on_host` false | `test_runner` 39 of 41, both new cases THREW the refusal by name at `runner.cpp` |
+| delete the token-row restore | `test_runner` 39 of 41, both new cases red on the `token_ids_cpu` compare, `CHECK( 0 == 14 )`; `test_mtp_depth`, `test_dflash2_runner_reach`, `test_engine_core_proc` and `test_draft_fill` all green |
+| delete `propose_after_decode` at the SYNC call site | `test_mtp_depth` and `test_dflash2_runner_reach` exit 1, throwing `async draft fill: no drafts proposed for request 'req' (placeholders scheduled without a matching propose)` — which is #2920's predicted symptom, produced on the entry point that IS reached |
+
+The first row is the reachability measurement and it is a NEGATIVE one: deleting
+the production call site is invisible to every suite but the two cases written
+for it, because no production step reaches the arm. The last row is the
+counterpart on the entry point that is reached, and it is what the async arm
+would do to a spec engine the moment A2-5 lifts the veto.
+
+**Two gaps the fix did NOT close are `## Owed` entries above**: the propose
+refuses by name on both CUDA write-back branches, whose committed ids are not
+host-readable at the tail, and the token-row restore is a `spec_on()`-scoped
+divergence from the async arm's own design. Both are A2-4's device-resident
+propose to remove, and the first of them means A2-5 cannot flip the veto by
+deleting one condition.
+
+A2-4's remaining pieces are the next wave, and the residency refusal above is
+what A2-5 is now blocked on.
+
+**A2-4 has landed** (#3004), in the two halves the wave names.
+
+**The propose reads the committed ids where they live, and there is no residence
+question left.** `sample_tokens_async`'s decode arm no longer asks which
+write-back branch ran. It calls `DownloadCommittedIds` unconditionally, on every
+branch, which forks the copy queue off the main queue with `verify_fork_event_`,
+issues the int64 D2H into page-locked staging, records `verify_ready_event_` on
+the copy queue and waits that event alone — the shape A2-2 gave the verify
+download and the shape `AsyncOutput` has upstream (`async_utils.py:29-44`). The
+`committed_ids_on_host` flag and the refusal that read it are GONE, and they are
+gone because there is nothing left for them to describe: a fourth write-back
+branch cannot forget to set a flag that does not exist. `ApplyCommittedIdsFor
+Propose` (`prepare_inputs.h`) then writes both pieces of host state the propose
+arms read — the `last_sampled_tokens` anchor AND the token-row column — from that
+one array. #2920 wrote only the second, and wrote it FROM `last_sampled_tokens`,
+which is exactly the array the mirror branch leaves stale; that restore was
+correct only on the branch that did not need it.
+
+**The optimistic correction replaced W7's structural rule.** `prev_num_draft_len`
+is upstream's name and upstream's value, written where the drafts are spliced
+(`gpu_input_batch.py:517`) and read at the next step (`:1356`). The schedule-time
+pass writes `prev_num_computed_tokens + 1 + prev_num_draft_len` — every draft
+assumed accepted, and NO accept result in the expression — and queues a
+correction; `apply_deferred_spec_decode_corrections` subtracts
+`optimistic_num_accepted - num_accepted` (`:1543-1546`). W7's rule was correct
+for one reason, that our rejection walk ran on the host before the next step was
+scheduled, and A2-2 began removing that reason.
+
+**HOW THE REPLACEMENT IS CHECKED RATHER THAN ARGUED.** While the accept result is
+still host-visible, W7's structural value is computable inside the correction, so
+the correction asserts that its own result equals it — an equality between two
+independent derivations of one number, which fires on an arithmetic slip in
+either half. It holds on every step `test_mtp_depth` and
+`test_dflash2_runner_reach` drive.
+
+**RED-BEFORE.** `tests/vllm/v1/worker/test_committed_ids.cpp` against #2920's
+rule, transcribed into the new function verbatim: `9 test cases, 3 passed, 6
+failed`, `59 assertions, 17 failed`, exit 1, with
+`CHECK( last_sampled[0] == 77 )` reading `CHECK( 11 == 77 )` and the stale-anchor
+case reading `CHECK( 400 != 400 )`. After: `9 passed, 59 assertions, 0 failed`.
+G1 was green before (eleven targets, all exit 0) and after (twelve, all exit 0).
+
+WHAT WAS MUTATED for A2-4, on the CPU tier
+(`-DVLLM_CPP_CUDA=OFF -DVLLM_CPP_BUILD_TESTS=ON`, Release), each restored
+byte-for-byte afterwards (`md5sum` reads `6a395f76d96244f8f9050c2cdb12e696` for
+`runner.cpp` and `96ce759e9e4a3800d1fafa48f1b12ceb` for `prepare_inputs.cpp`
+before and after every one):
+
+| mutation | result |
+|---|---|
+| delete the `apply_deferred_spec_decode_corrections()` call site | `test_mtp_depth` 5 of 10 and `test_dflash2_runner_reach` 1 of 10, both throwing `async spec computed-token correction out of range for 'req': scheduler sent 3, optimistic value 9, prev drafts 3` — the optimistic value compounds and the next step's range check refuses |
+| delete the `ApplyCommittedIdsForPropose` call site | `test_runner` 39 of 41: `:1806` `CHECK( 0 == 14 )` and `:1876` `CHECK( 0 == 28 )`. The other eleven G1 targets green |
+| write the token column at `n` instead of `n - 1` | `test_committed_ids` 6 of 9 (8 assertions) AND `test_runner` 39 of 41 |
+| drop the `discard` guard | `test_committed_ids` 7 of 9 (3 assertions) and `test_runner` **GREEN** |
+
+The last row is a finding about the PRE-EXISTING instrument and it is why the new
+file exists. #2920's mixed `num_reqs > 1` runner case does not assert that a
+discarded row's token column is untouched, so it cannot see a rule that writes
+one; `test_committed_ids` is the only thing in the tree that can. That is the
+same class three A2-3 reviews each found independently — a guarantee no test
+could red — caught here in a test rather than in the code.
+
+**NOTHING IN THIS WAVE IS UNBUILT.** `DownloadCommittedIds`, the call site, the
+apply rule and the hoisted destructor drain are all outside `#ifdef
+VLLM_CPP_CUDA` and are compiled and exercised on the CPU build. What the CPU
+tier cannot show is asynchrony: `Copy` is a memcpy, `CreateQueue` returns the
+main queue's null handle and every event call is a no-op, so the download gates
+its sizing, its staging retain rule and the ids it returns, and NOT that the copy
+ran off the main stream.
+
+**NO THROUGHPUT RESULT IS CLAIMED, AND NONE MAY BE.** G4 reads 96.01% GPU busy
+and the stop condition above stands as amended: A2-4 lands for its structural
+value and to unblock A2-5, exactly as A2-3 did. The download this wave adds is
+`num_reqs` int64s per spec decode step under `spec_on()` and is not measured
+here.
+
+**THE STOP CONDITION WAS AMENDED WITH THIS WAVE, NOT BY IT.** The operator
+amended `## Stop conditions` on 2026-09-06 and the decision is recorded there
+with its basis (#3004). In short: G4's 96.01% / 96.53% reading refuted async as
+a SUFFICIENT fix, and the clause "the throughput ceiling is zero" overstated it.
+The decomposition of the same trace ranks idle first at 3.99%, ahead of non-GEMM
+kernel time at 3.46% and GEMM rate at 2.61%, for a 10.06% ceiling against an
+11.1% gap; the missing point is #2964's. So A2-4 contributes and is not
+sufficient on its own, it claims nothing, and A2-5 remains gated on its own
+G3/G4 evidence. The original stop-condition text and its G4 reasoning are kept
+in place, because the reading is correct and only the conclusion changed.
+
+A2-5 is the next wave. What it is now blocked on is no longer the residency
+refusal, which is gone; it is the three `## Owed` entries above — the flip
+itself, the device accept-count read with the correction's move past the launch,
+and the device-resident token row.

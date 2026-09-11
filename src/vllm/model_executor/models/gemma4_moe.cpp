@@ -1640,6 +1640,19 @@ Gemma4MoeScratch RunGemma4Moe(vt::Queue& q, const Gemma4MoeLayerWeights& moe,
           ExpertGeGLUFp8Native(d, ysum, xin.t(), fex.dev_fp8_gu, fex.dev_s_gu, fex.dev_fp8_dn,
                                fex.dev_s_dn, I, H, esc, ww, beta);
           fused_mix = true;
+        } else {
+          // Native FP8 device arm unavailable — fall back to host BF16 dequant,
+          // exactly as the !fp8_native sibling below.  Without this else the
+          // expert is skipped and `y` is never written, so the accumulator gets
+          // whatever the TLS scratch held (zero under TSan, garbage otherwise).
+          EnsureGemma4Fp8ExpertCached(fex, I, H);
+          if (!fex.cached_gu.empty() && !fex.cached_dn.empty()) {
+            ExpertGeGLUHost(d, y, xin.t(), fex.cached_gu.data(), fex.cached_dn.data(), I, H, esc,
+                            &fex);
+          } else {
+            DequantGemma4Fp8ExpertToBf16Ephemeral(fex, I, H, gu_tmp.data(), dn_tmp.data());
+            ExpertGeGLUHost(d, y, xin.t(), gu_tmp.data(), dn_tmp.data(), I, H, esc, &fex);
+          }
         }
       } else if (need_peer_sc && gu_sc && dn_sc) {
         if (PeerCopyGemma4ExpertSlice(ex.dev_id, ex.gate_up_dev, ex.down_dev, e, I, H,

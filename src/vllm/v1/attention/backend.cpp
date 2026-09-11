@@ -2,6 +2,8 @@
 // (get_kv_cache_shape from vllm/v1/attention/backends/flash_attn.py @ e24d1b24 —
 // deliberately NOT re-anchored; see the divergence note at the top of backend.h)
 #include "vllm/v1/attention/backend.h"
+#include <optional>
+#include "vllm/model_executor/layers/attention/attention.h"
 
 #include <algorithm>
 #include <memory>
@@ -327,9 +329,15 @@ void TritonMLAImpl::forward_mqa(const AttentionLayer& layer, const vt::Tensor& q
   // i.e. the inclusive left distance is `sliding_window - 1` — the same pair
   // upstream hands FlashAttention on the prefill half (`:300`). 0 leaves this
   // `std::nullopt`, which is the full-context loop the op already had.
-  if (sliding_window > 0) {
-    args.window_size = vt::AttentionWindow{static_cast<int32_t>(sliding_window - 1), 0};
-  }
+  // ENG-ATTENTION-WINDOW W2 (#2388): through the SHARED resolver, like the five
+  // model sites W1 moved and for the same reason -- one window rule, one place.
+  // The `> 0` guard becomes the optional the resolver takes, so the VALUE is
+  // unchanged; what is added is the `[1, INT32_MAX]` refusal and obedience to
+  // `--disable-sliding-window`, which this site silently ignored after W3.
+  args.window_size = vllm::ResolveAttentionWindow(
+      /*per_layer=*/std::nullopt,
+      sliding_window > 0 ? std::optional<int64_t>(sliding_window) : std::nullopt,
+      vllm::v1::AttentionType::kDecoder, vllm::DisableSlidingWindowActive());
   // dots3-note's SPARSE decode (#699 W4b-3c): the DSA selection, when the step
   // carries one. Upstream expresses this as a different IMPL
   // (`Dots3NotePaddedSparseImpl.forward_mqa`, attention.py:744-815 @

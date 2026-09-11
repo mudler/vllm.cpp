@@ -1,0 +1,29 @@
+{
+  "name": "ambient-device-v2",
+  "argv": [
+    "flock",
+    "-n",
+    "-F",
+    "/home/vikash/gpu.lock",
+    "env",
+    "HIP_VISIBLE_DEVICES=0,1",
+    "ROCR_VISIBLE_DEVICES=0,1",
+    "VT_ROCM_GATHER_REQUIRE_TWO_DEVICES=1",
+    "TMPDIR=/home/vikash/.cache/rdna3-gather-impl/tmp",
+    "timeout",
+    "180s",
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/tests/test_rocm_embedding_quant",
+    "--test-case=ROCm gather follows the queue device when the ambient device differs",
+    "--abort-after=1"
+  ],
+  "exit_code": 0,
+  "elapsed_seconds": 0.5165746212005615,
+  "manifest_sha256": "2928aa6cbc417a3993c86481cbdd6c3ba4e35072bbf703212976344bda57fed0",
+  "log_sha256": "38fec7edbc44a0e557538088a130e98da012892fdec43f29234989d35718209e",
+  "all_101_manifest_inputs_verified_before_after": true,
+  "core_dumps_disabled": true,
+  "summary": [
+    "[doctest] test cases:  1 |  1 passed | 0 failed | 8 skipped",
+    "[doctest] assertions: 16 | 16 passed | 0 failed |"
+  ]
+}

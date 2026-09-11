@@ -465,6 +465,48 @@ inline constexpr char kLtx2RetakeFrameRateExtra[] = "retake_frame_rate";
 inline constexpr char kLtx2RegenerateVideoExtra[] = "regenerate_video";
 inline constexpr char kLtx2RegenerateAudioExtra[] = "regenerate_audio";
 
+// ── IC-LoRA REFERENCE CONDITIONING. Row LTX25-IC-LORA-REF-VIDEO (#3020) ─────
+//
+// Read ONLY on an engine whose recipe declares `ic_lora_reference`, which is
+// `pipeline_kind = ic_lora` alone. `ICLoraPipeline` is a pipeline CLASS upstream
+// (ic_lora.py:60) and no other pipeline in `ltx-pipelines` calls
+// `append_ic_lora_reference_video_conditionings`, so serving the arm elsewhere
+// would be inventing conditioning the reference does not have.
+//
+// The reference CLIP itself is `VideoGenParams::ref_video_dir` — a directory of
+// `frame_%06d.ppm`, this ABI's standing spelling for a video, because no demuxer
+// is vendored here. Upstream reads a container (`decode_video_by_frame`,
+// iclora_utils.py:141) and its folder arm is the adaptation row LTX25-RETAKE
+// already recorded.
+
+// The STRENGTH half of `--video-conditioning PATH STRENGTH`
+// (ic_lora.py:416-425), which becomes `VideoConditionByReferenceLatent.strength`
+// (iclora_utils.py:166) and therefore the reference tokens' denoise mask
+// `1 - strength`. Default 1.0. Upstream's flag is REQUIRED and takes both halves
+// together; here the path is a request field that already exists, so only the
+// strength needs a name.
+inline constexpr char kLtx2RefVideoStrengthExtra[] = "ref_video_strength";
+
+// The MASK_PATH half of `--conditioning-attention-mask MASK_PATH STRENGTH`
+// (ic_lora.py:427-441), as a directory of `frame_%06d.ppm` for the reason above.
+// Upstream loads it at the STAGE-1 resolution (`args.height // 2`, `:460-461`);
+// this engine reads it at the stage's own grid, which is the same number derived
+// rather than assumed.
+inline constexpr char kLtx2CondAttentionMaskDirExtra[] = "conditioning_attention_mask_dir";
+
+// Its STRENGTH half (`:454-455`), multiplied into the downsampled mask
+// (iclora_utils.py:156). Default 1.0, and refused outside [0, 1] exactly as
+// `ICLoraPipeline.__call__` refuses it.
+//
+// A STRENGTH BELOW 1 WITHOUT A MASK IS REFUSED BY NAME, and that is a mirror
+// rather than a limitation. Upstream's scalar-only arm (`iclora_utils.py:157-158`)
+// cannot be reached from the CLI: `conditioning_attention_strength` is assigned
+// only inside `if args.conditioning_attention_mask is not None`
+// (ic_lora.py:452-455) and is 1.0 otherwise, so a sub-1.0 strength always
+// arrives with a mask. It is a Python-API-only branch, MEASURED as such by
+// `kLtx2RefWrapScalarBelowOne`, and it is recorded owed rather than guessed at.
+inline constexpr char kLtx2CondAttentionStrengthExtra[] = "conditioning_attention_strength";
+
 // ── TEXT-TO-AUDIO. Row LTX25-T2A-ONE-STAGE (#1005) ─────────────────────────
 //
 // These are read ONLY on a `pipeline_kind = t2a_one_stage` engine — that is a
@@ -631,6 +673,34 @@ struct Ltx2ConditioningTrace {
   // upstream logs the same two numbers at blocks.py:881-888.
   double duration_seconds = 0.0;
   int64_t duration_frames = 0;
+  // ── AND THE HEAD'S TWO WIDTHS (A24 wave 6, row LTX25-A24-DURATION-HEAD-BF16,
+  //    issue #2955) ──────────────────────────────────────────────────────────
+  //
+  // STORAGE and ARITHMETIC are DIFFERENT CLAIMS and they get different fields,
+  // because wave 5 of this gap failed review for gating one while claiming the
+  // other. Neither is inferable from the two numbers above: a frame count is an
+  // integer either arm can produce, and `duration_seconds` is one scalar.
+  //
+  // STORAGE — `Ltx2VaeWeights::Bytes()` over the resident bag, beside how many
+  // parameters it holds. The RATIO is the claim (2 on this arm, 4 on the f32
+  // one), so no byte count is quoted anywhere. Recorded per render like the two
+  // upsampler bags above, and 0/0 when the engine loaded no head.
+  int64_t duration_head_weight_bytes = 0, duration_head_weight_elems = 0;
+  // ARITHMETIC — how many values the head PRODUCED that could not have come out
+  // of a bf16 store, out of how many it produced. Zero on this arm because every
+  // store point rounds; essentially the whole population on the f32 one. It is
+  // the instrument on THIS path, which has no other way to see a dtype that is
+  // too wide, and `duration_head_values` is the control that says it looked at
+  // anything: a counter that ran over nothing also reports zero. Both are 0 when
+  // no auto duration was resolved, which is every request that named its own
+  // count.
+  //
+  // It is NOT the only instrument on the claim, and reading it as one overstates
+  // it. Each count is taken after its own store has run, so it sees a store
+  // point told the wrong arm and not a store point that is missing — deleting
+  // one leaves this at zero. The head's bit-exact goldens and the assertion that
+  // the returned seconds survive a bf16 round trip cover that half.
+  int64_t duration_head_not_bf16 = 0, duration_head_values = 0;
   // True when the text tower encoded the request's own prompt; false when the
   // conditioning came from `prompt_embeds_path`.
   bool from_prompt = false;
@@ -1043,6 +1113,37 @@ struct Ltx2ConditioningTrace {
   // the right size and the right token count.
   uint64_t retake_latent_digest = 0;
   double retake_latent_absmax = 0.0;
+
+  // ── IC-LoRA REFERENCE VIDEO and its ATTENTION MASK ────────────────────────
+  //    (row LTX25-IC-LORA-REF-VIDEO, #3020 — gaps A15 and A16)
+  //
+  // Observed for the reason the retake block above is: the whole mechanism is
+  // APPENDED TOKENS plus an attention BIAS, and neither is visible in a frame
+  // count, an output resolution or a finished clip. A build that read the
+  // reference clip, encoded it, and then appended nothing renders a video of
+  // exactly the right length with exactly the right soundtrack.
+  //
+  // `ic_lora_reference_tokens` is how many tokens the reference item appended,
+  // measured as the sequence GROWTH across the item rather than recomputed from
+  // the latent shape — a count derived from the shape would agree with itself on
+  // a build that computed the shape and appended nothing.
+  int64_t ic_lora_reference_tokens = 0;
+  // The encoded reference latent, before any denoising. The lower bound a token
+  // count cannot make: a zeroed latent has the right size and the right count.
+  uint64_t ic_lora_reference_digest = 0;
+  double ic_lora_reference_absmax = 0.0;
+  // The self-attention STRENGTH mask actually handed to the DiT, and NOT the one
+  // that was built. `rows` is `Ltx2ModalityInput::attention_mask_rows` at the
+  // forward — 0 when no mask was handed over — so a build that constructed the
+  // mask and then dropped the pointer is separated from one that passed it.
+  //
+  // `min` and `max` are both recorded because an ALL-ONES mask is the identity:
+  // it renders correctly, it has the right shape, and it is exactly what a
+  // downsample that lost its values produces. A mask whose min equals its max is
+  // not attenuating anything.
+  int64_t ic_lora_attention_mask_rows = 0;
+  double ic_lora_attention_mask_min = 0.0;
+  double ic_lora_attention_mask_max = 0.0;
 
   // ── THE SAMPLER (row LTX25-RES2S-LOOP, #921) ──────────────────────────────
   //

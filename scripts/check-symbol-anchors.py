@@ -70,6 +70,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import issue_records
+
 
 ROOT = Path(__file__).resolve().parents[1]
 UPSTREAM_SYNC = ROOT / ".agents/upstream-sync.md"
@@ -95,13 +97,16 @@ SCAN_SUFFIXES = {
     ".md", ".cpp", ".cc", ".h", ".hpp", ".cu", ".cuh", ".py", ".sh", ".yml", ".txt",
 }
 
-# Skipped by PREFIX, and counted so the skip is visible rather than silent.
+# Skipped historical sources, counted so the skip is visible rather than silent.
 #
 # `.agents/completed/` is the frozen archive: AGENTS.md `## Records` says moved
 # detail keeps its provenance, and rewriting an archived citation would forge
 # what a past session wrote. `.agents/issue-index.md` is append-only by rule --
 # a row there may never be edited -- so a stale anchor inside one is unrepairable
-# by construction and gating it would be a gate nobody may satisfy.
+# by construction and gating it would be a gate nobody may satisfy. Migrated
+# canonical issue records with `Availability: METADATA_ONLY` preserve the same
+# frozen archive text. Their citations describe the historical tree, not live
+# symbol assertions. Full local issue records remain part of the live scan.
 FROZEN_PREFIXES = (".agents/completed/",)
 FROZEN_FILES = (".agents/issue-index.md",)
 
@@ -251,6 +256,17 @@ def contains_symbol(body: str, symbol: str) -> bool:
     return re.search(pattern, body) is not None
 
 
+def is_metadata_only_issue_record(rel: str, text: str) -> bool:
+    path = Path(rel)
+    if len(path.parts) != 4 or path.parts[:2] != (".agents", "issues"):
+        return False
+    try:
+        record = issue_records.parse_issue_text(text)
+    except issue_records.IssueRecordError:
+        return False
+    return path.name == f"{record.id}.md" and record.availability == "METADATA_ONLY"
+
+
 def collect(root: Path, counts: Counts) -> list[Citation]:
     found: list[Citation] = []
     for rel in tracked_files(root):
@@ -260,8 +276,11 @@ def collect(root: Path, counts: Counts) -> list[Citation]:
         path = root / rel
         if path.suffix not in SCAN_SUFFIXES or not path.is_file():
             continue
-        counts.scanned_files += 1
         text = path.read_text(encoding="utf-8", errors="replace")
+        if is_metadata_only_issue_record(rel, text):
+            counts.frozen_files += 1
+            continue
+        counts.scanned_files += 1
         if "::" not in text:
             continue
         for number, line in enumerate(text.splitlines(), 1):

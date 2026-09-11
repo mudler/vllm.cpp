@@ -285,7 +285,7 @@ window.
 
 ## Owed
 
-* [#1316](https://github.com/mudler/vllm.cpp/issues/1316) -- `main-baseline.py`
+* ISSUE-GH-1316 -- `main-baseline.py`
   renders a run that executed zero jobs as `RED` with all 11 jobs `missing`,
   which is a verdict about a tree the run never checked out. Found while reading
   the two evicted runs; it is fail-closed, so it is filed rather than folded in,

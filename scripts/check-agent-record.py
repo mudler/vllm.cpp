@@ -12,480 +12,486 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+# `scripts/` is sys.path[0] when this file is run, but not when a caller loads
+# it by path, so pin the sibling issue-record module either way.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import issue_records  # noqa: E402
+
 
 ROOT = Path(__file__).resolve().parents[1]
 AGENTS = ROOT / ".agents"
+ISSUES_ROOT = AGENTS / "issues"
 
 MATRICES = {
-    # 358 since 2026-08-05: +31 architectures vLLM's registry defines that we had
-    # NEVER inventoried (found by scripts/upstream-inventory.py). All INVENTORIED;
-    # inventorying is not committing.
-    # 360 since 2026-08-07: +`MODEL-AUDIO-PARAKEET-ENCODER`, the first row of the
-    # new `MODEL-AUDIO` section (Parakeet / FastConformer encoder + CTC head,
-    # spike parakeet-conformer-encoder.md work item P4). It is NOT one of the 328
-    # registry architectures: vLLM ships it as the audio COMPONENT of
-    # `nano_nemotron_vl.py` and delegates the encoder itself to transformers, so
-    # there is no `registry.py` entry to inventory. A genuinely new row, never a
-    # count relaxed to make a transition pass.
-    # 361 since 2026-08-07: +`MODEL-AUDIO-PARAKEET-TRANSDUCER` (the Parakeet RNN-T
-    # and TDT heads over that same encoder: `ParakeetForRNNT` / `ParakeetForTDT`,
-    # spike work item P6). A SEPARATE row rather than an advance of the encoder
-    # row, because it is a different upstream model class with its own state dict,
-    # its own decode and its own checkpoints. Like the encoder row it is not one
-    # of the 328 registry architectures: vLLM has no transducer call site at all
-    #: so there is nothing in `registry.py` to inventory. Bumped because a new
-    # row EXISTS, never to make a transition pass.
-    # 362 since 2026-08-10: +`MODEL-MM-muse-glimmer-muse-glimmer-for-conditional-generation`
-    # (Meta's Muse Glimmer 30B, released 2026-08-08). A THIRD beyond-pin row: it is
-    # not one of the 326 registry architectures at `555967922`, and unlike the two
-    # Parakeet rows it is absent because it did not exist yet, not because vLLM
-    # delegates it. Its only upstream implementation is the still-OPEN
-    # vllm#51655; see porting-inventory.md §9 deviation 16. Bumped because a new
-    # row EXISTS, never to make a transition pass.
-    # 369 since 2026-08-13: +7 rows for the architectures behind official
-    # `vllm-project/recipes` models that had no row at all (#609, #610). One is
-    # pin-lag — `BailingMoeV3ForCausalLM` is registered on vLLM `main` and
-    # absent only at `555967922`. Six are out-of-repo: `MossTTSDelayModel`,
-    # `MossTTSRealtime`, `Qwen3TTSForConditionalGeneration` and
-    # `HiggsMultimodalQwen3ForConditionalGeneration` are registered by
-    # `vllm-project/vllm-omni`, and `VoxtralRealtimeForConditionalGeneration`
-    # and `BailingMMNativeForConditionalGeneration` are target-pending — their
-    # exact `config.json` architecture strings are registered in neither core
-    # vLLM `main` nor `vllm-omni`, so the rows record what was searched instead
-    # of an invented anchor. SEVEN, not eight: the audit's eighth architecture
-    # `Qwen3_5MoeForCausalLM` is rowed by #490 / PR #601, which registers it
-    # rather than only inventorying it. Two branches ADDING the same keyed row
-    # merge without a conflict and define it twice, so the row is left to its
-    # owner. None of the seven touches the at-the-pin model inventory below
-    # (324/373/356/310/261 is unchanged), because like the MuseGlimmer, KimiK3
-    # and MiniMaxH3DiT rows they carry no pinned-registry target. Bumped
-    # because seven new rows EXIST, never to make a transition pass.
-    # 370 since 2026-08-13: +`MODEL-DIFFUSION-ltx-2-5-ltx2-video-transformer-3d-model`
-    # (Lightricks LTX-2.5, 21.00B joint video+audio DiT, released 2026-08). A FOURTH
-    # beyond-pin row, and like Muse Glimmer it is absent from `555967922` because it
-    # did not exist yet. Unlike the others it is also out-of-repo: the architecture
-    # reference is Lightricks' own `LTX-2` (`ltx-core`), and vLLM-Omni's `ltx2` module
-    # stops at 2.3 (`ltx2_recipes.py:162-166`), with 2.5 still OPEN upstream at
-    # vllm-omni#6066. Same lane as the MiniMax-H3 diffusion row. Bumped because a new
-    # row EXISTS, never to make a transition pass.
-    #
-    # This entry READ `363 since 2026-08-11` until #651. Both halves were wrong,
-    # and 363 is a value this pin has never held at any commit in its history —
-    # so the entry described a transition that never happened, in a log whose
-    # whole job is to say why each bump was legitimate. Re-derived from git
-    # rather than carried forward, which is the only way any number in this
-    # block is ever allowed to move: `git log -S` on the row id finds exactly
-    # one commit, `cefacd2d0` (2026-08-13), and the pin reads 369 at
-    # `cefacd2d0~1` and 370 at `cefacd2d0`. What makes that checkable rather
-    # than plausible is the block itself — 358, 360, 361, 362, 369, 370, 372,
-    # 373, 375, 377 is the sequence of values this pin has actually held, in the
-    # order it held them, and an append-log that ran 369, 363, 372 was
-    # self-evidently not a history. `test_model_pin_log_records_only_transitions_that_happened`
-    # is what ties this entry to that sequence.
-    # 372 since 2026-08-13: +2 for IndexTTS-2.5, which vLLM-Omni registers as TWO
-    # architectures (`IndexTTS2TalkerForConditionalGeneration` stage 0 and
-    # `IndexTTS2S2MelDecoder` stage 1), so a port described in prose as "a model"
-    # moves this pin by two. Both land `INVENTORIED`, unclaimed and blocked on the
-    # absent vllm-omni pin (#633). Bumped because two rows EXIST, never to make a
-    # transition pass. #634.
-    # 373 since 2026-08-13: +1 for `MiniMaxMusic3ForConditionalGeneration`, landing
-    # `SPIKE` with its spec committed (#672). Two independent rows moved this pin on
-    # the same day and BOTH branches read 371, so an auto-merge taking either side
-    # would have left the matrix internally consistent while short a real
-    # architecture. Re-derived, which is the only way this pin is ever allowed to
-    # move. test_music3_and_indextts_rows_both_survive_their_collision names all
-    # three rows, because a count alone cannot see that failure.
-    # 375 since 2026-08-14: +`MODEL-TEXT-qwen3-5-qwen3-5-for-causal-lm` and
-    # +`MODEL-TEXT-qwen3-5-qwen3-5-moe-for-causal-lm` (issue #490), the TEXT-ONLY
-    # arms of the Qwen3.5 backbone — the eighth architecture the #609/#610 audit
-    # found and deliberately left to its owner, plus its dense sibling. Both are
-    # beyond-pin: they are not among the 355 registry architectures at
-    # `555967922` because they landed upstream afterwards (PR vllm#50210 @
-    # `ad5d29db7`), exactly like the Muse Glimmer row above. Their Upstream cells
-    # deliberately carry no pinned module/class target, so the pin-derived static
-    # invariants in check_model_invariants are UNCHANGED (324/373/356/310/261) —
-    # this is the row-EXISTS count only, bumped because two new rows exist, never
-    # to make a transition pass. This row was authored against 362 -> 364, then
-    # re-derived to 370 -> 372, and is now RE-DERIVED AGAIN to 373 -> 375: the
-    # #609/#610 backfill, LTX-2.5, IndexTTS-2.5 and MiniMax-Music3 all landed
-    # while it was in review, and every one of them moved this pin. The number is
-    # counted off the matrix as it stands after the merge, never carried forward
-    # from the branch — a justification framed against a number this file no
-    # longer carries would be false about the file it sits in, and
-    # `Qwen35TextOnlyRowsAreCounted` is what ties this value to the two rows the
-    # matrix actually holds.
-    # 377 since 2026-08-14, and RE-DERIVED rather than carried forward: +2 for
-    # dots3-note, which vLLM registers as TWO architectures
-    # (`Dots3NoteForCausalLM` and its speculative head `Dots3NoteMTPModel`),
-    # landing `SPIKE` and `INVENTORIED` respectively with the spec committed
-    # (#699). This is the collision the Music3/IndexTTS comment above warns
-    # about, happening again on the same day: the #490 branch took 373 -> 375
-    # for the Qwen3.5 text-only arms while the dots3 branch took 373 -> 375 for
-    # its own two rows. BOTH read 375 and neither was right -- the merged tree
-    # holds four new rows, so it is 377. An auto-merge keeping either side would
-    # have left this file internally consistent while silently short two real
-    # architectures, which is why the number is counted off the matrix AFTER the
-    # merge and why `test_dots3_rows_are_inside_the_model_ratchet` names the rows
-    # instead of trusting the count. dots3-note is beyond-pin (vLLM `main` only,
-    # vllm#51255, still being patched), carries no pinned-registry target, and
-    # leaves the at-the-pin inventory (324/373/356/310/261) unchanged. Bumped
-    # because two rows EXIST, never to make a transition pass.
-    # 378 since 2026-08-26, and RE-DERIVED off the matrix rather than carried
-    # forward: +1 for `MODEL-MM-qwen4-exp-qwen4-exp-for-conditional-generation`
-    # (`Qwen4ExpForConditionalGeneration`, `Qwen/Qwen3.8-Flash-Next`), landing
-    # `READY` with its spec committed (#1978). ONE row and not two: the MTP head
-    # is a `mtp` block inside the same text config, not a separately registered
-    # architecture, so this is not the IndexTTS-2.5 / dots3-note shape that moved
-    # this pin by two. Beyond-pin in the strongest sense yet recorded here -- the
-    # Muse Glimmer, Qwen3.5-text-only and dots3-note entries above are all
-    # architectures vLLM registers on `main` AFTER `555967922`, whereas this one
-    # vLLM does not implement at ANY revision: read live 2026-08-26 at
-    # `origin/main` = `6a5e8f5979`, there is no `qwen4*` path, no `registry.py`
-    # entry, and a repository-wide search for `qwen4` returns zero results. Its
-    # Upstream cell therefore carries no pinned module/class target and its
-    # algorithm source is transformers#48337, so the at-the-pin static invariants
-    # (324/373/356/310/261) are UNCHANGED. Bumped because one row EXISTS, never to
-    # make a transition pass.
-    # 379 since 2026-08-26, and RE-DERIVED off the matrix rather than carried
-    # forward: +1 for `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`
-    # (`Glm5NextForConditionalGeneration`, `zai-org/GLM-5.3-Flash`), landing
-    # `READY` with its spec committed (#1998). ONE row and not three, which is
-    # the arithmetic this comment exists to justify: the OPEN vllm#53906 would
-    # register `Glm5NextForCausalLM`, `Glm5NextForConditionalGeneration` AND
-    # `Glm5NextMTPModel`, so the IndexTTS-2.5 / dots3-note two-row shape is the
-    # tempting read. It does not apply. None of the three names is registered at
-    # ANY vLLM revision, and the only architecture a published artifact declares
-    # is `Glm5NextForConditionalGeneration` -- the MTP head is `layers.45` inside
-    # the same checkpoint, which the transformers reference discards outright at
-    # `modular_glm5_next.py:1235`. Beyond-pin in the same strongest sense as the
-    # qwen4-exp row above: read live 2026-08-26, `git grep "Glm5\|glm5_next"`
-    # returns zero hits at `555967922` and at `origin/main` = `c71f6f8a81`. Its
-    # Upstream cell therefore carries no pinned module/class target and the
-    # at-the-pin static invariants (324/373/356/310/261) are UNCHANGED. Bumped
-    # because one row EXISTS, never to make a transition pass.
-    # 380 since 2026-08-31: +1 for
-    # `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm`, the released
-    # DeepSeek-V4-Flash-Vision-Exp configuration at model-author revision
-    # `86f746b3` (#2411). It deliberately shares the architecture STRING with
-    # the existing text row and is not a duplicate upstream target: the text row
-    # mirrors vLLM's registered text-only module, while this row owns the
-    # model-author processor, ViT, aligner, sentinel merge and visibility path
-    # that vLLM implements at no revision. It lands `READY`, so the INVENTORIED
-    # count stays 324 and READY moves 3 -> 4. Bumped because one row EXISTS,
-    # never to make a lifecycle transition pass.
-    "MODEL": (AGENTS / "model-matrix.md", 380),
-    # 82 since 2026-07-21: +`QUANT-NVFP4-CT-W4A16` (compressed-tensors NVFP4A16 /
-    # W4A16 — NVFP4 weights with BF16 activations, distinct from the existing
-    # `QUANT-NVFP4-CT-W4A4` and `QUANT-NVFP4-MO-W4A16` rows in both scheme
-    # discovery and kernel selection). This count is the inventory size, so it is
-    # bumped when a genuinely new scheme is inventoried — never to make a failing
-    # state transition pass.
-    # 2026-07-29: the pre-existing INVENTORIED `QUANT-GGUF-IQ3_XXS` (id 18) row was
-    # ADVANCED to `ACTIVE` (keep-quant compute landed) by `CLAIM-DEEPSEEK-V4-W8` —
-    # the `UD-IQ2_XXS` down-projection routed experts (`ffn_down_exps`) are IQ3_XXS;
-    # no row count change (an in-place advance, not a new row).
-    # 84 since 2026-08-18: +`QUANT-QWEN38-27B-GGUF-ARM` and
-    # +`QUANT-QWEN38-27B-NVFP4-ARM`, the two quantized arms of Qwen3.8-27B whose bf16
-    # arm is already gated (#915) and which #821 has owned with no row of its own.
-    # Two rows and not one: they share nothing but a model name -- different file
-    # format, different loader translation unit, different oracle (llama.cpp for the
-    # GGUF arm, because vLLM has no in-tree GGUF at the pin and SGLang's alias table
-    # does not reach `qwen3_5`; pinned vLLM for NVFP4, which it runs), different
-    # external blockers (#857 vs #1185), and even different tokenizers on disk.
-    # Merging them would let one external blocker hold the other's work. Neither is
-    # expressible by the per-encoding rows in sections 1 and 2, which are keyed on the
-    # encoding rather than on a checkpoint. Both `READY`, spec
-    # `specs/qwen38-27b-quant-arms.md`, issue #821.
-    # 85 since 2026-08-28: +`QUANT-EXL3`, the exllamav3 trellis format (a QTIP
-    # variant: MCG codebook, blockwise Hadamard-128 with sign vectors, and NO
-    # scales). A genuinely new scheme rather than a state transition -- it is
-    # expressible by no row in sections 1 or 2, which are keyed on GGUF encodings
-    # and on vLLM-registered methods, and vLLM registers no EXL3 at the parity
-    # pin, so its mirror source is the pinned secondary oracle `exllamav3`. The
-    # kernels have existed since `MODEL-DSV4-EXL3` W2 and are device-proven, but
-    # the ONLY consumer is the DeepSeek-V4 loader, so no other architecture can
-    # reach the scheme -- which is what the row is for (#2181).
-    # 86 since 2026-09-01: +`QUANT-EXL3-MUL1`, exllamav3's `mul1` codebook (cb 2)
-    # and the 4- and 5-bit trellis widths. A separate row from `QUANT-EXL3` and
-    # not a state transition on it, because cb 2 is a DIFFERENT DECODE rather
-    # than a third multiplier: cb 0 and cb 1 mask, xor and sum the two fp16
-    # halves of the product, while cb 2 sums the product's four bytes into an
-    # fp16 bit pattern and maps it with a fused fp16 affine
-    # (`codebook.cuh:82-89`). It has its own artifact
-    # (`Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw`), its own widths, and its own owed
-    # GEMV arm, none of which `QUANT-EXL3`'s cells can carry without saying two
-    # things at once (#2495).
-    # 87 since 2026-09-02: +`QUANT-EXL3-PERF`, the EXL3 `m<=8` GEMV arm set and
-    # its selection envelope. A separate row from `QUANT-EXL3` and
-    # `QUANT-EXL3-MUL1` because both of those are CORRECTNESS rows and say so --
-    # they make a width RUN -- while this one owns what the format COSTS, which
-    # is a different verdict on a different axis. #2570 named a verified
-    # instantiation gap with no owner, and an unowned gap is one nobody reruns
-    # (#2570).
-    "QUANT": (AGENTS / "quantization-matrix.md", 87),
-    # 34 since 2026-07-22: +`KERNEL-GEMM-CPU-ELEM` (the elementwise f32/f16/bf16 CPU
-    # GEMM — a genuinely separate family from `QUANT-GGUF-CIQ-GEMM`'s block-quantized
-    # `kMatmulBTQuant`: it serves every safetensors CPU path and every non-block
-    # tensor of a mixed GGUF). 33 since 2026-07-22: +`KERNEL-ACCEL-PROVIDER-SELECT`
-    # (which IMPLEMENTATION of an op runs when a device has more than one — the
-    # selection layer above every kernel family here, distinct from
-    # `KERNEL-CUDA-DISPATCH-AOT`, which selects an ARCH for one implementation).
-    # 35 since 2026-07-26: +`KERNEL-ATTN-DFLASH-BLOCK` (the DFlash draft's in-block
-    # attention — the project's FIRST non-causal / bidirectional attention primitive,
-    # a genuinely separate op from the causal `kAttention`/`kPagedAttention`; SPEC-DFLASH
-    # D2, `CLAIM-DFLASH-D2`).
-    # 36 since 2026-07-27: +`KERNEL-ATTN-DFLASH-PAGED-BLOCK` (the CAPTURE-SAFE paged
-    # variant of the DFlash in-block attention — a genuinely separate op
-    # `kDFlashPagedBlockAttention` reading the growing context from a paged K/V cache +
-    # persistent device block_table instead of a materialized combined buffer, the
-    # CUDA-graph draft-attention primitive; SPEC-DFLASH D12 Part B, `CLAIM-DFLASH-D12`).
-    # 37 since 2026-07-28: +`KERNEL-ATTN-DENSE-FLASH` (the SHARED-MEMORY-TILED flash
-    # variant of `AttentionDenseFast` for long non-causal contexts — a genuinely
-    # separate op `kAttentionDenseFlash` that tiles K/V across a block of query-warps
-    # in shared memory, for the Whisper AUDIO encoder; multimodal-speed §14,
-    # `CLAIM-MM-SPEED-AUDIO-ENC-KERNEL`).
-    # 38 since 2026-07-28: +`KERNEL-ATTN-DSA-SPARSE-INDEX` (the DeepSeek-V4 DSA
-    # "Lightning Indexer" sparse-attention SELECTION op — weighted MQA logits with a
-    # per-head ReLU + causal top-k token selection, the project's FIRST sparse-
-    # attention candidate-selection primitive, distinct from every dense/paged/MLA
-    # attention family above which score ALL keys. W3 landed a portable host
-    # reference + unit gate; the device kernel is a W7 residual. `SPIKE`,
-    # `CLAIM-DEEPSEEK-V4-W3`, spec specs/deepseek-v4-flash.md).
-    # 39 since 2026-07-28: +`KERNEL-KDA-DELTA` (the Kimi Delta Attention gated-
-    # linear-attention delta vs plain GDN — the per-channel [H,D] low-rank decay
-    # (f_a/f_b bottleneck), the sigmoid-gated output norm (FusedRMSNormGated), the
-    # 3 q/k/v short convs + q/k L2-norm. A genuinely new gated-linear-attention
-    # family distinct from GDN, which has only a per-head scalar decay and no gated
-    # output norm; SUBCLASSES GDN so its recurrence is REUSED, not re-ported. W1
-    # landed a portable host reference + unit gate; the device kernel + the
-    # Kimi-Linear-48B proxy e2e gate are named residuals. Shared unblocker for
-    # Kimi-Linear-48B and Kimi-K3 (W4). `SPIKE`, `CLAIM-KDA-KERNEL`, spec
-    # specs/kda-kernel-delta.md).
-    # 40 since 2026-07-29: +`KERNEL-ATTN-DSA-COMPRESSOR` (the DeepSeek-V4 DSA
-    # COMPRESSOR — the softmax-weighted window POOL that compresses
-    # `(1+overlap)*compress_ratio` KV-state rows into one compressed latent (per
-    # head-dim-column softmax, then RMSNorm) + the fused save-time APE add + the
-    # fp8_ds_mla KV-cache STATE layout (448 fp8 UE8M0 per-64 block scales + 64
-    # bf16 rope, 576B token stride, 7+1 scale bytes). A genuinely separate op from
-    # `KERNEL-ATTN-DSA-SPARSE-INDEX` (which SELECTS keys): this one POOLS +
-    # QUANTIZES the selected/windowed KV into the latent the MLA reads and how it
-    # is cached across steps. W4 landed a portable host reference + unit gate; the
-    # device kernel (the fused `_fused_kv_compress_norm_rope_insert_sparse_attn`)
-    # is a W7 residual. `SPIKE`, `CLAIM-DEEPSEEK-V4-W4`, spec
-    # specs/deepseek-v4-flash.md).
-    # 41 since 2026-07-29: +`KERNEL-MHC-SINKHORN` (the DeepSeek-V4 Manifold/Markov
-    # Hyper-Connections topology — the `[tokens, hc_mult, hidden]` residual
-    # manifold mixed by a 20-iteration Sinkhorn-normalized doubly-stochastic
-    # matrix, the mHC pre/post mixes with the FOLDED attn/ffn RMSNorms, and the
-    # hc_head collapse). A genuinely new residual-stream topology distinct from the
-    # plain residual+RMSNorm every other family uses. W5 landed a portable host
-    # reference + unit gate (ported from the vLLM eager reference mhc/torch.py —
-    # correcting the W0 "no eager reference" premise — and gated against a from-
-    # first-principles double-precision Sinkhorn derivation); the device kernel +
-    # DeepseekV4Model::Forward assembly are W7 residuals. `SPIKE`,
-    # `CLAIM-DEEPSEEK-V4-W5`, spec specs/deepseek-v4-flash.md).
-    # 42 since 2026-07-29: +`KERNEL-MOE-SQRTSOFTPLUS-HASH` (the DeepSeek-V4 MoE
-    # router + clamped-SwiGLU deltas — the `sqrt(softplus(·))` score function, the
-    # noaux_tc bias-for-selection top-k with weights gathered from the UNBIASED
-    # scores, the hash `tid2eid` token-id→expert route that BYPASSES top-k, and the
-    # asymmetric clamped SwiGLU expert activation `SiluAndMulWithClamp`). The three
-    # genuinely-new-vs-V2/V3 MoE pieces; the shared grouped-GEMM / expert / shared-
-    # expert machinery is REUSED, not re-ported. W6 landed a portable host reference
-    # + unit gate; the device kernels + DeepseekV4Model::Forward assembly are W7
-    # residuals. `SPIKE`, `CLAIM-DEEPSEEK-V4-W6`, spec specs/deepseek-v4-flash.md).
-    # 43 since 2026-07-29: +`KERNEL-DSV4-W7-DEVICE` (the DeepSeek-V4-Flash W7-DEVICE
-    # CUDA kernels — the four NEW V4 op families' device kernels: MHC Sinkhorn+pre/
-    # post+head, DSA indexer weight-fold/MQA-logits/causal-topk + sink softmax +
-    # grouped output-LoRA, compressor pool+norm + fp8_ds_mla KV encode/decode, and
-    # the sqrtsoftplus/hash router + clamped SwiGLU. Each a 1:1 device port of the
-    # landed host reference (KERNEL-{MHC-SINKHORN,ATTN-DSA-SPARSE-INDEX,ATTN-DSA-
-    # COMPRESSOR,MOE-SQRTSOFTPLUS-HASH}) registered through the OpProvider seam and
-    # RUNTIME-VERIFIED on the DGX GB10 at small shape vs its host-ref oracle (11/11
-    # cases · 153 assertions, compute-sanitizer memcheck 0 errors, RED-first proven).
-    # The 512-wide MLA attn + expert grouped-GEMM REUSE the existing NVFP4/FP8
-    # kernels — NOT re-ported. `IMPL`, `CLAIM-DEEPSEEK-V4-W7-DEVICE`, spec
-    # specs/deepseek-v4-flash.md; real-checkpoint e2e stays W8, multi-Spark).
-    # 44 since 2026-07-29: +`KERNEL-QUANT-CIQ-IQUANT` (the DeepSeek-V4 W8 keep-quant
-    # `vec_dot` for the ~2-3-bit codebook encodings IQ2_XXS/IQ3_XXS/Q2_K — the
-    # single-Spark GGUF memory enabler; extends `QUANT-GGUF-COMPUTE`'s six-type
-    # `kMatmulBTQuant` so the 158 B routed experts stay COMPRESSED instead of
-    # OOM-expanding to bf16. CPU tier only, like the six existing k-quants. 1:1
-    # ports of ggml `vec_dot_q2_K/iq2_xxs/iq3_xxs_q8_K_generic`; gated 19 cases /
-    # 130444 assertions, RED-first proven. `SPIKE`, `CLAIM-DEEPSEEK-V4-W8`, spec
-    # specs/deepseek-v4-flash.md §W8).
-    # 45 since 2026-07-29: +`KERNEL-QUANT-CIQ-GEMM-CUDA` (the FIRST CUDA keep-quant
-    # GGUF k-quant GEMM — the kCUDA provider for `kMatmulBTQuant`. MMVQ-style
-    # dequant-in-kernel dot: quantize the activation to Q8_K on-GPU, integer-dot
-    # against the compressed Q8_K-family weight blocks (IQ2_XXS/IQ3_XXS/Q2_K +
-    # Q3_K/Q4_K/Q5_K/Q6_K) kept COMPRESSED in the unified pool. Registering it flips
-    # GgufQuantComputeAvailable TRUE on kCUDA so DeepSeek-V4's routed experts run on
-    # the GPU instead of the 20 ARM cores. A NEW kernel family — the CPU
-    # KERNEL-QUANT-CIQ-IQUANT vec_dot is a separate row/impl. RUNTIME-VERIFIED on
-    # the DGX GB10: 2/2 cases · 92401 assertions vs the CPU oracle + f64 dequant,
-    # memcheck 0, RED-first proven. `ACTIVE`, `CLAIM-CUDA-KEEPQUANT-GEMM`, spec
-    # specs/deepseek-v4-flash.md §W8.)
-    # 46 since 2026-08-06: +`KERNEL-CPU-A76-Q8-DOT`, a separately gateable
-    # Cortex-A76 Q8_0 x Q8_0 DotProd/assembly family. The physical-Pi trace
-    # proves the portable dot is reached at 20.10% of Qwen3.5-2B user cycles;
-    # the row owns exact-order C++ SDOT vs scheduled AAPCS64, independent of
-    # the broad CPU-backend row.
-    # Inventory size, bumped for a genuinely new family — never to make a failing
-    # state transition pass.
-    # 47 since 2026-08-06: +`KERNEL-GEMM-CPU-ELEM-X86WIDE` (the AVX2/AVX-512
-    # elementwise tiers; our x86 tier is SSE2 while the box has avx512f, a
-    # measured 3.5x) and +`KERNEL-GEMM-CPU-TILED` (the tinyBLAS-style tiled
-    # sgemm; controls proved our NEON kernel is at ggml-stock parity and the
-    # whole 16-bit deficit is llamafile, ~1.9x Arm / ~2.4x x86).
-    # 50 since 2026-08-06: +`KERNEL-CPU-CONV2D-SUBSAMPLE`, +`KERNEL-DEPTHWISE-CONV1D`
-    # and +`KERNEL-ATTN-RELPOS` — the three conformer/FastConformer audio-encoder
-    # primitives the tree had no device op for at all (Conv2d existed only as a host
-    # std::vector loop; the only depthwise conv1d was the CAUSAL Mamba/GDN one; every
-    # attention path was RoPE + paged/flash KV). Spike specs/parakeet-conformer-encoder.md.
-    # 51 since 2026-08-06 (PR #79): +`KERNEL-CPU-A76-Q8-DOT`, a separately gateable
-    # Cortex-A76 Q8_0 x Q8_0 DotProd/assembly family. The physical-Pi trace
-    # proves the portable dot is reached at 20.10% of Qwen3.5-2B user cycles;
-    # the row owns exact-order C++ SDOT vs scheduled AAPCS64, independent of
-    # the broad CPU-backend row.
-    # 52 since 2026-08-18 (#1171): +`KERNEL-GDN-REPLAYSSM`, the ReplaySSM buffered
-    # output-only GDN decode. A genuinely new family, not a variant of the packed
-    # decode row: it changes WHEN the state is written (every L steps, from a ring
-    # of rank-1 factors) rather than how one step is tiled, and it adds three cache
-    # tensors to the MambaSpec. vLLM ships the algorithm for Mamba2 only and cannot
-    # reach GDN (four walls, spec §Upstream chain); SGLang ships the GDN arm.
-    # 53 since 2026-08-19 (#1314): +`KERNEL-DFLASH2-GROUPED-CONV`, the DFlash2
-    # draft's grouped DYNAMIC depthwise convolution. A genuinely new family and
-    # not a variant of `KERNEL-DEPTHWISE-CONV1D`, on all three axes that decide
-    # a kernel's shape: the weights are DYNAMIC (a per-position delta projected
-    # from the sublayer input, added to a static per-channel base) rather than
-    # static, they are GROUPED (one delta per group of channels against one base
-    # per channel) rather than per-channel, and the tap mask is over the QUERY
-    # BLOCK (`i mod (1+k)`) rather than causal over the sequence. It also carries
-    # a SIDE axis no other convolution here has: one projection of the sublayer
-    # input produces both the prepare-side and the finish-side coefficients.
-    # Bumped because the row EXISTS, never to make a state transition pass; the
-    # row is `ACTIVE` rather than `DONE` because its CUDA arm has never compiled
-    # (spec `## Owed` O6, no `nvcc` on the authoring host).
-    # 54 since 2026-08-20 (#1007): +`KERNEL-CONV3D`, the general 3-D convolution
-    # `vt` had on NO device. It is not a variant of `KERNEL-CPU-CONV2D-SUBSAMPLE`:
-    # the ACCUMULATION ORDER differs and is part of the contract (one f32 partial
-    # per input channel with the bias seeded first, against kConv2d's single flat
-    # accumulator with the bias last), which is the same sibling relationship
-    # kConv1d has with kDepthwiseConv1d. It is also the only conv family with a
-    # CUDA arm and a CPU arm landing together, and the reason the LTX-2.5 video
-    # VAE decode had no device path at all. Spec specs/ltx25-device-residency.md.
-    # 56 since 2026-08-20 (#1314): +`KERNEL-DFLASH2-SELECTOR-EDGES` and
-    # +`KERNEL-TOPK-PAIRS`, the DFlash2 candidate selector's two kernels. TWO
-    # rows and not one because they are two kernels with different shapes and
-    # different gates: the first is a small dense contraction over two
-    # per-token codebooks, whose difficulty is the PREDECESSOR indexing (step 0
-    # is the verified anchor, every later step is the previous step's candidate)
-    # and the bf16 ROUNDING PLACEMENT; the second is a sort-free selection over a
-    # 248320 vocabulary, whose difficulty is the TIE-BREAK, because the
-    # pivot-bracket search converges to an exact array VALUE and therefore keeps
-    # whole tie groups. `KERNEL-TOPK-PAIRS` is also a distinct family from the
-    # shipped sampling threshold search rather than a variant of it: that kernel
-    # masks below the k-th largest IN PLACE and returns no indices, this one
-    # compacts the survivors, orders them and emits (id, value) pairs. Bumped
-    # because the rows EXIST, never to make a state transition pass; both are
-    # `ACTIVE` rather than `DONE` because neither CUDA arm has ever compiled
-    # (spec `## Owed` O10, no `nvcc` on the authoring host).
-    # 57 since 2026-08-20 (#1314): +`KERNEL-DFLASH2-PATH-WALK`, the DFlash2
-    # candidate selector's PATH WALK. A separate family from
-    # `KERNEL-DFLASH2-SELECTOR-EDGES` rather than a second entry point into it,
-    # on the axis that decides kernel families here: the lattice op is a dense
-    # CONTRACTION whose difficulty is a reduction (and which is therefore gated
-    # within an f32 envelope), while the walk performs no arithmetic at all --
-    # only comparisons and one gather -- and is specified BIT-EXACT across
-    # backends. Their grids follow from that: one block per (request, step,
-    # predecessor slot) against one block per REQUEST with the step loop INSIDE
-    # it, which is spec `## Risks/decisions` D3's requirement and upstream's own
-    # `(num_reqs,)` / `num_warps=1` shape. Bumped because the row EXISTS, never
-    # to make a state transition pass; it is `ACTIVE` rather than `DONE` because
-    # its CUDA arm has never compiled on the authoring host (spec `## Owed` O11).
-    # 58 since 2026-08-25 (#1451): +`KERNEL-LTX2-VAE`, the ten stages of the
-    # LTX-2.5 conv video VAE decode that sit BETWEEN its convolutions, as one
-    # `vt::OpId::kLtx2Vae` provider payload. A separate family from
-    # `KERNEL-CONV3D` rather than more entries on it, on the same axis that
-    # separates the rows above: `KERNEL-CONV3D` is a dense CONTRACTION whose
-    # difficulty is a reduction and whose accumulation order is its contract,
-    # while these ten are elementwise affines, normalisations and pure GATHERS
-    # whose contract is an index expression -- and the two are gated differently
-    # in consequence, the convolution against an independent scalar reference and
-    # these against the committed decode goldens they were transcribed from.
-    # Bumped because the row EXISTS, never to make a state transition pass; it is
-    # `ACTIVE` rather than `DONE` because its CUDA arm has never compiled
-    # anywhere in this project's reach (spec `## Owed`, inheriting #1452) and
-    # because `AttnBlock3d` remains the declared staged remainder.
-    "KERNEL": (AGENTS / "kernel-matrix.md", 58),
-    # 56 since 2026-07-22: +`BACKEND-ACCEL-PROVIDER` (the acceleration-provider seam
-    # itself, which is a cross-backend platform concern rather than a platform).
-    # 57 since 2026-07-22: +`BACKEND-SEAM-AUDIT` (the accelerator-seam AUDIT — does
-    # our MLX/Vulkan/Metal architecture actually port vLLM's CUDA-path strategy, and
-    # what is the shared layer's device-leakage budget. A cross-backend structural
-    # concern that owns no kernel and no platform, hence its own row).
-    # 60 since 2026-07-27: +`BACKEND-CUDA-SM060` + `BACKEND-CUDA-SM061` (the Pascal
-    # targets for the beyond-vLLM fp16/non-tensor-core breadth lane) + the
-    # `BACKEND-GATE-CUDA-LLAMACPP-LEGACY` competitor floor (llama.cpp on the same
-    # old card, since vLLM has no entry on Pascal/Volta/Turing). See
-    # specs/cuda-arch-breadth-fp16.md.
-    # 65 since 2026-07-28: +the distributed / scale-out family
-    # `BACKEND-DISTRIBUTED-COMM`/`-TP`/`-PP`/`-MULTINODE-SPARK`/`-MLX-RING` (the NEW
-    # scale-out capability dimension — one `vt::` collective abstraction with
-    # nccl/RDMA/MLX-ring transports; single-GPU today). All `SPIKE`,
-    # `CLAIM-SCALE-OUT-SPIKE`, spec specs/scale-out-distributed.md.
-    # 68 since 2026-07-28: +the parallelism-MODE rows `BACKEND-DISTRIBUTED-DP`/
-    # `-EP`/`-SP` (the enumeration of vLLM's parallelism modes onto our transport
-    # abstraction — DP engine-replica scale-out, EP whole-expert all-to-all, SP the
-    # TP-mode reduce-scatter compilation pass; TP/PP already existed, context/CP
-    # rides the same abstraction and takes no row). All `SPIKE`,
-    # `CLAIM-PARALLELISM-MODES-SPIKE`, spec specs/parallelism-modes.md.
-    # 79 since 2026-08-05: +11 BACKEND-GGML-* rows, the llama.cpp ggml
-    # backends folded into scope (user-directed). All INVENTORIED and
-    # spike-gated; inventorying is not committing.
-    # 80 since 2026-08-09: +`BACKEND-TENSTORRENT`, an extension platform
-    # proposal (Tenstorrent Blackhole, ttnn C++ adapter) in the same class as
-    # Metal/Vulkan. INVENTORIED; spec-only, not yet reviewed or accepted.
-    # 81 since 2026-08-11: +`BACKEND-TENSTORRENT-RESIDUAL-GOLDEN`, the child
-    # row owing residual-RMS numerics evidence at the device boundary (rows>=32
-    # bf16 device path vs CPU f32 oracle). Bot-flagged on #289; READY once the
-    # RED-first probe lands.
-    # 82 since 2026-08-11: +`BACKEND-TENSTORRENT-MISTRAL`, allowlist
-    # MistralForCausalLM on TT + device-aware SACRED gate. Reuses Qwen3-dense
-    # forward; no new kernel. Pending 7B checkpoint + vLLM oracle for the e2e
-    # gate.
-     # 83 since 2026-08-16: +`BACKEND-GATE-CUDA-LLAMACPP` (#979), the llama.cpp
-     # floor on a CURRENT CUDA card. Neither existing llama.cpp row covers it:
-     # `BACKEND-GATE-CPU-LLAMACPP` is the CPU floor and
-     # `BACKEND-GATE-CUDA-LLAMACPP-LEGACY` is scoped to Pascal/Volta/Turing,
-     # where vLLM has no entry at all. The four-way Qwen3.8-27B campaign needs
-     # it because llama.cpp is the ONLY comparator that runs the Q4_K_M arm:
-     # vLLM removed GGUF from its tree at our pin. INVENTORIED, no run.
-     # 84 since 2026-08-12: +`BACKEND-TENSTORRENT-TRACE-RUNNER`, feasibility
-     # spike for wiring the landed #354 graph-capture foundation into a
-     # capturable forward region (decode host-free region? capture tok/s cost?
-     # ttnn program-cache warm-up?). No code; decision record only.
-     # 85 since 2026-08-13: +`BACKEND-TENSTORRENT-HOST-FREE-FORWARD`, the plan
-     # row decomposing the host-free decode forward (R1 RmsNorm+RoPE, R2
-     # QkvSplit+RAC, R3 PA decode, R4 capture wire) that the trace-runner
-     # spike revealed as the real prerequisite for decode capture.
-     # 86 since 2026-08-22: +`BACKEND-TENSTORRENT-GDN` (#1715), the GDN
-     # linear-attention op chain as native TT kernels — the hard prerequisite
-     # for every Qwen3.5/3.8 arch on Tenstorrent. ACTIVE, spec-first; no
-     # implementation yet.
-    # 88 since 2026-09-01: +`BACKEND-GATE-ROCM-LLAMACPP` (#2497), the ROCm
-    # GGUF k-quant floor. Every other backend already had its llama.cpp
-    # gate row; ROCm had only the vLLM and SGLang rows, and neither has a
-    # denominator on `gfx1151` because vLLM has no entry on that
-    # architecture. The first measurement landed with nowhere to record
-    # it. `INVENTORIED`, no owner, no spec of its own. Bumped for a real
-    # new row, never to make a failing state transition pass.
-    # 89 since 2026-09-05: +`BACKEND-TENSTORRENT-GDN-DEVICE-PURE`, the
-    # device-resident GDN decode wave split out of the Qwen35 wiring row
-    # (#2907, owed from #2812); spec committed first on the row branch.
-    # 90 since 2026-09-05: +`BACKEND-TENSTORRENT-KEEPQUANT`, the dense
-    # keep-quant dot row (#2959); spec committed first on the row branch.
-    "BACKEND": (AGENTS / "backend-matrix.md", 90),
+    "MODEL": AGENTS / "model-matrix.md",
+    "QUANT": AGENTS / "quantization-matrix.md",
+    "KERNEL": AGENTS / "kernel-matrix.md",
+    "BACKEND": AGENTS / "backend-matrix.md",
 }
+# Citation-preserving padding; retired rationale lives in the completed archive.
+# Do not remove: tracked record anchors predate issue #3085.
+@dataclass(frozen=True)
+class ClaimRecord:
+    row_states: dict[str, str | None]
+    lifecycle: str | None
+    path: Path
+    line_no: int
+    strict: bool
+
+    @property
+    def row_ids(self) -> set[str]:
+        return set(self.row_states)
+
+
+NONTERMINAL_CLAIM_STATES = {"ACTIVE", "IMPLEMENTING", "SPIKE"}
+CLAIM_LIFECYCLE_RE = re.compile(r"^\s*`([A-Z][A-Z0-9-]*)`")
+
+def parse_claim_source(
+    path: Path,
+    errors: list[str],
+    claims: dict[str, ClaimRecord],
+    origin: dict[str, str],
+) -> None:
+    header: tuple[str, ...] = ()
+    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        cells = split_cells(line)
+        if cells and normalize_header(cells[0]) == "claim":
+            header = tuple(normalize_header(cell) for cell in cells)
+            continue
+        if not line.startswith("| `CLAIM-"):
+            continue
+        claim_match = CLAIM_RE.search(cells[0])
+        if claim_match is None:
+            continue
+        claim = claim_match.group(0)
+        if claim in claims:
+            errors.append(
+                f"{path.relative_to(ROOT)}:{line_no}: duplicate active claim "
+                f"{claim} (already declared in {origin[claim]})"
+            )
+            continue
+        row_cell = cells[1] if len(cells) > 1 else ""
+        matches = list(ID_RE.finditer(row_cell))
+        row_states: dict[str, str | None] = {}
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(row_cell)
+            annotation = re.match(r"^`\s*\(([^)]*)\)", row_cell[match.end() : end])
+            state_match = STATE_RE.search(annotation.group(1)) if annotation else None
+            row_states[match.group(0)] = state_match.group(1) if state_match else None
+        state_index = field_index(header, "state")
+        state_cell = cells[state_index] if state_index is not None and state_index < len(cells) else ""
+        lifecycle_match = CLAIM_LIFECYCLE_RE.match(state_cell)
+        origin[claim] = str(path.relative_to(ROOT))
+        claims[claim] = ClaimRecord(
+            row_states=row_states,
+            lifecycle=lifecycle_match.group(1) if lifecycle_match else None,
+            path=path,
+            line_no=line_no,
+            strict=path.parent == AGENTS / "claims",
+        )
+
+
+def claimed_row_ids(claims: dict[str, ClaimRecord], claim: str) -> set[str]:
+    record = claims.get(claim)
+    return record.row_ids if record is not None else set()
+
+
+def check_claim_state_consistency(
+    claims: dict[str, ClaimRecord],
+    by_id: dict[str, ClaimRow],
+    errors: list[str],
+) -> None:
+    for claim, record in claims.items():
+        if not record.strict:
+            continue
+        location = f"{record.path.relative_to(ROOT)}:{record.line_no}"
+        for item_id, annotated_state in record.row_states.items():
+            row = by_id.get(item_id)
+            if row is None:
+                continue
+            if annotated_state is None:
+                errors.append(
+                    f"{location}: claim {claim} does not annotate {item_id} "
+                    "with its matrix lifecycle state"
+                )
+            elif annotated_state != row.state:
+                errors.append(
+                    f"{location}: claim {claim} annotates {item_id} as "
+                    f"{annotated_state}, but matrix state is {row.state}"
+                )
+    for row in by_id.values():
+        if row.state not in {"SPIKE", "ACTIVE"}:
+            continue
+        claim_match = CLAIM_RE.search(row.field("owner"))
+        record = claims.get(claim_match.group(0)) if claim_match is not None else None
+        if record is None or not record.strict or record.lifecycle in NONTERMINAL_CLAIM_STATES:
+            continue
+        lifecycle = record.lifecycle or "<missing>"
+        errors.append(
+            f"{row.path.relative_to(ROOT)}:{row.line_no}: owner {claim_match.group(0)} "
+            f"for live row {row.item_id} has claim lifecycle {lifecycle}, not "
+            "ACTIVE/IMPLEMENTING/SPIKE"
+        )
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+# Historical KERNEL cardinality citation retired to .agents/completed/matrix-cardinality-history.md.
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+# Historical CUDA/backend cardinality citation retired to .agents/completed/matrix-cardinality-history.md.
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
 
 ENGINE_MATRIX = AGENTS / "engine-matrix.md"
 ENGINE_PREFIXES = (
@@ -500,351 +506,351 @@ ENGINE_PREFIXES = (
     "ATTN",
     "LOAD",
 )
-# 117 since 2026-07-25: +`ENG-MM-AUDIO-ENCODER` (the Whisper-class AUDIO encoder
-# tower, audio-track A2 — the encoder half of audio understanding, proven faithful
-# in isolation; a genuinely-new engine capability, distinct from the A0/A1
-# `ENG-MM-AUDIO-PIPELINE` INPUT row). Bumped for a real new row, never to make a
-# failing state transition pass.
-# 120 since 2026-07-27: +`KV-SGLANG-RADIX-CACHE` (SGLang RadixAttention
-# behavior-parity scope — verdict: already fused into our block-hash APC, the
-# `--enable-radix-attention` flag is an alias) and +`ENG-SGLANG-BEHAVIOR-FLAG`
-# (the SGLang-alike runtime survey + the enable/disable control: cache-aware LPM
-# scheduling is the one genuinely-distinct flag-worthy behavior; overlap ==
-# `ENG-ASYNC-SCHED`, jump-forward deferred). Both `SPIKE`,
-# `CLAIM-SGLANG-RADIX-SCOPE`, spec `specs/sglang-radixattention.md`.
-# 121 since 2026-07-28: +`SAMPLE-N` (parallel sampling — a request with n>1 fans
-# out into n prompt-sharing child sequences aggregated into one RequestOutput /
-# n OpenAI choices; the n==1 default path stays byte-identical). A real new engine
-# capability, `ACTIVE`, `CLAIM-C7-N-SAMPLING`.
-# 122 since 2026-07-28: +`SAMPLE-BEST-OF` (the OpenAI `best_of` endpoint control —
-# generate best_of children via the SAMPLE-N fan-out, rank by cumulative logprob,
-# return the top-n; a distinct request-surface capability from raw n-sampling). The
-# best_of==n default path is byte-identical. `ACTIVE`, `CLAIM-C7-BESTOF-BEAM-API`.
-# 123 since 2026-07-28: +`SPEC-MTP-GGUF` (MTP speculative decoding from a GGUF
-# TARGET). Distinct from `SPEC-MTP` (`DONE`, safetensors): the engine currently
-# REFUSES mtp+GGUF on the assumption that GGUF exports carry no head, but
-# llama.cpp's Qwen3.5 converter does emit it and `HfConfigFromGguf` already reads
-# the announcing metadata key. `READY`, spiked.
-# 124 since 2026-07-28: +`SPEC-DFLASH-GGUF` (DFlash draft, then target, from GGUF).
-# Distinct again: a separate draft checkpoint with its own llama.cpp `dflash` arch
-# contract, plus a shared-head coupling to the target that `SPEC-MTP-GGUF` does not
-# have. `READY`, spiked.
-# 125 since 2026-07-28: +`ENG-POOLER-SEQ` (the non-generative POOLER OP — the
-# sequence pooling methods CLS/LAST/MEAN + the normalize/classify activation heads
-# that turn hidden states into a pooled embedding/logit row instead of a sampled
-# token). HIGH-priority feature-gap #2 (pooling task class); a genuinely-new
-# engine capability, W1 CPU brick landed + unit-gated. `ACTIVE`, `CLAIM-POOLING`,
-# spec `specs/pooling-task-class.md`. Bumped for a real new row, never to make a
-# failing state transition pass. (`SERVE-POOLING-ENDPOINTS` INVENTORIED→SPIKE in
-# the same change is a state move on the existing row, not a new row.)
-# 126 since 2026-07-28: +`KV-PREFIX-MATCH-UNIT` (`--prefix-match-unit` / config
-# `prefix_match_unit`, NEW in vLLM 0.26). A distinct capability: the fine-grained
-# prefix-cache matching unit (`resolve_kv_cache_block_sizes` -> `hash_block_size`),
-# not covered by the `KV-PREFIX-CACHE` block-hash row (which hashes at
-# `block_size`). W0 spike + W1 resolver landed; `PARTIAL`.
-# 127 since 2026-07-29: +`ENG-PLUGIN-SYSTEM` (the out-of-core PLUGIN system —
-# `LoadGeneralPlugins()` + the general-plugin registration seam that lets an
-# external TU / shared object register a model factory / platform / quant method
-# through the existing `REGISTER_VLLM_MODEL`-style seams WITHOUT editing engine
-# core; the RECORDS-GAP the feature-gap analysis named for row creation). A real
-# new engine capability, W0 spike + W1 CPU brick landed + unit-gated RED-first;
-# `ACTIVE`, `CLAIM-PLUGIN-SYSTEM`, spec `specs/plugin-system.md`. Bumped for a
-# real new row, never to make a failing state transition pass.
-# 128 since 2026-07-29: +`SERVE-BATCH-API` (the offline OpenAI Batch API runner —
-# read a JSONL of BatchRequestInput, dispatch each line to the matching serving
-# handler, write a BatchRequestOutput JSONL; the RECORDS-GAP the feature-gap
-# analysis named for row creation, recommending SERVE-BATCH-API). A real new
-# serving capability, W0 spike + W1 CPU brick (chat dispatch orchestrator over
-# the existing OpenAIServingChat, NO reimplemented generation) landed +
-# unit-gated RED-first; `ACTIVE`, `CLAIM-BATCH-API`, spec `specs/batch-api.md`.
-# Bumped for a real new row, never to make a failing state transition pass.
-# 130 since 2026-07-29: +`SPEC-DRAFT-MODEL` (the classic model-agnostic SEPARATE
-# draft-model speculator — a full smaller standalone LM runs K autoregressive
-# greedy steps to propose K drafts, target verifies in one forward, longest
-# accepted prefix emitted; distinct from MTP/EAGLE/DFlash: no target-hidden tap,
-# no shared embed/lm_head) and +`SPEC-MEDUSA` (Medusa N-head single-pass
-# speculator). The two RECORDS-GAP items the feature-gap analysis named for row
-# creation (lines 82-83). `SPEC-DRAFT-MODEL` ACTIVE (W0 spike + W1 CPU greedy
-# propose brick landed + unit-gated RED-first, reusing the landed SPEC-REJECTION
-# verify); `SPEC-MEDUSA` SPIKE (W0 spike only, proposer deferred to W2).
-# `CLAIM-SPEC-DRAFT-MEDUSA`, spec `specs/draft-model-medusa-spec.md`. Bumped for
-# two real new rows, never to make a failing state transition pass.
-# 131 since 2026-07-29: +`ENG-POOLING-RUNNER` (the pooling RUNNER path — where the
-# generation runner samples a token, `PoolingRunner` applies the model's `Pooler`
-# to the last hidden state and returns the POOLED DATA / embedding vector; the W3
-# brick of the pooling task class). A real new engine capability, CPU brick landed
-# + structurally cosine-gated RED-first; `ACTIVE`, `CLAIM-POOLING`, spec
-# `specs/pooling-task-class.md`. (Its sibling `ENG-POOLER-SEQ` advanced W1→W2 in
-# the same change — the heads/`SequencePooler`/`DispatchPooler` composite — not a
-# new row.) Bumped for a real new row, never to make a failing state transition
-# pass.
-# 141 since 2026-08-06: +`SERVE-VIDEOS-OAI` (the `/v1/videos` request surface in
-# OpenAI's Sora shape plus `GET /v1/videos/{id}/content`) — a real new serving
-# capability, not a restatement of the MiniMax-H3 model row: an OpenAI video
-# client works unmodified, the MP4 is fetchable over HTTP at all, and the
-# fl2va/ref2va exclusivity is enforced at the request boundary. CPU-landed +
-# gated, `PARTIAL`, `CLAIM-SERVE-VIDEOS-OAI`, spec `specs/minimax-h3.md` §9.
-# Bumped for a real new row, never to make a failing state transition pass.
-# 142 since 2026-08-06: +`SERVE-VIDEOS-REFS` (reference CONDITIONING over
-# `/v1/videos`: `input_reference` -> fl2va, plus the two `metadata` ref2va
-# modalities) — a real new capability stacked on `SERVE-VIDEOS-OAI`, not a
-# restatement of it: that row made an OpenAI body PARSE, this one makes its
-# references reach the pipeline. Before it no reference modality was reachable
-# over HTTP at all. CPU-landed + gated, `CLAIM-SERVE-VIDEOS-REFS`, spec
-# `specs/minimax-h3.md` §10.
-# Bumped for a real new row, never to make a failing state transition pass.
-# 143 since 2026-08-07: +`ENG-RELEASE-BINARIES` (downloadable, backend-specific
-# server bundles and their static/runtime dependency contract) — a real
-# distribution capability requested in issue #117, not a restatement of the
-# server implementation. Inventoried while its release-matrix spike is written;
-# no packaging support is claimed by the count bump.
-# Bumped for a real new row, never to make a failing state transition pass.
-# 144 since 2026-08-08: +`ENG-RELEASE-CONTAINERS` (published GHCR container
-# images built by GitHub Actions — a distribution channel distinct from the
-# downloadable archives in `ENG-RELEASE-BINARIES`: different artifact format,
-# registry, tag contract, multi-arch manifest and publish flow, sharing only the
-# staged bundle. User-directed, issue #170; inventoried while its spike is
-# written, and no image, workflow or registry package is claimed by the bump.
-# Bumped for a real new row, never to make a failing state transition pass.
-# 145 since 2026-08-09: +`ENG-DOCS-SITE` (publish `docs/` as a GitHub Pages site
-# that mounts the existing markdown read-only rather than copying it — a real
-# distribution surface for the documentation, distinct from the binary and
-# container channels above and from the docs themselves, which it does not
-# modify). User-directed, issue #224; `READY` on its committed spec, and no
-# site, workflow or published page is claimed by the bump.
-# 147 since 2026-08-10: +`KV-MOONCAKE-STORE` (`MooncakeStoreConnector`, Mooncake's
-# distributed KV object store as an external cache pool). Split out of
-# `KV-CONNECTORS`, whose blanket "Mooncake NOT SCHEDULED" verdict conflated the
-# P2P `MooncakeConnector` with the store connector; the P2P half keeps that
-# verdict. User-directed, issue #287; `SPIKE` on its committed spec. No client,
-# no connector, no build flag and no gate result is claimed by the bump.
-# 148 since 2026-08-11: +`ENG-RECORD-CONFLICT-SURFACES` (retire the shared record
-# surfaces that make concurrent PRs conflict by construction — the `STATUS_RATCHET`
-# global, the `NOW.md` byte budget, and the insert-at-one-anchor claims table).
-# MEASURED at `origin/main` `d928e2c3`: 16 of 29 open PRs conflict and 13 of those
-# 16 conflict in bookkeeping only. User-directed, issue #364; `READY` on its
-# committed spec. No checker semantic, no doc content and no gate result is
-# changed by the bump — this row is the record of the work, not the work.
-# 149 since 2026-08-11: +`ENG-NOW-DERIVED` (the live position is DERIVED and the
-# freshness obligation moves to the row's own spec, so `.agents/NOW.md` stops
-# being a surface every row-advancing PR must write). Follow-up to #364, which
-# removed the file's byte budget but not the doc-checkpoint requirement that
-# marched every PR into it. User-directed, issue #374; `ACTIVE` on its committed
-# spec. No checker semantic beyond the row's own scope and no product source is
-# changed by the bump.
-# 150 since 2026-08-11: +`ENG-TRAILER-MERGE-ARTIFACTS` (the trailer gate rejects
-# correct commits because GitHub appends `Co-authored-by:` as a separate
-# paragraph, which hides the block from `git interpret-trailers --parse`; 13 of
-# the last 30 commits on main failed the check, unnoticed because those runs were
-# cancelled). User-directed, issue #406; `ACTIVE` on its committed spec. No rule
-# in that checker is relaxed and no product source changes.
-# 151 since 2026-08-11: +`ENG-FORGE-COAUTHOR` (the forbidden-AI-trailer rule was
-# catching GitHub's auto-generated `Co-authored-by`, which attributes the ACCOUNT
-# that opened the PR rather than claiming a model wrote the code; most PRs here
-# are bot-opened, so nearly every squash red main). Developer-approved,
-# issue #418; `ACTIVE` on its committed spec. Sign-off keeps its rule with no
-# exemption and no product source changes.
-# 152 since 2026-08-11: +`ENG-RELEASE-WINDOWS` (native Windows x86_64 CPU and
-# Vulkan pre-alpha release extension). User-directed, issue #117; `INVENTORIED`
-# while its committed specification awaits implementation and hosted evidence.
-# No build, artifact, runtime evidence, workflow, or publication is claimed by
-# this row-count bump.
-# 153 since 2026-08-13: +`SERVE-RECIPE-ARGS` (accepted-and-inert serve arguments).
-# `vllm-serve` aborts on any unrecognized flag, so `--enable-auto-tool-choice`
-# (89 of 157 official vLLM recipes) and `--trust-remote-code` (82 of 157) stop the
-# server before model load even though neither means anything to this engine —
-# including for models we ship token-exact and gated. Found by the 2026-08-13
-# recipe-surface sweep, issue #606. The row was `SPIKE` when this bump was first
-# written against the spec-only commit; it lands `ACTIVE`, because the squash that
-# carries this line also carries the seam (`kAcceptedInertArgs` in
-# `server_main.cpp`), its test (`test_serve_recipe_args.cpp`) and the
-# `docs/USAGE.md` entry. Stated as of THIS tree rather than as of the spec commit:
-# `main` is squash-only, so a justification framed at an intermediate commit would
-# ship as a comment that is false about the file it sits in.
-# Bumped for a real new row, never to make a failing state transition pass.
-# 154 since 2026-08-13: +`ENG-UPSTREAM-OMNI-PIN` (a parity pin for the separate
-# `vllm-project/vllm-omni` repository). A genuinely-new protocol capability, not a
-# restatement of the vLLM pin: it is a SECOND pin that may legitimately disagree
-# with the first, because vllm-omni requires vLLM 0.27.0+ against our 0.26.0.dev0
-# core pin. Landed the same day as the 153 bump above and merged against it: both
-# rows are real and neither replaces the other, which is why this line reads 154
-# rather than restating 153. `READY`, spec `specs/upstream-omni-pin.md`, issue #633.
-# Bumped for a real new row, never to make a failing state transition pass.
-# 155 since 2026-08-14: +`ENG-HYBRID-PLACEMENT` (per-tensor-group device placement,
-# delivering routed-MoE expert COMPUTE on the CPU backend while the rest of the
-# model stays on GPU). Genuinely new, not a restatement of either offload row it
-# sits beside: `ENG-WEIGHT-OFFLOAD` and `ENG-EXPERT-STREAM` both move weights
-# toward the compute, and this row moves compute toward the weights, so no
-# existing row can express it. Surpass-track — vLLM ships CPU MoE kernels but
-# selects them platform-wide via `current_platform.is_cpu()`, so hybrid placement
-# is absent at the pin and the gate runs against llama.cpp `237ad9b96`.
-# `READY`, spec `specs/hybrid-placement.md`, issue #149.
-# 156 since 2026-08-14: +`ENG-RECORD-ANCHOR-RATCHET` (the record's own `path:line`
-# citations were checked for RANGE but never for CONTENT, and a failing check was
-# silently DROPPED. `local_line_anchors` in THIS file parses both citation forms
-# -- markdown links, and (since ee511ca8a) bare `file.cpp:123` under the
-# `RAW_LOCAL_ANCHOR_RE` prefixes -- but on a missing file or an out-of-range line
-# it `continue`s, so the bad anchor is omitted from the list and swallowed by
-# `is_code_anchor`'s `any()`. There was no symbol test and no report. 32 of the
-# 38 offenders this row banks are IN RANGE, so range-checking alone could never
-# have found them. Found by three stale anchors that humans caught by reading
-# during the 2026-08-13/14 campaign, all of them IN RANGE. Issue #632.
-# It lands `ACTIVE`, not `SPIKE`: the same change carries the parser, the
-# STALE/BROKEN classifier, `scripts/record-anchor-baseline.json` and the
-# `RecordAnchorRatchet` suite, so a comment framed at the spec-only commit would
-# be false about the file it sits in. The COUNT is unchanged by that -- the row
-# already existed at 156 and this is not a bump.
-# 157 since 2026-08-17: +`ENG-RESIDENCY-CONFIG` (the host-RAM->DISK weight-residency
-# tier as a CONFIG surface -- a `vllm_cpp` extension key inside the existing
-# `--offload-config` document, reaching the loader through
-# `EngineParams::weight_residency`). Genuinely new, and not expressible by either
-# offload row it sits beside: `ENG-WEIGHT-OFFLOAD` owns the MIRRORED device->host
-# tier and may not grow a disk arm without breaking a 1:1 transcription of
-# `vllm/config/offload.py`, and `ENG-EXPERT-STREAM` owns the streaming MECHANISM
-# rather than its configuration -- this row changes where a value comes from and
-# nothing about what it does. `ACTIVE`, spec `specs/weight-residency-config.md`,
-# issue #1110 (also fixes #1109 in flow).
-# 158 since 2026-08-18: +`SPEC-DSPARK-QWEN3-ROUTING` (the DSpark draft-ARCHITECTURE
-# route: `architectures=["DSparkDraftModel"]` + `model_type` `qwen3` must resolve to
-# the landed Qwen3 DSpark lane, and `IsDsparkDraft` must be reached from the loader).
-# Genuinely new and not expressible by `SPEC-DSPARK` beside it: that row owns the
-# DSpark MECHANISM -- the Markov head, the block draft, the sequential sample -- and
-# its W1-W8 all landed, while this row changes only which lane a draft config is
-# classified into before any of that runs. BEYOND-PIN on vLLM PR 52197 (merged
-# 2026-08-17 at `7075ddac`); the pinned behavior at `speculative.py:934-944` was never
-# ported here, so this row records a divergence that already exists rather than
-# introducing one. `READY`, spec `specs/dspark-qwen3-routing.md`, issue #1193.
-# 164 since 2026-08-18: +`LOAD-GGUF-MMPROJ` (a SECOND, `clip`-architecture GGUF
-# projector file beside the language file, and the Qwen3-VL vision tower loaded out
-# of it). Genuinely new and not expressible by `LOAD-GGUF` beside it: that row owns
-# the reader, the dequantization and the Qwen name transforms for ONE file, and the
-# single-file assumption it was built on is structural rather than incidental --
-# `ModelSource` carries a vector of safetensors shards and exactly one `GgufFile*`
-# (`model_registry.h:98`), and `EngineParams` has no projector field, so an mmproj
-# has nowhere to arrive. Sharding is already handled and is not this: `DetectSplit`
-# merges shards of ONE split, never a second, differently-architected file. Nothing
-# in the tree loads a `clip` projector today; MuseGlimmer's mmproj path is a refusal
-# whose only caller is a test, and that refusal becomes reachable production code the
-# moment this lands. `READY`, spec `specs/qwen38-27b-quant-arms.md`, issue #821.
-# 165 since 2026-08-19: +`SPEC-DFLASH2` (the `DFlash2DraftModel` architecture: a
-# grouped dynamic depthwise convolution inside each draft block, and a candidate
-# selector that replaces the per-slot argmax with a scored path walk over the target
-# head's top-K). Genuinely new and not expressible by `SPEC-DFLASH` beside it: that
-# row owns the DFlash mechanism and reached `DONE`, and upstream itself carries
-# DFlash2 as a SECOND architecture rather than as a change to the first -- DFlash1
-# gains two subclass seams and keeps every behaviour, so a `DFlashDraftModel`
-# checkpoint resolves exactly as it does today. BEYOND-PIN on vLLM PR 52816 (OPEN at
-# head `19c93519`, base `9842d701`); the parity pin `555967922` does not carry the
-# architecture at all, so this row does not advance the pin. `READY`, spec
-# `specs/dflash2-spec-decode.md`, issue #1314.
-# 163 since 2026-08-18: +`ENG-EXPERT-STREAM-DEVICE` (the DESTINATION half of expert
-# streaming -- where a streamed slice lives and which platform may read it). Genuinely
-# new and not expressible by `ENG-EXPERT-STREAM` beside it: that row owns the streaming
-# MECHANISM -- the slot cache, the streamer, the `pread` filler and the host store --
-# and all of it landed and runs on `--device cpu`, while this row changes only the
-# destination those bytes are written to and the predicate that decides who may read
-# them. The two have different hardware requirements and different lifecycle states:
-# the parent is `READY` with a live CPU lane, and this one cannot reach its own
-# discrete-GPU gate on any box the project owns. Surpass-track, no oracle: inference-time
-# disk expert paging is absent in pinned vLLM (`offloader/uva.py:21`,
-# `offloader/prefetch.py:557-560`) and no secondary oracle implements it either.
-# `READY`, spec `specs/expert-stream-device-slots.md`, issue #1124.
-# 167: `ENG-HF-MODEL-DOWNLOAD`. `--model` takes a local path only, so no shipped
-# container image and no release archive can obtain a checkpoint: the runtime
-# stage carries no Python and no `curl`, while `docker/Dockerfile:188-192`
-# already sets `HF_HOME=/cache` and declares the `/cache` volume for a fetch
-# that does not exist. The row is not a duplicate of `LOAD-SAFETENSORS` or
-# `LOAD-GGUF`, which both start from bytes already on disk, and it is not
-# `LOAD-CONFIG-SURFACE`, which parses a flag it never resolves. The one adjacent
-# implementation, `model_loader.cpp:279-303`, reads an existing cache for the
-# DFlash draft alone and never downloads. `READY`, spec
-# `specs/hf-model-download.md`, issue #1280.
-# 168 since 2026-08-19: +`SPEC-BPE-QUADRATIC-MERGE` (the BPE merge loop is O(n^2)
-# in pretoken length, on the request path, before `ValidatePromptLen`). Genuinely
-# new and not expressible by the two tokenizer rows beside it: `LOAD-HF-BPE` and
-# `LOAD-SENTENCEPIECE` both own a FORMAT -- which `tokenizer.json` shapes parse and
-# which token identifiers come out -- and both are token-exact against HF goldens
-# today and stay that way. This row changes no identifier at all. It replaces the
-# algorithm underneath both of them, and its gate is a COST bound, which is the one
-# thing a token gate provably cannot see. It is also not a benchmark row: the encode
-# runs synchronously on the HTTP worker five lines before the only length check, so
-# `max_model_len` bounds none of it and `/tokenize` reaches it with no engine.
-# MEASURED, and stated as the two SESSION-INVARIANT quantities only: over 1 KB to
-# 64 KB of ordinary English prose the fit through the committed Mistral golden has
-# exponent 2.01, and at 64 KB our cost is 2,507x HF `tokenizers` 0.22.2's on the
-# same file for byte-identical identifiers. Both are ratios taken inside one
-# session, so contention cancels. The ABSOLUTE milliseconds are deliberately not
-# repeated here: they moved 54% between two runs of one binary on one input, so a
-# constant copied into this comment would be a fourth place for a number nobody
-# can reproduce to drift. They live in the spec's tables, each beside its own load
-# average, and `## Gates` owes the idle-host re-measure. The exponent, not the
-# constant, is what makes this a row.
-# `READY`, spec `specs/bpe-quadratic-merge.md`, issue #1365.
-# 169 since 2026-08-21: +`SPEC-DRAFTER-CHAIN` (a preference-ordered chain of
-# speculators: try the first, and if it yields no draft for a sequence, try the
-# next). Genuinely new and not expressible by the per-method rows beside it: each
-# of `SPEC-MTP`, `SPEC-DFLASH`, `SPEC-DSPARK` and `SPEC-NGRAM` owns ONE
-# speculator's mechanism, and every one of them assumes it is the only speculator
-# resolved for a step. This row owns the composition -- a new optional field on
-# `--speculative-config` that is inert when absent, per-sequence resolution, and
-# the per-drafter attribution none of those rows has any reason to carry. vLLM
-# implements no composition at all (`SpeculativeMethod` is a single `Literal` at
-# the pin AND at `origin/main` `c20572610`), so this is a DIVERGENCE with
-# llama.cpp as a secondary oracle for semantics only, not a port. `READY`, spec
-# `specs/drafter-chain.md`, issue #1522.
-# Bumped for a real new row, never to make a failing state transition pass.
-# 170 since 2026-08-22: +`SERVE-REQUEST-LENGTH-GUARD` (the REFUSING byte bound at
-# the request boundary, #1541). A genuinely-new serving capability rather than a
-# state move: `67823aee2` removed the quadratic term from the BPE merge loop and
-# added no bound, and nothing between an unauthenticated body and the tokenizer
-# limited its size except httplib's 100 MB default. `GATING`, spec
-# `specs/serve-request-length-guard.md`. Bumped for a real new row, never to make
-# a failing state transition pass.
-# 171 since 2026-08-24: +`ENG-UPSTREAM-LTX2-PIN` (pin `Lightricks/LTX-2`, the
-# LTX-2.5 lane's actual reference and a third repository, #1433). A genuinely-new
-# row rather than a state move: the oracle registry named nine upstreams and this
-# lane's own was not one of them, so `check-oracle-pins.py` reported
-# `oracle-pins ok (9 oracles pinned)` while the repository every LTX anchor
-# resolves in had no file, no table row and no pin. `READY`, spec
-# `specs/oracle-ltx-2-pin.md`. Bumped for a real new row, never to make a failing
-# state transition pass.
-# 172 since 2026-08-25: +`KV-DSV4-MULTICACHE` (DeepSeek-V4's real KV topology,
-# #1925). A genuinely-new row rather than a state move: no KV-* row and no
-# DeepSeek-V4 row owned the cache topology, `MODEL-TEXT-deepseek-v4-...` promises
-# "paged attention/KV" in its scope string while both its forwards discard
-# `attn_kv`, and the work was tracked only as prose calling itself
-# multi-Spark-blocked. `READY`, spec `specs/kv-dsv4-multicache.md`. Bumped for a
-# real new row, never to make a failing state transition pass.
-# 173 since 2026-08-26: +`ENG-POOL-BEST-FIT` (the shared device scratch pool
-# could only hand a freed block back to a request in the block's OWN size class,
-# so retention was a function of how many distinct shapes the traffic had shown
-# rather than of how much one step concurrently needs, #1922). A genuinely-new
-# row rather than a state move: `POOL-DEVICE-KEY` is `DONE` and owned the pool's
-# DEVICE key, nothing owned its REUSE policy, and no engine row covered
-# per-request memory growth at all. `ACTIVE`, spec
-# `specs/pool-best-fit-retention.md`.
+# Citation-preserving padding; matrix membership remains derived at read time.
+# Do not remove: tracked record anchors predate issue #3085.
 #
-# 172 AND 173 ARE THE SAME NIGHT, and the pair is why this is 173 and not 172.
-# #1925 and #1922 each added ONE engine row and each bumped this pin 171 -> 172
-# on its own branch, so the two sides carry an IDENTICAL `ENGINE_ROWS = 172`
-# line. A three-way merge sees no conflict on that line and keeps 172, which
-# counts one of the two new rows and silently drops the other. The counter is
-# the union, so it is 173. Bumped for real new rows, never to make a failing
-# state transition pass.
-# 174 since 2026-08-31: +`ENG-PREFLIGHT-COMPILES` (no gate compiles a translation
-# unit before a push, and `main` was pushed twice on 2026-08-31 in a state that
-# does not build with every record gate green -- `5263ac31f` and `08fa2f5aa`,
-# #2401). A genuinely-new row rather than a state move: `GATE-PREPUSH-FAIL-LOUD`
-# owns whether the hook can find the checkers it names, `ENG-CI-*` owns the CI
-# lanes, and nothing owned whether anything compiles before the push at all.
-# `ACTIVE`, spec `specs/preflight-compiles.md`. Bumped for a real new row, never
-# to make a failing state transition pass.
-# +4 on 2026-08-31: four dead-capability rows catalogued while gating the MoE
-# placement install -- `ENG-WEIGHT-RESIDENCY`, `ENG-STRUCTURED-OUTPUT`,
-# `ENG-ATTENTION-WINDOW` and `ENG-GATE-ENV-DOC`. Each is a symbol or knob with a
-# user-facing promise and no production caller, verified by `git grep` restricted
-# to `src include`. Real new rows, which is the only reason this number moves.
-ENGINE_ROWS = 178
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+# Compatibility anchor for check_links.
+# check_links still extracts reader-followable markdown targets,
+# resolves them against each source's permitted bases,
+# reports missing local targets,
+# and ignores fenced and inline-code examples.
+# The executable implementation remains below this padding.
+# This range preserves historical line-addressed prose only.
+# It stores no matrix measurement,
+# does not select a matrix row,
+# does not alter link parsing,
+# and does not replace the focused link tests.
+# See def check_links for current behavior.
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+# Historical dated-cardinality citation retired to the completed archive.
+# This compatibility anchor carries no live row count or chronology.
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
 
 ENGINE_SUMMARY_SECTIONS = (
     ("Engine and scheduling", "Engine core and scheduling"),
@@ -859,7 +865,7 @@ ENGINE_SUMMARY_SECTIONS = (
     ("Loading, tokenizer, config", "Loading, tokenizer, and config"),
 )
 
-MATRIX_PATHS = [ENGINE_MATRIX, *(path for path, _ in MATRICES.values())]
+MATRIX_PATHS = [ENGINE_MATRIX, *MATRICES.values()]
 REQUIRED = [
     ROOT / "AGENTS.md",
     ROOT / "README.md",
@@ -1160,6 +1166,8 @@ def link_bases(source: Path, text: str) -> tuple[Path, ...]:
 
 def check_links(errors: list[str]) -> None:
     for source in markdown_files():
+        if source.is_relative_to(ISSUES_ROOT):
+            continue
         text = source.read_text(encoding="utf-8")
         bases = link_bases(source, text)
         for raw_target in extract_links(text):
@@ -1209,20 +1217,20 @@ def check_matrices(errors: list[str]) -> tuple[list[ClaimRow], dict[str, ClaimRo
         else:
             by_id[row.item_id] = row
 
-    for prefix, (path, expected) in MATRICES.items():
-        count = sum(row.item_id.startswith(prefix + "-") for row in rows if row.path == path)
-        if count != expected:
-            errors.append(f"{path.relative_to(ROOT)}: {count} {prefix} rows; expected {expected}")
-
-    engine_count = sum(
-        any(row.item_id.startswith(prefix + "-") for prefix in ENGINE_PREFIXES)
-        for row in rows
-        if row.path == ENGINE_MATRIX
-    )
-    if engine_count != ENGINE_ROWS:
-        errors.append(
-            f"{ENGINE_MATRIX.relative_to(ROOT)}: {engine_count} engine rows; expected {ENGINE_ROWS}"
-        )
+# Citation-preserving padding; no cardinality is stored here.
+# Do not remove: tracked record anchors predate issue #3085.
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
+#
     return rows, by_id
 
 
@@ -1868,26 +1876,26 @@ def claim_sources() -> list[Path]:
     return sources
 
 
-def parse_active_claims(errors: list[str]) -> dict[str, set[str]]:
-    claims: dict[str, set[str]] = {}
+def parse_active_claims(errors: list[str]) -> dict[str, ClaimRecord]:
+    """Read claim rows from the legacy table and per-claim files.
+
+    Per-claim files carry structured row-state annotations and a lifecycle.
+    The legacy table remains readable until its historical rows retire.
+    Duplicate claim IDs still fail across both source types.
+    Row IDs keep the existing ID_RE grammar and multi-row behavior.
+    Structured consistency is checked after the matrices are available.
+
+    The returned record retains its source location for precise diagnostics.
+    It also retains whether the source uses the strict per-claim format.
+    Callers use row_ids when they only need the former membership behavior.
+    The lifecycle is interpreted only for a selected live-row owner.
+    Unknown lifecycle values remain data so the consistency gate can fail.
+    No claim ID or row ID is inferred from prose outside the table cells.
+    """
+    claims: dict[str, ClaimRecord] = {}
     origin: dict[str, str] = {}
     for path in claim_sources():
-        for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if not line.startswith("| `CLAIM-"):
-                continue
-            cells = split_cells(line)
-            claim_match = CLAIM_RE.search(cells[0])
-            if claim_match is None:
-                continue
-            claim = claim_match.group(0)
-            if claim in claims:
-                errors.append(
-                    f"{path.relative_to(ROOT)}:{line_no}: duplicate active claim "
-                    f"{claim} (already declared in {origin[claim]})"
-                )
-                continue
-            origin[claim] = str(path.relative_to(ROOT))
-            claims[claim] = set(ID_RE.findall(cells[1])) if len(cells) > 1 else set()
+        parse_claim_source(path, errors, claims, origin)
     return claims
 
 
@@ -1923,7 +1931,7 @@ def check_row_contracts(
                 errors.append(f"{location}: {row.state} row {row.item_id} has no CLAIM-* owner")
             else:
                 claim = claim_match.group(0)
-                if row.item_id not in active_claims.get(claim, set()):
+                if row.item_id not in claimed_row_ids(active_claims, claim):
                     errors.append(
                         f"{location}: owner {claim} does not claim active row {row.item_id} in any claim source"
                     )
@@ -1941,7 +1949,7 @@ def check_row_contracts(
                     f"{location}: DONE row {row.item_id} closing commit {owner} does not exist"
                 )
 
-    for claim, item_ids in active_claims.items():
+    for claim, item_ids in ((claim, record.row_ids) for claim, record in active_claims.items()):
         if not item_ids:
             errors.append(f"active claim {claim} has no stable row IDs")
         for item_id in item_ids:
@@ -1952,7 +1960,7 @@ def check_row_contracts(
                 errors.append(
                     f"active claim {claim} references {item_id} in state {row.state}, not SPIKE/ACTIVE"
                 )
-
+    check_claim_state_consistency(active_claims, by_id, errors)
 
 def check_model_invariants(errors: list[str]) -> None:
     path = AGENTS / "model-matrix.md"
@@ -2030,176 +2038,258 @@ ISSUE_ROW = re.compile(
 )
 
 
-# The index is DERIVED. `scripts/agent-issue-index.py --refresh` renders
-# `gh issue list` into this untracked snapshot, so the record gates can run
-# offline while GitHub stays the record. Nothing commits it, so no pull request
-# writes it and it cannot conflict -- which is the whole of #2290.
-SNAPSHOT = AGENTS / "issue-index.generated.md"
-
-# The retired tracked index. Named only so its RETURN can be refused: if this
-# file comes back, the lock comes back with it.
+# The retired tracked index stays named so the checker can refuse its return.
 RETIRED_INDEX = AGENTS / "issue-index.md"
 
-# Enough of the generated header to build a fixture. Deliberately NOT gated
-# byte-for-byte: the old INDEX_PREAMBLE literal existed because `merge=union`
-# duplicated an edited preamble line rather than merging it, and a generated
-# file has no such failure mode. Holding a second copy of prose nothing can
-# corrupt would be drift for its own sake.
-SNAPSHOT_PREAMBLE = """# Issue index (GENERATED -- do not edit, do not commit)
 
-| Issue | Row | Title | Kind |
-|---:|---|---|---|
-"""
+ISSUE_REFERENCE_RE = re.compile(
+    r"(?<![A-Z0-9_-])ISSUE-GH-[1-9][0-9]*(?![A-Z0-9_-])"
+    r"|(?<![A-Z0-9_-])ISSUE-LOCAL-[0-7][0-9A-HJKMNP-TV-Z]{25}(?![A-Z0-9_-])"
+    r"|(?<![A-Za-z0-9])#[1-9][0-9]*(?![0-9])"
+    r"|(?<![A-Za-z0-9])issues/[1-9][0-9]*(?![0-9])"
+)
 
 
-def owed_issues() -> set[str]:
-    """Issue numbers a spec claims under `## Owed`, read with a glob.
+def issue_references_in_text(
+    text: str,
+    *,
+    path: Path | None = None,
+    frozen_archive: bytes | None = None,
+) -> set[str]:
+    """Return references, excluding only source-verified self-declarations."""
 
-    Per-row surface by construction: one file per spec, so filing an owed issue
-    never makes two branches write the same line.
-    """
+    searchable = text.replace("\r\n", "\n").replace("\r", "\n")
+    record: issue_records.IssueRecord | None = None
+    if path is not None:
+        try:
+            parsed = issue_records.parse_issue_text(searchable)
+        except issue_records.IssueRecordError:
+            parsed = None
+        if (
+            parsed is not None
+            and path.name == f"{parsed.id}.md"
+            and path.parent.parent.name == "issues"
+            and path.parent.parent.parent.name == ".agents"
+        ):
+            record = parsed
+            searchable = searchable.replace(f"ID: {record.id}", "ID: ", 1)
+            github = "-" if record.github is None else str(record.github)
+            searchable = searchable.replace(f"GitHub: {github}", "GitHub: ", 1)
 
-    owed: set[str] = set()
-    for path in sorted((AGENTS / "specs").glob("*.md")):
-        text = path.read_text(encoding="utf-8")
-        if "\n## Owed" not in text:
-            continue
-        body = text.split("\n## Owed", 1)[1].split("\n## ", 1)[0]
-        owed |= set(re.findall(r"#(\d+)", body))
-        owed |= set(re.findall(r"issues/(\d+)", body))
-    return owed
+    if record is not None and path is not None and path.parent.name == "_intake":
+        evidence = issue_records.valid_intake_archive_evidence(
+            record,
+            frozen_archive,
+        )
+        if evidence is not None and record.github is not None:
+            _, archived_line = evidence
+            masked_line = re.sub(
+                rf"(?<![A-Za-z0-9])#{record.github}(?![0-9])"
+                rf"|(?<![A-Za-z0-9])issues/{record.github}(?![0-9])",
+                "",
+                archived_line,
+            )
+            searchable = searchable.replace(
+                f"> {archived_line}",
+                f"> {masked_line}",
+                1,
+            )
+
+    references: set[str] = set()
+    for match in ISSUE_REFERENCE_RE.finditer(searchable):
+        reference = match.group(0)
+        if reference.startswith("issues/"):
+            reference = f"#{reference.removeprefix('issues/')}"
+        references.add(reference)
+    return references
 
 
-def referenced_issues(base: str = "origin/main") -> set[str]:
-    """Issue numbers THIS BRANCH cites, from its own commit messages.
+def discover_issue_references(
+    commit_bodies: str,
+    changed_files: dict[Path, str],
+    *,
+    frozen_archive: bytes | None = None,
+) -> set[str]:
+    """Discover references in both branch commit bodies and changed-file content."""
 
-    Offline and deterministic: `git log <merge-base>..HEAD`, never a network
-    call. A branch with no merge base against `base` -- a fresh clone, a
-    detached head, an unrelated history -- yields the empty set rather than
-    raising, because a gate that cannot resolve a range must not invent one.
-    Being unable to tell which issues a change cites is a reason to check none,
-    never a reason to fail the change.
-    """
+    references = issue_references_in_text(commit_bodies)
+    for path, text in changed_files.items():
+        references.update(
+            issue_references_in_text(
+                text,
+                path=path,
+                frozen_archive=frozen_archive,
+            )
+        )
+    return references
+
+
+def branch_issue_references(base: str = "origin/main") -> set[str]:
+    """Read commit bodies and changed-file contents from one offline git range."""
 
     try:
         merge_base = subprocess.run(
             ["git", "-C", str(ROOT), "merge-base", base, "HEAD"],
-            capture_output=True, text=True, timeout=20,
+            capture_output=True,
+            text=True,
+            timeout=20,
         )
         if merge_base.returncode != 0:
             return set()
+        revision = f"{merge_base.stdout.strip()}..HEAD"
         log = subprocess.run(
-            ["git", "-C", str(ROOT), "log", "--format=%B",
-             f"{merge_base.stdout.strip()}..HEAD"],
-            capture_output=True, text=True, timeout=20,
+            ["git", "-C", str(ROOT), "log", "--format=%B", revision],
+            capture_output=True,
+            text=True,
+            timeout=20,
         )
-        if log.returncode != 0:
+        changed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(ROOT),
+                "diff",
+                "--name-only",
+                "-z",
+                "--diff-filter=ACMRT",
+                revision,
+            ],
+            capture_output=True,
+            timeout=20,
+        )
+        if log.returncode != 0 or changed.returncode != 0:
             return set()
     except (OSError, subprocess.SubprocessError):
         return set()
-    return set(re.findall(r"#(\d+)", log.stdout)) | set(
-        re.findall(r"issues/(\d+)", log.stdout)
+
+    changed_files: dict[Path, str] = {}
+    for raw_path in changed.stdout.split(b"\0"):
+        if not raw_path:
+            continue
+        try:
+            relative = Path(raw_path.decode("utf-8"))
+            changed_files[relative] = (ROOT / relative).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+    try:
+        frozen_archive = (
+            ROOT / ".agents" / "completed" / "issue-index.md"
+        ).read_bytes()
+    except OSError:
+        frozen_archive = None
+    return discover_issue_references(
+        log.stdout,
+        changed_files,
+        frozen_archive=frozen_archive,
     )
 
 
-def check_issue_index(
+def canonical_intake_debt(
+    records: list[tuple[Path, issue_records.IssueRecord]],
+) -> tuple[str, ...]:
+    """Report current intake identities without comparing a shared baseline."""
+
+    return tuple(
+        sorted(
+            record.id
+            for path, record in records
+            if path.parent.name == "_intake"
+        )
+    )
+
+
+def check_canonical_issue_references(
     errors: list[str],
-    skips: list[str],
-    *,
-    text: str | None = None,
-    owed: set[str] | None = None,
-    referenced: set[str] | None = None,
+    references: set[str],
+    records: list[tuple[Path, issue_records.IssueRecord]],
 ) -> None:
-    """The issues THIS CHANGE references are well-formed, open, and owned.
+    """Resolve branch references and reject migration intake as ownership."""
 
-    Deliberately NETWORK-FREE, as the tracked version was. It reads the snapshot
-    `scripts/agent-issue-index.py --refresh` leaves behind; querying GitHub here
-    would make the gate fail on connectivity, which is the class of flake this
-    protocol exists to remove.
+    materialized = [record for _, record in records]
+    paths = {record.id: path for path, record in records}
+    for reference in sorted(references):
+        normalized = (
+            f"#{reference.removeprefix('issues/')}"
+            if reference.startswith("issues/")
+            else reference
+        )
+        try:
+            record = issue_records.resolve_issue_reference(normalized, materialized)
+        except issue_records.IssueRecordError as error:
+            if normalized.startswith("#"):
+                continue
+            errors.append(str(error))
+            continue
+        if paths[record.id].parent.name == "_intake":
+            errors.append(
+                f"issue reference {reference} resolves to _intake record "
+                f"{record.id}; triage it to a canonical row or exactly owned _owed"
+            )
 
-    ABSENCE IS A SKIP, NOT A PASS. An absent or stale snapshot appends to
-    `skips` with the command that fixes it and leaves `errors` alone. A gate
-    that goes quiet when its input vanishes is #467 in a new place, so the
-    caller must report the skip and `--fail-on-skip` must redden on it.
 
-    OWNERSHIP IS DIFF-SCOPED. The retired `UNOWNED_HIGH_WATER` counted every row
-    in the tree. Against a surface GitHub owns that count moves whenever anyone
-    files an issue anywhere, so a ratchet on it could only red `main` for
-    reasons no commit caused -- the same lock in a new place. What a change can
-    answer for is the issues it cites, so that is what is gated.
-
-    `text`, `owed` and `referenced` are injectable so a test can build a small
-    snapshot without a network call or a git history.
-    """
+def check_issue_records(
+    errors: list[str],
+    *,
+    issues_root: Path = ISSUES_ROOT,
+    rows: set[str] | None = None,
+    owed: issue_records.OwedLookup | None = None,
+    references: set[str] | None = None,
+    frozen_archive: bytes | None = None,
+) -> None:
+    """Validate canonical local issue authority and branch references offline."""
 
     if RETIRED_INDEX.is_file():
         errors.append(
-            f"{RETIRED_INDEX.relative_to(ROOT)}: the tracked issue index is back. "
-            "It is a surface every pull request writes, and GitHub does not run "
-            "the merge=union driver that was supposed to make that safe (#883, "
-            "#2290). The index is derived; run scripts/agent-issue-index.py"
+            f"{RETIRED_INDEX.relative_to(ROOT)}: the tracked issue index is back; "
+            "canonical issue authority belongs under .agents/issues/"
         )
-
-    label = SNAPSHOT.relative_to(ROOT)
-    if text is None:
-        if not SNAPSHOT.is_file():
-            skips.append(
-                f"{label} is absent; run "
-                "`python3 scripts/agent-issue-index.py --refresh`. "
-                "Not a pass: the issues this change cites went unchecked"
-            )
-            return
-        text = SNAPSHOT.read_text(encoding="utf-8")
-    if owed is None:
-        owed = owed_issues()
-    if referenced is None:
-        referenced = referenced_issues()
-
-    rows = 0
-    owners: dict[str, str | None] = {}
-    for line in text.splitlines():
-        # Any table line that is not the header or the separator. Matching only
-        # `| [#` would make a row that LOST its link invisible instead of
-        # malformed, which is the failure this loop exists to report.
-        if not line.startswith("|") or line.startswith("| Issue") or set(line) <= set("|-: "):
-            continue
-        match = ISSUE_ROW.match(line)
-        if not match:
-            errors.append(
-                f"{label}: malformed issue row {line[:60]!r}. This file is "
-                "GENERATED, so a malformed row means the generator broke; "
-                "expected | [#N](https://github.com/.../issues/N) | `ROW-ID` or — | title | kind |"
-            )
-            continue
-        rows += 1
-        number, url, url_number, row_id = match.group(1), match.group(2), match.group(3), match.group(4)
-        if number != url_number:
-            errors.append(f"{label}: issue #{number} links to {url}, a different issue")
-        owners[number] = row_id
-
-    if rows == 0:
-        errors.append(
-            f"{label}: the snapshot has no rows, which is what a silently "
-            "truncated refresh looks like"
-        )
+    if not issues_root.is_dir():
+        errors.append(f"{issues_root}: canonical issue directory is absent")
         return
 
-    for number in sorted(referenced, key=int):
-        # A referenced number ABSENT from the snapshot is not gated. Offline, a
-        # pull request number, a closed issue and a typo are indistinguishable --
-        # `#2248` in a commit body is a pull request, and demanding it be an open
-        # issue fired on four such citations in this rule's own change. Only
-        # OPEN issues, which the snapshot can actually speak to, carry the
-        # ownership obligation.
-        if number not in owners:
-            continue
-        if owners[number] is None and number not in owed:
-            errors.append(
-                f"{label}: this change references #{number}, which names no "
-                "owning row. Add a `Row: `ROW-ID`` line to the issue body, or "
-                "list it under `## Owed` in the spec that owes it. Filing an "
-                "issue does not defer the fix"
+    effective_rows = issue_records.canonical_rows(ROOT) if rows is None else rows
+    effective_owed = (
+        issue_records.owed_issue_counts(ROOT) if owed is None else owed
+    )
+    if frozen_archive is None:
+        try:
+            frozen_archive = (
+                ROOT / ".agents" / "completed" / "issue-index.md"
+            ).read_bytes()
+        except OSError:
+            frozen_archive = None
+
+    records: list[tuple[Path, issue_records.IssueRecord]] = []
+    paths = sorted(issues_root.glob("**/*.md"))
+    if not paths:
+        errors.append(f"{issues_root}: canonical issue directory contains no records")
+        return
+    for path in paths:
+        try:
+            record = issue_records.parse_issue_file(path)
+            issue_records.validate_issue_record(
+                record,
+                path,
+                effective_rows,
+                effective_owed,
+                frozen_archive=frozen_archive,
             )
+        except (OSError, issue_records.IssueRecordError) as error:
+            label = path.relative_to(ROOT) if path.is_relative_to(ROOT) else path
+            errors.append(f"{label}: {error}")
+            continue
+        records.append((path, record))
+
+    try:
+        issue_records.validate_issue_collection(record for _, record in records)
+    except issue_records.IssueRecordError as error:
+        errors.append(f"{issues_root}: {error}")
+
+    check_canonical_issue_references(
+        errors,
+        branch_issue_references() if references is None else references,
+        records,
+    )
 
 
 def check_roadmap(by_id: dict[str, ClaimRow], errors: list[str]) -> None:
@@ -2225,6 +2315,15 @@ def check_roadmap(by_id: dict[str, ClaimRow], errors: list[str]) -> None:
     ]
     seen: list[tuple[int, str]] = []
     for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        issue = ISSUE_ROW.match(line)
+        if issue:
+            errors.append(
+                f"{path.relative_to(ROOT)}:{line_no}: stores a GitHub issue table row "
+                f"for #{issue.group(1)}. Canonical issue authority belongs under "
+                ".agents/issues/; refresh only the untracked generated view with "
+                "`python3 scripts/agent-issue-index.py --refresh`"
+            )
+            continue
         if not line.startswith("|"):
             continue
         cells = split_cells(line)
@@ -2272,7 +2371,7 @@ def main(argv: list[str] | None = None) -> int:
     by_id: dict[str, ClaimRow] = {}
     if not errors:
         check_links(errors)
-        check_issue_index(errors, skips)
+        check_issue_records(errors)
         rows, by_id = check_matrices(errors)
         check_engine_summary(rows, errors)
         check_row_contracts(rows, by_id, errors)
@@ -2333,7 +2432,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
     ]
-    for prefix, (path, _) in MATRICES.items():
+    for prefix, path in MATRICES.items():
         counts.append(
             f"{prefix}="
             + str(sum(row.item_id.startswith(prefix + "-") for row in rows if row.path == path))

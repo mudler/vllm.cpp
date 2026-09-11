@@ -1,0 +1,72 @@
+{
+ "generator": "benchmarks/variadic/build_corpus.py",
+ "seed": 0,
+ "count": 192,
+ "weights": {
+  "S": 0.35,
+  "M": 0.4,
+  "L": 0.15,
+  "XL": 0.1
+ },
+ "band_counts": {
+  "S": 67,
+  "M": 77,
+  "L": 29,
+  "XL": 19
+ },
+ "sources": {
+  "gsm8k": {
+   "path": "/workspace/exl3-variadic/corpora/gsm8k-test.jsonl",
+   "sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+   "rows": 1319
+  },
+  "humaneval": {
+   "path": "/workspace/exl3-variadic/corpora/HumanEval.jsonl",
+   "sha256": "1d49078ba3e2b196b9344535bef34a43021f038fad9561d6ee7c53450609a6a2",
+   "rows": 164
+  },
+  "sonnet": {
+   "path": "/workspace/exl3-variadic/corpora/sonnet.txt",
+   "sha256": "d58663195ba6780da5f029b920c7ac00cad1e435ee1df7e03bf9ec2470f8dea4",
+   "lines": 518
+  }
+ },
+ "rules": {
+  "L_block_lines_mid": 75,
+  "L_block_lines_range": [
+   56,
+   94
+  ],
+  "L_target_chars": 3200,
+  "XL_k_mid": 20,
+  "XL_target_chars": 9000
+ },
+ "realised_chars": {
+  "L": {
+   "n": 29,
+   "min": 2605,
+   "median": 3171,
+   "max": 4262
+  },
+  "M": {
+   "n": 77,
+   "min": 130,
+   "median": 372,
+   "max": 1167
+  },
+  "S": {
+   "n": 67,
+   "min": 84,
+   "median": 210,
+   "max": 493
+  },
+  "XL": {
+   "n": 19,
+   "min": 7217,
+   "median": 9569,
+   "max": 11044
+  }
+ },
+ "corpus_sha256": "b52ef36ccb1ac564f66f81eae988ef466ea90fea4132d28d3ae5e88d31382352",
+ "note": "The first 144 prompts are identical to corpus-manifest.json (deterministic seed). The extra 48 prompts extend the corpus so c32 has enough requests for warmup plus measured output. Band character statistics transcribed from results.txt lines 330-333, which record min/p50/max but not mean."
+}

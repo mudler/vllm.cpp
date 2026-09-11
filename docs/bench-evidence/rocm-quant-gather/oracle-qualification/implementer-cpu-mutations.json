@@ -1,0 +1,21 @@
+{
+  "authority": "Parent explicitly authorized helper CPU mutation executions after initial root-only runtime delegation",
+  "results": [
+    {
+      "name": "remove-copy-consumption",
+      "exit_code": 1,
+      "seconds": 0.003428966971114278,
+      "observed_failure": "RECURRENT FAILED: consumed recurrent copy has no storage",
+      "log_sha256": "4e8244705d4f9ad1452e20f6da015daf84f88fc0db83795b12712e7d27f01076"
+    },
+    {
+      "name": "corrupt-copy-indices",
+      "exit_code": 1,
+      "seconds": 0.0035978900268673897,
+      "observed_failure": "RECURRENT FAILED: recurrent state or reused copy allocation changed",
+      "log_sha256": "2200cb88bf7a47788357bfe6f8a52b767bce595ddcbb2d42be1b9527a618cb1b"
+    }
+  ],
+  "all_frozen_inputs_unchanged": true,
+  "gpu_work": false
+}

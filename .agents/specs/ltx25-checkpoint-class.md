@@ -445,7 +445,7 @@ Both are behaviour changes on shipped, gated arms and belong to their own rows.
      literal `*` characters for every `lfs.oid` and `xetHash`, so this needs an
      authenticated fetch — and, unlike the header in 2.4, a digest needs the
      whole 42 GB, so an authenticated RANGE request does not reach it. Owned by
-     [#1048](https://github.com/mudler/vllm.cpp/issues/1048).
+     ISSUE-GH-1048.
   3. **A payload-level signature.** Unknown, and now known to be the ONLY place
      left to look. Section 2.4 made the header half of the diff the earlier
      draft of this bullet said was unavailable, and it came back empty: the two

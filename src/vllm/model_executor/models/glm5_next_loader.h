@@ -114,6 +114,7 @@
 #define VLLM_MODEL_EXECUTOR_MODELS_GLM5_NEXT_LOADER_H_
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -240,6 +241,9 @@ struct Glm5NextMlpWeights {
 // `Glm5NextTextMoE` (`:186-208`): 288 routed experts at top-8 through a
 // sigmoid `noaux_tc` router, plus ONE shared expert.
 struct Glm5NextMoeWeights {
+  // Captured at load, using the same placement as bank residency. Absent on
+  // hand-built fixtures, which retain caller-device execution.
+  std::optional<vt::DeviceType> compute_device;
   // `Glm5NextTextTopkRouter.weight` [num_experts, hidden].
   //
   // **f32, and upstream is the one who says so**, not this port: the router

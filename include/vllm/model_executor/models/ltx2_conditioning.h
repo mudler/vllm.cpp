@@ -55,19 +55,27 @@ namespace vllm {
 // LatentState (types.py:251-287) at batch 1, carrying only the fields a
 // conditioning item touches.
 //
-// `attention_mask` is deliberately absent, and the reason is a fact about the
-// ported items rather than a simplification. Both appending VIDEO items pass a
-// literal `attention_mask=None` (keyframe_cond.py:68-76,
-// reference_video_cond.py:88-96), and `update_attention_mask` returns None when
-// its argument is None and the state carries no mask
-// (conditioning/mask_utils.py:110-143). The ONLY upstream route to a non-None
-// mask is `ConditioningItemAttentionStrengthWrapper`, whose sole application
-// site is the IC-LoRA path (ltx-pipelines/iclora_utils.py:169);
+// `attention_mask` WAS deliberately absent until row LTX25-IC-LORA-REF-VIDEO
+// (#3020), and the argument for its absence is kept rather than deleted because
+// it was correct and this row is exactly what made it false.
+//
+// It read: both appending VIDEO items pass a literal `attention_mask=None`
+// (keyframe_cond.py:68-76, reference_video_cond.py:88-96), and
+// `update_attention_mask` returns None when its argument is None and the state
+// carries no mask (conditioning/mask_utils.py:110-143). The ONLY upstream route
+// to a non-None mask is `ConditioningItemAttentionStrengthWrapper`, whose sole
+// application site is the IC-LoRA path (ltx-pipelines/iclora_utils.py:169);
 // `combined_image_conditionings` (ltx-pipelines/utils/helpers.py:272-308), which
-// is the route this engine mirrors, never wraps. So a field here would be one no
-// ported item can populate — the unpassed-parameter shape .agents/reachability.md
-// enumerates. An item that DID need one would have to grow this struct rather
-// than silently dropping it, which is why the omission is stated here.
+// is the route this engine mirrored, never wraps. So a field here would have been
+// one no ported item could populate — the unpassed-parameter shape
+// .agents/reachability.md enumerates — and the note ended: an item that DID need
+// one would have to grow this struct rather than silently dropping it.
+//
+// #3020 is that item. `iclora_utils.py:162-169` is now REACHED: the reference
+// item is built and, when a conditioning attention mask was supplied, wrapped.
+// The field below is what the wrapper writes, and `ltx2_video.cpp` hands it to
+// `Ltx2ModalityInput::attention_mask` — whose whole consumption chain existed
+// and was assigned only from a test helper before this row.
 // `GeneratedKeyframeLayout` (types.py:220-247): where a state's generated
 // keyframe slot tokens live, and what they represent.
 //
@@ -110,6 +118,35 @@ struct Ltx2LatentState {
   // state that grows is a marker that silently stops describing it, and nothing
   // about the render's SHAPE can see the difference.
   std::vector<float> keyframes_mask;
+
+  // `LatentState.attention_mask` (types.py:251-287), a DENSE [tokens, tokens]
+  // STRENGTH mask in [0, 1]. EMPTY is upstream's `None`, which every state
+  // carries until an item wraps.
+  //
+  // DENSE and not the key-only broadcast form. `build_attention_mask` returns
+  // (B, N+M, N+M) unconditionally (mask_utils.py:220), and the block structure
+  // it fills is not expressible as one row: the noisy rows and the prior-ref
+  // rows get DIFFERENT values in the same column (`:236` against `:242`).
+  //
+  // GROWS WITH THE SEQUENCE, and that is the trap. An item that appends tokens
+  // without extending this leaves a mask the DiT reads as the key-only form —
+  // legal, differently shaped, and silently masking the wrong axis. That is why
+  // `Ltx2PadAttentionMaskForUnmaskedTokens` exists and why it is upstream's own
+  // answer at mask_utils.py:141-156 rather than a defensive addition here.
+  std::vector<float> attention_mask;
+
+  // `latent_tools.target_shape.token_count()`, which every appending item hands
+  // `update_attention_mask` as `num_noisy_tokens` (keyframe_cond.py:71,
+  // reference_video_cond.py:89). It is the count BEFORE any item ran, and it is
+  // NOT `tokens` once one has: rows between `noisy_tokens` and `tokens` are
+  // PRIOR reference tokens, and the block structure gives them a different value
+  // from the noisy rows in the same column (mask_utils.py:236 against `:242`).
+  //
+  // Carried on the state because this engine's phase loop rebuilds an
+  // `Ltx2LatentState` per item from a running `StreamState`, so `tokens` has
+  // already grown by the time the second item is applied and cannot stand in.
+  // Zero means "no mask can be built", which is what an audio state carries.
+  int64_t noisy_tokens = 0;
 
   // `LatentState.generated_keyframe_layout` (types.py:246). Default-constructed
   // is upstream's `None`, and `Ltx2ConditionVideoByGeneratedKeyframeSlots`

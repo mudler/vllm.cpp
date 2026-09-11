@@ -345,7 +345,7 @@ re-run.
 
   If 2 still dies, the next instrument is a backtrace at `CudaBackend::Alloc`,
   which is how #1380 was located and is exactly what
-  [#2037](https://github.com/mudler/vllm.cpp/issues/2037) exists to make
+  ISSUE-GH-2037 exists to make
   unnecessary. `VT_POOL_STATS` cannot substitute: it prints per-pool totals at
   destruction, after the engine is already dead, and names no class.
 - The seven decode drivers with no capture pre-grow at all —
@@ -354,8 +354,8 @@ re-run.
   [#2036](https://github.com/mudler/vllm.cpp/issues/2036) (D4).
 - `sanitize-cpu` disabling the `DevicePool` on both lanes, so neither sanitizer
   executes the pool at all and this wave's gate is not exercised there —
-  [#2059](https://github.com/mudler/vllm.cpp/issues/2059).
+  ISSUE-GH-2059.
 - The fatal handler prints `e.what()` and no backtrace while
   `include/vllm/v1/engine/core_client.h:63` promises "See stack trace (above)",
   which is why #2029 and #2028 were both expensive to chase —
-  [#2037](https://github.com/mudler/vllm.cpp/issues/2037).
+  ISSUE-GH-2037.

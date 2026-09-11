@@ -44,7 +44,7 @@ TEMP=${TEMP:-0.6}
 TOPP=${TOPP:-0.95}
 TOPK=${TOPK:-20}
 SEED=${SEED:-0}
-CORPUS_COUNT=${CORPUS_COUNT:-144}  # >= NPROMPTS + max warmup
+CORPUS_COUNT=${CORPUS_COUNT:-192}  # >= NPROMPTS + max warmup
 CORPUS_SEED=${CORPUS_SEED:-0}
 
 # --- our engine's serving configuration ---

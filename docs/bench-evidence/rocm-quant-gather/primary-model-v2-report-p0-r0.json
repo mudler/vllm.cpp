@@ -1,0 +1,49 @@
+{
+  "model": {
+    "bytes": 944192,
+    "sha256": "663597e28852d64097f7a67542675e4575ee158d3c5e6e2143aadd1b4188f4af"
+  },
+  "config": {
+    "bytes": 974,
+    "sha256": "919812c5a2a3cfae586873cc965f0f4b33179a7ca96b8d8b1afcdac88afca71e"
+  },
+  "primary_pin": "e126687a9a828d513c01a07cd69f025f27d63280",
+  "plugin_pin": "d4c1f0d082fc7cd4350da56689109a01c1f29d6c",
+  "prompt": [
+    1,
+    0,
+    63,
+    127,
+    63
+  ],
+  "repeat": 0,
+  "tokens": [],
+  "requested": {
+    "model_dtype": "auto from bfloat16 config",
+    "block_size": 16,
+    "num_gpu_blocks_override": 4,
+    "max_model_len": 64,
+    "max_num_seqs": 1,
+    "kv_cache_dtype": "auto",
+    "seed": 1380926285,
+    "greedy": true,
+    "ignore_eos": true,
+    "max_tokens": 4,
+    "stop": [],
+    "stop_token_ids": []
+  },
+  "harness_adaptations": [
+    "pre-tokenized IDs with skip_tokenizer_init=True",
+    "explicit local HF text config mirrors GGUF geometry",
+    "no oracle patch or eager-mode override"
+  ],
+  "status": "PENDING: primary model refused before qualification",
+  "torch": "2.12.0+git6bbd260",
+  "torch_git": "6bbd26020da1c6dc198625dfcdd968b1e4e6b1c5",
+  "hip": "7.2.53211",
+  "vllm": "0.28.1rc1.dev132+ge126687a9",
+  "plugin": "0.0.5+d4c1f0d.gfx1100",
+  "exception_type": "TypeError",
+  "exception": "Invalid type of HuggingFace config. Expected type: <class 'vllm.transformers_utils.configs.qwen3_5.Qwen3_5Config'>, but found type: <class 'vllm.transformers_utils.configs.qwen3_5.Qwen3_5TextConfig'>",
+  "traceback": "Traceback (most recent call last):\n  File \"/home/vikash/.cache/rdna3-gather-impl/primary-model-v1/primary_model.py\", line 52, in main\n    model = LLM(model=str(args.model), hf_config_path=str(args.config),\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/entrypoints/llm.py\", line 343, in __init__\n    self.llm_engine = LLMEngine.from_engine_args(\n                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/v1/engine/llm_engine.py\", line 179, in from_engine_args\n    return cls(\n           ^^^^\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/v1/engine/llm_engine.py\", line 91, in __init__\n    self.renderer = renderer = renderer_from_config(self.vllm_config)\n                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/renderers/registry.py\", line 88, in renderer_from_config\n    return RENDERER_REGISTRY.load_renderer(renderer_mode, config, tokenizer)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/renderers/registry.py\", line 70, in load_renderer\n    return renderer_cls(config, tokenizer)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/renderers/hf.py\", line 916, in __init__\n    super().__init__(config, tokenizer)\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/renderers/base.py\", line 127, in __init__\n    self.mm_processor = mm_registry.create_processor(\n                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/multimodal/registry.py\", line 237, in create_processor\n    return factories.build_processor(ctx, cache=cache)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/multimodal/registry.py\", line 95, in build_processor\n    return self.processor(info, dummy_inputs_builder, cache=cache)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/multimodal/processing/processor.py\", line 1049, in __init__\n    self.data_parser = self.info.get_data_parser()\n                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/model_executor/models/qwen3_vl.py\", line 929, in get_data_parser\n    self.get_hf_config().vision_config.spatial_merge_size,\n    ^^^^^^^^^^^^^^^^^^^^\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/model_executor/models/qwen3_5.py\", line 108, in get_hf_config\n    return self.ctx.get_hf_config(Qwen3_5Config)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/multimodal/processing/context.py\", line 140, in get_hf_config\n    raise TypeError(\nTypeError: Invalid type of HuggingFace config. Expected type: <class 'vllm.transformers_utils.configs.qwen3_5.Qwen3_5Config'>, but found type: <class 'vllm.transformers_utils.configs.qwen3_5.Qwen3_5TextConfig'>\n"
+}

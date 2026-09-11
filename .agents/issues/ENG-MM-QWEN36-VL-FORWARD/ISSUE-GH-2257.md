@@ -1,0 +1,23 @@
+ID: ISSUE-GH-2257
+Title: **The four Qwen3.5/3.6 VL greedy drivers have no production caller: `ModelRegistry::Forward` cannot route an image or video request to any of them.** `Qwen3_5VLGenerateGreedy`, `Qwen3_5VLGenerateGreedyVideo`, `Qwen3_5MoeVLGenerateGreedy` and `Qwen3_5MoeVLGenerateGreedyVideo` are DEFINED at `src/vllm/model_executor/models/qwen3_5.cpp:9892,9915,9960,9974` and declared in `qwen3_5.h` / `qwen3_5_dense.h`; a grep for the four names over `src/ include/ examples/ tools/ benchmarks/` returns those four definitions and their six declaration lines and NOTHING else, so **every caller is in `tests/`**. The registered factories for `Qwen3_5ForConditionalGeneration` and `Qwen3_5MoeForConditionalGeneration` (`REGISTER_VLLM_MODEL`, `qwen3_5_dense.cpp:283`) route the forward to `ForwardQwen3_5Dense`, which takes a `ModelForwardInput` and carries no multimodal hook, and `ModelRegistry::Forward` additionally refuses a non-null `multi_kv` (`model_registry.cpp:428-440`) that this architecture's three cache groups make the runner set. The tree already states the same condition for the sibling 4B driver at `include/vllm/entrypoints/openai/chat_mm.h:266-267` — the M2c driver "runs it standalone, outside `ModelRegistry::Forward`". So M3-b image and M3d video are gated e2e and correct, and **no user arrives at them**, which by AGENTS.md `## Nothing lands dead` makes every change inside `VLGenerateCoreGdn` or below it reached by a test and by nothing else. FOUND, not caused, while landing W5d-2 of [#2249](https://github.com/mudler/vllm.cpp/issues/2249), which gave `BuildMropeCosSinHost` external linkage: that wave's `## Owed` entry in `.agents/specs/qwen4-exp-flash-next.md` has to name who owns the hop above its call sites, and nothing tracked this gap. The condition PREDATES the extraction and is unchanged by it in either direction. Owned by `ENG-MM-QWEN36-VL-FORWARD`, which owns `BuildMropeCosSinHost`, the shared `VLGenerateCoreGdn` and the two 27B dense drivers; the two MoE drivers additionally sit under `MODEL-MM-qwen3-5-qwen3-5-moe-for-conditional-generation` and [#891](https://github.com/mudler/vllm.cpp/issues/891)
+Row: ENG-MM-QWEN36-VL-FORWARD
+State: UNKNOWN
+Kind: bug
+GitHub: 2257
+Mirror: MISSING
+Availability: METADATA_ONLY
+Created: UNKNOWN
+Updated: UNKNOWN
+Closed: UNKNOWN
+
+## Problem
+
+Archive: `.agents/completed/issue-index.md:888`
+
+### Frozen archive evidence
+
+> | [#2257](https://github.com/mudler/vllm.cpp/issues/2257) | `ENG-MM-QWEN36-VL-FORWARD` | **The four Qwen3.5/3.6 VL greedy drivers have no production caller: `ModelRegistry::Forward` cannot route an image or video request to any of them.** `Qwen3_5VLGenerateGreedy`, `Qwen3_5VLGenerateGreedyVideo`, `Qwen3_5MoeVLGenerateGreedy` and `Qwen3_5MoeVLGenerateGreedyVideo` are DEFINED at `src/vllm/model_executor/models/qwen3_5.cpp:9892,9915,9960,9974` and declared in `qwen3_5.h` / `qwen3_5_dense.h`; a grep for the four names over `src/ include/ examples/ tools/ benchmarks/` returns those four definitions and their six declaration lines and NOTHING else, so **every caller is in `tests/`**. The registered factories for `Qwen3_5ForConditionalGeneration` and `Qwen3_5MoeForConditionalGeneration` (`REGISTER_VLLM_MODEL`, `qwen3_5_dense.cpp:283`) route the forward to `ForwardQwen3_5Dense`, which takes a `ModelForwardInput` and carries no multimodal hook, and `ModelRegistry::Forward` additionally refuses a non-null `multi_kv` (`model_registry.cpp:428-440`) that this architecture's three cache groups make the runner set. The tree already states the same condition for the sibling 4B driver at `include/vllm/entrypoints/openai/chat_mm.h:266-267` — the M2c driver "runs it standalone, outside `ModelRegistry::Forward`". So M3-b image and M3d video are gated e2e and correct, and **no user arrives at them**, which by AGENTS.md `## Nothing lands dead` makes every change inside `VLGenerateCoreGdn` or below it reached by a test and by nothing else. FOUND, not caused, while landing W5d-2 of [#2249](https://github.com/mudler/vllm.cpp/issues/2249), which gave `BuildMropeCosSinHost` external linkage: that wave's `## Owed` entry in `.agents/specs/qwen4-exp-flash-next.md` has to name who owns the hop above its call sites, and nothing tracked this gap. The condition PREDATES the extraction and is unchanged by it in either direction. Owned by `ENG-MM-QWEN36-VL-FORWARD`, which owns `BuildMropeCosSinHost`, the shared `VLGenerateCoreGdn` and the two 27B dense drivers; the two MoE drivers additionally sit under `MODEL-MM-qwen3-5-qwen3-5-moe-for-conditional-generation` and [#891](https://github.com/mudler/vllm.cpp/issues/891) | bug |
+
+## Resolution
+
+-

@@ -1,0 +1,40 @@
+WHAT IS COMPARED AGAINST WHAT
+  side A (vllm.cpp)   prompt ids : /workspace/rocm-2957-attrib-20260906/out/rc-worker-lcjhd-20260906T070302Z/ours_prompt_ids.txt  (examples/tokenize on the GGUF's own vocab)
+  side A (vllm.cpp)   gen ids    : /workspace/rocm-2957-attrib-20260906/out/rc-worker-lcjhd-20260906T070302Z/fix_gen_ids_2.json      (vllm-bench --output-token-ids)
+  side B (llama.cpp)  prompt+gen : /workspace/rocm-2957-attrib-20260906/out/rc-worker-lcjhd-20260906T070302Z/oracle_hip.stdout        (oracle-tokens on stock libllama @ b10451)
+  prompts             : /workspace/rocm-2957-attrib-20260906/job/prompts.txt  (6 prompts)
+  tokens per prompt   : 48
+  ORACLE_ADD_BOS = 0
+  ORACLE_DEVICE = 1
+  ORACLE_EOS = 248046
+  ORACLE_N_GPU_LAYERS = 99
+  ORACLE_N_VOCAB = 248320
+  ORACLE_SYSTEM_INFO = ROCm
+  ORACLE_TOKENS_OK = 6
+  ORACLE_USE_EXTRA_BUFTS = 1
+
+PROMPT[0] TOKENIZER MATCH   n=6  'The capital city of France is'
+PROMPT[1] TOKENIZER MATCH   n=5  'The three primary colors are'
+PROMPT[2] TOKENIZER MATCH   n=6  'Water boils at a temperature of'
+PROMPT[3] TOKENIZER MATCH   n=7  'The Pythagorean theorem states that'
+PROMPT[4] TOKENIZER MATCH   n=11  'In 1969, humans first walked on'
+PROMPT[5] TOKENIZER MATCH   n=7  'A prime number is a natural number'
+GEN[0] TOKEN-EXACT      n=48  'The capital city of France is'
+GEN[1] DIVERGE          'The three primary colors are'
+        first differing index 45: vllm.cpp=303 llama.cpp=1521
+        vllm.cpp  [2438, 11, 6105, 11, 321, 13358, 13, 4081, 7736, 513, 6306, 5839, 1521, 781, 4021, 381, 3354, 539, 25936, 975, 7736, 3658, 13, 11746, 11, 781, 513, 1429, 310, 1791, 660, 975, 7736, 13, 198, 5844, 11, 6105, 11, 321, 13358, 513, 279, 5839, 7736, 303, 279, 8343]
+        llama.cpp [2438, 11, 6105, 11, 321, 13358, 13, 4081, 7736, 513, 6306, 5839, 1521, 781, 4021, 381, 3354, 539, 25936, 975, 7736, 3658, 13, 11746, 11, 781, 513, 1429, 310, 1791, 660, 975, 7736, 13, 198, 5844, 11, 6105, 11, 321, 13358, 513, 279, 5839, 7736, 1521, 781, 513]
+GEN[2] TOKEN-EXACT      n=48  'Water boils at a temperature of'
+GEN[3] DIVERGE          'The Pythagorean theorem states that'
+        first differing index 45: vllm.cpp=25 llama.cpp=393
+        vllm.cpp  [303, 264, 1245, 20837, 11, 279, 9057, 314, 279, 2984, 314, 279, 9460, 63414, 784, 318, 1719, 3008, 13600, 279, 1245, 8937, 8, 369, 5951, 310, 279, 2542, 314, 279, 30308, 314, 279, 27396, 314, 279, 975, 1330, 10744, 13, 1061, 4864, 369, 12917, 430, 25, 271, 64]
+        llama.cpp [303, 264, 1245, 20837, 11, 279, 9057, 314, 279, 2984, 314, 279, 9460, 63414, 784, 318, 1719, 3008, 13600, 279, 1245, 8937, 8, 369, 5951, 310, 279, 2542, 314, 279, 30308, 314, 279, 27396, 314, 279, 975, 1330, 10744, 13, 1061, 4864, 369, 12917, 430, 393, 64, 61]
+GEN[4] TOKEN-EXACT      n=48  'In 1969, humans first walked on'
+GEN[5] DIVERGE          'A prime number is a natural number'
+        first differing index 32: vllm.cpp=16 llama.cpp=15
+        vllm.cpp  [6826, 1056, 220, 16, 421, 682, 874, 6572, 3319, 39852, 975, 1056, 220, 16, 321, 4924, 13, 11747, 411, 7044, 11, 7995, 3315, 220, 16, 11, 15, 15, 15, 11, 15, 15, 16, 369, 264, 9944, 1324, 539, 39664, 1141, 47707, 3047, 13, 271, 1206, 7995, 3315, 220]
+        llama.cpp [6826, 1056, 220, 16, 421, 682, 874, 6572, 3319, 39852, 975, 1056, 220, 16, 321, 4924, 13, 11747, 411, 7044, 11, 7995, 3315, 220, 16, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15, 15, 11, 15, 15]
+
+TOKENIZER_DIVERGENCES=0/6
+GENERATION_DIVERGENCES=3/6
+TOKEN_GATE=FAIL

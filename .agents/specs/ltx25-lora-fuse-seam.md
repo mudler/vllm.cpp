@@ -349,7 +349,7 @@ Recorded in `.agents/benchmark-record.md` under this row.
 
 | Issue | Lever | State |
 |---|---|---|
-| [#1254](https://github.com/mudler/vllm.cpp/issues/1254) | the bf16 add-back loop, now 59% of a fused tensor; `vt::Add` has the contract, the f32 branch does not fit it | owed, MEASURED at 0.0733 s of a 0.1242 s call |
+| ISSUE-GH-1254 | the bf16 add-back loop, now 59% of a fused tensor; `vt::Add` has the contract, the f32 branch does not fit it | owed, MEASURED at 0.0733 s of a 0.1242 s call |
 | [#1210](https://github.com/mudler/vllm.cpp/issues/1210) | the two-stage rebind still fuses, un-fuses and re-fuses; this row shrinks the constant and leaves the round trip | owed by [`ltx25-decode-speed.md`](ltx25-decode-speed.md), restated here because this row is why the constant changed |
 
 Not owed here, and named so a reader does not go looking: the GB10-to-x86

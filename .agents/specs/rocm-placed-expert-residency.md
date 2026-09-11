@@ -76,12 +76,11 @@ Five facts, each read off the tree at the base SHA or off the board:
 3. **The loader asks the wrong device about a placed tower.** The one policy is
    `GgufLoadPolicy::FromEnv(source.device)` (`glm_moe_dsa_registry.cpp:80`), and
    `Route` hands `policy.device` straight to `RouteGgufTensor`
-   (`gguf_keep_quant.cpp:401-408`). `DeviceKeepQuantSupported` serves exactly
-   {Q8_0, Q4_K, Q5_K, Q6_K} on ROCm (`gguf_keep_quant.cpp:135-147`), so every
-   IQ1_S / IQ2_XXS / IQ3_XXS / IQ4_XS / Q2_K / Q3_K tower routes to
-   `kExpandBf16` and `LoadStackedExperts` refuses by name
-   (`glm_moe_dsa_loader.cpp:392-400`) — for a tower the plan has already
-   decided will execute on the CPU and whose bytes will never touch the GPU.
+   (`gguf_keep_quant.cpp:401-408`). `DeviceKeepQuantSupported` now keeps
+   IQ1_S, IQ2_XXS, IQ3_XXS, Q2_K, and Q3_K quantized on ROCm. IQ4_XS still
+   routes to `kExpandBf16`, so `LoadStackedExperts` can refuse that tower by
+   name (`glm_moe_dsa_loader.cpp:392-400`) after the plan has already selected
+   the CPU. Its bytes never touch the GPU.
 
 4. **The fit check ignores the plan installed 220 lines above it.**
    `InstallMoePlacementPlan` runs at `model_loader.cpp:2672`,
@@ -193,9 +192,9 @@ no block index, and on an out-of-range block.
   synthetic file whose numbers straddle the budget. RED before (the parameter
   does not exist).
 - The #2516 case is re-pointed from `CurrentPlatform().device_type()` to the
-  two devices it is actually about: `kCPU` routes IQ towers `kKeepQuant`, and
-  `kROCM` routes them `kExpandBf16`. Platform-independent, and it PINS the
-  ROCm gap #1940 owns instead of failing over it.
+  two devices it is actually about. `kCPU` keeps the IQ2_XS and IQ4_XS fixture
+  towers quantized. `kROCM` expands both. The case pins the two remaining gaps
+  that #1940 owns.
 
 **Reachability (`.agents/reachability.md`).** The production entry point is
 `vllm_engine_load` → `ModelLoader::FromModelDir`'s GGUF branch. The mutation

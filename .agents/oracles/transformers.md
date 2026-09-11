@@ -179,7 +179,25 @@ fleet device, and the field means what `## Gateability` says it means.
 See [`../specs/qwen4-exp-flash-next.md`](../specs/qwen4-exp-flash-next.md)
 `## Oracles`.
 
-## Lane exception: `glm5_next` (`MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, [#2096](https://github.com/mudler/vllm.cpp/issues/2096))
+## EXPIRED lane exception: `glm5_next` (`MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, [#2096](https://github.com/mudler/vllm.cpp/issues/2096))
+
+Expired on 3 September 2026 under its own registration condition. vLLM merged
+[PR #53906](https://github.com/vllm-project/vllm/pull/53906) at
+`98ed0856f31fa3aaf5e27464e2b4ef5a8ee6b2f5`. Its registry names
+`Glm5NextForCausalLM`, `Glm5NextForConditionalGeneration`, and
+`Glm5NextMTPModel`.
+
+vLLM now defines the algorithm. The transformers lane retains its historical
+pin for component evidence, preprocessing, and checkpoint interpretation.
+The global vLLM parity pin stays at `e126687a9a`, which predates registration.
+The merged source is not an accepted parity denominator. Real-model
+gateability remains `PENDING` under campaign issue #1998.
+The [reconciliation spec](../specs/glm5-next-upstream-reconciliation.md)
+records the source and test surfaces, tracked by
+[#3045](https://github.com/mudler/vllm.cpp/issues/3045).
+
+The original lane record follows. Its absence and fleet-capacity statements
+describe the August investigation, not a current search or a permanent limit.
 
 **This is the SECOND application of the exception the developer accepted on
 2026-08-26, not a new one and not a separately accepted one.** The `qwen4_exp`
@@ -251,6 +269,9 @@ pin_label = 5.16.1
 pinned_on = 2026-08-27
 accepted_by = precedent, the qwen4_exp lane exception the developer accepted 2026-08-26; NOT a fresh acceptance
 expires = when vLLM registers glm5_next
+expired_on = 2026-09-03
+expired_by = vllm-project/vllm 98ed0856f31fa3aaf5e27464e2b4ef5a8ee6b2f5 ([Model] add GLM-5.3-Flash support #53906)
+expiry_record = https://github.com/mudler/vllm.cpp/issues/3045
 gateable = no
 gateable_reason = no oracle has ever run this model, and none can on this fleet; the reference needs 305.78 GiB (FP8) or 598.5 GiB (BF16) resident and the largest reachable device is dgx:gpu0 at ~119.63 GiB. Owed as O1 by https://github.com/mudler/vllm.cpp/issues/1998
 owner_row = MODEL-MM-glm5-next-glm5-next-for-conditional-generation

@@ -2980,6 +2980,19 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // enumeration lives elsewhere is not accounted against qwen3_5's.
     if (vllm::IsQwen3_5Gguf(gguf)) {
       vllm::RefuseUnaccountedQwen3_5Gguf(gguf, config);
+      // KEEPQUANT W4a wave-3b-2 (#3030): the accounting above deliberately
+      // PASSES a declared head, because its tensors ARE enumerated as
+      // expected — and the trunk-only load below then leaves them unread.
+      // Say so, by name, before any weight byte moves. The one config that
+      // reads the head is speculative method "mtp" (the attach below); on
+      // every other run the skip is real and the line is its record. The
+      // pinned llama.cpp b10451 oracle ignores the same tensors, so a gate
+      // against it is matched work only with this skip loud.
+      const bool mtp_head_loads = params.speculative_config.has_value() &&
+                                  params.speculative_config->method == "mtp";
+      if (!mtp_head_loads) {
+        vllm::LogQwen3_5GgufMtpHeadSkip(gguf, config);
+      }
     }
     // LOAD-GGUF-MMPROJ (#821): the SECOND file. Opened, validated and READ
     // here — after the architecture resolve and the device-fit refusal, and

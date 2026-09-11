@@ -697,6 +697,31 @@ class DuplicateLiveIdTests(unittest.TestCase):
             dupes["BACKEND-CPU"], ["backend-matrix.md:12", "feature-matrix.md:40"]
         )
 
+    def test_feature_backend_summaries_are_nonclaimable_projections(self):
+        backend_ids = {
+            "BACKEND-CPU",
+            "BACKEND-CUDA-SM121",
+            "BACKEND-ROCM",
+            "BACKEND-VULKAN",
+        }
+        errors: list[str] = []
+        canonical = {
+            row.item_id
+            for row in audit.record.parse_claim_rows(
+                audit.record.AGENTS / "backend-matrix.md", errors
+            )
+        }
+        projected = {
+            row.item_id
+            for row in audit.record.parse_claim_rows(
+                audit.record.AGENTS / "feature-matrix.md", errors
+            )
+        }
+
+        self.assertEqual(errors, [])
+        self.assertTrue(backend_ids <= canonical)
+        self.assertTrue(backend_ids.isdisjoint(projected))
+
 
 class GateWiringTests(unittest.TestCase):
     def test_preflight_runs_the_audit_suite(self):

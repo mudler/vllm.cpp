@@ -15,7 +15,16 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+// rocWMMA int8 tile arm (KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4, issue #2109),
+// gfx1200/gfx1201 (RDNA4) only — same gate rocm_paged_attn.hip already uses
+// for its own WMMA arm, and the same reason: a fat build also emits other
+// gfx12 targets (for example gfx1036) that must not see this include.
+#if defined(__gfx1200__) || defined(__gfx1201__)
+#include <rocwmma/rocwmma.hpp>
+#define VT_ROCM_QUANT_WMMA_OK 1
+#endif
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -28,8 +37,12 @@
 
 #include "vt/grow_only_stream_scratch.h"
 #include "vt/ops.h"
+#include "vt/rocm/rocm_act_quant.h"
+#include "vt/rocm/rocm_arch.h"
 #include "vt/rocm/rocm_device_bind.h"
 #include "vt/rocm/rocm_f16_codec.h"
+#include "vt/rocm/rocm_mmvq_policy.h"
+#include "vt/rocm/rocm_norm_quant_bridge.h"
 #include "vt/rocm/rocm_runtime.h"
 
 // Block layouts — the single source of truth (ggml-common.h mirrors).
@@ -46,11 +59,7 @@ using vt::cpu::BlockQ6_K;
 using vt::cpu::kQK8_0;
 using vt::cpu::kQK_K;
 
-enum class ActDT : int { kF32 = 0, kF16 = 1, kBF16 = 2 };
 using Q8KKernelWitnessCount = unsigned long long;
-inline ActDT ActDtOf(DType dt) {
-  return dt == DType::kF32 ? ActDT::kF32 : dt == DType::kF16 ? ActDT::kF16 : ActDT::kBF16;
-}
 
 // ---- device numeric helpers ----
 // The four half/bfloat16 conversions moved to `vt/rocm/rocm_f16_codec.h`
@@ -58,18 +67,6 @@ inline ActDT ActDtOf(DType dt) {
 // the trellis decode. They are unchanged, and they are still the bit-exact
 // transcriptions of `vt::F16ToF32` / `vt::F32ToF16` rather than the hardware
 // conversion intrinsics; a second copy is what moving them avoided.
-__device__ inline int DNearestInt(float fval) {
-  float val = fval + 12582912.0f;
-  int i = __float_as_int(val);
-  return (i & 0x007fffff) - 0x00400000;
-}
-__device__ inline float DLoadAct(const void* base, ActDT dt, int64_t idx) {
-  switch (dt) {
-    case ActDT::kF32: return static_cast<const float*>(base)[idx];
-    case ActDT::kF16: return DF16ToF32(static_cast<const uint16_t*>(base)[idx]);
-    default: return DBF16ToF32(static_cast<const uint16_t*>(base)[idx]);
-  }
-}
 __device__ __forceinline__ int GetIntB2(const int8_t* qs, int i32) {
   const uint16_t* x16 = reinterpret_cast<const uint16_t*>(qs);
   return static_cast<int>(x16[2 * i32 + 0]) | (static_cast<int>(x16[2 * i32 + 1]) << 16);
@@ -120,30 +117,7 @@ __global__ void QuantizeQ8KK(BlockQ8_K* __restrict__ scratch, const void* __rest
   if (t == 0 && kernel_witness != nullptr) atomicAdd(&kernel_witness[0], 1ULL);
   const int64_t i = t / nsb;
   const int64_t sb = t % nsb;
-  const int64_t elem0 = i * a_rs + sb * kQK_K;
-  float mx = 0.0f, amax = 0.0f;
-  for (int j = 0; j < kQK_K; ++j) {
-    const float ax = fabsf(DLoadAct(a, adt, elem0 + j));
-    if (ax > amax) { amax = ax; mx = DLoadAct(a, adt, elem0 + j); }
-  }
-  BlockQ8_K& y = scratch[t];
-  if (amax == 0.0f) {
-    y.d = 0.0f;
-    for (int j = 0; j < kQK_K; ++j) y.qs[j] = 0;
-    for (int g = 0; g < kQK_K / 16; ++g) y.bsums[g] = 0;
-    return;
-  }
-  const float iscale = -127.0f / mx;
-  for (int j = 0; j < kQK_K; ++j) {
-    const int v = DNearestInt(iscale * DLoadAct(a, adt, elem0 + j));
-    y.qs[j] = static_cast<int8_t>(v < 127 ? v : 127);
-  }
-  for (int g = 0; g < kQK_K / 16; ++g) {
-    int sum = 0;
-    for (int ii = 0; ii < 16; ++ii) sum += y.qs[g * 16 + ii];
-    y.bsums[g] = static_cast<int16_t>(sum);
-  }
-  y.d = 1.0f / iscale;
+  QuantQ8KSBlock(scratch[t], a, adt, i * a_rs + sb * kQK_K);
 }
 
 // Q8_K (block-per-256-superblock): cuda_quant_dot.cu
@@ -380,6 +354,411 @@ __device__ inline int DotQ6KIsumRange(const BlockQ6_K* xb, const BlockQ8_K* yb, 
   return isum;
 }
 
+// Reconstructs the 16 RAW (unscaled) int8 weights of Q6_K scale-group `grp`
+// (`grp` in [0, kQK_K/16) == [0, 16)).
+// Bit-identical to `DotQ6KIsumRange`'s own reconstruction: `grp = g*2 + t`
+// selects the same 32-wide sub-block `g` and the same upper/lower 16-wide
+// half `t` that function already walks, just returning the 16 values instead
+// of folding them into a dot product. Kept beside it rather than expressed as
+// a call into it, because that function accumulates over a *range* of groups
+// and has no seam to hand back one group's raw values without either
+// widening its contract or adding a second exit path to it.
+//
+// Guarded by VT_ROCM_QUANT_WMMA_OK (only the WMMA kernel body below calls it):
+// on the host pass and on every non-gfx1200/gfx1201 device pass that body
+// takes its stub branch, which would leave this genuinely unused and trip
+// -Werror,-Wunused-function.
+#if defined(VT_ROCM_QUANT_WMMA_OK)
+__device__ inline void DequantQ6KGroup16(const BlockQ6_K* xb, int grp, int8_t out[16]) {
+  const int g = grp >> 1;
+  const int t = grp & 1;
+  const uint8_t* q4 = xb->ql + (g / 4) * 64;
+  const uint8_t* qh = xb->qh + (g / 4) * 32;
+  const int r = g & 3;
+  const uint8_t* q4b = q4 + ((r & 1) ? 32 : 0);
+  const int nib_shift = (r >= 2) ? 4 : 0;
+  const int qh_shift = 2 * r;
+#pragma unroll
+  for (int k = 0; k < 16; ++k) {
+    const int l = t * 16 + k;
+    out[k] = static_cast<int8_t>(
+        static_cast<int8_t>(((q4b[l] >> nib_shift) & 0xF) | (((qh[l] >> qh_shift) & 3) << 4)) - 32);
+  }
+}
+#endif  // VT_ROCM_QUANT_WMMA_OK
+
+// --- RDNA4 WMMA int8 tile arm of KQuantGemmK (KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4,
+// issue #2109). Q6_K only in this first cut: the row's spec lists Q4_K/Q5_K —
+// same shape, same 16-wide-group scale layout — as `## Owed` to a follow-up
+// commit, and M/N tail handling (m or n not a multiple of 16) as owed to
+// whoever generalizes the launch site below.
+//
+// One warp computes one 16x16 tile of `out[i0:i0+16, j0:j0+16]`. Q6_K's 256-
+// element superblock has exactly `kQK_K/16 == 16` independent int8 scales
+// (one per 16-wide group), which is exactly one WMMA K-tile (`WK == 16`), so
+// each group maps to one `mma_sync` with no ragged remainder — the spec's
+// `## Design` calls this out as the reason 16 was the tile width chosen.
+//
+// The scale is per (weight row, group), so it cannot be folded into the int8
+// operands ahead of the tensor-core op without overflowing int8 (a 6-bit
+// scale times a 6-bit dequant already exceeds it). It is applied in an
+// epilogue instead, exactly like the scalar `DotQ6KIsumRange` arm: the raw
+// (unscaled) tile the tensor core produces is staged to shared memory, and
+// every lane folds `isum[i][j] += raw[i][j] * scale[j]` in INTEGER
+// arithmetic. Integer addition is exact and reorders freely, so `isum` here
+// is bit-for-bit the quantity the scalar warp computes; only the
+// superblock's one f32 scale product (`d * isum`, applied once below, same as
+// every other arm in this file) is shared with the rest of the reduction.
+//
+// This first cut bounces every group's raw tile through shared memory before
+// scaling it, which is a known, NOT-yet-measured performance cost (a
+// synchronization and a shared-memory round trip every 16 K-elements) rather
+// than a correctness concern — the row's spec gate (c) (rocprofv3 total
+// kernel time) is not asserted by this commit, and closing it is follow-up
+// work once this mechanism is confirmed correct on-target.
+// Plain integers, never gated by VT_ROCM_QUANT_WMMA_OK: the host launch site
+// below needs kQuantWmmaWarpsPerBlock on every compilation pass, including
+// the host pass, where that macro is never defined; kGroupGemmBatch is
+// shared by every WMMA-format kernel in this file (Q4_K's below included),
+// so it lives at file scope rather than once per kernel body.
+constexpr int kQuantWmmaWarpsPerBlock = 4;
+constexpr int kGroupGemmBatch = 2;
+static_assert(16 % kGroupGemmBatch == 0, "16 scale-groups must divide evenly into batches");
+
+template <typename OutT>
+__global__ void KQuantGemmKWmmaQ6K(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
+                                   const BlockQ8_K* __restrict__ act, int64_t m, int64_t n,
+                                   int64_t nsb, int64_t n_tiles) {
+#if !defined(VT_ROCM_QUANT_WMMA_OK)
+  // Compiled for a target other than gfx1200/gfx1201, or for the host pass:
+  // never launched there (`Gfx12QuantWmmaHostOk` gates every launch site
+  // below on the actual device's runtime gcnArchName, not on this macro —
+  // the macro is only visible to a device compilation pass for gfx1200/
+  // gfx1201 itself, exactly the trap issue #785 already found and fixed for
+  // `rocm_paged_attn.hip`'s own WMMA arm).
+  (void)out; (void)weight; (void)act; (void)m; (void)n; (void)nsb; (void)n_tiles;
+  return;
+#else
+  using namespace rocwmma;
+  const int64_t tile = static_cast<int64_t>(blockIdx.x) * kQuantWmmaWarpsPerBlock +
+                       static_cast<int64_t>(threadIdx.y);
+  const int64_t m_tiles = m / 16;
+  if (tile >= m_tiles * n_tiles) return;
+  const int64_t it = tile / n_tiles;
+  const int64_t jt = tile % n_tiles;
+  const int64_t i0 = it * 16;
+  const int64_t j0 = jt * 16;
+  const int lane = static_cast<int>(threadIdx.x);
+  const int wy = static_cast<int>(threadIdx.y);
+
+  // w_stage holds ALL 16 scale-groups' dequantized tiles for the current
+  // superblock, filled once per superblock rather than once per group: the
+  // first cut synced after every single-group fill (16 barriers/superblock
+  // for that step alone), and every lane sat idle half the time doing it
+  // (only 16 of 32 lanes filled one row each). Spreading the same total work
+  // over all 32 lanes across all 16 groups removes both costs in one change.
+  __shared__ int8_t w_stage[kQuantWmmaWarpsPerBlock][16][16][16];
+  // raw_tile holds kGroupGemmBatch groups' raw WMMA tiles at once, so a
+  // whole batch's compute+store is one barrier and its scale-fold is
+  // another, rather than a barrier per single group each way. 16 KiB
+  // (w_stage) + 8 KiB (this, at batch 2) = 24 KiB/block, comfortably under
+  // the 64 KiB LDS budget this project's other WMMA kernels stay inside
+  // (rocm_paged_attn.hip's own BM=16 BN=64 d=256 note).
+  __shared__ int32_t raw_tile[kQuantWmmaWarpsPerBlock][kGroupGemmBatch][16][16];
+
+  const size_t row_stride = static_cast<size_t>(nsb) * sizeof(BlockQ6_K);
+  const BlockQ6_K* w_row_base[16];
+#pragma unroll
+  for (int r = 0; r < 16; ++r) {
+    w_row_base[r] =
+        reinterpret_cast<const BlockQ6_K*>(weight + static_cast<size_t>(j0 + r) * row_stride);
+  }
+  const BlockQ8_K* a_row0 = act + i0 * nsb;
+
+  float acc_f[8];
+#pragma unroll
+  for (int c = 0; c < 8; ++c) acc_f[c] = 0.0f;
+
+  for (int64_t sb = 0; sb < nsb; ++sb) {
+    const BlockQ6_K* xb_cur[16];
+#pragma unroll
+    for (int r = 0; r < 16; ++r) xb_cur[r] = w_row_base[r] + sb;
+
+    int32_t isum[8];
+#pragma unroll
+    for (int c = 0; c < 8; ++c) isum[c] = 0;
+
+    // One fill for the whole superblock: 16 groups x 16 rows = 256 (row,
+    // group) pairs, 8 per lane, each call still filling that pair's 16
+    // elements via DequantQ6KGroup16 unchanged.
+    for (int t = lane; t < 16 * 16; t += 32) {
+      const int row = t / 16;
+      const int grp2 = t % 16;
+      DequantQ6KGroup16(xb_cur[row], grp2, w_stage[wy][grp2][row]);
+    }
+    __syncthreads();
+
+    // A batch of kGroupGemmBatch groups: every WMMA op in the batch computes
+    // and stores to its OWN slice of raw_tile before the batch's single
+    // barrier, and every group's scale-fold reads back before the batch's
+    // other barrier — replacing what was a barrier PER GROUP each way.
+    for (int gb = 0; gb < 16; gb += kGroupGemmBatch) {
+#pragma unroll
+      for (int gi = 0; gi < kGroupGemmBatch; ++gi) {
+        const int grp = gb + gi;
+        fragment<matrix_a, 16, 16, 16, int8_t, row_major> a_frag;
+        fragment<matrix_b, 16, 16, 16, int8_t, col_major> b_frag;
+        fragment<accumulator, 16, 16, 16, int32_t> acc;
+        fill_fragment(acc, 0);
+        const int8_t* a_ptr = a_row0[sb].qs + grp * 16;
+        const long a_ld = static_cast<long>(nsb) * static_cast<long>(sizeof(BlockQ8_K));
+        load_matrix_sync(a_frag, a_ptr, a_ld);
+        load_matrix_sync(b_frag, &w_stage[wy][grp][0][0], 16);
+        mma_sync(acc, a_frag, b_frag, acc);
+        store_matrix_sync(&raw_tile[wy][gi][0][0], acc, 16, mem_row_major);
+      }
+      __syncthreads();
+
+#pragma unroll
+      for (int gi = 0; gi < kGroupGemmBatch; ++gi) {
+        const int grp = gb + gi;
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+          const int cell = lane + c * 32;
+          const int ii = cell / 16, jj = cell % 16;
+          isum[c] += raw_tile[wy][gi][ii][jj] * static_cast<int32_t>(xb_cur[jj]->scales[grp]);
+        }
+      }
+      __syncthreads();
+    }
+
+#pragma unroll
+    for (int c = 0; c < 8; ++c) {
+      const int cell = lane + c * 32;
+      const int ii = cell / 16, jj = cell % 16;
+      const float d = DF16ToF32(xb_cur[jj]->d) * a_row0[ii * nsb + sb].d;
+      acc_f[c] += d * static_cast<float>(isum[c]);
+    }
+  }
+
+#pragma unroll
+  for (int c = 0; c < 8; ++c) {
+    const int cell = lane + c * 32;
+    const int ii = cell / 16, jj = cell % 16;
+    const int64_t oi = i0 + ii, oj = j0 + jj;
+    if constexpr (sizeof(OutT) == 4) out[oi * n + oj] = acc_f[c];
+    else out[oi * n + oj] = DF32ToBF16(acc_f[c]);
+  }
+#endif  // VT_ROCM_QUANT_WMMA_OK
+}
+
+// --- RDNA4 WMMA int8 tile arm of KQuantGemmK, Q4_K
+// (KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4, issue #2109's `## Owed`). Same mechanism
+// as `KQuantGemmKWmmaQ6K` above (same tile shape, same fill-once-per-
+// superblock staging, same batch-of-`kGroupGemmBatch` store/fold), but Q4_K's
+// layout differs from Q6_K's in two ways this kernel has to carry:
+//
+// 1. Q4_K's nibbles are UNSIGNED (0..15, no -32 recentering — DotQ4K's own
+//    scalar reconstruction has none either, because the "DC offset" a
+//    superblock's values sit at is corrected by the min term below rather
+//    than by centering the nibble itself).
+// 2. Q4_K's scale granularity is 32-wide (`kQK_K/32 == 8` sub-blocks), twice
+//    the 16-wide WMMA K-tile, so `kGroupGemmBatch == 2` batches two K-tiles
+//    per sub-block by CONSTRUCTION here, not by the batch-size tuning
+//    `KQuantGemmKWmmaQ6K`'s spec table recorded — `qsb = gb / kGroupGemmBatch`
+//    is exact for batch 2 and would silently stop being one sub-block if that
+//    constant ever changed independently of this comment.
+//
+// Q4_K also carries a SECOND per-sub-block correction the scalar arm calls
+// `dmin * sumi`: `sumi = sum_g bsums[g] * mins[g/2]` uses the ACTIVATION's
+// already-quantized per-16-group sums (`BlockQ8_K::bsums`) against the
+// WEIGHT's per-32-sub-block mins, and needs no tensor-core work at all — it
+// is 16 integer multiply-adds per output cell, done directly in registers.
+// `isum` (the tensor-core term) and `sumi` (the min term) are kept in
+// SEPARATE integer accumulators for the same reason `KQuantGemmKWmmaQ6K`
+// keeps one: each is exact on its own, and `d * isum - dmin * sumi` is the
+// only float expression, applied once per superblock, matching `DotQ4K`
+// verbatim.
+#if defined(VT_ROCM_QUANT_WMMA_OK)
+__device__ inline void DequantQ4KTile16(const BlockQ4_K* xb, int tile16, int8_t out[16]) {
+  const int sb = tile16 >> 1;
+  const int t = tile16 & 1;
+  const uint8_t* q4b = xb->qs + (sb / 2) * 32;
+  const int shift = (sb & 1) ? 4 : 0;
+#pragma unroll
+  for (int k = 0; k < 16; ++k) {
+    const int e = t * 16 + k;
+    out[k] = static_cast<int8_t>((q4b[e] >> shift) & 0x0F);
+  }
+}
+
+// The packed-scales unpack `DotQ4K`/`DotQ5K` both already do inline; factored
+// out here only because this kernel needs it once per (row, superblock)
+// rather than folded into a single-row dot product.
+__device__ inline void UnpackQ4KScalesMins(const BlockQ4_K* xb, uint8_t scales[8],
+                                           uint8_t mins[8]) {
+  const uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f, kmask3 = 0x03030303;
+  uint32_t utmp[4];
+  memcpy(utmp, xb->scales, 12);
+  utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+  const uint32_t uaux = utmp[1] & kmask1;
+  utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+  utmp[2] = uaux;
+  utmp[0] &= kmask1;
+  const uint8_t* s = reinterpret_cast<const uint8_t*>(&utmp[0]);
+  const uint8_t* mn = reinterpret_cast<const uint8_t*>(&utmp[2]);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    scales[i] = s[i];
+    mins[i] = mn[i];
+  }
+}
+#endif  // VT_ROCM_QUANT_WMMA_OK
+
+template <typename OutT>
+__global__ void KQuantGemmKWmmaQ4K(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
+                                   const BlockQ8_K* __restrict__ act, int64_t m, int64_t n,
+                                   int64_t nsb, int64_t n_tiles) {
+#if !defined(VT_ROCM_QUANT_WMMA_OK)
+  (void)out; (void)weight; (void)act; (void)m; (void)n; (void)nsb; (void)n_tiles;
+  return;
+#else
+  using namespace rocwmma;
+  const int64_t tile = static_cast<int64_t>(blockIdx.x) * kQuantWmmaWarpsPerBlock +
+                       static_cast<int64_t>(threadIdx.y);
+  const int64_t m_tiles = m / 16;
+  if (tile >= m_tiles * n_tiles) return;
+  const int64_t it = tile / n_tiles;
+  const int64_t jt = tile % n_tiles;
+  const int64_t i0 = it * 16;
+  const int64_t j0 = jt * 16;
+  const int lane = static_cast<int>(threadIdx.x);
+  const int wy = static_cast<int>(threadIdx.y);
+
+  __shared__ int8_t w_stage[kQuantWmmaWarpsPerBlock][16][16][16];
+  __shared__ int32_t raw_tile[kQuantWmmaWarpsPerBlock][kGroupGemmBatch][16][16];
+  // Unpacked once per (row, superblock): 8 scales + 8 mins, tiny next to the
+  // tile buffers above.
+  __shared__ uint8_t row_scales[kQuantWmmaWarpsPerBlock][16][8];
+  __shared__ uint8_t row_mins[kQuantWmmaWarpsPerBlock][16][8];
+
+  const size_t row_stride = static_cast<size_t>(nsb) * sizeof(BlockQ4_K);
+  const BlockQ4_K* w_row_base[16];
+#pragma unroll
+  for (int r = 0; r < 16; ++r) {
+    w_row_base[r] =
+        reinterpret_cast<const BlockQ4_K*>(weight + static_cast<size_t>(j0 + r) * row_stride);
+  }
+  const BlockQ8_K* a_row0 = act + i0 * nsb;
+
+  float acc_f[8];
+#pragma unroll
+  for (int c = 0; c < 8; ++c) acc_f[c] = 0.0f;
+
+  for (int64_t sb = 0; sb < nsb; ++sb) {
+    const BlockQ4_K* xb_cur[16];
+#pragma unroll
+    for (int r = 0; r < 16; ++r) xb_cur[r] = w_row_base[r] + sb;
+
+    if (lane < 16) UnpackQ4KScalesMins(xb_cur[lane], row_scales[wy][lane], row_mins[wy][lane]);
+
+    int32_t isum[8];
+#pragma unroll
+    for (int c = 0; c < 8; ++c) isum[c] = 0;
+
+    for (int t = lane; t < 16 * 16; t += 32) {
+      const int row = t / 16;
+      const int tile16 = t % 16;
+      DequantQ4KTile16(xb_cur[row], tile16, w_stage[wy][tile16][row]);
+    }
+    __syncthreads();
+
+    for (int gb = 0; gb < 16; gb += kGroupGemmBatch) {
+      const int qsb = gb / kGroupGemmBatch;  // one Q4_K sub-block of 32 (see header note)
+#pragma unroll
+      for (int gi = 0; gi < kGroupGemmBatch; ++gi) {
+        const int grp = gb + gi;
+        fragment<matrix_a, 16, 16, 16, int8_t, row_major> a_frag;
+        fragment<matrix_b, 16, 16, 16, int8_t, col_major> b_frag;
+        fragment<accumulator, 16, 16, 16, int32_t> acc;
+        fill_fragment(acc, 0);
+        const int8_t* a_ptr = a_row0[sb].qs + grp * 16;
+        const long a_ld = static_cast<long>(nsb) * static_cast<long>(sizeof(BlockQ8_K));
+        load_matrix_sync(a_frag, a_ptr, a_ld);
+        load_matrix_sync(b_frag, &w_stage[wy][grp][0][0], 16);
+        mma_sync(acc, a_frag, b_frag, acc);
+        store_matrix_sync(&raw_tile[wy][gi][0][0], acc, 16, mem_row_major);
+      }
+      __syncthreads();
+
+#pragma unroll
+      for (int gi = 0; gi < kGroupGemmBatch; ++gi) {
+#pragma unroll
+        for (int c = 0; c < 8; ++c) {
+          const int cell = lane + c * 32;
+          const int ii = cell / 16, jj = cell % 16;
+          isum[c] += raw_tile[wy][gi][ii][jj] * static_cast<int32_t>(row_scales[wy][jj][qsb]);
+        }
+      }
+      __syncthreads();
+    }
+
+#pragma unroll
+    for (int c = 0; c < 8; ++c) {
+      const int cell = lane + c * 32;
+      const int ii = cell / 16, jj = cell % 16;
+      int32_t sumi = 0;
+#pragma unroll
+      for (int g = 0; g < 16; ++g) {
+        sumi += static_cast<int32_t>(a_row0[ii * nsb + sb].bsums[g]) *
+                static_cast<int32_t>(row_mins[wy][jj][g / 2]);
+      }
+      const float d = DF16ToF32(xb_cur[jj]->d) * a_row0[ii * nsb + sb].d;
+      const float dmin = DF16ToF32(xb_cur[jj]->dmin) * a_row0[ii * nsb + sb].d;
+      acc_f[c] += d * static_cast<float>(isum[c]) - dmin * static_cast<float>(sumi);
+    }
+  }
+
+#pragma unroll
+  for (int c = 0; c < 8; ++c) {
+    const int cell = lane + c * 32;
+    const int ii = cell / 16, jj = cell % 16;
+    const int64_t oi = i0 + ii, oj = j0 + jj;
+    if constexpr (sizeof(OutT) == 4) out[oi * n + oj] = acc_f[c];
+    else out[oi * n + oj] = DF32ToBF16(acc_f[c]);
+  }
+#endif  // VT_ROCM_QUANT_WMMA_OK
+}
+
+// Per-device, once: launch the Q6_K WMMA tile only when this device's
+// gcnArchName is gfx1200/gfx1201 (prefix match). NEVER gated by
+// VT_ROCM_QUANT_WMMA_OK at a host call site — that macro is defined only on
+// the device compilation pass for gfx1200/gfx1201 itself, so a host-side
+// `#if` on it always compiles away the launch (issue #785's exact trap,
+// documented in `.agents/specs/rocm-sharedk-wmma-host-dispatch.md`). Reuses
+// the same HIP-free, unit-tested prefix check `rocm_paged_attn.hip`'s own
+// WMMA dispatch already established (`vt::rocm::GcnArchNameIsGfx12PrefillWmma`,
+// `include/vt/rocm/rocm_arch.h`); the name is attention-flavored but the test
+// it names is pure architecture matching, shared rather than duplicated here.
+bool Gfx12QuantWmmaHostOk(int device_index) {
+  struct Slot {
+    std::once_flag once;
+    bool ok = false;
+  };
+  static std::array<Slot, 64> slots;
+  if (device_index < 0 || static_cast<unsigned>(device_index) >= slots.size()) return false;
+  std::call_once(slots[static_cast<unsigned>(device_index)].once, [device_index] {
+    hipDeviceProp_t prop{};
+    if (hipGetDeviceProperties(&prop, device_index) != hipSuccess) {
+      slots[static_cast<unsigned>(device_index)].ok = false;
+      return;
+    }
+    slots[static_cast<unsigned>(device_index)].ok =
+        vt::rocm::GcnArchNameIsGfx12PrefillWmma(prop.gcnArchName);
+  });
+  return slots[static_cast<unsigned>(device_index)].ok;
+}
+
 // ---- grouped kernels ----
 template <typename OutT>
 __global__ void GroupedQ8_0K(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
@@ -442,14 +821,58 @@ __global__ void GroupedKQ8K(OutT* __restrict__ out, const uint8_t* __restrict__ 
 
 // --- non-grouped keep-quant GEMM (cuda_quant_dot.cu QuantDotGemmKernel :706) ---
 // warp per (i,j); no expert indirection (w_row = weight + j*w_row_bytes).
+//
+// skip_m/skip_n: the WMMA tile-aligned corner [0,skip_m)x[0,skip_n) a caller
+// already filled and this launch must not recompute (KERNEL-QUANT-CIQ-GEMM-
+// ROCM-RDNA4's M/N tail arm). Every pre-existing call site passes 0,0 and
+// takes the FULL-GRID branch below unchanged -- the tail arm is the only
+// caller that passes a nonzero skip_m or skip_n.
+//
+// The tail-fill call sites used to launch this kernel over the entire m*n
+// grid and rely on an `i < skip_m && j < skip_n` guard to no-op every warp
+// landing inside the corner. That is correct but not sized to the work: for
+// a large aligned corner and a wide N (e.g. N=12288, this row's own
+// production benchmark shape), the no-op warps outnumber the real ones by
+// roughly the corner's own area, so the launch and its address computation
+// cost close to as much as the whole GEMM to fill in what is typically a
+// thin remainder strip. This review finding (KERNEL-QUANT-CIQ-GEMM-ROCM,
+// independent review round) replaces the skip guard with an index remap so
+// the host can size the tail-fill grid to the remainder itself, not m*n:
+// a launched index `t` enumerates ONLY the bottom strip [skip_m,m)x[0,n)
+// (contiguous at the buffer's own row stride n, so it needs no separate
+// stride parameter) followed by the right strip [0,skip_m)x[skip_n,n) --
+// together the exact complement of the WMMA corner, and disjoint from each
+// other by construction (the bottom strip already claims every row at or
+// past skip_m; the right strip only visits rows before it).
 template <typename OutT, int Fmt>
 __global__ void KQuantGemmK(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
                             const BlockQ8_K* __restrict__ act, int64_t m, int64_t n,
-                            int64_t nsb, size_t w_row_bytes, size_t w_block_bytes) {
-  const int64_t warp = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
-  if (warp >= m * n) return;
-  const int64_t i = warp / n;
-  const int64_t j = warp % n;
+                            int64_t nsb, size_t w_row_bytes, size_t w_block_bytes,
+                            int64_t skip_m, int64_t skip_n) {
+  const int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  int64_t i, j;
+  if (skip_m == 0 && skip_n == 0) {
+    // Full-grid path, byte-for-byte the launch every pre-existing call site
+    // still takes: unchanged from before this review finding.
+    if (t >= m * n) return;
+    i = t / n;
+    j = t % n;
+  } else {
+    // Tail-fill path: t enumerates only the remainder the WMMA corner left
+    // untouched, bottom strip first then right strip (see the kernel-level
+    // note above for the shapes and why they are disjoint).
+    const int64_t bottom_strip = (m - skip_m) * n;
+    const int64_t right_strip = skip_m * (n - skip_n);
+    if (t >= bottom_strip + right_strip) return;
+    if (t < bottom_strip) {
+      i = skip_m + t / n;
+      j = t % n;
+    } else {
+      const int64_t t2 = t - bottom_strip;
+      i = t2 / (n - skip_n);
+      j = skip_n + t2 % (n - skip_n);
+    }
+  }
   const int lane = threadIdx.x;
   const uint8_t* w_row = weight + static_cast<size_t>(j) * w_row_bytes;
   const BlockQ8_K* a_row = act + i * nsb;
@@ -598,6 +1021,181 @@ __global__ void Q8_0GemmK(OutT* __restrict__ out, const uint8_t* __restrict__ we
   }
 }
 
+// The MMVQ decode arm assigns each superblock to an eight-lane octet. The
+// integer phase can reassociate exactly. Each octet leader then reconstructs
+// the baseline float term, and the warp replays the baseline lane ownership
+// and reduction order. The resulting output is byte-identical to KQuantGemmK.
+template <typename OutT, int Fmt>
+__device__ inline void KQuantGemvMmvqRow(OutT* __restrict__ out,
+                                         const uint8_t* __restrict__ w_row,
+                                         const BlockQ8_K* __restrict__ act_row,
+                                         int64_t j, int lane, int64_t nsb,
+                                         size_t w_block_bytes) {
+  float partial = 0.0f;
+  const int passes = static_cast<int>((nsb + 3) / 4);
+  for (int p = 0; p < passes; ++p) {
+    const int sb = p * 4 + (lane >> 3);
+    const int c = lane & 7;
+    int acc = 0;
+    int sumi_c = 0;
+
+    if (sb < nsb) {
+      const uint8_t* blk = w_row + static_cast<size_t>(sb) * w_block_bytes;
+      const BlockQ8_K& yb = act_row[sb];
+      if constexpr (Fmt == 2) {
+        const int q = c >> 2;
+        const int seg = c & 3;
+        const uint8_t* ql = blk + q * 64 + (seg & 1) * 32;
+        const uint8_t* qh = blk + kQK_K / 2 + q * 32;
+        const int8_t* sc = reinterpret_cast<const int8_t*>(blk + 192);
+        const int shift = (seg >> 1) * 4;
+        const int hs = seg * 2;
+        const int8_t* q8 = yb.qs + c * 32;
+        int sub0 = 0, pre0 = 0, sub1 = 0, pre1 = 0;
+#pragma unroll
+        for (int word = 0; word < 8; ++word) {
+          uint32_t wq, wh, w8;
+          memcpy(&wq, ql + 4 * word, 4);
+          memcpy(&wh, qh + 4 * word, 4);
+          memcpy(&w8, q8 + 4 * word, 4);
+          const uint32_t value =
+              ((wq >> shift) & 0x0F0F0F0Fu) |
+              (((wh >> hs) & 0x03030303u) << 4);
+          if (word < 4) {
+            sub0 = Dp4a(static_cast<int>(value), static_cast<int>(w8), sub0);
+            pre0 = Dp4a(0x20202020, static_cast<int>(w8), pre0);
+          } else {
+            sub1 = Dp4a(static_cast<int>(value), static_cast<int>(w8), sub1);
+            pre1 = Dp4a(0x20202020, static_cast<int>(w8), pre1);
+          }
+        }
+        acc = static_cast<int>(sc[2 * c]) * (sub0 - pre0) +
+              static_cast<int>(sc[2 * c + 1]) * (sub1 - pre1);
+      } else {
+        uint32_t w0, w1, w2;
+        memcpy(&w0, blk + 4, 4);
+        memcpy(&w1, blk + 8, 4);
+        memcpy(&w2, blk + 12, 4);
+        int scale, minimum;
+        if (c < 4) {
+          scale = static_cast<int>((w0 >> (8 * c)) & 0x3F);
+          minimum = static_cast<int>((w1 >> (8 * c)) & 0x3F);
+        } else {
+          const int offset = 8 * (c - 4);
+          scale = static_cast<int>(((w2 >> offset) & 0xF) |
+                                   (((w0 >> (offset + 6)) & 3) << 4));
+          minimum = static_cast<int>(((w2 >> (offset + 4)) & 0xF) |
+                                     (((w1 >> (offset + 6)) & 3) << 4));
+        }
+        const uint8_t* qb = blk + (Fmt == 1 ? 48 : 16) + (c >> 1) * 32;
+        const int shift = (c & 1) ? 4 : 0;
+        const uint8_t* hm = blk + 16;
+        const int8_t* q8 = yb.qs + c * 32;
+        int sub = 0;
+#pragma unroll
+        for (int word = 0; word < 8; ++word) {
+          uint32_t wq, w8;
+          memcpy(&wq, qb + 4 * word, 4);
+          memcpy(&w8, q8 + 4 * word, 4);
+          uint32_t value = (wq >> shift) & 0x0F0F0F0Fu;
+          if constexpr (Fmt == 1) {
+            uint32_t wh;
+            memcpy(&wh, hm + 4 * word, 4);
+            value |= ((wh >> c) & 0x01010101u) << 4;
+          }
+          sub = Dp4a(static_cast<int>(value), static_cast<int>(w8), sub);
+        }
+        acc = scale * sub;
+        sumi_c = minimum * (yb.bsums[2 * c] + yb.bsums[2 * c + 1]);
+      }
+    }
+#pragma unroll
+    for (int off = 4; off > 0; off >>= 1) {
+      acc += __shfl_down_sync(0xffffffffULL, acc, off);
+      sumi_c += __shfl_down_sync(0xffffffffULL, sumi_c, off);
+    }
+    const int remaining = static_cast<int>(nsb - p * 4);
+    const int active = remaining < 4 ? remaining : 4;
+    for (int octet = 0; octet < active; ++octet) {
+      const int sb_index = p * 4 + octet;
+      const int isum = __shfl_sync(0xffffffffULL, acc, 8 * octet);
+      const int sumi = __shfl_sync(0xffffffffULL, sumi_c, 8 * octet);
+      float term = 0.0f;
+      if (lane == 8 * octet) {
+        const uint8_t* blk =
+            w_row + static_cast<size_t>(sb_index) * w_block_bytes;
+        uint16_t dh;
+        if constexpr (Fmt == 2) {
+          memcpy(&dh, blk + 208, 2);
+        } else {
+          memcpy(&dh, blk, 2);
+        }
+        const float d = DF16ToF32(dh) * act_row[sb_index].d;
+        if constexpr (Fmt == 2) {
+          term = d * static_cast<float>(isum);
+        } else {
+          uint16_t dmh;
+          memcpy(&dmh, blk + 2, 2);
+          const float dmin = DF16ToF32(dmh) * act_row[sb_index].d;
+          term = d * static_cast<float>(isum) - dmin * static_cast<float>(sumi);
+        }
+      }
+      const float value = __shfl_sync(0xffffffffULL, term, 8 * octet);
+      if ((sb_index & 31) == lane) partial += value;
+    }
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    partial += __shfl_down_sync(0xffffffffULL, partial, off);
+  }
+  if (lane == 0) {
+    if constexpr (sizeof(OutT) == 4) {
+      out[j] = partial;
+    } else {
+      out[j] = DF32ToBF16(partial);
+    }
+  }
+}
+
+template <typename OutT, int Fmt>
+__global__ void KQuantGemvMmvqK(OutT* __restrict__ out,
+                                const uint8_t* __restrict__ weight,
+                                const BlockQ8_K* __restrict__ act, int64_t n,
+                                int64_t nsb, size_t w_block_bytes) {
+  const int64_t j =
+      static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  if (j >= n) return;
+  const uint8_t* w_row =
+      weight + static_cast<size_t>(j) * static_cast<size_t>(nsb) * w_block_bytes;
+  KQuantGemvMmvqRow<OutT, Fmt>(out, w_row, act, j,
+                               static_cast<int>(threadIdx.x), nsb,
+                               w_block_bytes);
+}
+
+template <typename OutT, int Fmt>
+__global__ void KQuantGemvMmvqFusedK(OutT* __restrict__ out,
+                                     const uint8_t* __restrict__ weight,
+                                     const void* __restrict__ a, ActDT adt,
+                                     int64_t n, int64_t nsb,
+                                     size_t w_block_bytes) {
+  extern __shared__ unsigned char vt_mmvq_smem[];
+  BlockQ8_K* scratch = reinterpret_cast<BlockQ8_K*>(vt_mmvq_smem);
+  const int tid =
+      static_cast<int>(threadIdx.y) * 32 + static_cast<int>(threadIdx.x);
+  for (int64_t sb = tid; sb < nsb; sb += 128) {
+    QuantQ8KSBlock(scratch[sb], a, adt, sb * kQK_K);
+  }
+  __syncthreads();
+  const int64_t j =
+      static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  if (j >= n) return;
+  const uint8_t* w_row =
+      weight + static_cast<size_t>(j) * static_cast<size_t>(nsb) * w_block_bytes;
+  KQuantGemvMmvqRow<OutT, Fmt>(out, w_row, scratch, j,
+                               static_cast<int>(threadIdx.x), nsb,
+                               w_block_bytes);
+}
+
 inline void Check(hipError_t err, const char* what) {
   if (err != hipSuccess)
     throw std::runtime_error(std::string("vt rocm grouped_gemm: ") + what + ": " +
@@ -738,6 +1336,32 @@ void LaunchQ8KQuantizer(BlockQ8_K* scratch, const void* act, ActDT dtype,
 // one by construction, so no output comparison can witness the dispatch).
 std::atomic<uint64_t> g_kq_coop_dispatches{0};
 
+// How many dense Q6_K prefill dispatches took the RDNA4 WMMA tile arm
+// (KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4, issue #2109). Same reason as the coop
+// counter above: the arm is designed to be bit-identical to the scalar one,
+// so the reachability gate needs a witness that does not depend on comparing
+// output values.
+std::atomic<uint64_t> g_kq_wmma_dispatches{0};
+
+// Same witness, Q4_K's own call site. Kept as a separate counter rather than
+// folded into the one above so a reviewer can prove EACH format's launch
+// site is reached independently, not infer Q4_K's from Q6_K's.
+std::atomic<uint64_t> g_kq_wmma_q4k_dispatches{0};
+
+// VT_ROCM_QUANT_WMMA=0 forces the scalar arm even on gfx1200/gfx1201 — the
+// A/B escape hatch every WMMA arm in this tree ships with
+// (VT_ATTN_PREFILL_SHAREDK_WMMA is the paged-attention precedent). Default
+// on: the gate below still requires the runtime architecture match and
+// `m >= 16 && n >= 16` (not exact alignment — the M/N tail arm fills the
+// rest) before this path is ever reached.
+bool QuantWmmaEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_ROCM_QUANT_WMMA");
+    return e == nullptr || !(e[0] == '0' && e[1] == '\0');
+  }();
+  return on;
+}
+
 // VT_ROCM_Q6K_SMALL_PRIVATE=1 — the A/B arm for
 // [#2511](https://github.com/mudler/vllm.cpp/issues/2511). Every failing leg on
 // `gfx1151` ended inside `KQuantGemmK<OutT, 2>`, the Q6_K arm, with all three of
@@ -761,7 +1385,131 @@ bool Q6KSmallPrivateEnabled() {
   return on;
 }
 
+std::atomic<uint64_t> g_mmvq_route_baseline{0};
+std::atomic<uint64_t> g_mmvq_route_gemv{0};
+std::atomic<uint64_t> g_mmvq_route_fused{0};
+detail::NormQuantScratchPool<uint64_t, hipStream_t> g_norm_quant_scratch;
+detail::NormQuantTokenRegistry g_norm_quant_tokens;
+std::atomic<uint64_t> g_norm_quant_generation{0};
+std::atomic<uint64_t> g_norm_quant_producers{0};
+std::atomic<uint64_t> g_norm_quant_reused{0};
+std::atomic<uint64_t> g_norm_quant_standalone{0};
+std::atomic<const void*> g_norm_quant_last_scratch{nullptr};
+
 }  // namespace
+
+void MmvqResetRouteCountsForTesting() {
+  g_mmvq_route_baseline.store(0, std::memory_order_relaxed);
+  g_mmvq_route_gemv.store(0, std::memory_order_relaxed);
+  g_mmvq_route_fused.store(0, std::memory_order_relaxed);
+}
+
+MmvqRouteCounts MmvqRouteCountsForTesting() {
+  return {g_mmvq_route_baseline.load(std::memory_order_relaxed),
+          g_mmvq_route_gemv.load(std::memory_order_relaxed),
+          g_mmvq_route_fused.load(std::memory_order_relaxed)};
+}
+
+void* NormQuantProducerScratch(Queue& q, size_t bytes, size_t* scratch_capacity,
+                               uint64_t* scratch_generation) {
+  EnsureQueueDevice(q);
+  g_norm_quant_tokens.Reset();
+  *scratch_generation =
+      g_norm_quant_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+  const hipStream_t stream = static_cast<hipStream_t>(q.handle);
+  void* scratch = g_norm_quant_scratch.Ensure(
+      q.id, stream, bytes,
+      [](hipStream_t value) {
+        hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+        Check(hipStreamIsCapturing(value, &capture),
+              "norm-quant scratch capture query");
+        if (capture == hipStreamCaptureStatusActive) {
+          return detail::NormQuantCaptureState::kActive;
+        }
+        if (capture == hipStreamCaptureStatusNone) {
+          return detail::NormQuantCaptureState::kNone;
+        }
+        return detail::NormQuantCaptureState::kInvalidated;
+      },
+      [](size_t allocation_bytes, hipStream_t value) {
+        void* block = nullptr;
+        Check(hipMallocAsync(&block, allocation_bytes, value),
+              "norm-quant scratch grow");
+        return block;
+      },
+      scratch_capacity);
+  return scratch;
+}
+
+void NormQuantRecordProducer(Queue& q, const void* activation, int64_t rows,
+                             int64_t hidden, int64_t row_stride, DType dtype,
+                             void* scratch, size_t scratch_bytes,
+                             uint64_t scratch_generation) {
+  detail::NormQuantKey key{activation,
+                           rows,
+                           hidden,
+                           row_stride,
+                           dtype,
+                           q.device,
+                           q.id,
+                           q.handle,
+                           std::this_thread::get_id()};
+  g_norm_quant_tokens.Record(detail::NormQuantToken{
+      key, scratch, scratch_bytes, scratch_generation});
+  g_norm_quant_last_scratch.store(scratch, std::memory_order_release);
+  g_norm_quant_producers.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool NormQuantTakeConsumer(Queue& q, const void* activation, int64_t rows,
+                           int64_t hidden, int64_t row_stride, DType dtype,
+                           const void** scratch) {
+  const detail::NormQuantKey key{activation,
+                                 rows,
+                                 hidden,
+                                 row_stride,
+                                 dtype,
+                                 q.device,
+                                 q.id,
+                                 q.handle,
+                                 std::this_thread::get_id()};
+  const std::optional<detail::NormQuantToken> token =
+      g_norm_quant_tokens.Take(key);
+  const size_t required =
+      hidden > 0 && hidden % kQK_K == 0 && rows > 0
+          ? static_cast<size_t>(rows) * static_cast<size_t>(hidden / kQK_K) *
+                sizeof(BlockQ8_K)
+          : 0;
+  if (token.has_value() && required > 0 && token->scratch != nullptr &&
+      token->scratch_bytes >= required &&
+      token->scratch_generation ==
+          g_norm_quant_generation.load(std::memory_order_acquire)) {
+    *scratch = token->scratch;
+    g_norm_quant_reused.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  g_norm_quant_standalone.fetch_add(1, std::memory_order_relaxed);
+  return false;
+}
+
+void NormQuantInvalidate(Queue&) { g_norm_quant_tokens.Reset(); }
+
+NormQuantCounts NormQuantCountsForTesting() {
+  return {g_norm_quant_producers.load(std::memory_order_relaxed),
+          g_norm_quant_reused.load(std::memory_order_relaxed),
+          g_norm_quant_standalone.load(std::memory_order_relaxed)};
+}
+
+void NormQuantResetForTesting() {
+  g_norm_quant_tokens.Reset();
+  g_norm_quant_last_scratch.store(nullptr, std::memory_order_release);
+  g_norm_quant_producers.store(0, std::memory_order_relaxed);
+  g_norm_quant_reused.store(0, std::memory_order_relaxed);
+  g_norm_quant_standalone.store(0, std::memory_order_relaxed);
+}
+
+const void* NormQuantLastScratchForTesting() {
+  return g_norm_quant_last_scratch.load(std::memory_order_acquire);
+}
 
 // Warps that cooperate on one output row of the dense K-quant GEMM. 1 selects
 // the single-warp `KQuantGemmK` the path has always had.
@@ -789,6 +1537,14 @@ int KQuantDecodeCoopWarps(DType wdt, int64_t m, int64_t nsb) {
 
 uint64_t KQuantCoopDispatchCount() {
   return g_kq_coop_dispatches.load(std::memory_order_relaxed);
+}
+
+uint64_t KQuantWmmaDispatchCount() {
+  return g_kq_wmma_dispatches.load(std::memory_order_relaxed);
+}
+
+uint64_t KQuantWmmaQ4KDispatchCount() {
+  return g_kq_wmma_q4k_dispatches.load(std::memory_order_relaxed);
 }
 
 void Q8KQuantizeForTest(Queue& q, void* scratch, const void* act, DType dtype,
@@ -827,7 +1583,7 @@ void* Q8KSetKernelExecutionWitnessForTest(void* device_counts) {
   return previous;
 }
 
-void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
+void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   EnsureQueueDevice(q);
   const int64_t m = a.shape[0], k = a.shape[1], n = b.shape[0];
   if (m == 0 || n == 0) return;
@@ -836,6 +1592,7 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
   dim3 block(32, kWarpsPerBlock);
   const uint8_t* w = static_cast<const uint8_t*>(b.data);
   if (b.dtype == DType::kQ8_0) {
+    NormQuantInvalidate(q);
     if (k % kQK8_0 != 0) throw std::runtime_error("vt rocm: matmul_bt_quant Q8_0: K%32!=0");
     const int64_t nb = k / kQK8_0;
     BlockQ8_0* qact = static_cast<BlockQ8_0*>(EnsureQuantScratch(
@@ -858,16 +1615,150 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
                                 : b.dtype == DType::kQ5_K ? sizeof(BlockQ5_K)
                                                           : sizeof(BlockQ4_K);
     const size_t w_row_bytes = static_cast<size_t>(nsb) * w_block_bytes;
-    BlockQ8_K* qact = static_cast<BlockQ8_K*>(EnsureQuantScratch(
-        static_cast<size_t>(m) * nsb * sizeof(BlockQ8_K), s));
-    LaunchQ8KQuantizer(qact, a.data, ActDtOf(a.dtype), a.stride[0], m, nsb, s,
-                       Q8KProductionRoute::kDense, q.device.index);
-    const int64_t grid = (m * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
     const int fmt = b.dtype == DType::kQ6_K ? 2 : b.dtype == DType::kQ5_K ? 1 : 0;
     const int coop = KQuantDecodeCoopWarps(b.dtype, m, nsb);
+    const detail::MmvqRoute mmvq_route = detail::SelectMmvqRoute(
+        std::getenv("VT_GEMV_MMVQ"), std::getenv("VT_GEMV_MMVQ_FOLD_MAX"), m,
+        n, static_cast<size_t>(nsb) * sizeof(BlockQ8_K));
+    auto launch_mmvq = [&](auto output_type, BlockQ8_K* qact) {
+      using OutT = decltype(output_type);
+      auto* output = static_cast<OutT*>(out.data);
+      constexpr int kGemvWarpsPerBlock = 4;
+      const int64_t grid =
+          (n + kGemvWarpsPerBlock - 1) / kGemvWarpsPerBlock;
+      const dim3 gemv_block(32, kGemvWarpsPerBlock);
+      if (mmvq_route == detail::MmvqRoute::kFused) {
+        const size_t lds_bytes = static_cast<size_t>(nsb) * sizeof(BlockQ8_K);
+        if (fmt == 2) {
+          KQuantGemvMmvqFusedK<OutT, 2><<<static_cast<unsigned>(grid), gemv_block,
+                                         lds_bytes, s>>>(
+              output, w, a.data, ActDtOf(a.dtype), n, nsb, w_block_bytes);
+        } else if (fmt == 1) {
+          KQuantGemvMmvqFusedK<OutT, 1><<<static_cast<unsigned>(grid), gemv_block,
+                                         lds_bytes, s>>>(
+              output, w, a.data, ActDtOf(a.dtype), n, nsb, w_block_bytes);
+        } else {
+          KQuantGemvMmvqFusedK<OutT, 0><<<static_cast<unsigned>(grid), gemv_block,
+                                         lds_bytes, s>>>(
+              output, w, a.data, ActDtOf(a.dtype), n, nsb, w_block_bytes);
+        }
+      } else if (fmt == 2) {
+        KQuantGemvMmvqK<OutT, 2><<<static_cast<unsigned>(grid), gemv_block, 0, s>>>(
+            output, w, qact, n, nsb, w_block_bytes);
+      } else if (fmt == 1) {
+        KQuantGemvMmvqK<OutT, 1><<<static_cast<unsigned>(grid), gemv_block, 0, s>>>(
+            output, w, qact, n, nsb, w_block_bytes);
+      } else {
+        KQuantGemvMmvqK<OutT, 0><<<static_cast<unsigned>(grid), gemv_block, 0, s>>>(
+            output, w, qact, n, nsb, w_block_bytes);
+      }
+    };
+    if (mmvq_route == detail::MmvqRoute::kFused) {
+      NormQuantInvalidate(q);
+      g_mmvq_route_fused.fetch_add(1, std::memory_order_relaxed);
+      if (out.dtype == DType::kF32) {
+        launch_mmvq(float{}, nullptr);
+      } else {
+        launch_mmvq(uint16_t{}, nullptr);
+      }
+      Check(hipGetLastError(), "K-quant MMVQ fused GEMV");
+      return;
+    }
+
+    BlockQ8_K* qact = nullptr;
+    const void* produced_scratch = nullptr;
+    if (NormQuantTakeConsumer(q, a.data, m, k, a.stride[0], a.dtype,
+                              &produced_scratch)) {
+      qact = static_cast<BlockQ8_K*>(const_cast<void*>(produced_scratch));
+    } else {
+      qact = static_cast<BlockQ8_K*>(EnsureQuantScratch(
+          static_cast<size_t>(m) * nsb * sizeof(BlockQ8_K), s));
+      LaunchQ8KQuantizer(qact, a.data, ActDtOf(a.dtype), a.stride[0], m, nsb,
+                         s, Q8KProductionRoute::kDense, q.device.index);
+    }
+    if (mmvq_route == detail::MmvqRoute::kGemv) {
+      g_mmvq_route_gemv.fetch_add(1, std::memory_order_relaxed);
+      if (out.dtype == DType::kF32) {
+        launch_mmvq(float{}, qact);
+      } else {
+        launch_mmvq(uint16_t{}, qact);
+      }
+      Check(hipGetLastError(), "K-quant MMVQ GEMV");
+      return;
+    }
+
+    g_mmvq_route_baseline.fetch_add(1, std::memory_order_relaxed);
+    const int64_t grid = (m * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
+    // RDNA4 WMMA tile arm: Q6_K and Q4_K prefill only (m > 1, since
+    // KQuantDecodeCoopWarps above already owns m == 1). Q5_K is `## Owed` —
+    // same 32-wide scale/min shape as Q4_K plus a high-bit plane, not yet
+    // ported. Every other format and every other architecture falls through
+    // to the arms below unchanged.
+    //
+    // M/N TAIL (KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4's `## Owed`, closed here):
+    // `m >= 16 && n >= 16` is the gate, not exact alignment — the WMMA
+    // kernels already floor internally (`m_tiles = m / 16`, and `n_tiles`
+    // is passed in as `n / 16`), so a non-16-multiple shape still gets the
+    // WMMA arm over its floor(m/16)*16 x floor(n/16)*16 corner. What was
+    // missing was the REST of the output: a real prompt is essentially never
+    // 16-aligned (this row's own real-model gate (c) measurement needed a
+    // prompt hand-trimmed to exactly 288/512 tokens to engage the WMMA arm
+    // at all), so requiring exact alignment meant the common case fell back
+    // to scalar for the WHOLE shape, not just the remainder. The scalar
+    // kernel's `skip_m`/`skip_n`-indexed tail fills in that remainder --
+    // bottom rows [m_aligned, m) x all columns, and the right columns
+    // [0, m_aligned) x [n_aligned, n) -- without recomputing the corner
+    // WMMA already wrote. The tail-fill grid below is sized to that
+    // remainder (`grid_tail`), not to the full m*n grid `grid` above: an
+    // independent review found the original full-grid launch (relying on a
+    // skip guard to no-op every warp inside the corner) cost close to as
+    // much as the whole GEMM to fill a typically thin remainder strip, for
+    // a large aligned corner and wide N.
+    const bool wmma_ok = (fmt == 2 || fmt == 0) && m >= 16 && n >= 16 &&
+                        QuantWmmaEnabled() && Gfx12QuantWmmaHostOk(q.device.index);
     auto launch = [&](auto ot) {
       using OutT = decltype(ot);
       auto* o = static_cast<OutT*>(out.data);
+      if (wmma_ok && fmt == 2) {
+        g_kq_wmma_dispatches.fetch_add(1, std::memory_order_relaxed);
+        const int64_t n_tiles = n / 16;
+        const int64_t m_tiles = m / 16;
+        const int64_t grid_wmma = (m_tiles * n_tiles + kQuantWmmaWarpsPerBlock - 1) /
+                                  kQuantWmmaWarpsPerBlock;
+        KQuantGemmKWmmaQ6K<OutT><<<static_cast<unsigned>(grid_wmma),
+                                   dim3(32, kQuantWmmaWarpsPerBlock), 0, s>>>(
+            o, w, qact, m, n, nsb, n_tiles);
+        const int64_t m_aligned = m_tiles * 16, n_aligned = n_tiles * 16;
+        if (m_aligned < m || n_aligned < n) {
+          // Remainder cell count: the bottom strip [m_aligned,m)x[0,n) plus
+          // the right strip [0,m_aligned)x[n_aligned,n) -- see KQuantGemmK's
+          // own comment for why these two are exactly the WMMA corner's
+          // complement. Sized to the remainder, not m*n.
+          const int64_t remainder = (m - m_aligned) * n + m_aligned * (n - n_aligned);
+          const int64_t grid_tail = (remainder + kWarpsPerBlock - 1) / kWarpsPerBlock;
+          KQuantGemmK<OutT, 2><<<static_cast<unsigned>(grid_tail), block, 0, s>>>(
+              o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes, m_aligned, n_aligned);
+        }
+        return;
+      }
+      if (wmma_ok && fmt == 0) {
+        g_kq_wmma_q4k_dispatches.fetch_add(1, std::memory_order_relaxed);
+        const int64_t n_tiles = n / 16;
+        const int64_t m_tiles = m / 16;
+        const int64_t grid_wmma = (m_tiles * n_tiles + kQuantWmmaWarpsPerBlock - 1) /
+                                  kQuantWmmaWarpsPerBlock;
+        KQuantGemmKWmmaQ4K<OutT><<<static_cast<unsigned>(grid_wmma),
+                                   dim3(32, kQuantWmmaWarpsPerBlock), 0, s>>>(
+            o, w, qact, m, n, nsb, n_tiles);
+        const int64_t m_aligned = m_tiles * 16, n_aligned = n_tiles * 16;
+        if (m_aligned < m || n_aligned < n) {
+          const int64_t remainder = (m - m_aligned) * n + m_aligned * (n - n_aligned);
+          const int64_t grid_tail = (remainder + kWarpsPerBlock - 1) / kWarpsPerBlock;
+          KQuantGemmK<OutT, 0><<<static_cast<unsigned>(grid_tail), block, 0, s>>>(
+              o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes, m_aligned, n_aligned);
+        }
+        return;
+      }
       if (coop == 8 && fmt == 2) {
         // One block per output element, eight warps deep. Only the measured
         // width is instantiated; anything else falls through to the single-warp
@@ -877,25 +1768,29 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
             o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
         return;
       }
-      if (fmt == 2 && Q6KSmallPrivateEnabled()) KQuantGemmK<OutT, 3><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
-      else if (fmt == 2) KQuantGemmK<OutT, 2><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
-      else if (fmt == 1) KQuantGemmK<OutT, 1><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
-      else KQuantGemmK<OutT, 0><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
+      if (fmt == 2 && Q6KSmallPrivateEnabled()) KQuantGemmK<OutT, 3><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes, 0, 0);
+      else if (fmt == 2) KQuantGemmK<OutT, 2><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes, 0, 0);
+      else if (fmt == 1) KQuantGemmK<OutT, 1><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes, 0, 0);
+      else KQuantGemmK<OutT, 0><<<static_cast<unsigned>(grid), block, 0, s>>>(o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes, 0, 0);
     };
     if (out.dtype == DType::kF32) launch(float{}); else launch(uint16_t{});
     Check(hipGetLastError(), "K-quant gemm");
     return;
   }
-  throw std::runtime_error("vt rocm: matmul_bt_quant: unsupported weight dtype (ported: Q8_0/Q4_K/Q5_K/Q6_K; owed: Q4_0/Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ3_S/IQ2_S/MXFP4 -- the loader pre-filters to the ported set, so reaching here is a bug)");
+  throw std::runtime_error(
+      "vt rocm: internal GDN matmul_bt_quant provider received an unsupported weight dtype "
+      "(GDN-owned: Q8_0/Q4_K/Q5_K/Q6_K; wrapper-owned: Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ2_S/IQ1_S/IQ1_XXXS; "
+      "unimplemented: Q4_0/Q5_0/IQ2_XS/IQ4_NL/IQ3_S/IQ4_XS/MXFP4 -- the ROCm wrapper must delegate only the GDN-owned set)");
 }
 
 
 // kMatmulBTQuantGrouped for ROCm: Q8_0 / Q4_K / Q6_K natively (the formats the
 // target GDN-MoE GGUFs carry); anything else throws loudly (never a silent
 // CPU-pointer deref on a discrete card).
-void MatmulBTQuantGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
-                                    const Tensor& weight, const Tensor& expert_ids) {
+void MatmulBTQuantGroupedKernelRocmGdn(Queue& q, Tensor& out, const Tensor& act,
+                                       const Tensor& weight, const Tensor& expert_ids) {
   EnsureQueueDevice(q);
+  NormQuantInvalidate(q);
   const int64_t P = out.shape[0], n = out.shape[1], k = act.shape[1];
   if (P == 0 || n == 0) return;
   const int64_t Pa = act.shape[0];
@@ -955,8 +1850,9 @@ void MatmulBTQuantGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
   }
 
   throw std::runtime_error(
-      "vt rocm: matmul_bt_quant_grouped: unsupported weight dtype (ported: Q8_0/Q4_K/Q5_K/Q6_K; "
-      "owed: Q4_0/Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ2_S/MXFP4 -- the loader pre-filters, so reaching here is a bug)");
+      "vt rocm: internal GDN matmul_bt_quant_grouped provider received an unsupported weight dtype "
+      "(GDN-owned: Q8_0/Q4_K/Q5_K/Q6_K; wrapper-owned: Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ2_S/IQ1_S/IQ1_XXXS; "
+      "unimplemented: Q4_0/Q5_0/IQ2_XS/IQ4_NL/IQ3_S/IQ4_XS/MXFP4 -- the ROCm wrapper must delegate only the GDN-owned set)");
 }
 
 }  // namespace vt::rocm

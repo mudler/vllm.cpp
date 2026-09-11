@@ -704,11 +704,11 @@ TEST_CASE(
   //
   // #2516: NAMED DEVICES, not `CurrentPlatform()`. This case is about the CPU
   // and CUDA `vec_dot` kernels #2247 added, and asking the running platform made
-  // it RED on every ROCm build for a reason the case did not state --
-  // `DeviceKeepQuantSupported` serves exactly {Q8_0, Q4_K, Q5_K, Q6_K} there
-  // (#1940 owns the gap). Both answers are pinned instead, because the ROCm one
-  // is a real property of this tree and a case that merely skipped it would stop
-  // noticing when #1940 lands.
+  // it RED on every ROCm build for a reason the case did not state. ROCm now
+  // serves 11 formats, but the IQ2_XS and IQ4_XS tensors in this fixture remain
+  // unsupported (#1940 owns both gaps). Both answers are pinned instead,
+  // because the ROCm one is a real property of this tree and a case that merely
+  // skipped it would stop noticing when either gap lands.
   for (const vllm::GgufTensorInfo& t : gguf.Tensors()) {
     CAPTURE(t.name);
     CHECK(vllm::RouteGgufTensor(true, false, false, false,
@@ -932,9 +932,10 @@ TEST_CASE(
   vllm::GgufLoadPolicy rocm = PolicyWith(true, false, false, false);
   rocm.device = vt::DeviceType::kROCM;
 
-  // NO PLAN: ROCm has no IQ `vec_dot` (#1940), so the towers expand and the
-  // predicate is false. This is the state #2516 reports and the inertness pin
-  // for every ROCm load that configures no placement.
+  // NO PLAN: ROCm supports IQ2_XXS, but not this fixture's IQ4_XS tower
+  // (#1940), so that tower expands and the predicate is false. This is the
+  // state #2516 reports and the inertness pin for every ROCm load that
+  // configures no placement.
   vllm::ResetActiveMoePlacementPlanForTesting();
   CHECK_FALSE(
       vllm::GgufExpertTowersReachSlotLane(gguf, "_exps.weight", rocm));

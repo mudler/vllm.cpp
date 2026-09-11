@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "head": "2e5adfb85a255528bffa5d3cdb016efb2bab70d8",
+  "argv": [
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/tests/test_gguf_keep_quant",
+    "--test-case=Q8_K*"
+  ],
+  "env": {
+    "HIP_VISIBLE_DEVICES": "-1",
+    "ROCR_VISIBLE_DEVICES": "-1"
+  },
+  "exit": 1,
+  "result": "Reader case passed; ordinary loader throws at OwnGgufQuantBlocks KeepQuantDType guard, qwen3_5_gguf_weights.cpp:89. All12 assertions passed before exception.",
+  "files": {
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/src/vllm/model_executor/model_loader/gguf_reader.cpp": {
+      "bytes": 29998,
+      "sha256": "2901344cb8252ac3c66cacd9b2ae137a814217425df28c387bbdade83d9c12e5"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp": {
+      "bytes": 90319,
+      "sha256": "9ee863b7821648d43deaaed288408f3fcd13dd089ace8109bf12233d4212e944"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/include/vllm/model_executor/models/qwen3_5_gguf_weights.h": {
+      "bytes": 17840,
+      "sha256": "ecb95af1c711afc2c2eefef5de7aba88bcefd3f61453fb25b92b7df4f3d9053d"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/tests/vllm/test_gguf_keep_quant.cpp": {
+      "bytes": 134876,
+      "sha256": "65a5e5a40f19d8e264bc1bb341c2a8276a3719c59c7faa2c91b4f4b7bfe9dd92"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/libvllm.a": {
+      "bytes": 95078844,
+      "sha256": "48d0ab6c0541c20ba4e3d87df07da1aa31c14baac87dcfb995d4af8f73c64b25"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/tests/test_gguf_keep_quant": {
+      "bytes": 31354600,
+      "sha256": "5970560b000d16d7e86390417793317ff2b06f4e4bd5232603b8304fc715ed5d"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/evidence/materializer-second-red.log": {
+      "bytes": 846,
+      "sha256": "4d8846fe34ed7c6abb0d7bdeb4853674de3f4a2fc4b45c95fbd8fa59d1f23397"
+    }
+  }
+}

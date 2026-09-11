@@ -1,0 +1,13 @@
+["podman", "--storage-driver=vfs", "--root", "/tmp/podman-pr66-root-vfs", "--runroot", "/tmp/podman-pr66-run-vfs", "run", "--rm", "--name", "strix-3015-b13accc403d34a68a99fb8e39d3252de", "--device=/dev/kfd", "--device=/dev/dri", "--group-add", "video", "-v", "/tmp/strix-3015-4fdrfcj3:/tmp/strix-3015-4fdrfcj3:rw", "-v", "/workspace/ccache:/workspace/ccache:rw", "--ulimit", "fsize=536870912:536870912", "-e", "LD_LIBRARY_PATH=/tmp/strix-3015-4fdrfcj3/build-vllmcpp:/tmp/strix-3015-4fdrfcj3/build-vllmcpp/bin:/opt/rocm/lib", "-e", "VT_OP_PROVIDER_STATS=1", "--entrypoint", "/tmp/strix-3015-4fdrfcj3/build-vllmcpp/examples/vllm-cli", "d554fe849c5e3c4d6b81227e0b87f165fa3b7b015899872bd93bc732c12ffeb6", "--help"]
+usage: /tmp/strix-3015-4fdrfcj3/build-vllmcpp/examples/vllm-cli --model <dir> --prompt "<text>"
+          [--tokenizer-config <path>] [--device auto|cpu|cuda]
+          [--max-tokens N] [--temperature T] [--top-p P] [--top-k K]
+          [--seed S] [--stream] [--repeat N]
+          [--gpu-memory-utilization F] [--kv-cache-memory BYTES]
+          [--max-num-seqs N]
+          [--kv-cache-dtype auto|bfloat16|fp8|fp8_e4m3]
+          [--speculative-config '<json>'] [--offload-config '<json>']
+
+Runs completion(s) over the vllm.cpp C ABI (libvllm). <dir> holds
+config.json, tokenizer.json and the *.safetensors shards.
+--repeat N: load once, run N blocking completions (for warm tok/s).

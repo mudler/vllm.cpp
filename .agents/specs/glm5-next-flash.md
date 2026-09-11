@@ -1,5 +1,10 @@
 # `Glm5NextForConditionalGeneration` (GLM-5.3-Flash)
 
+Current reference: vLLM registered this model on 3 September 2026. The
+[upstream reconciliation](glm5-next-upstream-reconciliation.md) supersedes the
+original no-vLLM premise and port-source priority below. Historical evidence
+remains intact. See `## Now` for the current continuation.
+
 **SCOPING ONLY. NO PRODUCT CODE LANDS UNDER THIS PULL REQUEST.** This document
 and its records are the whole deliverable of the pull request that introduces
 it. Implementation follows in separate `row/MODEL-MM-GLM53-FLASH-W<n>` branches
@@ -42,9 +47,9 @@ IN scope for the campaign this spec plans:
 
 OUT of scope, explicitly:
 
-- Advancing the vLLM parity pin. `555967922` does not reach this architecture
-  and neither does vLLM `main`; see §Oracles. Nothing in this campaign may move
-  `.agents/upstream-sync.md`.
+- Advancing the vLLM parity pin. The current pin `e126687a9a` predates the
+  model's registration at `98ed0856f3`. Nothing in this campaign moves
+  `.agents/upstream-sync.md`. The original `555967922` search remains below.
 - The MTP speculative head (`num_nextn_predict_layers = 1`). It is recorded
   under §Owed and gets its own row when the backbone runs.
 - Any claim of speed parity. There is no denominator: no oracle runs this model
@@ -83,7 +88,25 @@ generates plausible text and is never checked. §Gates decides it.
 
 ## Oracles
 
-Everything in this section was read live on **2026-08-26**.
+### Current reference on 7 September 2026
+
+vLLM [PR #53906](https://github.com/vllm-project/vllm/pull/53906) merged at
+`98ed0856f31fa3aaf5e27464e2b4ef5a8ee6b2f5` on 3 September 2026.
+The campaign's registration stop condition fired. vLLM defines the algorithm,
+defaults, and errors wherever it implements them. The transformers algorithm
+exception expired. Its old evidence remains useful component evidence.
+
+The [reconciliation spec](glm5-next-upstream-reconciliation.md) records exact
+source and test anchors and the next implementation obligations.
+The global pin remains `e126687a9a828d513c01a07cd69f025f27d63280`.
+It lacks this registration. The merged revision is a fixed forward source
+reference, not a gateable model oracle or an accepted parity denominator.
+The real-model build and run remain `PENDING` under #1998.
+
+### Historical oracle survey on 26 August 2026
+
+The rest of this section preserves the original survey. Its statements about
+upstream absence, open pull requests, and available hardware describe that date.
 
 ### vLLM at the parity pin `555967922` — implements NOTHING
 
@@ -223,6 +246,10 @@ That is a statement about the full model. It is NOT a statement that this
 campaign is ungateable; §Gates constructs the gate that is actually reachable.
 
 ## Upstream chain
+
+The following transformers map records the original component implementation.
+Use the [vLLM reconciliation](glm5-next-upstream-reconciliation.md) for new
+ports and reconcile each reached primitive before accepting equivalence.
 
 `transformers` `v5.16.1`, `src/transformers/models/glm5_next/`. The modular file
 is the source of truth and every port-map cell below cites
@@ -2802,55 +2829,47 @@ spec records both rather than the convenient one.
 | mHC manifold | all | **NOTHING.** `kDeepseekV4Mhc` (294) is CUDA-only (`cuda_deepseek_v4.cu:2102`) with **no CPU provider** (O34) | zero `vt::` calls; `glm5_next_mhc.cpp:22-88` delegating to `deepseek_v4_mhc.cpp:72-165`, per-token, `std::vector` slabs allocated inside the loop | everything, and O34's inverted gap bites here too |
 | MoE 288+1 | 43 blocks | 3 of 4 ops native (`rocm_ops.hip:170,206,213`); `kMoeGateUpSwiGLUGrouped` NONE | 4 vt ops; router-logits GEMM, shared expert and dense MLP hand-rolled (`glm5_next_moe.cpp:200-210, 291-325`) | one provider; **best-served arm by far** |
 | ViT | 24 | n/a | **does not exist.** No vision forward file; `glm5_next_loader.cpp:519-526` refuses any config declaring `vision_config` | the whole tower (W6), on every backend |
-| keep-quant residency | — | Q8_0/Q4_K/Q5_K/Q6_K only | this artifact is IQ2_XS/IQ3_XXS/IQ4_XS/Q2_K/Q3_K | see below — **the exact blocker** |
+| keep-quant residency | — | 11 formats, including IQ3_XXS/Q2_K/Q3_K | this artifact also uses IQ2_XS/IQ4_XS | those two formats still expand; see below |
 
-#### `rocm_grouped_gemm.hip` serves exactly what the predicate claims — do NOT widen it
+#### The ROCm wrapper serves 11 formats; two artifact formats remain closed
 
-The obvious cheap slice was to widen `DeviceKeepQuantSupported`'s ROCm arm
-(`gguf_keep_quant.cpp:128-140`). **Measured, and refused.** The kernel
-implements four dot products and no more: `DotQ8_0`
-(`rocm_grouped_gemm.hip:182`), `DotQ4K` (`:191`), `DotQ5K` (`:225`), `DotQ6K`
-(`:261`), dispatched at `:641,:657` (non-grouped) and `:712,:734` (grouped),
-with everything else falling to a `throw` at `:692` and `:761`. There is no
-IQ2_XS, IQ3_XXS, IQ4_XS, Q2_K or Q3_K path of any kind. **The predicate is
-exactly as wide as the kernel**, and widening it would make the loader keep
-blocks it cannot execute and throw at first forward with the model resident —
-which is precisely the regression `.agents/specs/rocm-gg-keep-quant.md` was
-written to repair. A predicate that claims more than the kernel does is worse
-than a narrow one, so this wave leaves it alone and records why.
+The internal GDN provider still owns `DotQ8_0`, `DotQ4K`, `DotQ5K`, and
+`DotQ6K`. The ROCm wrapper now adds Q2_K, Q3_K, IQ2_XXS, IQ3_XXS, IQ2_S,
+IQ1_S, and IQ1_XXXS through `rocm_quant_dot.hip`. The loader admits that exact
+11-format union. This artifact's IQ2_XS and IQ4_XS formats remain unsupported.
+Admitting either before its provider exists would reproduce the load-then-throw
+regression that `.agents/specs/rocm-gg-keep-quant.md` repaired.
 
 The cost of that honesty, by the census in §W9a, is exact and total:
 
 | encoding | tensors | on disk | ROCm keep-quant |
 |---|---:|---:|---|
 | IQ2_XS | 82 | 53.3320 GiB | **no** |
-| IQ3_XXS | 41 | 35.3145 GiB | **no** |
+| IQ3_XXS | 41 | 35.3145 GiB | yes |
 | IQ4_XS | 3 | 3.5859 GiB | **no** |
-| Q2_K | 2 | 1.4766 GiB | **no** |
-| Q3_K | 1 | 0.9668 GiB | **no** |
+| Q2_K | 2 | 1.4766 GiB | yes |
+| Q3_K | 1 | 0.9668 GiB | yes |
 | Q5_K | 181 | 3.0286 GiB | yes |
 | Q6_K | 117 | 2.1966 GiB | yes |
 | Q8_0 | 346 | 0.8013 GiB | yes |
 | Q4_K | 1 | 0.3323 GiB | yes |
 
-The five unservable encodings sum to **94.6758 GiB**, which is to four decimal
-places the routed-expert total §W9a measured independently (94.6758 GiB). That
-is not a coincidence worth glossing: **every byte ROCm cannot keep quantized is
-a routed expert, and every routed expert is a byte ROCm cannot keep
-quantized.** ROCm can keep 6.3588 GiB of 101.0346 GiB quantized — **6.29%**.
-The other 94.6758 GiB takes its pre-existing `expand_bf16` residency, 580.50
-GiB, for a total of 587.07 GiB — **10.1x the measured 58 GiB ceiling.**
+The two unservable encodings sum to **56.9179 GiB**. ROCm can now keep
+44.1167 GiB of the 101.0346 GiB table above quantized. The prior 587.07 GiB
+resident estimate and its 10.1x ratio are obsolete. No run has measured the
+new mixed-residency footprint, so that number is `PENDING`. The packed
+101.2535 GiB artifact already exceeds the measured 58 GiB device ceiling.
 
 #### Scope and price of what is NOT done here
 
 Priced so the option is a decision rather than a vague debt. None is started.
 
-1. **Five i-quant/k-quant ROCm dot kernels** (IQ2_XS, IQ3_XXS, IQ4_XS, Q2_K,
-   Q3_K) on both the grouped and non-grouped arms, against the CPU keep-quant
+1. **Two I-quant ROCm dot kernels** (IQ2_XS and IQ4_XS) on both the grouped
+   and non-grouped arms, against the CPU keep-quant
    oracle at the NMSE<=5e-4 bar `rocm-gg-keep-quant.md` already sets. This is
    `rocm-gg-keep-quant.md`'s owed list and it is that row's to take, not this
-   one's. It is a prerequisite for any ROCm arm of this model and it is **not
-   sufficient**, because of the residency ceiling above.
+   one's. They are not sufficient for a ROCm arm because the packed artifact
+   already exceeds the residency ceiling above.
 2. **A ROCm MLA/DSA family** — seven op ids, none registered. Not a wave.
 3. **A ROCm k-pool**, which needs a CPU provider first if the reference tier is
    ever to answer for it.
@@ -5351,11 +5370,11 @@ Debts this row carries, each visible rather than waived:
   started. `--device cuda` on this model still refuses by name, and O30's
   ` Paris.` on `--device cpu` at 195.5 s/token remains the only generation this
   row has ever observed. Owned by row `MODEL-MM-GLM53-FLASH-CUDA` and tracked by
-  [#2410](https://github.com/mudler/vllm.cpp/issues/2410), which is a REAL issue
+  ISSUE-GH-2410, which is a REAL issue
   filed by this wave rather than an inherited number. **The `#1998` and `#2241`
   this row cites throughout resolve to neither an issue nor a pull request
   today** (`gh issue view` and `gh pr view` both 404 while `gh issue view 2409`
-  serves, and a `--state all` listing spanning #41..#2409 does not contain
+  serves, and a `--state all` listing spanning #41..ISSUE-GH-2409 does not contain
   them). That observation is recorded and NOT acted on: this exact 404 pattern
   once got read as mass deletion and written into AGENTS.md as a falsehood, so
   the correct response is a re-measurement by someone with the forge in front of
@@ -5481,34 +5500,25 @@ Debts this row carries, each visible rather than waived:
   shared header belongs to ENG-MULTIKV-BYNAME's row, and reverting the accessor
   rather than the comment would change three models' seam. Tracked by
   [#2459](https://github.com/mudler/vllm.cpp/issues/2459).
-- **O40 — THE ROCm ARM IS BLOCKED ON DEVICE FIT, NOT ON KERNELS, and the fleet's
+- **O40 — THE ROCm ARM REMAINS BLOCKED ON DEVICE FIT, and the fleet's
   only AMD device was measured rather than assumed.** `strix:gpu0` (`gfx1151`,
   ROCm 7.2.4) holds at most **58.000 GiB** of `hipMallocManaged` memory —
   measured twice, at 2 GiB and 4 GiB granularity, jobs
   `e87ec9b6-4672-468d-9eaa-1b346a1f2af6` and
   `08b6baee-4ec8-41ff-a22e-cba6c018e0c4`. The artifact is 101.2535 GiB, so it
-  overshoots by 1.75x in its BEST case, in which every missing ROCm keep-quant
-  kernel has already been written. In the case that actually obtains today it
-  overshoots by 10.1x, because the five encodings ROCm cannot keep quantized are
-  exactly the 129 routed-expert tensors and they expand to 580.50 GiB. Owed
+  overshoots by 1.75x even if every format stays packed. The seven-format
+  provider changes the mixed-residency case, so the previous 10.1x value is no
+  longer current. Its replacement is `PENDING` an artifact rerun. Owed
   against an AMD device that can hold ~101 GiB, or against a published
   GLM-5.3-Flash artifact whose experts encode below ~1.2 bpw, and neither exists
   today. Tracked by [#2462](https://github.com/mudler/vllm.cpp/issues/2462).
-  **This entry is why no ROCm kernel was written**: on this fleet a ROCm MLA,
-  k-pool or i-quant kernel would land dead, with no device able to load the
-  weights that would reach it. W10 carries the arm-by-arm map and the price of
-  each piece.
-- **O41 — THE ROCm KEEP-QUANT PREDICATE MUST NOT BE WIDENED, and this entry
-  exists so the next reader does not repeat the attempt.**
-  `DeviceKeepQuantSupported`'s ROCm arm (`gguf_keep_quant.cpp:128-140`) admits
-  Q8_0/Q4_K/Q5_K/Q6_K, and `rocm_grouped_gemm.hip` implements exactly four dot
-  products — `DotQ8_0` (`:182`), `DotQ4K` (`:191`), `DotQ5K` (`:225`), `DotQ6K`
-  (`:261`) — dispatched at `:641,:657,:712,:734` and throwing at `:692,:761`
-  otherwise. The predicate is exactly as wide as the kernel. Widening it to
-  reach this artifact's IQ2_XS/IQ3_XXS/IQ4_XS/Q2_K/Q3_K would keep blocks the
-  device cannot execute and throw at first forward with the model resident,
-  reintroducing the regression `.agents/specs/rocm-gg-keep-quant.md` was written
-  to repair. The five kernels remain owed to THAT row, not to this one.
+  The new provider does not change this fit result. W10 carries the arm-by-arm
+  map and the price of each remaining piece.
+- **O41 — IQ2_XS AND IQ4_XS REMAIN OUTSIDE THE ROCm KEEP-QUANT PREDICATE.**
+  `DeviceKeepQuantSupported` now admits eleven formats. The new wrapper arms
+  cover IQ3_XXS, Q2_K, and Q3_K from this artifact. No ROCm provider implements
+  IQ2_XS or IQ4_XS, so both remain on `expand_bf16`. They stay owed to the
+  keep-quant row, not this one. Do not admit either before its provider exists.
 - **O42 — THE ROCm REFERENCE-TIER FALLBACK MAKES THIS MODEL'S TWO MISSING
   PROVIDERS INVISIBLE ON AN APU AND FATAL ON A dGPU, and a coverage claim must
   say which.** `kKdaGatedDeltaRule` and `kMoeGateUpSwiGLUGrouped` — 2 of the 5
@@ -5877,6 +5887,20 @@ Debts this row carries, each visible rather than waived:
 
 ## Now
 
+`ACTIVE`, 7 September 2026. The vLLM registration stop condition fired on
+3 September. [Reconciliation #3045](glm5-next-upstream-reconciliation.md)
+expires the transformers algorithm exception and identifies the device-port
+source and tests. The global parity pin remains unchanged.
+
+Next, repair routed-expert placement admission under
+[#3019](https://github.com/mudler/vllm.cpp/issues/3019), then complete the
+device forward under [#2410](https://github.com/mudler/vllm.cpp/issues/2410).
+Reconcile the reached vLLM defaults, layouts, and tests in each implementation.
+The real-model oracle gate remains `PENDING` under #1998. No new model run or
+performance result is established by this documentation change.
+
+### Status before the upstream reconciliation
+
 `ACTIVE`, 2026-09-01. **THE KERNEL THAT BLOCKED THIS MODEL'S DEVICE ARM LANDED
 EIGHT DAYS AGO IN ANOTHER ROW, AND NOTHING HERE READ IT.** O19 says the expert
 GEMM for this artifact's `IQ2_XS` and `IQ4_XS` tensors "runs on the CPU, and the
@@ -5960,12 +5984,11 @@ to it.
 `hipMallocManaged` memory, measured twice on two separately compiled binaries
 (2 GiB granularity, job `e87ec9b6`; 4 GiB granularity, job `08b6baee`, which
 read 56.000 GiB — the last multiple of 4 below 58, so the two agree). The
-artifact is **101.2535 GiB**. It overshoots by **1.75x in the best imaginable
-case**, the one where every missing ROCm keep-quant kernel has already been
-written, and by **10.1x in the case that obtains today**. To fit, the experts
-would have to encode at ~1.2 bpw against the published 2.609. **So a ROCm MLA,
-k-pool or i-quant kernel written now would land dead**, and O40 records that as
-the reason none was written.
+artifact is **101.2535 GiB**. It overshoots by **1.75x in the best case**, where
+every format remains packed. The seven-format provider invalidates the old
+10.1x mixed-residency ratio. No artifact rerun has measured a replacement, so
+the current footprint is `PENDING`. The packed artifact still cannot fit on
+this device, and O40 records that blocker.
 
 **`hipMemGetInfo` fails toward a pass on this box and would have hidden it.** It
 reported `free = 63.703 GiB` unchanged from 2 GiB resident all the way to 58 GiB
@@ -5973,12 +5996,10 @@ resident, and was still reporting 63.703 GiB free at the call that returned
 out-of-memory. A budget computed from it would have been wrong by the entire
 measurement. The staircase is the instrument.
 
-**The cheap slice was refused on evidence.** W10 was scoped to widen
-`DeviceKeepQuantSupported`'s ROCm arm if the kernel supported it. It does not:
-`rocm_grouped_gemm.hip` implements exactly `DotQ8_0`/`DotQ4K`/`DotQ5K`/`DotQ6K`
-and throws on everything else, so the predicate is already exactly as wide as
-the kernel and widening it would be a lie that throws at first forward. O41
-records that so the attempt is not repeated.
+**The cheap slice partially landed through the GFX1100 reconstruction.** The
+ROCm wrapper now serves IQ3_XXS, Q2_K, and Q3_K from this artifact. IQ2_XS and
+IQ4_XS still have no provider, so the loader does not admit them. O41 records
+that surviving boundary.
 
 **Two findings the arm-by-arm map turned up that outlive this wave.** The model
 makes **exactly five `vt::` op calls across the 2,783 lines of its seven

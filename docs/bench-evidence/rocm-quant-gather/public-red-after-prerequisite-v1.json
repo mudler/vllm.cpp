@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "row": "BACKEND-ROCM-QUANT-GATHER",
+  "head": "4fc300f93cfb075c0afddccdd476a552fa900cdb",
+  "prerequisite_original_head": "6a7bcb77637e66df34429208e3a4055e0945a875",
+  "files": {
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/tests/capi/rocm_quant_gather_fixture.h": {
+      "bytes": 8283,
+      "sha256": "339414f93e59e6be9a4ca545d5e762bb2816714343f466e218dbc2b69483bdfd"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/tests/capi/test_rocm_embedding_quant.cpp": {
+      "bytes": 6579,
+      "sha256": "add58ac23eef26588fb358d7679feeac961baee3a1da3d5ddd3adedaf9a1a825"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/tests/CMakeLists.txt": {
+      "bytes": 274633,
+      "sha256": "c97dc1e2fa7e70bb8c579a71d22fc7884d98bf6275d0c1ac6d8c5908ee4e4b93"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/src/vllm/model_executor/models/qwen3_5.cpp": {
+      "bytes": 646312,
+      "sha256": "899913b8aeff65a08eb5289f6f08777ee78638e37722f9d8138daff723f8f498"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/src/vt/rocm/rocm_ops.hip": {
+      "bytes": 22510,
+      "sha256": "c05bddd75520fa8e418313ce3bd05957b7135e106bab16f47fb3fd6220d8eb0f"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/libvllm.a": {
+      "bytes": 94251376,
+      "sha256": "a6173ff1ce88eff74be323584295f7e07abd52142e559190dd213916f38f0bc3"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/tests/test_capi_rocm_embedding_quant": {
+      "bytes": 30196792,
+      "sha256": "067d0c228b22ed88b84dc1bc5d53f5fa5aacd44731e618b19d9a343673930885"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/fixtures/Q4_0.gguf": {
+      "bytes": 944192,
+      "sha256": "663597e28852d64097f7a67542675e4575ee158d3c5e6e2143aadd1b4188f4af"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/fixtures/Q4_0-dense.gguf": {
+      "bytes": 991296,
+      "sha256": "0e6554ba521edfde00d4d025a3058eabaaacdce6b24344f959e83d8dde35df7f"
+    }
+  },
+  "cwd": "/home/vikash/vllm.cpp-rdna3-gather-impl",
+  "env": {
+    "HIP_VISIBLE_DEVICES": "0",
+    "ROCR_VISIBLE_DEVICES": "0",
+    "TMPDIR": "/home/vikash/.cache/rdna3-gather-impl/tmp"
+  },
+  "argv": [
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/tests/test_capi_rocm_embedding_quant",
+    "--abort-after=1"
+  ],
+  "log": "/home/vikash/.cache/rdna3-gather-impl/evidence/public-red-after-prerequisite.log",
+  "authority": "Operator alone executes under the recorded GPU 0 mutex",
+  "expected_red": "Public load and completion succeed, then positive kEmbeddingQuant ROCm selection assertion fails because registration is absent. Any failure before successful completion is a wrong-reason red.",
+  "control": "Prerequisite operator rerun passed this exact Q4_0-dense.gguf geometry and bytes. This red test checks quant provider stats before entering its dense Run arm, so --abort-after=1 does not itself rerun that dense control. The green test later executes both arms for all formats."
+}

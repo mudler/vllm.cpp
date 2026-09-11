@@ -125,9 +125,11 @@ class FakeXpuBackend final : public vt::Backend {
 // refuse a configuration that works.
 class PartialXpuPlatform final : public vllm::platforms::Platform {
  public:
-  explicit PartialXpuPlatform(FakeXpuBackend& backend) : backend_(backend) {}
+  explicit PartialXpuPlatform(FakeXpuBackend& backend,
+                              vt::DeviceType type = vt::DeviceType::kXPU)
+      : backend_(backend), type_(type) {}
 
-  vt::DeviceType device_type() const override { return vt::DeviceType::kXPU; }
+  vt::DeviceType device_type() const override { return type_; }
   vt::Backend& backend() const override { return backend_; }
   vllm::platforms::DeviceCapability get_device_capability() const override { return {}; }
   std::vector<vt::DType> supported_dtypes() const override { return {vt::DType::kBF16}; }
@@ -142,6 +144,7 @@ class PartialXpuPlatform final : public vllm::platforms::Platform {
 
  private:
   FakeXpuBackend& backend_;
+  vt::DeviceType type_;
 };
 
 // THE BYPASS LANE IS A REAL CONFIGURATION OF THIS REPOSITORY, not a debugging
@@ -165,6 +168,12 @@ FakeXpuBackend& Backend() {
 PartialXpuPlatform& Platform() {
   static PartialXpuPlatform platform(Backend());
   return platform;
+}
+
+void EnsureRocmPlatformRegistered(vllm::platforms::Platform& fallback) {
+  if (!vllm::platforms::HasPlatform(vt::DeviceType::kROCM)) {
+    vllm::platforms::RegisterPlatform(vt::DeviceType::kROCM, &fallback);
+  }
 }
 
 // Registered into the CUDA slot as well as its own: `CurrentPlatform()` walks
@@ -781,6 +790,10 @@ TEST_CASE("ltx2 vae: the video decode's DEVICE ALLOCATIONS are drawn from the sh
 
   // DELTAS, not absolutes: this executable runs other decodes on the same
   // backend, and doctest gives no case order it is safe to depend on.
+  // Discard prior cases' retained blocks before measuring this cold decode.
+  // Keep both decodes below in the same pool so the second still proves reuse.
+  pool.Drain(Backend());
+  REQUIRE(pool.stats().retained_bytes == 0);
   const vllm::DevicePool::Stats before = pool.stats();
   const unsigned allocs_before = Backend().allocs;
 
@@ -949,6 +962,10 @@ TEST_CASE("ltx2 vae: a ZERO-PAD decode is correct on a RECYCLED pool block, twic
   vt::Queue q{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
   vllm::DevicePool& pool = vllm::Pool(Backend());
 
+  // Prior shapes can lend larger blocks and change this fixture's reuse order.
+  // Start its first decode cold; retain its dirty blocks for the second decode.
+  pool.Drain(Backend());
+  REQUIRE(pool.stats().retained_bytes == 0);
   CountingNoise noise_first;
   const vllm::Ltx2VideoFrames dev_first =
       vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh, d.lw,
@@ -995,6 +1012,20 @@ TEST_CASE("ltx2 vae: a ZERO-PAD decode is correct on a RECYCLED pool block, twic
 }
 
 TEST_CASE("ltx2 vae: a device queue whose PLATFORM IS UNREGISTERED is refused by name") {
+  // Reproduce HIP static registration on CPU without replacing a real platform.
+  // The fixture must still reach the missing-platform refusal when ROCm exists.
+  static PartialXpuPlatform registered_rocm(Backend(), vt::DeviceType::kROCM);
+  static PartialXpuPlatform other_rocm(Backend(), vt::DeviceType::kROCM);
+  const auto* expected_rocm = vllm::platforms::HasPlatform(vt::DeviceType::kROCM)
+                                  ? &vllm::platforms::GetPlatform(vt::DeviceType::kROCM)
+                                  : &registered_rocm;
+  EnsureRocmPlatformRegistered(registered_rocm);
+  REQUIRE(vllm::platforms::HasPlatform(vt::DeviceType::kROCM));
+  CHECK(&vllm::platforms::GetPlatform(vt::DeviceType::kROCM) == expected_rocm);
+  // A second fallback must not replace the CPU fixture or the real HIP platform.
+  EnsureRocmPlatformRegistered(other_rocm);
+  CHECK(&vllm::platforms::GetPlatform(vt::DeviceType::kROCM) == expected_rocm);
+
   // #1904's stated obstacle, made executable. Routing the decode's memory
   // through `DBuf` makes a registered PLATFORM a precondition it did not have
   // before, because `ResolveDevicePoolPolicy` reads the pool's soft cap off
@@ -1007,28 +1038,47 @@ TEST_CASE("ltx2 vae: a device queue whose PLATFORM IS UNREGISTERED is refused by
   // names the device, the platform registry and the pool, instead of dying
   // inside a lookup three headers down that names none of them.
   //
-  // kROCM, NOT kXPU. The platform registry is process-wide and has no
-  // unregister, so a case that depended on kXPU still being platform-less would
-  // depend on doctest's case order. Nothing in this executable ever registers a
-  // ROCm PLATFORM, so the precondition holds however the cases are scheduled.
-  vt::RegisterBackend(vt::DeviceType::kROCM, &Backend());
+  // Real backends and earlier cases can register platforms. The registry has
+  // no unregister operation, so choose a currently absent non-CPU slot rather
+  // than assuming a particular platform is missing. No available slot is a
+  // fixture failure, never a reason to skip the refusal.
+  vt::DeviceType missing_type = vt::DeviceType::kCPU;
+  for (size_t i = 1; i < vt::kNumDeviceTypes; ++i) {
+    const auto candidate = static_cast<vt::DeviceType>(i);
+    if (!vllm::platforms::HasPlatform(candidate)) {
+      missing_type = candidate;
+      break;
+    }
+  }
+  REQUIRE(missing_type != vt::DeviceType::kCPU);
+  const std::string missing_name = vt::DeviceTypeName(missing_type);
+  CAPTURE(missing_name);
+  vt::RegisterBackend(missing_type, &Backend());
   // EVERY kernel the decode needs is registered, so the platform is the ONLY
   // thing missing. Without this the decode is refused by the op provider before
   // it allocates anything, and the case would pass on a message that has nothing
   // to do with what it claims to gate.
-  vt::RegisterOp(vt::OpId::kConv3d, vt::DeviceType::kROCM,
+  vt::RegisterOp(vt::OpId::kConv3d, missing_type,
                  vt::GetOp(vt::OpId::kConv3d, vt::DeviceType::kCPU));
-  vt::RegisterOp(vt::OpId::kLtx2, vt::DeviceType::kROCM,
+  vt::RegisterOp(vt::OpId::kLtx2, missing_type,
                  vt::GetOp(vt::OpId::kLtx2, vt::DeviceType::kCPU));
-  vt::RegisterOp(vt::OpId::kLtx2Vae, vt::DeviceType::kROCM,
+  vt::RegisterOp(vt::OpId::kLtx2Vae, missing_type,
                  vt::GetOp(vt::OpId::kLtx2Vae, vt::DeviceType::kCPU));
-  vt::RegisterOp(vt::OpId::kAdd, vt::DeviceType::kROCM,
+  vt::RegisterOp(vt::OpId::kAdd, missing_type,
                  vt::GetOp(vt::OpId::kAdd, vt::DeviceType::kCPU));
-  REQUIRE(vt::TryGetBackend(vt::Device{vt::DeviceType::kROCM, 0}) != nullptr);
-  REQUIRE_FALSE(vllm::platforms::HasPlatform(vt::DeviceType::kROCM));
+  // OpRegistered excludes the portable reference tier. GetOp alone could
+  // resolve a fallback and would not prove these native registrations exist.
+  for (const auto op : {vt::OpId::kConv3d, vt::OpId::kLtx2, vt::OpId::kLtx2Vae,
+                        vt::OpId::kAdd}) {
+    CAPTURE(vt::OpName(op));
+    REQUIRE(vt::OpRegistered(op, missing_type));
+    CHECK(vt::GetOp(op, missing_type) == vt::GetOp(op, vt::DeviceType::kCPU));
+  }
+  REQUIRE(vt::TryGetBackend(vt::Device{missing_type, 0}) != nullptr);
+  REQUIRE_FALSE(vllm::platforms::HasPlatform(missing_type));
 
   const TinyDecoder d = MakeTinyDecoder();
-  vt::Queue q{vt::Device{vt::DeviceType::kROCM, 0}, nullptr};
+  vt::Queue q{vt::Device{missing_type, 0}, nullptr};
   std::string msg;
   try {
     (void)vllm::Ltx2ConvVideoDecode(d.cfg, d.weights, d.latent, d.cfg.in_channels, d.lt, d.lh,
@@ -1038,7 +1088,7 @@ TEST_CASE("ltx2 vae: a device queue whose PLATFORM IS UNREGISTERED is refused by
   }
   INFO(msg);
   REQUIRE_FALSE(msg.empty());
-  CHECK(msg.find("rocm") != std::string::npos);
+  CHECK(msg.find(missing_name) != std::string::npos);
   CHECK(msg.find("platform") != std::string::npos);
   CHECK(msg.find("pool") != std::string::npos);
 }

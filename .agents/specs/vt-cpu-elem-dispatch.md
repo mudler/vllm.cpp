@@ -317,7 +317,7 @@ a scope qualifier or a correction, it is not this row's kernel, and it is in
   kernel is bound by something else and a hoist buys the fraction the profile
   names. `AttentionKernel` and `AttentionCrossKernel` read 62.68% and were worth
   9x. Do not sweep: each hoist needs its own byte-equality gate, and the two here
-  cost eight mutations between them. Owner: unowned; issue #2376 stays open
+  cost eight mutations between them. Owner: unowned; issue ISSUE-GH-2376 stays open
   against this item.
 - **`__attribute__((always_inline))` ON `LoadF32`, worth a further 1.78x on top
   of (A) and MEASURED.** 4.768 s -> 1.810 s and 2.440 s -> 0.974 s, byte-

@@ -264,7 +264,7 @@ would be a regression rather than a repair.
 
 ## Owed
 
-- [#1573](https://github.com/mudler/vllm.cpp/issues/1573) — run the CUDA head-dim
+- ISSUE-GH-1573 — run the CUDA head-dim
   refusal case for `AttentionDenseFlash` on a leased device, and mutate the
   launcher's bound call to prove the case reaches it. PENDING a GPU lease. This
   stays owed after the merge: the CPU cases pin the arithmetic and never that the
@@ -290,7 +290,7 @@ would be a regression rather than a repair.
   allowlisted population. Nothing is owed after the merge, so this entry is the
   link and not a debt.
 
-- [#1631](https://github.com/mudler/vllm.cpp/issues/1631) — teach
+- ISSUE-GH-1631 — teach
   `scripts/check-pr-size.py` to tell a comment-only or docstring-only diff to a
   `governance_checker` from a semantic one, so a measurably false comment in a
   checker can be corrected on its own. `check-pr-size.py:170` classifies every
@@ -304,7 +304,7 @@ would be a regression rather than a repair.
   rather than to the trailing `\(`, and `:252-255` denies an equality that
   holds ON EVERY GREEN RUN, for ANY allowlist, and always did -- which is a
   larger claim than the one this entry used to make about one tree, and it is
-  the one #1631 needs. The comment's stated reason is that "a marked call inside
+  the one ISSUE-GH-1631 needs. The comment's stated reason is that "a marked call inside
   an allowlisted file counts in `marked`". True, and it does not separate the
   quantities: such a call is counted in `marked` AND excluded from `excused`, so
   it cancels on both sides. The only shape that separates `excused` from

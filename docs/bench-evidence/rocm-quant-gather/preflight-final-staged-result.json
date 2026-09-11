@@ -1,0 +1,48 @@
+{
+  "worktree": "/home/vikash/vllm.cpp-rdna3-gather-impl",
+  "base_commit": "b46852d13f7c8776557dab170e02ebea50cdfdec",
+  "staged_tree": "57d80b867e348f6a61ecb3b369fae4430e175057",
+  "scope": "The final full preflight reads this staged source and record state. Subsequent result-only record edits require focused record checks; frozen product bytes remain identical.",
+  "argv": [
+    "env",
+    "TMPDIR=/home/vikash/.cache/rdna3-gather-impl/tmp",
+    "GIT_CEILING_DIRECTORIES=/home/vikash/.cache/rdna3-gather-impl/tmp",
+    "GIT_CONFIG_GLOBAL=/dev/null",
+    "PYTHONPATH=/home/vikash/.cache/hrx-evaluation-3080-preflight/python",
+    "bash",
+    "scripts/agent-preflight.sh",
+    "--staged",
+    "--quiet"
+  ],
+  "log": "/home/vikash/.cache/rdna3-gather-impl/evidence/preflight-final-staged.log",
+  "source_manifest": "/home/vikash/.cache/rdna3-gather-impl/evidence/fresh-review-source-manifest.json",
+  "source_manifest_sha256": "780329dbc81e8ba1eeef575e1f321e30c232e4109bf0718edeb94c9d6b25a2fa",
+  "exit_status": 0,
+  "log_sha256": "23e50cc8260928a06e42faa0d7f63ef0b27f5d9aa04883a50028ddf413441833",
+  "reported_ok_calls": 158,
+  "skipped_argument_dependent_gates": [
+    "check-arm-isa-build.py",
+    "check-cpu-isa-build.py",
+    "check-cuda-fat-gencode.py",
+    "check-pr-size.py",
+    "check-triton-aot-multiarch.py"
+  ],
+  "all_green": false,
+  "explicit_cpu_isa": {
+    "argv": [
+      "python3",
+      "scripts/check-cpu-isa-build.py",
+      "--compile-commands",
+      "build-cpu-rocm-quant-gather/compile_commands.json"
+    ],
+    "exit_status": 0,
+    "log_sha256": "4f54e0b5f7fb96d55768af81286498f80a23d0d70cae9b32e62cc2a8e6bcaf16"
+  },
+  "scope_of_unsupplied_inputs": {
+    "check-arm-isa-build.py": "No ARM compilation in this x86_64 HIP build",
+    "check-cuda-fat-gencode.py": "VLLM_CPP_CUDA=OFF for this HIP build",
+    "check-triton-aot-multiarch.py": "CUDA AOT artifacts are disabled in this HIP build",
+    "check-pr-size.py": "Exact commit classification runs after committing; staged paths were independently classified"
+  },
+  "combined_cuda_hip_execution": "PENDING: no combined build was available for this qualification"
+}

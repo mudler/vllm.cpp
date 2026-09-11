@@ -1,0 +1,23 @@
+ID: ISSUE-GH-1098
+Title: `README.md` cannot be corrected, and TWO gates each refuse the fix independently. The claims that are wrong right now: **"37 registered architectures"** four times (`README.md:11,:80,:253,:296`) where `docs/FEATURES.md` says **40** in three places, corrected two commits earlier in `9143196c7`; and **ZERO `LTX` occurrences** against a `minimax` control of 7, so the video-generation announcement names one of the two shipped video families. Blocker 1: `README.md` measures **29,989 chars against `MAX_README_CHARS = 30000`** (`scripts/check-readme-structure.py:47`), so the `LTX-2.5` matrix row (~130 chars) could only land by DELETING another architecture's row - the shared-file lock AGENTS.md forbids in its own words ("Limit an entry, not a shared file"), and the third instance after the two whole-file budgets [#364](https://github.com/mudler/vllm.cpp/issues/364) retired on that argument, `MAX_CHARS` in `check-now-current.py` and the `chars` key in `check-public-doc-tables.py`. The per-ENTRY caps beside it (`MAX_CELL_CHARS = 220`, `MAX_PARAGRAPH_CHARS = 900`) are what actually stop a landing page decaying into a status log. Blocker 2, which is the decisive one: `check-doc-checkpoint.py:346-354` refuses ANY README change that does not also touch a LANDING SOURCE (`:104-113` - `.agents/mission.md`, `CMakeLists.txt`, three `benchmarks/demo/*.json`, `examples/{cli,server}/main.cpp`), evaluated PER COMMIT ([#573](https://github.com/mudler/vllm.cpp/issues/573)) so splitting the edit out does not help, and its own comment calls the rule deliberate and directly tested. It has no arm for a README CORRECTION as against README CHURN, and a correction has a natural witness: the value disagrees with the projection that owns it. So a two-family paragraph was written, MEASURED to fit at 445 chars against the old 438 with 4 to spare, and then REVERTED unlanded; it is preserved verbatim in the issue thread rather than lost. Asked: whether the checkpoint gate should distinguish correction from churn, and whether the whole-file cap should exist at all. NOT asked: raise the constant, which is widening an assertion to keep a gate green
+Row: ROAD-V1-LTX25
+State: UNKNOWN
+Kind: bug
+GitHub: 1098
+Mirror: MISSING
+Availability: METADATA_ONLY
+Created: UNKNOWN
+Updated: UNKNOWN
+Closed: UNKNOWN
+
+## Problem
+
+Archive: `.agents/completed/issue-index.md:326`
+
+### Frozen archive evidence
+
+> | [#1098](https://github.com/mudler/vllm.cpp/issues/1098) | `ROAD-V1-LTX25` | `README.md` cannot be corrected, and TWO gates each refuse the fix independently. The claims that are wrong right now: **"37 registered architectures"** four times (`README.md:11,:80,:253,:296`) where `docs/FEATURES.md` says **40** in three places, corrected two commits earlier in `9143196c7`; and **ZERO `LTX` occurrences** against a `minimax` control of 7, so the video-generation announcement names one of the two shipped video families. Blocker 1: `README.md` measures **29,989 chars against `MAX_README_CHARS = 30000`** (`scripts/check-readme-structure.py:47`), so the `LTX-2.5` matrix row (~130 chars) could only land by DELETING another architecture's row - the shared-file lock AGENTS.md forbids in its own words ("Limit an entry, not a shared file"), and the third instance after the two whole-file budgets [#364](https://github.com/mudler/vllm.cpp/issues/364) retired on that argument, `MAX_CHARS` in `check-now-current.py` and the `chars` key in `check-public-doc-tables.py`. The per-ENTRY caps beside it (`MAX_CELL_CHARS = 220`, `MAX_PARAGRAPH_CHARS = 900`) are what actually stop a landing page decaying into a status log. Blocker 2, which is the decisive one: `check-doc-checkpoint.py:346-354` refuses ANY README change that does not also touch a LANDING SOURCE (`:104-113` - `.agents/mission.md`, `CMakeLists.txt`, three `benchmarks/demo/*.json`, `examples/{cli,server}/main.cpp`), evaluated PER COMMIT ([#573](https://github.com/mudler/vllm.cpp/issues/573)) so splitting the edit out does not help, and its own comment calls the rule deliberate and directly tested. It has no arm for a README CORRECTION as against README CHURN, and a correction has a natural witness: the value disagrees with the projection that owns it. So a two-family paragraph was written, MEASURED to fit at 445 chars against the old 438 with 4 to spare, and then REVERTED unlanded; it is preserved verbatim in the issue thread rather than lost. Asked: whether the checkpoint gate should distinguish correction from churn, and whether the whole-file cap should exist at all. NOT asked: raise the constant, which is widening an assertion to keep a gate green | bug |
+
+## Resolution
+
+-

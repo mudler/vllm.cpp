@@ -312,15 +312,15 @@ Landed as the sweep of #847. The class residue under
 
 ## Owed
 
-- [#896](https://github.com/mudler/vllm.cpp/issues/896) — a checker refusing a
+- ISSUE-GH-896 — a checker refusing a
   new `static_cast<...LoadedModel&>` under `src/vllm/model_executor/models/`
   (§6). Decided yes, scoped to its own row so the gate change is reviewable on
   its own argument.
-- [#897](https://github.com/mudler/vllm.cpp/issues/897) — `ModelAs`'s
+- ISSUE-GH-897 — `ModelAs`'s
   `const LoadedModel&` overload has **no caller in the tree** (§3.3, M4). Either
   a caller appears when an entry point takes a `const LoadedModel&`, or the
   overload goes. Not decided here because it is #868's seam.
 - Making `forward` virtual on `LoadedModel` and retiring the downcast class
   outright (§8.2). Weighed and rejected for this row, not for the project. No
   issue filed: it is a design option this spec records having considered, not a
-  defect, and #847 already names it.
+  defect, and ISSUE-GH-847 already names it.

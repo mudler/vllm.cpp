@@ -860,18 +860,18 @@ They are pinned to `fd4ded7f` / `3a2f35d4` and audited separately under
 
 ## Owed
 
-- [#673](https://github.com/mudler/vllm.cpp/issues/673) — this row's
+- ISSUE-GH-673 — this row's
   checkpoint-derived evidence is manual and host-local. `LTX2_CHECKPOINT_ROOT` is
   set by no workflow, so the `test_ltx2_video` shipped-header case skips in CI and
   `scripts/measure-ltx2-prompt-adaln.py` is a manual tool no gate invokes. Filed
   as visible debt; wiring checkpoints into CI is explicitly not in this row.
-- [#900](https://github.com/mudler/vllm.cpp/issues/900) — the prompt-AdaLN term is
+- ISSUE-GH-900 — the prompt-AdaLN term is
   REACHED from `vllm_video_generate` (chain above) but no test ENTERS through that
   entry point and observes it: deleting the term's only consumer leaves
   `test_ltx2_video` green at 37 of 37. That is the second half of `AGENTS.md`
   `## Nothing lands dead`, whose rule and guide post-date this row (`8f49ac3be`,
   #886). Closing it needs an ABI-level value oracle designed red-first.
-- [#911](https://github.com/mudler/vllm.cpp/issues/911) — this spec is the worked
+- ISSUE-GH-911 — this spec is the worked
   example for a class, not an outlier. It shipped EIGHT stale repo-local anchors
   across two repair commits (`7a6165dab`, `00613767d`), every one introduced by
   the row's own commits and moved by its own `020381676` and by `98f8e046d`

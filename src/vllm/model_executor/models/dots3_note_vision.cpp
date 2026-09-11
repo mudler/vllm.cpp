@@ -13,7 +13,14 @@
 #include <utility>
 #include <vector>
 
+#include <cstdio>
+#include <memory>
+
 #include "vllm/model_executor/layers/linear.h"  // UnquantizedMlpGateUpMethod seam
+#include "vllm/model_executor/layers/quantization/fp8_block.h"  // Fp8BlockLinearMethod
+#include "vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_config.h"  // src/ header: QuantizationConfigOf
+#include "vllm/model_executor/layers/quantization/fp8_block_quant.h"
+#include "vllm/model_executor/models/dense_fp8_block_gemm.h"  // BlockFp8Runnable
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/dense_attn_block.h"
 #include "vllm/model_executor/models/dense_weight_loaders.h"
@@ -21,6 +28,7 @@
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
+#include "vt/fp8_kv.h"  // F32ToF8E4M3
 #include "vt/ops.h"
 
 namespace vllm {
@@ -186,6 +194,11 @@ Dots3NoteVisionParams ParseDots3NoteVisionParams(const HfConfig& config) {
   v.capacity_factor = ReadNumOr(j, "capacity_factor", 2.0);
   v.router_scoring_func = ReadStrOr(j, "router_scoring_func", "sigmoid");
   v.router_scale = ReadNumOr(j, "router_scale", 1.0);
+  // `enable_fp8_moe` (`vision.py:69` @ 9035151d6), ABSENT from every released
+  // `vision_config` measured on this row, so the TRUE below is the value every
+  // real load takes. It is upstream's constructor default and nothing else;
+  // `ResolveDots3NoteVisionMoeArm` decides what taking that branch means here.
+  v.enable_fp8_moe = ReadBoolOr(j, "enable_fp8_moe", true);
   v.adapter_type = ReadStrOr(j, "adapter_type", "pixel_shuffle_mlp");
   v.adapter_in_dim = ReadIntOr(j, "adapter_in_dim", 1536);
   v.adapter_out_dim = ReadIntOr(j, "adapter_out_dim", 2048);
@@ -240,6 +253,185 @@ Dots3NoteVisionParams ParseDots3NoteVisionParams(const HfConfig& config) {
                "(vision.py:363-366 @ 9035151d6), so a short list would make the "
                "tail silently dense.");
   return v;
+}
+
+// ── the FP8 ARM (W9d, #2881) ────────────────────────────────────────────────
+
+namespace {
+
+// `_BLOCK_SHAPE = [128, 128]` (`vision_moe.py:22` @ 9035151d6). Both axes, and
+// the ONE value `_per_block_cast_to_fp8_padded` passes for `block_size`
+// (`vision.py:227`, `:238`).
+constexpr int64_t kVisionFp8Block = 128;
+// The literal 448.0 the VENDORED caster divides by
+// (`deep_gemm/utils/math.py:58` @ DeepGEMM `e21c821f`); `vllm/utils/deep_gemm.py`
+// calls `get_fp8_min_max()` for the same value, and that module is NOT the one
+// `vision.py:14` imports.
+constexpr float kVisionFp8Max = 448.0F;
+// `.clamp(1e-4)` on the block amax (`deep_gemm/utils/math.py:57`). NOT the activation
+// quantizer's `1e-10`; see the header's note on the three constants.
+constexpr float kVisionFp8AmaxFloor = 1e-4F;
+
+int64_t VisionCDiv(int64_t a, int64_t b) { return (a + b - 1) / b; }
+
+}  // namespace
+
+Dots3NoteVisionMoeArm ResolveDots3NoteVisionMoeArm(
+    const Dots3NoteVisionParams& v) {
+  Dots3NoteVisionMoeArm arm;
+  // `mlp_cls = MoESwiGLUFFNFP8 if config.enable_fp8_moe else MoESwiGLUFFN`
+  // (`vision.py:369` @ 9035151d6). The predicate is written out rather than
+  // inverted so this line and upstream's read the same way round.
+  if (!v.enable_fp8_moe) return arm;
+
+  // ONE width, and it is NOT the expert one. `note_vision_fused_moe_fp8`
+  // quantizes twice. The FIRST call takes the tower's own activation
+  // (`vision_moe.py:77-81`), whose last dimension is `embed_dim`, and no pad
+  // reaches it. The SECOND takes `activated`, whose width is
+  // `intermediate_size // 2` where `intermediate_size` is `w13.shape[1]`
+  // (`:47`, `:70`) -- and `w13` is the stack of shards
+  // `_per_block_cast_to_fp8_padded` already rounded up to a multiple of 128, so
+  // that width is 128-aligned by construction and the second assertion cannot
+  // fail once the first passed. `Dots3NoteVisionMoeArm`'s own note carries the
+  // two-function chain that establishes it.
+  if (v.embed_dim % kVisionFp8Block == 0) {
+    arm.fp8 = true;
+    return arm;
+  }
+
+  arm.upstream_raises =
+      std::string(
+          "dots3-note vision tower: `enable_fp8_moe` is true (its own default, "
+          "vision.py:69 @ 9035151d6) so upstream builds `MoESwiGLUFFNFP8` "
+          "(vision.py:369) -- and that class RAISES on this config before its "
+          "first GEMM. `note_vision_fused_moe_fp8` quantizes the tower's own "
+          "activation per token in groups of ") +
+      std::to_string(kVisionFp8Block) +
+      " (`_BLOCK_SHAPE`, vision_moe.py:22, at vision_moe.py:77-81), and "
+      "`per_token_group_quant_fp8` opens with `assert x.shape[-1] % group_size "
+      "== 0` (fp8_utils.py:563-566 @ 9035151d6). That last dimension is "
+      "`embed_dim`, it is " +
+      std::to_string(v.embed_dim) + " and " + std::to_string(v.embed_dim) +
+      " % " + std::to_string(kVisionFp8Block) + " == " +
+      std::to_string(v.embed_dim % kVisionFp8Block) +
+      ". NO PAD REACHES THIS ONE: `_per_block_cast_to_fp8_padded` rounds the "
+      "EXPERT extents up (vision.py:225-239), which is what keeps "
+      "`moe_intermediate_size` out of this predicate at every value, and the "
+      "activation the tower hands in is not a weight. This tower therefore "
+      "runs upstream's OTHER class, `MoESwiGLUFFN` (the `enable_fp8_moe=False` "
+      "branch), which is the arm W6b ported and the only one of the two that "
+      "computes anything on this geometry. That is a DIVERGENCE from upstream "
+      "and it is reported rather than silent: upstream raises here. Issue "
+      "#2881, spec `.agents/specs/dots3-note.md` section 4.20";
+  return arm;
+}
+
+bool Dots3NoteVisionFp8UnrunnableHere(const Dots3NoteVisionMoeArm& arm,
+                                      vt::DeviceType device) {
+  // The whole predicate, in one place, because it is the thing that decides
+  // whether a served image request is answered or refused. `VisionMoeFfn` is
+  // its only production caller and the gate asks it directly; see the header's
+  // note for why the conjunction is named rather than inlined.
+  return arm.fp8 && !dense_fp8_block::BlockFp8Runnable(device);
+}
+
+int64_t Dots3NoteVisionFp8PadTo128(int64_t extent) {
+  // `_ceil_to_multiple` (`vision.py:222-223` @ 9035151d6) == DeepGEMM's `align`
+  // (`deep_gemm/utils/math.py:9-10` @ `e21c821f`).
+  return VisionCDiv(extent, kVisionFp8Block) * kVisionFp8Block;
+}
+
+Fp8BlockWeight Dots3NoteVisionBlockCastFp8(const OwnedTensor& w, int64_t n,
+                                           int64_t k) {
+  VT_CHECK(w.dtype == vt::DType::kBF16,
+           "Dots3NoteVisionBlockCastFp8: the vision experts are BF16 on disk "
+           "and `MoESwiGLUFFNFP8.process_weights_after_loading` casts THAT "
+           "(vision.py:255-257 @ 9035151d6); got a different dtype");
+  VT_CHECK(w.bytes.size() == static_cast<size_t>(n) * static_cast<size_t>(k) * 2,
+           "Dots3NoteVisionBlockCastFp8: the weight does not carry n*k bf16 "
+           "values");
+  // THE PADDED EXTENTS ARE THE RESULT'S EXTENTS. `_per_block_cast_to_fp8_padded`
+  // allocates `new_zeros(ceil(rows,128), ceil(cols,128))` (`vision.py:230-234`)
+  // and `per_block_cast_to_fp8` slices back to the shape of the tensor IT was
+  // handed (`deep_gemm/utils/math.py:61` @ `e21c821f`), which is that padded
+  // one. Emitting `[n, k]` here -- W9d's defect -- would make the merged `w13`
+  // scale grid disagree with its own block rows whenever `n` is ragged.
+  const int64_t np = Dots3NoteVisionFp8PadTo128(n);
+  const int64_t kp = Dots3NoteVisionFp8PadTo128(k);
+  const int64_t bn = np / kVisionFp8Block;
+  const int64_t bk = kp / kVisionFp8Block;
+
+  const auto* src = reinterpret_cast<const uint16_t*>(w.bytes.data());
+  // bf16 -> f32 is an exact widening: the 16 bits ARE the top half of the f32.
+  const auto bf16 = [src](int64_t idx) {
+    uint32_t bits = static_cast<uint32_t>(src[idx]) << 16;
+    float out = 0.0F;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+  };
+
+  // Zero-initialized, which IS the pad: `(0 * (1/sf))` encodes to the e4m3 zero
+  // byte for every finite positive `sf`, so a pad lane needs no pass of its own
+  // and cannot pick up a value from one.
+  std::vector<uint8_t> packed(static_cast<size_t>(np) * static_cast<size_t>(kp),
+                              0U);
+  std::vector<uint8_t> scale_bytes(static_cast<size_t>(bn) *
+                                   static_cast<size_t>(bk) * sizeof(float));
+  auto* sf = reinterpret_cast<float*>(scale_bytes.data());
+
+  for (int64_t bi = 0; bi < bn; ++bi) {
+    for (int64_t bj = 0; bj < bk; ++bj) {
+      const int64_t r0 = bi * kVisionFp8Block;
+      const int64_t c0 = bj * kVisionFp8Block;
+      const int64_t r1 = std::min(r0 + kVisionFp8Block, n);
+      const int64_t c1 = std::min(c0 + kVisionFp8Block, k);
+      // `x_amax = x_view.abs().float().amax(...).clamp(1e-4)`
+      // (`deep_gemm/utils/math.py:57`). The pad is zero-filled (`:54-55`), and
+      // a zero never raises an absolute maximum, so iterating the real lanes
+      // only is upstream's number and not a shortcut past it. A block with no
+      // real lane at all reads amax 0 and takes the floor, which is again
+      // upstream's answer for an all-zero block.
+      float amax = 0.0F;
+      for (int64_t r = r0; r < r1; ++r) {
+        for (int64_t c = c0; c < c1; ++c) {
+          amax = std::fmax(amax, std::fabs(bf16(r * k + c)));
+        }
+      }
+      if (amax < kVisionFp8AmaxFloor) amax = kVisionFp8AmaxFloor;
+      // `sf = x_amax / fp8_max` (`math.py:58`), and NO `ceil_to_ue8m0` because
+      // `use_ue8m0` is False at this call site (`vision.py:237`).
+      const float s = amax / kVisionFp8Max;
+      sf[bi * bk + bj] = s;
+      // `x_scaled = (x_view * (1.0 / sf)).to(fp8)` (`math.py:60`) -- a
+      // reciprocal MULTIPLY, formed once per block exactly as upstream forms
+      // it, and not the divide the activation quantizer ships.
+      const float inv = 1.0F / s;
+      for (int64_t r = r0; r < r1; ++r) {
+        for (int64_t c = c0; c < c1; ++c) {
+          packed[static_cast<size_t>(r * kp + c)] =
+              vt::F32ToF8E4M3(bf16(r * k + c) * inv);
+        }
+      }
+    }
+  }
+
+  Fp8BlockWeight out;
+  out.packed.bytes = OwnedBytes(std::move(packed));
+  out.packed.dtype = vt::DType::kI8;
+  out.packed.rank = 2;
+  out.packed.shape[0] = np;
+  out.packed.shape[1] = kp;
+  out.packed.nk = true;
+  out.scale.bytes = OwnedBytes(std::move(scale_bytes));
+  out.scale.dtype = vt::DType::kF32;
+  out.scale.rank = 2;
+  out.scale.shape[0] = bn;
+  out.scale.shape[1] = bk;
+  out.n = np;
+  out.k = kp;
+  out.block_n = kVisionFp8Block;
+  out.block_k = kVisionFp8Block;
+  return out;
 }
 
 std::string Dots3NoteVisionRefusal(
@@ -373,21 +565,31 @@ std::string Dots3NoteVisionRefusal(
 }
 
 std::string Dots3NoteVisionRefusalFor(const HfConfig& config) {
-  // The `quantization_config` block is read HERE rather than through
-  // `ParseDots3NoteParams`, because this overload must answer for a checkpoint
-  // whose LANGUAGE config the caller has not validated — the chat seam runs at
-  // server start and holds only a path.
+  // THE SHARED READER, NOT A FOURTH COPY OF IT (W9d, #2881). This overload must
+  // answer for a checkpoint whose LANGUAGE config the caller has not validated
+  // — the chat seam runs at server start and holds only a path — so it cannot
+  // route through `ParseDots3NoteParams`. It used to hand-roll the
+  // `quantization_config` read instead, which made this the row's second copy
+  // of a lookup that `layers/quantization/fp8_block_quant.h` already owns and
+  // that `model_registry.cpp` and `qwen3_5_dense_weights.cpp` both use. Two
+  // copies are two answers to "where does the quantization config live", and
+  // the nested `text_config` spelling a multimodal wrapper uses is exactly
+  // where they drift: `Fp8WeightBlockSizeOf` reads BOTH spellings and the
+  // hand-rolled loop read only the top-level one.
+  const std::vector<int64_t> weight_block_size = Fp8WeightBlockSizeOf(config);
+  // `quant_method` is still read directly, and deliberately. The shared
+  // `ReadFp8BlockQuantConfig` THROWS on a non-fp8 method beside a block size,
+  // which is right at `ModelRegistry::Load` and wrong here: this function is a
+  // string-returning predicate the chat seam calls to decide whether to install
+  // a REFUSING seam, and a throw from it stops the server instead of answering
+  // an image request with a 400. The refusal below wants the method's TEXT, not
+  // its validity.
   std::string quant_method;
-  std::vector<int64_t> weight_block_size;
-  const auto qc = config.raw.find("quantization_config");
-  if (qc != config.raw.end() && qc->is_object()) {
+  const nlohmann::json* qc =
+      layers::compressed_tensors::QuantizationConfigOf(config.raw);
+  if (qc != nullptr) {
     const auto qm = qc->find("quant_method");
     if (qm != qc->end() && qm->is_string()) quant_method = qm->get<std::string>();
-    const auto wb = qc->find("weight_block_size");
-    if (wb != qc->end() && wb->is_array()) {
-      for (const nlohmann::json& e : *wb)
-        if (e.is_number_integer()) weight_block_size.push_back(e.get<int64_t>());
-    }
   }
   return Dots3NoteVisionRefusal(ParseDots3NoteVisionParams(config), quant_method,
                                 weight_block_size);
@@ -475,6 +677,16 @@ Dots3NoteVisionWeights MaterializeDots3NoteVision(
   const int64_t E = v.embed_dim, I = v.intermediate_size, D = v.head_dim();
   const std::string p = "vision_encoder.";
   Dots3NoteVisionWeights w;
+  // `vision.py:369` asked ONCE, here, so the loader and the forward cannot
+  // answer it differently.
+  w.moe_arm = ResolveDots3NoteVisionMoeArm(v);
+  // The DIVERGENCE, said out loud. `upstream_raises` is non-empty only when
+  // upstream would select the FP8 class and its own assertion would fire, and
+  // this tower answers instead. An operator who never opens the spec still sees
+  // it; the gate asserts the same text for the released config.
+  if (!w.moe_arm.upstream_raises.empty() && v.num_moe_blocks() > 0) {
+    std::fprintf(stderr, "WARNING: %s\n", w.moe_arm.upstream_raises.c_str());
+  }
 
   // `DotsPatchEmbed.proj` is an `nn.Conv2d(C, E, kernel=stride=patch)`
   // (vision.py:328-333), so its weight ships [E, C, p, p]. The forward takes
@@ -549,6 +761,52 @@ Dots3NoteVisionWeights MaterializeDots3NoteVision(
         m.expert_gate.push_back(std::move(g));
         m.expert_up.push_back(std::move(u));
         m.expert_down.push_back(std::move(dn));
+      }
+      // ── `MoESwiGLUFFNFP8.process_weights_after_loading` (vision.py:245-283
+      // @ 9035151d6), including its LAST line ────────────────────────────────
+      if (w.moe_arm.fp8) {
+        // The resolver's own precondition, restated where the bytes are
+        // written: `embed_dim` is the ONE width no pad reaches, so the cast
+        // shards' K (gate/up) and N (down) come out equal to `E` rather than
+        // rounded, and the down GEMM's output is `E` wide as
+        // `note_vision_fused_moe_fp8`'s `output_size` is (`vision_moe.py:48`,
+        // `:147-148`). Reaching here with a ragged `E` is a caller defect, not
+        // a config this arm silently rounds.
+        VT_CHECK(E % 128 == 0,
+                 "dots3-note vision tower: the FP8 arm was selected with "
+                 "embed_dim " +
+                     std::to_string(E) +
+                     ", which is not a multiple of 128. "
+                     "ResolveDots3NoteVisionMoeArm should have sent this "
+                     "config to the bf16 class; reaching here is a defect.");
+        m.expert_gate_fp8.reserve(static_cast<size_t>(m.num_routed));
+        m.expert_up_fp8.reserve(static_cast<size_t>(m.num_routed));
+        m.expert_down_fp8.reserve(static_cast<size_t>(m.num_routed));
+        m.expert_gateup_merged.resize(static_cast<size_t>(m.num_routed));
+        for (int64_t e = 0; e < m.num_routed; ++e) {
+          const size_t ei = static_cast<size_t>(e);
+          // `w1, s1 = _per_block_cast_to_fp8_padded(expert.fc1.weight)` and the
+          // two lines under it (`:255-257`). Each half is cast SEPARATELY --
+          // the `cat` at `:258-259` happens AFTER, and here it happens inside
+          // the merged seam rather than by hand. The LOGICAL extents are passed
+          // in; the caster returns the PADDED ones, exactly as
+          // `_per_block_cast_to_fp8_padded` does, so `Im` here and
+          // `expert_gate_fp8[ei].n` differ whenever `Im` is ragged.
+          m.expert_gate_fp8.push_back(
+              Dots3NoteVisionBlockCastFp8(m.expert_gate[ei], Im, E));
+          m.expert_up_fp8.push_back(
+              Dots3NoteVisionBlockCastFp8(m.expert_up[ei], Im, E));
+          m.expert_down_fp8.push_back(
+              Dots3NoteVisionBlockCastFp8(m.expert_down[ei], E, Im));
+        }
+        // `del self.experts` (`vision.py:283`). Mirrored rather than skipped:
+        // on the released tower these are 608 experts x 3 tensors, and keeping
+        // both residencies would double the bytes for an arm that no longer
+        // reads the bf16 one. `Dots3NoteVisionMoeWeights`'s own note carries
+        // the size.
+        m.expert_gate.clear();
+        m.expert_up.clear();
+        m.expert_down.clear();
       }
     } else {
       // fc1 = the SwiGLU gate, fc3 = the up projection
@@ -757,9 +1015,17 @@ std::vector<float> DownloadF32(Dev d, DBuf& buf, int64_t n) {
 // is why `Dots3NoteVisionRefusal` turns away the two arms where upstream does
 // NOT renormalize (issue #2615): there the denominator is genuinely per-token.
 DBuf VisionMoeFfn(Dev d, const Dots3NoteVisionMoeWeights& m,
-                  const Dots3NoteVisionParams& v, const Tensor& x, int64_t L,
+                  const Dots3NoteVisionParams& v,
+                  const Dots3NoteVisionMoeArm& arm, const Tensor& x, int64_t L,
                   int64_t E, int64_t block, Dots3NoteVisionCapture* cap) {
   const int64_t ne = m.num_routed, k = m.top_k, Im = v.moe_intermediate_size;
+  // THE WIDTH THE FP8 ARM RUNS AT IS THE PADDED ONE, and it is derived from
+  // the same function the caster used rather than recomputed. `w13.shape[1]`
+  // is `2 * align(Im, 128)` (`vision.py:258` over `:225-239`) and
+  // `activated_size` is half of that (`vision_moe.py:47`, `:70`), so the
+  // SwiGLU tail and the down GEMM both see `align(Im, 128)`. On the bf16 arm
+  // nothing pads and this is `Im`.
+  const int64_t Imp = Dots3NoteVisionFp8PadTo128(Im);
   const int64_t P = L * k;
   VT_CHECK(k >= 2 && k <= ne,
            "dots3-note vision tower: block " + std::to_string(block) +
@@ -767,6 +1033,33 @@ DBuf VisionMoeFfn(Dev d, const Dots3NoteVisionMoeWeights& m,
                std::to_string(ne) +
                " experts. Dots3NoteVisionRefusal should have refused this "
                "config; reaching here is a caller defect.");
+  // THE ARCH REFUSAL, BY NAME, BEFORE ANYTHING RUNS (W9d, #2881).
+  //
+  // `MoESwiGLUFFNFP8` needs a block-scaled FP8 GEMM, and the CUDA one is
+  // registered only for the `cutlass-fp8` arch cell `12.0a,12.1a`
+  // (`cmake/CudaArchFeatures.cmake:290`, and the TU that registers it is
+  // `src/vt/cuda/cuda_matmul_fp8_block_cutlass.cu:544-550`). On any other CUDA
+  // arch -- Thor's sm_110 and Orin's sm_87 are both this project's own hosts --
+  // `vt::MatmulFp8BlockScaled` is simply UNREGISTERED, and the honest answer is
+  // to say so here rather than to fault at the first GEMM of the first image.
+  // The shared `RefuseUnrunnableFp8BlockWeight` is the seam for this; it names
+  // the projection, the device and the arch cell.
+  //
+  // AND THIS GUARD NOW FIRES ON THE RELEASED CHECKPOINT, which it did not do
+  // before PR #2947 corrected the resolver. `arm.fp8` was false for the
+  // released `vision_config` and this whole `if` was unreachable for it, so an
+  // image request against that checkpoint was ANSWERED on the bf16 class on
+  // every device. It is now refused by name on any CUDA build outside the cell.
+  // That is a behaviour change and not only a records repair; the spec's
+  // `## Owed` carries it with its unblocking condition, and
+  // `test_dots3_note_vision`'s G5 asserts that the released config reaches this
+  // predicate. Falling back to bf16 here instead would be a silent divergence
+  // from the class upstream builds, which is the trade AGENTS.md refuses.
+  if (Dots3NoteVisionFp8UnrunnableHere(arm, d.q.device.type)) {
+    RefuseUnrunnableFp8BlockWeight(
+        "vision_encoder.blocks." + std::to_string(block) + ".mlp.experts",
+        d.q.device.type);
+  }
 
   // --- the router -----------------------------------------------------------
   // THE F32 IS THE OUTPUT, NOT THE OPERANDS. Upstream writes `.float()` on both
@@ -845,14 +1138,33 @@ DBuf VisionMoeFfn(Dev d, const Dots3NoteVisionMoeWeights& m,
                        row_bytes,
                row_bytes);
     }
-    DBuf act = layers::UnquantizedMlpGateUpSplitMethod(
-                   &m.expert_gate[static_cast<size_t>(e)],
-                   &m.expert_up[static_cast<size_t>(e)], Im)
-                   .Apply(d, xg.t());
+    const size_t ei = static_cast<size_t>(e);
+    // ONE expert's SwiGLU, through the shared seam its arm names. Both arms are
+    // an `MlpGateUpMethodBase` over a mergeable gate/up pair followed by the
+    // down projection, so the two differ in the METHOD and in nothing else --
+    // no second gather, no second scatter, no second residual.
+    DBuf act =
+        arm.fp8 ? layers::Fp8BlockMlpGateUpMethod(
+                      &m.expert_gate_fp8[ei], &m.expert_up_fp8[ei],
+                      &m.expert_gateup_merged[ei], Imp)
+                      .Apply(d, xg.t())
+                : layers::UnquantizedMlpGateUpSplitMethod(&m.expert_gate[ei],
+                                                          &m.expert_up[ei], Im)
+                      .Apply(d, xg.t());
     DBuf o(d, DType::kBF16, {n, E});
-    vt::MatmulBT(d.q, o.t(), act.t(),
-                 ResidentWeight(d, m.expert_down[static_cast<size_t>(e)],
-                                {E, Im}));
+    if (arm.fp8) {
+      // `dispatch_fused_moe_kernel(..., tl.bfloat16, ...)` on the SECOND GEMM
+      // (`vision_moe.py:124-145`), i.e. the model dtype, which is what
+      // `Fp8BlockLinearMethod` over `MatmulFp8BlockScaledD` emits when asked
+      // for it. The routed-weight multiply upstream folds into that kernel's
+      // epilogue (`mul_routed_weight=True` at `:135`) is the combine below,
+      // for the reason the combine's own note gives.
+      o = layers::Fp8BlockLinearMethod(&m.expert_down_fp8[ei])
+              .Apply(d, act.t(), DType::kBF16);
+    } else {
+      vt::MatmulBT(d.q, o.t(), act.t(),
+                   ResidentWeight(d, m.expert_down[ei], {E, Im}));
+    }
     for (int64_t r = 0; r < n; ++r) {
       const auto& tj = list[static_cast<size_t>(r)];
       d.b.Copy(d.q,
@@ -864,27 +1176,97 @@ DBuf VisionMoeFfn(Dev d, const Dots3NoteVisionMoeWeights& m,
     }
   }
 
-  // --- the self-normalizing combine (:212-:217) -----------------------------
-  // The divisor is the CONSTANT `router_scale`, NOT the realised sum of `tw`.
-  // Upstream divides by the sum it actually accumulated; this call divides by
-  // the value that sum is guaranteed to take after the renormalize at
-  // :196-:199. The two agree to ~1e-7 at f32 and the guarantee is exactly what
-  // `Dots3NoteVisionRefusal` protects, but they are not the same expression —
-  // spec §4.12.2 and §4.12.3.
+  // --- the self-normalizing combine, and THE ONE PLACE THE TWO CLASSES
+  // ---     DISAGREE ON ARITHMETIC (:212-:217 vs :314-315) --------------------
+  //
+  // Both classes divide the routed sum by the token's own routed-weight total.
+  // They compute that total differently, and no output tolerance separates them
+  // on a fixture where the two happen to agree:
+  //
+  //   MoESwiGLUFFN     :188  aggregated_gate = zeros(..., dtype=x.dtype)  BF16
+  //                    :200  addends already `.to(x_flat.dtype)`          BF16
+  //                    :216  divide by `aggregated_gate + 1e-9`
+  //   MoESwiGLUFFNFP8  :314  `topk_weights.sum(-1).clamp_min(1e-9)`        F32
+  //
+  // `clamp_min` is not `+ eps`, and an F32 sum is not a BF16 one. Spec §4.20.3
+  // measures the gap and the gate asserts WHICH of the two this arm took.
   const float eps = 1e-9f;
   DBuf out(d, DType::kBF16, {L, E});
-  vt::MoeCombine(d.q, out.t(), expert_out.t(), tw.t(), /*shared=*/nullptr,
-                 1.0f / (static_cast<float>(v.router_scale) + eps));
+  std::vector<float> denom(static_cast<size_t>(L), 0.0f);
+  if (arm.fp8) {
+    // THE F32 SUM, REALISED. `tw` is `[L, top_k]` -- four bytes per SELECTED
+    // slot, not per token-channel -- so reading it back costs the same class of
+    // transfer as the `tid` download the gather already pays, and nothing like
+    // the `[L, E]` round trip the bf16 arm refuses.
+    //
+    // The division is applied to the WEIGHTS and the combine then runs at
+    // `routed_scale` 1.0, because `vt::MoeCombine` carries one float for the
+    // whole tensor and this denominator is per token. `(w_j/D) * e_j` summed is
+    // `(sum_j w_j e_j)/D` up to f32 rounding; upstream divides after the sum,
+    // this divides before it, and the ASSOCIATION is the difference. It is
+    // named here and measured by the in-test reference rather than defined
+    // away, exactly as the bf16 arm's own constant-divisor note does.
+    std::vector<float> wts(static_cast<size_t>(P));
+    tw.Download(d, wts.data());
+    for (int64_t t = 0; t < L; ++t) {
+      float sum = 0.0f;
+      for (int64_t j = 0; j < k; ++j) sum += wts[static_cast<size_t>(t * k + j)];
+      // `.clamp_min(1e-9)` (:314): a FLOOR, not an added epsilon.
+      const float dn = sum < eps ? eps : sum;
+      const float w0 = wts[static_cast<size_t>(t * k)];
+      for (int64_t j = 0; j < k; ++j)
+        wts[static_cast<size_t>(t * k + j)] /= dn;
+      // THE CAPTURE RECORDS THE DIVISOR THAT WAS APPLIED, RECOVERED FROM THE
+      // WEIGHTS THIS LOOP ACTUALLY WROTE -- not the `dn` it intended to apply.
+      //
+      // The difference is the whole reason this line is shaped like this, and
+      // it was MEASURED rather than reasoned about. A mutation that reports
+      // `clamp_min(F32)` while dividing by the bf16 value left the entire
+      // suite green (spec section 4.20.4.1, M2b): no value comparison this
+      // fixture can make separates a 6.1e-3 denominator change from e4m3
+      // quantization noise 155.7x larger, so the capture was the only witness --
+      // and a capture that reports an INTENT witnesses nothing about what ran.
+      // Deriving it from the quotient makes "reported but not applied"
+      // unrepresentable instead of undetected.
+      denom[static_cast<size_t>(t)] =
+          w0 != 0.0f ? w0 / wts[static_cast<size_t>(t * k)] : dn;
+    }
+    // A SECOND buffer rather than a write-back, so `tw` still holds upstream's
+    // own `topk_weights` for the capture and the gate reads the pair rather
+    // than a quotient it would have to invert.
+    DBuf twd(d, DType::kF32, {L, k});
+    d.b.Copy(d.q, twd.ptr(), wts.data(), twd.bytes());
+    vt::MoeCombine(d.q, out.t(), expert_out.t(), twd.t(), /*shared=*/nullptr,
+                   1.0f);
+  } else {
+    // THE BF16 ARM, UNCHANGED SINCE W6b. The divisor is the CONSTANT
+    // `router_scale`, NOT the realised sum of `tw`: upstream divides by the sum
+    // it actually accumulated, and this call divides by the value that sum is
+    // guaranteed to take after the renormalize at :196-:199. The two agree to
+    // ~1e-7 at f32 and the guarantee is exactly what `Dots3NoteVisionRefusal`
+    // protects, but they are not the same expression — spec §4.12.2 and
+    // §4.12.3.
+    for (int64_t t = 0; t < L; ++t)
+      denom[static_cast<size_t>(t)] = static_cast<float>(v.router_scale) + eps;
+    vt::MoeCombine(d.q, out.t(), expert_out.t(), tw.t(), /*shared=*/nullptr,
+                   1.0f / (static_cast<float>(v.router_scale) + eps));
+  }
 
   if (cap != nullptr) {
     Dots3NoteVisionMoeRoute route;
     route.block = block;
     route.num_routed = ne;
     route.top_k = k;
+    route.fp8 = arm.fp8;
     route.logits.resize(static_cast<size_t>(L * ne));
     logits.Download(d, route.logits.data());
+    // Upstream's own `topk_weights` on both arms, PRE-division, with the
+    // denominator the combine used beside it. The gate needs both, because the
+    // whole question W9d's A/B asks is which denominator this arm formed from
+    // these weights.
     route.weights.resize(static_cast<size_t>(P));
     tw.Download(d, route.weights.data());
+    route.denominator = denom;
     route.ids = ids;
     cap->moe_routes.push_back(std::move(route));
   }
@@ -1038,7 +1420,7 @@ std::vector<float> Dots3NoteVisionForward(
       // `MoEVisionBlock.__init__` picks the routed mlp on
       // `pyramid_num_routed[layer] > 0` (vision.py:363-374 @ 9035151d6), and
       // the residual around it is the same one the dense arm uses (:394).
-      DBuf routed = VisionMoeFfn(d, bw.moe, v, n2.t(), L, E,
+      DBuf routed = VisionMoeFfn(d, bw.moe, v, w.moe_arm, n2.t(), L, E,
                                  static_cast<int64_t>(b), cap);
       vt::Add(d.q, hidden.t(), hidden.t(), routed.t());
     } else {

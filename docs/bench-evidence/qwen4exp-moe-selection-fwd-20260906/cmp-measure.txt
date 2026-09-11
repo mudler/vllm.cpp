@@ -1,0 +1,74 @@
+=== MEASURE-CPU-vs-CUDA ===
+RESULT SELFWD MEASURE-CPU-vs-CUDA COUNT base_digests=384 other_digests=384 base_tok=576 other_tok=576
+RESULT SELFWD MEASURE-CPU-vs-CUDA COUNTED-PROPERTY base last_digest_lines=576 value_lines_seen=576 agree=True
+RESULT SELFWD MEASURE-CPU-vs-CUDA COUNTED-PROPERTY other last_digest_lines=576 value_lines_seen=576 agree=True
+RESULT SELFWD MEASURE-CPU-vs-CUDA STRUCTURE calls_common=384 prefill_calls(L)=48 decode_calls=336 T_prefill=5
+RESULT SELFWD MEASURE-CPU-vs-CUDA STRUCTURE contiguous_and_uniform=True
+RESULT SELFWD MEASURE-CPU-vs-CUDA STRUCTURE forwards=8 moe_blocks_per_forward=48
+fwd  phase   calls  slots     FLIPPED   hash_mism  first_L  
+0    prefill 48     240       53        35         4        
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 0 prefill calls=48 slots=240 FLIPPED=53 hash_mismatch=35 first_flip_layer=4
+     first flip: call=4 layer=4 tok=4
+        base  ids=41,48,54,63,133,205,252,309,393,469 ulps=0 lo=-4.34375(0xc08b) hi=-4.34375(0xc08b)
+        other ids=41,48,54,133,205,252,309,360,393,469 ulps=1 lo=-4.34375(0xc08b) hi=-4.375(0xc08c)
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 0 FIRSTFLIP call=4 layer=4 tok=4 base_ids=41,48,54,63,133,205,252,309,393,469 other_ids=41,48,54,133,205,252,309,360,393,469 base_ulps=0 other_ulps=1
+1    decode  48     48        22        22         12       
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 1 decode calls=48 slots=48 FLIPPED=22 hash_mismatch=22 first_flip_layer=12
+     first flip: call=60 layer=12 tok=0
+        base  ids=10,36,139,180,216,281,344,366,381,436 ulps=1 lo=-4.125(0xc084) hi=-4.15625(0xc085)
+        other ids=10,36,67,139,180,216,281,366,381,436 ulps=0 lo=-4.125(0xc084) hi=-4.125(0xc084)
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 1 FIRSTFLIP call=60 layer=12 tok=0 base_ids=10,36,139,180,216,281,344,366,381,436 other_ids=10,36,67,139,180,216,281,366,381,436 base_ulps=1 other_ulps=0
+2    decode  48     48        29        29         5        
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 2 decode calls=48 slots=48 FLIPPED=29 hash_mismatch=29 first_flip_layer=5
+     first flip: call=101 layer=5 tok=0
+        base  ids=20,34,56,163,216,220,236,421,435,460 ulps=0 lo=-4.6875(0xc096) hi=-4.6875(0xc096)
+        other ids=34,56,163,216,220,236,336,421,435,460 ulps=1 lo=-4.65625(0xc095) hi=-4.6875(0xc096)
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 2 FIRSTFLIP call=101 layer=5 tok=0 base_ids=20,34,56,163,216,220,236,421,435,460 other_ids=34,56,163,216,220,236,336,421,435,460 base_ulps=0 other_ulps=1
+3    decode  48     48        17        17         9        
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 3 decode calls=48 slots=48 FLIPPED=17 hash_mismatch=17 first_flip_layer=9
+     first flip: call=153 layer=9 tok=0
+        base  ids=75,111,139,154,171,367,462,466,508,511 ulps=0 lo=-4.25(0xc088) hi=-4.25(0xc088)
+        other ids=71,75,139,154,171,367,462,466,508,511 ulps=0 lo=-4.25(0xc088) hi=-4.25(0xc088)
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 3 FIRSTFLIP call=153 layer=9 tok=0 base_ids=75,111,139,154,171,367,462,466,508,511 other_ids=71,75,139,154,171,367,462,466,508,511 base_ulps=0 other_ulps=0
+4    decode  48     48        33        33         8        
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 4 decode calls=48 slots=48 FLIPPED=33 hash_mismatch=33 first_flip_layer=8
+     first flip: call=200 layer=8 tok=0
+        base  ids=148,182,231,244,325,363,370,429,451,505 ulps=0 lo=-3.875(0xc078) hi=-3.875(0xc078)
+        other ids=182,231,244,325,337,363,370,429,451,505 ulps=1 lo=-3.859375(0xc077) hi=-3.875(0xc078)
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 4 FIRSTFLIP call=200 layer=8 tok=0 base_ids=148,182,231,244,325,363,370,429,451,505 other_ids=182,231,244,325,337,363,370,429,451,505 base_ulps=0 other_ulps=1
+5    decode  48     48        48        48         0        
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 5 decode calls=48 slots=48 FLIPPED=48 hash_mismatch=48 first_flip_layer=0
+     first flip: call=240 layer=0 tok=0
+        base  ids=58,211,293,338,348,349,369,404,414,446 ulps=0 lo=-4.5625(0xc092) hi=-4.5625(0xc092)
+        other ids=58,133,289,290,291,338,348,349,404,426 ulps=1 lo=-4.53125(0xc091) hi=-4.5625(0xc092)
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 5 FIRSTFLIP call=240 layer=0 tok=0 base_ids=58,211,293,338,348,349,369,404,414,446 other_ids=58,133,289,290,291,338,348,349,404,426 base_ulps=0 other_ulps=1
+6    decode  48     48        46        46         1        
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 6 decode calls=48 slots=48 FLIPPED=46 hash_mismatch=46 first_flip_layer=1
+     first flip: call=289 layer=1 tok=0
+        base  ids=172,175,209,320,368,383,394,423,451,475 ulps=1 lo=-4.3125(0xc08a) hi=-4.34375(0xc08b)
+        other ids=0,172,175,209,215,320,368,383,451,475 ulps=0 lo=-4.25(0xc088) hi=-4.25(0xc088)
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 6 FIRSTFLIP call=289 layer=1 tok=0 base_ids=172,175,209,320,368,383,394,423,451,475 other_ids=0,172,175,209,215,320,368,383,451,475 base_ulps=1 other_ulps=0
+7    decode  48     48        48        48         0        
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 7 decode calls=48 slots=48 FLIPPED=48 hash_mismatch=48 first_flip_layer=0
+     first flip: call=336 layer=0 tok=0
+        base  ids=44,79,138,188,320,381,416,464,470,485 ulps=1 lo=-4.65625(0xc095) hi=-4.6875(0xc096)
+        other ids=34,44,138,190,378,384,427,463,470,485 ulps=11 lo=-4.21875(0xc087) hi=-4.5625(0xc092)
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 7 FIRSTFLIP call=336 layer=0 tok=0 base_ids=44,79,138,188,320,381,416,464,470,485 other_ids=34,44,138,190,378,384,427,463,470,485 base_ulps=1 other_ulps=11
+RESULT SELFWD MEASURE-CPU-vs-CUDA GROUP DIVERGING forwards=[4, 6, 7] slots=144 FLIPPED=127
+RESULT SELFWD MEASURE-CPU-vs-CUDA GROUP AGREEING forwards=[1, 2, 3, 5] slots=192 FLIPPED=116
+RESULT SELFWD MEASURE-CPU-vs-CUDA HIGHEST FORWARD REACHED = 7 (the open clause needs >= 7)
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 x_base=3615.47142 x_other=3615.62777 (compare with the recorded L00 mhc.mix pair)
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 sel_base=5bbd84f0b21b362b sel_other=5bbd84f0b21b362b hash_equal=True
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 LAYER-0 VERDICT: tokens=5 FLIPPED=0 -> NO FLIP (layer 0 agrees on every token)
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 tok=0 equal=True base_ulps=4 other_ulps=4 base_ids=32,46,71,130,160,215,226,286,309,342 other_ids=32,46,71,130,160,215,226,286,309,342
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 tok=1 equal=True base_ulps=2 other_ulps=2 base_ids=68,119,289,293,338,369,386,441,471,492 other_ids=68,119,289,293,338,369,386,441,471,492
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 tok=2 equal=True base_ulps=1 other_ulps=1 base_ids=21,76,101,265,293,301,314,338,361,369 other_ids=21,76,101,265,293,301,314,338,361,369
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 tok=3 equal=True base_ulps=1 other_ulps=1 base_ids=211,226,366,367,386,414,434,441,446,503 other_ids=211,226,366,367,386,414,434,441,446,503
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 tok=4 equal=True base_ulps=0 other_ulps=0 base_ids=21,88,96,148,265,337,378,406,462,463 other_ids=21,88,96,148,265,337,378,406,462,463
+RESULT SELFWD MEASURE-CPU-vs-CUDA TIE-RATE base exact_bf16_ties=143 of 576 boundaries = 24.8%
+RESULT SELFWD MEASURE-CPU-vs-CUDA TIE-RATE other exact_bf16_ties=133 of 576 boundaries = 23.1%
+RESULT SELFWD MEASURE-CPU-vs-CUDA AXIS x     first_call_not_bit_identical=0 (forward=0) [ORDERING ONLY]
+RESULT SELFWD MEASURE-CPU-vs-CUDA AXIS logit first_call_not_bit_identical=0 (forward=0) [ORDERING ONLY]
+RESULT SELFWD MEASURE-CPU-vs-CUDA AXIS exp   first_call_not_bit_identical=0 (forward=0) [ORDERING ONLY]
+RESULT SELFWD MEASURE-CPU-vs-CUDA AXIS shr   first_call_not_bit_identical=0 (forward=0) [ORDERING ONLY]
+RESULT SELFWD MEASURE-CPU-vs-CUDA VERDICT total_flipped_slots=296 over_forwards=8

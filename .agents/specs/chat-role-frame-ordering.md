@@ -213,7 +213,7 @@ from "a client reaches it".
 
 - [#1982](https://github.com/mudler/vllm.cpp/issues/1982) — this change closes
   the ordering half.
-- [#1992](https://github.com/mudler/vllm.cpp/issues/1992) — a streaming error
+- ISSUE-GH-1992 — a streaming error
   frame. Neither `ChatSseStream::next` nor
   `CompletionSseStream::next` converts an engine exception into
   `data: {"error": …}` + `data: [DONE]` the way

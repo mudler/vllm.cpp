@@ -256,12 +256,12 @@ No GPU and no lease. The whole leaf is host arithmetic.
   this loop accumulates in `double`, which no reference on this path uses. #1008
   measured and fixed precisely this for the video half. It is a golden-changing
   correctness row and it is the larger remaining lever here, because it is what
-  unlocks SIMD as well. Owner: this row, through #2405.
+  unlocks SIMD as well. Owner: this row, through ISSUE-GH-2405.
 - **The device arm through `vt::Conv2d`.** The op exists with CPU and device
   arms and a published f32 accumulation contract (`include/vt/ops.h:4236-4258`),
   and upstream runs this decoder on the accelerator. It lands with the item
   above, because that op's accumulator width is the change above. Owner: this
-  row, through #2405.
+  row, through ISSUE-GH-2405.
 - **The remaining 206.0 s of the parent row's render** is still a second
   question, and this row moves one term of it. Owner:
   `LTX25-RENDER-SPEED-PARITY`.

@@ -77,6 +77,110 @@ class CheckerEvidenceMapping(unittest.TestCase):
 
 
 class PathClassification(unittest.TestCase):
+    def test_canonical_issue_files_are_project_records(self) -> None:
+        for path in (
+            ".agents/issues/ARCH-ONE-SURFACE/ISSUE-GH-1195.md",
+            ".agents/issues/_owed/ISSUE-GH-2390.md",
+            ".agents/issues/_intake/ISSUE-GH-41.md",
+            ".agents/issues/ENG-RECORD-CONFLICT-SURFACES/"
+            "ISSUE-" "LOCAL-01ARZ3NDEKTSV4RRFFQ69G5FAV.md",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(checker.classify_path(path), "project_record")
+
+    def test_canonical_issue_file_near_misses_fail_closed(self) -> None:
+        for path in (
+            ".agents/issues/ARCH-ONE-SURFACE/nested/ISSUE-GH-1195.md",
+            ".agents/issues/ARCH-ONE-SURFACE/ISSUE-GH-0.md",
+            ".agents/issues/ARCH-ONE-SURFACE/ISSUE-GH-01195.md",
+            ".agents/issues/ARCH-ONE-SURFACE/"
+            "ISSUE-LOCAL-01ARZ3NDEKTSV4RRFFQ69G5FAI.md",
+            ".agents/issues/_intake/"
+            "ISSUE-" "LOCAL-01ARZ3NDEKTSV4RRFFQ69G5FAV.md",
+            ".agents/issues/ISSUE-GH-1195.md",
+            ".agents/issues/_other/ISSUE-GH-1195.md",
+            ".agents/issues/ARCH-ONE-SURFACE/notes.md",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    checker.classify_path(path)
+
+    def test_recorded_exl3_artifacts_are_evidence(self) -> None:
+        """#3060: inspect every recorded path, including the incomplete leg."""
+        runs = {
+            "qwen38-27b-exl3-headtohead-20260903": (
+                "OURS-A.clientlog", "OURS-B.clientlog",
+                "THEIRS-A.clientlog", "THEIRS-B.clientlog",
+                "serve_openai-usage.patch",
+            ),
+            "qwen38-27b-exl3-variadic-20260905": (
+                "OURS-r1-c1.clientlog", "OURS-r1-c4.clientlog", "OURS-r1-c8.clientlog",
+                "OURS-r2-c1.clientlog", "OURS-r2-c4.clientlog", "OURS-r2-c8.clientlog",
+                "PROBE.clientlog",
+                "THEIRS-r1-c1.clientlog", "THEIRS-r1-c4.clientlog", "THEIRS-r1-c8.clientlog",
+                "THEIRS-r2-c8.clientlog",
+            ),
+        }
+        for run, names in runs.items():
+            for name in names:
+                path = f"docs/bench-evidence/{run}/{name}"
+                with self.subTest(path=path):
+                    self.assertEqual(checker.classify_path(path), "evidence")
+
+    def test_recorded_exl3_evidence_near_misses_fail_closed(self) -> None:
+        head = "docs/bench-evidence/qwen38-27b-exl3-headtohead-20260903"
+        variadic = "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905"
+        for path in (
+            f"{head}/OURS-C.clientlog",
+            f"{head}/PROBE.clientlog",
+            f"{variadic}/THEIRS-r3-c1.clientlog",
+            f"{variadic}/serve_openai-usage.patch",
+            f"{head}/other.patch",
+            f"{head}/OURS-A.patch",
+            f"{head}/OURS-A.clientlog.bak",
+            f"{head}/ours-a.clientlog",
+            f"{head}/OURS-A.CLIENTLOG",
+            f" {head}/OURS-A.clientlog",
+            f"{head}/OURS-A.clientlog ",
+            f"{head}/nested/OURS-A.clientlog",
+            f"{head}/nested/serve_openai-usage.patch",
+            "docs/bench-evidence/OURS-A.clientlog",
+            "docs/bench-evidence/serve_openai-usage.patch",
+            "docs/bench-evidence/uninspected-run/OURS-A.clientlog",
+            "docs/bench-evidence/uninspected-run/serve_openai-usage.patch",
+            "docs/other/OURS-A.clientlog",
+            "docs/other/serve_openai-usage.patch",
+            f"./{head}/OURS-A.clientlog",
+            f"{head}//OURS-A.clientlog",
+            f"{head}/../qwen38-27b-exl3-headtohead-20260903/OURS-A.clientlog",
+            f"{head}/serve_openai-usage.patch/",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    checker.classify_path(path)
+
+    def test_recorded_exl3_evidence_preserves_existing_classes(self) -> None:
+        head = "docs/bench-evidence/qwen38-27b-exl3-headtohead-20260903"
+        variadic = "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905"
+        expected = {
+            f"{head}/README.md": "public_document",
+            f"{variadic}/corpus-manifest.json": "public_document",
+            f"{head}/job-as-run.sh": "evidence",
+            f"{head}/client.py": "evidence",
+            f"{head}/results.txt": "evidence",
+            f"{variadic}/job-as-run.sh": "evidence",
+            "benchmarks/variadic/job.sh": "product",
+            "benchmarks/variadic/OURS-A.clientlog": "product",
+            "benchmarks/variadic/serve_openai-usage.patch": "product",
+            "tools/serve_openai.py": "product",
+            "src/serve_openai-usage.patch": "product",
+            "scripts/check-pr-size.py": "governance_checker",
+            "tests/scripts/test_check_pr_size.py": "governance_test",
+        }
+        for path, path_class in expected.items():
+            with self.subTest(path=path):
+                self.assertEqual(checker.classify_path(path), path_class)
+
     def test_state_migration_manifest_archives_are_evidence(self) -> None:
         for path in (
             ".agents/completed/state-migration-manifest.csv",

@@ -224,7 +224,7 @@ It is recorded here because `assertions: 0` reads as a pass in a summary line.
   vLLM and SGLang positions alike. A repeat count derived from the measured
   spread, interleaved arms, and a terminal control in the harness are owed
   before any c=8 number is evidence again. Tracked by
-  [#2152](https://github.com/mudler/vllm.cpp/issues/2152) and owed here until a
+  ISSUE-GH-2152 and owed here until a
   row picks it up.
 - **We reorder where upstream does not.** `_may_reorder_batch`
   (`gpu_model_runner.py:1108-1130`) returns early when every attention group

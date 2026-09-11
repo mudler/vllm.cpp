@@ -136,11 +136,33 @@ bool KeepNvfp4DType(uint32_t ggml_type) { return ggml_type == 40; }
 bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
   switch (dev) {
     case vt::DeviceType::kROCM:
-      // src/vt/rocm/rocm_grouped_gemm.hip implements exactly these on both the
-      // grouped and non-grouped arms; Q4_0/Q2_K/Q3_K/IQ2_*/IQ3_*/MXFP4 are
-      // owed (recorded in .agents/specs/rocm-gg-keep-quant.md).
+      // rocm_grouped_gemm.hip implements Q8_0/Q4_K/Q5_K/Q6_K, while
+      // rocm_quant_dot.hip adds the seven Q8_K-activation formats below on
+      // both grouped and non-grouped arms. IQ4_XS remains with #3029 and is
+      // not admitted by this row; Q4_0/Q5_0/IQ2_XS/IQ4_NL/IQ3_S/IQ4_XS/
+      // MXFP4 stay on the named expand-or-refuse path.
       return dt == vt::DType::kQ8_0 || dt == vt::DType::kQ4_K ||
-             dt == vt::DType::kQ5_K || dt == vt::DType::kQ6_K;
+             dt == vt::DType::kQ5_K || dt == vt::DType::kQ6_K ||
+             dt == vt::DType::kIQ2_XXS || dt == vt::DType::kIQ3_XXS ||
+             dt == vt::DType::kQ2_K || dt == vt::DType::kQ3_K ||
+             dt == vt::DType::kIQ2_S || dt == vt::DType::kIQ1_S ||
+             dt == vt::DType::kIQ1_XXXS;
+    case vt::DeviceType::kTENSTORRENT:
+      // KEEPQUANT W3: the P150 is discrete with no CPU fallback tier, so this
+      // arm admits exactly what src/vt/tenstorrent/tenstorrent_ops.cpp has a
+      // registered decode for — MatmulBTQuantKernel decodes Q4_K/Q5_K/Q6_K/
+      // Q8_0 through the bit-exact DecodeKeepQuantBlocksF32 chains, staged as
+      // the per-weight resident i32 word shadow. The vehicle's own histogram
+      // (the q4km artifact: token_embd Q6_K, attn_qkv/ssm_out Q5_K,
+      // ssm_alpha/ssm_beta Q8_0) is what pulled Q5_K/Q6_K/Q8_0 from W4 into
+      // W3 — kernels and predicate widened IN THE SAME CHANGE. kQ4_0 has no
+      // TT arm at all and kQ2_K/kQ3_K stay owed; admitting an encoding
+      // without its kernel throws at first forward with the model resident,
+      // the exact failure this predicate exists to prevent.
+      // tests/vllm/test_gguf_keep_quant.cpp pins the set; widening the arm
+      // without widening the kernel reds it.
+      return dt == vt::DType::kQ4_K || dt == vt::DType::kQ5_K ||
+             dt == vt::DType::kQ6_K || dt == vt::DType::kQ8_0;
     default:
       // CUDA falls back to the CPU kernel for anything it lacks
       // (cuda_quant_dot.cu:1841-1846); the CPU list IS the CPU capability.
@@ -181,7 +203,7 @@ bool KeepQuantGatherDType(uint32_t ggml_type, vt::DType* out) {
 // CUDA backend (cuda_ops.cu, through cuda_quant_dequant.cuh) -- named in prose
 // rather than as the enumerator on purpose, because the leakage checker greps
 // the token in comments too, and rightly so: a prose mention is how the next
-// hand-kept device list starts. METAL, VULKAN, ROCM and
+// hand-kept device list starts. METAL, VULKAN and
 // TENSTORRENT register only `kEmbedding`, whose kernels each assert a float
 // table by name, so they answer false here and keep their pre-existing
 // expand-bf16 residency -- and their gather arms are owed.
@@ -199,8 +221,8 @@ bool DeviceQuantGatherSupported(vt::DeviceType dev) {
 bool KeepQuantDType(uint32_t ggml_type, vt::DType* out) {
   vt::DType dt = vt::DType::kF32;
   if (!vt::BlockDTypeFromGgmlTypeId(ggml_type, &dt)) return false;
-  // Q8_K is the K-quants' ACTIVATION encoding; it never appears as a file
-  // weight type and has no vec_dot, so it is not keep-quant capable.
+  // Q8_K is the K-quants' ACTIVATION encoding and has no weight-side vec_dot, so
+  // it is not keep-quant capable, although a file CAN carry it (reader case 15).
   if (!vt::cpu::HasQuantDotKernel(dt)) return false;
   if (out != nullptr) *out = dt;
   return true;
@@ -410,13 +432,12 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv(vt::DeviceType dev) {
 // this GEMM have a `vec_dot` for this encoding", so for a PLACED routed-expert
 // tower it is a question about the placement device, not about the engine.
 //
-// Measured, on GLM-5.3 `UD-IQ1_S` on `strix:gpu0`: `DeviceKeepQuantSupported`
-// serves {Q8_0, Q4_K, Q5_K, Q6_K} on ROCm, so all 228 IQ1_S/IQ3_XXS/IQ2_XXS/
-// IQ4_XS/Q2_K/Q3_K towers routed `kExpandBf16` and `LoadStackedExperts` refused
-// the load by name -- for towers whose bytes never reach the GPU at all (that
-// model reads a tower only through `GlmExpertSlice`, never through
-// `ResidentWeight`) and which the installed plan had already sent to the CPU,
-// whose `vec_dot` table covers every one of those six encodings.
+// On GLM-5.3 `UD-IQ1_S`, five of the six expert formats now stay quantized on
+// ROCm: IQ1_S/IQ3_XXS/IQ2_XXS/Q2_K/Q3_K. IQ4_XS still routes
+// `kExpandBf16`, so `LoadStackedExperts` can refuse a load for a tower whose
+// bytes never reach the GPU (the model reads a tower only through
+// `GlmExpertSlice`, never through `ResidentWeight`) and which the installed
+// plan has already sent to the CPU. The CPU `vec_dot` table covers all six.
 //
 // THIS IS #1136 AND #2406 ONE SEAM FURTHER ALONG. Both were the same shape: a
 // residency decision resolved against a device other than the one that would

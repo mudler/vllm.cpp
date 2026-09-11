@@ -186,7 +186,6 @@ jobs:
         run: |
           python3 scripts/check-agent-record.py --report
           python3 tests/scripts/test_agent_record.py
-          python3 tests/scripts/test_agent_issue_index.py
       - name: Accepted binary-release design and record anchors stay in sync
         run: |
           python3 scripts/check-release-binary-contract.py
@@ -541,6 +540,9 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-numpy
+          python3 tests/scripts/test_qwen3_capture_tools.py
+          python3 tests/scripts/test_qwen3_capture_outputs.py
+          python3 tests/scripts/test_rocm_quant_gather_compare.py
           python3 tests/scripts/test_ltx25_render_compare.py && python3 tests/scripts/test_ltx25_absolute_reference.py
           # The prompt-adherence half of the same tool (#2295, owning #1854's
           # first sub-question). 42 of its 47 cases need numpy only; the five

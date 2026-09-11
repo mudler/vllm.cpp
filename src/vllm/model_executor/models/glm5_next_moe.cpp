@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/models/deepseek_v4_moe.h"  // deepseek_v4::ClampedSwiGLU
 #include "vllm/model_executor/models/dense_attn_block.h"  // dense_attn::ResidentWeight
 #include "vllm/model_executor/models/dense_device_glue.h"  // dense_attn::Dev, DBuf
@@ -174,7 +175,7 @@ void WarnDeviceFallbackOnce(const char* why) {
 void MoeExpertsKeepQuant(const MoeDims& d, const MoeQuantBanks& b,
                          const std::vector<float>& hidden, const MoeRouting& r,
                          int64_t num_tokens, vt::Queue& queue,
-                         dense_attn::Dev* dev,
+                         dense_attn::Dev* dev, const std::string& expert_group,
                          std::vector<float>* expert_out) {
   const int64_t H = d.hidden_size;
   const int64_t I = d.moe_intermediate_size;
@@ -220,6 +221,17 @@ void MoeExpertsKeepQuant(const MoeDims& d, const MoeQuantBanks& b,
   // q.device` check passes because it is TRUE and not because it was made to
   // look true.
   if (dev != nullptr && b.HasSources() && DeviceBanksFit(b, *dev)) {
+    // ResidentWeight uploads the source bytes, not the cached host view.
+    // Check every bank before uploading any of them; down may use a different
+    // encoding from gate/up. Host and memory-fallback arms need no admission.
+    const OwnedTensor* sources[] = {b.gate_src, b.up_src, b.down_src};
+    const char* suffixes[] = {"_gate_exps.weight", "_up_exps.weight", "_down_exps.weight"};
+    for (size_t i = 0; i < 3; ++i) {
+      VT_CHECK(DeviceKeepQuantSupported(sources[i]->dtype, dev->q.device.type),
+               "glm5_next moe: " + expert_group + suffixes[i] + " uses " +
+                   vt::Name(sources[i]->dtype) + ", missing kept-expert device arm on " +
+                   vt::DeviceTypeName(dev->q.device.type));
+    }
     AnnounceDeviceArmOnce(dev->q.device);
     // `ResidentWeight` uploads `bytes` verbatim and keeps the block dtype, so
     // these stay Q2_K / IQ2_XS / IQ3_XXS / IQ4_XS on the device. The shapes are
@@ -478,6 +490,16 @@ std::vector<float> MoeForward(const MoeDims& d, const MoeLayerWeights& w,
                               const std::vector<float>& hidden, int64_t num_tokens,
                               vt::Queue& queue, dense_attn::Dev* dev) {
   d.Validate();
+  // Placement follows the loaded model, not the current process-global plan.
+  // The host arm already owns host activations and output, so CPU placement
+  // needs no transfer and must not enter the device-memory fallback.
+  if (w.compute_device == vt::DeviceType::kCPU) dev = nullptr;
+  if (dev != nullptr && w.compute_device.has_value()) {
+    VT_CHECK(*w.compute_device == dev->q.device.type,
+             "glm5_next moe: " + w.expert_group + " was loaded for " +
+                 vt::DeviceTypeName(*w.compute_device) + ", but forward uses " +
+                 vt::DeviceTypeName(dev->q.device.type));
+  }
   const int64_t H = d.hidden_size;
   const int64_t E = d.n_routed_experts;
   const int64_t I = d.moe_intermediate_size;
@@ -546,7 +568,7 @@ std::vector<float> MoeForward(const MoeDims& d, const MoeLayerWeights& w,
   // fold: they are the operand the parity gate compares against, and deleting
   // them deletes the gate.
   if (w.has_quant_banks) {
-    MoeExpertsKeepQuant(d, w.quant_banks, hidden, r, num_tokens, queue, dev,
+    MoeExpertsKeepQuant(d, w.quant_banks, hidden, r, num_tokens, queue, dev, w.expert_group,
                         &expert_out);
   } else {
     std::vector<float> gate_up(static_cast<size_t>(2 * I));

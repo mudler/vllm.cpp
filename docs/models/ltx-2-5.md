@@ -117,6 +117,71 @@ ltx2-gen \
   --device cuda --workdir /tmp/ltx25 --out /tmp/ltx25/video.mp4
 ```
 
+## Condition a render on a reference clip (IC-LoRA)
+
+```sh
+ltx2-gen \
+  --dit "$LTX_ROOT/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors" \
+  --model-version 2.5 --checkpoint-class distilled \
+  --video-vae "$LTX_ROOT/vae/ltx-2.5-video-vae-conv-bf16.safetensors" \
+  --audio-vae "$LTX_ROOT/vae/ltx-2.5-audio-vae-bf16.safetensors" \
+  --upsampler "$LTX_ROOT/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors" \
+  --pipeline-kind ic_lora \
+  --lora "$LTX_ROOT/loras/<YOUR-IC-LORA>.safetensors" \
+  --ref-video /tmp/depth_frames --ref-video-strength 1.0 \
+  --prompt-embeds "$LTX_VIDEO_EMBEDS" --audio-prompt-embeds "$LTX_AUDIO_EMBEDS" \
+  --frames 25 --width 320 --height 192 --seed 20260812 \
+  --workdir /tmp/ltx25ic --out /tmp/ltx25ic/video.mp4
+```
+
+`--lora` is a PLACEHOLDER above, and deliberately so. The pinned upstream
+checkout names no reference-conditioning IC-LoRA for 2.5: its only 2.5 IC-LoRA is
+[`ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors`](https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler),
+which is `DFRPipeline`'s detailing adapter and rides stage 2 (`README.md:95-96`).
+The published control adapters that DO condition on a reference clip are 2.3-era
+and 19b — `LTX-2.3-22b-IC-LoRA-Union-Control`,
+`LTX-2.3-22b-IC-LoRA-Motion-Track-Control` and
+`LTX-2-19b-IC-LoRA-Pose-Control` (`MODELS-LTX-2.3.md:32-35`) — so none of them
+pairs with the 2.5 22b transformer this recipe loads. No adapter is named here
+because naming one would claim a pairing nothing has run. The mechanism below is
+what this row gated; the weights are not.
+
+`--ref-video` is a directory of `frame_%06d.ppm`, not a container: upstream opens
+one with PyAV and no demuxer is vendored here. The clip is read at
+`height // reference_downscale_factor` by `width // reference_downscale_factor`,
+and both factors come from the adapter's own metadata rather than from a flag. A
+load with no adapter reads both as 1, which is upstream's default. A target
+either axis of which the factor does not divide is refused by name, with
+upstream's own sentence.
+
+The adapter rides **stage 1 only** and stage 2 runs bare. That is the mirror
+image of `ti2vid_two_stage`, `a2vid_two_stage` and `keyframe_interpolation`,
+where the adapter rides stage 2, and it is why IC-LoRA has its own pipeline kind
+rather than being a mode of `distilled_two_stage`. A reference clip supplied to
+any other kind is refused, and the message names this one.
+
+`--conditioning-attention-mask` takes a directory of grayscale
+`frame_%06d.ppm` whose pixels attenuate the reference per region: black ignores
+the conditioning there, white takes it in full. The frames are read at the
+stage's own resolution and downsampled to the reference latent's grid, so a mask
+must describe the same moments as the clip. `--conditioning-attention-strength`
+scales the whole mask and must be in `[0, 1]`; above 1 it would amplify
+attention rather than attenuate it, and is refused.
+
+A strength below 1 with **no** mask is refused rather than served. Upstream has
+that branch and its own CLI cannot reach it either: the strength is assigned only
+alongside a mask, so a sub-1.0 value always arrives with one.
+
+Through the C ABI and the server these are per-generation extras rather than
+flags: `ref_video_strength`, `conditioning_attention_mask_dir` and
+`conditioning_attention_strength`, beside the existing `ref_video` field.
+
+Not served, and refused by name: the EXR/HDR reference arm, which needs an
+OpenEXR reader and a declared colour space; a tiled reference encode; and
+reference IMAGES, which are not an IC-LoRA shape at all — upstream's flag takes a
+video or an EXR directory and `ltx-pipelines` has no reference-image
+conditioning.
+
 `--lora` is repeatable, and each repetition takes an adapter path with an
 optional strength, exactly as upstream's own flag does: `--lora
 first.safetensors 0.8 --lora second.safetensors`. An omitted strength is
@@ -235,9 +300,16 @@ against a loaded head therefore uses upstream's own defaults, 1 s and 20 s.
 `/v1/videos` does not carry `auto_duration` either: that endpoint forwards no
 per-generation extra to any engine yet (#928).
 
-The head runs in f32 here where upstream builds it in bfloat16. That arm is
-owed under `## Owed` in `.agents/specs/ltx25-duration-head-wire.md`, as the
-eighth component of gap A24.
+The head computes and stores in **bfloat16**, which is the single dtype
+upstream resolves for the whole pipeline (`distilled.py:109`, handed to
+`DurationPredictor.from_checkpoint` at `:163-165`). It ran in f32 until A24 wave
+6 ([#2955](https://github.com/mudler/vllm.cpp/issues/2955)), the eighth and last
+component of that gap, and the resident head is now half the bytes it was. What
+the head still owes is not a width: its FP8 and NVFP4 arms belong to A22 and
+refuse by name, a CUDA arm is a residency question rather than a dtype one, and
+no real-weight render has been run because no checkpoint carrying a
+`duration_head.` block is available here -- which was equally true of the f32
+arm.
 
 ## Dynamic frame-rate temporal rounds
 

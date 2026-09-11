@@ -97,29 +97,67 @@ builders() {
 # "busy" and "total" jiffies across all cpus. iowait is NOT counted as busy: a
 # neighbour waiting on disk does not steal our cores. steal IS counted -- on a
 # KVM guest that is exactly the co-tenant this box keeps losing series to.
-stat_busy() { awk '/^cpu /{print $2+$3+$4+$7+$8+$9}' /proc/stat; }
-stat_total() { awk '/^cpu /{s=0; for(i=2;i<=NF;i++)s+=$i; print s}' /proc/stat; }
+stat_snapshot() {
+  local line
+  IFS= read -r line < /proc/stat || return 1
+  printf '%s\n' "$line"
+}
+
+invalid_cpu_sample() {
+  echo "INVALID_CPU_SAMPLE: unavailable or inconsistent counters" >&2
+  echo 100  # conservative sentinel, never a valid measurement
+  return 1
+}
+
+cpu_share() {  # before, after, own jiffies
+  local -a before after
+  local i a b delta total=0 busy=0 own=$3
+  read -r -a before <<< "$1"
+  read -r -a after <<< "$2"
+  if [ "${before[0]-}" != cpu ] || [ "${after[0]-}" != cpu ]; then
+    invalid_cpu_sample; return 1
+  fi
+  # Eight 16-digit decimal counters, multiplied by 100, fit signed 64-bit.
+  # Validate before arithmetic: Bash otherwise accepts expressions and octal.
+  [[ "$own" =~ ^[0-9]{1,16}$ ]] || { invalid_cpu_sample; return 1; }
+  own=$((10#$own))
+  for i in {1..8}; do
+    a=${before[$i]-}; b=${after[$i]-}
+    if ! [[ "$a" =~ ^[0-9]{1,16}$ && "$b" =~ ^[0-9]{1,16}$ ]]; then
+      invalid_cpu_sample; return 1
+    fi
+    a=$((10#$a)); b=$((10#$b))
+    # Linux documents that iowait can decrease. Do not call that sample quiet.
+    if (( b < a )); then invalid_cpu_sample; return 1; fi
+    delta=$((b - a)); total=$((total + delta))
+    if (( i != 4 && i != 5 )); then busy=$((busy + delta)); fi
+  done
+  # Guest and guest_nice overlap user and nice: do not add fields 9 and 10.
+  if (( total <= 0 )); then invalid_cpu_sample; return 1; fi
+  busy=$((busy - own))
+  (( busy < 0 )) && busy=0
+  echo $((100 * busy / total))
+}
 
 # Percent of the whole machine busy over a fresh BUSY_WINDOW. Nothing here is
 # decayed and nothing here counts a process that has already exited, so the
 # harness cannot gate on its own previous leg.
 busy_pct() {
-  local b0 t0 b1 t1 db dt
-  b0=$(stat_busy); t0=$(stat_total)
+  local s0 s1
+  s0=$(stat_snapshot) || { invalid_cpu_sample; return 1; }
   sleep "$BUSY_WINDOW"
-  b1=$(stat_busy); t1=$(stat_total)
-  db=$((b1 - b0)); dt=$((t1 - t0))
-  if [ "$dt" -le 0 ]; then echo 100; return; fi
-  echo $((100 * db / dt))
+  s1=$(stat_snapshot) || { invalid_cpu_sample; return 1; }
+  cpu_share "$s0" "$s1" 0
 }
 
 wait_quiet() {
-  local waited=0 p b
+  local waited=0 p b valid
   while :; do
     b=$(builders)
     p=$(busy_pct)          # consumes BUSY_WINDOW seconds
+    valid=$?
     waited=$((waited + BUSY_WINDOW))
-    if [ "$p" -le "$QUIET_BUSY" ] && [ "$b" -eq 0 ]; then return 0; fi
+    if [ "$p" -le "$QUIET_BUSY" ] && [ "$b" -eq 0 ] && [ "$valid" -eq 0 ]; then return 0; fi
     if [ "$waited" -ge "$WAIT_TIMEOUT" ]; then
       # The spec's stop condition: the box cannot be brought under the ceiling,
       # so the axes stay PENDING a quiet host. Stop; do not average through it.
@@ -143,7 +181,7 @@ own_cpu_jiffies() {
 }
 
 run_leg() {  # engine rep -> 0 accepted, 1 discard
-  local eng=$1 rep=$2 rc stem b0 t0 b1 t1 own foreign cap fpct bafter
+  local eng=$1 rep=$2 rc stem s0 s1 own fpct bafter valid
   stem="$OUT/$eng-$rep"
   wait_quiet || return 1
   # G5: the load average before and after EVERY leg, in a file, per leg.
@@ -154,7 +192,7 @@ run_leg() {  # engine rep -> 0 accepted, 1 discard
     echo "before builders: $(builders)"
   } > "$stem.load"
   echo "$eng rep=$rep START load=$(loadall) builders=$(builders)"
-  b0=$(stat_busy); t0=$(stat_total)
+  s0=$(stat_snapshot)
   if [ "$eng" = ours ]; then
     # shellcheck disable=SC2086
     $TIMEV $TASKSET env VLLM_CPP_CPU_THREADS=$T \
@@ -171,15 +209,14 @@ run_leg() {  # engine rep -> 0 accepted, 1 discard
     rc=$?
     own=$(own_cpu_jiffies "$OUT/llama-bench-$rep.time")
   fi
-  b1=$(stat_busy); t1=$(stat_total)
+  s1=$(stat_snapshot)
   bafter=$(builders)
   # Everything the machine burned while our leg ran, minus what our leg burned,
   # as a share of the machine. This is the check the old post-leg test did not
   # make: it re-tested `builders` only, so a leg could run straight through
   # load 80 from any non-compiler source and still be ACCEPTED.
-  cap=$((t1 - t0)); foreign=$(( (b1 - b0) - own ))
-  [ "$foreign" -lt 0 ] && foreign=0
-  if [ "$cap" -le 0 ]; then fpct=100; else fpct=$((100 * foreign / cap)); fi
+  fpct=$(cpu_share "$s0" "$s1" "$own")
+  valid=$?
   {
     echo "after uptime: $(uptime)"
     echo "after loadavg: $(loadall)"
@@ -187,10 +224,11 @@ run_leg() {  # engine rep -> 0 accepted, 1 discard
     echo "exit: $rc"
     echo "own_cpu_jiffies: $own"
     echo "foreign_cpu_pct: $fpct"
+    echo "cpu_sample_status: $valid"
     echo "ncpu: $NCPU"
   } >> "$stem.load"
   echo "$eng rep=$rep END exit=$rc load=$(loadall) builders=$bafter foreign=${fpct}%"
-  if [ "$rc" -ne 0 ] || [ "$bafter" -ne 0 ] || [ "$fpct" -gt "$FOREIGN_MAX" ]; then
+  if [ "$valid" -ne 0 ] || [ "$rc" -ne 0 ] || [ "$bafter" -ne 0 ] || [ "$fpct" -gt "$FOREIGN_MAX" ]; then
     echo "$eng rep=$rep DISCARDED (exit=$rc builders_after=$bafter foreign=${fpct}%)"
     return 1
   fi

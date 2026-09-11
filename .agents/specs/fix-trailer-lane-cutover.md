@@ -191,7 +191,7 @@ which is exactly what happened here, so a local belt to that brace is worth
 having. It is separated because it changes an operator procedure and a gate
 command rather than a checker rule, so it carries its own red-first evidence and
 its own reviewer, and because it is not needed to clear the lane. Filed as
-[#1263](https://github.com/mudler/vllm.cpp/issues/1263) and owed here.
+ISSUE-GH-1263 and owed here.
 
 **The range walk holds a MERGE COMMIT to the authored-commit contract, and the CI
 job that calls it skips merge commits fifty lines earlier.** `validate_range`
@@ -215,7 +215,7 @@ here and NOT fixed here: excluding merges narrows what the gate accepts, so unde
 AGENTS.md § *Changing the rules or a checker* it owes its own spec, red-before
 evidence and reviewer, and the developer chose on 2026-08-28 to authorize
 `row/*` force-push instead of changing the checker. Filed as
-[#2157](https://github.com/mudler/vllm.cpp/issues/2157) and owed here.
+ISSUE-GH-2157 and owed here.
 
 ## Outcome
 

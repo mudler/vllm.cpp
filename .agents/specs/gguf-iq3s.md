@@ -133,7 +133,7 @@ admission for a GGUF weight is decided by
 |---|---|---|
 | CPU | **expands to bf16** — no `VecDotIQ3_SQ8_K`, so `KeepQuantDType` is false and `RouteGgufTensor` returns `kExpandBf16`. Owed. | **native** (`BlockToFloat`) |
 | CUDA | **expands to bf16**, for the same reason: the loader never admits the block, so `IsCudaKeepQuantSupported` is never asked. Owed. | **native** (`DqIQ3_S`) |
-| ROCm | **expands to bf16.** `DeviceKeepQuantSupported` lists Q8_0/Q4_K/Q5_K/Q6_K only; the throw in `MatmulBTQuantKernelRocm` names IQ3_S among the owed set. Owed. | expands — ROCm registers `kEmbedding` only, so `DeviceQuantGatherSupported` is false. Pre-existing, owed by `cuda-quant-gather.md`. |
+| ROCm | **expands to bf16.** `DeviceKeepQuantSupported` admits eleven other formats; the ROCm provider still names IQ3_S as unsupported. Owed. | expands — ROCm registers `kEmbedding` only, so `DeviceQuantGatherSupported` is false. Pre-existing, owed by `cuda-quant-gather.md`. |
 | Metal | **expands to bf16.** Same shape as ROCm. Owed. | expands. Pre-existing. |
 | Vulkan | **expands to bf16.** Same shape as ROCm. Owed. | expands. Pre-existing. |
 
@@ -426,9 +426,9 @@ No other gate failed.
   coupling in `## Why the vec_dot is NOT in this change`. Tracked by
   [#2510](https://github.com/mudler/vllm.cpp/issues/2510), which stays open for
   it; this change closes only the refusal it names.
-- **ROCm / Metal / Vulkan native IQ3_S GEMM.** Those tiers implement no IQ
-  encoding at all (`DeviceKeepQuantSupported` lists Q8_0/Q4_K/Q5_K/Q6_K for
-  ROCm), so IQ3_S joins the standing owed set rather than adding a new one.
+- **ROCm / Metal / Vulkan native IQ3_S GEMM.** ROCm now implements IQ2_XXS,
+  IQ3_XXS, IQ2_S, IQ1_S, and IQ1_XXXS, but it still lacks IQ3_S. Metal and
+  Vulkan also retain this gap. IQ3_S remains in the standing owed set.
   Owned by [`rocm-gg-keep-quant.md`](rocm-gg-keep-quant.md).
 - **ROCm / Metal / Vulkan quantized gather.** Pre-existing; those backends
   register `kEmbedding` only. Owned by

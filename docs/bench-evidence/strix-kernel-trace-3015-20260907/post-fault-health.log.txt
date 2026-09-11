@@ -1,0 +1,106 @@
+parakeet-pr66-rocm-server-test Exited (0) 9 days ago
+hopeful_golick Up 5 days
+eager_shtern Up 4 days
+codex-strix-3015-tools Exited (0) About an hour ago
+codex-strix-3015-profile-deps Exited (0) 45 minutes ago
+[Mon Sep  7 10:30:15 2026] veth1b1e2b9c (unregistering): left promiscuous mode
+[Mon Sep  7 10:30:15 2026] cni-podman0: port 3(veth1b1e2b9c) entered disabled state
+[Mon Sep  7 10:30:19 2026] cni-podman0: port 3(veth6af7dd02) entered blocking state
+[Mon Sep  7 10:30:19 2026] cni-podman0: port 3(veth6af7dd02) entered disabled state
+[Mon Sep  7 10:30:19 2026] veth6af7dd02: entered allmulticast mode
+[Mon Sep  7 10:30:19 2026] veth6af7dd02: entered promiscuous mode
+[Mon Sep  7 10:30:19 2026] cni-podman0: port 3(veth6af7dd02) entered blocking state
+[Mon Sep  7 10:30:19 2026] cni-podman0: port 3(veth6af7dd02) entered forwarding state
+[Mon Sep  7 10:30:19 2026] cni-podman0: port 3(veth6af7dd02) entered disabled state
+[Mon Sep  7 10:30:19 2026] veth6af7dd02 (unregistering): left allmulticast mode
+[Mon Sep  7 10:30:19 2026] veth6af7dd02 (unregistering): left promiscuous mode
+[Mon Sep  7 10:30:19 2026] cni-podman0: port 3(veth6af7dd02) entered disabled state
+[Mon Sep  7 10:30:32 2026] cni-podman0: port 3(veth1d7d932f) entered blocking state
+[Mon Sep  7 10:30:32 2026] cni-podman0: port 3(veth1d7d932f) entered disabled state
+[Mon Sep  7 10:30:32 2026] veth1d7d932f: entered allmulticast mode
+[Mon Sep  7 10:30:32 2026] veth1d7d932f: entered promiscuous mode
+[Mon Sep  7 10:30:32 2026] cni-podman0: port 3(veth1d7d932f) entered blocking state
+[Mon Sep  7 10:30:32 2026] cni-podman0: port 3(veth1d7d932f) entered forwarding state
+[Mon Sep  7 10:30:33 2026] cni-podman0: port 3(veth1d7d932f) entered disabled state
+[Mon Sep  7 10:30:33 2026] veth1d7d932f (unregistering): left allmulticast mode
+[Mon Sep  7 10:30:33 2026] veth1d7d932f (unregistering): left promiscuous mode
+[Mon Sep  7 10:30:33 2026] cni-podman0: port 3(veth1d7d932f) entered disabled state
+[Mon Sep  7 10:30:37 2026] cni-podman0: port 3(vetha6da3171) entered blocking state
+[Mon Sep  7 10:30:37 2026] cni-podman0: port 3(vetha6da3171) entered disabled state
+[Mon Sep  7 10:30:37 2026] vetha6da3171: entered allmulticast mode
+[Mon Sep  7 10:30:37 2026] vetha6da3171: entered promiscuous mode
+[Mon Sep  7 10:30:37 2026] cni-podman0: port 3(vetha6da3171) entered blocking state
+[Mon Sep  7 10:30:37 2026] cni-podman0: port 3(vetha6da3171) entered forwarding state
+[Mon Sep  7 10:38:30 2026] cni-podman0: port 3(vetha6da3171) entered disabled state
+[Mon Sep  7 10:38:30 2026] vetha6da3171 (unregistering): left allmulticast mode
+[Mon Sep  7 10:38:30 2026] vetha6da3171 (unregistering): left promiscuous mode
+[Mon Sep  7 10:38:30 2026] cni-podman0: port 3(vetha6da3171) entered disabled state
+[Mon Sep  7 10:38:47 2026] cni-podman0: port 3(vethf2fdb472) entered blocking state
+[Mon Sep  7 10:38:47 2026] cni-podman0: port 3(vethf2fdb472) entered disabled state
+[Mon Sep  7 10:38:47 2026] vethf2fdb472: entered allmulticast mode
+[Mon Sep  7 10:38:47 2026] vethf2fdb472: entered promiscuous mode
+[Mon Sep  7 10:38:47 2026] cni-podman0: port 3(vethf2fdb472) entered blocking state
+[Mon Sep  7 10:38:47 2026] cni-podman0: port 3(vethf2fdb472) entered forwarding state
+[Mon Sep  7 10:38:49 2026] cni-podman0: port 3(vethf2fdb472) entered disabled state
+[Mon Sep  7 10:38:49 2026] vethf2fdb472 (unregistering): left allmulticast mode
+[Mon Sep  7 10:38:49 2026] vethf2fdb472 (unregistering): left promiscuous mode
+[Mon Sep  7 10:38:49 2026] cni-podman0: port 3(vethf2fdb472) entered disabled state
+[Mon Sep  7 10:38:53 2026] cni-podman0: port 3(veth426614b5) entered blocking state
+[Mon Sep  7 10:38:53 2026] cni-podman0: port 3(veth426614b5) entered disabled state
+[Mon Sep  7 10:38:53 2026] veth426614b5: entered allmulticast mode
+[Mon Sep  7 10:38:53 2026] veth426614b5: entered promiscuous mode
+[Mon Sep  7 10:38:53 2026] cni-podman0: port 3(veth426614b5) entered blocking state
+[Mon Sep  7 10:38:53 2026] cni-podman0: port 3(veth426614b5) entered forwarding state
+[Mon Sep  7 10:45:09 2026] cni-podman0: port 3(veth426614b5) entered disabled state
+[Mon Sep  7 10:45:09 2026] veth426614b5 (unregistering): left allmulticast mode
+[Mon Sep  7 10:45:09 2026] veth426614b5 (unregistering): left promiscuous mode
+[Mon Sep  7 10:45:09 2026] cni-podman0: port 3(veth426614b5) entered disabled state
+[Mon Sep  7 10:53:32 2026] cni-podman0: port 3(vetha43df7d5) entered blocking state
+[Mon Sep  7 10:53:32 2026] cni-podman0: port 3(vetha43df7d5) entered disabled state
+[Mon Sep  7 10:53:32 2026] vetha43df7d5: entered allmulticast mode
+[Mon Sep  7 10:53:32 2026] vetha43df7d5: entered promiscuous mode
+[Mon Sep  7 10:53:32 2026] cni-podman0: port 3(vetha43df7d5) entered blocking state
+[Mon Sep  7 10:53:32 2026] cni-podman0: port 3(vetha43df7d5) entered forwarding state
+[Mon Sep  7 10:54:06 2026] amdgpu 0000:c5:00.0: amdgpu: MES failed to respond to msg=REMOVE_QUEUE
+[Mon Sep  7 10:54:06 2026] amdgpu 0000:c5:00.0: amdgpu: failed to remove hardware queue from MES, doorbell=0x1002
+[Mon Sep  7 10:54:06 2026] amdgpu 0000:c5:00.0: amdgpu: MES might be in unrecoverable state, issue a GPU reset
+[Mon Sep  7 10:54:06 2026] amdgpu 0000:c5:00.0: amdgpu: Failed to evict queue 1
+[Mon Sep  7 10:54:06 2026] amdgpu 0000:c5:00.0: amdgpu: Failed to evict process queues
+[Mon Sep  7 10:54:06 2026] amdgpu 0000:c5:00.0: amdgpu: GPU reset begin!
+[Mon Sep  7 10:54:06 2026] amdgpu: Failed to quiesce KFD
+[Mon Sep  7 10:54:06 2026] amdgpu 0000:c5:00.0: amdgpu: Dumping IP State
+[Mon Sep  7 10:54:06 2026] amdgpu 0000:c5:00.0: amdgpu: Dumping IP State Completed
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: MES failed to respond to msg=SUSPEND
+[Mon Sep  7 10:54:09 2026] [drm:amdgpu_mes_suspend [amdgpu]] *ERROR* failed to suspend all gangs
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: suspend of IP block <mes_v11_0> failed -110
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: MODE2 reset
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: GPU reset succeeded, trying to resume
+[Mon Sep  7 10:54:09 2026] [drm] PCIE GART of 512M enabled (table at 0x0000008000300000).
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: SMU is resuming...
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: SMU is resumed successfully!
+[Mon Sep  7 10:54:09 2026] [drm] DMUB hardware initialized: version=0x09002C01
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: ring gfx_0.0.0 uses VM inv eng 0 on hub 0
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: ring comp_1.0.0 uses VM inv eng 1 on hub 0
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: ring comp_1.1.0 uses VM inv eng 4 on hub 0
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: ring comp_1.2.0 uses VM inv eng 6 on hub 0
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: ring comp_1.3.0 uses VM inv eng 7 on hub 0
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: ring comp_1.0.1 uses VM inv eng 8 on hub 0
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: ring comp_1.1.1 uses VM inv eng 9 on hub 0
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: ring comp_1.2.1 uses VM inv eng 10 on hub 0
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: ring comp_1.3.1 uses VM inv eng 11 on hub 0
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: ring sdma0 uses VM inv eng 12 on hub 0
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: ring vcn_unified_0 uses VM inv eng 0 on hub 8
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: ring vcn_unified_1 uses VM inv eng 1 on hub 8
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: ring jpeg_dec_0 uses VM inv eng 4 on hub 8
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: ring jpeg_dec_1 uses VM inv eng 6 on hub 8
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: ring mes_kiq_3.1.0 uses VM inv eng 13 on hub 0
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: ring vpe uses VM inv eng 7 on hub 8
+[Mon Sep  7 10:54:09 2026] amdgpu 0000:c5:00.0: amdgpu: GPU reset(122) succeeded!
+[Mon Sep  7 11:13:30 2026] amdgpu: Freeing queue vital buffer 0x77e309600000, queue evicted
+[Mon Sep  7 11:13:30 2026] amdgpu: Freeing queue vital buffer 0x77e66c200000, queue evicted
+[Mon Sep  7 11:13:30 2026] amdgpu: Freeing queue vital buffer 0x77e66d200000, queue evicted
+[Mon Sep  7 11:13:30 2026] cni-podman0: port 3(vetha43df7d5) entered disabled state
+[Mon Sep  7 11:13:30 2026] vetha43df7d5 (unregistering): left allmulticast mode
+[Mon Sep  7 11:13:30 2026] vetha43df7d5 (unregistering): left promiscuous mode
+[Mon Sep  7 11:13:30 2026] cni-podman0: port 3(vetha43df7d5) entered disabled state
+bash: line 1: rocm-smi: command not found

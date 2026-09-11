@@ -383,8 +383,9 @@ predicate this row repairs, and both already measured before #2507 was filed:
   condition was satisfied, citing `managedMemory=1 concurrentManagedAccess=1`;
   those are the inputs to `UseManagedAlloc`, a different predicate. Filed as
   #2515.
-- `GgufExpertTowersReachSlotLane()` is FALSE. ROCm registers no IQ `vec_dot`, so
-  `RouteGgufTensor` answers `kExpandBf16` for the IQ2_XS/IQ4_XS
+- `GgufExpertTowersReachSlotLane()` is FALSE. ROCm now registers five IQ
+  `vec_dot` formats, but not IQ2_XS or IQ4_XS. `RouteGgufTensor` answers
+  `kExpandBf16` for the IQ2_XS/IQ4_XS
   `kStackedExpertWeight` towers this checkpoint stores its experts in. This also
   makes `test_gguf_device_fit` RED on any ROCm build, 1 case and 2 assertions,
   pre-existing on `main`. Filed as #2516.

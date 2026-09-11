@@ -461,6 +461,7 @@ target_compile_definitions(test_ltx2_pipeline PRIVATE
 # CLI-stage validations. Its own target rather than cases inside
 # test_ltx2_pipeline, which several concurrent rows of this campaign edit. The
 # REACHABILITY proof for the same row lives in test_ltx2_video.
+vllm_cpp_add_test(test_ltx2_iclora_reference vllm/models/test_ltx2_iclora_reference.cpp)
 vllm_cpp_add_test(test_ltx2_retake vllm/models/test_ltx2_retake.cpp)
 vllm_cpp_add_test(test_ltx2_lora vllm/models/test_ltx2_lora.cpp)
 vllm_cpp_add_test(test_ltx2_loader vllm/models/test_ltx2_loader.cpp)
@@ -1237,6 +1238,22 @@ target_include_directories(test_glm5_next_bridge PRIVATE
 # because at any geometry small enough to run in a test the default gives ONE
 # chunk and the loop would never be entered twice.
 vllm_cpp_add_test(test_glm5_next_forward vllm/models/test_glm5_next_forward.cpp)
+vllm_cpp_add_test(test_glm5_next_placement vllm/models/test_glm5_next_placement.cpp)
+target_include_directories(test_glm5_next_placement PRIVATE ${CMAKE_SOURCE_DIR}/src)
+set_tests_properties(test_glm5_next_placement PROPERTIES
+  ENVIRONMENT "VT_GLM5_NEXT_DEVICE_EXPERTS=1")
+add_test(NAME test_glm5_next_placement_default
+  COMMAND ${CMAKE_COMMAND} -E env --unset=VT_GLM5_NEXT_DEVICE_EXPERTS
+  $<TARGET_FILE:test_glm5_next_placement>
+  "--test-case=glm5_next placement: loaded CPU experts never upload to ROCm")
+add_test(NAME test_glm5_next_placement_off COMMAND test_glm5_next_placement
+  "--test-case=glm5_next placement: loaded CPU experts never upload to ROCm")
+set_tests_properties(test_glm5_next_placement_off PROPERTIES
+  ENVIRONMENT "VT_GLM5_NEXT_DEVICE_EXPERTS=0")
+add_test(NAME test_glm5_next_placement_nonexact COMMAND test_glm5_next_placement
+  "--test-case=glm5_next placement: loaded CPU experts never upload to ROCm")
+set_tests_properties(test_glm5_next_placement_nonexact PROPERTIES
+  ENVIRONMENT "VT_GLM5_NEXT_DEVICE_EXPERTS=11")
 target_include_directories(test_glm5_next_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(test_glm5_next_forward PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
@@ -1269,7 +1286,13 @@ target_include_directories(test_dots3_note_attn PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # performance number is claimable. CPU-only, no checkpoint download, no GPU.
 vllm_cpp_add_test(test_dots3_note_vision vllm/models/test_dots3_note_vision.cpp)
 target_compile_definitions(test_dots3_note_vision PRIVATE
-  DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev")
+  DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev"
+  # W9d (#2881): the reference-independence case re-reads THIS file and counts
+  # the qualified names in each reference namespace, through the shared
+  # instrument in `dots3_note_ref_independence.h`. Same arrangement the audio
+  # target uses; the instrument takes the path as an argument precisely so the
+  # two targets share one scan and one pp-number rule.
+  DOTS3_VISION_TEST_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/test_dots3_note_vision.cpp")
 
 # dots3-note W7a (#2703): the AUDIO tower and its front end. Two fixture
 # directories, because the two halves are gated against different things — the
@@ -1469,6 +1492,12 @@ target_include_directories(test_qwen27_paged_forward PRIVATE ${CMAKE_SOURCE_DIR}
 # is the property the Q4_K_M token gate is decided by and which no token gate we
 # own can see. Public headers only, so no extra include directory.
 vllm_cpp_add_test(test_qwen35_gguf_logits_f32 vllm/models/test_qwen35_gguf_logits_f32.cpp)
+# BACKEND-TENSTORRENT-KEEPQUANT W3 (#2959): the q4km vehicle's dequantized-
+# artifact dump — the teacher-forcing oracle input the row spec prescribes
+# (our bit-exact loader writes a safetensors dir; the pinned transformers
+# cannot parse the `qwen35` GGUF arch). Env-gated: skips loudly unless
+# VLLM_CPP_QWEN35_Q4KM_GGUF and VLLM_CPP_QWEN35_Q4KM_DUMP_DIR are both set.
+vllm_cpp_add_test(test_qwen35_gguf_q4km_dequant_dump vllm/models/test_qwen35_gguf_q4km_dequant_dump.cpp)
 # #2534. `detail::ActDType` caches its getenv in a function-local static, so one
 # process observes exactly ONE value of VT_ACT_F32 and a single run cannot tell a
 # resolver that READS the lever from one hardwired to its default answer. Re-run
@@ -2033,6 +2062,10 @@ vllm_cpp_add_test(test_verify_route_predicate vllm/v1/worker/test_verify_route_p
 # off the same per-req_state draft buffer the combine's scatter reads. Same shape
 # and same reason as the two predicates above -- one rule, one expression.
 vllm_cpp_add_test(test_draft_fill vllm/v1/worker/test_draft_fill.cpp)
+# SPEC-DFLASH2 A2-4 (#3004): the async decode arm's propose reads this step's
+# committed ids where they live, on every write-back branch, instead of refusing
+# by name when the branch that ran left them unreadable on the host.
+vllm_cpp_add_test(test_committed_ids vllm/v1/worker/test_committed_ids.cpp)
 vllm_cpp_add_test(test_async_output vllm/v1/worker/test_async_output.cpp)
 vllm_cpp_add_test(test_async_runner_flag vllm/v1/worker/test_async_runner_flag.cpp)
 # ENG-POOL-BEST-FIT (#1922): the shared scratch pool must reach a steady state
@@ -2600,6 +2633,7 @@ endif()
 # C ABI (M3.5 Task 1): the C++ test drives the public C API over a synthetic
 # engine via the internal MakeEngineHandle hook (reached under src/).
 vllm_cpp_add_test(test_capi capi/test_capi.cpp)
+vllm_cpp_add_test(test_capi_qwen35_full_attn_state capi/test_qwen35_full_attn_state.cpp)
 target_include_directories(test_capi PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_definitions(test_capi PRIVATE
   PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e"
@@ -2683,6 +2717,14 @@ vllm_cpp_add_test(test_rocm_arch vt/test_rocm_arch.cpp)
 # the SYNCHRONISATION is gated on a CPU-only runner with no accelerator.
 vllm_cpp_add_test(test_grow_only_stream_scratch vt/test_grow_only_stream_scratch.cpp)
 target_include_directories(test_grow_only_stream_scratch PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# The fused ROCm norm-quant token is pure host bookkeeping. Keep its identity,
+# one-shot, and concurrency contract gated when no AMD compiler is installed.
+vllm_cpp_add_test(test_rocm_norm_quant_bridge vt/test_rocm_norm_quant_bridge.cpp)
+target_include_directories(test_rocm_norm_quant_bridge PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# The ROCm quant-dot device cases skip without HIP. Its scratch policy is
+# compiled with host fakes so capture ownership remains gated in CPU-only CI.
+vllm_cpp_add_test(test_rocm_quant_dot vt/test_rocm_quant_dot.cpp)
+target_include_directories(test_rocm_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # #785 P1 host package (fixture/oracle/trace classifier). CPU-only.
 vllm_cpp_add_test(test_ops_paged_attn_sharedk_wmma_p1
   vt/test_ops_paged_attn_sharedk_wmma_p1.cpp)
@@ -2699,6 +2741,11 @@ if(VLLM_CPP_HIP)
 # case no-ops when the build has HIP but the box has no AMD GPU.
 vllm_cpp_add_test(test_rocm_backend vt/test_rocm_backend.cpp)
 vllm_cpp_add_test(test_rocm_fp8_kv_cache vt/test_rocm_fp8_kv_cache.cpp)
+# BACKEND-ROCM silu-gate dtype rounding repair (#2889 silu item, #1954): the
+# ROCm SiluAndMul/MoeSiluMul kernels narrow silu(gate) to the gate dtype before
+# the multiply, matching the CPU oracle RoundThrough and upstream vLLM silu_kernel.
+# Self-skipping without a ROCm device, mirroring test_rocm_backend.cpp guard.
+vllm_cpp_add_test(test_ops_rocm_silu_rounding vt/test_ops_rocm_silu_rounding.cpp)
 # #785 P1 GPU product-seam witness. Executable only — NOT add_test.
 # Ordinary CTest must not see this target. Runner fail-closes on 77/nonzero.
 add_executable(test_ops_paged_attn_sharedk_wmma_p1_gpu
@@ -2902,6 +2949,19 @@ target_include_directories(test_cuda_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # header and the vt/cpu quant headers.
 vllm_cpp_add_test(test_cuda_embedding_quant vt/test_cuda_embedding_quant.cpp)
 target_include_directories(test_cuda_embedding_quant PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# BACKEND-ROCM-QUANT-GATHER: the production gate starts at the public loader.
+vllm_cpp_add_test(test_capi_rocm_embedding_quant capi/test_rocm_embedding_quant.cpp)
+vllm_cpp_add_test(test_rocm_embedding_quant vt/test_rocm_embedding_quant.cpp)
+target_include_directories(test_rocm_embedding_quant PRIVATE ${CMAKE_SOURCE_DIR}/src)
+if(VLLM_CPP_HIP)
+  set_source_files_properties(vt/test_rocm_embedding_quant.cpp PROPERTIES LANGUAGE HIP)
+  if(VLLM_CPP_HIP_ARCHITECTURES)
+    set_property(TARGET test_rocm_embedding_quant PROPERTY HIP_ARCHITECTURES "${VLLM_CPP_HIP_ARCHITECTURES}")
+  endif()
+endif()
+add_executable(rocm_quant_gather_capture ../tools/rocm_quant_gather/capture.cpp)
+target_link_libraries(rocm_quant_gather_capture PRIVATE vllm)
+target_include_directories(rocm_quant_gather_capture PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
 # CPU-ELEM-GEMM: the specialized + SIMD elementwise (bf16/f16/f32) GEMM. The
 # gate is BYTE-IDENTITY against an independent scalar reference across every
 # dtype combination, both weight orientations, ragged K/N, row-strided

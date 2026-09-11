@@ -183,11 +183,11 @@ with a strict loader, because no `safe_load`-based assertion ever can.
 
 ## Owed
 
-- [#869](https://github.com/mudler/vllm.cpp/issues/869). `github.event.pull_request.head.ref` is interpolated into an
+- ISSUE-GH-869. `github.event.pull_request.head.ref` is interpolated into an
   inline script (`ci.yml:584`). Pre-existing, confirmed by linting the base
   revision, and not introduced here. It is untrusted input on a fork pull request and should move
   to an environment variable.
-- [#874](https://github.com/mudler/vllm.cpp/issues/874). `windows-msvc-cpu` and
+- ISSUE-GH-874. `windows-msvc-cpu` and
   `windows-msvc-vulkan` still START on a closed pull request.
   `scripts/check-release-workflow.py::validate_pr_ci` compares their WHOLE job
   mapping for equality against the read-only native Windows PR proof schema --

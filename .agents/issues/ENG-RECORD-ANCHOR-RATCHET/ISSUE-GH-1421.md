@@ -1,0 +1,23 @@
+ID: ISSUE-GH-1421
+Title: Two NVFP4 W4A16 upstream anchors are WRONG AT THE PIN `5559679229bc961848b121ccdeaa8fa5d79bec98`, verified against a local checkout of `vllm-project/vllm` at that exact commit (`origin` is upstream, not a fork). The quoted `elif linear_backend == "auto" and use_a16: force_kernel = MarlinNvFp4LinearKernel` is at `kernels/linear/__init__.py:922-924`, not `:879-881`; `:879-881` is the tail of `init_wfp8_a16_linear_kernel` (`:848`), an FP8 helper sharing the `a16` vocabulary, and `init_nvfp4_linear_kernel` does not start until `:883`. And `packed_modules_mapping` is at `models/qwen3.py:275-278`, not `:271-274`, which is the `class Qwen3ForCausalLM(...)` line. Both are the worst shape of anchor rot: the cited line EXISTS and holds plausible neighbouring code, so a reader who checks the anchor is confirmed in a wrong belief. Nine code and test sites over SEVEN files (`dense_nvfp4_gemm.h:18,627,783`, `nvfp4.h:10`, `gguf_keep_quant.h:201`, `dense_weight_loaders.h:674`, `minimax_h3_device.cpp:153`, `test_qwen3_32b_nvfp4a16_paged_engine.cpp:63`, `test_qwen3_32b_nvfp4a16_load.cpp:19` -- count the parenthetical, the earlier `six files` did not) plus EIGHT record sites over FIVE record files, `parity-ledger.md:599,915,916` carrying three of them and `quantization-matrix.md:124`, `specs/sweep-qwen3-32b-nvfp4a16.md:86,465`, `specs/minimax-h3.md:332` and `completed/state-events/2026-08/STATE-20260806T141900-001.md:14` the rest. PRE-EXISTING and NOT fixed in flow: it is not small or confined, it spans paths several rows own, it would turn `parity-ledger.md` into a lock, and it needs the whole citation set RE-DERIVED at the pin rather than a sed -- range-checking cannot find it, because every one of these is in range. Found while repairing fresh-review findings on [#1415](https://github.com/mudler/vllm.cpp/pull/1415) (A2-Q2b, [#810](https://github.com/mudler/vllm.cpp/issues/810)), which relocates the `:783` citation from `:725` and deliberately leaves its VALUE unchanged so this issue owns every site uniformly instead of half of them looking reviewed. Owned by row `ENG-RECORD-ANCHOR-RATCHET`, the anchor-rot ratchet row
+Row: ENG-RECORD-ANCHOR-RATCHET
+State: UNKNOWN
+Kind: bug
+GitHub: 1421
+Mirror: MISSING
+Availability: METADATA_ONLY
+Created: UNKNOWN
+Updated: UNKNOWN
+Closed: UNKNOWN
+
+## Problem
+
+Archive: `.agents/completed/issue-index.md:483`
+
+### Frozen archive evidence
+
+> | [#1421](https://github.com/mudler/vllm.cpp/issues/1421) | `ENG-RECORD-ANCHOR-RATCHET` | Two NVFP4 W4A16 upstream anchors are WRONG AT THE PIN `5559679229bc961848b121ccdeaa8fa5d79bec98`, verified against a local checkout of `vllm-project/vllm` at that exact commit (`origin` is upstream, not a fork). The quoted `elif linear_backend == "auto" and use_a16: force_kernel = MarlinNvFp4LinearKernel` is at `kernels/linear/__init__.py:922-924`, not `:879-881`; `:879-881` is the tail of `init_wfp8_a16_linear_kernel` (`:848`), an FP8 helper sharing the `a16` vocabulary, and `init_nvfp4_linear_kernel` does not start until `:883`. And `packed_modules_mapping` is at `models/qwen3.py:275-278`, not `:271-274`, which is the `class Qwen3ForCausalLM(...)` line. Both are the worst shape of anchor rot: the cited line EXISTS and holds plausible neighbouring code, so a reader who checks the anchor is confirmed in a wrong belief. Nine code and test sites over SEVEN files (`dense_nvfp4_gemm.h:18,627,783`, `nvfp4.h:10`, `gguf_keep_quant.h:201`, `dense_weight_loaders.h:674`, `minimax_h3_device.cpp:153`, `test_qwen3_32b_nvfp4a16_paged_engine.cpp:63`, `test_qwen3_32b_nvfp4a16_load.cpp:19` -- count the parenthetical, the earlier `six files` did not) plus EIGHT record sites over FIVE record files, `parity-ledger.md:599,915,916` carrying three of them and `quantization-matrix.md:124`, `specs/sweep-qwen3-32b-nvfp4a16.md:86,465`, `specs/minimax-h3.md:332` and `completed/state-events/2026-08/STATE-20260806T141900-001.md:14` the rest. PRE-EXISTING and NOT fixed in flow: it is not small or confined, it spans paths several rows own, it would turn `parity-ledger.md` into a lock, and it needs the whole citation set RE-DERIVED at the pin rather than a sed -- range-checking cannot find it, because every one of these is in range. Found while repairing fresh-review findings on [#1415](https://github.com/mudler/vllm.cpp/pull/1415) (A2-Q2b, [#810](https://github.com/mudler/vllm.cpp/issues/810)), which relocates the `:783` citation from `:725` and deliberately leaves its VALUE unchanged so this issue owns every site uniformly instead of half of them looking reviewed. Owned by row `ENG-RECORD-ANCHOR-RATCHET`, the anchor-rot ratchet row | bug |
+
+## Resolution
+
+-

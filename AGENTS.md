@@ -64,47 +64,49 @@ spec and run `git log -S`. Do not derive the history again.
 
 ## Every change starts from an issue
 
-**Do not start work without an open GitHub issue.** Before you claim a row or
-write code, make sure that an issue tracks the work. Open one if none exists.
-Link the issue in three places that must agree: the issue's own `Row:` line, the
-row's spec, and the pull request body.
+**Do not start work without an open canonical local issue.** Issue authority is
+one tracked file under `.agents/issues/`; GitHub is an optional mirror. Create a
+local issue before claiming a row or writing code:
 
-**GitHub is the index.** There is no index file. `gh issue list` is the intake
-surface, and the owning row lives in the issue body as its first line:
-
-```text
-Row: `BACKEND-ROCM`
+```sh
+python3 scripts/agent-issue.py create \
+  --title "..." --kind bug --problem "..." --row ROW-ID
 ```
 
-Write a dash when no row owns it yet and a spec lists it under `## Owed`
-instead. `scripts/agent-issue-index.py --refresh` renders the tracker into an
-untracked snapshot so the record gates can run offline; nothing commits it, so
-no pull request writes it. A tracked index was a surface every pull request had
-to write, and 16 of 21 open pull requests conflicted on it (#2290, #883).
+Import an existing GitHub issue with `agent-issue.py import-github N`. Imported
+text is quoted as historical evidence; it does not override the local record.
+Use `update`, `close`, and the explicit `mirror` command for later changes.
+Local validation and writes happen before any remote write.
 
-A bug that you find during other work still needs an issue. Filing the issue
-does not defer the fix. File it, fix it in the same flow, reference it in the
-commit, and close it. The person who found the bug has the context to fix it.
-Traceability is the goal, not another round trip.
+A row-owned issue lives at
+`.agents/issues/<ROW-ID>/ISSUE-GH-<number>.md` or
+`.agents/issues/<ROW-ID>/ISSUE-LOCAL-<ULID>.md`; its `Row:` field equals the
+directory. A rowless issue lives under `_owed`, and exactly one spec lists its
+stable local ID under `## Owed`. Assigning a row moves the file and removes that
+spec reference in the same change. `_intake` contains migration-only unavailable
+archive residue. It is not valid ownership for new work or a full record.
 
-**An issue you do not fix in the same flow has to say who owns it.** It names an
-owning row in its `Row:` line, or a spec lists it under `## Owed`.
-`scripts/check-agent-record.py` gates that for every issue a change references.
-Filing without fixing is therefore a gate failure rather than a habit. The gate
-is scoped to what a change cites, because a count over every open issue moves
-whenever anyone files one and could only ever fail `main` for reasons no commit
-caused.
+`scripts/agent-issue-index.py --refresh` validates the local files and renders
+the untracked `.agents/issue-index.generated.md` convenience view without a
+network call. `scripts/check-agent-record.py` validates every canonical issue
+and every issue reference in changed files and commit bodies offline. The four
+reference forms are `ISSUE-GH-<number>`, `ISSUE-LOCAL-<ULID>`, `#<number>`, and
+`issues/<number>`.
 
-**An issue closes when the work lands.** The pull request that lands the fix
-closes it, and its body carries the closing keyword that does so. Do not leave a
-fixed issue open for a later sweep; the person who landed the fix is the last
-one who knows it is fixed.
+A bug that you find during other work still needs a local issue. Filing the
+issue does not defer the fix. File it, fix it in the same flow, reference it in
+the commit, and close it. The person who found the bug has the context to fix
+it. Traceability is the goal, not another round trip.
+
+**An issue closes when the work lands.** Record dated resolution evidence in
+the local file. Mirror afterward only when a GitHub copy is wanted. Do not leave
+a fixed issue open for a later sweep.
 
 **An issue the tree falsifies closes with that evidence.** When the file,
-checker or behaviour an issue describes no longer exists, close it and say what
-falsified it. Do not re-spec it, and do not re-verify it a third time. Intake
-without an exit is how 701 open issues accumulated in 24 days, six of them
-already answered by the tree (#2298).
+checker, or behaviour an issue describes no longer exists, close it locally and
+say what falsified it. Do not re-spec it, and do not re-verify it a third time.
+Intake without an exit is how 701 open issues accumulated in 24 days, six of
+them already answered by the tree (#2298).
 
 This in-flow rule applies to small and clear fixes. Use the normal row, spec,
 and fresh-review path for a surprising fix. Use that path when a fix needs its
@@ -279,7 +281,7 @@ only when it appears in this table and has a recorded pin:
 | `ggml-org/llama.cpp` PR #27742 | `llama-cpp-qwen4exp` | the `qwen4exp` architecture, its GGUF conversion and its graph, which no released llama.cpp defines, so the stock `llama-cpp` pin cannot supply a denominator for it |
 | `ggml-org/llama.cpp` PR #27752 | `llama-cpp-glm5next` | the `glm5next` TEXT architecture, its GGUF conversion and its graph, which no released llama.cpp defines either; it is the head whose architecture string matches the published artifact, and it carries no vision tower |
 | turboderp-org `exllamav3` | `exllamav3` | the EXL3 trellis quantization format and its kernels, and the DeepSeek-V4 support the pinned HEAD carries, which neither vLLM nor vLLM-Omni implements |
-| `vllm-project/vllm-gguf-plugin` | `vllm-gguf-plugin` | GGUF, which the pinned vLLM carries no in-tree support for: it was deprecated in `vllm#39583` and moved to this first-party repository, so a GGUF path it serves is a path the PRIMARY oracle serves. Once this oracle is `gateable = yes`, llama.cpp stops being admissible for that path; while it is `gateable = no` the `llama-cpp` row above stays the denominator, because an oracle that has never emitted a token cannot replace one that has |
+| `vllm-project/vllm-gguf-plugin` | `vllm-gguf-plugin` | GGUF, which the pinned vLLM carries no in-tree support for: it was deprecated in `vllm#39583` and moved to this first-party repository, so a GGUF path it serves is a path the PRIMARY oracle serves. `gateable = yes` since 2026-09-10 (emitted byte-identical tokens on gfx1151); the CUDA `sm_110` forward gap ([#2624](https://github.com/mudler/vllm.cpp/issues/2624)) is a vLLM wheel arch issue, not a plugin defect |
 | Tenstorrent tt-forge | `tt-forge` | Tenstorrent hardware, for which vLLM has no backend |
 
 <!-- oracle-registry:end -->

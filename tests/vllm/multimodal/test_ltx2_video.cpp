@@ -54,6 +54,7 @@
 #include "vllm.h"
 #include "vt/backend.h"
 #include "vt/device.h"
+#include "vt/dtype.h"
 #include "vllm/multimodal/video_engine.h"
 #include "vllm/multimodal/render_phase_log.h"
 
@@ -1773,96 +1774,57 @@ TEST_CASE("ltx2 video: keyframe and reference conditioning is refused BY WHAT IS
     const vllm::multimodal::VideoResult result = engine->Generate(gen);
     CHECK(result.frame_count == 9);
   }
-  SUBCASE("a reference video may not blame a seam THIS ENGINE demonstrably has") {
-    // WHAT THIS CASE USED TO DO, AND WHY THAT WAS THE DEFECT. It asserted five
-    // SUBSTRINGS of the refusal: `reference_video_cond.py`, `clear_conditioning`,
-    // `TOKEN-APPEND`, `NOT the IC-LoRA metadata`, and the absence of one retired
-    // phrase. Two of those five are UPSTREAM symbol names, which are present in
-    // the pinned checkout whatever this engine can do, and the other three are
-    // literals the message declares about itself. So not one of them could go
-    // red when the ENGINE changed — and the engine did change, twice, in two
-    // days: #923 made the metadata readable and #930 (`c7cb59fbb`) built the
-    // token-append seam. A reviewer replaced the local-cause sentence with a
-    // self-declared falsehood, kept all five substrings, and the whole suite
-    // stayed green.
+  SUBCASE("a reference video on a pipeline that does not condition on one names where it lives") {
+    // THIS SUBCASE USED TO ASSERT A REFUSAL OF THE FEATURE ITSELF, and row
+    // LTX25-IC-LORA-REF-VIDEO (#3020) SERVED it. What it required — that the
+    // refusal not blame the token-append seam this engine demonstrably has, and
+    // that every closed cause appear only under a `WHAT IS *NOT* THE REASON`
+    // marker — was the right constraint on a message whose job was to explain a
+    // MISSING capability. The capability is no longer missing.
     //
-    // SO THIS CASE MEASURES THE ENGINE FIRST and only then constrains the
-    // message. The measurement is the same instrument the token-append row
-    // gates itself with: `video_tokens` is written INSIDE the phase loop, so it
-    // can observe what the loop does, unlike every field filled before denoise.
-    const vllm::multimodal::VideoModelParams cond_params = ConditioningParams(ws.paths);
-    const std::string kf = ws.root + "/append_witness.ppm";
-    WriteBytes(kf, ConditioningPpm(20, 28, 31));
-
-    auto tokens_of = [&](const std::string& tag, const std::string& keyframe) {
-      const std::unique_ptr<vllm::multimodal::VideoEngine> own =
-          vllm::multimodal::LoadVideoEngine(cond_params);
-      auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(own.get());
-      REQUIRE(ltx2 != nullptr);
-      vllm::multimodal::VideoGenParams g = FixtureGen(ws.root + "/" + tag);
-      if (!keyframe.empty()) {
-        g.last_frame_path = keyframe;
-        g.extras[vllm::multimodal::kLtx2ImageCrfExtra] = "0";
-      }
-      const vllm::multimodal::VideoResult result = own->Generate(g);
-      // THE TRIM, observed from outside: the volume handed to unpatchify is the
-      // target grid, so the clip comes back at the requested length whether or
-      // not anything was appended.
-      CHECK(result.frame_count == 9);
-      return ltx2->last_conditioning().video_tokens;
-    };
-
-    const int64_t plain = tokens_of("ref_witness_plain", "");
-    const int64_t grown = tokens_of("ref_witness_grown", kf);
-    // THE GROWTH. Both numbers are measured; pinning either to a literal would
-    // pass on a build that never grew anything.
-    REQUIRE_MESSAGE(grown > plain,
-                    "this engine's phase loop did not grow its token sequence for an appending "
-                    "conditioning item ("
-                        << grown << " against a target of " << plain
-                        << "), so the rest of this case cannot say what the refusal may claim");
-
+    // So the constraint is replaced by the stronger one the new shape allows:
+    // the message may not describe a missing feature AT ALL, because there is
+    // none. It has to name the pipeline that serves it. That is a property a
+    // reader can act on in one step, where the old message asked them to
+    // re-derive which of four causes still held.
+    //
+    // The token-append measurement the old subcase made is not dropped: it moved
+    // to `ltx2 ic-lora: a reference clip REACHES the render through the public
+    // ABI`, which measures the same growth by rendering through it.
     const std::string msg = refusal("a reference video",
                                     [](vllm::multimodal::VideoGenParams& g, const Workspace& w) {
                                       g.ref_video_dir = w.root;
                                     });
     INFO(msg);
 
-    // BECAUSE THE TWO MEASUREMENTS ABOVE HOLD, the refusal may not CLAIM the
-    // phase loop. It may still MENTION it — the message's own convention is to
-    // record a ruled-out cause under `WHAT IS *NOT* THE REASON` so the next
-    // reader re-checks rather than re-derives — so the property asserted here is
-    // positional: every occurrence of a closed cause sits after that marker.
-    //
-    // That is what makes this case red for the mutation that motivated it.
-    // Restoring the pre-repair message leaves no marker at all AND puts
-    // `TOKEN-APPEND` in the first sentence, so both halves fire.
-    const size_t ruled_out = msg.find("WHAT IS *NOT* THE REASON");
-    REQUIRE_MESSAGE(ruled_out != std::string::npos,
-                    "the refusal carries no `WHAT IS *NOT* THE REASON` section, so a cause this "
-                    "engine has already closed cannot be told apart from one it still has");
-    for (const char* closed : {"TOKEN-APPEND", "fixed at the target grid's token count",
-                               "nowhere to go", "nothing to trim"}) {
-      const size_t at = msg.find(closed);
-      const bool only_as_ruled_out = (at == std::string::npos) || (at > ruled_out);
-      CHECK_MESSAGE(only_as_ruled_out,
+    // IT NAMES WHERE THE FEATURE IS, and does not describe it as absent.
+    CHECK(msg.find("'ic_lora'") != std::string::npos);
+    CHECK(msg.find("ic_lora.py:381-402") != std::string::npos);
+    CHECK(msg.find("ref_video_dir") != std::string::npos);
+    // ...and it distinguishes the OTHER thing this directory can mean, which is
+    // the whole reason `!wants_retake` guards the route.
+    CHECK(msg.find("retake_start_time") != std::string::npos);
+
+    // AND IT CLAIMS NO MISSING SEAM. Every phrase below named a cause this
+    // engine has since built, and each one appeared in this refusal at some
+    // point in the campaign; a message that reintroduces any of them is
+    // describing a build that no longer exists. There is no `WHAT IS *NOT* THE
+    // REASON` escape hatch here, because a refusal that only says "load a
+    // different pipeline" has no reason to mention a seam at all.
+    for (const char* closed : {"TOKEN-APPEND", "is not served", "has no pixel path",
+                               "no reader", "second resident", "fused at load"}) {
+      CHECK_MESSAGE(msg.find(closed) == std::string::npos,
                     "the refusal states '"
                         << std::string(closed)
-                        << "' as a cause rather than as a ruled-out one, and this case has just "
-                           "MEASURED that the loop grows ("
-                        << plain << " -> " << grown << ") and trims back to the target grid");
+                        << "', which describes a MISSING capability. The reference arm is served "
+                           "on 'pipeline_kind' 'ic_lora' (#3020) and this message's only job is "
+                           "to say so.");
     }
-    // The metadata half, same shape: the factors printed are READ from the
-    // adapter at load, so this asserts the read happened rather than asserting
-    // a sentence about it. `factors` says "no adapter was supplied" here.
+    // The adapter factors are still READ and reported, which is what says the
+    // metadata half happened rather than asserting a sentence about it.
     CHECK(msg.find("no adapter was supplied") != std::string::npos);
-    CHECK(msg.find("which this project does not read") == std::string::npos);
-    // And the two causes that DO remain are named, by the upstream anchors a
-    // reader can go and check.
-    CHECK(msg.find("iclora_utils.py:116-117") != std::string::npos);
-    CHECK(msg.find("ic_lora.py:108") != std::string::npos);
-    CHECK(msg.find("ref_video_dir") != std::string::npos);
   }
+
   SUBCASE("reference audio names the AUDIO encoder, which this row did not build") {
     const std::string msg = refusal("reference audio",
                                     [](vllm::multimodal::VideoGenParams& g, const Workspace& w) {
@@ -7378,9 +7340,13 @@ TEST_CASE("ltx2 video: a trace for a render that never completed says so") {
   //
   // IT IS STILL A REFUSAL AFTER ROW LTX25-IMAGE-COND (#644), which served the
   // first-frame arm and would have made a `first_frame_ppm` probe stop
-  // refusing. The reference arm stays refused for a reason this row did not
-  // touch (the IC-LoRA scale factors), so the probe was moved to it rather than
-  // to whatever happened to still throw.
+  // refusing, and after row LTX25-IC-LORA-REF-VIDEO (#3020), which served the
+  // reference CLIP. THE PROBE IS NOW A REFERENCE IMAGE and that is the durable
+  // choice rather than the convenient one: `--video-conditioning` takes a video
+  // file or an EXR directory (ic_lora.py:416-425) and there is no
+  // reference-IMAGE conditioning anywhere in `ltx-pipelines`, so this arm is
+  // refused because upstream has nothing to mirror — not because a seam here is
+  // missing. It is the one refusal in this file that no later row can serve.
   Workspace ws;
   const vllm::multimodal::VideoModelParams mp = EncoderParams(ws.paths);
   const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
@@ -7397,7 +7363,7 @@ TEST_CASE("ltx2 video: a trace for a render that never completed says so") {
   } catch (const std::exception& e) {
     const std::string msg = e.what();
     INFO(msg);
-    CHECK(msg.find("reference-image / reference-video conditioning") != std::string::npos);
+    CHECK(msg.find("reference-IMAGE conditioning is not served") != std::string::npos);
   }
 
   const vllm::multimodal::Ltx2ConditioningTrace trace = ltx->last_conditioning();
@@ -8590,29 +8556,36 @@ TEST_CASE("ltx2 retake: the wrong recipe refuses, and the reference arm still do
     }
   }
 
-  SUBCASE("a reference clip WITHOUT the retake knobs is still refused, and #975 stays open") {
-    // THE LOCAL FACT this row's refusal edit turns on: the LTX side now reads
-    // `ref_video_dir`, so the sentence claiming nothing did is gone. A case that
-    // asserted only upstream symbol names could not see that going stale — which
-    // is exactly how the sentence survived (#987).
+  SUBCASE("a reference clip WITHOUT the retake knobs points at the pipeline that serves it") {
+    // THE LOCAL FACT this subcase turns on has CHANGED TWICE and the history is
+    // kept because that is the point of the case. It first asserted that the
+    // refusal must not claim nothing reads `ref_video_dir`, because the LTX side
+    // reads it (#987). Row LTX25-IC-LORA-REF-VIDEO (#3020) then SERVED the
+    // reference arm, on `pipeline_kind` `ic_lora`, so there is no missing seam
+    // left for a message to misdescribe.
+    //
+    // What survives is the shape: at least one assertion tied to a fact about
+    // THIS tree, so a message whose claim goes stale is visible. That fact is
+    // now that the engine HAS the feature and this pipeline is not it.
     vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/refstill");
     gen.ref_video_dir = clip;
     try {
       (void)engine->Generate(gen);
-      FAIL_CHECK("reference-video conditioning must still be refused");
+      FAIL_CHECK("a reference clip on a distilled_two_stage engine must be refused");
     } catch (const std::exception& e) {
       const std::string msg = e.what();
       INFO(msg);
-      const size_t ruled_out = msg.find("WHAT IS *NOT* THE REASON");
-      REQUIRE(ruled_out != std::string::npos);
-      const size_t stale = msg.find("nothing reads `ref_video_dir` at all");
-      const bool only_as_ruled_out = (stale == std::string::npos) || (stale > ruled_out);
-      CHECK_MESSAGE(only_as_ruled_out,
-                    "the refusal states as a CAUSE that nothing reads ref_video_dir, and this "
-                    "suite has just rendered a retake that reads it");
-      // And it names the reader that DOES exist, so the next reader goes looking
-      // for the reference item's geometry rather than for a file walker.
-      CHECK(msg.find("Ltx2ReadFrameDirectory") != std::string::npos);
+      // It names the pipeline that serves it, and the two operations this same
+      // directory can mean — which is what a caller can act on.
+      CHECK(msg.find("'ic_lora'") != std::string::npos);
+      CHECK(msg.find("retake_start_time") != std::string::npos);
+      CHECK(msg.find("SEEDS the video latent") != std::string::npos);
+      // AND IT CLAIMS NOTHING IS MISSING. This suite has just rendered a retake
+      // that reads this very directory, and the row above serves the reference
+      // arm from it, so a message that described either as absent would be
+      // describing a build that no longer exists.
+      CHECK(msg.find("nothing reads `ref_video_dir` at all") == std::string::npos);
+      CHECK(msg.find("is not served") == std::string::npos);
     }
   }
 }
@@ -13632,6 +13605,42 @@ TEST_CASE("ltx2 video: a loaded duration head DECIDES the frame count") {
   // Every count this path emits sits on the causal temporal grid.
   CHECK((trace.duration_frames - 1) % 8 == 0);
 
+  // ── THE HEAD'S TWO WIDTHS (A24 wave 6, row LTX25-A24-DURATION-HEAD-BF16,
+  //    issue #2955) ─────────────────────────────────────────────────────────
+  //
+  // Upstream resolves ONE pipeline dtype and it is bfloat16 (distilled.py:109),
+  // handed to the head at :163-165. Everything above this point -- the frame
+  // count, the grid, the trace, the render -- was green while this tree ran the
+  // head at f32, because a frame count is an integer either arm produces and
+  // `duration_seconds` is one scalar. These are the two lines that can see it,
+  // and they claim DIFFERENT things on purpose.
+  //
+  // STORAGE: the resident bag's bytes over its parameter count. `Load` asks for
+  // `kBF16` at both call sites; this is what says the file agreed. Reverting
+  // EITHER call site alone reds it.
+  const int64_t bf16_bytes = static_cast<int64_t>(vt::SizeOf(vt::DType::kBF16));
+  INFO("duration head weights: " << trace.duration_head_weight_bytes << " bytes over "
+                                 << trace.duration_head_weight_elems << " parameters");
+  REQUIRE(trace.duration_head_weight_elems > 0);
+  CHECK(trace.duration_head_weight_bytes == trace.duration_head_weight_elems * bf16_bytes);
+
+  // ARITHMETIC: how many values the head PRODUCED that could not have come out
+  // of a bf16 store. Zero on this arm; `duration_head_values` is the control
+  // that the counter looked at anything, because a counter over nothing also
+  // reports zero and would make the line above it read as a pass.
+  INFO("duration head produced " << trace.duration_head_values << " values, "
+                                 << trace.duration_head_not_bf16 << " wider than bf16");
+  REQUIRE(trace.duration_head_values > 0);
+  CHECK(trace.duration_head_not_bf16 == 0);
+  // AND THE PREDICTED SECONDS IS ITSELF A bf16 WORD -- R4, the last rounding and
+  // the only one a user sees. Swept across the head's output bias at 25 fps on
+  // the shipped widths, 10 of 1000 samples FLIP THE FRAME COUNT by eight frames
+  // on the 8k+1 grid, so this is the store point that decides how much video
+  // gets rendered. A discrete selection has bimodal error, which is why the
+  // frame count above is asserted as an equality and never as a band.
+  const float seconds = static_cast<float>(trace.duration_seconds);
+  CHECK(seconds == vt::BF16ToF32(vt::F32ToBF16(seconds)));
+
   // AND IT IS NOT THE RECIPE'S. The same request against an engine with no head
   // renders the recipe default; a predicted count that happened to equal it would
   // make everything above pass for the wrong reason.
@@ -13643,6 +13652,104 @@ TEST_CASE("ltx2 video: a loaded duration head DECIDES the frame count") {
   recipe_gen.num_frames = 0;
   const vllm::multimodal::VideoResult recipe_res = plain->Generate(recipe_gen);
   CHECK(res.frame_count != recipe_res.frame_count);
+}
+
+// THE BARE SPELLING, WHICH NOTHING REACHED. `Ltx2VideoEngine::Load` has TWO
+// `Ltx2LoadDurationHeadWeights` call sites: the prefixed one, and a fallback for
+// a head stored without upstream's `duration_head.` prefix. The fixture for the
+// bare spelling has existed since row LTX25-DURATION-HEAD-WIRE (#2900) and NO
+// case used it, so the second call site was unreached and reverting its dtype
+// alone could not be seen. That is wave 5's own M9 finding -- two loader sites
+// reverted together, neither visible alone -- reproduced here rather than
+// inherited, and the row's spec named it before this case existed.
+//
+// So this case is the pair to the one above: the same two widths, through the
+// OTHER call site, on a head whose keys carry no prefix at all.
+TEST_CASE("ltx2 video: the BARE-spelled duration head loads through the second call site") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras["duration_head_path"] = ws.paths.duration_head_bare;
+  mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine = vllm::multimodal::LoadVideoEngine(mp);
+
+  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/out_bare");
+  gen.num_frames = 0;
+  gen.extras["auto_duration"] = "1,20";
+  vllm::multimodal::VideoResult res;
+  REQUIRE_NOTHROW(res = engine->Generate(gen));
+
+  const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx != nullptr);
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx->last_conditioning();
+  INFO("bare head predicted " << trace.duration_seconds << "s -> " << trace.duration_frames
+                              << " frames");
+  // THE HEAD RAN, which is what says the fallback bound a real bag rather than
+  // returning upstream's `None` and leaving the recipe to decide.
+  REQUIRE(trace.duration_frames > 0);
+  CHECK(res.frame_count == trace.duration_frames);
+
+  // AND IT RAN AT UPSTREAM'S WIDTH. Reverting the bare call site alone to `kF32`
+  // reds these two and nothing else in this suite.
+  const int64_t bf16_bytes = static_cast<int64_t>(vt::SizeOf(vt::DType::kBF16));
+  INFO("bare duration head weights: " << trace.duration_head_weight_bytes << " bytes over "
+                                      << trace.duration_head_weight_elems << " parameters");
+  REQUIRE(trace.duration_head_weight_elems > 0);
+  CHECK(trace.duration_head_weight_bytes == trace.duration_head_weight_elems * bf16_bytes);
+  REQUIRE(trace.duration_head_values > 0);
+  CHECK(trace.duration_head_not_bf16 == 0);
+}
+
+// THE SECOND RENDER ROUTE, WHICH REPORTED A WIDTH NOTHING MEASURED. The two
+// cases above enter through `Generate`'s video path. `GenerateAudioOnly` is the
+// OTHER production route into the head -- a text-to-audio request carries no
+// video stream, which is why `DurationHead.forward` admits a null one at all
+// (t2a_one_stage.py:103-107) -- and it writes the same two trace fields from its
+// own call. Nothing reached it: `auto_duration` appeared in this suite only on
+// the video route, and the t2a fixture never named a `duration_head_path`.
+//
+// That is this row's own O6 finding one level up. O6 found the second LOADER
+// site nothing reached and covered it; this covers the second RENDER site.
+// Replacing that route's two writes with an absurd report -- `not_bf16` at
+// 999999 and `values` at 0 -- left the whole suite green before this case
+// existed, so an f32 head on a t2a render was invisible.
+TEST_CASE("ltx2 t2a: an auto-duration render reports the head's width through the second route") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = T2aParams(ws.paths);
+  mp.extras["duration_head_path"] = ws.paths.duration_head;
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+
+  vllm::multimodal::VideoGenParams gen = T2aGen(ws.root + "/t2a_auto", "a b c");
+  // The count has to GO, not change: an explicit count beside `auto_duration`
+  // is refused two cases below, and refused on purpose.
+  gen.num_frames = 0;
+  gen.extras["auto_duration"] = "1,20";
+  vllm::multimodal::VideoResult res;
+  REQUIRE_NOTHROW(res = engine->Generate(gen));
+
+  const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx != nullptr);
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx->last_conditioning();
+
+  // THE ROUTE, asserted locally rather than assumed from the pipeline kind: a
+  // build that fell through to the video path would satisfy every width check
+  // below while measuring the call site the two cases above already cover.
+  CHECK(trace.t2a_rendered);
+  CHECK(res.frame_count == 0);
+
+  // THE HEAD RAN HERE, on an audio stream alone. Upstream passes
+  // `video_encoding=None` on this pipeline, so this is also the only case in
+  // this suite that predicts from one modality.
+  INFO("t2a head predicted " << trace.duration_seconds << "s -> " << trace.duration_frames
+                             << " frames");
+  REQUIRE(trace.duration_frames > 0);
+
+  // AND IT RAN AT UPSTREAM'S WIDTH, which is the claim this case was added to
+  // make measurable on this route. `duration_head_values` is the control: a
+  // counter that ran over nothing also reports zero wide values.
+  REQUIRE(trace.duration_head_values > 0);
+  CHECK(trace.duration_head_not_bf16 == 0);
 }
 
 // A RETAKE HAS NO PREDICTOR, AND THIS ROW REFUSED TO LET ONE SILENTLY WIN
@@ -13728,6 +13835,481 @@ TEST_CASE("ltx2 video: auto_duration refuses MIN > MAX and refuses doubling an e
       const std::string msg = e.what();
       INFO(msg);
       CHECK(msg.find("auto_duration") != std::string::npos);
+    }
+  }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IC-LoRA REFERENCE VIDEO and its CONDITIONING ATTENTION MASK
+// Row LTX25-IC-LORA-REF-VIDEO, issue #3020,
+// spec .agents/specs/ltx25-ic-lora-ref-video.md (gaps A15 and A16).
+//
+// These are the REACHABILITY cases and they are the only proof this row has.
+// They enter through `LoadVideoEngine` and `Generate` — where
+// `vllm_video_generate` arrives — and not through the ported helpers. The
+// value-level cases live in `test_ltx2_iclora_reference` and per
+// .agents/reachability.md they localize a failure rather than prove one: they
+// stay green when the production call site is deleted.
+//
+// THE SEAM THIS ROW RETIRES. Before it, `Ltx2ModalityInput::attention_mask` and
+// its whole consumption chain — `Ltx2PrepareSelfAttentionMask`, `self_bias` on
+// host and device, `vt::AttentionCross`'s additive bias — were assigned at
+// exactly four sites, all of them inside a `BuildModalities` helper in
+// `test_ltx2.cpp` and `test_ltx2_device.cpp`. Nothing in `src/` wrote either
+// field. The mask case below is the production assignment.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// An `ic_lora` engine. The kind is a LOAD extra, because `ICLoraPipeline` is a
+// pipeline CLASS upstream (ic_lora.py:60) and not a per-request mode: stage 2
+// runs `loras=()` against stage 1's `loras=tuple(loras)` (`:108` against
+// `:119`), which is a property of how the weights are held.
+//
+// `skip_stage_2` IS UPSTREAM'S OWN FLAG (`--skip-stage-2`, ic_lora.py:442-448),
+// spelled here as the `max_phase` load extra this engine already has. It is not
+// a test convenience, and the case below records exactly why one leg needs it.
+vllm::multimodal::VideoModelParams IcLoraParams(const ltx2_fixture::Paths& paths,
+                                                const std::string& upsampler,
+                                                bool skip_stage_2 = false) {
+  vllm::multimodal::VideoModelParams mp = FixtureParams(paths);
+  mp.extras[vllm::multimodal::kLtx2PipelineKindExtra] = "ic_lora";
+  mp.extras[vllm::multimodal::kLtx2CheckpointClassExtra] = FixtureCheckpointClass("ic_lora");
+  // Stage 2 spatially upsamples, exactly as the distilled two-stage recipe this
+  // one derives from does (`ICLoraPipeline` calls `self.upsampler` at
+  // ic_lora.py:307).
+  mp.extras["upsampler_path"] = upsampler;
+  if (skip_stage_2) mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  return mp;
+}
+
+// The spatial x2 upsampler stage 2 needs, written at the fixture's own reduced
+// channel count so the phase's shapes follow the DiT contract rather than a
+// literal.
+std::string WriteIcLoraUpsampler(const std::string& path) {
+  vllm::Ltx2UpsamplerConfig cfg =
+      ltx2_fixture::ReducedUpsamplerConfig(ltx2_fixture::ReducedDitParams().in_channels);
+  cfg.dims = 2;
+  ltx2_fixture::WriteReducedUpsampler(cfg, path);
+  return path;
+}
+
+// A clip of CONSTANT frames, and NOT `ConditioningPpm`'s seeded ramp.
+//
+// MEASURED, and it is the reduced-fixture trap this campaign has recorded twice.
+// `ConditioningPpm` fills a frame with `(i * 37 + seed * 101) % 251` — a dense
+// high-frequency ramp that a seed only PHASE-SHIFTS. The video VAE downsamples
+// 32x spatially, so two seeds average to nearly the same latent: measured absmax
+// 0.539 against 0.464, with the two renders identical to the byte. A fixture
+// built on it cannot see whether the reference reached the DiT at all. Constant
+// frames survive the downsample, and 20 against 235 encode to latents whose
+// absmax is 0.434 against 0.637.
+//
+// The retake cases use the ramp and are right to: retake SEEDS the video latent
+// with the clip, so a small latent difference propagates one-for-one. A
+// reference's whole effect arrives through ATTENTION, which attenuates.
+std::string WriteIcLoraClip(const std::string& dir, int frames, int height, int width,
+                            unsigned char value) {
+  ::mkdir(dir.c_str(), 0755);
+  for (int i = 0; i < frames; ++i) {
+    std::string ppm = "P6\n" + std::to_string(width) + " " + std::to_string(height) + "\n255\n";
+    ppm.append(static_cast<size_t>(height) * static_cast<size_t>(width) * 3,
+               static_cast<char>(value));
+    char name[64];
+    std::snprintf(name, sizeof(name), "/frame_%06d.ppm", i);
+    WriteBytes(dir + name, ppm);
+  }
+  return dir;
+}
+
+// A grayscale mask clip: the LEFT half at `left` and the right half at `right`,
+// so the mask is SPATIALLY structured rather than uniform. A uniform mask cannot
+// separate "the mask reached the DiT" from "the strength scalar did", and an
+// all-ones mask is the identity.
+std::string WriteIcLoraMask(const std::string& dir, int frames, int height, int width,
+                            unsigned char left, unsigned char right) {
+  ::mkdir(dir.c_str(), 0755);
+  for (int i = 0; i < frames; ++i) {
+    std::string ppm = "P6\n" + std::to_string(width) + " " + std::to_string(height) + "\n255\n";
+    for (int y = 0; y < height; ++y) {
+      for (int x = 0; x < width; ++x) {
+        const char v = static_cast<char>(x < width / 2 ? left : right);
+        ppm.push_back(v);
+        ppm.push_back(v);
+        ppm.push_back(v);
+      }
+    }
+    char name[64];
+    std::snprintf(name, sizeof(name), "/frame_%06d.ppm", i);
+    WriteBytes(dir + name, ppm);
+  }
+  return dir;
+}
+
+// 128x128 and NOT the 64x64 every other case uses, deliberately. The distilled
+// two-stage recipe runs stage 1 at half resolution, so the reference clip is
+// read at 64x64, and the fixture VAE's (8, 32, 32) factors then give a 2 x 2 x 2
+// reference latent — 8 tokens. At 64x64 the same arithmetic gives a 1 x 1
+// SPATIAL grid, where a row-major and a column-major patchify are identical and
+// a downscale factor of 2 collapses to the same single token as a factor of 1.
+// A reduced fixture that degenerates the axis it gates is this campaign's
+// recorded failure, so the geometry is chosen against it.
+vllm::multimodal::VideoGenParams IcLoraGen(const std::string& out_dir, const std::string& clip) {
+  vllm::multimodal::VideoGenParams gen;
+  gen.num_frames = 9;
+  gen.height = 128;
+  gen.width = 128;
+  gen.has_seed = true;
+  gen.seed = 7;
+  gen.output_dir = out_dir;
+  gen.ref_video_dir = clip;
+  return gen;
+}
+
+std::string FirstFrame(const vllm::multimodal::VideoResult& result) {
+  return ReadAll(std::string(result.frame_dir) + "/frame_000000.ppm");
+}
+
+}  // namespace
+
+TEST_CASE("ltx2 ic-lora: a reference clip REACHES the render through the public ABI") {
+  // THE RED-FIRST CASE. Before this row `pipeline_kind=ic_lora` resolved to no
+  // recipe at all and `ref_video_dir` was refused outright on every kind but
+  // `retake`, so nothing here could reach the new code. The literal red was
+  //   ERROR: test case THREW exception: Unsupported LTX pipeline kind/version:
+  //   'ic_lora'/'2.5'.
+  Workspace ws;
+  const std::string ups = WriteIcLoraUpsampler(ws.root + "/ic_ups.safetensors");
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(IcLoraParams(ws.paths, ups));
+  auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+
+  // Stage 1 renders at 64x64 and the fixture's factors are (8, 32, 32), so the
+  // reference clip encodes to 2 x 2 x 2 = 8 tokens.
+  const std::string clip = WriteIcLoraClip(ws.root + "/ic_clip", 9, 64, 64, /*value=*/20);
+  const vllm::multimodal::VideoResult result =
+      engine->Generate(IcLoraGen(ws.root + "/ic_out", clip));
+
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+  CHECK(trace.completed);
+  CHECK_MESSAGE(trace.ic_lora_reference_tokens == 8,
+                "the reference clip did not append one latent frame's worth of tokens per latent "
+                "frame; got "
+                    << trace.ic_lora_reference_tokens);
+  // The lower bound a token count cannot make: a clip that encoded to zeros has
+  // the right shape, the right count, and renders.
+  CHECK(trace.ic_lora_reference_absmax > 0.0);
+  CHECK(trace.ic_lora_reference_digest != 0);
+  // The output geometry comes from the REQUEST, not from the reference — which
+  // is where it differs from retake, whose geometry comes from the clip.
+  CHECK(result.frame_count == 9);
+  CHECK(result.width == 128);
+  CHECK(result.height == 128);
+  // NO MASK WAS SUPPLIED, so no mask was handed over. `attention_mask` stays a
+  // null pointer and the DiT takes upstream's `attention_mask is None` branch.
+  // Asserted, because a build that handed over an all-ones mask would render
+  // identically and would be measuring nothing at every case below.
+  CHECK(trace.ic_lora_attention_mask_rows == 0);
+
+  // THE RENDER DEPENDS ON THE REFERENCE CLIP'S PIXELS, and this is the assertion
+  // the trace above cannot make. `ic_lora_reference_absmax` observes the ENCODE;
+  // it says nothing about whether the encoded latent was ever handed to the
+  // phase. A build that read the clip, encoded it, recorded the trace and then
+  // appended zeros satisfies every check above.
+  //
+  // ON THE SKIP-STAGE-2 ARM, AND THAT IS MEASURED RATHER THAN CONVENIENT.
+  // Upstream applies the reference to stage 1 ONLY (ic_lora.py:269-281 against
+  // `:314-321`) and stage 2 re-noises the upsampled latent to
+  // `STAGE_2_DISTILLED_SIGMAS[0]` = 0.909375, so 91% of stage 2's input is fresh
+  // noise. MEASURED on this reduced fixture: stage 1's latents for the two clips
+  // DO differ (clean digests 7109293506366579875 against 12136535927875385707)
+  // and stage 2's inputs still differ, but the surviving difference falls below
+  // 1/255 and the two-stage renders come out byte-identical. That is a property
+  // of a 2-block random-weight DiT, not of the port, and the honest answer is to
+  // make the pixel claim where the conditioning is applied. `--skip-stage-2` is
+  // upstream's own flag for exactly this configuration (ic_lora.py:442-448), so
+  // this leg is a supported request shape and not a test hook.
+  const std::unique_ptr<vllm::multimodal::VideoEngine> stage1 =
+      vllm::multimodal::LoadVideoEngine(IcLoraParams(ws.paths, ups, /*skip_stage_2=*/true));
+  const std::string other = WriteIcLoraClip(ws.root + "/ic_clip_b", 9, 64, 64, /*value=*/235);
+  REQUIRE(ReadAll(clip + "/frame_000000.ppm") != ReadAll(other + "/frame_000000.ppm"));
+  const std::string frame_a = FirstFrame(stage1->Generate(IcLoraGen(ws.root + "/s1_a", clip)));
+  const std::string frame_b = FirstFrame(stage1->Generate(IcLoraGen(ws.root + "/s1_b", other)));
+  REQUIRE(frame_a.size() == frame_b.size());
+  CHECK_MESSAGE(frame_a != frame_b,
+                "two different reference clips rendered byte-identical frames at the same seed, "
+                "so the encoded reference latent never reached the phase");
+}
+
+TEST_CASE("ltx2 ic-lora: the conditioning attention MASK reaches the DiT and moves the render") {
+  // THE CASE THAT RETIRES THE DEAD SEAM. `Ltx2ModalityInput::attention_mask` had
+  // no assignment in `src/` before this row; the only four in the tree were in a
+  // `BuildModalities` test helper. This is the production assignment, reached
+  // from `Generate`.
+  Workspace ws;
+  const std::string ups = WriteIcLoraUpsampler(ws.root + "/mask_ups.safetensors");
+  const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+      vllm::multimodal::LoadVideoEngine(IcLoraParams(ws.paths, ups, /*skip_stage_2=*/true));
+  auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx2 != nullptr);
+
+  const std::string clip = WriteIcLoraClip(ws.root + "/mask_clip", 9, 64, 64, /*value=*/20);
+  // The mask is read at the STAGE's resolution (64x64), which is what upstream
+  // spells `args.height // 2` (ic_lora.py:460-461), and downsampled to the
+  // REFERENCE latent's own 2 x 2 x 2 shape (iclora_utils.py:151-155).
+  const std::string mask =
+      WriteIcLoraMask(ws.root + "/mask_dir", 9, 64, 64, /*left=*/0, /*right=*/255);
+
+  const std::string plain = FirstFrame(engine->Generate(IcLoraGen(ws.root + "/m_plain", clip)));
+  const vllm::multimodal::Ltx2ConditioningTrace no_mask = ltx2->last_conditioning();
+  CHECK(no_mask.ic_lora_attention_mask_rows == 0);
+
+  vllm::multimodal::VideoGenParams masked = IcLoraGen(ws.root + "/m_masked", clip);
+  masked.extras[vllm::multimodal::kLtx2CondAttentionMaskDirExtra] = mask;
+  const std::string with_mask = FirstFrame(engine->Generate(masked));
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx2->last_conditioning();
+
+  // THE MASK WAS HANDED OVER, and the row count says it was the DENSE form. A
+  // build that constructed the mask and dropped the pointer leaves this at 0
+  // while every other check in this case still passes.
+  //
+  // 8 target tokens + 8 reference tokens = 16.
+  CHECK_MESSAGE(trace.ic_lora_attention_mask_rows == 16,
+                "the self-attention strength mask did not reach the DiT as the dense "
+                "[tokens, tokens] form; rows = "
+                    << trace.ic_lora_attention_mask_rows);
+  // AND IT IS NOT THE IDENTITY. An all-ones mask renders correctly, has the
+  // right shape, and is exactly what a downsample that lost its values produces.
+  // Both ends are asserted because one of them alone cannot see a constant mask.
+  CHECK_MESSAGE(trace.ic_lora_attention_mask_min < 1.0,
+                "every weight in the mask is 1.0, which is the identity: this case would be "
+                "measuring nothing");
+  CHECK(trace.ic_lora_attention_mask_max == 1.0);
+  // The left half of the mask is 0 and the right half is 255, so after
+  // `(x + 1) / 2` the latent weights straddle 0 and 1 — a mask whose minimum is
+  // 0 is a token that is FULLY masked, which is `finfo.min` in the log-space
+  // bias and the one value a smooth attenuation cannot produce.
+  CHECK(trace.ic_lora_attention_mask_min == 0.0);
+
+  REQUIRE(plain.size() == with_mask.size());
+  CHECK_MESSAGE(plain != with_mask,
+                "a conditioning attention mask that fully masks half the reference's tokens "
+                "rendered byte-identical frames, so the mask never reached the attention");
+
+  // AND THE MASK'S VALUES MATTER, not merely its presence. Two DIFFERENT masks
+  // must render differently; a build that read the directory and then handed
+  // over a constant satisfies every check above.
+  const std::string other_mask =
+      WriteIcLoraMask(ws.root + "/mask_dir_b", 9, 64, 64, /*left=*/255, /*right=*/0);
+  vllm::multimodal::VideoGenParams flipped = IcLoraGen(ws.root + "/m_flipped", clip);
+  flipped.extras[vllm::multimodal::kLtx2CondAttentionMaskDirExtra] = other_mask;
+  const std::string with_flipped = FirstFrame(engine->Generate(flipped));
+  CHECK_MESSAGE(with_flipped != with_mask,
+                "a mask and its left-right mirror rendered identically, so the mask's VALUES "
+                "never reached the attention — only its presence did");
+
+  // AND THE STRENGTH SCALES IT (iclora_utils.py:156). Halving the strength
+  // halves every latent weight, so the maximum drops from 1.0 to 0.5 and the
+  // render moves again.
+  vllm::multimodal::VideoGenParams half = IcLoraGen(ws.root + "/m_half", clip);
+  half.extras[vllm::multimodal::kLtx2CondAttentionMaskDirExtra] = mask;
+  half.extras[vllm::multimodal::kLtx2CondAttentionStrengthExtra] = "0.5";
+  const std::string with_half = FirstFrame(engine->Generate(half));
+  const vllm::multimodal::Ltx2ConditioningTrace half_trace = ltx2->last_conditioning();
+  CHECK_MESSAGE(half_trace.ic_lora_attention_mask_max == 1.0,
+                "the mask's own block still attends fully to itself (mask_utils.py:229); the "
+                "strength scales the CROSS weights, not the whole matrix");
+  CHECK(with_half != with_mask);
+}
+
+TEST_CASE("ltx2 ic-lora: the reference GEOMETRY follows the adapter, and refuses what it cannot divide") {
+  Workspace ws;
+  const std::string ups = WriteIcLoraUpsampler(ws.root + "/geom_ups.safetensors");
+  const std::string clip = WriteIcLoraClip(ws.root + "/geom_clip", 9, 64, 64, /*value=*/20);
+
+  SUBCASE("downscale 2 reads the clip at HALF the stage's grid, and appends fewer tokens") {
+    // The adapter's own metadata (iclora_utils.py:30-49), read at load by row
+    // LTX25-IC-LORA. Stage 1 runs at 64x64, so `reference_downscale_factor = 2`
+    // reads the clip at 32x32 and the (8, 32, 32) factors give a 2 x 1 x 1
+    // reference latent — 2 tokens against the unscaled arm's 8.
+    vllm::multimodal::VideoModelParams mp = IcLoraParams(ws.paths, ups, /*skip_stage_2=*/true);
+    mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = WriteFixtureLora(
+        ws.root + "/ref_lora.safetensors", kFixtureLoraTarget, 1.0F,
+        {{"reference_downscale_factor", "2"}});
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    auto* ltx2 = dynamic_cast<vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+    REQUIRE(ltx2 != nullptr);
+    (void)engine->Generate(IcLoraGen(ws.root + "/geom_out", clip));
+    CHECK_MESSAGE(ltx2->last_conditioning().ic_lora_reference_tokens == 2,
+                  "the reference was not read at `height // reference_downscale_factor` "
+                  "(iclora_utils.py:116-117); it appended "
+                      << ltx2->last_conditioning().ic_lora_reference_tokens << " tokens");
+  }
+
+  SUBCASE("a target the factor does not divide is refused by upstream's own message") {
+    vllm::multimodal::VideoModelParams mp = IcLoraParams(ws.paths, ups, /*skip_stage_2=*/true);
+    mp.extras[vllm::multimodal::kLtx2LoraPathExtra] = WriteFixtureLora(
+        ws.root + "/ref_lora3.safetensors", kFixtureLoraTarget, 1.0F,
+        {{"reference_downscale_factor", "3"}});
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(mp);
+    try {
+      // Stage 1 is 64x64 and 64 % 3 != 0.
+      (void)engine->Generate(IcLoraGen(ws.root + "/geom_bad", clip));
+      FAIL("a target the reference_downscale_factor does not divide must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      // Upstream's own wording, pinned by `kLtx2RefDivisibilityRefusal`.
+      CHECK(msg.find("must be divisible by reference_downscale_factor") != std::string::npos);
+      CHECK(msg.find("iclora_utils.py:112-115") != std::string::npos);
+    }
+  }
+}
+
+TEST_CASE("ltx2 ic-lora: every refusal names what is wrong and where the feature lives") {
+  Workspace ws;
+  const std::string clip = WriteIcLoraClip(ws.root + "/ref_clip", 9, 64, 64, /*value=*/20);
+
+  SUBCASE("a reference clip on a pipeline that has no reference conditioning") {
+    // THE SAME `serves_reference` PREDICATE the route uses, negated. A refusal
+    // and its route predicate written as two expressions is how this campaign
+    // shipped a silently wrong answer, and this case is what holds them together.
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths));
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/refuse_ref");
+    gen.ref_video_dir = clip;
+    try {
+      (void)engine->Generate(gen);
+      FAIL("a reference clip on distilled_two_stage must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      // It names the pipeline that DOES serve it, rather than saying the feature
+      // is missing — it is not missing, it is elsewhere.
+      CHECK(msg.find("'ic_lora'") != std::string::npos);
+      CHECK(msg.find("ic_lora.py:381-402") != std::string::npos);
+      // ...and it names retake as the other thing this directory can mean.
+      CHECK(msg.find("retake_start_time") != std::string::npos);
+      // The adapter factors are READ, so the message reports what was read
+      // rather than a sentence about it.
+      CHECK(msg.find("no adapter was supplied") != std::string::npos);
+    }
+  }
+
+  SUBCASE("an ic_lora render with NO reference clip") {
+    const std::string ups = WriteIcLoraUpsampler(ws.root + "/none_ups.safetensors");
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(IcLoraParams(ws.paths, ups, /*skip_stage_2=*/true));
+    vllm::multimodal::VideoGenParams gen = IcLoraGen(ws.root + "/no_ref", "");
+    try {
+      (void)engine->Generate(gen);
+      FAIL("`--video-conditioning` is required=True upstream; an ic_lora render without one "
+           "must be refused rather than silently becoming a distilled render");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("required=True") != std::string::npos);
+      CHECK(msg.find("distilled_two_stage") != std::string::npos);
+    }
+  }
+
+  SUBCASE("a mask on a pipeline that appends no reference tokens") {
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(ConditioningParams(ws.paths));
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/refuse_mask");
+    gen.extras[vllm::multimodal::kLtx2CondAttentionMaskDirExtra] = ws.root;
+    try {
+      (void)engine->Generate(gen);
+      FAIL("a conditioning attention mask with no reference tokens to attenuate must refuse");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("combined_image_conditionings` never wraps") != std::string::npos);
+      CHECK(msg.find("'ic_lora'") != std::string::npos);
+    }
+  }
+
+  SUBCASE("the scalar-only strength arm, which upstream's CLI cannot reach either") {
+    const std::string ups = WriteIcLoraUpsampler(ws.root + "/scalar_ups.safetensors");
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(IcLoraParams(ws.paths, ups, /*skip_stage_2=*/true));
+    vllm::multimodal::VideoGenParams gen = IcLoraGen(ws.root + "/scalar", clip);
+    gen.extras[vllm::multimodal::kLtx2CondAttentionStrengthExtra] = "0.5";
+    try {
+      (void)engine->Generate(gen);
+      FAIL("a sub-1.0 strength with no mask is upstream's Python-API-only arm and must be "
+           "refused by name rather than served");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("iclora_utils.py:157-158") != std::string::npos);
+      CHECK(msg.find("ic_lora.py:452-455") != std::string::npos);
+      CHECK(msg.find("owed") != std::string::npos);
+    }
+  }
+
+  SUBCASE("a strength outside [0, 1]") {
+    const std::string ups = WriteIcLoraUpsampler(ws.root + "/range_ups.safetensors");
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(IcLoraParams(ws.paths, ups, /*skip_stage_2=*/true));
+    vllm::multimodal::VideoGenParams gen = IcLoraGen(ws.root + "/range", clip);
+    gen.extras[vllm::multimodal::kLtx2CondAttentionMaskDirExtra] = ws.root;
+    gen.extras[vllm::multimodal::kLtx2CondAttentionStrengthExtra] = "1.5";
+    try {
+      (void)engine->Generate(gen);
+      FAIL("a strength above 1 would AMPLIFY attention and must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("[0.0, 1.0]") != std::string::npos);
+      CHECK(msg.find("AMPLIFY") != std::string::npos);
+    }
+  }
+
+  SUBCASE("a strength outside [0, 1] with NO mask, which upstream refuses just the same") {
+    // `ic_lora.py:230-233` is UNCONDITIONAL: it is in the method body, not
+    // inside `if args.conditioning_attention_mask is not None`. Guarding this
+    // engine's copy on a mask directory made an out-of-range strength with no
+    // mask pass the range check AND pass the sub-1.0 scalar-arm refusal below
+    // it, leaving a value that is accepted, never read (its only reader is
+    // inside the mask branch) and silently ignored on every pipeline.
+    const std::string ups = WriteIcLoraUpsampler(ws.root + "/nomask_range_ups.safetensors");
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(IcLoraParams(ws.paths, ups, /*skip_stage_2=*/true));
+    vllm::multimodal::VideoGenParams gen = IcLoraGen(ws.root + "/nomask_range", clip);
+    // NO kLtx2CondAttentionMaskDirExtra. That is the whole point of the case.
+    gen.extras[vllm::multimodal::kLtx2CondAttentionStrengthExtra] = "1.5";
+    try {
+      (void)engine->Generate(gen);
+      FAIL("an out-of-range strength must be refused whether or not a mask was supplied; "
+           "upstream's check does not consult the mask");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("[0.0, 1.0]") != std::string::npos);
+      CHECK(msg.find("AMPLIFY") != std::string::npos);
+      CHECK(msg.find("ic_lora.py:230-233") != std::string::npos);
+    }
+  }
+
+  SUBCASE("a reference IMAGE, which is not what an IC-LoRA reference is") {
+    const std::string ups = WriteIcLoraUpsampler(ws.root + "/img_ups.safetensors");
+    const std::unique_ptr<vllm::multimodal::VideoEngine> engine =
+        vllm::multimodal::LoadVideoEngine(IcLoraParams(ws.paths, ups, /*skip_stage_2=*/true));
+    vllm::multimodal::VideoGenParams gen = IcLoraGen(ws.root + "/refimg", clip);
+    gen.ref_image_paths.push_back(ws.paths.audio_embeds);
+    try {
+      (void)engine->Generate(gen);
+      FAIL("reference images are not an IC-LoRA shape and must be refused");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("--video-conditioning") != std::string::npos);
+      CHECK(msg.find("first_frame_ppm") != std::string::npos);
     }
   }
 }

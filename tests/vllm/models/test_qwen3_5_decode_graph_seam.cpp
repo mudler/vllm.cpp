@@ -42,6 +42,7 @@
 
 #include "decode_graph_seam_harness.h"
 #include "vllm/model_executor/models/device_pool.h"
+#include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/transformers_utils/hf_config.h"
@@ -973,6 +974,316 @@ bool PoolBypassLane() {
 }
 
 }  // namespace
+
+
+namespace {
+
+CommonAttentionMetadata FullAttnDecodeMeta(int32_t batch, int32_t position) {
+  auto am = DecodeAttnMeta(position);
+  am.num_reqs = am.num_actual_tokens = batch;
+  am.query_start_loc.clear();
+  am.seq_lens.assign(static_cast<size_t>(batch), position + 1);
+  am.block_table_tensor.clear();
+  am.slot_mapping.clear();
+  for (int32_t r = 0; r < batch; ++r) {
+    am.query_start_loc.push_back(r);
+    am.block_table_tensor.push_back(r);
+    am.slot_mapping.push_back(static_cast<int64_t>(r) * 16 + position);
+  }
+  am.query_start_loc.push_back(batch);
+  am.query_start_loc_cpu = am.query_start_loc;
+  am.seq_lens_cpu = am.seq_lens;
+  return am;
+}
+
+GDNAttentionMetadata UnusedGdnMeta(int32_t batch, int mode) {
+  GDNAttentionMetadata gm;
+  if (mode == 0) return gm;
+  gm.num_decodes = gm.num_decode_tokens = gm.num_actual_tokens = batch;
+  gm.non_spec_state_indices_tensor = std::vector<int32_t>(static_cast<size_t>(batch));
+  for (int32_t r = 0; r < batch; ++r)
+    (*gm.non_spec_state_indices_tensor)[static_cast<size_t>(r)] = r;
+  if (mode == 2) {
+    // No GDN consumer can read any of this metadata. In particular, graph
+    // padding must not copy this vector into an S-entry destination.
+    gm.non_spec_state_indices_tensor->assign(4096, 777);
+    gm.num_actual_tokens = -7;
+    gm.num_spec_decodes = 999;
+  }
+  return gm;
+}
+
+template <class Graph, class Weights>
+void FullAttnGraphRouting(const HfConfig& c, const Weights& w) {
+  for (bool capture : {false, true}) {
+    CAPTURE(capture);
+    for (bool async : {false, true}) {
+      CAPTURE(async);
+      for (int mode : {0, 1, 2}) {
+        CAPTURE(mode);
+        for (int32_t batch : {1, 3}) {
+          CAPTURE(batch);
+          StaticGraphCpu harness(capture);
+          const ScopedEnv async_mode("VT_ASYNC_EXECUTOR", async ? "1" : "0");
+          // Padding from three requests to four needs no GDN state I/O.
+          const ScopedEnv no_indexed_state("VT_GDN_INDEXED_STATE_IO", "0");
+          CachePool pool(c, 4, 16);
+          REQUIRE(pool.gdn_state.empty());
+          vt::Queue q = Q();
+          vt::ResetGraphBreakStats();
+          vt::ResetStepInputStats();
+          Graph graph(w, c, q, 4);
+          for (int32_t step = 0; step < 6; ++step) {
+            const std::vector<int32_t> ids(static_cast<size_t>(batch), 11 + step);
+            const std::vector<int32_t> positions(static_cast<size_t>(batch), step);
+            const auto logits = graph.Step(ids, positions, FullAttnDecodeMeta(batch, step),
+                                            UnusedGdnMeta(batch, mode), pool.attn_kv,
+                                            pool.gdn_state);
+            REQUIRE(logits.rows == batch);
+            REQUIRE(logits.vocab == c.vocab_size);
+            REQUIRE(logits.on_device());
+            if (step == 0) {
+              CHECK_FALSE(graph.captured());
+              CHECK(vt::GetGraphBreakStats().segments_captured == 0);
+            }
+          }
+          const auto graphs = vt::GetGraphBreakStats();
+          const auto inputs = vt::GetStepInputStats();
+          if (capture) {
+            CHECK(graph.captured());
+            CHECK(graphs.segments_captured == (async ? 2 : 1));
+            CHECK(graphs.replays == (async ? 4 : 5));
+            CHECK(graph.replay_count() == (async ? 4 : 5));
+            // Exactly five generic inputs per slot. A sixth input means the
+            // no-consumer path still binds recurrent state indices.
+            CHECK(inputs.binds == (async ? 10 : 0));
+            CHECK(inputs.host_refreshes == (async ? 10 : 0));
+          } else {
+            CHECK_FALSE(graph.captured());
+            CHECK(graphs.segments_captured == 0);
+            CHECK(graphs.replays == 0);
+            CHECK(inputs.binds == 0);
+            CHECK(inputs.host_refreshes == 0);
+          }
+          CHECK(inputs.device_refreshes == 0);
+        }
+      }
+    }
+  }
+  MESSAGE("CPU fake graph: cold, capture, staging, replay, and fallback routing only; "
+          "no GPU replay numerics");
+}
+
+template <class Graph, class Weights>
+void FullAttnGraphShapeGuards(const HfConfig& c, const Weights& w) {
+  StaticGraphCpu harness;
+  CachePool pool(c, 4, 16);
+  vt::Queue q = Q();
+  Graph graph(w, c, q, 4);
+  auto am = DecodeAttnMeta(0);
+  const char* expected = nullptr;
+  SUBCASE("oversized slot mapping") {
+    am.slot_mapping.push_back(0);
+    expected = "slot_mapping";
+  }
+  SUBCASE("oversized sequence lengths") {
+    am.seq_lens.push_back(1);
+    expected = "full-attn metadata shapes";
+  }
+  SUBCASE("oversized query offsets") {
+    am.query_start_loc.push_back(1);
+    expected = "full-attn metadata shapes";
+  }
+  SUBCASE("oversized block table") {
+    am.block_table_tensor.push_back(0);
+    expected = "block table";
+  }
+  SUBCASE("query offsets do not cover the batch") {
+    am.query_start_loc.back() = 2;
+    expected = "query offsets";
+  }
+  SUBCASE("query offsets start after zero") {
+    am.query_start_loc = {1, 1};
+    am.query_start_loc_cpu = am.query_start_loc;
+    expected = "query offsets";
+  }
+  SUBCASE("query offsets descend inside the batch") {
+    am = FullAttnDecodeMeta(3, 0);
+    am.query_start_loc = {0, 2, 1, 3};
+    am.query_start_loc_cpu = am.query_start_loc;
+    expected = "query offsets";
+  }
+  REQUIRE(expected != nullptr);
+  const std::vector<int32_t> ids(static_cast<size_t>(am.num_actual_tokens), 11);
+  const std::vector<int32_t> positions(static_cast<size_t>(am.num_actual_tokens), 0);
+  CHECK_THROWS_WITH_AS(graph.Step(ids, positions, am, {}, pool.attn_kv, pool.gdn_state),
+                       doctest::Contains(expected), std::runtime_error);
+}
+
+// A scoped routing witness, not a new backend. The real CPU backend and all
+// native CPU arithmetic remain in use. Only the MoE registry's existing FP4
+// capability predicate receives a test answer. The fake graph replays no math.
+class ScopedFp4GraphCapability final : public vllm::platforms::Platform {
+ public:
+  ScopedFp4GraphCapability()
+      : previous_(vllm::platforms::GetPlatform(vt::DeviceType::kCPU)) {
+    vllm::platforms::RegisterPlatform(vt::DeviceType::kCPU, this);
+  }
+  ~ScopedFp4GraphCapability() override {
+    vllm::platforms::RegisterPlatform(vt::DeviceType::kCPU, &previous_);
+  }
+  vt::DeviceType device_type() const override { return previous_.device_type(); }
+  vt::Backend& backend() const override { return previous_.backend(); }
+  vllm::platforms::DeviceCapability get_device_capability() const override {
+    return previous_.get_device_capability();
+  }
+  std::vector<vt::DType> supported_dtypes() const override {
+    return previous_.supported_dtypes();
+  }
+  vllm::platforms::ResidencyPolicy residency_policy() const override {
+    return previous_.residency_policy();
+  }
+  bool support_static_graph_mode() const override { return true; }
+  bool cutlass_fp4_supported() const override { return true; }
+
+ private:
+  vllm::platforms::Platform& previous_;
+};
+
+// The existing MakeNvfp4W4A16 test pattern, with finite nonzero E2M1 values and
+// E4M3 scales. K and N are the CPU model's real expert projection dimensions.
+vllm::Nvfp4Weight RoutingFp4(int64_t n, int64_t k) {
+  vllm::Nvfp4Weight w;
+  w.n = n;
+  w.k = k;
+  w.scale2 = 1.0F;
+  w.packed.dtype = w.scale.dtype = DType::kI8;
+  w.packed.rank = w.scale.rank = 2;
+  w.packed.shape[0] = w.scale.shape[0] = n;
+  w.packed.shape[1] = k / 2;
+  w.scale.shape[1] = k / 16;
+  w.packed.bytes.assign(static_cast<size_t>(n * k / 2), 0x21);
+  w.scale.bytes.assign(static_cast<size_t>(n * k / 16), 0x20);
+  return w;
+}
+
+void AddRoutingFp4(Qwen3_5MoeWeights& w, const HfConfig& c) {
+  for (auto& layer : w.layers) {
+    auto& moe = layer.moe;
+    moe.expert_gate.clear();
+    moe.expert_up.clear();
+    moe.expert_down.clear();
+    for (int64_t expert = 0; expert < c.num_experts; ++expert) {
+      moe.expert_gate_fp4.push_back(RoutingFp4(c.moe_intermediate_size, c.hidden_size));
+      moe.expert_up_fp4.push_back(RoutingFp4(c.moe_intermediate_size, c.hidden_size));
+      moe.expert_down_fp4.push_back(RoutingFp4(c.hidden_size, c.moe_intermediate_size));
+    }
+    moe.shared_gate_proj = OwnedTensor{};
+    moe.shared_up_proj = OwnedTensor{};
+    moe.shared_down_proj = OwnedTensor{};
+    moe.shared_gate_proj_fp4 = RoutingFp4(c.shared_expert_intermediate_size, c.hidden_size);
+    moe.shared_up_proj_fp4 = RoutingFp4(c.shared_expert_intermediate_size, c.hidden_size);
+    moe.shared_down_proj_fp4 = RoutingFp4(c.hidden_size, c.shared_expert_intermediate_size);
+  }
+}
+
+void RegistryFullAttnGraph(vllm::LoadedModel& model, const HfConfig& c, bool expect_graph) {
+  CachePool pool(c, 4, 16);
+  vt::Queue q = Q();
+  const std::vector<int32_t> indices;
+  CHECK(model.registration().architecture == c.architectures.front());
+  CHECK(model.registration().factory == vllm::RegistrationFor(c.architectures.front()).factory);
+  vt::ResetGraphBreakStats();
+  vt::ResetStepInputStats();
+  for (int32_t step = 0; step < 6; ++step) {
+    const std::vector<int32_t> ids = {11 + step}, positions = {step};
+    const auto am = DecodeAttnMeta(step);
+    const auto gm = UnusedGdnMeta(1, 2);
+    vllm::ModelForwardInput input{ids, positions, am, gm, pool.attn_kv,
+                                  pool.gdn_state, c, q, indices};
+    input.num_reqs = 1;
+    input.pure_decode = true;
+    input.uniform_query_len = 1;
+    // The legacy planner group carries capacity even without a state consumer.
+    input.gdn_state_slots = 4;
+    const auto logits = vllm::ModelRegistry::Forward(model, input);
+    REQUIRE(logits.rows == 1);
+    REQUIRE(logits.vocab == c.vocab_size);
+  }
+  const auto graphs = vt::GetGraphBreakStats();
+  CHECK(graphs.segments_captured == (expect_graph ? 2 : 0));
+  CHECK(graphs.replays == (expect_graph ? 4 : 0));
+  CHECK(vt::GetStepInputStats().binds == (expect_graph ? 10 : 0));
+  CHECK(vt::GetStepInputStats().host_refreshes == (expect_graph ? 10 : 0));
+}
+
+}  // namespace
+
+TEST_CASE("full-attention dense graph ignores unused GDN state") {
+  HfConfig c = dense::TinyConfig();
+  c.num_hidden_layers = 1;
+  c.layer_types = {"full_attention"};
+  const auto w = dense::MakeWeights(c);
+  FullAttnGraphRouting<vllm::Qwen3_5DenseDecodeGraph>(c, w);
+}
+
+TEST_CASE("full-attention MoE graph ignores unused GDN state") {
+  HfConfig c = TinyConfig();
+  c.num_hidden_layers = 1;
+  c.layer_types = {"full_attention"};
+  const auto w = MakeWeights(c);
+  FullAttnGraphRouting<vllm::Qwen3_5DecodeGraph>(c, w);
+}
+
+TEST_CASE("full-attention dense graph keeps attention shape guards") {
+  HfConfig c = dense::TinyConfig();
+  c.num_hidden_layers = 1;
+  c.layer_types = {"full_attention"};
+  const auto w = dense::MakeWeights(c);
+  FullAttnGraphShapeGuards<vllm::Qwen3_5DenseDecodeGraph>(c, w);
+}
+
+TEST_CASE("full-attention MoE graph keeps attention shape guards") {
+  HfConfig c = TinyConfig();
+  c.num_hidden_layers = 1;
+  c.layer_types = {"full_attention"};
+  const auto w = MakeWeights(c);
+  FullAttnGraphShapeGuards<vllm::Qwen3_5DecodeGraph>(c, w);
+}
+
+TEST_CASE("full-attention registry reaches the dense graph Step") {
+  StaticGraphCpu harness;
+  const ScopedEnv async("VT_ASYNC_EXECUTOR", "1");
+  HfConfig c = dense::TinyConfig();
+  c.num_hidden_layers = 1;
+  c.layer_types = {"full_attention"};
+  const auto w = dense::MakeWeights(c);
+  auto model = vllm::BorrowQwen3_5DenseLoadedModel(w);
+  RegistryFullAttnGraph(*model, c, true);
+}
+
+TEST_CASE("full-attention registry reaches the MoE graph Step through its FP4 predicate") {
+  StaticGraphCpu harness;
+  const ScopedEnv async("VT_ASYNC_EXECUTOR", "1");
+  HfConfig c = TinyConfig();
+  c.num_hidden_layers = 1;
+  c.layer_types = {"full_attention"};
+  auto w = MakeWeights(c);
+  AddRoutingFp4(w, c);
+  // Control: valid FP4 CPU arithmetic alone does not satisfy the registry's
+  // platform predicate, so the registered forward stays eager.
+  {
+    auto model = vllm::BorrowQwen3_5MoeLoadedModel(w);
+    RegistryFullAttnGraph(*model, c, false);
+  }
+  {
+    ScopedFp4GraphCapability fake_capability;
+    auto model = vllm::BorrowQwen3_5MoeLoadedModel(w);
+    RegistryFullAttnGraph(*model, c, true);
+  }
+  MESSAGE("MoE registry witness uses a fake CPU FP4 capability and fake graph replay; "
+          "no GPU replay numerics");
+}
 
 TEST_CASE("#2029: a NON-speculative Qwen3_5DenseDecodeGraph capture allocates nothing"
           " [pooled lane only -- SKIPPED under VT_POOL_BYPASS, where the pool is"

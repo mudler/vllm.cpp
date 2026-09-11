@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 262" width="640" height="262" role="img" aria-labelledby="t d">
+<title id="t">Throughput by counting convention</title><desc id="d">vllm.cpp leads exllamav3 on both counting conventions.</desc>
+<line x1="118.0" y1="30" x2="118.0" y2="200" stroke="#c9d2d9" stroke-width="1"/>
+<text x="118.0" y="220.0" fill="#68798a" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="middle">0</text>
+<line x1="232.0" y1="30" x2="232.0" y2="200" stroke="#c9d2d9" stroke-width="1" stroke-dasharray="2 3"/>
+<text x="232.0" y="220.0" fill="#68798a" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="middle">15</text>
+<line x1="346.0" y1="30" x2="346.0" y2="200" stroke="#c9d2d9" stroke-width="1" stroke-dasharray="2 3"/>
+<text x="346.0" y="220.0" fill="#68798a" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="middle">30</text>
+<line x1="460.0" y1="30" x2="460.0" y2="200" stroke="#c9d2d9" stroke-width="1" stroke-dasharray="2 3"/>
+<text x="460.0" y="220.0" fill="#68798a" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="middle">45</text>
+<line x1="574.0" y1="30" x2="574.0" y2="200" stroke="#c9d2d9" stroke-width="1" stroke-dasharray="2 3"/>
+<text x="574.0" y="220.0" fill="#68798a" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="middle">60</text>
+<text x="346.0" y="242.0" fill="#68798a" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="middle">tokens per second</text>
+<text x="106.0" y="58.0" fill="#68798a" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="end">decode only</text>
+<rect x="118" y="44" width="407.6" height="21" rx="4" fill="#b4530a"/>
+<text x="533.6" y="59.0" fill="#b4530a" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="start">53.63</text>
+<text x="598.0" y="59.0" fill="#b4530a" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="start">vllm.cpp</text>
+<rect x="118" y="69" width="340.6" height="21" rx="4" fill="#1f6f9c"/>
+<text x="466.6" y="84.0" fill="#1f6f9c" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="start">44.82</text>
+<text x="598.0" y="84.0" fill="#1f6f9c" font-size="10" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="start">exllamav3</text>
+<text x="106.0" y="118.0" fill="#68798a" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="end">whole run</text>
+<rect x="118" y="104" width="283.9" height="21" rx="4" fill="#b4530a"/>
+<text x="409.9" y="119.0" fill="#b4530a" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="start">37.35</text>
+<rect x="118" y="129" width="252.8" height="21" rx="4" fill="#1f6f9c"/>
+<text x="378.8" y="144.0" fill="#1f6f9c" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="start">33.26</text>
+</svg>

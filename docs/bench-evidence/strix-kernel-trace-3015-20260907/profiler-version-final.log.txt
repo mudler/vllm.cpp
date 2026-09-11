@@ -1,0 +1,14 @@
+0
+163110912
+             version: 1.1.0
+        git_revision: 97f5574fe2fdc7bef44fb01545347912ee9f1779
+        library_arch: x86_64-linux-gnu
+         system_name: Linux
+    system_processor: x86_64
+      system_version: 6.8.0-85-generic
+         compiler_id: GNU
+    compiler_version: 13.3.0
+        rocm_version: 7.2.4
+hsa-amd-aqlprofile	1.0.0.70204-93~24.04
+libdw1t64:amd64	0.190-1.1ubuntu0.1
+rocprofiler-sdk	1.1.0-93~24.04

@@ -441,7 +441,7 @@ checks that this prose and that message agree.
   introduced here and it is not closed here.
 - Limit 6: comparing `compile_commands.json` at base and at head would cover a
   flag-only build edit exactly, at the cost of a second configure and a base
-  worktree. Not built; #2401 owns it.
+  worktree. Not built; ISSUE-GH-2401 owns it.
 - Limit 2: the non-default configurations stay CI-only. No row claims moving
   them earlier. The checker names the units it could not check for this reason
   in its own output -- on the `08fa2f5aa^` range that is five `.cu` files and
@@ -449,7 +449,7 @@ checks that this prose and that message agree.
   only in this document.
 - A repeat preflight run on an unchanged wide branch recompiles the same units.
   A cache keyed on `(unit, hash of its dependency set, recorded command)` would
-  reduce it to the dependency scan. Not built; #2401 owns it.
+  reduce it to the dependency scan. Not built; ISSUE-GH-2401 owns it.
 
 ## Stop conditions
 

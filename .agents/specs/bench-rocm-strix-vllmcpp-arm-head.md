@@ -180,3 +180,23 @@ this run re-measures them.
 - The revision, tree or built-bytes assertion fails: the job exits non-zero and
   nothing is published. This is the assertion working, not a blocker.
 - The lease is lost: report what completed and what did not.
+
+## Owed
+
+- **The `windows-msvc-cpu` and `windows-msvc-vulkan` reds this row's two
+  publications land over.**
+  [#2403](https://github.com/mudler/vllm.cpp/issues/2403) is the standing
+  `0xC0000409` abort in `test_openai_api_server.exe`, in the explicit-cpu and
+  embeddings cases. It is unrelated to a benchmark page: neither publication
+  touches `src/`, `include/` or `tests/`, and both lanes are pull-request-only,
+  so `main` carries no verdict for them either. Not repaired here, and this row
+  cannot repair it: the authoring host has no MSVC and the failure needs a
+  Windows reproduction under a debugger.
+  **#2403 names no owning row.** Its body assigns itself to "the api_server row
+  (OPENAI-API-SERVER surface)", and no such row exists in the issue index, so the
+  index records its owner as `—`. This entry is what stops that citation from
+  being an unowned reference; it is NOT a claim that this benchmark row owns the
+  abort. Assigning it a real owner is itself owed, and picking one between the
+  api_server surface its author named and `ENG-RELEASE-WINDOWS`, which owns every
+  other Windows-lane issue in the index, is a judgement this row did not make and
+  had no standing to make.

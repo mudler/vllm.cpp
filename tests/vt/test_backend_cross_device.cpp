@@ -44,6 +44,7 @@
 #include "vt/ops.h"
 #include "vt/quant.h"
 #include "vt/recipes.h"
+#include "vt/rocm/rocm_arch.h"
 #include "vt/rocm/rocm_runtime.h"
 
 namespace {
@@ -1810,6 +1811,100 @@ TEST_CASE("GDN prefill/decode recurrence matches the CPU oracle within NMSE <= 5
 }
 
 
+TEST_CASE("KDA per-K-channel-decay recurrence matches the CPU oracle within NMSE <= 5e-4") {
+  // KDA is GDN with per-K-channel decay: the gate g is [T,Hv,Dk] (per-channel)
+  // not [T,Hv] (per-head). This is the load-bearing assertion — if the kernel
+  // reads g at the wrong stride, the per-channel decay is wrong and the output
+  // diverges. Three assertions per device (PR #3001 precedent): (1) NMSE on out
+  // AND state, (2) OpRegistered is the native-only probe, (3) reference-tier
+  // hits do not increase (the call did not fall through to the CPU tier).
+  const int64_t HK = 2, HV = 4, DK = 16, DV = 24;  // HV = ratio*HK
+  const float scale = 0.25f;
+  vt::GdnArgs ga;
+  ga.scale = scale;
+
+  // ---- prefill: two sequences, lens 4 and 1, fresh zero state.
+  const std::vector<int32_t> qsl = {0, 4, 5};
+  const int64_t N = 2, T = 5;
+  const size_t qkn = static_cast<size_t>(T * HK * DK), vn = static_cast<size_t>(T * HV * DV);
+  const size_t ggn = static_cast<size_t>(T * HV * DK), gbn = static_cast<size_t>(T * HV);
+  const size_t stn = static_cast<size_t>(N * HV * DV * DK);
+  const std::vector<float> qin = RandomVec(qkn, 871, -0.5f, 0.5f);
+  const std::vector<float> kin = RandomVec(qkn, 872, -0.5f, 0.5f);
+  const std::vector<float> vin = RandomVec(vn, 873, -0.5f, 0.5f);
+  const std::vector<float> gin = RandomVec(ggn, 874, -0.3f, -0.01f);  // log-decay < 0
+  const std::vector<float> bin = RandomVec(gbn, 875, 0.0f, 0.5f);
+
+  std::vector<float> ref_out(vn, 0.0f), ref_st(stn, 0.0f);
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> hq = qin, hk_ = kin, hv_ = vin, hg = gin, hb = bin;
+    std::vector<int32_t> cqsl = qsl;
+    Tensor tq = Tensor::Contiguous(hq.data(), DType::kF32, cd, {T, HK, DK});
+    Tensor tk = Tensor::Contiguous(hk_.data(), DType::kF32, cd, {T, HK, DK});
+    Tensor tv = Tensor::Contiguous(hv_.data(), DType::kF32, cd, {T, HV, DV});
+    Tensor tg = Tensor::Contiguous(hg.data(), DType::kF32, cd, {T, HV, DK});
+    Tensor tb = T2(hb.data(), cd, T, HV);
+    Tensor tst = Tensor::Contiguous(ref_st.data(), DType::kF32, cd, {N, HV, DV, DK});
+    Tensor tqsl = TI32(cqsl.data(), cd, N + 1);
+    Tensor tout = Tensor::Contiguous(ref_out.data(), DType::kF32, cd, {T, HV, DV});
+    vt::KdaGatedDeltaRule(cq, tout, tq, tk, tv, tg, tb, tst, tqsl, ga);
+    cpu.DestroyQueue(cq);
+  }
+
+  // ASSERTION 2, unconditional on a ROCm build and NOT `if (!OpAvailable)
+  // continue`. A missing registration is the defect under test: the portable
+  // reference tier computes the SAME answer as a native kernel, so assertion (1)
+  // alone is green with no kernel at all.
+  const bool rocm_built = [&] {
+    for (DeviceType dt : RegisteredDevices())
+      if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (rocm_built) {
+    CHECK(vt::OpRegistered(vt::OpId::kKdaGatedDeltaRule, DeviceType::kROCM));
+  }
+
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!OpAvailable(vt::OpId::kKdaGatedDeltaRule, dt)) continue;
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+    DevBuf dq(dev, q, qkn), dk(dev, q, qkn), dv(dev, q, vn), dg(dev, q, ggn),
+        db(dev, q, gbn), dout(dev, q, vn), dst(dev, q, stn);
+    DevBufI32 dqsl(dev, q, N + 1);
+    dq.Upload(qin);
+    dk.Upload(kin);
+    dv.Upload(vin);
+    dg.Upload(gin);
+    db.Upload(bin);
+    dst.Upload(std::vector<float>(stn, 0.0f));
+    dqsl.Upload(qsl);
+    Tensor tq = Tensor::Contiguous(dq.ptr(), DType::kF32, d, {T, HK, DK});
+    Tensor tk = Tensor::Contiguous(dk.ptr(), DType::kF32, d, {T, HK, DK});
+    Tensor tv = Tensor::Contiguous(dv.ptr(), DType::kF32, d, {T, HV, DV});
+    Tensor tg = Tensor::Contiguous(dg.ptr(), DType::kF32, d, {T, HV, DK});
+    Tensor tb = T2(db.ptr(), d, T, HV);
+    Tensor tst = Tensor::Contiguous(dst.ptr(), DType::kF32, d, {N, HV, DV, DK});
+    Tensor tqsl = TI32(dqsl.ptr(), d, N + 1);
+    Tensor tout = Tensor::Contiguous(dout.ptr(), DType::kF32, d, {T, HV, DV});
+    // ASSERTION 3. OpRegistered says a native provider EXISTS; this says the
+    // call did not fall through to the tier anyway.
+    const unsigned long long hits_before = vt::GetReferenceTierHits();
+    vt::KdaGatedDeltaRule(q, tout, tq, tk, tv, tg, tb, tst, tqsl, ga);
+    dev.Synchronize(q);
+    CHECK(vt::GetReferenceTierHits() == hits_before);
+    // ASSERTION 1. Green with no kernel at all — never read it alone.
+    CHECK(Nmse(ref_out, dout.Download()) <= kNmseTol);
+    CHECK(Nmse(ref_st, dst.Download()) <= kNmseTol);
+    dev.DestroyQueue(q);
+  }
+}
+
+
 TEST_CASE("RmsNormGated and SigmoidGate match the CPU oracle") {
   // §5. RmsNormGated: NMSE (rms reduction + gate activation), both gate
   // activations, and BOTH gate layouts — contiguous rank-2 and the padded-row
@@ -2664,6 +2759,8 @@ TEST_CASE("keep-quant Q6_K GEMM runs at the production launch geometry") {
 namespace vt::rocm {
 int KQuantDecodeCoopWarps(vt::DType wdt, int64_t m, int64_t nsb);
 uint64_t KQuantCoopDispatchCount();
+uint64_t KQuantWmmaDispatchCount();
+uint64_t KQuantWmmaQ4KDispatchCount();
 void Q8KQuantizeForTest(vt::Queue& q, void* scratch, const void* act, vt::DType dtype,
                         int64_t row_stride, int64_t rows, int64_t nsb, bool candidate);
 bool Q8KCandidateSelectedForTest(const char* env_value, bool gfx1100_default_accepted,
@@ -3296,6 +3393,411 @@ TEST_CASE("ROCm Q6_K decode spreads one row's superblocks over several warps") {
     }
   }
 }
+
+// KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4 (issue #2109), W1: the RDNA4 WMMA int8
+// tile arm of the Q6_K prefill GEMM. Runs ONLY on gfx1200/gfx1201 — every
+// other ROCm target keeps the scalar arm the case above already covers, so
+// this returns early rather than skip-reporting on hardware it does not
+// target (`GcnArchNameIsGfx12PrefillWmma` is the same host gate the kernel's
+// own dispatch decision uses, per `include/vt/rocm/rocm_arch.h`).
+TEST_CASE("keep-quant Q6_K WMMA tile arm matches the CPU oracle on RDNA4") {
+  const bool rocm_registered = [] {
+    for (DeviceType dt : RegisteredDevices())
+      if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (!rocm_registered) return;
+  REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM));
+
+  const std::string actual_arch = vt::rocm::DeviceArchName(0);
+  if (!vt::rocm::GcnArchNameIsGfx12PrefillWmma(actual_arch)) return;
+
+  // Tile-aligned M and N (both multiples of 16, and not equal, so the grid
+  // exercises a non-square m_tiles x n_tiles), K spanning more than one
+  // superblock so the per-superblock scale reset is exercised more than once.
+  constexpr int64_t M = 32, N = 48, K = 512;
+  constexpr int64_t kBlockBytes = 210;  // sizeof(BlockQ6_K)
+  constexpr int kDOff = 208;            // the superblock scale's byte offset
+  const int64_t nsb = K / vt::cpu::kQK_K;
+  REQUIRE(nsb == 2);
+  const size_t row_bytes = static_cast<size_t>(nsb) * kBlockBytes;
+  const size_t wn = static_cast<size_t>(N) * row_bytes;
+
+  std::mt19937 rng(2109);
+  std::vector<uint8_t> wt(wn);
+  for (uint8_t& b : wt) b = static_cast<uint8_t>(rng() & 0xFF);
+  for (int64_t r = 0; r < N; ++r)
+    for (int64_t bIdx = 0; bIdx < nsb; ++bIdx) {
+      uint8_t* blk = wt.data() + r * row_bytes + bIdx * kBlockBytes;
+      const float jitter = 1.0f + 0.05f * static_cast<float>((r + bIdx) % 7);
+      const uint16_t h = vt::F32ToF16(0.0125f * jitter);
+      std::memcpy(blk + kDOff, &h, 2);
+    }
+
+  const size_t an = static_cast<size_t>(M) * K, on = static_cast<size_t>(M) * N;
+  const std::vector<float> act = RandomVec(an, 2110, -0.5f, 0.5f);
+
+  std::vector<float> ref(on, 0.0f);
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> ca = act;
+    std::vector<uint8_t> cw = wt;
+    Tensor tout = T2(ref.data(), cd, M, N);
+    Tensor tact = T2(ca.data(), cd, M, K);
+    Tensor twt = Tensor::Contiguous(cw.data(), vt::DType::kQ6_K, cd, {N, K});
+    vt::MatmulBTQuant(cq, tout, tact, twt);
+    cpu.DestroyQueue(cq);
+  }
+
+  vt::Backend& rocm = vt::GetBackend(DeviceType::kROCM);
+  Queue q = rocm.CreateQueue();
+  const Device d{DeviceType::kROCM, 0};
+  DevBuf da(rocm, q, an);
+  DevBufBytes dwt(rocm, q, wn);
+  da.Upload(act);
+  dwt.Upload(wt.data());
+  Tensor tact = T2(da.ptr(), d, M, K);
+  Tensor twt = Tensor::Contiguous(dwt.ptr(), vt::DType::kQ6_K, d, {N, K});
+
+  // f32 and bf16 OutT are two different template instantiations of the
+  // kernel; both must be reached and both must match the oracle.
+  for (bool bf16_out : {false, true}) {
+    CAPTURE(bf16_out);
+    const uint64_t wmma_before = vt::rocm::KQuantWmmaDispatchCount();
+    if (!bf16_out) {
+      DevBuf dout(rocm, q, on);
+      Tensor tout = T2(dout.ptr(), d, M, N);
+      vt::MatmulBTQuant(q, tout, tact, twt);
+      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+    } else {
+      DevBufBytes dout(rocm, q, on * sizeof(uint16_t));
+      Tensor tout = Tensor::Contiguous(dout.ptr(), DType::kBF16, d, {M, N});
+      vt::MatmulBTQuant(q, tout, tact, twt);
+      std::vector<uint16_t> got(on);
+      dout.Download(got.data());
+      std::vector<float> gotf(on);
+      for (size_t i = 0; i < on; ++i) gotf[i] = vt::BF16ToF32(got[i]);
+      CHECK(Nmse(ref, gotf) <= kNmseTol);
+    }
+    const uint64_t wmma_after = vt::rocm::KQuantWmmaDispatchCount();
+    // Reachability (AGENTS.md "Nothing lands dead"): deleting the WMMA launch
+    // site's call in a scratch copy leaves this counter flat and reds this
+    // case, which the NMSE checks above cannot do on their own — the scalar
+    // fallback would still pass them.
+    CHECK(wmma_after > wmma_before);
+  }
+  rocm.DestroyQueue(q);
+}
+
+// Same row, Q4_K arm (issue #2109's `## Owed`, landed in a follow-up wave):
+// Q4_K's scale granularity is 32-wide, twice the 16-wide WMMA K-tile, and it
+// carries a second per-sub-block correction (`dmin * sumi`) Q6_K has no
+// equivalent of, so this is not just the Q6_K case with a different dtype —
+// it exercises a materially different code path in `KQuantGemmKWmmaQ4K`.
+TEST_CASE("keep-quant Q4_K WMMA tile arm matches the CPU oracle on RDNA4") {
+  const bool rocm_registered = [] {
+    for (DeviceType dt : RegisteredDevices())
+      if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (!rocm_registered) return;
+  REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM));
+
+  const std::string actual_arch = vt::rocm::DeviceArchName(0);
+  if (!vt::rocm::GcnArchNameIsGfx12PrefillWmma(actual_arch)) return;
+
+  constexpr int64_t M = 32, N = 48, K = 512;
+  constexpr int64_t kBlockBytes = 144;  // sizeof(BlockQ4_K)
+  constexpr int kDOff = 0, kDminOff = 2;
+  const int64_t nsb = K / vt::cpu::kQK_K;
+  REQUIRE(nsb == 2);
+  const size_t row_bytes = static_cast<size_t>(nsb) * kBlockBytes;
+  const size_t wn = static_cast<size_t>(N) * row_bytes;
+
+  std::mt19937 rng(2412);
+  std::vector<uint8_t> wt(wn);
+  for (uint8_t& b : wt) b = static_cast<uint8_t>(rng() & 0xFF);
+  for (int64_t r = 0; r < N; ++r)
+    for (int64_t bIdx = 0; bIdx < nsb; ++bIdx) {
+      uint8_t* blk = wt.data() + r * row_bytes + bIdx * kBlockBytes;
+      const float jitter = 1.0f + 0.05f * static_cast<float>((r + bIdx) % 7);
+      auto put16 = [&](int off, float v) {
+        const uint16_t h = vt::F32ToF16(v);
+        std::memcpy(blk + off, &h, 2);
+      };
+      put16(kDOff, 0.0125f * jitter);
+      put16(kDminOff, 0.0075f * jitter);
+    }
+
+  const size_t an = static_cast<size_t>(M) * K, on = static_cast<size_t>(M) * N;
+  const std::vector<float> act = RandomVec(an, 2413, -0.5f, 0.5f);
+
+  std::vector<float> ref(on, 0.0f);
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> ca = act;
+    std::vector<uint8_t> cw = wt;
+    Tensor tout = T2(ref.data(), cd, M, N);
+    Tensor tact = T2(ca.data(), cd, M, K);
+    Tensor twt = Tensor::Contiguous(cw.data(), vt::DType::kQ4_K, cd, {N, K});
+    vt::MatmulBTQuant(cq, tout, tact, twt);
+    cpu.DestroyQueue(cq);
+  }
+
+  vt::Backend& rocm = vt::GetBackend(DeviceType::kROCM);
+  Queue q = rocm.CreateQueue();
+  const Device d{DeviceType::kROCM, 0};
+  DevBuf da(rocm, q, an);
+  DevBufBytes dwt(rocm, q, wn);
+  da.Upload(act);
+  dwt.Upload(wt.data());
+  Tensor tact = T2(da.ptr(), d, M, K);
+  Tensor twt = Tensor::Contiguous(dwt.ptr(), vt::DType::kQ4_K, d, {N, K});
+
+  for (bool bf16_out : {false, true}) {
+    CAPTURE(bf16_out);
+    const uint64_t wmma_before = vt::rocm::KQuantWmmaQ4KDispatchCount();
+    if (!bf16_out) {
+      DevBuf dout(rocm, q, on);
+      Tensor tout = T2(dout.ptr(), d, M, N);
+      vt::MatmulBTQuant(q, tout, tact, twt);
+      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+    } else {
+      DevBufBytes dout(rocm, q, on * sizeof(uint16_t));
+      Tensor tout = Tensor::Contiguous(dout.ptr(), DType::kBF16, d, {M, N});
+      vt::MatmulBTQuant(q, tout, tact, twt);
+      std::vector<uint16_t> got(on);
+      dout.Download(got.data());
+      std::vector<float> gotf(on);
+      for (size_t i = 0; i < on; ++i) gotf[i] = vt::BF16ToF32(got[i]);
+      CHECK(Nmse(ref, gotf) <= kNmseTol);
+    }
+    const uint64_t wmma_after = vt::rocm::KQuantWmmaQ4KDispatchCount();
+    CHECK(wmma_after > wmma_before);
+  }
+  rocm.DestroyQueue(q);
+}
+
+// The M/N tail (KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4's `## Owed`, closed in a
+// follow-up wave): a real prompt is essentially never a multiple of 16, and
+// the WMMA arm used to require EXACT alignment on both M and N, so it fell
+// back to scalar for the whole call whenever either dimension had a
+// remainder — losing the row's entire benefit on the common case, not just
+// the ragged edge. M=37, N=50 are chosen so NEITHER dimension is aligned
+// (floor(37/16)=32, floor(50/16)=48), exercising the WMMA corner, the
+// bottom-row remainder, and the right-column remainder all in one case.
+TEST_CASE("keep-quant GEMM matches the CPU oracle when M and N are not multiples of 16") {
+  const bool rocm_registered = [] {
+    for (DeviceType dt : RegisteredDevices())
+      if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (!rocm_registered) return;
+  REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM));
+
+  const std::string actual_arch = vt::rocm::DeviceArchName(0);
+  if (!vt::rocm::GcnArchNameIsGfx12PrefillWmma(actual_arch)) return;
+
+  constexpr int64_t M = 37, N = 50, K = 512;
+  struct Fmt {
+    vt::DType dt;
+    int64_t block_bytes;
+    int d_off, dmin_off;
+    const char* name;
+  };
+  const Fmt fmts[] = {
+      {vt::DType::kQ6_K, 210, 208, -1, "q6_K"},
+      {vt::DType::kQ4_K, 144, 0, 2, "q4_K"},
+  };
+  const int64_t nsb = K / vt::cpu::kQK_K;
+  REQUIRE(nsb == 2);
+
+  for (const Fmt& f : fmts) {
+    CAPTURE(std::string(f.name));
+    const size_t row_bytes = static_cast<size_t>(nsb) * f.block_bytes;
+    const size_t wn = static_cast<size_t>(N) * row_bytes;
+
+    std::mt19937 rng(3716);
+    std::vector<uint8_t> wt(wn);
+    for (uint8_t& b : wt) b = static_cast<uint8_t>(rng() & 0xFF);
+    for (int64_t r = 0; r < N; ++r)
+      for (int64_t bIdx = 0; bIdx < nsb; ++bIdx) {
+        uint8_t* blk = wt.data() + r * row_bytes + bIdx * f.block_bytes;
+        const float jitter = 1.0f + 0.05f * static_cast<float>((r + bIdx) % 7);
+        auto put16 = [&](int off, float v) {
+          const uint16_t h = vt::F32ToF16(v);
+          std::memcpy(blk + off, &h, 2);
+        };
+        put16(f.d_off, 0.0125f * jitter);
+        if (f.dmin_off >= 0) put16(f.dmin_off, 0.0075f * jitter);
+      }
+
+    const size_t an = static_cast<size_t>(M) * K, on = static_cast<size_t>(M) * N;
+    const std::vector<float> act = RandomVec(an, 3717, -0.5f, 0.5f);
+
+    std::vector<float> ref(on, 0.0f);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> ca = act;
+      std::vector<uint8_t> cw = wt;
+      Tensor tout = T2(ref.data(), cd, M, N);
+      Tensor tact = T2(ca.data(), cd, M, K);
+      Tensor twt = Tensor::Contiguous(cw.data(), f.dt, cd, {N, K});
+      vt::MatmulBTQuant(cq, tout, tact, twt);
+      cpu.DestroyQueue(cq);
+    }
+
+    vt::Backend& rocm = vt::GetBackend(DeviceType::kROCM);
+    Queue q = rocm.CreateQueue();
+    const Device d{DeviceType::kROCM, 0};
+    DevBuf da(rocm, q, an);
+    DevBufBytes dwt(rocm, q, wn);
+    da.Upload(act);
+    dwt.Upload(wt.data());
+    Tensor tact = T2(da.ptr(), d, M, K);
+    Tensor twt = Tensor::Contiguous(dwt.ptr(), f.dt, d, {N, K});
+
+    const uint64_t wmma_before = f.dt == vt::DType::kQ6_K
+                                     ? vt::rocm::KQuantWmmaDispatchCount()
+                                     : vt::rocm::KQuantWmmaQ4KDispatchCount();
+    DevBuf dout(rocm, q, on);
+    Tensor tout = T2(dout.ptr(), d, M, N);
+    vt::MatmulBTQuant(q, tout, tact, twt);
+    CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+    const uint64_t wmma_after = f.dt == vt::DType::kQ6_K
+                                    ? vt::rocm::KQuantWmmaDispatchCount()
+                                    : vt::rocm::KQuantWmmaQ4KDispatchCount();
+    // Reachability: the WMMA arm must still fire for its floor(M/16)x
+    // floor(N/16) corner even though the full shape is not aligned — a
+    // silent full fallback to scalar would pass the NMSE check above just
+    // as well, which is exactly why #2109's own real-model measurement
+    // needed a hand-trimmed prompt before this fix.
+    CHECK(wmma_after > wmma_before);
+    rocm.DestroyQueue(q);
+  }
+}
+
+// The M=37/N=50 case above misaligns BOTH dimensions at once, which exercises
+// the WMMA corner, the bottom-row remainder, and the right-column remainder
+// together but never isolates one remainder shape from the other. An
+// independent review of this row found the tail-fill launch's host-side grid
+// still sized to the FULL m*n domain (relying on a skip guard rather than
+// enumerating only the remainder), which the M=37/N=50 case cannot catch
+// either way since it only asserts correctness, not launch geometry — a
+// bug in an "only M has a remainder" or "only N has a remainder" split
+// specifically (for example an off-by-one at the boundary between the
+// bottom strip and the right strip) could still pass that combined case by
+// coincidence. These two shapes isolate each split on its own: M=37/N=48
+// has a bottom-strip-only remainder (N is an exact multiple of 16, so
+// right_strip == 0), and M=32/N=50 has a right-strip-only remainder (M is
+// an exact multiple of 16, so bottom_strip == 0).
+TEST_CASE("keep-quant GEMM matches the CPU oracle when only one of M/N is misaligned") {
+  const bool rocm_registered = [] {
+    for (DeviceType dt : RegisteredDevices())
+      if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (!rocm_registered) return;
+  REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM));
+
+  const std::string actual_arch = vt::rocm::DeviceArchName(0);
+  if (!vt::rocm::GcnArchNameIsGfx12PrefillWmma(actual_arch)) return;
+
+  constexpr int64_t K = 512;
+  struct Fmt {
+    vt::DType dt;
+    int64_t block_bytes;
+    int d_off, dmin_off;
+    const char* name;
+  };
+  const Fmt fmts[] = {
+      {vt::DType::kQ6_K, 210, 208, -1, "q6_K"},
+      {vt::DType::kQ4_K, 144, 0, 2, "q4_K"},
+  };
+  struct Shape {
+    int64_t m, n;
+    const char* label;
+  };
+  const Shape shapes[] = {
+      {37, 48, "M misaligned, N aligned (bottom-strip-only remainder)"},
+      {32, 50, "N misaligned, M aligned (right-strip-only remainder)"},
+  };
+  const int64_t nsb = K / vt::cpu::kQK_K;
+  REQUIRE(nsb == 2);
+
+  for (const Shape& shape : shapes) {
+    CAPTURE(std::string(shape.label));
+    const int64_t M = shape.m, N = shape.n;
+    for (const Fmt& f : fmts) {
+      CAPTURE(std::string(f.name));
+      const size_t row_bytes = static_cast<size_t>(nsb) * f.block_bytes;
+      const size_t wn = static_cast<size_t>(N) * row_bytes;
+
+      std::mt19937 rng(4827);
+      std::vector<uint8_t> wt(wn);
+      for (uint8_t& b : wt) b = static_cast<uint8_t>(rng() & 0xFF);
+      for (int64_t r = 0; r < N; ++r)
+        for (int64_t bIdx = 0; bIdx < nsb; ++bIdx) {
+          uint8_t* blk = wt.data() + r * row_bytes + bIdx * f.block_bytes;
+          const float jitter = 1.0f + 0.05f * static_cast<float>((r + bIdx) % 7);
+          auto put16 = [&](int off, float v) {
+            const uint16_t h = vt::F32ToF16(v);
+            std::memcpy(blk + off, &h, 2);
+          };
+          put16(f.d_off, 0.0125f * jitter);
+          if (f.dmin_off >= 0) put16(f.dmin_off, 0.0075f * jitter);
+        }
+
+      const size_t an = static_cast<size_t>(M) * K, on = static_cast<size_t>(M) * N;
+      const std::vector<float> act = RandomVec(an, 4828, -0.5f, 0.5f);
+
+      std::vector<float> ref(on, 0.0f);
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<float> ca = act;
+        std::vector<uint8_t> cw = wt;
+        Tensor tout = T2(ref.data(), cd, M, N);
+        Tensor tact = T2(ca.data(), cd, M, K);
+        Tensor twt = Tensor::Contiguous(cw.data(), f.dt, cd, {N, K});
+        vt::MatmulBTQuant(cq, tout, tact, twt);
+        cpu.DestroyQueue(cq);
+      }
+
+      vt::Backend& rocm = vt::GetBackend(DeviceType::kROCM);
+      Queue q = rocm.CreateQueue();
+      const Device d{DeviceType::kROCM, 0};
+      DevBuf da(rocm, q, an);
+      DevBufBytes dwt(rocm, q, wn);
+      da.Upload(act);
+      dwt.Upload(wt.data());
+      Tensor tact = T2(da.ptr(), d, M, K);
+      Tensor twt = Tensor::Contiguous(dwt.ptr(), f.dt, d, {N, K});
+
+      const uint64_t wmma_before = f.dt == vt::DType::kQ6_K
+                                       ? vt::rocm::KQuantWmmaDispatchCount()
+                                       : vt::rocm::KQuantWmmaQ4KDispatchCount();
+      DevBuf dout(rocm, q, on);
+      Tensor tout = T2(dout.ptr(), d, M, N);
+      vt::MatmulBTQuant(q, tout, tact, twt);
+      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+      const uint64_t wmma_after = f.dt == vt::DType::kQ6_K
+                                      ? vt::rocm::KQuantWmmaDispatchCount()
+                                      : vt::rocm::KQuantWmmaQ4KDispatchCount();
+      // Reachability: the WMMA arm must still fire for its aligned corner
+      // even though one dimension is a remainder-only split.
+      CHECK(wmma_after > wmma_before);
+      rocm.DestroyQueue(q);
+    }
+  }
+}
 #endif  // VLLM_CPP_HIP
 
 TEST_CASE("grouped quant expert GEMM (Q8_0/Q4_K/Q6_K) matches the CPU oracle") {
@@ -3384,6 +3886,170 @@ TEST_CASE("grouped quant expert GEMM (Q8_0/Q4_K/Q6_K) matches the CPU oracle") {
       vt::MatmulBTQuantGrouped(q, tout, tact, twt, te);
       CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
       dev.DestroyQueue(q);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GLM-5.3-Flash on ROCm (BACKEND-ROCM, #2942). The ONE op the Flash forward asks
+// the op table for and does not get on a ROCm queue.
+//
+// READ THIS BEFORE LOOSENING ANY ASSERTION HERE, and read the note at the MLA
+// registration case below for the general form of the trap. The portable
+// reference tier computes the SAME ANSWER as a native kernel — it IS this
+// oracle, running on the host against device memory the backend reports
+// host-addressable. So assertion (1) alone is GREEN on a backend with no kernel
+// at all. Assertion (2) is `vt::OpRegistered`, a NATIVE-ONLY probe by design
+// (src/vt/op_provider.cpp:801-825), and it is the only one of the three that can
+// tell a native kernel from the tier. Assertion (3) catches the same thing from
+// the other side, by counting.
+//
+// `glm5_next_forward.cpp:307-310` reads BOTH kMoeGateUpSwiGLUGrouped and
+// kMatmulBTQuantGrouped through `vt::OpRegistered` before it builds an operand,
+// and refuses the device when either is false. ROCm has had the second since
+// `rocm_ops.hip:261`; this case covers the first.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("fused MoE gate+up+SwiGLU grouped GEMM matches the CPU oracle and is NATIVE on ROCm") {
+  // The CPU golden (cpu_quant_gemm.cpp:282-299) is the composite this op is
+  // DEFINED against: two grouped keep-quant GEMMs into f32 temporaries, then
+  //   gate = min(g, limit); up = clamp(u, ±limit); out = gate·sigmoid(gate)·up
+  // with no extra scale, because the grouped GEMM already folded the weight
+  // FinalFactor into g and u. Fixture, block builders and tolerance are the
+  // kMatmulBTQuantGrouped case's above — the same shape, so a divergence here is
+  // the epilogue and not the GEMM.
+  constexpr int64_t P = 3, N = 8, K = 512;      // K%256==0 (K-quant superblocks)
+  constexpr int64_t E = 4;                       // experts
+  const std::vector<int32_t> eids = {2, 0, 3};   // routed experts (non-sorted)
+
+  struct Fmt { vt::DType dt; int64_t block_bytes; int d_off; int dmin_off; const char* name; };
+  const Fmt fmts[] = {
+    {vt::DType::kQ8_0, 34, 0, -1, "q8_0"},
+    {vt::DType::kQ4_K, 144, 0, 2, "q4_K"},
+    {vt::DType::kQ6_K, 210, 208, -1, "q6_K"},
+    {vt::DType::kQ5_K, 176, 0, 2, "q5_K"},
+  };
+
+  const bool rocm_built = [&] {
+    for (DeviceType dt : RegisteredDevices()) if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  // ASSERTION 2, and it is NOT `if (!OpAvailable) continue`. The harness header
+  // says a device that has not registered an op is SKIPPED rather than failed,
+  // and that is right for a partial backend in general — but here the missing
+  // registration IS the defect under test: it is what makes
+  // `glm5_next_forward.cpp:315-327` refuse a ROCm queue by name.
+  if (rocm_built) {
+    CHECK(vt::OpRegistered(vt::OpId::kMoeGateUpSwiGLUGrouped, DeviceType::kROCM));
+    // Its partner, already landed. Asserted beside it because the forward reads
+    // the PAIR and half the pair is not half the capability.
+    CHECK(vt::OpRegistered(vt::OpId::kMatmulBTQuantGrouped, DeviceType::kROCM));
+  }
+
+  // Both limits, because the finite one is the arm a naive port drops: with
+  // limit=+inf the two clamps are no-ops and out == silu(g)·u, so an epilogue
+  // that forgot them entirely would still be green.
+  const float limits[] = {std::numeric_limits<float>::infinity(), 1.5f};
+
+  for (const Fmt& f : fmts) {
+    // As std::string: doctest stringifies a bare `const char*` as `1`, so the
+    // capture in the case above cannot name the format that failed.
+    CAPTURE(std::string(f.name));
+    const int64_t elems_per_block = (f.dt == vt::DType::kQ8_0) ? 32 : 256;
+    const int64_t blocks_per_row = K / elems_per_block;
+    const size_t row_bytes = static_cast<size_t>(blocks_per_row) * f.block_bytes;
+    const size_t wn = static_cast<size_t>(E) * N * row_bytes;
+
+    // Two INDEPENDENT weight banks. Same bytes in both would make a swapped
+    // gate_w/up_w argument order invisible, and the clamp is asymmetric
+    // (min on gate, ±clamp on up), so the swap is a real defect this catches.
+    auto build_bank = [&](uint32_t seed, float base_d, float base_dmin) {
+      std::mt19937 rng(seed);
+      std::vector<uint8_t> w(wn);
+      for (uint8_t& b : w) b = static_cast<uint8_t>(rng() & 0xFF);
+      for (int64_t r = 0; r < E * N; ++r)
+        for (int64_t bIdx = 0; bIdx < blocks_per_row; ++bIdx) {
+          uint8_t* blk = w.data() + r * row_bytes + bIdx * f.block_bytes;
+          const float jitter = 1.0f + 0.05f * static_cast<float>((r + bIdx) % 7);
+          auto put16 = [&](int off, float v) {
+            uint16_t h = vt::F32ToF16(v); std::memcpy(blk + off, &h, 2);
+          };
+          if (f.d_off >= 0) put16(f.d_off, base_d * jitter);
+          if (f.dmin_off >= 0) put16(f.dmin_off, base_dmin * jitter);
+        }
+      return w;
+    };
+    const std::vector<uint8_t> gate_wt = build_bank(901, 0.0125f, 0.0075f);
+    const std::vector<uint8_t> up_wt = build_bank(902, 0.0110f, 0.0060f);
+
+    const size_t an = static_cast<size_t>(P) * K, on = static_cast<size_t>(P) * N;
+    const std::vector<float> act = RandomVec(an, 903, -0.5f, 0.5f);
+
+    // Filled by the first (infinite) limit and compared against by the second,
+    // so the finite arm can prove it actually clamped.
+    std::vector<float> ref_unclamped;
+    for (float limit : limits) {
+      CAPTURE(limit);
+      std::vector<float> ref(on, 0.0f);
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<float> ca = act;
+        std::vector<uint8_t> cg = gate_wt, cu = up_wt;
+        std::vector<int32_t> ce = eids;
+        Tensor tout = T2(ref.data(), cd, P, N);
+        Tensor tact = T2(ca.data(), cd, P, K);
+        Tensor tg = Tensor::Contiguous(cg.data(), f.dt, cd, {E * N, K});
+        Tensor tu = Tensor::Contiguous(cu.data(), f.dt, cd, {E * N, K});
+        Tensor te = TI32(ce.data(), cd, P);
+        vt::MoeGateUpSwiGLUGrouped(cq, tout, tact, tg, tu, te, limit);
+        cpu.DestroyQueue(cq);
+      }
+      // The finite-limit arm must actually CLAMP something, or it is the
+      // infinite arm again under another name and the clamp stays untested
+      // while reading green. Proved by DIFFERENCE against the infinite arm on
+      // the same inputs, not by "the output is non-zero".
+      if (!std::isfinite(limit)) {
+        ref_unclamped = ref;
+      } else {
+        REQUIRE(ref_unclamped.size() == ref.size());
+        bool clamp_bit_moved = false;
+        for (size_t i = 0; i < ref.size(); ++i)
+          if (ref[i] != ref_unclamped[i]) clamp_bit_moved = true;
+        REQUIRE(clamp_bit_moved);
+      }
+
+      for (DeviceType dt : RegisteredDevices()) {
+        if (!OpAvailable(vt::OpId::kMoeGateUpSwiGLUGrouped, dt)) continue;
+        CAPTURE(DeviceName(dt));
+        vt::Backend& dev = vt::GetBackend(dt);
+        Queue q = dev.CreateQueue();
+        const Device d{dt, 0};
+        DevBuf da(dev, q, an);
+        DevBufBytes dg(dev, q, wn);
+        DevBufBytes du(dev, q, wn);
+        DevBufI32 de(dev, q, P);
+        DevBuf dout(dev, q, on);
+        da.Upload(act);
+        dg.Upload(gate_wt.data());
+        du.Upload(up_wt.data());
+        de.Upload(eids);
+        Tensor tact = T2(da.ptr(), d, P, K);
+        Tensor tg = Tensor::Contiguous(dg.ptr(), f.dt, d, {E * N, K});
+        Tensor tu = Tensor::Contiguous(du.ptr(), f.dt, d, {E * N, K});
+        Tensor te = TI32(de.ptr(), d, P);
+        Tensor tout = T2(dout.ptr(), d, P, N);
+        // ASSERTION 3. `OpRegistered` says a native provider EXISTS; this says
+        // the call did not fall through to the tier anyway.
+        const unsigned long long hits_before = vt::GetReferenceTierHits();
+        vt::MoeGateUpSwiGLUGrouped(q, tout, tact, tg, tu, te, limit);
+        dev.Synchronize(q);
+        CHECK(vt::GetReferenceTierHits() == hits_before);
+        // ASSERTION 1. Green with no kernel at all — never read it alone.
+        CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+        dev.DestroyQueue(q);
+      }
     }
   }
 }

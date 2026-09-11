@@ -64,3 +64,437 @@ RESULT OURS-r2-c4 client rc=0
 RESULT OURS-r2-c1 client rc=0
 RESULT THEIRS server pid=19577
 RESULT THEIRS ready after 18s
+RESULT DEVICE NVIDIA GB10, 12.1, 580.173.02, [N/A]
+RESULT ARCH aarch64  KERNEL 6.17.0-1029-nvidia  BOOT d9cad4a9-af0b-470d-90ee-30c02de364bd
+RESULT LEASE_ID=493d6c72-1ff0-4362-bde4-1a1887edaf9a
+RESULT SCRATCH_FREE_GiB 1942
+RESULT LOAD 1.46 1.82 1.97 2/904 25283
+RESULT APT_UPDATE_RC=0
+RESULT DEPS_RC=0
+RESULT NVCC=13.0
+RESULT CORPUS rc=0
+RESULT CORPUS sha256 6d6420fc4c0a55019dc24da3dd5b410e2743a6b268f2ee2fb2c89ae21d3cfc5e
+RESULT CORPUS_SOURCE gsm8k      3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14
+RESULT CORPUS_SOURCE humaneval  1d49078ba3e2b196b9344535bef34a43021f038fad9561d6ee7c53450609a6a2
+RESULT CORPUS_SOURCE sonnet     d58663195ba6780da5f029b920c7ac00cad1e435ee1df7e03bf9ec2470f8dea4
+RESULT CORPUS_BAND L   n=22  chars min=2634 p50=3361 max=4186
+RESULT CORPUS_BAND M   n=58  chars min=133 p50=392 max=1360
+RESULT CORPUS_BAND S   n=50  chars min=95 p50=223 max=475
+RESULT CORPUS_BAND XL  n=14  chars min=7217 p50=9572 max=10048
+RESULT COPY rc target=0 draft=0
+RESULT SHA target1 7b77214fe58ff15fed0b4af55e3cd92f38842b8711886d68954e8071ff8270c6
+RESULT SHA target2 411c83bb1070b27f3d670fc93e38dca0f17eb66429f64b5706901b12613188b2
+RESULT SHA draft   6b2e3afc694a343b7f3f0edfe5925e460762fc9ede4699165b577ca0733c8e56
+RESULT G-BYTES PASS: the bytes measured are the pinned artifact
+RESULT OURS TREE PIN 3351ec54f375c6934246520cac112a10d2fbee07
+RESULT SRC untar rc=0 (pin 3351ec54f375c6934246520cac112a10d2fbee07)
+RESULT SRCDIR /tmp/exl3variadic/src/vllmcpp
+RESULT OURS BUILD RECIPE: cmake -S /tmp/exl3variadic/src/vllmcpp -B /tmp/exl3variadic/build -G Ninja -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUTLASS_FETCH=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache && cmake --build /tmp/exl3variadic/build -j 4 --target vllm-server
+RESULT OURS cmake rc=0
+RESULT OURS build rc=0
+RESULT OURS binary /tmp/exl3variadic/bin/vllm-server md5=55fc66e0b378da8752caebd5d07a7ca0
+RESULT THEIRS source untar rc=0 sha256(tarball)=18b49d64e6a171bcbfd06bd02f139fc53189e04b5ff8f510a3afbd622dd372d4
+RESULT THEIRS harness patch rc=0
+RESULT THEIRS patched server compiles rc=0
+RESULT THEIRS venv rc=0
+RESULT THEIRS pip bootstrap rc=0
+RESULT THEIRS torch install rc=0
+RESULT THEIRS torch /tmp/exl3variadic/venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+RESULT THEIRS reusing cached wheel exllamav3-1.4.2-cp312-cp312-linux_aarch64.whl sha256=a24b224a7e143a5deb0e16c29c06ff7d3182ce3a831164e00adc376514c8dd7a
+RESULT THEIRS engine build+install rc=0
+RESULT THEIRS server deps rc=0
+RESULT THEIRS import check: AttributeError: module 'exllamav3' has no attribute '__version__'
+RESULT PAGED PROBE resumed: PAGED_ENV='shipped default'
+RESULT PAGED ROUTE FOR EVERY LEG: 'shipped default (paged ON)'
+RESULT THEIRS round 1: every rung already recorded (resumed, server not started)
+RESULT OURS round 1: every rung already recorded (resumed, server not started)
+RESULT OURS round 2: every rung already recorded (resumed, server not started)
+RESULT THEIRS server pid=33460
+RESULT THEIRS ready after 64s
+RESULT THEIRS-r2-c8 CONFIG num_blocks=2048 max_model_len=8192 max_num_seqs=8 max_num_batched_tokens=16384 paged='shipped default'
+RESULT THEIRS-r2-c8 client rc=0
+RESULT THEIRS-r2-c4 CONFIG num_blocks=2048 max_model_len=8192 max_num_seqs=8 max_num_batched_tokens=16384 paged='shipped default'
+RESULT THEIRS-r2-c4 client rc=0
+RESULT THEIRS-r2-c1 CONFIG num_blocks=2048 max_model_len=8192 max_num_seqs=8 max_num_batched_tokens=16384 paged='shipped default'
+RESULT DEVICE NVIDIA GB10, 12.1, 580.173.02, [N/A]
+RESULT ARCH aarch64  KERNEL 6.17.0-1029-nvidia  BOOT 14944fc3-5071-4fbe-9920-ed87f11d6e25
+RESULT LEASE_ID=0d416c60-228b-4c05-9f57-4d255e8ff897
+RESULT SCRATCH_FREE_GiB 2050
+RESULT LOAD 0.87 0.57 0.29 1/838 275
+RESULT APT_UPDATE_RC=0
+RESULT DEPS_RC=0
+RESULT APT_CUDA_RC=0
+RESULT NVCC=13.0
+RESULT CORPUS rc=0
+RESULT CORPUS sha256 6d6420fc4c0a55019dc24da3dd5b410e2743a6b268f2ee2fb2c89ae21d3cfc5e
+RESULT CORPUS_SOURCE gsm8k      3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14
+RESULT CORPUS_SOURCE humaneval  1d49078ba3e2b196b9344535bef34a43021f038fad9561d6ee7c53450609a6a2
+RESULT CORPUS_SOURCE sonnet     d58663195ba6780da5f029b920c7ac00cad1e435ee1df7e03bf9ec2470f8dea4
+RESULT CORPUS_BAND L   n=22  chars min=2634 p50=3361 max=4186
+RESULT CORPUS_BAND M   n=58  chars min=133 p50=392 max=1360
+RESULT CORPUS_BAND S   n=50  chars min=95 p50=223 max=475
+RESULT CORPUS_BAND XL  n=14  chars min=7217 p50=9572 max=10048
+RESULT COPY rc target=0 draft=0
+RESULT SHA target1 7b77214fe58ff15fed0b4af55e3cd92f38842b8711886d68954e8071ff8270c6
+RESULT SHA target2 411c83bb1070b27f3d670fc93e38dca0f17eb66429f64b5706901b12613188b2
+RESULT SHA draft   6b2e3afc694a343b7f3f0edfe5925e460762fc9ede4699165b577ca0733c8e56
+RESULT G-BYTES PASS: the bytes measured are the pinned artifact
+RESULT OURS TREE PIN 3351ec54f375c6934246520cac112a10d2fbee07
+RESULT SRC untar rc=0 (pin 3351ec54f375c6934246520cac112a10d2fbee07)
+RESULT SRCDIR /tmp/exl3variadic/src/vllmcpp
+RESULT OURS BUILD RECIPE: cmake -S /tmp/exl3variadic/src/vllmcpp -B /tmp/exl3variadic/build -G Ninja -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUTLASS_FETCH=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache && cmake --build /tmp/exl3variadic/build -j 4 --target vllm-server
+RESULT OURS cmake rc=0
+RESULT OURS build rc=0
+RESULT OURS binary /tmp/exl3variadic/bin/vllm-server md5=a863b618b8f0fd239bf918afe68641b4
+RESULT THEIRS source untar rc=0 sha256(tarball)=18b49d64e6a171bcbfd06bd02f139fc53189e04b5ff8f510a3afbd622dd372d4
+RESULT THEIRS harness patch rc=0
+RESULT THEIRS patched server compiles rc=0
+RESULT THEIRS venv rc=0
+RESULT THEIRS pip bootstrap rc=0
+RESULT THEIRS torch install rc=0
+RESULT THEIRS torch /tmp/exl3variadic/venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+RESULT THEIRS reusing cached wheel exllamav3-1.4.2-cp312-cp312-linux_aarch64.whl sha256=a24b224a7e143a5deb0e16c29c06ff7d3182ce3a831164e00adc376514c8dd7a
+RESULT THEIRS engine build+install rc=0
+RESULT THEIRS server deps rc=0
+RESULT THEIRS import check: AttributeError: module 'exllamav3' has no attribute '__version__'
+RESULT PAGED PROBE resumed: PAGED_ENV='shipped default'
+RESULT PAGED ROUTE FOR EVERY LEG: 'shipped default (paged ON)'
+RESULT THEIRS round 1: every rung already recorded (resumed, server not started)
+RESULT OURS round 1: every rung already recorded (resumed, server not started)
+RESULT OURS round 2: every rung already recorded (resumed, server not started)
+RESULT THEIRS server pid=10484
+RESULT THEIRS ready after 62s
+RESULT THEIRS-r2-c1 CONFIG num_blocks=2048 max_model_len=8192 max_num_seqs=8 max_num_batched_tokens=16384 paged='shipped default'
+RESULT DEVICE NVIDIA GB10, 12.1, 580.173.02, [N/A]
+RESULT ARCH aarch64  KERNEL 6.17.0-1029-nvidia  BOOT 45baac41-7088-4352-86cb-eca568d3e517
+RESULT LEASE_ID=7cbb2904-4744-41ce-bde8-cd808861ef83
+RESULT SCRATCH_FREE_GiB 2005
+RESULT LOAD 1.46 1.26 0.67 1/861 273
+RESULT APT_UPDATE_RC=0
+RESULT DEPS_RC=0
+RESULT APT_CUDA_RC=0
+RESULT NVCC=13.0
+RESULT CORPUS rc=0
+RESULT CORPUS sha256 6d6420fc4c0a55019dc24da3dd5b410e2743a6b268f2ee2fb2c89ae21d3cfc5e
+RESULT CORPUS_SOURCE gsm8k      3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14
+RESULT CORPUS_SOURCE humaneval  1d49078ba3e2b196b9344535bef34a43021f038fad9561d6ee7c53450609a6a2
+RESULT CORPUS_SOURCE sonnet     d58663195ba6780da5f029b920c7ac00cad1e435ee1df7e03bf9ec2470f8dea4
+RESULT CORPUS_BAND L   n=22  chars min=2634 p50=3361 max=4186
+RESULT CORPUS_BAND M   n=58  chars min=133 p50=392 max=1360
+RESULT CORPUS_BAND S   n=50  chars min=95 p50=223 max=475
+RESULT CORPUS_BAND XL  n=14  chars min=7217 p50=9572 max=10048
+RESULT COPY rc target=0 draft=0
+RESULT SHA target1 7b77214fe58ff15fed0b4af55e3cd92f38842b8711886d68954e8071ff8270c6
+RESULT SHA target2 411c83bb1070b27f3d670fc93e38dca0f17eb66429f64b5706901b12613188b2
+RESULT SHA draft   6b2e3afc694a343b7f3f0edfe5925e460762fc9ede4699165b577ca0733c8e56
+RESULT G-BYTES PASS: the bytes measured are the pinned artifact
+RESULT OURS TREE PIN 3351ec54f375c6934246520cac112a10d2fbee07
+RESULT SRC untar rc=0 (pin 3351ec54f375c6934246520cac112a10d2fbee07)
+RESULT SRCDIR /tmp/exl3variadic/src/vllmcpp
+RESULT OURS BUILD RECIPE: cmake -S /tmp/exl3variadic/src/vllmcpp -B /tmp/exl3variadic/build -G Ninja -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUTLASS_FETCH=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache && cmake --build /tmp/exl3variadic/build -j 4 --target vllm-server
+RESULT OURS cmake rc=0
+RESULT OURS build rc=0
+RESULT OURS binary /tmp/exl3variadic/bin/vllm-server md5=1d7ba9a932ea1ca7bce23f138ea864e3
+RESULT THEIRS source untar rc=0 sha256(tarball)=18b49d64e6a171bcbfd06bd02f139fc53189e04b5ff8f510a3afbd622dd372d4
+RESULT THEIRS harness patch rc=0
+RESULT THEIRS patched server compiles rc=0
+RESULT THEIRS venv rc=0
+RESULT THEIRS pip bootstrap rc=0
+RESULT THEIRS torch install rc=0
+RESULT THEIRS torch /tmp/exl3variadic/venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+RESULT THEIRS reusing cached wheel exllamav3-1.4.2-cp312-cp312-linux_aarch64.whl sha256=a24b224a7e143a5deb0e16c29c06ff7d3182ce3a831164e00adc376514c8dd7a
+RESULT THEIRS engine build+install rc=0
+RESULT THEIRS server deps rc=0
+RESULT THEIRS import check: AttributeError: module 'exllamav3' has no attribute '__version__'
+RESULT PAGED PROBE resumed: PAGED_ENV='shipped default'
+RESULT PAGED ROUTE FOR EVERY LEG: 'shipped default (paged ON)'
+RESULT THEIRS round 1: every rung already recorded (resumed, server not started)
+RESULT OURS round 1: every rung already recorded (resumed, server not started)
+RESULT OURS round 2: every rung already recorded (resumed, server not started)
+RESULT THEIRS server pid=10477
+RESULT THEIRS ready after 62s
+RESULT THEIRS-r2-c1 CONFIG num_blocks=2048 max_model_len=8192 max_num_seqs=8 max_num_batched_tokens=16384 paged='shipped default'
+RESULT DEVICE NVIDIA GB10, 12.1, 580.173.02, [N/A]
+RESULT ARCH aarch64  KERNEL 6.17.0-1029-nvidia  BOOT 3720fed1-93ca-4890-99b1-107194646c6c
+RESULT LEASE_ID=59372f89-9dcd-4dba-8a66-45a2a7d3b485
+RESULT SCRATCH_FREE_GiB 2038
+RESULT LOAD 0.75 0.50 0.20 2/877 252
+RESULT APT_UPDATE_RC=0
+RESULT DEPS_RC=0
+RESULT APT_CUDA_RC=0
+RESULT NVCC=13.0
+RESULT CORPUS rc=0
+RESULT CORPUS sha256 6d6420fc4c0a55019dc24da3dd5b410e2743a6b268f2ee2fb2c89ae21d3cfc5e
+RESULT CORPUS_SOURCE gsm8k      3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14
+RESULT CORPUS_SOURCE humaneval  1d49078ba3e2b196b9344535bef34a43021f038fad9561d6ee7c53450609a6a2
+RESULT CORPUS_SOURCE sonnet     d58663195ba6780da5f029b920c7ac00cad1e435ee1df7e03bf9ec2470f8dea4
+RESULT CORPUS_BAND L   n=22  chars min=2634 p50=3361 max=4186
+RESULT CORPUS_BAND M   n=58  chars min=133 p50=392 max=1360
+RESULT CORPUS_BAND S   n=50  chars min=95 p50=223 max=475
+RESULT CORPUS_BAND XL  n=14  chars min=7217 p50=9572 max=10048
+RESULT COPY rc target=0 draft=0
+RESULT SHA target1 7b77214fe58ff15fed0b4af55e3cd92f38842b8711886d68954e8071ff8270c6
+RESULT SHA target2 411c83bb1070b27f3d670fc93e38dca0f17eb66429f64b5706901b12613188b2
+RESULT SHA draft   6b2e3afc694a343b7f3f0edfe5925e460762fc9ede4699165b577ca0733c8e56
+RESULT G-BYTES PASS: the bytes measured are the pinned artifact
+RESULT OURS TREE PIN 3351ec54f375c6934246520cac112a10d2fbee07
+RESULT SRC untar rc=0 (pin 3351ec54f375c6934246520cac112a10d2fbee07)
+RESULT SRCDIR /tmp/exl3variadic/src/vllmcpp
+RESULT OURS BUILD RECIPE: cmake -S /tmp/exl3variadic/src/vllmcpp -B /tmp/exl3variadic/build -G Ninja -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUTLASS_FETCH=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache && cmake --build /tmp/exl3variadic/build -j 4 --target vllm-server
+RESULT OURS cmake rc=0
+RESULT OURS build rc=0
+RESULT OURS binary /tmp/exl3variadic/bin/vllm-server md5=ca40681caa70ddf312b6e5006544179c
+RESULT THEIRS source untar rc=0 sha256(tarball)=18b49d64e6a171bcbfd06bd02f139fc53189e04b5ff8f510a3afbd622dd372d4
+RESULT THEIRS harness patch rc=0
+RESULT THEIRS patched server compiles rc=0
+RESULT THEIRS venv rc=0
+RESULT THEIRS pip bootstrap rc=0
+RESULT THEIRS torch install rc=0
+RESULT THEIRS torch /tmp/exl3variadic/venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+RESULT THEIRS reusing cached wheel exllamav3-1.4.2-cp312-cp312-linux_aarch64.whl sha256=a24b224a7e143a5deb0e16c29c06ff7d3182ce3a831164e00adc376514c8dd7a
+RESULT THEIRS engine build+install rc=0
+RESULT THEIRS server deps rc=0
+RESULT THEIRS import check: AttributeError: module 'exllamav3' has no attribute '__version__'
+RESULT PAGED PROBE resumed: PAGED_ENV='shipped default'
+RESULT PAGED ROUTE FOR EVERY LEG: 'shipped default (paged ON)'
+RESULT THEIRS round 1: every rung already recorded (resumed, server not started)
+RESULT OURS round 1: every rung already recorded (resumed, server not started)
+RESULT OURS round 2: every rung already recorded (resumed, server not started)
+RESULT THEIRS server pid=10586
+RESULT THEIRS ready after 62s
+RESULT THEIRS-r2-c8 already recorded (resumed)
+RESULT THEIRS-r2-c4 already recorded (resumed)
+RESULT THEIRS-r2-c1 CONFIG num_blocks=2048 max_model_len=8192 max_num_seqs=8 max_num_batched_tokens=16384 paged='shipped default'
+RESULT THEIRS-r2-c1 client rc=0
+RESULT DEVICE NVIDIA GB10, 12.1, 580.173.02, [N/A]
+RESULT ARCH aarch64  KERNEL 6.17.0-1029-nvidia  BOOT 3720fed1-93ca-4890-99b1-107194646c6c
+RESULT LEASE_ID=9170a7c2-4801-4305-8034-726853dde2a2
+RESULT SCRATCH_FREE_GiB 2004
+RESULT LOAD 0.69 0.66 0.64 1/863 11586
+RESULT APT_UPDATE_RC=0
+RESULT DEPS_RC=0
+RESULT NVCC=13.0
+RESULT CORPUS rc=0
+RESULT CORPUS sha256 6d6420fc4c0a55019dc24da3dd5b410e2743a6b268f2ee2fb2c89ae21d3cfc5e
+RESULT CORPUS_SOURCE gsm8k      3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14
+RESULT CORPUS_SOURCE humaneval  1d49078ba3e2b196b9344535bef34a43021f038fad9561d6ee7c53450609a6a2
+RESULT CORPUS_SOURCE sonnet     d58663195ba6780da5f029b920c7ac00cad1e435ee1df7e03bf9ec2470f8dea4
+RESULT CORPUS_BAND L   n=22  chars min=2634 p50=3361 max=4186
+RESULT CORPUS_BAND M   n=58  chars min=133 p50=392 max=1360
+RESULT CORPUS_BAND S   n=50  chars min=95 p50=223 max=475
+RESULT CORPUS_BAND XL  n=14  chars min=7217 p50=9572 max=10048
+RESULT WEIGHTS already staged in this boot (resumed)
+RESULT OURS TREE PIN 3351ec54f375c6934246520cac112a10d2fbee07
+RESULT SRCDIR /tmp/exl3variadic/src/vllmcpp
+RESULT OURS BUILD RECIPE: cmake -S /tmp/exl3variadic/src/vllmcpp -B /tmp/exl3variadic/build -G Ninja -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUTLASS_FETCH=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache && cmake --build /tmp/exl3variadic/build -j 4 --target vllm-server
+RESULT OURS cmake rc=0
+RESULT OURS build rc=0
+RESULT OURS binary /tmp/exl3variadic/bin/vllm-server md5=fcb34dca641d76a114f4e36d022a6b79
+RESULT THEIRS venv already usable (resumed)
+RESULT OURS server pid=13619 paged_env='shipped default'
+RESULT OURS ready after 10s
+RESULT OURS resolved max_num_seqs=32 (need 32) at --num-blocks 8192
+RESULT PAGED PROBE rc=0 on 'shipped default'
+RESULT PAGED ROUTE FOR EVERY LEG: 'shipped default (paged ON)'
+RESULT THEIRS server pid=13754
+RESULT THEIRS ready after 20s
+RESULT THEIRS-r1-c1 already recorded (resumed)
+RESULT THEIRS-r1-c4 already recorded (resumed)
+RESULT THEIRS-r1-c8 already recorded (resumed)
+RESULT THEIRS-r1-c16 CONFIG num_blocks=8192 max_model_len=8192 max_num_seqs=32 max_num_batched_tokens=16384 paged='shipped default'
+RESULT THEIRS-r1-c16 client rc=0
+RESULT THEIRS-r1-c32 CONFIG num_blocks=8192 max_model_len=8192 max_num_seqs=32 max_num_batched_tokens=16384 paged='shipped default'
+RESULT THEIRS-r1-c32 client rc=2
+RESULT OURS server pid=14679 paged_env='shipped default'
+RESULT OURS ready after 8s
+RESULT OURS resolved max_num_seqs=32 (need 32) at --num-blocks 8192
+RESULT OURS RESOLVED vllm.cpp: draft speculative context is limited to 8208 tokens (513 pages x 16, 160.312 MiB per concurrent request across 5 draft layers, so 5130 MiB of device memory at max_num_seqs 32 — NOT counted by gpu_memory_utilization). max_model_len is 8192 and the (1+k) draft block needs 8 more, so the whole advertised context is speculated. 
+RESULT OURS-r1-c1 already recorded (resumed)
+RESULT OURS-r1-c4 already recorded (resumed)
+RESULT OURS-r1-c8 already recorded (resumed)
+RESULT OURS-r1-c16 CONFIG num_blocks=8192 max_model_len=8192 max_num_seqs=32 max_num_batched_tokens=16384 paged='shipped default'
+RESULT DEVICE NVIDIA GB10, 12.1, 580.173.02, [N/A]
+RESULT ARCH aarch64  KERNEL 6.17.0-1029-nvidia  BOOT 3fcc8169-afd0-49ca-818f-9263bbcb2d13
+RESULT LEASE_ID=a7f8a60d-8a89-4f7d-b0d4-2cb01d3cd192
+RESULT SCRATCH_FREE_GiB 2003
+RESULT LOAD 1.67 0.46 0.16 2/843 266
+RESULT APT_UPDATE_RC=0
+RESULT DEPS_RC=0
+RESULT APT_CUDA_RC=0
+RESULT NVCC=13.0
+RESULT CORPUS rc=0
+RESULT CORPUS sha256 b52ef36ccb1ac564f66f81eae988ef466ea90fea4132d28d3ae5e88d31382352
+RESULT CORPUS_SOURCE gsm8k      3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14
+RESULT CORPUS_SOURCE humaneval  1d49078ba3e2b196b9344535bef34a43021f038fad9561d6ee7c53450609a6a2
+RESULT CORPUS_SOURCE sonnet     d58663195ba6780da5f029b920c7ac00cad1e435ee1df7e03bf9ec2470f8dea4
+RESULT CORPUS_BAND L   n=29  chars min=2605 p50=3171 max=4262
+RESULT CORPUS_BAND M   n=77  chars min=130 p50=372 max=1167
+RESULT CORPUS_BAND S   n=67  chars min=84 p50=210 max=493
+RESULT CORPUS_BAND XL  n=19  chars min=7217 p50=9569 max=11044
+RESULT COPY rc target=0 draft=0
+RESULT SHA target1 7b77214fe58ff15fed0b4af55e3cd92f38842b8711886d68954e8071ff8270c6
+RESULT SHA target2 411c83bb1070b27f3d670fc93e38dca0f17eb66429f64b5706901b12613188b2
+RESULT SHA draft   6b2e3afc694a343b7f3f0edfe5925e460762fc9ede4699165b577ca0733c8e56
+RESULT G-BYTES PASS: the bytes measured are the pinned artifact
+RESULT OURS TREE PIN 3351ec54f375c6934246520cac112a10d2fbee07
+RESULT SRC untar rc=0 (pin 3351ec54f375c6934246520cac112a10d2fbee07)
+RESULT SRCDIR /tmp/exl3variadic/src/vllmcpp
+RESULT OURS BUILD RECIPE: cmake -S /tmp/exl3variadic/src/vllmcpp -B /tmp/exl3variadic/build -G Ninja -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUTLASS_FETCH=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache && cmake --build /tmp/exl3variadic/build -j 4 --target vllm-server
+RESULT OURS cmake rc=0
+RESULT OURS build rc=0
+RESULT OURS binary /tmp/exl3variadic/bin/vllm-server md5=43076bc02c87f94bb744eadd9bb289c0
+RESULT THEIRS source untar rc=0 sha256(tarball)=18b49d64e6a171bcbfd06bd02f139fc53189e04b5ff8f510a3afbd622dd372d4
+RESULT THEIRS harness patch rc=0
+RESULT THEIRS patched server compiles rc=0
+RESULT THEIRS venv rc=0
+RESULT THEIRS pip bootstrap rc=0
+RESULT THEIRS torch install rc=0
+RESULT THEIRS torch /tmp/exl3variadic/venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+RESULT THEIRS reusing cached wheel exllamav3-1.4.2-cp312-cp312-linux_aarch64.whl sha256=a24b224a7e143a5deb0e16c29c06ff7d3182ce3a831164e00adc376514c8dd7a
+RESULT THEIRS engine build+install rc=0
+RESULT THEIRS server deps rc=0
+RESULT THEIRS import check: AttributeError: module 'exllamav3' has no attribute '__version__'
+RESULT PAGED PROBE resumed: PAGED_ENV='shipped default'
+RESULT PAGED ROUTE FOR EVERY LEG: 'shipped default (paged ON)'
+RESULT THEIRS server pid=10576
+RESULT THEIRS ready after 62s
+RESULT THEIRS-r1-c1 already recorded (resumed)
+RESULT THEIRS-r1-c4 already recorded (resumed)
+RESULT THEIRS-r1-c8 already recorded (resumed)
+RESULT THEIRS-r1-c16 already recorded (resumed)
+RESULT THEIRS-r1-c32 CONFIG num_blocks=8192 max_model_len=8192 max_num_seqs=32 max_num_batched_tokens=16384 paged='shipped default'
+RESULT THEIRS-r1-c32 client rc=0
+RESULT OURS server pid=11807 paged_env='shipped default'
+RESULT OURS ready after 8s
+RESULT OURS resolved max_num_seqs=32 (need 32) at --num-blocks 8192
+RESULT OURS RESOLVED vllm.cpp: draft speculative context is limited to 8208 tokens (513 pages x 16, 160.312 MiB per concurrent request across 5 draft layers, so 5130 MiB of device memory at max_num_seqs 32 — NOT counted by gpu_memory_utilization). max_model_len is 8192 and the (1+k) draft block needs 8 more, so the whole advertised context is speculated. 
+RESULT OURS-r1-c1 already recorded (resumed)
+RESULT OURS-r1-c4 already recorded (resumed)
+RESULT OURS-r1-c8 already recorded (resumed)
+RESULT OURS-r1-c16 CONFIG num_blocks=8192 max_model_len=8192 max_num_seqs=32 max_num_batched_tokens=16384 paged='shipped default'
+RESULT OURS-r1-c16 client rc=0
+RESULT OURS-r1-c32 CONFIG num_blocks=8192 max_model_len=8192 max_num_seqs=32 max_num_batched_tokens=16384 paged='shipped default'
+RESULT DEVICE NVIDIA GB10, 12.1, 580.173.02, [N/A]
+RESULT ARCH aarch64  KERNEL 6.17.0-1029-nvidia  BOOT 9f90c458-049c-49d1-aa85-19f4864599ae
+RESULT LEASE_ID=39e48a0e-5cbc-47ac-956f-9d30637659e0
+RESULT SCRATCH_FREE_GiB 2003
+RESULT LOAD 0.54 0.84 0.56 1/852 259
+RESULT APT_UPDATE_RC=0
+RESULT DEPS_RC=0
+RESULT APT_CUDA_RC=0
+RESULT NVCC=13.0
+RESULT CORPUS rc=0
+RESULT CORPUS sha256 b52ef36ccb1ac564f66f81eae988ef466ea90fea4132d28d3ae5e88d31382352
+RESULT CORPUS_SOURCE gsm8k      3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14
+RESULT CORPUS_SOURCE humaneval  1d49078ba3e2b196b9344535bef34a43021f038fad9561d6ee7c53450609a6a2
+RESULT CORPUS_SOURCE sonnet     d58663195ba6780da5f029b920c7ac00cad1e435ee1df7e03bf9ec2470f8dea4
+RESULT CORPUS_BAND L   n=29  chars min=2605 p50=3171 max=4262
+RESULT CORPUS_BAND M   n=77  chars min=130 p50=372 max=1167
+RESULT CORPUS_BAND S   n=67  chars min=84 p50=210 max=493
+RESULT CORPUS_BAND XL  n=19  chars min=7217 p50=9569 max=11044
+RESULT COPY rc target=0 draft=0
+RESULT SHA target1 7b77214fe58ff15fed0b4af55e3cd92f38842b8711886d68954e8071ff8270c6
+RESULT SHA target2 411c83bb1070b27f3d670fc93e38dca0f17eb66429f64b5706901b12613188b2
+RESULT SHA draft   6b2e3afc694a343b7f3f0edfe5925e460762fc9ede4699165b577ca0733c8e56
+RESULT G-BYTES PASS: the bytes measured are the pinned artifact
+RESULT OURS TREE PIN 3351ec54f375c6934246520cac112a10d2fbee07
+RESULT SRC untar rc=0 (pin 3351ec54f375c6934246520cac112a10d2fbee07)
+RESULT SRCDIR /tmp/exl3variadic/src/vllmcpp
+RESULT OURS BUILD RECIPE: cmake -S /tmp/exl3variadic/src/vllmcpp -B /tmp/exl3variadic/build -G Ninja -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUTLASS_FETCH=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache && cmake --build /tmp/exl3variadic/build -j 4 --target vllm-server
+RESULT OURS cmake rc=0
+RESULT OURS build rc=0
+RESULT OURS binary /tmp/exl3variadic/bin/vllm-server md5=56c1981ae08a16faeb738523f249eabd
+RESULT THEIRS source untar rc=0 sha256(tarball)=18b49d64e6a171bcbfd06bd02f139fc53189e04b5ff8f510a3afbd622dd372d4
+RESULT THEIRS harness patch rc=0
+RESULT THEIRS patched server compiles rc=0
+RESULT THEIRS venv rc=0
+RESULT THEIRS pip bootstrap rc=0
+RESULT THEIRS torch install rc=0
+RESULT THEIRS torch /tmp/exl3variadic/venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+RESULT THEIRS reusing cached wheel exllamav3-1.4.2-cp312-cp312-linux_aarch64.whl sha256=a24b224a7e143a5deb0e16c29c06ff7d3182ce3a831164e00adc376514c8dd7a
+RESULT THEIRS engine build+install rc=0
+RESULT THEIRS server deps rc=0
+RESULT THEIRS import check: AttributeError: module 'exllamav3' has no attribute '__version__'
+RESULT PAGED PROBE resumed: PAGED_ENV='shipped default'
+RESULT PAGED ROUTE FOR EVERY LEG: 'shipped default (paged ON)'
+RESULT THEIRS round 1: every rung already recorded (resumed, server not started)
+RESULT OURS server pid=10576 paged_env='shipped default'
+RESULT OURS ready after 8s
+RESULT OURS resolved max_num_seqs=32 (need 32) at --num-blocks 8192
+RESULT OURS RESOLVED vllm.cpp: draft speculative context is limited to 8208 tokens (513 pages x 16, 160.312 MiB per concurrent request across 5 draft layers, so 5130 MiB of device memory at max_num_seqs 32 — NOT counted by gpu_memory_utilization). max_model_len is 8192 and the (1+k) draft block needs 8 more, so the whole advertised context is speculated. 
+RESULT OURS-r1-c1 already recorded (resumed)
+RESULT OURS-r1-c4 already recorded (resumed)
+RESULT OURS-r1-c8 already recorded (resumed)
+RESULT OURS-r1-c16 already recorded (resumed)
+RESULT OURS-r1-c32 CONFIG num_blocks=8192 max_model_len=8192 max_num_seqs=32 max_num_batched_tokens=16384 paged='shipped default'
+RESULT OURS-r1-c32 client rc=0
+RESULT OURS server pid=10736 paged_env='shipped default'
+RESULT OURS ready after 8s
+RESULT OURS resolved max_num_seqs=32 (need 32) at --num-blocks 8192
+RESULT OURS RESOLVED vllm.cpp: draft speculative context is limited to 8208 tokens (513 pages x 16, 160.312 MiB per concurrent request across 5 draft layers, so 5130 MiB of device memory at max_num_seqs 32 — NOT counted by gpu_memory_utilization). max_model_len is 8192 and the (1+k) draft block needs 8 more, so the whole advertised context is speculated. 
+RESULT OURS-r2-c32 CONFIG num_blocks=8192 max_model_len=8192 max_num_seqs=32 max_num_batched_tokens=16384 paged='shipped default'
+RESULT DEVICE NVIDIA GB10, 12.1, 580.173.02, [N/A]
+RESULT ARCH aarch64  KERNEL 6.17.0-1029-nvidia  BOOT 96affb07-e224-4669-89ef-acbeed2df9a1
+RESULT LEASE_ID=a94c4f5c-c400-4ca3-842f-e9799efd2b9f
+RESULT SCRATCH_FREE_GiB 2004
+RESULT LOAD 0.84 0.80 0.38 1/872 262
+RESULT APT_UPDATE_RC=0
+RESULT DEPS_RC=0
+RESULT APT_CUDA_RC=0
+RESULT NVCC=13.0
+RESULT CORPUS rc=0
+RESULT CORPUS sha256 b52ef36ccb1ac564f66f81eae988ef466ea90fea4132d28d3ae5e88d31382352
+RESULT CORPUS_SOURCE gsm8k      3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14
+RESULT CORPUS_SOURCE humaneval  1d49078ba3e2b196b9344535bef34a43021f038fad9561d6ee7c53450609a6a2
+RESULT CORPUS_SOURCE sonnet     d58663195ba6780da5f029b920c7ac00cad1e435ee1df7e03bf9ec2470f8dea4
+RESULT CORPUS_BAND L   n=29  chars min=2605 p50=3171 max=4262
+RESULT CORPUS_BAND M   n=77  chars min=130 p50=372 max=1167
+RESULT CORPUS_BAND S   n=67  chars min=84 p50=210 max=493
+RESULT CORPUS_BAND XL  n=19  chars min=7217 p50=9569 max=11044
+RESULT COPY rc target=0 draft=0
+RESULT SHA target1 7b77214fe58ff15fed0b4af55e3cd92f38842b8711886d68954e8071ff8270c6
+RESULT SHA target2 411c83bb1070b27f3d670fc93e38dca0f17eb66429f64b5706901b12613188b2
+RESULT SHA draft   6b2e3afc694a343b7f3f0edfe5925e460762fc9ede4699165b577ca0733c8e56
+RESULT G-BYTES PASS: the bytes measured are the pinned artifact
+RESULT OURS TREE PIN 3351ec54f375c6934246520cac112a10d2fbee07
+RESULT SRC untar rc=0 (pin 3351ec54f375c6934246520cac112a10d2fbee07)
+RESULT SRCDIR /tmp/exl3variadic/src/vllmcpp
+RESULT OURS BUILD RECIPE: cmake -S /tmp/exl3variadic/src/vllmcpp -B /tmp/exl3variadic/build -G Ninja -DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUTLASS_FETCH=ON -DVLLM_CPP_CUDA_ARCHITECTURES=121a -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache && cmake --build /tmp/exl3variadic/build -j 4 --target vllm-server
+RESULT OURS cmake rc=0
+RESULT OURS build rc=0
+RESULT OURS binary /tmp/exl3variadic/bin/vllm-server md5=ec2780701e0fcb8bc4c2c9bfe7f6e778
+RESULT THEIRS source untar rc=0 sha256(tarball)=18b49d64e6a171bcbfd06bd02f139fc53189e04b5ff8f510a3afbd622dd372d4
+RESULT THEIRS harness patch rc=0
+RESULT THEIRS patched server compiles rc=0
+RESULT THEIRS venv rc=0
+RESULT THEIRS pip bootstrap rc=0
+RESULT THEIRS torch install rc=0
+RESULT THEIRS torch /tmp/exl3variadic/venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+RESULT THEIRS reusing cached wheel exllamav3-1.4.2-cp312-cp312-linux_aarch64.whl sha256=a24b224a7e143a5deb0e16c29c06ff7d3182ce3a831164e00adc376514c8dd7a
+RESULT THEIRS engine build+install rc=0
+RESULT THEIRS server deps rc=0
+RESULT THEIRS import check: AttributeError: module 'exllamav3' has no attribute '__version__'
+RESULT PAGED PROBE resumed: PAGED_ENV='shipped default'
+RESULT PAGED ROUTE FOR EVERY LEG: 'shipped default (paged ON)'
+RESULT THEIRS round 1: every rung already recorded (resumed, server not started)
+RESULT OURS round 1: every rung already recorded (resumed, server not started)
+RESULT OURS server pid=10591 paged_env='shipped default'
+RESULT OURS ready after 8s
+RESULT OURS resolved max_num_seqs=32 (need 32) at --num-blocks 8192
+RESULT OURS RESOLVED vllm.cpp: draft speculative context is limited to 8208 tokens (513 pages x 16, 160.312 MiB per concurrent request across 5 draft layers, so 5130 MiB of device memory at max_num_seqs 32 — NOT counted by gpu_memory_utilization). max_model_len is 8192 and the (1+k) draft block needs 8 more, so the whole advertised context is speculated. 
+RESULT OURS-r2-c32 CONFIG num_blocks=8192 max_model_len=8192 max_num_seqs=32 max_num_batched_tokens=16384 paged='shipped default'
+RESULT OURS-r2-c32 client rc=0
+RESULT OURS-r2-c16 CONFIG num_blocks=8192 max_model_len=8192 max_num_seqs=32 max_num_batched_tokens=16384 paged='shipped default'
+RESULT OURS-r2-c16 client rc=0
+RESULT OURS-r2-c8 already recorded (resumed)
+RESULT OURS-r2-c4 already recorded (resumed)
+RESULT OURS-r2-c1 already recorded (resumed)
+RESULT THEIRS server pid=10807
+RESULT THEIRS ready after 66s
+RESULT THEIRS-r2-c32 CONFIG num_blocks=8192 max_model_len=8192 max_num_seqs=32 max_num_batched_tokens=16384 paged='shipped default'
+RESULT THEIRS-r2-c32 client rc=0
+RESULT THEIRS-r2-c16 CONFIG num_blocks=8192 max_model_len=8192 max_num_seqs=32 max_num_batched_tokens=16384 paged='shipped default'
+RESULT THEIRS-r2-c16 client rc=0
+RESULT THEIRS-r2-c8 already recorded (resumed)
+RESULT THEIRS-r2-c4 already recorded (resumed)
+RESULT THEIRS-r2-c1 already recorded (resumed)

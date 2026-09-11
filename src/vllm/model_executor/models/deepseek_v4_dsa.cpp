@@ -1,6 +1,8 @@
 // DeepSeek-V4-Flash W3 primitives — host reference implementations.
 // See deepseek_v4_dsa.h for the full port map (file:line on both sides).
 #include "vllm/model_executor/models/deepseek_v4_dsa.h"
+#include <optional>
+#include "vllm/model_executor/layers/attention/attention.h"
 
 // For `HostBf16ToF32`, the inlined carried-tower widening `Wf` uses below.
 // No cycle: `deepseek_v4_dsa.h` includes only <cstdint> and <vector>, and
@@ -270,9 +272,13 @@ std::vector<float> PagedCausalMlaAttention(vt::Queue& queue, const std::vector<f
   // The op's convention is `left == sliding_window - 1` (an INCLUSIVE distance),
   // and `right == 0` because a decode query is the last position of its own
   // sequence. Absent (0) the kernel keeps its full-prefix loop byte-identically.
-  if (sliding_window > 0)
-    args.window_size =
-        vt::AttentionWindow{static_cast<int32_t>(sliding_window - 1), 0};
+  // ENG-ATTENTION-WINDOW W2 (#2388): the convention described above is the
+  // resolver's, so it is stated once there rather than re-derived here. Absent
+  // (0) still leaves `nullopt` and the kernel's full-prefix loop byte-identical.
+  args.window_size = vllm::ResolveAttentionWindow(
+      /*per_layer=*/std::nullopt,
+      sliding_window > 0 ? std::optional<int64_t>(sliding_window) : std::nullopt,
+      vllm::v1::AttentionType::kDecoder, vllm::DisableSlidingWindowActive());
   vt::Tensor t_lse;
   if (out_lse != nullptr) {
     out_lse->assign(static_cast<size_t>(num_tokens) * static_cast<size_t>(num_heads), 0.0f);

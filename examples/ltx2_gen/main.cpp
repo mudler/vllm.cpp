@@ -188,6 +188,17 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "how much is read (default: the clip\'s own duration). Either without\n"
       "--audio-path is refused rather than ignored. The rendered audio.wav is your own\n"
       "input, not a VAE round trip, which is upstream\'s deliberate choice.\n\n"
+      "IC-LoRA REFERENCE CONDITIONING conditions the whole render on a reference clip\n"
+      "(depth, pose, edges) and needs --pipeline-kind ic_lora, which is upstream's own\n"
+      "ICLoraPipeline: the adapter rides stage 1 and stage 2 runs bare. --ref-video is\n"
+      "the clip, as a DIRECTORY of frame_%%06d.ppm, and --ref-video-strength is the\n"
+      "second half of upstream's --video-conditioning PATH STRENGTH. Supply the\n"
+      "IC-LoRA itself with --lora: its metadata carries the downscale and temporal\n"
+      "factors the reference is read at, and without one both default to 1.\n"
+      "--conditioning-attention-mask names a grayscale frame directory whose pixels\n"
+      "attenuate the reference per region, and --conditioning-attention-strength\n"
+      "scales it. A strength below 1 with no mask is REFUSED rather than served: it is\n"
+      "upstream's Python-API-only branch, which its own CLI cannot reach either.\n\n"
       "RETAKE regenerates a time window of an existing clip and keeps the rest.\n"
       "--ref-video names a DIRECTORY of frame_%%06d.ppm (the layout minimax-h3-gen\n"
       "writes), not a container file: upstream opens one with PyAV and no demuxer is\n"
@@ -289,6 +300,9 @@ int main(int argc, char** argv) {
   // RETAKE (row LTX25-RETAKE, #924): a source clip DIRECTORY and the window to
   // regenerate. `--ref-video` is a directory of frame_%06d.ppm, not a container.
   std::string ref_video, retake_start, retake_end, retake_fps, regen_video, regen_audio;
+  // IC-LoRA reference conditioning (#3020): the strength half of
+  // `--video-conditioning`, and both halves of `--conditioning-attention-mask`.
+  std::string ref_video_strength, cond_mask_dir, cond_mask_strength;
   // TEXT-TO-AUDIO (row LTX25-T2A-ONE-STAGE, #1005): one flag per argument of
   // upstream's `default_1_stage_t2a_arg_parser` (utils/args.py:1070-1120).
   std::string negative_prompt, audio_cfg_scale, audio_stg_scale, audio_rescale;
@@ -422,6 +436,17 @@ int main(int argc, char** argv) {
       retake_end = Need(argc, argv, ++i, "--retake-end-time");
     else if (f == "--retake-frame-rate")
       retake_fps = Need(argc, argv, ++i, "--retake-frame-rate");
+    // IC-LoRA REFERENCE CONDITIONING (#3020). `--ref-video` above names the
+    // clip; these three are the rest of upstream's two flags —
+    // `--video-conditioning PATH STRENGTH` and
+    // `--conditioning-attention-mask MASK_PATH STRENGTH` (ic_lora.py:416-441).
+    // Per-generation, so they ride vp.extra_* like the retake knobs.
+    else if (f == "--ref-video-strength")
+      ref_video_strength = Need(argc, argv, ++i, "--ref-video-strength");
+    else if (f == "--conditioning-attention-mask")
+      cond_mask_dir = Need(argc, argv, ++i, "--conditioning-attention-mask");
+    else if (f == "--conditioning-attention-strength")
+      cond_mask_strength = Need(argc, argv, ++i, "--conditioning-attention-strength");
     // TEXT-TO-AUDIO (#1005). Selected by `--pipeline-kind t2a_one_stage`, which
     // is a LOAD extra; these six are per-generation and are refused by name on
     // any other pipeline rather than accepted and ignored.
@@ -516,6 +541,18 @@ int main(int argc, char** argv) {
   if (!audio_path.empty()) {
     gen_keys.emplace_back("audio_path");
     gen_values.push_back(audio_path);
+  }
+  if (!ref_video_strength.empty()) {
+    gen_keys.emplace_back("ref_video_strength");
+    gen_values.push_back(ref_video_strength);
+  }
+  if (!cond_mask_dir.empty()) {
+    gen_keys.emplace_back("conditioning_attention_mask_dir");
+    gen_values.push_back(cond_mask_dir);
+  }
+  if (!cond_mask_strength.empty()) {
+    gen_keys.emplace_back("conditioning_attention_strength");
+    gen_values.push_back(cond_mask_strength);
   }
   if (!audio_start_time.empty()) {
     gen_keys.emplace_back("audio_start_time");

@@ -492,7 +492,7 @@ split the guide predicts and the reason the unit suite is not the proof.
 - **A container demuxer.** Without it the audio half of retake cannot exist:
   every audio predicate is a conjunction with `initial_audio_latent is not None`
   (`retake.py:279,282`) and a frame folder never produces one. Owned by this row,
-  tracked by [#924](https://github.com/mudler/vllm.cpp/issues/924) until a
+  tracked by ISSUE-GH-924 until a
   demuxer row exists.
 - **The real-checkpoint retake render.** The gate here is reduced-dimension
   fixtures; the GPU was out of bounds. Owned by this row.

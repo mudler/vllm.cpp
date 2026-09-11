@@ -1,0 +1,5 @@
+# CLAIM-ENG-RECORD-CONFLICT-SURFACES-W9
+
+| Claim | Row IDs | Agent | Worktree / remote dir | Branch | Owned scope | State | Last update |
+|---|---|---|---|---|---|---|---|
+| `CLAIM-ENG-RECORD-CONFLICT-SURFACES-W9` | `ENG-RECORD-CONFLICT-SURFACES` (`ACTIVE`) | Codex (GPT-5.6), helper role | isolated worktree `/home/mudler/.cache/sdd/mudler-vllm.cpp/roadmap-consistency`; no GPU, model, service, or publication | `row/ENG-RECORD-CONFLICT-SURFACES-W9-IMPL`, ISSUE-GH-2390 | Owns the completed Tasks 31, 32, and 26 retry: migration-only `_intake`; ordered archive, spec, and evidence-resolved row ownership; stable four-form branch reference discovery; canonical local issue operations; the immutable 1,023-record union migration; and the atomic renderer, checker, roadmap, and policy cutover to local authority. GitHub was read for the frozen migration payload and was not edited. The generated view remains untracked and the archive remains frozen. Product fixes and remote issue changes remain excluded. | `ACTIVE` | 2026-09-01: local-authority migration and cutover complete; ISSUE-GH-2372 compile-defect split remains owed. |

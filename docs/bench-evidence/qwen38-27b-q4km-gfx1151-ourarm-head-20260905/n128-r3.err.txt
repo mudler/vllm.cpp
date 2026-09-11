@@ -1,0 +1,36 @@
+vllm-cli: loading model from /tmp/strixarm2944/models/Qwen3.8-27B-Q4_K_M.gguf
+engine: device placement: --fit resolved NO placement: the model has no routed-expert layers, so a placement has nothing to move
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+[vt op-provider] op=4 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=77 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=1 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=83 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=88 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=5 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=89 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=76 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=10 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=9 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=84 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=63 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=78 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=64 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=28 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=38 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=69 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=40 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=6 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+[vt op-provider] op=11 device=5 selected=vt-native priority=0 registered=1 caps=0.0/unprobed
+vllm-cli: run=1/4 finish_reason=length prompt_tokens=5 completion_tokens=128 secs=24.257 tok_s=5.277
+vllm-cli: run=1/4 generate_start_unix=1788640851.177685 generate_end_unix=1788640875.434565
+vllm-cli: run=1/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+vllm-cli: run=2/4 finish_reason=length prompt_tokens=5 completion_tokens=128 secs=23.917 tok_s=5.352
+vllm-cli: run=2/4 generate_start_unix=1788640875.434631 generate_end_unix=1788640899.351973
+vllm-cli: run=2/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+vllm-cli: run=3/4 finish_reason=length prompt_tokens=5 completion_tokens=128 secs=23.913 tok_s=5.353
+vllm-cli: run=3/4 generate_start_unix=1788640899.352009 generate_end_unix=1788640923.265424
+vllm-cli: run=3/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0
+vllm-cli: run=4/4 finish_reason=length prompt_tokens=5 completion_tokens=128 secs=23.945 tok_s=5.345
+vllm-cli: run=4/4 generate_start_unix=1788640923.265464 generate_end_unix=1788640947.210946
+vllm-cli: run=4/4 spec_drafts_proposed=0 spec_drafts_accepted=0 spec_drafted_request_steps=0

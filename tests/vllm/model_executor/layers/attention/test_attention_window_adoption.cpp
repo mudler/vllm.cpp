@@ -23,9 +23,20 @@
 
 namespace {
 
-// The expression all five model sites inlined, verbatim.
+// The expression all five model sites inlined, verbatim. W2 (#2388) found the
+// SAME expression at three more, which is why one helper covers both waves:
+// `v1/attention/backend.cpp`, `mla_chunked_context.h` and `deepseek_v4_dsa.cpp`.
 vt::AttentionWindow Inlined(int64_t sliding_window) {
   return vt::AttentionWindow{static_cast<int32_t>(sliding_window - 1), 0};
+}
+
+// W2's three sites hold an `int64_t`, not an `optional`, and each guarded the
+// inline expression with `if (sliding_window > 0)`. Adoption turns that guard
+// into the optional the resolver takes, so this helper is the ONE thing W2
+// actually changed about those sites and is what the case below pins.
+std::optional<int64_t> W2Guard(int64_t sliding_window) {
+  return sliding_window > 0 ? std::optional<int64_t>(sliding_window)
+                            : std::nullopt;
 }
 
 }  // namespace
@@ -103,4 +114,66 @@ TEST_CASE("attention window: out-of-range is REFUSED, not silently clamped") {
       vllm::ResolveAttentionWindow(std::nullopt, int64_t{1} << 32,
                                    vllm::v1::AttentionType::kDecoder, false),
       std::invalid_argument);
+}
+
+
+// W2 (#2388) — the three sites that are NOT model code.
+//
+// WHY THIS NEEDED NO DEVICE, which is the finding rather than the code. W2 sat
+// deferred because those sites "sit under paths no CPU-only build exercises, and
+// moving them without a device gate would be the unverified change this work has
+// been closing". That conflated two different questions. Proving the resolver
+// returns the SAME VALUE is pure arithmetic and needs no device — it is exactly
+// what W1 shipped for the five model sites, in the case at the top of this file.
+// Proving the site is REACHED is the other question, and it is unchanged by W2:
+// no gate here executes those paths, before or after.
+TEST_CASE("attention window: W2's guard translation preserves the old behaviour") {
+  // Every site guarded `if (sliding_window > 0)`. A 0 or a negative left
+  // `window_size` as `std::nullopt` and the kernel on its full-prefix loop, and
+  // that must still be true now the resolver decides it.
+  for (const int64_t w : {int64_t{-1}, int64_t{0}}) {
+    CAPTURE(w);
+    CHECK_FALSE(vllm::ResolveAttentionWindow(std::nullopt, W2Guard(w),
+                                             vllm::v1::AttentionType::kDecoder,
+                                             false)
+                    .has_value());
+  }
+  // And a real window resolves to precisely what the three sites inlined.
+  for (const int64_t w : {int64_t{1}, int64_t{513}, int64_t{4096}}) {
+    CAPTURE(w);
+    const std::optional<vt::AttentionWindow> got = vllm::ResolveAttentionWindow(
+        std::nullopt, W2Guard(w), vllm::v1::AttentionType::kDecoder, false);
+    REQUIRE(got.has_value());
+    CHECK(got->left == Inlined(w).left);
+    CHECK(got->right == Inlined(w).right);
+  }
+}
+
+TEST_CASE("attention window: W2's sites now REFUSE a window they used to truncate") {
+  // This is a deliberate behaviour CHANGE and the only one W2 makes.
+  // `static_cast<int32_t>(sliding_window - 1)` on a window past INT32_MAX wraps
+  // and hands the kernel a plausible small — or negative — radius. The three
+  // sites did that silently; the resolver refuses by name.
+  CHECK_THROWS_AS(vllm::ResolveAttentionWindow(
+                      std::nullopt, W2Guard(int64_t{1} << 40),
+                      vllm::v1::AttentionType::kDecoder, false),
+                  std::invalid_argument);
+}
+
+TEST_CASE("attention window: W2's sites OBEY --disable-sliding-window") {
+  // The gap W3 left and W2 closes. After W3 the flag reached five of the eight
+  // sites that carry a window; these three ignored it, so the same engine would
+  // have honoured the switch on Gemma and quietly kept the window on dots3-note's
+  // windowed decode, DeepSeek-V4's DSA and the MLA chunked-prefill context.
+  vllm::ResetDisableSlidingWindowForTesting();
+  vllm::SetDisableSlidingWindow(true);
+  CHECK_FALSE(vllm::ResolveAttentionWindow(std::nullopt, W2Guard(4096),
+                                           vllm::v1::AttentionType::kDecoder,
+                                           vllm::DisableSlidingWindowActive())
+                  .has_value());
+  vllm::ResetDisableSlidingWindowForTesting();
+  REQUIRE(vllm::ResolveAttentionWindow(std::nullopt, W2Guard(4096),
+                                       vllm::v1::AttentionType::kDecoder,
+                                       vllm::DisableSlidingWindowActive())
+              .has_value());
 }

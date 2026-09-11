@@ -198,7 +198,7 @@ kernel body's occupancy behavior before committing to `nwarps=8`.
   loses here. That needs its own row, spec and measurement.
 - **`test_backend_cross_device` is RED on gfx1200 before this row and after
   it**, at `:2067` `CHECK(got == ref_b)` in the case "MoeSiluMul matches the CPU
-  oracle within NMSE <= 5e-4", 1 of 26 cases and 1 of 80253 assertions. #1954
+  oracle within NMSE <= 5e-4", 1 of 26 cases and 1 of 80253 assertions. ISSUE-GH-1954
   records the same assertion at `:2063`, which is where it sat before this
   row's `CAPTURE` stringification repair in
   `tests/vt/test_backend_cross_device.cpp` moved it down four lines. It is
@@ -208,7 +208,7 @@ kernel body's occupancy behavior before committing to `nwarps=8`.
   cases and 1 of 80195 assertions. The control was run twice, once by the review
   and once again when this note was written, because a cited control is not a
   run one. Filed as
-  [#1954](https://github.com/mudler/vllm.cpp/issues/1954), the gfx1200
+  ISSUE-GH-1954, the gfx1200
   counterpart of the CUDA-only bookkeeping in
   [#1802](https://github.com/mudler/vllm.cpp/issues/1802), which carries this
   same test name and this same assertion on sm_110.
@@ -216,8 +216,8 @@ kernel body's occupancy behavior before committing to `nwarps=8`.
   family on sm_121a and **NOT the same test**: it records `test_cuda_ops`'s
   "CUDA silu_and_mul matches CPU" failing at 439 of 440 assertions, a different
   test and a different assertion. An earlier draft of this section, of the
-  `.agents/environment.md` row and of the #1954 index row claimed #907 carried
-  the same test and assertion, which is false; the corrected body of #1954 is
+  `.agents/environment.md` row and of the ISSUE-GH-1954 index row claimed #907 carried
+  the same test and assertion, which is false; the corrected body of ISSUE-GH-1954 is
   the source of truth for that distinction. `.agents/environment.md` now
   carries a gfx1200 known-red row for it, so the next reader of this gate reads
   one expected red rather than a regression. This row's own gate is therefore

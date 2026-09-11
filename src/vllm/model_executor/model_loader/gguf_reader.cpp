@@ -244,6 +244,12 @@ const GgmlTypeTraits* FindGgmlTraits(uint32_t type) {
       static constexpr GgmlTypeTraits t{256, 210, "Q6_K"};
       return &t;
     }
+    case 15: {
+      // Q8_K is decoder-only for embedding tables. Stock llama.cpp 10bf611e,
+      // ggml-common.h:370-376: f32 delta + 256 i8 values + 16 i16 sums.
+      static constexpr GgmlTypeTraits t{256, 292, "Q8_K"};
+      return &t;
+    }
     case 16: {
       // block_iq2_xxs (ggml-common.h:371-374): f16 d + QK_K/8 u16 qs
       // = 2 + 32*2 = 66. The Unsloth-Dynamic `UD-IQ2_XXS` ~2-bit encoding

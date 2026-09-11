@@ -1,0 +1,9 @@
+{
+  "python": "3.12.3 (main, Jul 15 2026, 23:46:41) [GCC 13.3.0]",
+  "platform": "Linux-7.0.0-28-generic-x86_64-with-glibc2.39",
+  "numpy": "2.4.6",
+  "numpy_path": "/home/vikash/.cache/hrx-evaluation-3080-preflight/python/numpy/__init__.py",
+  "msgspec": "0.21.1",
+  "msgspec_path": "/home/vikash/.cache/hrx-evaluation-3080-preflight/python/msgspec/__init__.py",
+  "purpose": "Existing task-local Python dependencies used by record mutation suites; no package installation or runtime modification in this row."
+}

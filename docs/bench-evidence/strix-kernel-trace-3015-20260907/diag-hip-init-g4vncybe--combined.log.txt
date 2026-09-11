@@ -1,0 +1,5 @@
+["podman", "--storage-driver=vfs", "--root", "/tmp/podman-pr66-root-vfs", "--runroot", "/tmp/podman-pr66-run-vfs", "run", "--rm", "--name", "strix-3015-aa7253c1715d4a12b6372c44aa2f1052", "--device=/dev/kfd", "--device=/dev/dri", "--group-add", "video", "-v", "/tmp/strix-3015-4fdrfcj3:/tmp/strix-3015-4fdrfcj3:rw", "-v", "/workspace/ccache:/workspace/ccache:rw", "--ulimit", "fsize=536870912:536870912", "-e", "LD_LIBRARY_PATH=/tmp/strix-3015-4fdrfcj3/build-vllmcpp:/tmp/strix-3015-4fdrfcj3/build-vllmcpp/bin:/opt/rocm/lib", "-e", "VT_OP_PROVIDER_STATS=1", "--entrypoint", "/usr/bin/python3", "d554fe849c5e3c4d6b81227e0b87f165fa3b7b015899872bd93bc732c12ffeb6", "-c", "import ctypes; print('before HIP library load',flush=True); h=ctypes.CDLL('/opt/rocm/lib/libamdhip64.so'); print('before hipInit',flush=True); r=h.hipInit(0); print('hipInit',r,flush=True); assert r==0; n=ctypes.c_int(); r=h.hipGetDeviceCount(ctypes.byref(n)); print('hipGetDeviceCount',r,n.value,flush=True); assert r==0 and n.value>0"]
+before HIP library load
+before hipInit
+hipInit 0
+hipGetDeviceCount 0 1

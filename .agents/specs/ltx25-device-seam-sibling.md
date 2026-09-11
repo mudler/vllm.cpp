@@ -679,7 +679,7 @@ cannot be unique by construction.
 
 ## Owed
 
-- [#828](https://github.com/mudler/vllm.cpp/issues/828) — the AST-level
+- ISSUE-GH-828 — the AST-level
   `dev_cast` check. `check-device-leakage.py:58,139,158` and §"Findings from
   review round 3" both name it as what closes the declared blind spot, and
   `scripts/check-device-leakage.py`'s docstring names it as what would enforce

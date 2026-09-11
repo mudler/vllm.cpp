@@ -1,0 +1,7 @@
+{
+  "chunk_id": "f1aaf4",
+  "wall_time_seconds": 0.00000286,
+  "exit_code": 0,
+  "original_token_count": 162,
+  "output": "original {\"head_dim\": 64, \"partial_rotary_factor\": 0.25, \"rope_parameters\": {\"rope_type\": \"default\", \"rope_theta\": 1000000.0, \"partial_rotary_factor\": 1.0, \"mrope_section\": [16, 8, 8], \"mrope_interleaved\": true}}\nafter_standardize {\"rotary_dim\": 16, \"mrope_section_sum\": 32, \"rope_parameters\": {\"rope_type\": \"default\", \"rope_theta\": 1000000.0, \"partial_rotary_factor\": 0.25, \"mrope_section\": [16, 8, 8], \"mrope_interleaved\": true}}\nwith_override {\"rotary_dim\": 64, \"mrope_section_sum\": 32, \"rope_parameters\": {\"rope_type\": \"default\", \"rope_theta\": 1000000.0, \"partial_rotary_factor\": 1.0, \"mrope_section\": [16, 8, 8], \"mrope_interleaved\": true}}\n"
+}

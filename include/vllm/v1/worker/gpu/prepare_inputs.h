@@ -572,6 +572,65 @@ std::map<std::string, std::vector<int32_t>> FillDraftsForStep(
     const std::unordered_map<std::string, int>& req_id_to_index,
     const std::vector<int32_t>& num_valid_draft_tokens);
 
+// ─── SPEC-DFLASH2 A2-4 (#3004): WHERE THE PROPOSE READS THIS STEP'S IDS ──────
+//
+// WHAT THIS IS. `sample_tokens_async` has three write-back branches and they
+// disagree about one thing the propose tail cares about: whether the ids this
+// step committed are readable ON THE HOST when the tail runs. The host branch
+// Synchronizes and writes them itself. Both CUDA branches scatter them with a
+// kernel queued on the main queue that nothing waits — the device-mirror branch
+// leaves the host array's VALUES stale on purpose (reading them back is the cost
+// it exists to remove), and the UMA branch writes the host array from a kernel
+// that has not run yet. #2920 answered that with a `committed_ids_on_host` flag
+// and a refusal by name, which is why A2-5 cannot flip the veto: on GB10's
+// integrated default the UMA branch runs and hits it.
+//
+// This function is the answer that makes the refusal unnecessary rather than
+// deleting it. The runner materializes the step's committed ids ONCE, on every
+// branch, and hands them here; the two pieces of host state every propose arm
+// reads are then written from that ONE array:
+//
+//   * `last_sampled_tokens[slot]` — the anchor `propose_drafts_block` takes;
+//   * `token_ids_cpu[slot * max_model_len + num_tokens_no_spec[slot] - 1]` —
+//     the column `propose_drafts_ngram` matches over. The async arm advances
+//     `num_tokens_no_spec` without writing that column (the token-VALUE append
+//     is deleted on purpose: the scheduler's `update_from_output` feeds detok
+//     and penalties when `get_output()` materializes), so left unwritten the
+//     matcher reads a zero where this step's token belongs and drafts off it.
+//
+// Upstream writes the same pair from the same place: `req_states.last_sampled`
+// (gpu/states.py) and `req_states.token_ids` are both updated from the sampler's
+// output in `_update_states` / `post_update`, and its n-gram proposer reads the
+// token row (`gpu_model_runner.py:1494-1500`, and the GPU n-gram tensors at
+// `:1519-1525` @ pin 5559679229bc961848b121ccdeaa8fa5d79bec98).
+//
+// WHY IT IS A NAMED FUNCTION AND NOT A LOOP AT THE CALL SITE. A per-request rule
+// feeding a per-STEP route is the shape that shipped a silent wrong answer on
+// this row: `tests/vllm/v1/worker/test_combine_row_predicate.cpp` (#2710) records
+// a version that survived 27 mutations because every case used `num_reqs == 1`.
+// Stating the rule once, over arrays, is what lets a MIXED step — some rows
+// committing, some discarded, different `num_tokens_no_spec` per row — be an
+// input rather than a reading.
+//
+// WHAT IT REFUSES, and each refusal is a case a test drives. A committed row
+// whose `num_tokens_no_spec` is not positive, and a committed row whose write
+// column falls outside `token_ids_cpu`. Both were SILENT `continue`s at the call
+// site #2920 landed, and a fail-open skip is indistinguishable from a fail-closed
+// one until something mutates it — the finding three A2-3 reviews each made.
+//
+// `discard` is the step's `discard_request_mask` and MAY be shorter than
+// `num_reqs` (the runner builds it per step); a row past its end is treated as
+// committing, exactly as every other loop over it in `runner.cpp` does. A
+// discarded row is left BYTE-IDENTICAL in both arrays: it produced no output
+// token this step, its `num_tokens_no_spec` was not advanced, and writing its
+// column would corrupt the newest token it actually committed.
+void ApplyCommittedIdsForPropose(const int64_t* committed_ids, int num_reqs,
+                                 const std::vector<uint8_t>& discard,
+                                 const std::vector<int32_t>& num_tokens_no_spec,
+                                 int max_model_len,
+                                 std::vector<int32_t>* last_sampled_tokens,
+                                 std::vector<int32_t>* token_ids_cpu);
+
 }  // namespace vllm::v1
 
 #endif  // VLLM_V1_WORKER_GPU_PREPARE_INPUTS_H_

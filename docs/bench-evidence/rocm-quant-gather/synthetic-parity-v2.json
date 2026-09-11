@@ -1,0 +1,1835 @@
+{
+  "manifest": {
+    "bytes": 6329,
+    "sha256": "78bc808e19b40ea745f5e767b72618dbd8087bb685333345826257dd4371ccfd"
+  },
+  "cases": [
+    {
+      "name": "Q4_0-256",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 18432,
+      "output_bytes": 4096,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q4_0-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "9966480cdeef7ea0007e83a432b0003915042615cec988bdc78aa81a9e05c4d4"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q4_0-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "9966480cdeef7ea0007e83a432b0003915042615cec988bdc78aa81a9e05c4d4"
+      }
+    },
+    {
+      "name": "Q4_0-256",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 18432,
+      "output_bytes": 2048,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q4_0-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "634ad1adfae1205b50995644230abe47d006f04afa3de126a908edc6d52a41c7"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q4_0-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "634ad1adfae1205b50995644230abe47d006f04afa3de126a908edc6d52a41c7"
+      }
+    },
+    {
+      "name": "Q4_0-1024",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 73728,
+      "output_bytes": 16384,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q4_0-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "73d07ea6da5385e2701b402832ecb32426cc902eabfa489644cc5b6b0a458e32"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q4_0-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "73d07ea6da5385e2701b402832ecb32426cc902eabfa489644cc5b6b0a458e32"
+      }
+    },
+    {
+      "name": "Q4_0-1024",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 73728,
+      "output_bytes": 8192,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q4_0-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "1cad407983d06f622ef3f0448bdfdde5e11aa2c816a1ecb1ee8f6cfbd717b2ca"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q4_0-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "1cad407983d06f622ef3f0448bdfdde5e11aa2c816a1ecb1ee8f6cfbd717b2ca"
+      }
+    },
+    {
+      "name": "Q5_0-256",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 22528,
+      "output_bytes": 4096,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q5_0-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "cddca55a921b2cc41118c57912cf30b394138a33e6d59bfbb24e5c7351f9b50d"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q5_0-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "cddca55a921b2cc41118c57912cf30b394138a33e6d59bfbb24e5c7351f9b50d"
+      }
+    },
+    {
+      "name": "Q5_0-256",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 22528,
+      "output_bytes": 2048,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q5_0-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "6eab30eecc3c325dd86839aba260930ca8bf7d38710e5f1b51591f1a0b4af63b"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q5_0-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "6eab30eecc3c325dd86839aba260930ca8bf7d38710e5f1b51591f1a0b4af63b"
+      }
+    },
+    {
+      "name": "Q5_0-1024",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 90112,
+      "output_bytes": 16384,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q5_0-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "495d23a83140b03ada09177c6f4b9bc31faadb610b1098e7687af410404acdf3"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q5_0-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "495d23a83140b03ada09177c6f4b9bc31faadb610b1098e7687af410404acdf3"
+      }
+    },
+    {
+      "name": "Q5_0-1024",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 90112,
+      "output_bytes": 8192,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q5_0-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "92b78a76767ce3cfe53b5aa42b23120dffd9ca588f4f7637e9b93717ff72e9ed"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q5_0-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "92b78a76767ce3cfe53b5aa42b23120dffd9ca588f4f7637e9b93717ff72e9ed"
+      }
+    },
+    {
+      "name": "Q8_0-256",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 34816,
+      "output_bytes": 4096,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q8_0-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "1c8493a1edd90c3a205727544e432228f90487b57d836e04aa2c70dbde2b18dc"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q8_0-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "1c8493a1edd90c3a205727544e432228f90487b57d836e04aa2c70dbde2b18dc"
+      }
+    },
+    {
+      "name": "Q8_0-256",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 34816,
+      "output_bytes": 2048,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q8_0-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "cf1659dbd4ec5c173833e93ed5ce6ef4f5267a5f9946e2fd2ddc5b735ad1dabb"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q8_0-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "cf1659dbd4ec5c173833e93ed5ce6ef4f5267a5f9946e2fd2ddc5b735ad1dabb"
+      }
+    },
+    {
+      "name": "Q8_0-1024",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 139264,
+      "output_bytes": 16384,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q8_0-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "834f8078f7ac197ee65dba962fcdf461ae7df8b2a4f5d32e4e84e9bd4be1fedc"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q8_0-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "834f8078f7ac197ee65dba962fcdf461ae7df8b2a4f5d32e4e84e9bd4be1fedc"
+      }
+    },
+    {
+      "name": "Q8_0-1024",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 139264,
+      "output_bytes": 8192,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q8_0-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "5c6c831f0038680adcbc353b74b9a7f2ccb61c2a8c08f2aa65800fee663a882f"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q8_0-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "5c6c831f0038680adcbc353b74b9a7f2ccb61c2a8c08f2aa65800fee663a882f"
+      }
+    },
+    {
+      "name": "Q2_K-256",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 10752,
+      "output_bytes": 4096,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q2_K-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "e24b791187d6821a4c2a75c762dbdfe17964a3290ad6ebe409102b98f42301a4"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q2_K-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "e24b791187d6821a4c2a75c762dbdfe17964a3290ad6ebe409102b98f42301a4"
+      }
+    },
+    {
+      "name": "Q2_K-256",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 10752,
+      "output_bytes": 2048,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q2_K-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "bc5d0b2852039a8f373b4c77d3c6e37a64f89b38850aaba1291396beb404ac4e"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q2_K-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "bc5d0b2852039a8f373b4c77d3c6e37a64f89b38850aaba1291396beb404ac4e"
+      }
+    },
+    {
+      "name": "Q2_K-1024",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 43008,
+      "output_bytes": 16384,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q2_K-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "55a37b1031ff271501b735e019d48c5b16651a28d096abc9cf66ae9b7e13032b"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q2_K-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "55a37b1031ff271501b735e019d48c5b16651a28d096abc9cf66ae9b7e13032b"
+      }
+    },
+    {
+      "name": "Q2_K-1024",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 43008,
+      "output_bytes": 8192,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q2_K-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "355660442b0a1b33e66868cd480fe19ad3cbef94d291cf96a0ba3a846b7bfff1"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q2_K-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "355660442b0a1b33e66868cd480fe19ad3cbef94d291cf96a0ba3a846b7bfff1"
+      }
+    },
+    {
+      "name": "Q3_K-256",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 14080,
+      "output_bytes": 4096,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q3_K-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "8abfd966f1a8d1cfe3a56ffe70951cf74861cec4937fe6cec311955c3bb8097c"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q3_K-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "8abfd966f1a8d1cfe3a56ffe70951cf74861cec4937fe6cec311955c3bb8097c"
+      }
+    },
+    {
+      "name": "Q3_K-256",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 14080,
+      "output_bytes": 2048,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q3_K-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "cdf4fecc71e5f51885720bdba5f669eac9f5526ce37d21cc0e4983943398219d"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q3_K-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "cdf4fecc71e5f51885720bdba5f669eac9f5526ce37d21cc0e4983943398219d"
+      }
+    },
+    {
+      "name": "Q3_K-1024",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 56320,
+      "output_bytes": 16384,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q3_K-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "c5db632dc69564c309db1e55800627d303353b322039d70bc64ad60a65e4544d"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q3_K-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "c5db632dc69564c309db1e55800627d303353b322039d70bc64ad60a65e4544d"
+      }
+    },
+    {
+      "name": "Q3_K-1024",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 56320,
+      "output_bytes": 8192,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q3_K-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "3c2a56e17bcd792a99c1d429d04872d530e3f35e5e59a40f0a2cb733e3c5881e"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q3_K-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "3c2a56e17bcd792a99c1d429d04872d530e3f35e5e59a40f0a2cb733e3c5881e"
+      }
+    },
+    {
+      "name": "Q4_K-256",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 18432,
+      "output_bytes": 4096,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q4_K-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "828bc6bd954f80b2bd5e90c4dead3785cc3f619a3e0cf85bbdd8977889e93780"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q4_K-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "828bc6bd954f80b2bd5e90c4dead3785cc3f619a3e0cf85bbdd8977889e93780"
+      }
+    },
+    {
+      "name": "Q4_K-256",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 18432,
+      "output_bytes": 2048,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q4_K-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "1183adfc4a8cf6fbdeed1a024991b6b703d67e9254f2547f8be74070ba311023"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q4_K-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "1183adfc4a8cf6fbdeed1a024991b6b703d67e9254f2547f8be74070ba311023"
+      }
+    },
+    {
+      "name": "Q4_K-1024",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 73728,
+      "output_bytes": 16384,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q4_K-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "818de25fdc842d287a28a404fe68291bed1a4f6f92d692be1697b63942d5de76"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q4_K-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "818de25fdc842d287a28a404fe68291bed1a4f6f92d692be1697b63942d5de76"
+      }
+    },
+    {
+      "name": "Q4_K-1024",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 73728,
+      "output_bytes": 8192,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q4_K-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "edb9258354cc7e85a80f0ac0f4d2372b7586152ea51ac9b7a5d05c1ddd5e7370"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q4_K-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "edb9258354cc7e85a80f0ac0f4d2372b7586152ea51ac9b7a5d05c1ddd5e7370"
+      }
+    },
+    {
+      "name": "Q5_K-256",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 22528,
+      "output_bytes": 4096,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q5_K-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "cccaa4367b4a06faba242e84ef5aef302d58ce73c58c51415337ca33058b7dbb"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q5_K-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "cccaa4367b4a06faba242e84ef5aef302d58ce73c58c51415337ca33058b7dbb"
+      }
+    },
+    {
+      "name": "Q5_K-256",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 22528,
+      "output_bytes": 2048,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q5_K-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "fa74aaf35aaea5781445d59d0d0dada1584a47fa079a374fb60a0d00dc52751a"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q5_K-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "fa74aaf35aaea5781445d59d0d0dada1584a47fa079a374fb60a0d00dc52751a"
+      }
+    },
+    {
+      "name": "Q5_K-1024",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 90112,
+      "output_bytes": 16384,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q5_K-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "8abdaf31ff6e869553fd22f6f57b15dd5699ac83921422291c22fb5979734c14"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q5_K-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "8abdaf31ff6e869553fd22f6f57b15dd5699ac83921422291c22fb5979734c14"
+      }
+    },
+    {
+      "name": "Q5_K-1024",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 90112,
+      "output_bytes": 8192,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q5_K-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "d448a2b8bf36fe9817b6ab4447bab0b32cf052268cdbe5d4a0b1166cb93dabab"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q5_K-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "d448a2b8bf36fe9817b6ab4447bab0b32cf052268cdbe5d4a0b1166cb93dabab"
+      }
+    },
+    {
+      "name": "Q6_K-256",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 26880,
+      "output_bytes": 4096,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": false,
+      "max_absolute_error": 0.00048828125,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q6_K-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "3e1665a3167a552c47493bdc538166acfa6cbd43a1e7dd30230c40e3c5b11207"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q6_K-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "955ba972e48a303803cdacca928e7f60176dfaa1b7f8590038bdb91830658428"
+      }
+    },
+    {
+      "name": "Q6_K-256",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 26880,
+      "output_bytes": 2048,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": false,
+      "max_absolute_error": 0.0078125,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q6_K-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "242d1b322588618517ee3d4d62e393d08b2faca2262414ab00d89d092598e8ee"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q6_K-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "c65412c7615787b9103207f55776d49dfda767740f4d6e1106cb711a99404bc6"
+      }
+    },
+    {
+      "name": "Q6_K-1024",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 107520,
+      "output_bytes": 16384,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": false,
+      "max_absolute_error": 0.00048828125,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q6_K-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "158400e054e65af2adad3e7d348b2fc3e082fcfc065706db200704d3c86a2581"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q6_K-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "5a0f2bb0da03f1eb5c689c6f95be636890aec44873bffe77dd039c2b5bc6c20a"
+      }
+    },
+    {
+      "name": "Q6_K-1024",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 107520,
+      "output_bytes": 8192,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": false,
+      "max_absolute_error": 0.0078125,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q6_K-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "54c4ea60561a742634c5fdf24c4dd372f0e101a48bf29b53d53a0b7e88f31aea"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/Q6_K-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "5955c913676e2e5003f84ad0dca7062d3f7106188a13e4844b13774a2764c238"
+      }
+    },
+    {
+      "name": "Q8_K-256",
+      "dtype": "f32",
+      "oracle": "stock",
+      "elements": 1024,
+      "table_bytes": 37376,
+      "output_bytes": 4096,
+      "scratch_bytes": 16,
+      "tolerance": "byte-exact, with explicit f32-to-bf16 RNE for bf16 output",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q8_K-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "42d365370201b210a4c646cc5718a3bf7becff7ef20bb5f381a1736ba22850e6"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-operator-v1/Q8_K-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "42d365370201b210a4c646cc5718a3bf7becff7ef20bb5f381a1736ba22850e6"
+      }
+    },
+    {
+      "name": "Q8_K-256",
+      "dtype": "bf16",
+      "oracle": "stock",
+      "elements": 1024,
+      "table_bytes": 37376,
+      "output_bytes": 2048,
+      "scratch_bytes": 16,
+      "tolerance": "byte-exact, with explicit f32-to-bf16 RNE for bf16 output",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q8_K-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "f5da512dcaf2f4165abd5b4b1377d275a5945d2ab8946d2d8266600c5b03d31f"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-operator-v1/Q8_K-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "42d365370201b210a4c646cc5718a3bf7becff7ef20bb5f381a1736ba22850e6"
+      }
+    },
+    {
+      "name": "Q8_K-1024",
+      "dtype": "f32",
+      "oracle": "stock",
+      "elements": 4096,
+      "table_bytes": 149504,
+      "output_bytes": 16384,
+      "scratch_bytes": 16,
+      "tolerance": "byte-exact, with explicit f32-to-bf16 RNE for bf16 output",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q8_K-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "bc4c56d33b3d53d928f21b39953ba08f191aec465ead263abb832820f6ccd29c"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-operator-v1/Q8_K-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "bc4c56d33b3d53d928f21b39953ba08f191aec465ead263abb832820f6ccd29c"
+      }
+    },
+    {
+      "name": "Q8_K-1024",
+      "dtype": "bf16",
+      "oracle": "stock",
+      "elements": 4096,
+      "table_bytes": 149504,
+      "output_bytes": 8192,
+      "scratch_bytes": 16,
+      "tolerance": "byte-exact, with explicit f32-to-bf16 RNE for bf16 output",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/Q8_K-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "6a1aa0cd72dca3f6ae3f6b835eeba50a87bf7b143ad607baa30482f0835f8c22"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-operator-v1/Q8_K-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "bc4c56d33b3d53d928f21b39953ba08f191aec465ead263abb832820f6ccd29c"
+      }
+    },
+    {
+      "name": "IQ2_XXS-256",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 8448,
+      "output_bytes": 4096,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ2_XXS-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "2d205710a3efc0745c45410d91ff4e86d43f486a8366714b93586957c69c1432"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ2_XXS-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "2d205710a3efc0745c45410d91ff4e86d43f486a8366714b93586957c69c1432"
+      }
+    },
+    {
+      "name": "IQ2_XXS-256",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 8448,
+      "output_bytes": 2048,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ2_XXS-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "7cfe27efb61e2bacbb37365e0375af69a42afacb9ad6bd20ed8a5732b710204b"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ2_XXS-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "7cfe27efb61e2bacbb37365e0375af69a42afacb9ad6bd20ed8a5732b710204b"
+      }
+    },
+    {
+      "name": "IQ2_XXS-1024",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 33792,
+      "output_bytes": 16384,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ2_XXS-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "7e5ac721517328088f4c4ff43e30aec9413c5e18047d91b3651b486d33ca45e2"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ2_XXS-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "7e5ac721517328088f4c4ff43e30aec9413c5e18047d91b3651b486d33ca45e2"
+      }
+    },
+    {
+      "name": "IQ2_XXS-1024",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 33792,
+      "output_bytes": 8192,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ2_XXS-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "d94a7d1d127389dccf61f4d39c484e8a38c6c6b8eb5cf1f2a2e1c2a5b0c5240c"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ2_XXS-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "d94a7d1d127389dccf61f4d39c484e8a38c6c6b8eb5cf1f2a2e1c2a5b0c5240c"
+      }
+    },
+    {
+      "name": "IQ2_XS-256",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 9472,
+      "output_bytes": 4096,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ2_XS-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "81f10e413631a1188b1b74dabba22f95812c2d7c8d5b34b2276cf69bf30b92aa"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ2_XS-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "81f10e413631a1188b1b74dabba22f95812c2d7c8d5b34b2276cf69bf30b92aa"
+      }
+    },
+    {
+      "name": "IQ2_XS-256",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 9472,
+      "output_bytes": 2048,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ2_XS-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "5d1ebc762d9b8c8160b7246ad2701e404d04fccac8a42fb8e1d12739fc7023db"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ2_XS-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "5d1ebc762d9b8c8160b7246ad2701e404d04fccac8a42fb8e1d12739fc7023db"
+      }
+    },
+    {
+      "name": "IQ2_XS-1024",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 37888,
+      "output_bytes": 16384,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ2_XS-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "74837cd35b8970c160e6785ca19ad9163178e039b3f63d280be46003710430bd"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ2_XS-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "74837cd35b8970c160e6785ca19ad9163178e039b3f63d280be46003710430bd"
+      }
+    },
+    {
+      "name": "IQ2_XS-1024",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 37888,
+      "output_bytes": 8192,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ2_XS-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "ea2f9564900a1bb82888a86bd5e1605682e30e1cc33fa0453815dc30a22712a5"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ2_XS-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "ea2f9564900a1bb82888a86bd5e1605682e30e1cc33fa0453815dc30a22712a5"
+      }
+    },
+    {
+      "name": "IQ3_XXS-256",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 12544,
+      "output_bytes": 4096,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ3_XXS-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "292689c91164b2c7dc6f225d06eacbbc19b005d40dd8992c19dbe8bd55b0fdda"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ3_XXS-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "292689c91164b2c7dc6f225d06eacbbc19b005d40dd8992c19dbe8bd55b0fdda"
+      }
+    },
+    {
+      "name": "IQ3_XXS-256",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 12544,
+      "output_bytes": 2048,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ3_XXS-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "92bc21816f28827df760ea52f25de72ee085b53c63b3d691e3d42a7c09496631"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ3_XXS-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "92bc21816f28827df760ea52f25de72ee085b53c63b3d691e3d42a7c09496631"
+      }
+    },
+    {
+      "name": "IQ3_XXS-1024",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 50176,
+      "output_bytes": 16384,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ3_XXS-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "7e044ef28ae859e13df96388c97c06f50e1df645cdf7eb9fec9a373a7b7745e1"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ3_XXS-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "7e044ef28ae859e13df96388c97c06f50e1df645cdf7eb9fec9a373a7b7745e1"
+      }
+    },
+    {
+      "name": "IQ3_XXS-1024",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 50176,
+      "output_bytes": 8192,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ3_XXS-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "812efe38d269cceafbc23f54913b3d3e3ef2177730f0bfcf9915287bb804bf44"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ3_XXS-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "812efe38d269cceafbc23f54913b3d3e3ef2177730f0bfcf9915287bb804bf44"
+      }
+    },
+    {
+      "name": "IQ1_S-256",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 6400,
+      "output_bytes": 4096,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ1_S-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "4e7645670f8d1e86c3aa84d9b63435bdbd241228eeea56cf39686a6280d3eaf1"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ1_S-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "4e7645670f8d1e86c3aa84d9b63435bdbd241228eeea56cf39686a6280d3eaf1"
+      }
+    },
+    {
+      "name": "IQ1_S-256",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 6400,
+      "output_bytes": 2048,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ1_S-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "f2a6a1a52667cf9cf4f822f9af52408880f21d9a1955d46e7704a3a21d191090"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ1_S-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "f2a6a1a52667cf9cf4f822f9af52408880f21d9a1955d46e7704a3a21d191090"
+      }
+    },
+    {
+      "name": "IQ1_S-1024",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 25600,
+      "output_bytes": 16384,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ1_S-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "7d93653c10b72ce36a7bc4a6a46ec21eefd3d4704128f0281b8eeb4b018f1a02"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ1_S-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "7d93653c10b72ce36a7bc4a6a46ec21eefd3d4704128f0281b8eeb4b018f1a02"
+      }
+    },
+    {
+      "name": "IQ1_S-1024",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 25600,
+      "output_bytes": 8192,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ1_S-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "5972de407abdee675d416358801507600103e60c5518d5a7e3dc61362d3e4fe9"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ1_S-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "5972de407abdee675d416358801507600103e60c5518d5a7e3dc61362d3e4fe9"
+      }
+    },
+    {
+      "name": "IQ4_NL-256",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 18432,
+      "output_bytes": 4096,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ4_NL-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "16184a3758d6b6f361b16cf741d5fe0d05ff8f7d866050ebdc3354915c57ad9e"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ4_NL-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "16184a3758d6b6f361b16cf741d5fe0d05ff8f7d866050ebdc3354915c57ad9e"
+      }
+    },
+    {
+      "name": "IQ4_NL-256",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 18432,
+      "output_bytes": 2048,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ4_NL-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "4f602b6088ab68c2631b7293a3e884785828a135de210d6fd8eb2b82b7bc69d9"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ4_NL-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "4f602b6088ab68c2631b7293a3e884785828a135de210d6fd8eb2b82b7bc69d9"
+      }
+    },
+    {
+      "name": "IQ4_NL-1024",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 73728,
+      "output_bytes": 16384,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ4_NL-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "d7f5fb54d2e2c52429c669245858945ae1b0a6fcee09f24c8a21c7c7d71ab516"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ4_NL-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "d7f5fb54d2e2c52429c669245858945ae1b0a6fcee09f24c8a21c7c7d71ab516"
+      }
+    },
+    {
+      "name": "IQ4_NL-1024",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 73728,
+      "output_bytes": 8192,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ4_NL-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "2bf0d166828994d5497b4cb20400fbbc45c1fc0fd94a3380d525df16450b81a3"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ4_NL-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "2bf0d166828994d5497b4cb20400fbbc45c1fc0fd94a3380d525df16450b81a3"
+      }
+    },
+    {
+      "name": "IQ3_S-256",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 14080,
+      "output_bytes": 4096,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": false,
+      "max_absolute_error": 0.12109375,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ3_S-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "7843ff13e1c7f1475f949583ec0466b7cd3020723994d7c725e7c618c11c34f0"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ3_S-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "8cad98f9fecbfcac883cb11a91df1ac703846dfe88bac12792ab3066420243ad"
+      }
+    },
+    {
+      "name": "IQ3_S-256",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 14080,
+      "output_bytes": 2048,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": false,
+      "max_absolute_error": 0.125,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ3_S-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "281888da0636914c257cd25407adc1465b2d40e96aa7694eb5c3bd0df4036b73"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ3_S-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "7f36f4a4ba9f0977f68d452e8ec1d26ea299ea9ddbc82fd0ede324abc94d6595"
+      }
+    },
+    {
+      "name": "IQ3_S-1024",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 56320,
+      "output_bytes": 16384,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": false,
+      "max_absolute_error": 0.12109375,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ3_S-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "8932dbeb65d3716cfb60014ad471ab0fb5d2d2d4b037e8745464e65f77b936de"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ3_S-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "ebcadd200e64857ed483aa7176172dc94b966198fb81d2910ab723260fb46fdc"
+      }
+    },
+    {
+      "name": "IQ3_S-1024",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 56320,
+      "output_bytes": 8192,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": false,
+      "max_absolute_error": 0.125,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ3_S-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "11a954e23ccc31f98a3398902b7ce96ec39f0fc0119d41202732630299d9a623"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ3_S-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "88e55dfa1c9378436bd431db09fca5bf5aad9910dc311b493d6f94d1ec98dc7c"
+      }
+    },
+    {
+      "name": "IQ2_S-256",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 10496,
+      "output_bytes": 4096,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ2_S-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "2c2908ecf0382e9e8d6414ca7bbacd8fe8ac95cc15dd5483d32293883801714f"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ2_S-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "2c2908ecf0382e9e8d6414ca7bbacd8fe8ac95cc15dd5483d32293883801714f"
+      }
+    },
+    {
+      "name": "IQ2_S-256",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 10496,
+      "output_bytes": 2048,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ2_S-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "22e25316adaf5931c49ef737972a2f1d612b90acb69a3ca76002effd2a43d195"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ2_S-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "22e25316adaf5931c49ef737972a2f1d612b90acb69a3ca76002effd2a43d195"
+      }
+    },
+    {
+      "name": "IQ2_S-1024",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 41984,
+      "output_bytes": 16384,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ2_S-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "90c3f52ffccbc2f83e5b66edaf5805f2e23967aea551d55d1216142a2e3cc9f4"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ2_S-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "90c3f52ffccbc2f83e5b66edaf5805f2e23967aea551d55d1216142a2e3cc9f4"
+      }
+    },
+    {
+      "name": "IQ2_S-1024",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 41984,
+      "output_bytes": 8192,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ2_S-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "68f4582c895e47c648f5a3e3972d991d38a49404f5d3dd1434a2e27b90096907"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ2_S-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "68f4582c895e47c648f5a3e3972d991d38a49404f5d3dd1434a2e27b90096907"
+      }
+    },
+    {
+      "name": "IQ4_XS-256",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 17408,
+      "output_bytes": 4096,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ4_XS-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "bc2868543de19f14c38589e427629f77c0fd02a8a24d22d47570e7fa03250ae2"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ4_XS-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "bc2868543de19f14c38589e427629f77c0fd02a8a24d22d47570e7fa03250ae2"
+      }
+    },
+    {
+      "name": "IQ4_XS-256",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 1024,
+      "table_bytes": 17408,
+      "output_bytes": 2048,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ4_XS-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "1d664b63884d614512b6544cb085eb91626e7e20ebd05d9afca3e662bcbdeccc"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ4_XS-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "1d664b63884d614512b6544cb085eb91626e7e20ebd05d9afca3e662bcbdeccc"
+      }
+    },
+    {
+      "name": "IQ4_XS-1024",
+      "dtype": "f32",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 69632,
+      "output_bytes": 16384,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ4_XS-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "c5d5b46955ae2c26887b015601e67cdaa3c4712910e1d743f58a0910f2cef889"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ4_XS-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "c5d5b46955ae2c26887b015601e67cdaa3c4712910e1d743f58a0910f2cef889"
+      }
+    },
+    {
+      "name": "IQ4_XS-1024",
+      "dtype": "bf16",
+      "oracle": "primary-plugin",
+      "elements": 4096,
+      "table_bytes": 69632,
+      "output_bytes": 8192,
+      "scratch_bytes": 16,
+      "tolerance": "atol=0.01 rtol=0.04, pinned upstream embedding test",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ4_XS-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "b5d820d40868cc699f6d83fa2cc63f773b7c01c42af2fc961952261e4198a48d"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/primary-synthetic-v1/IQ4_XS-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "b5d820d40868cc699f6d83fa2cc63f773b7c01c42af2fc961952261e4198a48d"
+      }
+    },
+    {
+      "name": "MXFP4-256",
+      "dtype": "f32",
+      "oracle": "stock",
+      "elements": 1024,
+      "table_bytes": 17408,
+      "output_bytes": 4096,
+      "scratch_bytes": 16,
+      "tolerance": "byte-exact, with explicit f32-to-bf16 RNE for bf16 output",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/MXFP4-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "aca27b230e9675ea214c31723306036025295c570903f8804d4d767b4fb0bdb2"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-operator-v1/MXFP4-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "aca27b230e9675ea214c31723306036025295c570903f8804d4d767b4fb0bdb2"
+      }
+    },
+    {
+      "name": "MXFP4-256",
+      "dtype": "bf16",
+      "oracle": "stock",
+      "elements": 1024,
+      "table_bytes": 17408,
+      "output_bytes": 2048,
+      "scratch_bytes": 16,
+      "tolerance": "byte-exact, with explicit f32-to-bf16 RNE for bf16 output",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/MXFP4-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "4b66106696144b4970929d2f5734d3ddf8e6e4580a2fe8910b500ebaab5431a9"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-operator-v1/MXFP4-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "aca27b230e9675ea214c31723306036025295c570903f8804d4d767b4fb0bdb2"
+      }
+    },
+    {
+      "name": "MXFP4-1024",
+      "dtype": "f32",
+      "oracle": "stock",
+      "elements": 4096,
+      "table_bytes": 69632,
+      "output_bytes": 16384,
+      "scratch_bytes": 16,
+      "tolerance": "byte-exact, with explicit f32-to-bf16 RNE for bf16 output",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/MXFP4-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "a2688e4f8d766f642b8fbdebcbfff7e4e2720ae9fc57409812eb0a21f4bb6fec"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-operator-v1/MXFP4-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "a2688e4f8d766f642b8fbdebcbfff7e4e2720ae9fc57409812eb0a21f4bb6fec"
+      }
+    },
+    {
+      "name": "MXFP4-1024",
+      "dtype": "bf16",
+      "oracle": "stock",
+      "elements": 4096,
+      "table_bytes": 69632,
+      "output_bytes": 8192,
+      "scratch_bytes": 16,
+      "tolerance": "byte-exact, with explicit f32-to-bf16 RNE for bf16 output",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/MXFP4-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "cdd6e95bc3bc3e18bc014dee2cdb125cb179b670256896536b0e3822b0adfa83"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-operator-v1/MXFP4-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "a2688e4f8d766f642b8fbdebcbfff7e4e2720ae9fc57409812eb0a21f4bb6fec"
+      }
+    },
+    {
+      "name": "IQ1_XXXS-256",
+      "dtype": "f32",
+      "oracle": "fork",
+      "elements": 1024,
+      "table_bytes": 4864,
+      "output_bytes": 4096,
+      "scratch_bytes": 16,
+      "tolerance": "byte-exact, with explicit f32-to-bf16 RNE for bf16 output",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ1_XXXS-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "b4707ef68fb11c9d3720db82722924de4004e75c97d07cdbd0b24c08f3677fce"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-operator-v1/IQ1_XXXS-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "b4707ef68fb11c9d3720db82722924de4004e75c97d07cdbd0b24c08f3677fce"
+      }
+    },
+    {
+      "name": "IQ1_XXXS-256",
+      "dtype": "bf16",
+      "oracle": "fork",
+      "elements": 1024,
+      "table_bytes": 4864,
+      "output_bytes": 2048,
+      "scratch_bytes": 16,
+      "tolerance": "byte-exact, with explicit f32-to-bf16 RNE for bf16 output",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ1_XXXS-256-bf16.bin",
+        "bytes": 2048,
+        "sha256": "9de69ca2d01fda18f05e9ee7ac531f3cb806d39a3af8d10e64ba0c53dab1b08a"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-operator-v1/IQ1_XXXS-256-f32.bin",
+        "bytes": 4096,
+        "sha256": "b4707ef68fb11c9d3720db82722924de4004e75c97d07cdbd0b24c08f3677fce"
+      }
+    },
+    {
+      "name": "IQ1_XXXS-1024",
+      "dtype": "f32",
+      "oracle": "fork",
+      "elements": 4096,
+      "table_bytes": 19456,
+      "output_bytes": 16384,
+      "scratch_bytes": 16,
+      "tolerance": "byte-exact, with explicit f32-to-bf16 RNE for bf16 output",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ1_XXXS-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "10b121b53bde30b8e24ea1fb6ef8bb4f3123952900c2c66886d2e09b40ee62c0"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-operator-v1/IQ1_XXXS-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "10b121b53bde30b8e24ea1fb6ef8bb4f3123952900c2c66886d2e09b40ee62c0"
+      }
+    },
+    {
+      "name": "IQ1_XXXS-1024",
+      "dtype": "bf16",
+      "oracle": "fork",
+      "elements": 4096,
+      "table_bytes": 19456,
+      "output_bytes": 8192,
+      "scratch_bytes": 16,
+      "tolerance": "byte-exact, with explicit f32-to-bf16 RNE for bf16 output",
+      "byte_exact": true,
+      "max_absolute_error": 0.0,
+      "finite": true,
+      "pass": true,
+      "native": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/native-synthetic-v2/IQ1_XXXS-1024-bf16.bin",
+        "bytes": 8192,
+        "sha256": "14e07510990f222b0656fdbacd1a3d6271c28e00526587b67c4a1b399674c3d5"
+      },
+      "oracle_output": {
+        "file": "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-operator-v1/IQ1_XXXS-1024-f32.bin",
+        "bytes": 16384,
+        "sha256": "10b121b53bde30b8e24ea1fb6ef8bb4f3123952900c2c66886d2e09b40ee62c0"
+      }
+    }
+  ],
+  "outputs": 76,
+  "all_pass": true,
+  "scope": "synthetic operation parity; original fixture and model gates remain separate"
+}

@@ -1,0 +1,369 @@
+
+### 02:15:40 === A. ENV ===
+rc-worker-n8smh
+Sun Sep  6 02:15:40 UTC 2026
+aarch64
+RESULT HOST: rc-worker-n8smh arch=aarch64 cpus=14
+NVIDIA Thor, 11.0, 595.78
+RESULT GPU: NVIDIA Thor, 11.0, 595.78
+RESULT DF /tmp before: overlay         918G  722G  149G  83% /
+SUM ENV_RC=0
+
+### 02:15:47 === B. THE BINARY IS WAVE ARMTOKENS', BY DIGEST ===
+SUM BINCOPY_RC=0
+RESULT BINARY sha256=1d129fa0ab96663bea8f50f715117596241a7f2f8ae77e877ba5853bb198792f (expect 1d129fa0ab96663bea8f50f715117596241a7f2f8ae77e877ba5853bb198792f)
+SUM BINSHA_RC=0
+RESULT BINARY EXECS: rc=0 help_lines=37
+RESULT BINARY CARRIES: VT_MOE_SEL_FP=1(>=1) moesel_fmt=2(>=1) poscontrol=3(>=1) negcontrol=0(==0)
+SUM BININSTR_RC=0
+
+### 02:15:53 === C. THE ARTIFACT IS THE SAME ONE, STAGED WORKER-LOCAL ===
+RESULT ARTIFACT STAGE REUSED (no copy)
+RESULT ARTIFACT shard1 sha256=88a1420825a9304063e882ada29d438263617f51ac8923d438d927496693bafd (expect 88a1420825a9304063e882ada29d438263617f51ac8923d438d927496693bafd)
+RESULT ARTIFACT shards=3 staged_bytes=72546461650
+SUM ARTIFACT_RC=0
+
+### 02:15:53 === ARM A-CPU (device=cpu env='VT_CPU_QUANT_REPACK=0') ===
+RESULT ARM A-CPU START device=cpu env='VT_CPU_QUANT_REPACK=0' budget=512
+RESULT ARM A-CPU HEALTH up=1 load_wall=45s
+SUM ARM_A-CPU_UP=1
+RESULT ARM A-CPU REQ http=200 curl_rc=0 wall=5s
+RESULT ARM A-CPU TOKEN IDS: 11751 13 15767 411 2029 11 1092 369
+RESULT ARM A-CPU EXPECTED  : 11751 13 15767 411 2029 11 1092 369
+RESULT ARM A-CPU DRIFT: NONE (the tap did not perturb the sampled ids)
+SUM ARM_A-CPU_DRIFT=0
+RESULT ARM A-CPU MOESEL LINES: 960  digests=384
+SUM ARM_A-CPU_SELLINES=960
+RESULT ARM A-CPU LAST DIGEST: moesel call=383 dev=0 T=1 E=512 k=10 sel=7eafad3768793b6f minulps=1 mintok=0 x=2133.37231 logit=3271.54688 exp=1324.99537 shr=125.559372 lines=576 END
+RESULT ARM A-CPU steps completed: 11
+RESULT ARM A-CPU FIRST ERROR LINE: 
+/workspace/moesel-2552-fwd4/job.sh: line 122: 748002 Killed                  env VT_MOE_SEL_FP=$BUDGET "$@" "$SERVER" --model "$STAGE/$S1F" --device "$DEVICE" --host 127.0.0.1 --port $PORT --block-size 16 --num-blocks 128 --max-model-len 256 --served-model-name qwen4exp --verbose > "$AOUT/server.log" 2>&1
+RESULT ARM A-CPU END
+SUM ARM_A_RC=0
+
+### 02:16:57 === ARM B-CUDA (device=cuda env='VT_CPU_QUANT_REPACK=0') ===
+RESULT ARM B-CUDA START device=cuda env='VT_CPU_QUANT_REPACK=0' budget=512
+RESULT ARM B-CUDA HEALTH up=1 load_wall=15s
+SUM ARM_B-CUDA_UP=1
+### hb 02:17:40 load=6.15 5.57 5.55
+RESULT ARM B-CUDA REQ http=200 curl_rc=0 wall=112s
+RESULT ARM B-CUDA TOKEN IDS: 11751 13 15767 411 1928 11 628 567
+RESULT ARM B-CUDA EXPECTED  : 11751 13 15767 411 1928 11 628 567
+RESULT ARM B-CUDA DRIFT: NONE (the tap did not perturb the sampled ids)
+SUM ARM_B-CUDA_DRIFT=0
+RESULT ARM B-CUDA MOESEL LINES: 960  digests=384
+SUM ARM_B-CUDA_SELLINES=960
+RESULT ARM B-CUDA LAST DIGEST: moesel call=383 dev=1 T=1 E=512 k=10 sel=4455121f195fbf99 minulps=2 mintok=0 x=2202.47119 logit=3265.78125 exp=1518.05895 shr=102.723363 lines=576 END
+RESULT ARM B-CUDA steps completed: 11
+RESULT ARM B-CUDA FIRST ERROR LINE: 
+/workspace/moesel-2552-fwd4/job.sh: line 122: 748094 Killed                  env VT_MOE_SEL_FP=$BUDGET "$@" "$SERVER" --model "$STAGE/$S1F" --device "$DEVICE" --host 127.0.0.1 --port $PORT --block-size 16 --num-blocks 128 --max-model-len 256 --served-model-name qwen4exp --verbose > "$AOUT/server.log" 2>&1
+RESULT ARM B-CUDA END
+SUM ARM_B_RC=0
+
+### 02:19:17 === ARM C-CPU2 (device=cpu env='VT_CPU_QUANT_REPACK=0') ===
+RESULT ARM C-CPU2 START device=cpu env='VT_CPU_QUANT_REPACK=0' budget=512
+RESULT ARM C-CPU2 HEALTH up=1 load_wall=15s
+SUM ARM_C-CPU2_UP=1
+RESULT ARM C-CPU2 REQ http=200 curl_rc=0 wall=6s
+RESULT ARM C-CPU2 TOKEN IDS: 11751 13 15767 411 2029 11 1092 369
+RESULT ARM C-CPU2 EXPECTED  : 11751 13 15767 411 2029 11 1092 369
+RESULT ARM C-CPU2 DRIFT: NONE (the tap did not perturb the sampled ids)
+SUM ARM_C-CPU2_DRIFT=0
+### hb 02:19:40 load=6.17 5.78 5.63
+RESULT ARM C-CPU2 MOESEL LINES: 960  digests=384
+SUM ARM_C-CPU2_SELLINES=960
+RESULT ARM C-CPU2 LAST DIGEST: moesel call=383 dev=0 T=1 E=512 k=10 sel=7eafad3768793b6f minulps=1 mintok=0 x=2133.37231 logit=3271.54688 exp=1324.99537 shr=125.559372 lines=576 END
+RESULT ARM C-CPU2 steps completed: 11
+RESULT ARM C-CPU2 FIRST ERROR LINE: 
+/workspace/moesel-2552-fwd4/job.sh: line 122: 748168 Killed                  env VT_MOE_SEL_FP=$BUDGET "$@" "$SERVER" --model "$STAGE/$S1F" --device "$DEVICE" --host 127.0.0.1 --port $PORT --block-size 16 --num-blocks 128 --max-model-len 256 --served-model-name qwen4exp --verbose > "$AOUT/server.log" 2>&1
+RESULT ARM C-CPU2 END
+SUM ARM_C_RC=0
+SUM ARMS_RC=0
+SUM TOKENDRIFT_RC=0
+
+### 02:19:51 === D. THE NEGATIVE CONTROL: A vs C MUST FLIP NOTHING ===
+SUM CONTROL_CMP_RC=0
+=== CONTROL-A-vs-C ===
+RESULT SELFWD CONTROL-A-vs-C COUNT base_digests=384 other_digests=384 base_tok=576 other_tok=576
+RESULT SELFWD CONTROL-A-vs-C COUNTED-PROPERTY base last_digest_lines=576 value_lines_seen=576 agree=True
+RESULT SELFWD CONTROL-A-vs-C COUNTED-PROPERTY other last_digest_lines=576 value_lines_seen=576 agree=True
+RESULT SELFWD CONTROL-A-vs-C STRUCTURE calls_common=384 prefill_calls(L)=48 decode_calls=336 T_prefill=5
+RESULT SELFWD CONTROL-A-vs-C STRUCTURE contiguous_and_uniform=True
+RESULT SELFWD CONTROL-A-vs-C STRUCTURE forwards=8 moe_blocks_per_forward=48
+fwd  phase   calls  slots     FLIPPED   hash_mism  first_L  
+0    prefill 48     240       0         0          -        
+RESULT SELFWD CONTROL-A-vs-C FWD 0 prefill calls=48 slots=240 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+1    decode  48     48        0         0          -        
+RESULT SELFWD CONTROL-A-vs-C FWD 1 decode calls=48 slots=48 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+2    decode  48     48        0         0          -        
+RESULT SELFWD CONTROL-A-vs-C FWD 2 decode calls=48 slots=48 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+3    decode  48     48        0         0          -        
+RESULT SELFWD CONTROL-A-vs-C FWD 3 decode calls=48 slots=48 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+4    decode  48     48        0         0          -        
+RESULT SELFWD CONTROL-A-vs-C FWD 4 decode calls=48 slots=48 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+5    decode  48     48        0         0          -        
+RESULT SELFWD CONTROL-A-vs-C FWD 5 decode calls=48 slots=48 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+6    decode  48     48        0         0          -        
+RESULT SELFWD CONTROL-A-vs-C FWD 6 decode calls=48 slots=48 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+7    decode  48     48        0         0          -        
+RESULT SELFWD CONTROL-A-vs-C FWD 7 decode calls=48 slots=48 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+RESULT SELFWD CONTROL-A-vs-C GROUP DIVERGING forwards=[4, 6, 7] slots=144 FLIPPED=0
+RESULT SELFWD CONTROL-A-vs-C GROUP AGREEING forwards=[1, 2, 3, 5] slots=192 FLIPPED=0
+RESULT SELFWD CONTROL-A-vs-C HIGHEST FORWARD REACHED = 7 (the open clause needs >= 7)
+RESULT SELFWD CONTROL-A-vs-C CALL0 x_base=3615.47142 x_other=3615.47142 (compare with the recorded L00 mhc.mix pair)
+RESULT SELFWD CONTROL-A-vs-C CALL0 sel_base=5bbd84f0b21b362b sel_other=5bbd84f0b21b362b hash_equal=True
+RESULT SELFWD CONTROL-A-vs-C CALL0 LAYER-0 VERDICT: tokens=5 FLIPPED=0 -> NO FLIP (layer 0 agrees on every token)
+RESULT SELFWD CONTROL-A-vs-C CALL0 tok=0 equal=True base_ulps=4 other_ulps=4 base_ids=32,46,71,130,160,215,226,286,309,342 other_ids=32,46,71,130,160,215,226,286,309,342
+RESULT SELFWD CONTROL-A-vs-C CALL0 tok=1 equal=True base_ulps=2 other_ulps=2 base_ids=68,119,289,293,338,369,386,441,471,492 other_ids=68,119,289,293,338,369,386,441,471,492
+RESULT SELFWD CONTROL-A-vs-C CALL0 tok=2 equal=True base_ulps=1 other_ulps=1 base_ids=21,76,101,265,293,301,314,338,361,369 other_ids=21,76,101,265,293,301,314,338,361,369
+RESULT SELFWD CONTROL-A-vs-C CALL0 tok=3 equal=True base_ulps=1 other_ulps=1 base_ids=211,226,366,367,386,414,434,441,446,503 other_ids=211,226,366,367,386,414,434,441,446,503
+RESULT SELFWD CONTROL-A-vs-C CALL0 tok=4 equal=True base_ulps=0 other_ulps=0 base_ids=21,88,96,148,265,337,378,406,462,463 other_ids=21,88,96,148,265,337,378,406,462,463
+RESULT SELFWD CONTROL-A-vs-C TIE-RATE base exact_bf16_ties=143 of 576 boundaries = 24.8%
+RESULT SELFWD CONTROL-A-vs-C TIE-RATE other exact_bf16_ties=143 of 576 boundaries = 24.8%
+RESULT SELFWD CONTROL-A-vs-C AXIS x     first_call_not_bit_identical=None (forward=-) [ORDERING ONLY]
+RESULT SELFWD CONTROL-A-vs-C AXIS logit first_call_not_bit_identical=None (forward=-) [ORDERING ONLY]
+RESULT SELFWD CONTROL-A-vs-C AXIS exp   first_call_not_bit_identical=None (forward=-) [ORDERING ONLY]
+RESULT CONTROL A-vs-C total_flipped_slots=0 (MUST be 0)
+SUM CONTROL_FLIPS=0
+
+### 02:19:53 === E. THE MEASUREMENT: A vs B, GROUPED BY FORWARD ===
+SUM MEASURE_CMP_RC=0
+=== MEASURE-CPU-vs-CUDA ===
+RESULT SELFWD MEASURE-CPU-vs-CUDA COUNT base_digests=384 other_digests=384 base_tok=576 other_tok=576
+RESULT SELFWD MEASURE-CPU-vs-CUDA COUNTED-PROPERTY base last_digest_lines=576 value_lines_seen=576 agree=True
+RESULT SELFWD MEASURE-CPU-vs-CUDA COUNTED-PROPERTY other last_digest_lines=576 value_lines_seen=576 agree=True
+RESULT SELFWD MEASURE-CPU-vs-CUDA STRUCTURE calls_common=384 prefill_calls(L)=48 decode_calls=336 T_prefill=5
+RESULT SELFWD MEASURE-CPU-vs-CUDA STRUCTURE contiguous_and_uniform=True
+RESULT SELFWD MEASURE-CPU-vs-CUDA STRUCTURE forwards=8 moe_blocks_per_forward=48
+fwd  phase   calls  slots     FLIPPED   hash_mism  first_L  
+0    prefill 48     240       53        35         4        
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 0 prefill calls=48 slots=240 FLIPPED=53 hash_mismatch=35 first_flip_layer=4
+     first flip: call=4 layer=4 tok=4
+        base  ids=41,48,54,63,133,205,252,309,393,469 ulps=0 lo=-4.34375(0xc08b) hi=-4.34375(0xc08b)
+        other ids=41,48,54,133,205,252,309,360,393,469 ulps=1 lo=-4.34375(0xc08b) hi=-4.375(0xc08c)
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 0 FIRSTFLIP call=4 layer=4 tok=4 base_ids=41,48,54,63,133,205,252,309,393,469 other_ids=41,48,54,133,205,252,309,360,393,469 base_ulps=0 other_ulps=1
+1    decode  48     48        22        22         12       
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 1 decode calls=48 slots=48 FLIPPED=22 hash_mismatch=22 first_flip_layer=12
+     first flip: call=60 layer=12 tok=0
+        base  ids=10,36,139,180,216,281,344,366,381,436 ulps=1 lo=-4.125(0xc084) hi=-4.15625(0xc085)
+        other ids=10,36,67,139,180,216,281,366,381,436 ulps=0 lo=-4.125(0xc084) hi=-4.125(0xc084)
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 1 FIRSTFLIP call=60 layer=12 tok=0 base_ids=10,36,139,180,216,281,344,366,381,436 other_ids=10,36,67,139,180,216,281,366,381,436 base_ulps=1 other_ulps=0
+2    decode  48     48        29        29         5        
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 2 decode calls=48 slots=48 FLIPPED=29 hash_mismatch=29 first_flip_layer=5
+     first flip: call=101 layer=5 tok=0
+        base  ids=20,34,56,163,216,220,236,421,435,460 ulps=0 lo=-4.6875(0xc096) hi=-4.6875(0xc096)
+        other ids=34,56,163,216,220,236,336,421,435,460 ulps=1 lo=-4.65625(0xc095) hi=-4.6875(0xc096)
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 2 FIRSTFLIP call=101 layer=5 tok=0 base_ids=20,34,56,163,216,220,236,421,435,460 other_ids=34,56,163,216,220,236,336,421,435,460 base_ulps=0 other_ulps=1
+3    decode  48     48        17        17         9        
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 3 decode calls=48 slots=48 FLIPPED=17 hash_mismatch=17 first_flip_layer=9
+     first flip: call=153 layer=9 tok=0
+        base  ids=75,111,139,154,171,367,462,466,508,511 ulps=0 lo=-4.25(0xc088) hi=-4.25(0xc088)
+        other ids=71,75,139,154,171,367,462,466,508,511 ulps=0 lo=-4.25(0xc088) hi=-4.25(0xc088)
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 3 FIRSTFLIP call=153 layer=9 tok=0 base_ids=75,111,139,154,171,367,462,466,508,511 other_ids=71,75,139,154,171,367,462,466,508,511 base_ulps=0 other_ulps=0
+4    decode  48     48        33        33         8        
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 4 decode calls=48 slots=48 FLIPPED=33 hash_mismatch=33 first_flip_layer=8
+     first flip: call=200 layer=8 tok=0
+        base  ids=148,182,231,244,325,363,370,429,451,505 ulps=0 lo=-3.875(0xc078) hi=-3.875(0xc078)
+        other ids=182,231,244,325,337,363,370,429,451,505 ulps=1 lo=-3.859375(0xc077) hi=-3.875(0xc078)
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 4 FIRSTFLIP call=200 layer=8 tok=0 base_ids=148,182,231,244,325,363,370,429,451,505 other_ids=182,231,244,325,337,363,370,429,451,505 base_ulps=0 other_ulps=1
+5    decode  48     48        48        48         0        
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 5 decode calls=48 slots=48 FLIPPED=48 hash_mismatch=48 first_flip_layer=0
+     first flip: call=240 layer=0 tok=0
+        base  ids=58,211,293,338,348,349,369,404,414,446 ulps=0 lo=-4.5625(0xc092) hi=-4.5625(0xc092)
+        other ids=58,133,289,290,291,338,348,349,404,426 ulps=1 lo=-4.53125(0xc091) hi=-4.5625(0xc092)
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 5 FIRSTFLIP call=240 layer=0 tok=0 base_ids=58,211,293,338,348,349,369,404,414,446 other_ids=58,133,289,290,291,338,348,349,404,426 base_ulps=0 other_ulps=1
+6    decode  48     48        46        46         1        
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 6 decode calls=48 slots=48 FLIPPED=46 hash_mismatch=46 first_flip_layer=1
+     first flip: call=289 layer=1 tok=0
+        base  ids=172,175,209,320,368,383,394,423,451,475 ulps=1 lo=-4.3125(0xc08a) hi=-4.34375(0xc08b)
+        other ids=0,172,175,209,215,320,368,383,451,475 ulps=0 lo=-4.25(0xc088) hi=-4.25(0xc088)
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 6 FIRSTFLIP call=289 layer=1 tok=0 base_ids=172,175,209,320,368,383,394,423,451,475 other_ids=0,172,175,209,215,320,368,383,451,475 base_ulps=1 other_ulps=0
+7    decode  48     48        48        48         0        
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 7 decode calls=48 slots=48 FLIPPED=48 hash_mismatch=48 first_flip_layer=0
+     first flip: call=336 layer=0 tok=0
+        base  ids=44,79,138,188,320,381,416,464,470,485 ulps=1 lo=-4.65625(0xc095) hi=-4.6875(0xc096)
+        other ids=34,44,138,190,378,384,427,463,470,485 ulps=11 lo=-4.21875(0xc087) hi=-4.5625(0xc092)
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 7 FIRSTFLIP call=336 layer=0 tok=0 base_ids=44,79,138,188,320,381,416,464,470,485 other_ids=34,44,138,190,378,384,427,463,470,485 base_ulps=1 other_ulps=11
+RESULT SELFWD MEASURE-CPU-vs-CUDA GROUP DIVERGING forwards=[4, 6, 7] slots=144 FLIPPED=127
+RESULT SELFWD MEASURE-CPU-vs-CUDA GROUP AGREEING forwards=[1, 2, 3, 5] slots=192 FLIPPED=116
+RESULT SELFWD MEASURE-CPU-vs-CUDA HIGHEST FORWARD REACHED = 7 (the open clause needs >= 7)
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 x_base=3615.47142 x_other=3615.62777 (compare with the recorded L00 mhc.mix pair)
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 sel_base=5bbd84f0b21b362b sel_other=5bbd84f0b21b362b hash_equal=True
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 LAYER-0 VERDICT: tokens=5 FLIPPED=0 -> NO FLIP (layer 0 agrees on every token)
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 tok=0 equal=True base_ulps=4 other_ulps=4 base_ids=32,46,71,130,160,215,226,286,309,342 other_ids=32,46,71,130,160,215,226,286,309,342
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 tok=1 equal=True base_ulps=2 other_ulps=2 base_ids=68,119,289,293,338,369,386,441,471,492 other_ids=68,119,289,293,338,369,386,441,471,492
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 tok=2 equal=True base_ulps=1 other_ulps=1 base_ids=21,76,101,265,293,301,314,338,361,369 other_ids=21,76,101,265,293,301,314,338,361,369
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 tok=3 equal=True base_ulps=1 other_ulps=1 base_ids=211,226,366,367,386,414,434,441,446,503 other_ids=211,226,366,367,386,414,434,441,446,503
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 tok=4 equal=True base_ulps=0 other_ulps=0 base_ids=21,88,96,148,265,337,378,406,462,463 other_ids=21,88,96,148,265,337,378,406,462,463
+RESULT SELFWD MEASURE-CPU-vs-CUDA TIE-RATE base exact_bf16_ties=143 of 576 boundaries = 24.8%
+RESULT SELFWD MEASURE-CPU-vs-CUDA TIE-RATE other exact_bf16_ties=133 of 576 boundaries = 23.1%
+RESULT SELFWD MEASURE-CPU-vs-CUDA AXIS x     first_call_not_bit_identical=0 (forward=0) [ORDERING ONLY]
+RESULT SELFWD MEASURE-CPU-vs-CUDA AXIS logit first_call_not_bit_identical=0 (forward=0) [ORDERING ONLY]
+RESULT SELFWD MEASURE-CPU-vs-CUDA AXIS exp   first_call_not_bit_identical=0 (forward=0) [ORDERING ONLY]
+RESULT SELFWD MEASURE-CPU-vs-CUDA AXIS shr   first_call_not_bit_identical=0 (forward=0) [ORDERING ONLY]
+RESULT SELFWD MEASURE-CPU-vs-CUDA VERDICT total_flipped_slots=296 over_forwards=8
+
+### 02:19:55 === E2. THE PAIR IS THE BRACKETED ONE, ASSERTED ON A SECOND INSTRUMENT ===
+RESULT CALL0 x A-CPU =3615.47142 (recorded L00 mhc.mix CPU-CHUNKED = 3615.47142)
+RESULT CALL0 x B-CUDA=3615.62777 (recorded L00 mhc.mix CUDA-CTRL  = 3615.62777)
+RESULT PAIR IDENTITY: CONFIRMED -- this is the 4.324e-05 matched pair
+SUM PAIRIDENT_RC=0
+
+### 02:19:55 === F. VERDICT INPUTS ===
+RESULT IDS A-CPU : 11751 13 15767 411 2029 11 1092 369
+RESULT IDS B-CUDA: 11751 13 15767 411 1928 11 628 567
+RESULT IDS C-CPU2: 11751 13 15767 411 2029 11 1092 369
+RESULT DF /tmp after: overlay         918G  722G  149G  83% /
+SUM DRIFT_RC=0
+SUM FINAL_RC=0
+
+### 02:19:57 === ALL RESULTS ===
+RESULT HOST: rc-worker-n8smh arch=aarch64 cpus=14
+RESULT GPU: NVIDIA Thor, 11.0, 595.78
+RESULT DF /tmp before: overlay         918G  722G  149G  83% /
+SUM ENV_RC=0
+SUM BINCOPY_RC=0
+RESULT BINARY sha256=1d129fa0ab96663bea8f50f715117596241a7f2f8ae77e877ba5853bb198792f (expect 1d129fa0ab96663bea8f50f715117596241a7f2f8ae77e877ba5853bb198792f)
+SUM BINSHA_RC=0
+RESULT BINARY EXECS: rc=0 help_lines=37
+RESULT BINARY CARRIES: VT_MOE_SEL_FP=1(>=1) moesel_fmt=2(>=1) poscontrol=3(>=1) negcontrol=0(==0)
+SUM BININSTR_RC=0
+RESULT ARTIFACT STAGE REUSED (no copy)
+RESULT ARTIFACT shard1 sha256=88a1420825a9304063e882ada29d438263617f51ac8923d438d927496693bafd (expect 88a1420825a9304063e882ada29d438263617f51ac8923d438d927496693bafd)
+RESULT ARTIFACT shards=3 staged_bytes=72546461650
+SUM ARTIFACT_RC=0
+RESULT ARM A-CPU START device=cpu env='VT_CPU_QUANT_REPACK=0' budget=512
+RESULT ARM A-CPU HEALTH up=1 load_wall=45s
+SUM ARM_A-CPU_UP=1
+RESULT ARM A-CPU REQ http=200 curl_rc=0 wall=5s
+RESULT ARM A-CPU TOKEN IDS: 11751 13 15767 411 2029 11 1092 369
+RESULT ARM A-CPU EXPECTED  : 11751 13 15767 411 2029 11 1092 369
+RESULT ARM A-CPU DRIFT: NONE (the tap did not perturb the sampled ids)
+SUM ARM_A-CPU_DRIFT=0
+RESULT ARM A-CPU MOESEL LINES: 960  digests=384
+SUM ARM_A-CPU_SELLINES=960
+RESULT ARM A-CPU LAST DIGEST: moesel call=383 dev=0 T=1 E=512 k=10 sel=7eafad3768793b6f minulps=1 mintok=0 x=2133.37231 logit=3271.54688 exp=1324.99537 shr=125.559372 lines=576 END
+RESULT ARM A-CPU steps completed: 11
+RESULT ARM A-CPU FIRST ERROR LINE: 
+RESULT ARM A-CPU END
+SUM ARM_A_RC=0
+RESULT ARM B-CUDA START device=cuda env='VT_CPU_QUANT_REPACK=0' budget=512
+RESULT ARM B-CUDA HEALTH up=1 load_wall=15s
+SUM ARM_B-CUDA_UP=1
+RESULT ARM B-CUDA REQ http=200 curl_rc=0 wall=112s
+RESULT ARM B-CUDA TOKEN IDS: 11751 13 15767 411 1928 11 628 567
+RESULT ARM B-CUDA EXPECTED  : 11751 13 15767 411 1928 11 628 567
+RESULT ARM B-CUDA DRIFT: NONE (the tap did not perturb the sampled ids)
+SUM ARM_B-CUDA_DRIFT=0
+RESULT ARM B-CUDA MOESEL LINES: 960  digests=384
+SUM ARM_B-CUDA_SELLINES=960
+RESULT ARM B-CUDA LAST DIGEST: moesel call=383 dev=1 T=1 E=512 k=10 sel=4455121f195fbf99 minulps=2 mintok=0 x=2202.47119 logit=3265.78125 exp=1518.05895 shr=102.723363 lines=576 END
+RESULT ARM B-CUDA steps completed: 11
+RESULT ARM B-CUDA FIRST ERROR LINE: 
+RESULT ARM B-CUDA END
+SUM ARM_B_RC=0
+RESULT ARM C-CPU2 START device=cpu env='VT_CPU_QUANT_REPACK=0' budget=512
+RESULT ARM C-CPU2 HEALTH up=1 load_wall=15s
+SUM ARM_C-CPU2_UP=1
+RESULT ARM C-CPU2 REQ http=200 curl_rc=0 wall=6s
+RESULT ARM C-CPU2 TOKEN IDS: 11751 13 15767 411 2029 11 1092 369
+RESULT ARM C-CPU2 EXPECTED  : 11751 13 15767 411 2029 11 1092 369
+RESULT ARM C-CPU2 DRIFT: NONE (the tap did not perturb the sampled ids)
+SUM ARM_C-CPU2_DRIFT=0
+RESULT ARM C-CPU2 MOESEL LINES: 960  digests=384
+SUM ARM_C-CPU2_SELLINES=960
+RESULT ARM C-CPU2 LAST DIGEST: moesel call=383 dev=0 T=1 E=512 k=10 sel=7eafad3768793b6f minulps=1 mintok=0 x=2133.37231 logit=3271.54688 exp=1324.99537 shr=125.559372 lines=576 END
+RESULT ARM C-CPU2 steps completed: 11
+RESULT ARM C-CPU2 FIRST ERROR LINE: 
+RESULT ARM C-CPU2 END
+SUM ARM_C_RC=0
+SUM ARMS_RC=0
+SUM TOKENDRIFT_RC=0
+SUM CONTROL_CMP_RC=0
+RESULT SELFWD CONTROL-A-vs-C COUNT base_digests=384 other_digests=384 base_tok=576 other_tok=576
+RESULT SELFWD CONTROL-A-vs-C COUNTED-PROPERTY base last_digest_lines=576 value_lines_seen=576 agree=True
+RESULT SELFWD CONTROL-A-vs-C COUNTED-PROPERTY other last_digest_lines=576 value_lines_seen=576 agree=True
+RESULT SELFWD CONTROL-A-vs-C STRUCTURE calls_common=384 prefill_calls(L)=48 decode_calls=336 T_prefill=5
+RESULT SELFWD CONTROL-A-vs-C STRUCTURE contiguous_and_uniform=True
+RESULT SELFWD CONTROL-A-vs-C STRUCTURE forwards=8 moe_blocks_per_forward=48
+RESULT SELFWD CONTROL-A-vs-C FWD 0 prefill calls=48 slots=240 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+RESULT SELFWD CONTROL-A-vs-C FWD 1 decode calls=48 slots=48 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+RESULT SELFWD CONTROL-A-vs-C FWD 2 decode calls=48 slots=48 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+RESULT SELFWD CONTROL-A-vs-C FWD 3 decode calls=48 slots=48 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+RESULT SELFWD CONTROL-A-vs-C FWD 4 decode calls=48 slots=48 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+RESULT SELFWD CONTROL-A-vs-C FWD 5 decode calls=48 slots=48 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+RESULT SELFWD CONTROL-A-vs-C FWD 6 decode calls=48 slots=48 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+RESULT SELFWD CONTROL-A-vs-C FWD 7 decode calls=48 slots=48 FLIPPED=0 hash_mismatch=0 first_flip_layer=-
+RESULT SELFWD CONTROL-A-vs-C GROUP DIVERGING forwards=[4, 6, 7] slots=144 FLIPPED=0
+RESULT SELFWD CONTROL-A-vs-C GROUP AGREEING forwards=[1, 2, 3, 5] slots=192 FLIPPED=0
+RESULT SELFWD CONTROL-A-vs-C HIGHEST FORWARD REACHED = 7 (the open clause needs >= 7)
+RESULT SELFWD CONTROL-A-vs-C CALL0 x_base=3615.47142 x_other=3615.47142 (compare with the recorded L00 mhc.mix pair)
+RESULT SELFWD CONTROL-A-vs-C CALL0 sel_base=5bbd84f0b21b362b sel_other=5bbd84f0b21b362b hash_equal=True
+RESULT SELFWD CONTROL-A-vs-C CALL0 LAYER-0 VERDICT: tokens=5 FLIPPED=0 -> NO FLIP (layer 0 agrees on every token)
+RESULT SELFWD CONTROL-A-vs-C CALL0 tok=0 equal=True base_ulps=4 other_ulps=4 base_ids=32,46,71,130,160,215,226,286,309,342 other_ids=32,46,71,130,160,215,226,286,309,342
+RESULT SELFWD CONTROL-A-vs-C CALL0 tok=1 equal=True base_ulps=2 other_ulps=2 base_ids=68,119,289,293,338,369,386,441,471,492 other_ids=68,119,289,293,338,369,386,441,471,492
+RESULT SELFWD CONTROL-A-vs-C CALL0 tok=2 equal=True base_ulps=1 other_ulps=1 base_ids=21,76,101,265,293,301,314,338,361,369 other_ids=21,76,101,265,293,301,314,338,361,369
+RESULT SELFWD CONTROL-A-vs-C CALL0 tok=3 equal=True base_ulps=1 other_ulps=1 base_ids=211,226,366,367,386,414,434,441,446,503 other_ids=211,226,366,367,386,414,434,441,446,503
+RESULT SELFWD CONTROL-A-vs-C CALL0 tok=4 equal=True base_ulps=0 other_ulps=0 base_ids=21,88,96,148,265,337,378,406,462,463 other_ids=21,88,96,148,265,337,378,406,462,463
+RESULT SELFWD CONTROL-A-vs-C TIE-RATE base exact_bf16_ties=143 of 576 boundaries = 24.8%
+RESULT SELFWD CONTROL-A-vs-C TIE-RATE other exact_bf16_ties=143 of 576 boundaries = 24.8%
+RESULT SELFWD CONTROL-A-vs-C AXIS x     first_call_not_bit_identical=None (forward=-) [ORDERING ONLY]
+RESULT SELFWD CONTROL-A-vs-C AXIS logit first_call_not_bit_identical=None (forward=-) [ORDERING ONLY]
+RESULT SELFWD CONTROL-A-vs-C AXIS exp   first_call_not_bit_identical=None (forward=-) [ORDERING ONLY]
+RESULT SELFWD CONTROL-A-vs-C AXIS shr   first_call_not_bit_identical=None (forward=-) [ORDERING ONLY]
+RESULT SELFWD CONTROL-A-vs-C VERDICT total_flipped_slots=0 over_forwards=8
+RESULT CONTROL A-vs-C total_flipped_slots=0 (MUST be 0)
+SUM CONTROL_FLIPS=0
+SUM MEASURE_CMP_RC=0
+RESULT SELFWD MEASURE-CPU-vs-CUDA COUNT base_digests=384 other_digests=384 base_tok=576 other_tok=576
+RESULT SELFWD MEASURE-CPU-vs-CUDA COUNTED-PROPERTY base last_digest_lines=576 value_lines_seen=576 agree=True
+RESULT SELFWD MEASURE-CPU-vs-CUDA COUNTED-PROPERTY other last_digest_lines=576 value_lines_seen=576 agree=True
+RESULT SELFWD MEASURE-CPU-vs-CUDA STRUCTURE calls_common=384 prefill_calls(L)=48 decode_calls=336 T_prefill=5
+RESULT SELFWD MEASURE-CPU-vs-CUDA STRUCTURE contiguous_and_uniform=True
+RESULT SELFWD MEASURE-CPU-vs-CUDA STRUCTURE forwards=8 moe_blocks_per_forward=48
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 0 prefill calls=48 slots=240 FLIPPED=53 hash_mismatch=35 first_flip_layer=4
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 0 FIRSTFLIP call=4 layer=4 tok=4 base_ids=41,48,54,63,133,205,252,309,393,469 other_ids=41,48,54,133,205,252,309,360,393,469 base_ulps=0 other_ulps=1
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 1 decode calls=48 slots=48 FLIPPED=22 hash_mismatch=22 first_flip_layer=12
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 1 FIRSTFLIP call=60 layer=12 tok=0 base_ids=10,36,139,180,216,281,344,366,381,436 other_ids=10,36,67,139,180,216,281,366,381,436 base_ulps=1 other_ulps=0
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 2 decode calls=48 slots=48 FLIPPED=29 hash_mismatch=29 first_flip_layer=5
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 2 FIRSTFLIP call=101 layer=5 tok=0 base_ids=20,34,56,163,216,220,236,421,435,460 other_ids=34,56,163,216,220,236,336,421,435,460 base_ulps=0 other_ulps=1
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 3 decode calls=48 slots=48 FLIPPED=17 hash_mismatch=17 first_flip_layer=9
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 3 FIRSTFLIP call=153 layer=9 tok=0 base_ids=75,111,139,154,171,367,462,466,508,511 other_ids=71,75,139,154,171,367,462,466,508,511 base_ulps=0 other_ulps=0
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 4 decode calls=48 slots=48 FLIPPED=33 hash_mismatch=33 first_flip_layer=8
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 4 FIRSTFLIP call=200 layer=8 tok=0 base_ids=148,182,231,244,325,363,370,429,451,505 other_ids=182,231,244,325,337,363,370,429,451,505 base_ulps=0 other_ulps=1
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 5 decode calls=48 slots=48 FLIPPED=48 hash_mismatch=48 first_flip_layer=0
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 5 FIRSTFLIP call=240 layer=0 tok=0 base_ids=58,211,293,338,348,349,369,404,414,446 other_ids=58,133,289,290,291,338,348,349,404,426 base_ulps=0 other_ulps=1
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 6 decode calls=48 slots=48 FLIPPED=46 hash_mismatch=46 first_flip_layer=1
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 6 FIRSTFLIP call=289 layer=1 tok=0 base_ids=172,175,209,320,368,383,394,423,451,475 other_ids=0,172,175,209,215,320,368,383,451,475 base_ulps=1 other_ulps=0
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 7 decode calls=48 slots=48 FLIPPED=48 hash_mismatch=48 first_flip_layer=0
+RESULT SELFWD MEASURE-CPU-vs-CUDA FWD 7 FIRSTFLIP call=336 layer=0 tok=0 base_ids=44,79,138,188,320,381,416,464,470,485 other_ids=34,44,138,190,378,384,427,463,470,485 base_ulps=1 other_ulps=11
+RESULT SELFWD MEASURE-CPU-vs-CUDA GROUP DIVERGING forwards=[4, 6, 7] slots=144 FLIPPED=127
+RESULT SELFWD MEASURE-CPU-vs-CUDA GROUP AGREEING forwards=[1, 2, 3, 5] slots=192 FLIPPED=116
+RESULT SELFWD MEASURE-CPU-vs-CUDA HIGHEST FORWARD REACHED = 7 (the open clause needs >= 7)
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 x_base=3615.47142 x_other=3615.62777 (compare with the recorded L00 mhc.mix pair)
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 sel_base=5bbd84f0b21b362b sel_other=5bbd84f0b21b362b hash_equal=True
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 LAYER-0 VERDICT: tokens=5 FLIPPED=0 -> NO FLIP (layer 0 agrees on every token)
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 tok=0 equal=True base_ulps=4 other_ulps=4 base_ids=32,46,71,130,160,215,226,286,309,342 other_ids=32,46,71,130,160,215,226,286,309,342
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 tok=1 equal=True base_ulps=2 other_ulps=2 base_ids=68,119,289,293,338,369,386,441,471,492 other_ids=68,119,289,293,338,369,386,441,471,492
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 tok=2 equal=True base_ulps=1 other_ulps=1 base_ids=21,76,101,265,293,301,314,338,361,369 other_ids=21,76,101,265,293,301,314,338,361,369
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 tok=3 equal=True base_ulps=1 other_ulps=1 base_ids=211,226,366,367,386,414,434,441,446,503 other_ids=211,226,366,367,386,414,434,441,446,503
+RESULT SELFWD MEASURE-CPU-vs-CUDA CALL0 tok=4 equal=True base_ulps=0 other_ulps=0 base_ids=21,88,96,148,265,337,378,406,462,463 other_ids=21,88,96,148,265,337,378,406,462,463
+RESULT SELFWD MEASURE-CPU-vs-CUDA TIE-RATE base exact_bf16_ties=143 of 576 boundaries = 24.8%
+RESULT SELFWD MEASURE-CPU-vs-CUDA TIE-RATE other exact_bf16_ties=133 of 576 boundaries = 23.1%
+RESULT SELFWD MEASURE-CPU-vs-CUDA AXIS x     first_call_not_bit_identical=0 (forward=0) [ORDERING ONLY]
+RESULT SELFWD MEASURE-CPU-vs-CUDA AXIS logit first_call_not_bit_identical=0 (forward=0) [ORDERING ONLY]
+RESULT SELFWD MEASURE-CPU-vs-CUDA AXIS exp   first_call_not_bit_identical=0 (forward=0) [ORDERING ONLY]
+RESULT SELFWD MEASURE-CPU-vs-CUDA AXIS shr   first_call_not_bit_identical=0 (forward=0) [ORDERING ONLY]
+RESULT SELFWD MEASURE-CPU-vs-CUDA VERDICT total_flipped_slots=296 over_forwards=8
+RESULT CALL0 x A-CPU =3615.47142 (recorded L00 mhc.mix CPU-CHUNKED = 3615.47142)
+RESULT CALL0 x B-CUDA=3615.62777 (recorded L00 mhc.mix CUDA-CTRL  = 3615.62777)
+RESULT PAIR IDENTITY: CONFIRMED -- this is the 4.324e-05 matched pair
+SUM PAIRIDENT_RC=0
+RESULT IDS A-CPU : 11751 13 15767 411 2029 11 1092 369
+RESULT IDS B-CUDA: 11751 13 15767 411 1928 11 628 567
+RESULT IDS C-CPU2: 11751 13 15767 411 2029 11 1092 369
+RESULT DF /tmp after: overlay         918G  722G  149G  83% /
+SUM DRIFT_RC=0
+SUM FINAL_RC=0
+
+### 02:19:57 === DONE marker: MOESEL-DONE-OK 2026-09-06T02:19:57Z ===

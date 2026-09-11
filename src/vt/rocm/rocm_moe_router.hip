@@ -22,18 +22,34 @@ __device__ inline void St(__hip_bfloat16* p, int64_t i, float v) {
   p[i] = __float2bfloat16(v);
 }
 __device__ inline float Silu(float x) { return x / (1.0f + expf(-x)); }
+// Narrow an f32 value through the gate dtype (round-trip), matching the CPU
+// oracle's RoundThrough (cpu_ops.cpp:2355) and upstream vLLM's silu_kernel
+// (activation_kernels.cu:158) which casts the intermediate to T before
+// compute multiplies. f32 is identity; bf16 round-trips through the reduced
+// width so the multiply sees exactly the rounded silu value.
+template <typename T>
+__device__ inline float NarrowTo(float v) {
+  return v;  // f32: no narrowing
+}
+template <>
+__device__ inline float NarrowTo<__hip_bfloat16>(float v) {
+  return __bfloat162float(__float2bfloat16(v));
+}
 
 // kMoeSiluMul: out = silu(gate) * up, elementwise (CPU oracle
-// cpu_ops.cpp:448). The MoE-path companion op the router unblocks. Fully
+// cpu_ops.cpp:733). The MoE-path companion op the router unblocks. Fully
 // generic over the three f32/bf16 dtype slots — the live caller mixes them
 // (the first same-dtype guard fired on a real mix), and the CPU oracle's
-// LoadF32/StoreF32 are exactly this generic.
+// LoadF32/StoreF32 are exactly this generic. The silu(gate) intermediate is
+// narrowed to the gate dtype (Tg) before the multiply, matching the CPU
+// oracle's RoundThrough(in_dt, ...) and upstream vLLM's silu_kernel cast to T
+// (activation_kernels.cu:158) before compute multiplies.
 template <typename Tout, typename Tg, typename Tu>
 __global__ void MoeSiluMulK(Tout* out, const Tg* gate, const Tu* up, int64_t n) {
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        i < n; i += step) {
-    St(out, i, Silu(Ld(gate, i)) * Ld(up, i));
+    St(out, i, NarrowTo<Tg>(Silu(Ld(gate, i))) * Ld(up, i));
   }
 }
 

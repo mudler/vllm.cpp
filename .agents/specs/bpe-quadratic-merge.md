@@ -1083,14 +1083,14 @@ conditions` forbids taking a lease for anything in this row's tests. The row is
 Nothing this row leaves behind, and no defect. What stands open is one FOLLOW-ON
 issue, and one index row that says something true of the past:
 
-- [#1541](https://github.com/mudler/vllm.cpp/issues/1541) -- the REFUSING
+- ISSUE-GH-1541 -- the REFUSING
   request-boundary length guard of `## Defence in depth`, filed by the operator
   at the merge against `67823aee2` and listed here so the index row that the
   closing commit appends for it names an owner. It is a separate row's work and
   a second layer after the algorithmic fix, never a substitute for it, and it is
   NOT a defect this row leaves behind. `## Outcome`'s `### Owed at landing`
   records the debt as paid.
-- [#1365](https://github.com/mudler/vllm.cpp/issues/1365) itself is FIXED, and
+- ISSUE-GH-1365 itself is FIXED, and
   it is named in this list only so that its append-only index row keeps an owner
   without anyone editing it. See the next paragraph, which is the whole
   reconciliation.

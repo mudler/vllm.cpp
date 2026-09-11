@@ -1422,14 +1422,14 @@ authority and no fresh review (§8).
 | [#1009](https://github.com/mudler/vllm.cpp/issues/1009) | 3 — `ParallelForRows` unused by the decode | owed |
 | [#1010](https://github.com/mudler/vllm.cpp/issues/1010) | 6 — one log line per 2.5-hour render | owed, and it should land first |
 | [#1011](https://github.com/mudler/vllm.cpp/issues/1011) | 4 — `memory_efficient_decode.py`, re-ranked | owed |
-| [#1012](https://github.com/mudler/vllm.cpp/issues/1012) | record: `diffusers` implements LTX-2.5 and no LTX-2.5 record considers it | owed |
+| ISSUE-GH-1012 | record: `diffusers` implements LTX-2.5 and no LTX-2.5 record considers it | owed |
 | [#1014](https://github.com/mudler/vllm.cpp/issues/1014) | 5 — the 59 GiB: decode excluded, residency excluded, three hypotheses ranked | owed |
 | [#1015](https://github.com/mudler/vllm.cpp/issues/1015) | 5a — `Ltx2WidenDitToF32` holds bf16 and f32 at once | owed |
 | [#1016](https://github.com/mudler/vllm.cpp/issues/1016) | 5b — LTX loaders never release mmap source pages | owed, MEASURED at +10.83 GiB in rung 1 |
 | [#1021](https://github.com/mudler/vllm.cpp/issues/1021) | 5c — DiT staging is 7.5 min at 70.5 MiB/s, against 127.8 on rung 2; GPU idle, 0.15 cores | owed |
 | [#1024](https://github.com/mudler/vllm.cpp/issues/1024) | 0 — the GPU is idle for the WHOLE post-load render, not only the decode | owed; carries the owed `utilization.gpu` positive control |
 | [#1040](https://github.com/mudler/vllm.cpp/issues/1040) | none — the evidence for rungs 1 and 2 and for §1.4 is on an unreachable host, and neither rung's sampler cadence closes | owed |
-| [#1210](https://github.com/mudler/vllm.cpp/issues/1210) | 9 — the two-stage rebind fuses, un-fuses and re-fuses; the load-time pass is provably wasted | owed; supplies the number `ltx2_video.cpp:2849` records as UNMEASURED |
+| ISSUE-GH-1210 | 9 — the two-stage rebind fuses, un-fuses and re-fuses; the load-time pass is provably wasted | owed; supplies the number `ltx2_video.cpp:2849` records as UNMEASURED |
 
 **[#1202](https://github.com/mudler/vllm.cpp/issues/1202) is NOT owed here. It
 landed**, and it is removed from the table above for the reason argued twice

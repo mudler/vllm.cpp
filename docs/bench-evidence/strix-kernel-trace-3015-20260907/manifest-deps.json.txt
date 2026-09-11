@@ -1,0 +1,22 @@
+{
+  "image": "localhost/vllmcpp-strix-profile:3015-deps",
+  "model": "/workspace/ckpt/qwen38-27b-q4km/Qwen3.8-27B-Q4_K_M.gguf",
+  "clock_device": "/sys/class/drm/card1/device",
+  "sources": {
+    "vllmcpp": {
+      "archive": "/workspace/strix-3015-20260907.Gq6MW5/vllmcpp.tar",
+      "sha256": "a57ae15a89351f216fa7002c4300fa72d67e48b234ac6dd898f115751c812647",
+      "revision": "f98b638673b4d2edc0250eec56d229357ea38ab1"
+    },
+    "llamacpp": {
+      "archive": "/workspace/strix-3015-20260907.Gq6MW5/llamacpp.tar",
+      "sha256": "0f43551d3da94ba0d2af80e202177008a91966de66dbabf87a2042377d16d133",
+      "revision": "10bf611e533d81f739128304991c5e133c6aebd8"
+    }
+  },
+  "profiler_prefix": [
+    "/opt/rocm/bin/rocprofv3", "--kernel-trace", "--hip-runtime-trace",
+    "--memory-copy-trace", "--scratch-memory-trace", "--output-format", "csv",
+    "--output-directory", "{trace_dir}", "--"
+  ]
+}

@@ -550,7 +550,7 @@ c8 until #931 closes. Concurrencies above 8 were not run.
   thirteen minutes after every writer had stopped. `## Outcome` states both. The
   job above settles the second and bounds the first, if it can read the boot
   list at all.
-- [#1355](https://github.com/mudler/vllm.cpp/issues/1355), the prompt-token
+- ISSUE-GH-1355, the prompt-token
   divergence found in this campaign's raw result files: our server reported
   5,942 prompt tokens where vLLM reported 6,144 for the identical
   client-generated prompts, 19 of 48 short at c8. Whether we under-report

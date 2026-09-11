@@ -457,7 +457,7 @@ Report `NEEDS_DECISION` rather than narrowing silently if:
   recipe is gated against upstream SOURCE, not upstream OUTPUT, and that is the
   ceiling on this row's evidence.
 - **`/v1/videos` cannot drive this** until
-  [#928](https://github.com/mudler/vllm.cpp/issues/928) forwards per-generation
+  ISSUE-GH-928 forwards per-generation
   extras. §5b.
 
 ## Now

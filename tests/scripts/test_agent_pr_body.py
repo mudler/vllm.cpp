@@ -98,6 +98,40 @@ class ToolHarness(unittest.TestCase):
         )
 
 
+class ClosingKeywordRecordTests(ToolHarness):
+    """`Closes #N` in a body closes the GitHub mirror the moment the squash lands.
+
+    Local files are the issue authority, so the branch must also carry
+    `ISSUE-GH-N.md` reading `State: CLOSED`. Three landed pull requests
+    (#3092, #3098 and five on #3096) said `Closes` while their own local record
+    still read OPEN, which leaves the authoritative half saying OPEN forever.
+    """
+
+    def test_closing_an_issue_with_no_local_record_is_refused(self) -> None:
+        text = body(FILLED).replace(
+            "fix(ROW): the subject line of a body that will be squashed\n",
+            "fix(ROW): the subject line of a body that will be squashed\n\nCloses #999999.\n",
+        )
+        result = self.run_tool("--body-file", self.body_file(text))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"ISSUE-GH-{''}999999.md", result.stderr)
+
+    def test_a_bare_reference_without_a_closing_keyword_is_accepted(self) -> None:
+        """The gate is narrow ON PURPOSE: ordinary citations must not red a body.
+
+        Open pull requests carry six to ten bare `#N` citations each, most
+        without a local record. Failing those would fire the gate on ordinary
+        work, which AGENTS.md names as the defect rather than the discipline.
+        """
+
+        text = body(FILLED).replace(
+            "fix(ROW): the subject line of a body that will be squashed\n",
+            "fix(ROW): the subject line of a body that will be squashed\n\nRefs #999999.\n",
+        )
+        result = self.run_tool("--body-file", self.body_file(text))
+        self.assertEqual(result.returncode, 0)
+
+
 class OfflineContractTests(ToolHarness):
     def test_the_exact_landed_malformed_value_is_refused(self) -> None:
         """The bytes of 281b4bc76c0e, refused by a command an operator can run."""

@@ -151,7 +151,52 @@ def validate(body: str) -> int:
             "UNVERIFIED: the trailer checker rendered no verdict "
             f"(exit {result.returncode})"
         )
-    return EXIT_CONTRACT if result.returncode else EXIT_OK
+    verdict = EXIT_CONTRACT if result.returncode else EXIT_OK
+    problems = closing_keyword_records(body)
+    for problem in problems:
+        print(f"ERROR: {problem}", file=sys.stderr)
+    return EXIT_CONTRACT if problems else verdict
+
+
+CLOSING = re.compile(
+    r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#([1-9][0-9]*)\b", re.IGNORECASE
+)
+
+
+def closing_keyword_records(body: str) -> list[str]:
+    """Every `Closes #N` in the body whose local issue record does not read CLOSED.
+
+    The body IS the squash message, so a closing keyword here closes the GitHub
+    mirror the moment it lands. Local files are the issue authority, so if the
+    branch does not also carry `ISSUE-GH-N.md` reading `State: CLOSED`, the two
+    authorities disagree from the instant of the merge and the local record --
+    the authoritative one -- is the half left saying OPEN.
+
+    Read from the working tree, so run this from the branch being merged; that
+    is the same tree whose records would land.
+    """
+
+    problems: list[str] = []
+    for number in sorted({m.group(1) for m in CLOSING.finditer(body)}, key=int):
+        matches = sorted((ROOT / ".agents/issues").rglob(f"ISSUE-GH-{number}.md"))
+        if not matches:
+            problems.append(
+                f"body closes #{number} but no .agents/issues/**/ISSUE-GH-{number}.md "
+                "exists; file it (scripts/agent-issue.py import-github) or drop the keyword"
+            )
+            continue
+        text = matches[0].read_text(encoding="utf-8", errors="replace")
+        state = next(
+            (l.split(":", 1)[1].strip() for l in text.splitlines() if l.startswith("State:")),
+            "",
+        )
+        if state != "CLOSED":
+            problems.append(
+                f"body closes #{number} but {matches[0].relative_to(ROOT)} reads "
+                f"State: {state or '(absent)'}; close it locally first "
+                "(scripts/agent-issue.py close) or drop the keyword"
+            )
+    return problems
 
 
 def pull_request_number(value: str) -> int:

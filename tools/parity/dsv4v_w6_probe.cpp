@@ -31,9 +31,12 @@
 //
 // usage: dsv4v-w6-probe <mmproj.gguf> <image.rgb> <height> <width> <lead_pad>
 //                       <outdir> <tag>
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <fstream>
 #include <memory>
 #include <span>
@@ -70,6 +73,142 @@ std::vector<float> Widen(const uint16_t* p, size_t n) {
   return out;
 }
 
+// THE F32 ARM (DSV4V_PROBE_F32=1). A MEASUREMENT, NEVER A PRODUCT PATH.
+//
+// llama.cpp's CPU clip graph keeps its residual stream, norms, RoPE, softmax
+// and activations in f32 and rounds to bf16 only at each GEMM input
+// (ggml-cpu.c:395-399, vec_dot_type = GGML_TYPE_BF16). Our tower carries every
+// intermediate in bf16, which is the model dtype AGENTS.md requires. This arm
+// runs the SAME tower with f32 weights (widened exactly from the file's bf16)
+// and f32 activations, on the exact f32 pixels, so that if ours-in-f32 lands on
+// the oracle the W6 gap is compute dtype and not a defect.
+//
+// W2 refuses `compute_dtype != bf16`, so this arm runs only in a scratch copy
+// whose guard the W6 f32 job script deletes. It is never built from the tree.
+int RunF32(const vllm::GgufFile& gguf, const std::vector<uint8_t>& rgb,
+           int64_t height, int64_t width, int lead_pad,
+           const std::string& outdir, const std::string& tag) {
+  vllm::multimodal::DeepSeekV4VisionConfig cfg =
+      vllm::DeepSeekV4ClipMmprojVisionConfig(gguf);
+  const vllm::DeepSeekV4ClipMmproj proj =
+      vllm::LoadDeepSeekV4VisionFromClipMmproj(gguf, cfg);
+  std::deque<std::vector<float>> store;
+  auto widen = [&](const vt::Tensor& t) -> vt::Tensor {
+    if (t.dtype == vt::DType::kF32) return t;
+    if (t.dtype != vt::DType::kBF16 || !t.IsContiguous() || t.rank < 1 ||
+        t.rank > 2) {
+      std::fprintf(stderr, "FATAL: f32 arm cannot widen a weight\n");
+      std::exit(3);
+    }
+    std::vector<float>& s = store.emplace_back(
+        Widen(static_cast<const uint16_t*>(t.data),
+              static_cast<size_t>(t.Numel())));
+    return t.rank == 1
+               ? vt::Tensor::Contiguous(s.data(), vt::DType::kF32, t.device,
+                                        {t.shape[0]})
+               : vt::Tensor::Contiguous(s.data(), vt::DType::kF32, t.device,
+                                        {t.shape[0], t.shape[1]});
+  };
+  const vllm::multimodal::DeepSeekV4VisionWeights& b = proj.weights;
+  vllm::multimodal::DeepSeekV4VisionWeights w;
+  w.patch_weight = widen(b.patch_weight);
+  w.patch_bias = widen(b.patch_bias);
+  for (const auto& blk : b.blocks) {
+    vllm::multimodal::DeepSeekV4VisionBlockWeights o;
+    o.norm1_weight = widen(blk.norm1_weight);
+    o.qkv_weight = widen(blk.qkv_weight);
+    o.qkv_bias = widen(blk.qkv_bias);
+    o.out_weight = widen(blk.out_weight);
+    o.out_bias = widen(blk.out_bias);
+    o.norm2_weight = widen(blk.norm2_weight);
+    o.mlp_w1_weight = widen(blk.mlp_w1_weight);
+    o.mlp_w2_weight = widen(blk.mlp_w2_weight);
+    w.blocks.push_back(o);
+  }
+  w.final_norm_weight = widen(b.final_norm_weight);
+  w.aligner_w1_weight = widen(b.aligner_w1_weight);
+  w.aligner_w1_bias = widen(b.aligner_w1_bias);
+  w.aligner_w2_weight = widen(b.aligner_w2_weight);
+  w.aligner_w2_bias = widen(b.aligner_w2_bias);
+  cfg.compute_dtype = vt::DType::kF32;
+
+  const int64_t P = cfg.patch_size;
+  if (height % P != 0 || width % P != 0) {
+    std::fprintf(stderr, "FATAL: f32 arm takes an identity-size image only\n");
+    return 3;
+  }
+  const int64_t gh = height / P, gw = width / P, patches = gh * gw;
+  const int64_t feat = 3 * P * P;
+  // The processor's own formula (deepseek_v4_processor.cpp ProcessImage),
+  // without the final bf16 narrowing.
+  std::vector<float> px(static_cast<size_t>(patches * feat));
+  for (int64_t vh = 0; vh < gh; ++vh)
+    for (int64_t vw = 0; vw < gw; ++vw)
+      for (int64_t c = 0; c < 3; ++c)
+        for (int64_t dy = 0; dy < P; ++dy)
+          for (int64_t dx = 0; dx < P; ++dx) {
+            const uint8_t raw =
+                rgb[static_cast<size_t>(((vh * P + dy) * width + vw * P + dx) * 3 + c)];
+            px[static_cast<size_t>((vh * gw + vw) * feat + (c * P + dy) * P + dx)] =
+                ((static_cast<float>(raw) / 255.0f) - 0.5f) / 0.5f;
+          }
+  WriteF32(outdir + "/ours-" + tag + "-input.f32", patches, feat, px);
+
+  vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  vt::Queue queue = backend.CreateQueue();
+  vllm::multimodal::DeepSeekV4Vision tower(backend, cfg, w);
+  const int64_t cells = cfg.aligned_rows(gh, gw);
+  std::vector<float> cell_host(static_cast<size_t>(cells * cfg.output_size));
+  std::vector<float> vit_host(static_cast<size_t>(patches * cfg.hidden_size));
+  const vt::Tensor patch_t = vt::Tensor::Contiguous(
+      px.data(), vt::DType::kF32, queue.device, {patches, feat});
+  vt::Tensor cell_t = vt::Tensor::Contiguous(
+      cell_host.data(), vt::DType::kF32, queue.device, {cells, cfg.output_size});
+  vt::Tensor vit_t = vt::Tensor::Contiguous(
+      vit_host.data(), vt::DType::kF32, queue.device, {patches, cfg.hidden_size});
+  vllm::multimodal::DeepSeekV4VisionCapture capture;
+  capture.final_norm = &vit_t;
+  tower.Forward(queue, cell_t, patch_t, gh, gw, &capture);
+  backend.Synchronize(queue);
+  WriteF32(outdir + "/ours-" + tag + "-vit.f32", patches, cfg.hidden_size,
+           vit_host);
+  WriteF32(outdir + "/ours-" + tag + "-cells.f32", cells, cfg.output_size,
+           cell_host);
+
+  // The block, from the same layout function encode_mm uses, with the f32
+  // sentinels un-narrowed.
+  const int64_t r = cfg.downsample_ratio;
+  const vllm::multimodal::DeepSeekV4ImageBlock block =
+      vllm::multimodal::BuildDeepSeekV4ImageBlock((gh + r - 1) / r,
+                                                  (gw + r - 1) / r,
+                                                  3 - lead_pad);
+  const int64_t ow = cfg.output_size;
+  std::vector<float> rows(block.types.size() * static_cast<size_t>(ow));
+  size_t taken = 0;
+  for (size_t i = 0; i < block.types.size(); ++i) {
+    const float* src = nullptr;
+    switch (block.types[i]) {
+      case vllm::multimodal::kImage:
+        src = cell_host.data() + block.permutation[taken++] * ow;
+        break;
+      case vllm::multimodal::kImageStart: src = proj.image_start.data(); break;
+      case vllm::multimodal::kImageEnd: src = proj.image_end.data(); break;
+      case vllm::multimodal::kImagePad: src = proj.image_pad.data(); break;
+      case vllm::multimodal::kImageNewLine: src = proj.image_newline.data(); break;
+      default:
+        std::fprintf(stderr, "FATAL: unknown block token type\n");
+        return 3;
+    }
+    std::copy(src, src + ow, rows.begin() + static_cast<std::ptrdiff_t>(i * ow));
+  }
+  WriteF32(outdir + "/ours-" + tag + "-block.f32",
+           static_cast<int64_t>(block.types.size()), ow, rows);
+  backend.DestroyQueue(queue);
+  std::printf("PROBE_F32_DONE tag=%s block=%zu\n", tag.c_str(),
+              block.types.size());
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -103,6 +242,9 @@ int main(int argc, char** argv) {
   }
 
   const vllm::GgufFile gguf = vllm::GgufFile::Open(mmproj_path);
+  if (const char* f32 = std::getenv("DSV4V_PROBE_F32"); f32 && f32[0] == '1') {
+    return RunF32(gguf, rgb, height, width, lead_pad, outdir, tag);
+  }
   vllm::HfConfig config;
   config.architectures = {"DeepseekV4ForCausalLM"};
   config.model_type = "deepseek_v4";

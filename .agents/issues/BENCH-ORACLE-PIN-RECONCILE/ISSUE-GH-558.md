@@ -1,6 +1,6 @@
 ID: ISSUE-GH-558
 Title: `tests/parity/hf_snapshot.h` has no guard against declaration-order breaks: the C++ build catches them, but the records-only lane that broke it never builds C++, and all 14 TUs that include the header are checkpoint-gated so `ctest` reports the break as `***Not Run`. `fafa16f0f` (#546, #551) fixed the ordering and carried no guard
-Row: -
+Row: BENCH-ORACLE-PIN-RECONCILE
 State: UNKNOWN
 Kind: bug
 GitHub: 558

@@ -974,10 +974,11 @@ class AttributionIsEnforcedOnce(unittest.TestCase):
         self.assertIn("documentation-checkpoint", governed)
         self.assertNotIn("commit-protocol-tag", governed)
         self.assertTrue(
-            floor.rstrip().endswith("e1b5df1a6b5b30555639e0a0459f79a467544579"),
+            floor.rstrip().endswith("96c5e4719dcb1f859cb9e59573309f16c026b523"),
             "the floor VALUE moves only by a reviewed advance that re-pins this "
-            "assertion; #2322 narrowed its scope and did not move it, and #2743 "
-            "advanced it to e1b5df1a6 without widening the scope back",
+            "assertion; #2322 narrowed its scope and did not move it, #2743 "
+            "advanced it to e1b5df1a6, and #3135 advanced it to 96c5e4719 "
+            "without widening the scope back",
         )
 
 

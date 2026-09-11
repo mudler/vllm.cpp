@@ -64,6 +64,18 @@ bool HasCuda() {
   }
 }
 
+// QUANT-EXL3 W6. The reconstruct+cuBLAS op is a SEPARATE registration from
+// kExl3Gemm, so a device that has the cooperative kernel but not the
+// reconstruct path must skip these cases and not silently pass them.
+bool HasReconstructCuda() {
+  try {
+    (void)vt::GetBackend(vt::DeviceType::kCUDA);
+    return vt::OpRegistered(vt::OpId::kExl3ReconstructGemm, vt::DeviceType::kCUDA);
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
 vt::Queue CpuQueue() { return vt::GetBackend(vt::DeviceType::kCPU).CreateQueue(); }
 
 }  // namespace
@@ -1010,4 +1022,362 @@ TEST_CASE("exl3 gemm: the suh/svh scales and the trellis at ODD byte addresses d
   REQUIRE(nonzero > aligned.size() / 2);
 
   CHECK(run(1) == aligned);
+}
+
+// ─── QUANT-EXL3 W6: reconstruct + cuBLAS GEMM for M > 144 (#3124) ───────────
+//
+// exllamav3 dispatches to `reconstruct_hgemm` (dequantize trellis to fp16 +
+// cuBLAS fp16 GEMM) when M > AUTO_RECONSTRUCT_THRESHOLD (144), and to the fused
+// cooperative kernel otherwise (exl3.py:132-139). vllm.cpp lacked this path
+// entirely — `Exl3MatmulD` always called `vt::Exl3Gemm` — which BENCH-QWEN38-
+// EXL3-VARIADIC root-caused as the 0.51x prefill-rate gap on XL prompts.
+//
+// The reference is `Exl3ChainF64`, the same double-precision chain used by the
+// cooperative kernel's gate. It uses `vt::Exl3ReconstructInner` (CPU dequant)
+// internally, so it is independent of the device reconstruct kernel. The
+// `codebook` parameter was added to `Exl3ChainF64` so all seven arms can be
+// checked, not just cb 1.
+
+// Gate 1: the UNFUSED path (144 < M < 1024, exl3.py:186-211) across all seven
+// (bits, codebook) arms. M=256 is above the 144 threshold and below the 1024
+// fused threshold, so it exercises: input Hadamard (suh) → reconstruct (plain
+// dequant) → cuBLAS fp16 GEMM → output Hadamard (svh).
+//
+// The arm set is the same seven pairs as the widened-arms case above, for the
+// same reason: `dq_dispatch` static_asserts this set, and the reconstruct
+// kernel shares it.
+TEST_CASE("exl3 device: reconstruct+cuBLAS UNFUSED all arms match the f64 reference") {
+  if (!HasReconstructCuda()) {
+    MESSAGE(
+        "SKIPPED, no CUDA device: QUANT-EXL3 W6 unfused device parity is PENDING. "
+        "Reproduce with: "
+        "rc run --device dgx:gpu0 -- ctest --test-dir build-cuda -R test_exl3_gemm -V");
+    CHECK_FALSE(vt::OpRegistered(vt::OpId::kExl3ReconstructGemm, vt::DeviceType::kCUDA));
+    return;
+  }
+  vt::Backend& cb = vt::GetBackend(vt::DeviceType::kCUDA);
+  vt::Queue dq = cb.CreateQueue();
+
+  struct Arm {
+    int bits;
+    int codebook;
+    const char* what;
+  };
+  const Arm arms[] = {{3, 0, "a stock exl3 body"},
+                      {3, 1, "the DeepSeek-V4 artifact"},
+                      {6, 0, "a stock exl3 lm_head"},
+                      {3, 2, "the Qwen3.8-27B mul1 MLP"},
+                      {4, 2, "the Qwen3.8-27B mul1 GDN tower and attention"},
+                      {5, 2, "the Qwen3.8-27B mul1 5-bit tensor"},
+                      {6, 2, "the Qwen3.8-27B mul1 lm_head"}};
+
+  const int64_t m = 256, k = 256, n = 256;
+  for (const Arm& arm : arms) {
+    CAPTURE(arm.bits);
+    CAPTURE(arm.codebook);
+    const Exl3Fixture f = MakeFixture(k, n, arm.bits, 0x1D0C0DEu + arm.bits);
+    Rng rng;
+    rng.s = 0xC0FFEEu + arm.bits;
+    std::vector<uint16_t> a_h(static_cast<size_t>(m * k));
+    std::vector<float> a_f(static_cast<size_t>(m * k));
+    for (size_t i = 0; i < a_h.size(); ++i) {
+      a_h[i] = vt::F32ToF16(rng.next(1.0f));
+      a_f[i] = vt::F16ToF32(a_h[i]);
+    }
+    const size_t ab = a_h.size() * sizeof(uint16_t);
+    const size_t bb = f.trellis.size() * sizeof(uint16_t);
+    const size_t cb_ = static_cast<size_t>(m * n) * sizeof(float);
+    const size_t wb = static_cast<size_t>(k * n) * sizeof(uint16_t);
+    void* d_a = cb.Alloc(ab);
+    void* d_ah = cb.Alloc(ab);
+    void* d_b = cb.Alloc(bb);
+    void* d_suh = cb.Alloc(f.suh.size() * sizeof(uint16_t));
+    void* d_svh = cb.Alloc(f.svh.size() * sizeof(uint16_t));
+    void* d_c = cb.Alloc(cb_);
+    void* d_w = cb.Alloc(wb);
+    cb.Copy(dq, d_a, a_h.data(), ab);
+    cb.Copy(dq, d_b, f.trellis.data(), bb);
+    cb.Copy(dq, d_suh, f.suh.data(), f.suh.size() * sizeof(uint16_t));
+    cb.Copy(dq, d_svh, f.svh.data(), f.svh.size() * sizeof(uint16_t));
+
+    vt::Tensor tda = vt::Tensor::Contiguous(d_a, vt::DType::kF16, dq.device, {m, k});
+    vt::Tensor tdah = vt::Tensor::Contiguous(d_ah, vt::DType::kF16, dq.device, {m, k});
+    vt::Tensor tdb = vt::Tensor::Contiguous(d_b, vt::DType::kI8, dq.device,
+                                            {k / 16, n / 16, 32 * arm.bits});
+    vt::Tensor tdsuh = vt::Tensor::Contiguous(d_suh, vt::DType::kF16, dq.device, {k});
+    vt::Tensor tdsvh = vt::Tensor::Contiguous(d_svh, vt::DType::kF16, dq.device, {n});
+    vt::Tensor tdc = vt::Tensor::Contiguous(d_c, vt::DType::kF32, dq.device, {m, n});
+    vt::Tensor tdw = vt::Tensor::Contiguous(d_w, vt::DType::kF16, dq.device, {k, n});
+    vt::Exl3GemmArgs args;
+    args.bits = arm.bits;
+    args.codebook = arm.codebook;
+    vt::Exl3ReconstructGemm(dq, tdc, tda, tdb, tdsuh, tdsvh, tdah, tdw, args);
+    cb.Synchronize(dq);
+    std::vector<float> c_dev(static_cast<size_t>(m * n), 0.0f);
+    cb.Copy(dq, c_dev.data(), d_c, cb_);
+    cb.Synchronize(dq);
+    for (void* p : {d_a, d_ah, d_b, d_suh, d_svh, d_c, d_w}) cb.Free(p);
+
+    const std::vector<double> ref = Exl3ChainF64(f, a_f, m, arm.codebook);
+    const double rms = Rms(ref);
+    REQUIRE(rms > 0.0);
+    double sq = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+      const double d = static_cast<double>(c_dev[i]) - ref[i];
+      sq += d * d;
+    }
+    const double rel = std::sqrt(sq / static_cast<double>(ref.size())) / rms;
+    MESSAGE("reconstruct+cuBLAS unfused bits ", arm.bits, " cb ", arm.codebook,
+            " (", arm.what, "): device vs f64 rel_rms = ", rel);
+    CHECK(rel <= 1.0e-3);
+  }
+  cb.DestroyQueue(dq);
+}
+
+// Gate 2: the FUSED path (M >= 1024, both dims 128-divisible, exl3.py:184).
+// `reconstruct_had_slice` folds both Hadamards and the sign vectors into the
+// reconstruct kernel, emitting original-basis weights. The GEMM then runs on
+// the raw input, and the standalone input/output `had_r_128` launches
+// disappear. The algebra is identical to the unfused path; the f64 reference
+// checks it.
+//
+// M=1024 is the upstream threshold (`exl3.py:184`), not a tuned value. The
+// fused kernel costs ~4x plain reconstruct but saves the rows*(k+n) Hadamard
+// work; breakeven is rows ~400-900, threshold set conservatively at 1024.
+TEST_CASE("exl3 device: reconstruct+cuBLAS FUSED M>=1024 matches the f64 reference") {
+  if (!HasReconstructCuda()) {
+    MESSAGE(
+        "SKIPPED, no CUDA device: QUANT-EXL3 W6 fused device parity is PENDING. "
+        "Reproduce with: "
+        "rc run --device dgx:gpu0 -- ctest --test-dir build-cuda -R test_exl3_gemm -V");
+    CHECK_FALSE(vt::OpRegistered(vt::OpId::kExl3ReconstructGemm, vt::DeviceType::kCUDA));
+    return;
+  }
+  vt::Backend& cb = vt::GetBackend(vt::DeviceType::kCUDA);
+  vt::Queue dq = cb.CreateQueue();
+  const int64_t m = 1024, k = 256, n = 256;
+  const int kBits = 3, kCb = 1;
+  const Exl3Fixture f = MakeFixture(k, n, kBits, 0x27D4EB2Fu);
+  Rng rng;
+  rng.s = 0x165667B1u;
+  std::vector<uint16_t> a_h(static_cast<size_t>(m * k));
+  std::vector<float> a_f(static_cast<size_t>(m * k));
+  for (size_t i = 0; i < a_h.size(); ++i) {
+    a_h[i] = vt::F32ToF16(rng.next(1.0f));
+    a_f[i] = vt::F16ToF32(a_h[i]);
+  }
+  const size_t ab = a_h.size() * sizeof(uint16_t);
+  const size_t bb = f.trellis.size() * sizeof(uint16_t);
+  const size_t cb_ = static_cast<size_t>(m * n) * sizeof(float);
+  const size_t wb = static_cast<size_t>(k * n) * sizeof(uint16_t);
+  void* d_a = cb.Alloc(ab);
+  void* d_ah = cb.Alloc(ab);
+  void* d_b = cb.Alloc(bb);
+  void* d_suh = cb.Alloc(f.suh.size() * sizeof(uint16_t));
+  void* d_svh = cb.Alloc(f.svh.size() * sizeof(uint16_t));
+  void* d_c = cb.Alloc(cb_);
+  void* d_w = cb.Alloc(wb);
+  cb.Copy(dq, d_a, a_h.data(), ab);
+  cb.Copy(dq, d_b, f.trellis.data(), bb);
+  cb.Copy(dq, d_suh, f.suh.data(), f.suh.size() * sizeof(uint16_t));
+  cb.Copy(dq, d_svh, f.svh.data(), f.svh.size() * sizeof(uint16_t));
+
+  vt::Tensor tda = vt::Tensor::Contiguous(d_a, vt::DType::kF16, dq.device, {m, k});
+  vt::Tensor tdah = vt::Tensor::Contiguous(d_ah, vt::DType::kF16, dq.device, {m, k});
+  vt::Tensor tdb = vt::Tensor::Contiguous(d_b, vt::DType::kI8, dq.device,
+                                          {k / 16, n / 16, 32 * kBits});
+  vt::Tensor tdsuh = vt::Tensor::Contiguous(d_suh, vt::DType::kF16, dq.device, {k});
+  vt::Tensor tdsvh = vt::Tensor::Contiguous(d_svh, vt::DType::kF16, dq.device, {n});
+  vt::Tensor tdc = vt::Tensor::Contiguous(d_c, vt::DType::kF32, dq.device, {m, n});
+  vt::Tensor tdw = vt::Tensor::Contiguous(d_w, vt::DType::kF16, dq.device, {k, n});
+  vt::Exl3GemmArgs args;
+  args.bits = kBits;
+  args.codebook = kCb;
+  vt::Exl3ReconstructGemm(dq, tdc, tda, tdb, tdsuh, tdsvh, tdah, tdw, args);
+  cb.Synchronize(dq);
+  std::vector<float> c_dev(static_cast<size_t>(m * n), 0.0f);
+  cb.Copy(dq, c_dev.data(), d_c, cb_);
+  cb.Synchronize(dq);
+  for (void* p : {d_a, d_ah, d_b, d_suh, d_svh, d_c, d_w}) cb.Free(p);
+
+  const std::vector<double> ref = Exl3ChainF64(f, a_f, m, kCb);
+  const double rms = Rms(ref);
+  REQUIRE(rms > 0.0);
+  double sq = 0.0;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    const double d = static_cast<double>(c_dev[i]) - ref[i];
+    sq += d * d;
+  }
+  const double rel = std::sqrt(sq / static_cast<double>(ref.size())) / rms;
+  MESSAGE("reconstruct+cuBLAS fused M=1024: device vs f64 rel_rms = ", rel);
+  CHECK(rel <= 1.0e-3);
+  cb.DestroyQueue(dq);
+}
+
+// Gate 3: the two paths AGREE. `Exl3Gemm` (cooperative kernel) and
+// `Exl3ReconstructGemm` (reconstruct + cuBLAS) compute the same linear with
+// different kernel decompositions. Their outputs cannot be byte-identical
+// (different accumulation orders), but they must agree within the stated bound.
+//
+// Both are called at M=4 so the outputs are the same shape and comparable
+// directly. In production, `Exl3MatmulD` dispatches to `Exl3Gemm` for M<=144
+// and to `Exl3ReconstructGemm` for M>144; here we call both directly to
+// cross-check without needing two different M values. `force_gemv = 0` keeps
+// `Exl3Gemm` on the cooperative GEMM kernel, not the GEMV fast path, so the
+// comparison is GEMM-decomposition vs reconstruct-decomposition.
+TEST_CASE("exl3 device: reconstruct+cuBLAS agrees with Exl3Gemm at the same M") {
+  if (!HasReconstructCuda()) {
+    MESSAGE(
+        "SKIPPED, no CUDA device: QUANT-EXL3 W6 cross-path parity is PENDING. "
+        "Reproduce with: "
+        "rc run --device dgx:gpu0 -- ctest --test-dir build-cuda -R test_exl3_gemm -V");
+    CHECK_FALSE(vt::OpRegistered(vt::OpId::kExl3ReconstructGemm, vt::DeviceType::kCUDA));
+    return;
+  }
+  vt::Backend& cb = vt::GetBackend(vt::DeviceType::kCUDA);
+  vt::Queue dq = cb.CreateQueue();
+  const int64_t m = 4, k = 256, n = 256;
+  const Exl3Fixture f = MakeFixture(k, n, 3, 0x85EBCA6Bu);
+  Rng rng;
+  rng.s = 0x1B873593u;
+  std::vector<uint16_t> a_h(static_cast<size_t>(m * k));
+  for (auto& v : a_h) v = vt::F32ToF16(rng.next(1.0f));
+  const size_t ab = a_h.size() * sizeof(uint16_t);
+  const size_t bb = f.trellis.size() * sizeof(uint16_t);
+  const size_t cb_ = static_cast<size_t>(m * n) * sizeof(float);
+  const size_t wb = static_cast<size_t>(k * n) * sizeof(uint16_t);
+
+  void* d_a = cb.Alloc(ab);
+  void* d_ah = cb.Alloc(ab);
+  void* d_b = cb.Alloc(bb);
+  void* d_suh = cb.Alloc(f.suh.size() * sizeof(uint16_t));
+  void* d_svh = cb.Alloc(f.svh.size() * sizeof(uint16_t));
+  void* d_c_gemm = cb.Alloc(cb_);
+  void* d_c_rec = cb.Alloc(cb_);
+  void* d_w = cb.Alloc(wb);
+  cb.Copy(dq, d_a, a_h.data(), ab);
+  cb.Copy(dq, d_b, f.trellis.data(), bb);
+  cb.Copy(dq, d_suh, f.suh.data(), f.suh.size() * sizeof(uint16_t));
+  cb.Copy(dq, d_svh, f.svh.data(), f.svh.size() * sizeof(uint16_t));
+
+  vt::Tensor tda = vt::Tensor::Contiguous(d_a, vt::DType::kF16, dq.device, {m, k});
+  vt::Tensor tdah = vt::Tensor::Contiguous(d_ah, vt::DType::kF16, dq.device, {m, k});
+  vt::Tensor tdb = vt::Tensor::Contiguous(d_b, vt::DType::kI8, dq.device,
+                                          {k / 16, n / 16, 32 * 3});
+  vt::Tensor tdsuh = vt::Tensor::Contiguous(d_suh, vt::DType::kF16, dq.device, {k});
+  vt::Tensor tdsvh = vt::Tensor::Contiguous(d_svh, vt::DType::kF16, dq.device, {n});
+  vt::Tensor tdc_gemm = vt::Tensor::Contiguous(d_c_gemm, vt::DType::kF32, dq.device, {m, n});
+  vt::Tensor tdc_rec = vt::Tensor::Contiguous(d_c_rec, vt::DType::kF32, dq.device, {m, n});
+  vt::Tensor tdw = vt::Tensor::Contiguous(d_w, vt::DType::kF16, dq.device, {k, n});
+
+  vt::Exl3GemmArgs args;
+  args.bits = 3;
+  args.codebook = 1;
+  args.force_gemv = 0;
+  vt::Exl3Gemm(dq, tdc_gemm, tda, tdb, tdsuh, tdsvh, tdah, args);
+
+  vt::Exl3GemmArgs rargs;
+  rargs.bits = 3;
+  rargs.codebook = 1;
+  vt::Exl3ReconstructGemm(dq, tdc_rec, tda, tdb, tdsuh, tdsvh, tdah, tdw, rargs);
+  cb.Synchronize(dq);
+
+  std::vector<float> c_gemm(static_cast<size_t>(m * n), 0.0f);
+  std::vector<float> c_rec(static_cast<size_t>(m * n), 0.0f);
+  cb.Copy(dq, c_gemm.data(), d_c_gemm, cb_);
+  cb.Copy(dq, c_rec.data(), d_c_rec, cb_);
+  cb.Synchronize(dq);
+  for (void* p : {d_a, d_ah, d_b, d_suh, d_svh, d_c_gemm, d_c_rec, d_w}) cb.Free(p);
+
+  double num = 0.0, den = 0.0;
+  for (size_t i = 0; i < c_gemm.size(); ++i) {
+    const double d = static_cast<double>(c_rec[i]) - static_cast<double>(c_gemm[i]);
+    num += d * d;
+    den += static_cast<double>(c_gemm[i]) * c_gemm[i];
+  }
+  const double rel = std::sqrt(num / den);
+  MESSAGE("reconstruct vs cooperative GEMM at M=4: rel_rms = ", rel);
+  REQUIRE(den > 0.0);
+  CHECK(rel <= 1.0e-3);
+  cb.DestroyQueue(dq);
+}
+
+// Gate 4: the N > 32768 slicing path. When out_features exceeds
+// MAX_RECONSTRUCT_SLICE_N (32768, exl3.py:11), the weight is reconstructed and
+// GEMMed in 32768-column slices, reusing a scratch buffer (exl3.py:199-211).
+// Qwen3.8-27B's MLP down_proj (N=34816) exercises this on every forward.
+//
+// N=32896 is 32768+128, the smallest N that triggers the slicing path with a
+// non-trivial second slice (128 columns). M=4 keeps the f64 reference feasible.
+// The `w_scratch` is [k, 32768] (one full slice), and the second slice reuses
+// it as [k, 128] via `Slice(1, 0, 128)`.
+TEST_CASE("exl3 device: reconstruct+cuBLAS with N>32768 SLICING matches the f64 reference") {
+  if (!HasReconstructCuda()) {
+    MESSAGE(
+        "SKIPPED, no CUDA device: QUANT-EXL3 W6 slicing device parity is PENDING. "
+        "Reproduce with: "
+        "rc run --device dgx:gpu0 -- ctest --test-dir build-cuda -R test_exl3_gemm -V");
+    CHECK_FALSE(vt::OpRegistered(vt::OpId::kExl3ReconstructGemm, vt::DeviceType::kCUDA));
+    return;
+  }
+  vt::Backend& cb = vt::GetBackend(vt::DeviceType::kCUDA);
+  vt::Queue dq = cb.CreateQueue();
+  const int64_t m = 4, k = 256, n = 32896;  // 32768 + 128: two slices
+  const int kBits = 3, kCb = 1;
+  const Exl3Fixture f = MakeFixture(k, n, kBits, 0x9E3779B9u);
+  Rng rng;
+  rng.s = 0xCC9E2D51u;
+  std::vector<uint16_t> a_h(static_cast<size_t>(m * k));
+  std::vector<float> a_f(static_cast<size_t>(m * k));
+  for (size_t i = 0; i < a_h.size(); ++i) {
+    a_h[i] = vt::F32ToF16(rng.next(1.0f));
+    a_f[i] = vt::F16ToF32(a_h[i]);
+  }
+  const size_t ab = a_h.size() * sizeof(uint16_t);
+  const size_t bb = f.trellis.size() * sizeof(uint16_t);
+  const size_t cb_ = static_cast<size_t>(m * n) * sizeof(float);
+  const int64_t w_cols = 32768;  // min(n, 32768)
+  const size_t wb = static_cast<size_t>(k * w_cols) * sizeof(uint16_t);
+  void* d_a = cb.Alloc(ab);
+  void* d_ah = cb.Alloc(ab);
+  void* d_b = cb.Alloc(bb);
+  void* d_suh = cb.Alloc(f.suh.size() * sizeof(uint16_t));
+  void* d_svh = cb.Alloc(f.svh.size() * sizeof(uint16_t));
+  void* d_c = cb.Alloc(cb_);
+  void* d_w = cb.Alloc(wb);
+  cb.Copy(dq, d_a, a_h.data(), ab);
+  cb.Copy(dq, d_b, f.trellis.data(), bb);
+  cb.Copy(dq, d_suh, f.suh.data(), f.suh.size() * sizeof(uint16_t));
+  cb.Copy(dq, d_svh, f.svh.data(), f.svh.size() * sizeof(uint16_t));
+
+  vt::Tensor tda = vt::Tensor::Contiguous(d_a, vt::DType::kF16, dq.device, {m, k});
+  vt::Tensor tdah = vt::Tensor::Contiguous(d_ah, vt::DType::kF16, dq.device, {m, k});
+  vt::Tensor tdb = vt::Tensor::Contiguous(d_b, vt::DType::kI8, dq.device,
+                                          {k / 16, n / 16, 32 * kBits});
+  vt::Tensor tdsuh = vt::Tensor::Contiguous(d_suh, vt::DType::kF16, dq.device, {k});
+  vt::Tensor tdsvh = vt::Tensor::Contiguous(d_svh, vt::DType::kF16, dq.device, {n});
+  vt::Tensor tdc = vt::Tensor::Contiguous(d_c, vt::DType::kF32, dq.device, {m, n});
+  vt::Tensor tdw = vt::Tensor::Contiguous(d_w, vt::DType::kF16, dq.device, {k, w_cols});
+  vt::Exl3GemmArgs args;
+  args.bits = kBits;
+  args.codebook = kCb;
+  vt::Exl3ReconstructGemm(dq, tdc, tda, tdb, tdsuh, tdsvh, tdah, tdw, args);
+  cb.Synchronize(dq);
+  std::vector<float> c_dev(static_cast<size_t>(m * n), 0.0f);
+  cb.Copy(dq, c_dev.data(), d_c, cb_);
+  cb.Synchronize(dq);
+  for (void* p : {d_a, d_ah, d_b, d_suh, d_svh, d_c, d_w}) cb.Free(p);
+
+  const std::vector<double> ref = Exl3ChainF64(f, a_f, m, kCb);
+  const double rms = Rms(ref);
+  REQUIRE(rms > 0.0);
+  double sq = 0.0;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    const double d = static_cast<double>(c_dev[i]) - ref[i];
+    sq += d * d;
+  }
+  const double rel = std::sqrt(sq / static_cast<double>(ref.size())) / rms;
+  MESSAGE("reconstruct+cuBLAS slicing N=32896 M=4: device vs f64 rel_rms = ", rel);
+  CHECK(rel <= 1.0e-3);
+  cb.DestroyQueue(dq);
 }

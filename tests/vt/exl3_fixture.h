@@ -102,10 +102,11 @@ inline Exl3Fixture MakeFixture(int64_t k, int64_t n, int bits, uint32_t seed) {
 //   y_raw = x_had @ W_inner                (W_inner = reconstruct(trellis))
 //   y     = (y_raw @ H128 / sqrt(128)) * svh   (blockwise over n)
 inline std::vector<double> Exl3ChainF64(const Exl3Fixture& f,
-                                        const std::vector<float>& x_f16_rounded, int64_t m) {
+                                        const std::vector<float>& x_f16_rounded, int64_t m,
+                                        int codebook = 1) {
   const int64_t k = f.k, n = f.n;
   std::vector<float> w_inner(static_cast<size_t>(k * n));
-  vt::Exl3ReconstructInner(f.trellis.data(), k, n, f.bits, /*codebook=*/1, w_inner.data());
+  vt::Exl3ReconstructInner(f.trellis.data(), k, n, f.bits, codebook, w_inner.data());
 
   const double inv = 1.0 / std::sqrt(128.0);
   std::vector<double> y(static_cast<size_t>(m * n), 0.0);

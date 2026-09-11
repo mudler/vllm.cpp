@@ -5814,6 +5814,60 @@ void Exl3Gemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trellis, const
                                                                      a_had, args);
 }
 
+// QUANT-EXL3 W6. The reconstruct+cuBLAS dispatch, parallel to Exl3Gemm above.
+// Same validation, plus w_scratch: fp16 [k, min(n, 32768)] holding the
+// reconstructed weight (MAX_RECONSTRUCT_SLICE_N, exl3.py:11).
+void Exl3ReconstructGemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trellis,
+                          const Tensor& suh, const Tensor& svh, Tensor& a_had,
+                          Tensor& w_scratch, const Exl3GemmArgs& args) {
+  VT_CHECK(args.bits >= 1 && args.bits <= 8,
+           "exl3_reconstruct_gemm: bits must be in [1, 8]; got " + std::to_string(args.bits));
+  VT_CHECK(args.codebook >= 0 && args.codebook <= 2,
+           "exl3_reconstruct_gemm: codebook must be 0, 1 or 2; got " +
+               std::to_string(args.codebook));
+  VT_CHECK(a.rank == 2 && c.rank == 2, "exl3_reconstruct_gemm: A and C must be rank-2");
+  VT_CHECK(a.dtype == DType::kF16,
+           "exl3_reconstruct_gemm: A must be f16; got " + std::string(Name(a.dtype)));
+  VT_CHECK(a_had.dtype == DType::kF16,
+           "exl3_reconstruct_gemm: A_had must be f16; got " + std::string(Name(a_had.dtype)));
+  VT_CHECK(w_scratch.dtype == DType::kF16,
+           "exl3_reconstruct_gemm: w_scratch must be f16; got " +
+               std::string(Name(w_scratch.dtype)));
+  VT_CHECK(c.dtype == DType::kF16 || c.dtype == DType::kF32,
+           "exl3_reconstruct_gemm: C must be f16 or f32; got " + std::string(Name(c.dtype)));
+  VT_CHECK(trellis.dtype == DType::kI8,
+           "exl3_reconstruct_gemm: trellis must be i8; got " + std::string(Name(trellis.dtype)));
+  VT_CHECK(trellis.rank == 3, "exl3_reconstruct_gemm: trellis must be rank-3");
+  const int64_t m = a.shape[0];
+  const int64_t k = a.shape[1];
+  const int64_t n = c.shape[1];
+  VT_CHECK(c.shape[0] == m, "exl3_reconstruct_gemm: C rows must equal A rows");
+  VT_CHECK(a_had.shape[0] == m && a_had.shape[1] == k,
+           "exl3_reconstruct_gemm: A_had must be shaped like A");
+  const int64_t w_cols = n <= 32768 ? n : 32768;
+  VT_CHECK(w_scratch.shape[0] == k && w_scratch.shape[1] == w_cols,
+           "exl3_reconstruct_gemm: w_scratch must be [k, min(n, 32768)]");
+  VT_CHECK(k % 128 == 0 && n % 128 == 0,
+           "exl3_reconstruct_gemm: k and n must be multiples of 128");
+  VT_CHECK(trellis.shape[0] == k / 16 && trellis.shape[1] == n / 16 &&
+               trellis.shape[2] == 32 * static_cast<int64_t>(args.bits),
+           "exl3_reconstruct_gemm: trellis shape must be [k/16, n/16, 32*bits]");
+  VT_CHECK(suh.dtype == DType::kF16 && svh.dtype == DType::kF16,
+           "exl3_reconstruct_gemm: suh/svh must be fp16");
+  VT_CHECK(suh.Numel() == k, "exl3_reconstruct_gemm: suh must have k entries");
+  VT_CHECK(svh.Numel() == n, "exl3_reconstruct_gemm: svh must have n entries");
+  VT_CHECK(a.IsContiguous() && c.IsContiguous() && a_had.IsContiguous() &&
+               w_scratch.IsContiguous() && trellis.IsContiguous() &&
+               suh.IsContiguous() && svh.IsContiguous(),
+           "exl3_reconstruct_gemm: contiguous required");
+  VT_CHECK(a.device == q.device && c.device == q.device && a_had.device == q.device &&
+               w_scratch.device == q.device && trellis.device == q.device &&
+               suh.device == q.device && svh.device == q.device,
+           "exl3_reconstruct_gemm: device mismatch");
+  reinterpret_cast<Exl3ReconstructGemmFn>(GetOp(OpId::kExl3ReconstructGemm, q.device.type))(
+      q, c, a, trellis, suh, svh, a_had, w_scratch, args);
+}
+
 // ─── The fused MoE MLP — MODEL-DSV4-EXL3 W2d ─────────────────────────────────
 //
 // The checks are `exl3_moe.cu:145-201`, in upstream's own order, with the torch

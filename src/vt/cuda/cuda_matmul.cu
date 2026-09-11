@@ -46,6 +46,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "vt/cuda/cublas_lt_hgemm.h"
 #include "vt/cuda/fp8_plan_cache.h"
 #include "vt/cuda/gemm_algo_log.h"
 #include "vt/cuda/gemm_plan_cache.h"
@@ -1314,4 +1315,77 @@ struct Registrar {
 } registrar;
 
 }  // namespace
+
+// QUANT-EXL3 W6. fp16 @ fp16 -> fp16|f32 row-major GEMM for the EXL3
+// reconstruct+cuBLAS prefill path. The reference (exllamavav3_ext/hgemm.cu)
+// uses cublasGemmEx; this tree links cublasLt only, so the GEMM goes through
+// cublasLtMatmul with the same heuristic cache as the bf16/f32 lanes.
+//
+// a is fp16 [M, K] row-major, b is fp16 [K, N] row-major, c is [M, N]
+// row-major (fp16 or f32). Compute type CUBLAS_COMPUTE_32F with f32 alpha/beta,
+// matching the reference's CUBLAS_COMPUTE_32F / CUBLAS_GEMM_DEFAULT_TENSOR_OP.
+void CublasLtHgemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& b) {
+  if (a.dtype != DType::kF16 || b.dtype != DType::kF16 ||
+      (c.dtype != DType::kF16 && c.dtype != DType::kF32)) {
+    throw std::runtime_error("vt cuda: CublasLtHgemm: unsupported dtype combo (" +
+                             Name(a.dtype) + "," + Name(b.dtype) + ")->" + Name(c.dtype) +
+                             "; expected (f16,f16)->f16|f32");
+  }
+  const int64_t m = a.shape[0], k = a.shape[1], n = b.shape[1];
+  if (m == 0 || n == 0) return;
+  cudaStream_t s = static_cast<cudaStream_t>(q.handle);
+
+  const LtContext ctx = GetContext(q.device.index);
+  const cudaDataType_t ab_type = CUDA_R_16F;
+  const cudaDataType_t out_type = c.dtype == DType::kF32 ? CUDA_R_32F : CUDA_R_16F;
+
+  DescGuard desc;
+  CheckLt(cublasLtMatmulDescCreate(&desc.v, CUBLAS_COMPUTE_32F, CUDA_R_32F),
+          "cublasLtMatmulDescCreate (hgemm)");
+  LayoutGuard la, lb, lc;
+  MakeRowMajor(la, ab_type, m, k);
+  MakeRowMajor(lb, ab_type, k, n);
+  MakeRowMajor(lc, out_type, m, n);
+
+  PrefGuard pref;
+  CheckLt(cublasLtMatmulPreferenceCreate(&pref.v), "cublasLtMatmulPreferenceCreate (hgemm)");
+  CheckLt(cublasLtMatmulPreferenceSetAttribute(pref.v, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                               &kWorkspaceBytes, sizeof(kWorkspaceBytes)),
+          "set CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES (hgemm)");
+
+  GemmPlanKey key;
+  key.device = q.device.index;
+  key.op = kFp16Nn;
+  key.m = m;
+  key.n = n;
+  key.k = k;
+  key.lda = k;
+  key.ldb = n;
+  key.ldc = n;
+  key.ab_type = static_cast<int>(ab_type);
+  key.out_type = static_cast<int>(out_type);
+
+  cublasLtMatmulHeuristicResult_t heur{};
+  bool fresh = false;
+  if (!GetOrQueryGemmHeuristic(ctx, key, desc.v, la.v, lb.v, lc.v, pref.v,
+                               "cublasLtMatmulAlgoGetHeuristic (hgemm)", &heur, &fresh)) {
+    throw std::runtime_error("vt cuda: CublasLtHgemm: no cublasLt heuristic for [" +
+                             std::to_string(m) + "," + std::to_string(k) + "]x[" +
+                             std::to_string(k) + "," + std::to_string(n) + "] (f16,f16)->" +
+                             Name(c.dtype));
+  }
+  if (fresh) MaybeLogGemmAlgo(heur, m, n, k, ab_type, ab_type, out_type, "hgemm-fp16-NN");
+
+  if (k == 0) {
+    CheckCuda(cudaMemsetAsync(c.data, 0, c.Bytes(), s), "hgemm k=0 memset");
+    return;
+  }
+
+  const float alpha = 1.0f, beta = 0.0f;
+  CheckLt(cublasLtMatmul(ctx.handle, desc.v, &alpha, a.data, la.v, b.data, lb.v, &beta,
+                         c.data, lc.v, c.data, lc.v, &heur.algo, ctx.workspace,
+                         kWorkspaceBytes, s),
+          "cublasLtMatmul (hgemm)");
+}
+
 }  // namespace vt::cuda

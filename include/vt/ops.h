@@ -495,6 +495,12 @@ enum class OpId : uint8_t {
   // separate argument list (`exl3_moe.cuh:8-46`). See vt::Exl3MoeMlp below.
   // Appended before kCount so no existing op's id shifts.
   kExl3MoeMlp,
+  // QUANT-EXL3 W6. The reconstruct+cuBLAS GEMM path for M > 144, mirroring
+  // exllamav3's AUTO_RECONSTRUCT_THRESHOLD dispatch (exl3.py:10,135). A separate
+  // id and not a widening of `kExl3Gemm`, because the reconstruct path
+  // materializes the dequantized weight and runs cuBLAS, while `kExl3Gemm` runs
+  // the fused cooperative kernel. See vt::Exl3ReconstructGemm below.
+  kExl3ReconstructGemm,
   // --- The LTX-2.5 CONV VIDEO VAE's device-resident glue table
   // (LTX25-VAE-DEVICE-RESIDENCY, #1451). The ten stages between the decode's
   // convolutions that the shared `vt::` surface does NOT express: pixel-norm,
@@ -2298,6 +2304,14 @@ using Exl3GemmFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const
                             const Tensor&, Tensor&, const Exl3GemmArgs&);
 using Exl3MoeMlpFn = void (*)(Queue&, Tensor&, const Tensor&, const Exl3MoeExpertTables&,
                               const Exl3MoeRouting&, const Exl3MoeTemps&, const Exl3MoeArgs&);
+// QUANT-EXL3 W6. Same signature as Exl3GemmFn plus two scratch buffers:
+//   a_had      fp16 [M, K]  — input Hadamard output (unfused path)
+//   w_scratch  fp16 [K, min(N, 32768)] — reconstructed weight (sliced if N > 32768)
+// The unfused path writes the GEMM output directly to `c`, then applies the
+// output Hadamard in-place (safe: each 128-element block is independent).
+using Exl3ReconstructGemmFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                       const Tensor&, const Tensor&, Tensor&, Tensor&,
+                                       const Exl3GemmArgs&);
 using RmsNormFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const RmsNormArgs&, Tensor*);
 using ResidualRmsNormFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*a*/,
@@ -6057,5 +6071,39 @@ int Exl3GemvSmemMode();
 void Exl3MoeMlp(Queue& q, Tensor& output_state, const Tensor& hidden_state,
                 const Exl3MoeExpertTables& tables, const Exl3MoeRouting& routing,
                 const Exl3MoeTemps& temps, const Exl3MoeArgs& args);
+
+// `reconstruct_hgemm` (exl3.py:161-218): the EXL3 prefill path for M > 144.
+// Dequantizes the trellis to a full fp16 weight matrix, then runs cuBLAS fp16
+// GEMM. Upstream dispatches here when `rows > AUTO_RECONSTRUCT_THRESHOLD` (144);
+// `Exl3Gemm` (the fused cooperative kernel) handles M <= 144.
+//
+// The algebra is identical to `Exl3Gemm` — `C = had_r_128(had_r_128(A, suh) @
+// reconstruct(trellis), svh)` — but the Hadamards ride the WEIGHTS, not the
+// activations. Two sub-paths, selected at M >= 1024 when both dims are
+// 128-divisible (exl3.py:184):
+//   FUSED:   reconstruct_had_slice emits original-basis weights (both Hadamards
+//            + sign vectors folded in), so the GEMM runs on raw `a` and no
+//            standalone had_r_128 launches are needed.
+//   UNFUSED: reconstruct + had_r_128 on input (suh) + had_r_128 on output (svh).
+//
+// For N > 32768 (MAX_RECONSTRUCT_SLICE_N), the weight is reconstructed and
+// GEMMed in 32768-column slices to bound the temporary (exl3.py:199-211).
+//
+//   c        f16 or f32 [m, n], contiguous
+//   a        f16 [m, k], contiguous
+//   trellis  i8  [k/16, n/16, 32*bits] (bytes), contiguous
+//   suh      f16 [k]
+//   svh      f16 [n]
+//   a_had    f16 [m, k] scratch for the input Hadamard (unfused path)
+//   w_scratch f16 [k, min(n, 32768)] scratch for the reconstructed weight
+//   args     bits and codebook (same as Exl3GemmArgs)
+//
+// PARITY: the trellis decode and Hadamard are the same code as Exl3Gemm's, so
+// the bound is set by cuBLAS's fp16 GEMM accumulation order, which is
+// non-deterministic in reduction order. The bound is RMS relative 1.0e-3 and
+// 8 fp16 ulps, the same tier as Exl3Gemm.
+void Exl3ReconstructGemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trellis,
+                          const Tensor& suh, const Tensor& svh, Tensor& a_had,
+                          Tensor& w_scratch, const Exl3GemmArgs& args);
 
 }  // namespace vt

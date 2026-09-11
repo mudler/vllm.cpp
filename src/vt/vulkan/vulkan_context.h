@@ -311,7 +311,7 @@ class VulkanContext {
 
   int api_major() const { return api_major_; }
   int api_minor() const { return api_minor_; }
-  bool unified_memory() const { return false; } // FIXME: staging path bug
+  bool unified_memory() const { return unified_memory_; }
   bool shader_float64() const { return shader_float64_; }
   const std::string& device_name() const { return device_name_; }
   uint32_t max_workgroup_count_x() const { return max_workgroup_count_x_; }

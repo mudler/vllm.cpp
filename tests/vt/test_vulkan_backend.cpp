@@ -763,10 +763,15 @@ TEST_CASE("bf16 GEMM takes the COOPMAT tactic where available, scalar where not"
   // garbage rows were discarded by the bounds-checked store. See the ragged case
   // below, which asserts the tactic DECLINES rather than trying to be correct.
   const bool coop_expected = ctx.coopmat_bf16_f32() && ctx.subgroup_size() == 32;
+  // M and N are whole tiles AND M >= 16, so on a device without coopmat this
+  // shape is served by the tiled prefill GEMM (vt_matmul_tiled), not the flat
+  // scalar kernel (vt_matmul). The scalar module is still what runs for M < 16;
+  // the partial-tile case below pins that.
+  const bool tiled_expected = !coop_expected && kM >= 16;
   const std::string tactic_line =
-      std::string("bf16 GEMM tactic: ") + (coop_expected ? "COOPMAT" : "scalar");
+      std::string("bf16 GEMM tactic: ") + (coop_expected ? "COOPMAT" : (tiled_expected ? "tiled" : "scalar"));
   MESSAGE(tactic_line);
-  CHECK(ctx.PipelineExistsFor(coop_expected ? "vt_matmul_coopmat" : "vt_matmul"));
+  CHECK(ctx.PipelineExistsFor(coop_expected ? "vt_matmul_coopmat" : (tiled_expected ? "vt_matmul_tiled" : "vt_matmul")));
   if (!coop_expected) {
     // On a device without the configuration the coopmat module must NEVER be
     // built -- selecting it there would fail at pipeline creation.

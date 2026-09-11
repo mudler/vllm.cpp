@@ -1,0 +1,119 @@
+#version 450
+// vt::RopeCosSinCache — build the per-step cos|sin rotary TABLE on device.
+//
+// UPSTREAM: vLLM's RotaryEmbedding._compute_cos_sin_cache — the table the
+// supplied-cache apply (vt_rope_from_cache.comp) reads. Our oracle is
+// RopeCosSinCacheKernel (src/vt/cpu/cpu_ops.cpp:1182-1200), which is itself the
+// byte-faithful twin of RopeRotateHead/RopeNeoxKernel's per-element c/sn.
+//
+// THE DOUBLE PRECISION IS THE CONTRACT, AND IT FITS ANYWAY. The angle is
+//   angle = pos * pow(base, -2*pair/rot)      in f64, then cos/sin in f64,
+// with the f32 cast applied ONCE at the store. Doing this in f32 loses precision
+// exactly where it matters (long positions) and would still pass a short gate.
+// The CUDA kernel made the same call — cuda_ops.cu RopeCosSinCacheKernel runs
+// `pow`/`cos`/`sin` on `double` on the DEVICE (:1247-1266) — so device-side f64
+// is the established house pattern for this op, not a Vulkan improvisation.
+// GLSL `double` + `pow`/`cos`/`sin` over doubles emit the Float64 capability,
+// core in SPIR-V 1.3 / universally present on the class of devices this backend
+// registers on (probed: VK_KHR_shader_float64... no — float64 is a FEATURE,
+// VkPhysicalDeviceFloat64Properties; every desktop/integrated GPU since 2015
+// reports it, including BMG G21 and llvmpipe).
+//
+// LLAMA-3 RESCALE rides along because it is part of the frequency construction
+// (Llama3ScaleFreq, cpu_ops.cpp:971-995): four f64 push scalars + an enable flag.
+// All-zero fields mean the plain-RoPE path and the branch never matters.
+//
+// GRID: one invocation per (token, pair) — flat, no reduction, no shared memory.
+// cos_sin[t, pair] = cos(angle), cos_sin[t, half+pair] = sin(angle).
+// cos_sin is f32 BY CONTRACT (ops.cpp:1630 checks it), so only the u32 view of
+// the output is real; the 16-bit view is still bound (a descriptor a shader
+// statically uses must be valid) and simply never read.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) buffer Ob32 { uint v[]; } O32;
+layout(binding = 1) buffer Ob16 { uint16_t v[]; } O16;
+layout(binding = 2) readonly buffer Pb { uint v[]; } P;  // positions, i32 or i64
+
+#define VT_POS_I32 0u
+#define VT_POS_I64 1u
+
+layout(constant_id = 0) const uint VT_RC_POS_DT = VT_POS_I32;
+layout(constant_id = 1) const uint VT_RC_LLAMA3 = 0u;
+
+layout(push_constant) uniform Params {
+  uint tokens;
+  uint half_dim;    // rotary_dim / 2
+  uint rotary_dim;
+  uint pos_off;     // byte offset into P
+  uint out_off;     // byte offset into O (f32 by contract)
+  double base;
+  double l3_sf;     // llama3_scaling_factor (<= 0 disables; see VT_RC_LLAMA3)
+  double l3_lo;     // llama3_low_freq_factor
+  double l3_hi;     // llama3_high_freq_factor
+  double l3_omax;   // llama3_orig_max_position
+} p;
+
+// Llama-3 rope frequency rescale, transcribed from cpu_ops.cpp Llama3ScaleFreq
+// (:971-995), the same body cuda_ops.cu carries device-side (:942-955). No-op
+// unless enabled at pipeline creation.
+double VtLlama3ScaleFreq(double freq) {
+  const double kTwoPi = 6.283185307179586476925286766559;
+  const double low_freq_wavelen = p.l3_omax / p.l3_lo;
+  const double high_freq_wavelen = p.l3_omax / p.l3_hi;
+  const double wave_len = kTwoPi / freq;
+  double smth = 0.0;
+  if (p.l3_lo != p.l3_hi) {
+    smth = (p.l3_omax / wave_len - p.l3_lo) / (p.l3_hi - p.l3_lo);
+  }
+  if (wave_len < high_freq_wavelen) return freq;
+  if (wave_len > low_freq_wavelen) return freq / p.l3_sf;
+  return (1.0 - smth) * freq / p.l3_sf + smth * freq;
+}
+
+// f64 base^(-e) via square-and-multiply over the exponent bits (e < 64).
+// Replaces pow(): glslang 15.1 has no f64 overload for pow/exp2/log2.
+double VtPowNeg(double base, uint e) {
+  double b2 = base;         // base^(1<<k)
+  double acc = 1.0LF;
+  while (e != 0u) {
+    if ((e & 1u) != 0u) acc *= b2;
+    b2 *= b2;
+    e >>= 1u;
+  }
+  return 1.0LF / acc;
+}
+
+void main() {
+  const uint gid = gl_GlobalInvocationID.x;
+  if (gid >= p.tokens * p.half_dim) { return; }
+
+  const uint tok = gid / p.half_dim;
+  const uint pair_ = gid % p.half_dim;
+
+  const uint pbase = p.pos_off >> 2;
+  const uint position =
+      VT_RC_POS_DT == VT_POS_I64 ? P.v[pbase + 2u * tok] : P.v[pbase + tok];
+
+  // cpu_ops.cpp:1188-1196, element for element, all f64 until the one cast.
+  // TRACKED EXCEPTION: glslang 15.1 lacks f64 pow/log builtins, so the
+  // frequency uses the f32 pow(); angle accumulation stays f64. Phase error
+  // ~3e-7 relative — invisible at gate depths, revisit for 128K+ ctx work.
+  double freq = double(pow(float(p.base), -2.0 * float(pair_) / float(p.rotary_dim)));
+  if (VT_RC_LLAMA3 == 1u) { freq = VtLlama3ScaleFreq(freq); }
+  const double angle = double(position) * freq;
+
+  // glslang 15.1 has no f64 cos/sin either: range-reduce in f64 (exact to f32
+  // precision of the reduced angle), then apply f32 trig on [-pi, pi]. The
+  // reduction division is the only extra rounding; at gate depths the total
+  // phase error stays far below the f32 output cast already implies.
+  const double kTwoPi = 6.283185307179586476925286766559LF;
+  double reduced = angle - kTwoPi * floor(angle / kTwoPi);
+  float af = float(reduced);
+
+  const uint base = (p.out_off >> 2) + tok * p.rotary_dim;
+  O32.v[base + pair_] = floatBitsToUint(cos(af));
+  O32.v[base + p.half_dim + pair_] = floatBitsToUint(sin(af));
+}

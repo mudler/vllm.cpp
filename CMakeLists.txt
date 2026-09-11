@@ -779,6 +779,9 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen3_5_common.cpp
   src/vllm/model_executor/models/qwen3_5_dense.cpp
   src/vllm/model_executor/models/qwen3_5_moe.cpp
+  src/vllm/model_executor/models/maple_registry.cpp
+  src/vllm/model_executor/models/maple_gguf_weights.cpp
+  src/vllm/model_executor/models/maple.cpp
   # Qwen4-Exp (Qwen3.8-Flash-Next) W4: Qwen Sparse Attention. Host reference
   # math for the indexer, its side cache and the GATHER consumer (#1991).
   src/vllm/model_executor/models/qwen4_exp_qsa.cpp

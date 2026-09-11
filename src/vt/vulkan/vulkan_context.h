@@ -102,7 +102,7 @@ class VulkanContext {
   // loops) — here one module covers the axis and the count of committed artifacts
   // tracks shader FILES instead of their cross product.
   void Dispatch(const std::string& name, const void* const* buffers, uint32_t buffer_count,
-                const void* push_constants, uint32_t push_size, uint32_t group_count_x,
+                const void* push_constants, uint32_t push_size, uint32_t group_count_x, uint32_t group_count_y = 1,
                 const uint32_t* spec_values = nullptr, uint32_t spec_count = 0);
 
   // Was a pipeline for this SPIR-V module ever created? The cache key is the
@@ -299,25 +299,20 @@ class VulkanContext {
   void* ScratchData() const { return scratch_mapped_; }
   static constexpr size_t kScratchBytes = 1024;
 
-  // --- The VULKAN API VERSION. {1, 4} on GB10 (API 1.4.312). It is reached
-  // through vt::Backend::DeviceCapabilityMajor/Minor
-  // (src/vt/vulkan/vulkan_backend.cpp:144-145), which forwards to the
-  // api_major()/api_minor() accessors below; those are public and the suite
-  // reads them directly (tests/vt/test_vulkan_backend.cpp).
-  //
-  // It is NOT mirrored onto vllm::platforms::Platform, and #1823 is why. That
-  // seam's get_device_capability() is an NVIDIA SM version by contract
-  // (interface.py:420-431, "Stateless version of torch.cuda.get_device_capability"),
-  // so `has_device_capability(1, 1)` there does NOT read as "Vulkan >= 1.1" — on
-  // kVULKAN it is false for every argument, because the platform correctly
-  // reports ABSENT. This header used to claim the opposite, and the claim cost
-  // FLASH_ATTN on this backend: an SM-8.0 bar was applied to `major == 1`.
+  // --- Capability data mirrored onto the Platform seam (src/vllm/platforms/
+  // vulkan.cpp) and onto vt::Backend.
+  // The VULKAN API VERSION is what we expose as the DeviceCapability
+  // major/minor pair — {1, 4} on GB10 (API 1.4.312). CUDA answers this question
+  // with sm_XY and Metal with the Apple GPU family; the Vulkan analogue is the
+  // API level, so has_device_capability(1, 1) reads as "Vulkan >= 1.1", the same
+  // shape of question the CUDA code already asks.
   // The shared VkQueue, as the opaque handle vt::Queue carries.
   void* queue_handle() const { return queue_; }
 
   int api_major() const { return api_major_; }
   int api_minor() const { return api_minor_; }
-  bool unified_memory() const { return unified_memory_; }
+  bool unified_memory() const { return false; } // FIXME: staging path bug
+  bool shader_float64() const { return shader_float64_; }
   const std::string& device_name() const { return device_name_; }
   uint32_t max_workgroup_count_x() const { return max_workgroup_count_x_; }
   // The two float-controls properties that decide whether our f32 arithmetic is
@@ -339,6 +334,15 @@ class VulkanContext {
   // coopmat path is dgx-gated.
   bool coopmat_bf16_f32() const { return coopmat_bf16_f32_; }
   uint32_t subgroup_size() const { return subgroup_size_; }
+
+  // --- INTEGER DOT PRODUCT (VK-IDOT). GL_EXT_integer_dot_product provides
+  // dotPacked4x8EXT — a hardware-accelerated 4-way int8 dot product that the
+  // TQ1_0/TQ2_0 keep-quant shaders use to replace 4 scalar MACs with one
+  // instruction. Probed via VkPhysicalDeviceVulkan12Features::shaderIntegerDotProduct
+  // (CORE in 1.2, but we request 1.1 so the feature bit is probed, not assumed).
+  // The TQ shaders gate on this predicate and fall back to the scalar path
+  // where it is false (llvmpipe, older drivers).
+  bool integer_dot_product_4x8() const { return integer_dot_product_4x8_; }
 
   // --- WIDE REDUCTION SHADERS (VK-RMSNORM). Every shader in this backend is
   // compiled for the Vulkan-GUARANTEED 128 invocations, which is the right floor
@@ -373,6 +377,7 @@ class VulkanContext {
   uint32_t max_workgroup_invocations() const { return max_workgroup_invocations_; }
   uint32_t max_workgroup_size_x() const { return max_workgroup_size_x_; }
   bool subgroup_arithmetic_compute() const { return subgroup_arithmetic_compute_; }
+  bool subgroup_shuffle_compute() const { return subgroup_shuffle_compute_; }
 
   // Invocations the wide reducing modules are compiled for. Mirrors VT_TG in
   // src/vt/vulkan/shaders/vt_rms_norm_wide.comp; the host never launches with it
@@ -503,14 +508,18 @@ class VulkanContext {
   int api_major_ = 0;
   int api_minor_ = 0;
   bool unified_memory_ = false;
+  bool shader_float64_ = false;
   bool denorm_preserve_f32_ = false;
   bool sz_inf_nan_preserve_f32_ = false;
   bool coopmat_bf16_f32_ = false;
+  bool integer_dot_product_4x8_ = false;
   uint32_t subgroup_size_ = 0;
   uint32_t max_workgroup_count_x_ = 0;
+  uint32_t max_workgroup_count_y_ = 0;
   uint32_t max_workgroup_invocations_ = 0;
   uint32_t max_workgroup_size_x_ = 0;
   bool subgroup_arithmetic_compute_ = false;
+  bool subgroup_shuffle_compute_ = false;
   bool wide_reduce_ = false;
   int rms_norm_override_ = 0;
   std::string device_name_;

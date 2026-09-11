@@ -42,8 +42,10 @@ static int64_t g_vit_rc[2] = {0, 0}, g_cells_rc[2] = {0, 0};
 
 static bool eval_cb(ggml_tensor* t, bool ask, void*) {
   const char* n = ggml_get_name(t);
-  const bool vit = std::strncmp(n, "vit_out", 7) == 0;
-  const bool al = std::strncmp(n, "aligner_out", 11) == 0;
+  // EXACT names: the graph also names the reshaped / permuted views
+  // "vit_out (reshaped) ...", and a prefix match kept the last of them.
+  const bool vit = std::strcmp(n, "vit_out") == 0;
+  const bool al = std::strcmp(n, "aligner_out") == 0;
   if (ask) return vit || al;
   if (!(vit || al)) return true;
   if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
@@ -138,6 +140,22 @@ int main(int argc, char** argv) {
   }
   clip_image_f32& e = pp.entries[0];
   e.lead_pad = lead_pad;
+  // NOISE-FLOOR ARM. Our processor narrows the normalised pixels to bf16
+  // before the tower (deepseek_v4_processor.cpp) and the oracle keeps them f32.
+  // DSV4V_ROUND_INPUT_BF16=1 applies the same rounding here, so oracle(f32 in)
+  // against oracle(bf16 in) measures how far that perturbation ALONE moves the
+  // oracle's own output -- the floor ours-vs-oracle is judged against.
+  if (const char* rb = std::getenv("DSV4V_ROUND_INPUT_BF16"); rb && rb[0] == '1') {
+    std::vector<float> rounded = e.get_ro_buf();
+    for (float& v : rounded) {
+      uint32_t u;
+      std::memcpy(&u, &v, 4);
+      u = (u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u;
+      std::memcpy(&v, &u, 4);
+    }
+    e.cpy_buf(rounded);
+    std::printf("oracle input rounded to bf16 (noise-floor arm)\n");
+  }
   std::printf("oracle preprocess: %dx%d (from %dx%d) lead_pad=%d\n", e.nx(),
               e.ny(), width, height, e.lead_pad);
 

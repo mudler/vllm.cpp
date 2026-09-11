@@ -142,6 +142,31 @@ def main():
         {"row": img[k], "cell": cell[img[k]], **per[k]} for k in reversed(worst)]
     for w in report["worst_image_rows"]:
         print("worst", json.dumps(w))
+    # STRUCTURE. Precision noise gives a roughly uniform ABSOLUTE error, so the
+    # relative error is worst on the smallest rows and nothing tracks position.
+    # A positional defect (RoPE axis, unfold order, a padded edge) shows up as
+    # error concentrated on an aligner row or column.
+    by_r = [[] for _ in range(n_llm_h)]; by_c = [[] for _ in range(n_llm_w)]
+    for k, i in enumerate(img):
+        r, c = divmod(cell[i], n_llm_w)
+        by_r[r].append(per[k]["mean_abs"]); by_c[c].append(per[k]["mean_abs"])
+    mean = lambda v: sum(v) / len(v)
+    xs = [per[k]["ref_rms"] for k in range(len(img))]
+    ya = [per[k]["mean_abs"] for k in range(len(img))]
+    yr = [per[k]["rel_l2"] for k in range(len(img))]
+
+    def corr(x, y):
+        mx, my = mean(x), mean(y)
+        sx = math.sqrt(sum((v - mx) ** 2 for v in x)); sy = math.sqrt(sum((v - my) ** 2 for v in y))
+        return sum((u - mx) * (v - my) for u, v in zip(x, y)) / (sx * sy) if sx and sy else float("nan")
+
+    report["structure"] = {
+        "mean_abs_by_aligner_row": [round(mean(v), 6) for v in by_r],
+        "mean_abs_by_aligner_col": [round(mean(v), 6) for v in by_c],
+        "corr_ref_rms_vs_mean_abs": corr(xs, ya),
+        "corr_ref_rms_vs_rel_l2": corr(xs, yr),
+    }
+    print("structure", json.dumps(report["structure"]))
     allrows = [stats(a, b) for a, b in zip(ours, ref)]
     report["all_rows"] = {
         "max_abs": max(p["max_abs"] for p in allrows),
@@ -163,6 +188,15 @@ def main():
             report[stage] = "absent"
             continue
         a = load(po); b = load(pr)
+        grid = math.isqrt(a[0])
+        if (stage == "vit" and a[:2] != b[:2] and grid * grid == a[0]
+                and b[1] == grid and b[0] == a[1] * grid):
+            # The first W6 run captured llama.cpp's permuted+cont view of
+            # vit_out, laid out [hidden][y][x]. Re-index it to [y*gw+x][hidden].
+            g = b[1]
+            flat = [x for row in b[2] for x in row]
+            b = (a[0], a[1], [[flat[(c * g + p // g) * g + p % g] for c in range(a[1])]
+                              for p in range(a[0])])
         if a[:2] != b[:2]:
             report[stage] = {"shape_mismatch": [a[:2], b[:2]]}
             print(stage, report[stage])

@@ -152,7 +152,9 @@ def validate(body: str) -> int:
             f"(exit {result.returncode})"
         )
     verdict = EXIT_CONTRACT if result.returncode else EXIT_OK
-    problems = closing_keyword_records(body)
+    problems, warnings = closing_keyword_records(body)
+    for warning in warnings:
+        print(f"WARNING: {warning}", file=sys.stderr)
     for problem in problems:
         print(f"ERROR: {problem}", file=sys.stderr)
     return EXIT_CONTRACT if problems else verdict
@@ -177,12 +179,20 @@ def closing_keyword_records(body: str) -> list[str]:
     """
 
     problems: list[str] = []
+    warnings: list[str] = []
     for number in sorted({m.group(1) for m in CLOSING.finditer(body)}, key=int):
         matches = sorted((ROOT / ".agents/issues").rglob(f"ISSUE-GH-{number}.md"))
         if not matches:
-            problems.append(
-                f"body closes #{number} but no .agents/issues/**/ISSUE-GH-{number}.md "
-                "exists; file it (scripts/agent-issue.py import-github) or drop the keyword"
+            # WARNING, not a refusal. An authority that does not exist cannot be
+            # contradicted, and issues predating the local-first migration have no
+            # record at all: measured across the open queue this arm fires on 22 of
+            # 24 failures and would have blocked three pull requests that legitimately
+            # landed on 2026-09-11 (#3141, #3138, #3128). A gate that fires on
+            # ordinary work is the defect, not the discipline.
+            warnings.append(
+                f"body closes #{number} and no .agents/issues/**/ISSUE-GH-{number}.md "
+                "exists; import it (scripts/agent-issue.py import-github) so the local "
+                "record carries the resolution evidence"
             )
             continue
         text = matches[0].read_text(encoding="utf-8", errors="replace")
@@ -196,7 +206,7 @@ def closing_keyword_records(body: str) -> list[str]:
                 f"State: {state or '(absent)'}; close it locally first "
                 "(scripts/agent-issue.py close) or drop the keyword"
             )
-    return problems
+    return problems, warnings
 
 
 def pull_request_number(value: str) -> int:

@@ -38,6 +38,8 @@
 #include <string>
 #include <vector>
 
+#include <fstream>
+
 #include <nlohmann/json.hpp>
 
 #include "deepseek_v4_lang_gguf_fixture.h"
@@ -560,6 +562,37 @@ FixtureOptions OfficialVisionOptions() {
   return opt;
 }
 
+nlohmann::json ReadJsonFixture(const std::string& path) {
+  std::ifstream in(path);
+  REQUIRE_MESSAGE(in.good(), "cannot open fixture ", path);
+  return nlohmann::json::parse(in);
+}
+
+uint64_t Fnv1aLines(const std::vector<std::string>& lines) {
+  uint64_t hash = 1469598103934665603ull;
+  for (const std::string& line : lines) {
+    for (unsigned char c : line) {
+      hash ^= static_cast<uint64_t>(c);
+      hash *= 1099511628211ull;
+    }
+    hash ^= static_cast<uint64_t>('\n');
+    hash *= 1099511628211ull;
+  }
+  return hash;
+}
+
+// The same three-way partition `scripts/check-deepseek-v4-vision-manifests.py`
+// applies. Two descriptions of one rule, held to ONE committed manifest, so a
+// change to either that the other does not make turns this suite red.
+std::string IndexClass(const std::string& name) {
+  if (name.starts_with("vision.") || name.starts_with("aligner.") ||
+      name == "image_start" || name == "image_end" ||
+      name == "image_newline" || name == "image_pad")
+    return "vision";
+  if (name.starts_with("mtp.")) return "mtp";
+  return "language";
+}
+
 }  // namespace
 
 TEST_CASE("official vision safetensors fill every W2 field and outlive the shards") {
@@ -796,4 +829,110 @@ TEST_CASE("official vision safetensors reach ModelRegistry::Load, and a text che
   CHECK_FALSE(vllm::ModelAs<vllm::DeepseekV4LoadedModel>(
                   *text_model, "DeepseekV4ForCausalLM")
                   .has_vision());
+}
+
+// ─── The pinned manifests: what ties all of the above to a 156 GiB artifact ──
+//
+// These two cases are ported from the same parallel line as the loader
+// (`3f3860851`). They read the committed manifests that
+// `scripts/check-deepseek-v4-vision-manifests.py` builds from the pinned
+// revision, and hold this tree's derived name map and shape rules to them. The
+// checker recomputes the same quantities in Python; these recompute them in
+// C++. Neither reads a weight byte.
+TEST_CASE("the pinned index manifest classifies the released tensor map exactly") {
+  const nlohmann::json manifest = ReadJsonFixture(DEEPSEEK_V4_VISION_INDEX_MANIFEST);
+  CHECK(manifest.at("repo") == "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp");
+  CHECK(manifest.at("revision") == "86f746b36186f0e567729a5c06a8c918caba82a9");
+  CHECK(manifest.at("shard_count") == 48);
+  CHECK(manifest.at("total_size") == 167811372792ull);
+  CHECK(manifest.at("tensor_count") == 72633);
+  // 267 = 2 + 8 * 32 + 1 + 4 + 4, the same rule this fixture's 27 follows.
+  CHECK(manifest.at("classifications").at("vision").at("count") == 267);
+  const nlohmann::json config = ReadJsonFixture(DEEPSEEK_V4_VISION_CONFIG);
+  CHECK(config.at("vision_n_layers") == 32);
+  CHECK(config.at("vision_dim") == 1024);
+  CHECK(config.at("vision_n_heads") == 16);
+  CHECK(config.at("vision_inter_dim") == 2816);
+  CHECK(config.at("vision_patch_size") == 14);
+  CHECK(config.at("vision_downsample_ratio") == 3);
+  CHECK(2 + 8 * config.at("vision_n_layers").get<int64_t>() + 1 + 4 + 4 ==
+        manifest.at("classifications").at("vision").at("count").get<int64_t>());
+}
+
+TEST_CASE("the pinned shard-1 header gives every official vision tensor a BF16 shape this loader accepts") {
+  const nlohmann::json config = ReadJsonFixture(DEEPSEEK_V4_VISION_CONFIG);
+  const nlohmann::json manifest = ReadJsonFixture(DEEPSEEK_V4_VISION_HEADER_MANIFEST);
+  const nlohmann::json& tensors = manifest.at("tensors");
+  CHECK(manifest.at("shard") == "model-00001-of-00048.safetensors");
+  CHECK(manifest.at("vision_tensor_count") == 267);
+  CHECK(manifest.at("vision_payload_bytes") == 932786176ull);
+  REQUIRE(manifest.at("header_tensor_count").get<size_t>() == tensors.size());
+
+  const int64_t hidden = config.at("hidden_size").get<int64_t>();
+  const int64_t dim = config.at("vision_dim").get<int64_t>();
+  const int64_t inter = config.at("vision_inter_dim").get<int64_t>();
+  const int64_t patch = config.at("vision_patch_size").get<int64_t>();
+  const int64_t ratio = config.at("vision_downsample_ratio").get<int64_t>();
+  // The RELEASED shapes, derived here from the released config by the same
+  // rules the loader applies at this fixture's reduced geometry.
+  const auto released_shape =
+      [&](const std::string& name) -> std::vector<int64_t> {
+    if (name == "vision.patch_embed.proj.weight") return {dim, 3 * patch * patch};
+    if (name == "vision.patch_embed.proj.bias" || name == "vision.norm.weight" ||
+        name.ends_with("norm1.weight") || name.ends_with("norm2.weight") ||
+        name.ends_with("attn.wo.bias"))
+      return {dim};
+    if (name.ends_with("attn.wqkv.weight")) return {3 * dim, dim};
+    if (name.ends_with("attn.wqkv.bias")) return {3 * dim};
+    if (name.ends_with("attn.wo.weight")) return {dim, dim};
+    if (name.ends_with("mlp.w1.weight")) return {2 * inter, dim};
+    if (name.ends_with("mlp.w2.weight")) return {dim, inter};
+    if (name == "aligner.w1.weight") return {hidden, dim * ratio * ratio};
+    if (name == "aligner.w2.weight") return {hidden, hidden};
+    if (name.starts_with("aligner.") || name.starts_with("image_")) return {hidden};
+    return {};
+  };
+
+  size_t vision_names = 0;
+  size_t language_names = 0;
+  int64_t payload = 0;
+  std::vector<std::string> records;
+  for (const auto& [name, tensor] : tensors.items()) {
+    CAPTURE(name);
+    // EVERY tensor of the released group is BF16 on disk, which is what the
+    // loader refuses anything else against.
+    CHECK(tensor.at("dtype") == "BF16");
+    const std::vector<int64_t> shape =
+        tensor.at("shape").get<std::vector<int64_t>>();
+    if (IndexClass(name) != "vision") {
+      // Shard 1 carries exactly one language tensor beside the group.
+      ++language_names;
+      CHECK(name == "embed.weight");
+      CHECK(shape == std::vector<int64_t>{config.at("vocab_size").get<int64_t>(),
+                                          hidden});
+      continue;
+    }
+    ++vision_names;
+    const std::vector<int64_t> wanted = released_shape(name);
+    REQUIRE_MESSAGE(!wanted.empty(), name);
+    CHECK(shape == wanted);
+    int64_t bytes = 2;
+    for (int64_t d : shape) bytes *= d;
+    payload += bytes;
+    std::string record = name + "\tBF16\t";
+    for (size_t i = 0; i < shape.size(); ++i) {
+      if (i != 0) record += ",";
+      record += std::to_string(shape[i]);
+    }
+    records.push_back(record);
+  }
+  CHECK(language_names == 1);
+  CHECK(vision_names == 267);
+  CHECK(payload == manifest.at("vision_payload_bytes").get<int64_t>());
+  // The records are sorted by name, which is the order the checker hashed them
+  // in; this is the one assertion that would catch a shape changing while every
+  // count above stayed the same.
+  std::sort(records.begin(), records.end());
+  CHECK(std::to_string(Fnv1aLines(records)) ==
+        manifest.at("vision_records_fnv1a64").get<std::string>());
 }

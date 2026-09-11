@@ -864,6 +864,17 @@ target_include_directories(test_deepseek_v4_exl3_loader PRIVATE ${CMAKE_SOURCE_D
 # carry the tensor on every layer, and pins the text checkpoint's inertness when
 # it is absent. See .agents/specs/deepseek-v4-flash-vision.md.
 vllm_cpp_add_test(test_deepseek_v4_mm_loader vllm/models/test_deepseek_v4_mm_loader.cpp)
+# MODEL-MM-deepseek-v4 (#2411): the pinned OFFICIAL artifact's own metadata,
+# committed verbatim. `config.json` is the released file; the two manifests are
+# derived from it and from shard 1's safetensors HEADER by
+# `scripts/check-deepseek-v4-vision-manifests.py`, which reads two HTTP ranges
+# and never a weight payload. They are what ties this tree's derived tensor map
+# to the 156.287 GiB checkpoint nobody here can stage, so the loader gate can
+# ask a real question about an artifact it cannot open.
+target_compile_definitions(test_deepseek_v4_mm_loader PRIVATE
+  DEEPSEEK_V4_VISION_CONFIG="${CMAKE_SOURCE_DIR}/tests/parity/goldens/deepseek_v4_vision/config.json"
+  DEEPSEEK_V4_VISION_INDEX_MANIFEST="${CMAKE_SOURCE_DIR}/tests/parity/goldens/deepseek_v4_vision/index_manifest.json"
+  DEEPSEEK_V4_VISION_HEADER_MANIFEST="${CMAKE_SOURCE_DIR}/tests/parity/goldens/deepseek_v4_vision/shard1_header_manifest.json")
 target_include_directories(test_deepseek_v4_mm_loader PRIVATE
                            ${CMAKE_CURRENT_SOURCE_DIR}/vllm ${CMAKE_SOURCE_DIR}/src)
 

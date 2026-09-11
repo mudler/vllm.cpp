@@ -623,7 +623,7 @@ function Invoke-CrtAudit {
           [Parameter(Mandatory)][string]$Server,
           [scriptblock]$DumpbinRunner = {
               param([string]$Mode, [string]$Path)
-              $output = & dumpbin $Mode $Path 2>&1
+              $output = & dumpbin /nologo $Mode $Path
               if ($LASTEXITCODE -ne 0) {
                   throw "dumpbin $Mode failed for $Path with status $LASTEXITCODE"
               }
@@ -747,6 +747,30 @@ foreach ($name in @("SOURCE_SHA", "VERSION", "EVIDENCE_URL", "SOURCE_DATE_EPOCH"
     if (-not [Environment]::GetEnvironmentVariable($name)) {
         throw "$name is required"
     }
+}
+
+# The Visual Studio cmake generator finds cl.exe internally, but dumpbin
+# is called directly by the CRT audit (line 845) and the PE inspection
+# (line 935).  It is not on PATH by default on windows-2022 runners, so
+# locate it via vswhere and prepend its directory.
+$vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+if (Test-Path $vswhere) {
+    $vsInstall = & $vswhere -latest -property installationPath
+    if ($vsInstall) {
+        $msvcRoot = Join-Path $vsInstall "VC\Tools\MSVC"
+        if (Test-Path $msvcRoot) {
+            $dumpbinDir = Get-ChildItem -Path $msvcRoot -Directory |
+                Sort-Object Name -Descending | Select-Object -First 1 |
+                ForEach-Object { Join-Path $_.FullName "bin\Hostx64\x64" }
+            if ($dumpbinDir -and (Test-Path (Join-Path $dumpbinDir "dumpbin.exe"))) {
+                $env:PATH = "$dumpbinDir;$env:PATH"
+            }
+        }
+    }
+}
+
+if (-not (Get-Command dumpbin -ErrorAction SilentlyContinue)) {
+    throw "dumpbin.exe not found on PATH; CRT audit and PE inspection cannot run"
 }
 
 if (-not (Test-Path (Join-Path $SmokeModel "config.json"))) {
@@ -932,11 +956,11 @@ $absent = @{
     }
 } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $tierReport -Encoding utf8NoBOM
 
-$headerOutput = @(& dumpbin /nologo /headers $server 2>&1)
+$headerOutput = @(& dumpbin /nologo /headers $server)
 if ($LASTEXITCODE -ne 0) { throw "dumpbin /headers failed" }
-$dependentOutput = @(& dumpbin /nologo /dependents $server 2>&1)
+$dependentOutput = @(& dumpbin /nologo /dependents $server)
 if ($LASTEXITCODE -ne 0) { throw "dumpbin /dependents failed" }
-$rawOutput = @(& dumpbin /nologo /rawdata $server 2>&1)
+$rawOutput = @(& dumpbin /nologo /rawdata $server)
 if ($LASTEXITCODE -ne 0) { throw "dumpbin /rawdata failed" }
 $machine = if (($headerOutput -join "`n") -match '(?im)^\s*(8664)\s+machine') { $Matches[1] } else { "" }
 $imports = @(
@@ -954,7 +978,10 @@ $debugPaths = @(
     imports = $imports; debug_paths = $debugPaths
 } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $peReport -Encoding utf8NoBOM
 
+$savedEAP = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
 $compiler = (& cl 2>&1 | Select-Object -First 1) -join ""
+$ErrorActionPreference = $savedEAP
 $toolsetVersion = if ($env:VCToolsVersion) { $env:VCToolsVersion.TrimEnd('\') } else { throw "VCToolsVersion is required" }
 $ucrtVersion = if ($env:UCRTVersion) { $env:UCRTVersion.TrimEnd('\') } else { throw "UCRTVersion is required" }
 $abiVersion = ($toolsetVersion -split '\.')[0..1] -join '.'

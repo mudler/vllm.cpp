@@ -173,11 +173,16 @@ ForwardLogits ForwardDeepseekV4ForCausalLM(LoadedModel& model,
   // own predicate, not a copy of its clauses.
   if (input.multi_kv != nullptr && weights.has_exl3_weights) {
     std::vector<vt::Tensor> pages;
+    // KV-DSV4-MULTICACHE W8 slice 4 (#2455): the resolver reports the STORAGE
+    // ROW COUNT when it binds a packed fp8_ds_mla page, and 0 for a float one.
+    // Passing it is what lets this arm receive the architecture's DEFAULT page
+    // format instead of being refused for it.
+    int64_t rows_per_block = 0;
     const std::string refusal = ResolveDeepseekV4SwaPages(
         weights.params, *input.multi_kv, input.attn_kv, input.attn_meta.num_reqs,
         input.queue.device, &pages, /*dsa_dense=*/false,
         /*have_compressor_state=*/true,
-        /*num_tokens=*/static_cast<int64_t>(ids.size()));
+        /*num_tokens=*/static_cast<int64_t>(ids.size()), &rows_per_block);
     VT_CHECK(refusal.empty(), refusal);
     const int64_t kv_base =
         input.attn_meta.num_computed_tokens_cpu.empty()
@@ -186,7 +191,7 @@ ForwardLogits ForwardDeepseekV4ForCausalLM(LoadedModel& model,
     return DeepseekV4ForwardExl3PagedLogits(
         weights, input.queue, pages, kv_base, ids, input.positions,
         input.logits_indices,
-        &ds.compressor_state(weights.params.num_hidden_layers));
+        &ds.compressor_state(weights.params.num_hidden_layers), rows_per_block);
   }
   if (input.gather_logits) {
     return DeepseekV4Model::ForwardDevice(ids, input.positions,
@@ -201,11 +206,15 @@ ForwardLogits ForwardDeepseekV4ForCausalLM(LoadedModel& model,
     // which forces every layer dense, so a compressor layer would attend the raw
     // prefix and stays refused. Passing the two values explicitly is what makes
     // the difference between the arms readable rather than implicit.
+    // W8 slice 4 (#2455): same channel on this arm. A GGUF tower forces every
+    // layer dense, so the compressor clause never admits a layer here, and a
+    // packed page is therefore servable on exactly the SWA-only layers.
+    int64_t rows_per_block = 0;
     const std::string refusal = ResolveDeepseekV4SwaPages(
         weights.params, *input.multi_kv, input.attn_kv, input.attn_meta.num_reqs,
         input.queue.device, &pages, /*dsa_dense=*/true,
         /*have_compressor_state=*/false,
-        /*num_tokens=*/static_cast<int64_t>(ids.size()));
+        /*num_tokens=*/static_cast<int64_t>(ids.size()), &rows_per_block);
     VT_CHECK(refusal.empty(), refusal);
     const int64_t kv_base =
         input.attn_meta.num_computed_tokens_cpu.empty()
@@ -213,7 +222,9 @@ ForwardLogits ForwardDeepseekV4ForCausalLM(LoadedModel& model,
             : static_cast<int64_t>(input.attn_meta.num_computed_tokens_cpu[0]);
     return HostLogits(
         DeepseekV4ForwardGgufPaged(weights, input.queue, pages, kv_base, ids,
-                                   input.positions, input.logits_indices),
+                                   input.positions, input.logits_indices,
+                                   /*kv_prewritten=*/false,
+                                   /*compressor=*/nullptr, rows_per_block),
         weights.params.vocab_size);
   }
   return HostLogits(

@@ -520,17 +520,61 @@ TEST_CASE("PAGED-ENTRY: the resolver's compressor clause IS the composition's (#
                                         /*num_tokens=*/4)
             .empty());
 
-  // 6. A PACKED page refuses by name. The runner publishes the SWA pages at
-  //    `kI8` / `fp8_ds_mla`, and `vt::ConcatAndCacheMla` takes a float cache
-  //    only -- so without this the route aborts inside a kernel with a message
-  //    naming neither the topology nor the row that owes the store.
+  // 6. A PACKED page is now ROUTED, not refused (KV-DSV4-MULTICACHE W8 slice 4,
+  //    #2455). The runner publishes the SWA pages at `kI8` / `fp8_ds_mla` --
+  //    upstream's own default -- so this is the arm a real artifact takes, and
+  //    the resolver builds the rank-2 byte view the region-split block forces.
+  //
+  //    THE PAGE IS SIZED FROM `page_size_bytes`, NOT FROM THE VIEW. Those two
+  //    disagree for this spec by design, which is the whole reason the field is
+  //    carried: 64 * 512 = 32768 against a 37440-byte allocated page.
   auto packed = caches;
-  packed[1].dtype = vt::DType::kI8;
+  for (auto& c : packed) {
+    c.dtype = vt::DType::kI8;
+    c.page_size_bytes = 37440;  // round_up(64 * 584, 576), W1's own table
+  }
   pages.clear();
+  int64_t rows = 0;
   const std::string i8 = vllm::ResolveDeepseekV4SwaPages(
-      p128, mk, packed, 1, dev, &pages, false, true, 1);
-  CHECK(i8.find("PACKED page") != std::string::npos);
-  CHECK(i8.find("KV-DSV4-MULTICACHE W8") != std::string::npos);
+      SwaOnlyParams(L, HD), mk, packed, 1, dev, &pages, /*dsa_dense=*/true,
+      /*have_compressor_state=*/false, /*num_tokens=*/1, &rows);
+  CHECK(i8.empty());
+  CHECK(rows == packed[0].block_size);
+  REQUIRE(pages.size() == static_cast<size_t>(L));
+  for (const vt::Tensor& p : pages) {
+    CHECK(p.rank == 2);  // region-split: no (block, row, column) reaches a scale
+    CHECK(p.dtype == vt::DType::kI8);
+    CHECK(p.shape[1] == 37440);
+  }
+
+  // 6b. A caller that cannot RECEIVE the row count is refused, rather than
+  //     handed a byte page it would write as though it were float.
+  pages.clear();
+  const std::string no_rows = vllm::ResolveDeepseekV4SwaPages(
+      SwaOnlyParams(L, HD), mk, packed, 1, dev, &pages, true, false, 1);
+  CHECK(no_rows.find("out_rows_per_block") != std::string::npos);
+
+  // 6c. A page the runner never sized cannot be viewed. `page_size_bytes` is
+  //     filled only by `GPUModelRunner::initialize_kv_cache`, and recomputing it
+  //     from the view would be the 3.5x overrun this whole wave removes.
+  auto unsized = packed;
+  for (auto& c : unsized) c.page_size_bytes = 0;
+  pages.clear();
+  const std::string no_page = vllm::ResolveDeepseekV4SwaPages(
+      SwaOnlyParams(L, HD), mk, unsized, 1, dev, &pages, true, false, 1, &rows);
+  CHECK(no_page.find("page_size_bytes") != std::string::npos);
+
+  // 6d. A COMPRESSOR layer plus a packed page still refuses, naming the rows
+  //     that own the composition. `CompressorLayerStep` attends its window
+  //     through `vt::MlaDecodeAttention`, which takes a rank-3 float cache, so a
+  //     region-split byte page is not expressible there. This is the boundary
+  //     of W8 slice 4 and it is asserted rather than left to be discovered.
+  pages.clear();
+  const std::string comp_packed = vllm::ResolveDeepseekV4SwaPages(
+      p128, mk, packed, 1, dev, &pages, /*dsa_dense=*/false,
+      /*have_compressor_state=*/true, /*num_tokens=*/1, &rows);
+  CHECK(comp_packed.find("compressor") != std::string::npos);
+  CHECK(comp_packed.find("#2286") != std::string::npos);
 }
 
 TEST_CASE("W1: two LSE-merged passes equal one pass over the union — sink in EXACTLY one") {

@@ -141,6 +141,22 @@ struct V4Backend {
   // same keys, and a step that wrote one and read the other would produce
   // plausible tokens from a stale context.
   std::vector<vt::Tensor>* paged_kv = nullptr;
+  // KV-DSV4-MULTICACHE W8 slice 4 (#2455): STORAGE ROWS PER BLOCK for a PACKED
+  // page, and 0 for the float page every other arm binds.
+  //
+  // A rank-2 `[num_blocks, block_bytes]` byte page cannot carry this in its
+  // shape, which is the whole reason it is a separate field. The fp8_ds_mla
+  // block is REGION-SPLIT — a token's 8 scale bytes live at
+  // `block_size * 576 + pos * 8`, after ALL of the block's token data
+  // (`cache_utils.py:59-66`) — so the row count is an argument to both ops
+  // (`vt::ConcatAndCacheDsMla`'s trailing `block_size`, and
+  // `DequantAndGatherDsMlaArgs::block_size`) exactly as it is upstream.
+  //
+  // Resolved ONCE by `ResolveDeepseekV4SwaPages`, from the published spec's own
+  // `block_size`, and never recomputed from `block_bytes`: inverting
+  // `RoundUp(rows * 584, 576)` is not a function, and a wrong row count writes
+  // every token's scales into another token's data region.
+  int64_t paged_rows_per_block = 0;
   // MODEL-DSV4-DSA-COMPOSE W1 (#2286): the compressor is a STATE MACHINE across
   // steps, so its state is carried by the caller, one entry per layer. Null =>
   // no compressor arm, which is every existing path.
@@ -1010,8 +1026,35 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     VT_CHECK(static_cast<int64_t>(be.paged_kv->size()) > layer,
              "deepseek-v4: paged MLA cache has no tensor for this layer");
     vt::Tensor& page = (*be.paged_kv)[static_cast<size_t>(layer)];
-    VT_CHECK(page.rank == 3 && page.shape[2] == hd,
-             "deepseek-v4: paged MLA cache must be [num_blocks, block_size, head_dim]");
+    // KV-DSV4-MULTICACHE W8 slice 4 (#2455): TWO page shapes, and the dtype is
+    // not what distinguishes them -- the RANK is. A float page is the rank-3
+    // `[num_blocks, block_size, head_dim]` row view every other arm binds. The
+    // fp8_ds_mla page is rank-2 `[num_blocks, block_bytes]` bytes, because the
+    // block is REGION-SPLIT: a token's 8 scale bytes sit after ALL of the
+    // block's token data (`cache_utils.py:59-66`), so no (block, row, column)
+    // indexing reaches both halves of one token.
+    //
+    // `paged_rows_per_block` is the resolver's answer and is 0 for a float page,
+    // so the two facts are asserted to AGREE here rather than trusted
+    // separately: a rank-2 page with no row count cannot be addressed, and a
+    // row count against a rank-3 page means the resolver and this block
+    // disagree about which format was bound.
+    const bool packed_page = page.rank == 2;
+    VT_CHECK(packed_page == (be.paged_rows_per_block > 0),
+             "deepseek-v4: the paged cache's SHAPE and its storage row count "
+             "disagree -- a rank-2 fp8_ds_mla byte page needs rows_per_block > 0 "
+             "and a rank-3 float page needs 0 (KV-DSV4-MULTICACHE W8, #2455)");
+    if (packed_page) {
+      VT_CHECK(page.dtype == vt::DType::kI8,
+               "deepseek-v4: a rank-2 paged MLA cache is the fp8_ds_mla BYTE "
+               "page and must be DType::kI8 (KV-DSV4-MULTICACHE W8, #2455)");
+      VT_CHECK(page.shape[1] >= be.paged_rows_per_block * vt::kFp8DsMlaTokenBytes,
+               "deepseek-v4: the fp8_ds_mla page row must hold "
+               "rows_per_block * 584 bytes (KV-DSV4-MULTICACHE W8, #2455)");
+    } else {
+      VT_CHECK(page.rank == 3 && page.shape[2] == hd,
+               "deepseek-v4: paged MLA cache must be [num_blocks, block_size, head_dim]");
+    }
     kv_base = be.kv_base;
     n_keys = kv_base + T;
 
@@ -1022,6 +1065,28 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     const int64_t rope_w = rope, nope_w = hd - rope;
     std::vector<int64_t> slots(static_cast<size_t>(T));
     for (int64_t t = 0; t < T; ++t) slots[static_cast<size_t>(t)] = kv_base + t;
+    // KV-DSV4-MULTICACHE W8 slice 4 (#2455): THE PACKED ARM, and the first
+    // caller either packed op has ever had. `deck` is already exactly the
+    // operand `vt::ConcatAndCacheDsMla` wants -- one contiguous [T, 512] row per
+    // token, NoPE in [0, 448) and the ALREADY-ROTATED RoPE in [448, 512) -- so
+    // the latent is handed over whole rather than split into two strided views.
+    if (packed_page) {
+      // The layout constants are upstream's literals, not parameters
+      // (`cache_utils.py:180-183`), so a geometry they cannot describe is
+      // refused instead of being packed into the wrong offsets.
+      VT_CHECK(hd == vt::kFp8DsMlaInputDim && rope == vt::kFp8DsMlaRopeDim,
+               "deepseek-v4: the fp8_ds_mla page is fixed at 448 NoPE + 64 RoPE "
+               "(cache_utils.py:180-183); this config's head_dim/rope do not "
+               "match, so its latent cannot be packed (KV-DSV4-MULTICACHE W8, "
+               "#2455)");
+      vt::Tensor t_k = vt::Tensor::Contiguous(const_cast<float*>(deck.data()),
+                                              vt::DType::kF32, be.q->device, {T, hd});
+      vt::Tensor t_slot_p = vt::Tensor::Contiguous(slots.data(), vt::DType::kI64,
+                                                   be.q->device, {T});
+      if (!be.paged_kv_prewritten)
+        vt::ConcatAndCacheDsMla(*be.q, t_k, page, t_slot_p, be.paged_rows_per_block);
+      paged_attn = true;
+    } else {
     // Built contiguous then RE-STRIDED: the row stride is the full `hd`, so each
     // view walks the same buffer and reads its own columns. `ConcatAndCacheMla`
     // indexes by stride, which is what makes the no-copy split legal.
@@ -1039,6 +1104,7 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     if (!be.paged_kv_prewritten)
       vt::ConcatAndCacheMla(*be.q, t_kvc, t_pe, page, t_slot);
     paged_attn = true;
+    }
   }
   if (be.kv != nullptr) {
     VT_CHECK(!is_indexer && !is_comp,
@@ -1199,6 +1265,48 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
           // The compressed row carries RoPE on its tail, at this layer's own
           // base -- compressed layers use `compress_rope_theta`.
           rope, rope_base, sel_ptr);
+    } else if (be.paged_rows_per_block > 0) {
+      // KV-DSV4-MULTICACHE W8 slice 4 (#2455): THE PACKED READ. Upstream splits
+      // exactly here too -- its prefill dequant-gathers (`nvidia/flashmla.py:296`)
+      // while its decode hands the packed page to a vendor kernel (`:219-226`)
+      // we do not have -- so the page is gathered into a float scratch and the
+      // EXISTING attention runs over that, unchanged.
+      //
+      // THE SCRATCH IS ONE BLOCK. `PagedCausalMlaAttention` builds its own block
+      // table from `num_blocks`, so handing it `num_blocks = 1` and
+      // `block_size = n_keys` makes every query read row `pos` of the scratch,
+      // which is exactly the global position the gather wrote there. The causal
+      // mask stays the helper's `seq_lens[t] = kv_base + t + 1`.
+      //
+      // Cost is `n_keys * 512 * 4` bytes per layer per step, which is why the
+      // native fp8 decode is a later wave and not this one (the row's `## Owed`).
+      vt::Tensor& packed = (*be.paged_kv)[static_cast<size_t>(layer)];
+      const int64_t num_blocks = packed.shape[0];
+      std::vector<float> gathered(static_cast<size_t>(n_keys) * static_cast<size_t>(hd), 0.0f);
+      std::vector<int32_t> g_seq{static_cast<int32_t>(n_keys)};
+      std::vector<int32_t> g_tab(static_cast<size_t>(num_blocks));
+      for (int64_t b = 0; b < num_blocks; ++b) g_tab[static_cast<size_t>(b)] = static_cast<int32_t>(b);
+      VT_CHECK(n_keys <= num_blocks * be.paged_rows_per_block,
+               "deepseek-v4: the fp8_ds_mla page cannot hold this step's context "
+               "(KV-DSV4-MULTICACHE W8, #2455)");
+      vt::Tensor t_g = vt::Tensor::Contiguous(gathered.data(), vt::DType::kF32,
+                                              be.q->device, {1, n_keys, hd});
+      vt::Tensor t_gs = vt::Tensor::Contiguous(g_seq.data(), vt::DType::kI32,
+                                               be.q->device, {1});
+      vt::Tensor t_gt = vt::Tensor::Contiguous(g_tab.data(), vt::DType::kI32,
+                                               be.q->device, {1, num_blocks});
+      vt::DequantAndGatherDsMlaArgs gargs;
+      gargs.block_size = be.paged_rows_per_block;
+      gargs.offset = 0;
+      vt::DequantAndGatherDsMla(*be.q, t_g, packed, t_gs, /*gather_lens=*/nullptr,
+                                t_gt, gargs);
+      vt::Tensor flat_page = vt::Tensor::Contiguous(
+          gathered.data(), vt::DType::kF32, be.q->device, {1, n_keys, hd});
+      o = deepseek_v4::PagedCausalMlaAttention(
+          *be.q, q, flat_page, /*num_blocks=*/1, /*block_size=*/n_keys, T, nh, hd,
+          kv_base, L.attn_sink, scale,
+          /*no_sink=*/miswire == V4Miswire::kNoAttnSink,
+          /*sliding_window=*/p.has_compressor(layer) ? 0 : p.sliding_window);
     } else
     o = deepseek_v4::PagedCausalMlaAttention(
         *be.q, q, (*be.paged_kv)[static_cast<size_t>(layer)],
@@ -3574,7 +3682,8 @@ std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
                                               const std::vector<int32_t>& positions,
                                               const std::vector<int32_t>& logits_indices,
                                               bool kv_prewritten,
-                                              DeepseekV4CompressorState* compressor) {
+                                              DeepseekV4CompressorState* compressor,
+                                              int64_t rows_per_block) {
   VT_CHECK(weights.has_gguf_weights,
            "DeepseekV4ForwardGgufPaged: no keep-quant tower (call LoadDeepseekV4FromGguf)");
   VT_CHECK(weights.has_host_weights,
@@ -3584,6 +3693,7 @@ std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
            "DeepseekV4ForwardGgufPaged: one page tensor per layer is required");
   V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/&weights.gguf};
   be.paged_kv = &paged_kv;
+  be.paged_rows_per_block = rows_per_block;
   be.paged_kv_prewritten = kv_prewritten;
   be.compressor = compressor;
   be.kv_base = kv_base;
@@ -3609,7 +3719,11 @@ std::string ResolveDeepseekV4SwaPages(const DeepseekV4Params& params,
                                       int num_reqs, vt::Device device,
                                       std::vector<vt::Tensor>* out_pages,
                                       bool dsa_dense, bool have_compressor_state,
-                                      int64_t num_tokens) {
+                                      int64_t num_tokens,
+                                      int64_t* out_rows_per_block) {
+  // KV-DSV4-MULTICACHE W8 slice 4 (#2455). 0 means "the pages are float", which
+  // is what every caller binding a float page reads back.
+  if (out_rows_per_block != nullptr) *out_rows_per_block = 0;
   // ONE REQUEST. The paged forward carries a single `kv_base` for the whole
   // step, so a batch at differing context lengths would silently attend the
   // wrong history for every request but one.
@@ -3669,23 +3783,77 @@ std::string ResolveDeepseekV4SwaPages(const DeepseekV4Params& params,
              "' has head_size " + std::to_string(c.head_size) + ", expected head_dim " +
              std::to_string(params.head_dim);
     }
-    // A PACKED PAGE. `vt::ConcatAndCacheMla` refuses a non-float cache dtype by
-    // name, and `MakeDeepseekV4KVCache` publishes the SWA pages as `kI8` with
-    // `cache_dtype_str == "fp8_ds_mla"` -- upstream's own default
-    // (`attention.py:140`). The write would abort either way; refusing here says
-    // WHICH row owns the gap instead of surfacing a kernel precondition.
+    // A PACKED PAGE — the DEFAULT for this architecture, and as of W8 slice 4 a
+    // route rather than a refusal. `MakeDeepseekV4KVCache` publishes the SWA
+    // pages as `kI8` with `cache_dtype_str == "fp8_ds_mla"`, mirroring
+    // upstream's own default (`attention.py:140`), so this is the arm a real
+    // artifact takes.
     //
-    // The fix is the packed 584-byte store (`KV-DSV4-MULTICACHE` W8), NOT a
-    // wider guard in `ApplyCacheDType`: widening that would let a packed page be
-    // written as though it were float, which is the wrong-tokens shape this
-    // whole path exists to remove. MODEL-DSV4-PAGED-ENTRY (#2447), `## Owed`.
+    // IT IS RANK-2 BYTES, NOT A RANK-3 ROW VIEW, and that is forced rather than
+    // chosen: the block keeps a token's 8 scale bytes at
+    // `block_size * 576 + pos * 8`, in a different REGION from its 576 data
+    // bytes (`cache_utils.py:59-66`), so no `(block, row, column)` indexing
+    // reaches both. The row width is the page the RUNNER ALLOCATED, never
+    // `block_size * head_size`: those disagree by design here (64 * 512 = 32768
+    // against a 37440-byte page), and believing the view is a 3.5x overrun
+    // (#2085).
     if (c.dtype != vt::DType::kF32 && c.dtype != vt::DType::kF16 &&
         c.dtype != vt::DType::kBF16) {
-      return "deepseek-v4 paged forward: the SWA cache for '" + name +
-             "' is a PACKED page (vt::ConcatAndCacheMla takes a float cache "
-             "only, and this topology publishes fp8_ds_mla). The packed store "
-             "is owed to KV-DSV4-MULTICACHE W8 "
-             "(MODEL-DSV4-PAGED-ENTRY, #2447)";
+      if (c.dtype != vt::DType::kI8) {
+        return "deepseek-v4 paged forward: the SWA cache for '" + name +
+               "' has storage dtype " + std::string(vt::Name(c.dtype)) +
+               ", which is neither a float page nor the fp8_ds_mla byte page "
+               "(KV-DSV4-MULTICACHE W8, #2455)";
+      }
+      // A caller that cannot receive the row count cannot drive either packed
+      // op, so it is refused instead of being handed a page it would write as
+      // though it were float.
+      if (out_rows_per_block == nullptr) {
+        return "deepseek-v4 paged forward: the SWA cache for '" + name +
+               "' is a PACKED fp8_ds_mla page, and this caller passed no "
+               "out_rows_per_block, so it cannot supply the storage row count "
+               "both packed ops take (KV-DSV4-MULTICACHE W8, #2455)";
+      }
+      // THE ROW COUNT COMES FROM THE PUBLISHED SPEC. `PagedKvCache::block_size`
+      // is the spec's own `block_size`, and the SWA group is `compress_ratio`
+      // 1 (`sparse_swa.py:86-101`), so storage rows == block_size for it.
+      if (c.page_size_bytes <= 0) {
+        return "deepseek-v4 paged forward: the SWA cache for '" + name +
+               "' carries no page_size_bytes, so its packed byte page cannot be "
+               "sized; only GPUModelRunner::initialize_kv_cache fills that field "
+               "(KV-DSV4-MULTICACHE W8, #2455)";
+      }
+      // A COMPRESSOR LAYER CANNOT READ THIS PAGE. `CompressorLayerStep` attends
+      // its window through `vt::MlaDecodeAttention`, which takes a rank-3 cache
+      // whose dtype equals the query's (`vt/ops.cpp`), and a region-split byte
+      // page is not expressible as that tensor. Dequantising the window inside
+      // the composition is the fix, and it belongs to the rows that own the
+      // composition rather than to the wave that lands the page format.
+      if (params.has_compressor(l)) {
+        return "deepseek-v4 paged forward: layer " + std::to_string(l) +
+               " has a compressor AND a PACKED fp8_ds_mla page. Its window pass "
+               "attends through vt::MlaDecodeAttention, which takes a rank-3 "
+               "float cache, so the composition cannot read a region-split byte "
+               "page. Dequantising the window inside CompressorLayerStep is "
+               "owed to MODEL-DSV4-DSA-COMPOSE (#2286) / "
+               "MODEL-DSV4-PAGED-ENTRY (#2447); the packed store and read "
+               "themselves are KV-DSV4-MULTICACHE W8 (#2455)";
+      }
+      // ONE row count for the whole step. The pages come from a single
+      // published group, so a second value means the topology disagrees with
+      // itself and a shared `block_size` argument would be wrong for some layer.
+      if (*out_rows_per_block != 0 && *out_rows_per_block != c.block_size) {
+        return "deepseek-v4 paged forward: the SWA caches disagree about "
+               "storage rows per block (" +
+               std::to_string(*out_rows_per_block) + " and " +
+               std::to_string(c.block_size) +
+               "); both packed ops take ONE row count per step "
+               "(KV-DSV4-MULTICACHE W8, #2455)";
+      }
+      *out_rows_per_block = c.block_size;
+      pages[static_cast<size_t>(l)] = vt::Tensor::Contiguous(
+          c.data, vt::DType::kI8, device, {c.num_blocks, c.page_size_bytes});
+      continue;
     }
     pages[static_cast<size_t>(l)] = vt::Tensor::Contiguous(
         c.data, c.dtype, device, {c.num_blocks, c.block_size, c.head_size});
@@ -3882,7 +4050,7 @@ std::vector<float> DeepseekV4ForwardExl3Paged(
     std::vector<vt::Tensor>& paged_kv, int64_t kv_base,
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const std::vector<int32_t>& logits_indices,
-    DeepseekV4CompressorState* compressor) {
+    DeepseekV4CompressorState* compressor, int64_t rows_per_block) {
   VT_CHECK(weights.has_exl3_weights,
            "DeepseekV4ForwardExl3Paged: no EXL3 tower (the load did not take that arm)");
   VT_CHECK(static_cast<int64_t>(paged_kv.size()) == weights.params.num_hidden_layers,
@@ -3896,6 +4064,7 @@ std::vector<float> DeepseekV4ForwardExl3Paged(
   V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/nullptr};
   be.exl3 = &weights.exl3;
   be.paged_kv = &paged_kv;
+  be.paged_rows_per_block = rows_per_block;
   be.kv_base = kv_base;
   be.compressor = compressor;
   return ForwardComposeImpl(weights.host, weights.params, token_ids, positions,
@@ -3966,10 +4135,11 @@ ForwardLogits DeepseekV4ForwardExl3PagedLogits(
     std::vector<vt::Tensor>& paged_kv, int64_t kv_base,
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const std::vector<int32_t>& logits_indices,
-    DeepseekV4CompressorState* compressor) {
+    DeepseekV4CompressorState* compressor, int64_t rows_per_block) {
   std::vector<float> flat =
       DeepseekV4ForwardExl3Paged(weights, queue, paged_kv, kv_base, token_ids,
-                                 positions, logits_indices, compressor);
+                                 positions, logits_indices, compressor,
+                                 rows_per_block);
   const int64_t vocab = weights.params.vocab_size;
   const int64_t rows = vocab > 0 ? static_cast<int64_t>(flat.size()) / vocab : 0;
   return WrapV4DeviceLogits(std::move(flat), rows, vocab, queue);

@@ -35,9 +35,11 @@
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/models/deepseek_v4.h"
+#include "vllm/model_executor/models/deepseek_v4_compressor.h"
 #include "vt/device.h"
 #include "vt/dtype.h"
 #include "vt/merged_gemm.h"
+#include "vt/ops.h"
 #include "vt/ops.h"
 #include "vt/tensor.h"
 
@@ -1392,3 +1394,161 @@ TEST_CASE("W-3: `kv_prewritten` attends the pages WITHOUT overwriting them (#131
 // is reachable only from a NON-GGUF paged forward, and this tree has no public one
 // yet. `CompressorLayerStep` is gated in `test_deepseek_v4_paged_equiv`; reaching
 // it from a production entry point is owed by the row, not by this file.
+
+// ── KV-DSV4-MULTICACHE W8 slice 4 (#2455): THE REACHABILITY GATE ─────────────
+//
+// WHAT THIS EXISTS TO PROVE, and why the op-level suite cannot prove it.
+// `tests/vt/test_ops_ds_mla_cache.cpp` gates `vt::ConcatAndCacheDsMla` and
+// `vt::DequantAndGatherDsMla` byte-exactly against a poison-filled block, and it
+// passed for three slices while NOTHING in `src/vllm` called either op. That is
+// coverage of a class, not of a capability (`.agents/reachability.md`, "the
+// test-only driver"). This case enters through a paged FORWARD instead, so it
+// fails if the model stops routing to the packed page.
+//
+// THE COMPARISON IS EXACT, and that is a deliberate choice over a tolerance.
+// fp8_ds_mla is lossy, so packed-vs-float logits would need a tolerance nobody
+// can justify blind, and a loose one hides a wrong route. Instead the second arm
+// attends the DEQUANTIZED latents -- the exact f32 values the packed read itself
+// produces -- so both arms run identical numbers through identical code in
+// identical order. Any difference is a routing defect, never quantization.
+TEST_CASE("W8 slice 4: the forward WRITES and READS the fp8_ds_mla page (#2455)") {
+  Dims d;
+  // The layout's geometry is upstream's literals, not parameters
+  // (`cache_utils.py:180-183`): 448 NoPE + 64 RoPE. A config that does not match
+  // cannot be packed, and the forward refuses it by name.
+  d.head_dim = 512;
+  d.rope = 64;
+  // NO COMPRESSOR ON ANY LAYER. `has_compressor` is `compress_ratio != 0`, and a
+  // compressor layer with a packed page is REFUSED by name: its window pass
+  // attends through `vt::MlaDecodeAttention`, which takes a rank-3 float cache,
+  // so a region-split byte page is not expressible there. That boundary belongs
+  // to MODEL-DSV4-DSA-COMPOSE (#2286) / MODEL-DSV4-PAGED-ENTRY (#2447).
+  d.compress_ratios = {0, 0, 0, 0};
+  // A window would make the paged arm legitimately differ from a full-prefix
+  // reference, which would confound the comparison below.
+  d.sliding_window = 0;
+
+  TempFile f(BuildGguf(d));
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const vllm::GgufLoadPolicy keep = KeepPolicy();
+  const vllm::DeepseekV4Weights w =
+      vllm::LoadDeepseekV4FromGguf(g, vllm::HfConfig{}, &keep);
+  REQUIRE(w.has_gguf_weights);
+
+  const int64_t nlayers = w.params.num_hidden_layers;
+  const int64_t hd = w.params.head_dim;
+  REQUIRE(hd == vt::kFp8DsMlaInputDim);
+
+  const int64_t rows = 8;  // STORAGE rows per block
+  const int64_t num_blocks = 4;
+  // The page size comes from the SHARED packer, never from a local
+  // `RoundUp(rows * 584, 576)`: a second derivation of the padding rule is
+  // exactly the drift the one packer exists to prevent.
+  const vllm::deepseek_v4::Fp8DsMlaPageLayout P =
+      vllm::deepseek_v4::MakeFp8DsMlaPageLayout(
+          vllm::deepseek_v4::MakeFp8DsMlaLayout(vt::kFp8DsMlaNopeDim,
+                                                vt::kFp8DsMlaRopeDim,
+                                                vt::kFp8DsMlaQuantBlock),
+          rows);
+  const int64_t block_bytes = P.padded_block_bytes;
+
+  const std::vector<int32_t> step{1, 2, 3};
+  std::vector<int32_t> pos(step.size());
+  for (size_t i = 0; i < step.size(); ++i) pos[i] = static_cast<int32_t>(i);
+  const int64_t n_keys = static_cast<int64_t>(step.size());
+  const std::vector<int32_t> want_logits{static_cast<int32_t>(step.size() - 1)};
+
+  // POISON, so "the store ran" is a real observation rather than a check that
+  // zeros stayed zero.
+  std::vector<std::vector<uint8_t>> pstore(static_cast<size_t>(nlayers));
+  std::vector<vt::Tensor> ppages(static_cast<size_t>(nlayers));
+  for (int64_t l = 0; l < nlayers; ++l) {
+    pstore[static_cast<size_t>(l)].assign(
+        static_cast<size_t>(num_blocks * block_bytes), 0xA5);
+    ppages[static_cast<size_t>(l)] = vt::Tensor::Contiguous(
+        pstore[static_cast<size_t>(l)].data(), vt::DType::kI8, q.device,
+        {num_blocks, block_bytes});
+  }
+
+  // ARM A — the PACKED page, through the production forward. `rows_per_block`
+  // is what `ResolveDeepseekV4SwaPages` hands the registry on a real topology.
+  const std::vector<float> packed_logits = vllm::DeepseekV4ForwardGgufPaged(
+      w, q, ppages, /*kv_base=*/0, step, pos, want_logits,
+      /*kv_prewritten=*/false, /*compressor=*/nullptr, /*rows_per_block=*/rows);
+  REQUIRE_FALSE(packed_logits.empty());
+
+  // 1. THE WRITE REACHED THE PAGE. Every stored token's data region moved off
+  //    poison, and the 8th scale byte is the explicit zero pad upstream writes
+  //    (`cache_utils.py:148-149`).
+  for (int64_t l = 0; l < nlayers; ++l) {
+    const std::vector<uint8_t>& blk = pstore[static_cast<size_t>(l)];
+    CAPTURE(l);
+    bool moved = false;
+    for (int64_t t = 0; t < n_keys; ++t) {
+      const uint8_t* data = blk.data() + t * P.token_data_size;
+      for (int64_t i = 0; i < P.token_data_size; ++i)
+        if (data[i] != 0xA5) { moved = true; break; }
+      const uint8_t* sc = blk.data() + P.scale_region_offset + t * P.scale_dim;
+      CHECK(sc[P.token.n_nope_blocks] == 0);  // the pad byte, written not skipped
+    }
+    CHECK(moved);
+    // 2. AND IT STAYED INSIDE ITS BLOCK. Everything past `rows * 584` is the
+    //    alignment padding, and no store may reach it — this is the assertion a
+    //    3.5x overrun trips.
+    for (int64_t i = P.real_block_bytes; i < block_bytes; ++i) {
+      if (blk[static_cast<size_t>(i)] != 0xA5) {
+        CAPTURE(i);
+        REQUIRE(blk[static_cast<size_t>(i)] == 0xA5);
+      }
+    }
+  }
+
+  // 3. GATHER the page back, with the same op the forward's read uses, and lay
+  //    the latents out as a FLOAT page in block-major order.
+  std::vector<std::vector<float>> fstore(static_cast<size_t>(nlayers));
+  std::vector<vt::Tensor> fpages(static_cast<size_t>(nlayers));
+  for (int64_t l = 0; l < nlayers; ++l) {
+    std::vector<float> deq(static_cast<size_t>(n_keys * hd), 0.0f);
+    std::vector<int32_t> sl{static_cast<int32_t>(n_keys)};
+    std::vector<int32_t> bt(static_cast<size_t>(num_blocks));
+    for (int64_t b = 0; b < num_blocks; ++b) bt[static_cast<size_t>(b)] = static_cast<int32_t>(b);
+    vt::Tensor t_o = vt::Tensor::Contiguous(deq.data(), vt::DType::kF32, q.device,
+                                            {1, n_keys, hd});
+    vt::Tensor t_s = vt::Tensor::Contiguous(sl.data(), vt::DType::kI32, q.device, {1});
+    vt::Tensor t_b = vt::Tensor::Contiguous(bt.data(), vt::DType::kI32, q.device,
+                                            {1, num_blocks});
+    vt::DequantAndGatherDsMlaArgs a;
+    a.block_size = rows;
+    a.offset = 0;
+    vt::DequantAndGatherDsMla(q, t_o, ppages[static_cast<size_t>(l)], t_s,
+                              /*gather_lens=*/nullptr, t_b, a);
+
+    std::vector<float>& fb = fstore[static_cast<size_t>(l)];
+    fb.assign(static_cast<size_t>(num_blocks * rows * hd), 0.0f);
+    for (int64_t t = 0; t < n_keys; ++t) {
+      const int64_t blk = t / rows, row = t % rows;
+      std::memcpy(fb.data() + (blk * rows + row) * hd, deq.data() + t * hd,
+                  static_cast<size_t>(hd) * sizeof(float));
+    }
+    fpages[static_cast<size_t>(l)] = vt::Tensor::Contiguous(
+        fb.data(), vt::DType::kF32, q.device, {num_blocks, rows, hd});
+  }
+
+  // ARM B — the SAME forward over a FLOAT page holding those exact latents, with
+  // the write suppressed so nothing overwrites them.
+  const std::vector<float> float_logits = vllm::DeepseekV4ForwardGgufPaged(
+      w, q, fpages, /*kv_base=*/0, step, pos, want_logits,
+      /*kv_prewritten=*/true, /*compressor=*/nullptr, /*rows_per_block=*/0);
+
+  // 4. BIT-IDENTICAL. Both arms attended the same f32 values in the same order,
+  //    so this is an equality and not a tolerance. Deleting the packed store
+  //    leaves the page poisoned and this comparison is what reds.
+  REQUIRE(packed_logits.size() == float_logits.size());
+  for (size_t i = 0; i < packed_logits.size(); ++i) {
+    if (packed_logits[i] != float_logits[i]) {
+      CAPTURE(i);
+      REQUIRE(packed_logits[i] == float_logits[i]);
+    }
+  }
+}

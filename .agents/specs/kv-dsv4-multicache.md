@@ -13,6 +13,23 @@ recorded at `include/vllm/model_executor/models/deepseek_v4.h:13`.
 
 ## Now
 
+`ACTIVE` — **W8 slices 4 and 6 landed (2026-09-11,
+[#2455](https://github.com/mudler/vllm.cpp/issues/2455)), and DeepSeek-V4 now
+CONSTRUCTS on a default configuration.** `--kv-cache-dtype auto` stopped
+refusing the layout the model's own factory published, and the packed
+fp8_ds_mla page is written and read from the model through
+`vt::ConcatAndCacheDsMla` / `vt::DequantAndGatherDsMla` -- the first callers
+either op has ever had. See `### W8 design` and this document's `## Owed`.
+
+**The paragraphs below are the W1-W3 history and two of their sentences are
+STALE.** "Still nothing reads a cache" and "W4 through W7 remain proposals with
+no owner" were true when written and are not now: W5 landed
+([#2323](https://github.com/mudler/vllm.cpp/issues/2323)), `consumes_multi_kv`
+exists, DeepSeek-V4 sets it, and `ModelRegistry::Forward` gates on
+`MultiKvRefusalApplies` rather than refusing unconditionally. They are marked
+rather than deleted, because a reader who met them deserves to see the
+correction beside them.
+
 `ACTIVE` — W1 ([#1960](https://github.com/mudler/vllm.cpp/issues/1960)) landed
 as `c1e6f3fb9`: the KV-cache spec hierarchy gained `SlidingWindowMLASpec`, the
 four DeepSeek-V4 fields on `MLAAttentionSpec`, both `storage_block_size()`
@@ -2098,30 +2115,57 @@ config parse and upstream's disagree about the layer partition (that would be a
   [#2068](https://github.com/mudler/vllm.cpp/issues/2068).
 
 
-- **W8 slices 1, 2 and 3 have landed UNREACHED**
-  ([#2455](https://github.com/mudler/vllm.cpp/issues/2455)).
-  Slice 1 is the host packer -- `Fp8DsMlaPageLayout` / `MakeFp8DsMlaPageLayout` /
-  `Fp8DsMlaStoreToken` / `Fp8DsMlaLoadToken` in `deepseek_v4_compressor.{h,cpp}`,
-  beside the existing encode/decode pair. Slices 2 and 3 are the two ops built on
-  it: `vt::ConcatAndCacheDsMla` (`OpId::kConcatAndCacheDsMla`) and
-  `vt::DequantAndGatherDsMla` (`OpId::kDequantAndGatherDsMla`), CPU arms in
-  `src/vt/cpu/cpu_cache.cpp`, gated byte-exactly against a poison-filled block in
-  `tests/vt/test_ops_ds_mla_cache.cpp`.
+- **W8 slices 4 and 6 have LANDED, and the packed page is REACHED. Slice 5 is
+  what remains** ([#2455](https://github.com/mudler/vllm.cpp/issues/2455)).
 
-  **Nothing calls either op.** No model edit, no registry, no `include/vllm.h`
-  entry. That is deliberate rather than forgotten: the packer is the single host
-  reference the CUDA kernels of slice 5 are the other port of, so the layout is
-  written and gated once rather than three times, and the ops are the seam slice 4
-  routes onto. A slice that landed the model bridge first would have had nothing
-  byte-comparable to route TO.
+  Slices 1, 2 and 3 landed the host packer (`Fp8DsMlaPageLayout` /
+  `MakeFp8DsMlaPageLayout` / `Fp8DsMlaStoreToken` / `Fp8DsMlaLoadToken` in
+  `deepseek_v4_compressor.{h,cpp}`) and the two ops built on it,
+  `vt::ConcatAndCacheDsMla` and `vt::DequantAndGatherDsMla`, with CPU arms in
+  `src/vt/cpu/cpu_cache.cpp` gated byte-exactly against a poison-filled block in
+  `tests/vt/test_ops_ds_mla_cache.cpp`. **This entry recorded that NOTHING CALLED
+  EITHER OP**, which was true for three slices and is no longer true.
 
-  What is owed is the wiring, and it is `### W8 design` slices 4 through 6 in
-  this document: the model bridge in `deepseek_v4.cpp` /
-  `ResolveDeepseekV4SwaPages` that picks the packed store when the bound page is
-  `kI8`/fp8_ds_mla, the CUDA arms, and only then the `ApplyCacheDType` resolution
-  question. Until slice 4 lands, `ApplyCacheDType` still refuses every
-  `MLAAttentionSpec` on the default path and the real artifact still dies there.
-  Owned by this row, tracked under
+  **Slice 4 is the caller.** `ResolveDeepseekV4SwaPages` binds a PACKED page
+  instead of refusing it, as a rank-2 `[num_blocks, block_bytes]` byte view --
+  the shape the region split forces, because a token's scale bytes sit in a
+  different region from its data (`cache_utils.py:59-66`). `AttentionBlock`
+  stores through `vt::ConcatAndCacheDsMla` and reads through
+  `vt::DequantAndGatherDsMla` into an f32 scratch that the existing
+  `vt::MlaDecodeAttention` consumes unchanged, mirroring upstream's own split
+  between a dequant-gathering prefill (`nvidia/flashmla.py:296`) and a vendor
+  decode kernel (`:219-226`) this tree does not have.
+
+  **Slice 6 changed RESOLUTION, not the guard.** `auto` now means "use the dtype
+  the model's factory resolved", mirroring `_resolve_dsv4_kv_cache_dtype` writing
+  `cache_dtype = "fp8_ds_mla"` back onto the cache config
+  (`attention.py:89-119`). `RetypeAttentionSpec`'s MLA refusal is untouched and
+  still fires for every explicit override. It also closed two SILENT defects the
+  original entry never named: the indexer key cache (`kI8`, no `cache_dtype_str`)
+  hit that refusal, and the three f32 compressor state caches are
+  `SlidingWindowMLASpec`, which derives from `SlidingWindowSpec` and so never
+  reached the MLA guard at all -- they passed the float branch and had
+  `spec.dtype = kBF16` written over a page the runner allocates in f32.
+
+  **`PagedKvCache` gained `page_size_bytes`**, filled only by
+  `GPUModelRunner::initialize_kv_cache`. That is the expressible half of
+  [#2085](https://github.com/mudler/vllm.cpp/issues/2085): the view
+  (`block_size * head_size` = 32768) and the allocated page (37440) disagree by
+  design for this spec, and a packed store that believed the view would overrun
+  the block by 3.5x.
+
+  **What is still owed here.** Slice 5, the CUDA arms of both ops, byte-compared
+  against the CPU kernels; this wave is CPU-only. And a COMPRESSOR layer with a
+  packed page still REFUSES by name: `CompressorLayerStep` attends its window
+  through `vt::MlaDecodeAttention`, which takes a rank-3 float cache, so a
+  region-split byte page is not expressible there. Dequantising that window is
+  owed to `MODEL-DSV4-DSA-COMPOSE`
+  ([#2286](https://github.com/mudler/vllm.cpp/issues/2286)) and
+  `MODEL-DSV4-PAGED-ENTRY`
+  ([#2447](https://github.com/mudler/vllm.cpp/issues/2447)). On the real
+  43-layer artifact every layer 2-42 carries a compressor, so the packed path is
+  reachable today for the SWA-only layers and the rest is named rather than
+  silently unreached. Owned by this row, tracked under
   [#2455](https://github.com/mudler/vllm.cpp/issues/2455).
 
 ## Evidence

@@ -98,45 +98,24 @@ int pack_q8x4_m(int q0, int q1, int q2, int q3) {
 }
 #endif
 
-// Subgroup-based amax reduction: find the value with the largest |v| across
-// lpb lanes in the block. Uses subgroupShuffleXor butterfly (0 barriers when
-// lpb <= subgroupSize). Falls back to shared-memory tree for non-power-of-2 lpb.
+// Shared-memory amax reduction: find the value with the largest |v| across
+// lpb lanes in the block. Subgroup-size independent (works for subgroup 8 and 64).
 float block_amax_reduce(uint col_id, uint block_id, uint lpb,
-                        uint lane_in_block, uint tid, float maxv) {
-  if ((lpb & (lpb - 1u)) == 0u) {
-    uint sub_mask = min(lpb, gl_SubgroupSize);
-    for (uint s = sub_mask >> 1u; s > 0u; s >>= 1u) {
-      float other = subgroupShuffleXor(maxv, s);
-      if (abs(other) > abs(maxv)) maxv = other;
-    }
-    if (lpb > gl_SubgroupSize) {
-      uint subs_per_block = lpb / gl_SubgroupSize;
-      if (lane_in_block % gl_SubgroupSize == 0u) {
-        sm_reduce[col_id * 128u + block_id * lpb + lane_in_block / gl_SubgroupSize] = maxv;
-      }
-      barrier();
-      // Lane 0 combines the per-subgroup winners and broadcasts via sm_reduce.
-      if (lane_in_block == 0u) {
-        float v = sm_reduce[col_id * 128u + block_id * lpb];
-        for (uint i = 1u; i < subs_per_block; ++i) {
-          float other = sm_reduce[col_id * 128u + block_id * lpb + i];
-          if (abs(other) > abs(v)) v = other;
-        }
-        sm_reduce[col_id * 128u + block_id * lpb] = v;
-      }
-      barrier();
-      maxv = sm_reduce[col_id * 128u + block_id * lpb];
-    }
-    return maxv;
-  }
-  sm_reduce[col_id * 128u + tid] = maxv;
+                      uint lane_in_block, uint tid, float maxv) {
+  // Shared-memory tree reduction. Subgroup-size independent and matches the
+  // amax in vt_matmul_bt_tq2_dev.comp (the proven bit-exact path). The
+  // subgroup butterfly form was wrong on subgroup-8 devices (llvmpipe): the
+  // per-subgroup winners were combined only among lanes whose lane_in_block fell on
+  // a subgroup boundary, which left the max wrong when the block spans multiple
+  // subgroups and the winning magnitude lived mid-subgroup.
+  sm_reduce[col_id * 128u + block_id * lpb + lane_in_block] = maxv;
   barrier();
   for (uint s = lpb / 2u; s > 0u; s >>= 1u) {
     if (lane_in_block < s) {
-      float a = sm_reduce[col_id * 128u + tid];
-      float b = sm_reduce[col_id * 128u + tid + s];
+      float a = sm_reduce[col_id * 128u + block_id * lpb + lane_in_block];
+      float b = sm_reduce[col_id * 128u + block_id * lpb + lane_in_block + s];
       if (abs(b) > abs(a))
-        sm_reduce[col_id * 128u + tid] = b;
+        sm_reduce[col_id * 128u + block_id * lpb + lane_in_block] = b;
     }
     barrier();
   }
@@ -147,8 +126,11 @@ float col_reduce(uint col_id, float val) {
   float sg = subgroupAdd(val);
   uint sub_per_col = 128u / gl_SubgroupSize;
   uint col_sub_id = gl_SubgroupID % sub_per_col;
-  // No barrier needed here: subgroupAdd completes within the subgroup before
-  // subgroupElect runs. The second barrier makes the write visible to readers.
+  // SubgroupSize-independent: barrier before the shared-memory write so a
+  // subgroup's partial is visible before the combine loop reads it. Without it,
+  // subgroup-8 devices (llvmpipe) race the other columns' slots and corrupt
+  // the sum (subgroup-64 devices do not, so it hid until llvmpipe ran).
+  barrier();
   if (subgroupElect()) {
     sm_reduce[col_id * sub_per_col + col_sub_id] = sg;
   }

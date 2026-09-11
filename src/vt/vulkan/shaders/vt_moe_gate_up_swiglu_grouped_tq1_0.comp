@@ -202,8 +202,9 @@ float col_reduce(uint col_id, float val) {
   float sg = subgroupAdd(val);
   uint sub_per_col = 128u / gl_SubgroupSize;
   uint col_sub_id = gl_SubgroupID % sub_per_col;
-  // No barrier needed here: subgroupAdd completes within the subgroup before
-  // subgroupElect runs. The second barrier makes the write visible to readers.
+  // SubgroupSize-independent: barrier before the shared-memory write so a
+  // subgroup's partial is visible before the combine loop reads it.
+  barrier();
   if (subgroupElect()) {
     sm_reduce[col_id * sub_per_col + col_sub_id] = sg;
   }

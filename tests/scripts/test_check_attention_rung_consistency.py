@@ -636,7 +636,7 @@ class PopulationTests(unittest.TestCase):
     def test_widening_the_population_moves_no_present_verdict(self) -> None:
         # NOT a mutation, and labelled so rather than left to look like one: it
         # asserts that this change adds enforcement for the future WITHOUT moving
-        # a single verdict on the tree it lands on. The eight paths are named
+        # a single verdict on the tree it lands on. The paths are named
         # rather than counted, because a count of the model tree stored in this
         # file is the drift lock #1629 removed and must not come back: naming them
         # reds only when one of these specific files changes, which is the review
@@ -644,6 +644,7 @@ class PopulationTests(unittest.TestCase):
         self.assertEqual(
             sorted(mod.scan_models()),
             [
+                f"{MODELS}/deepseek_v4_vision.cpp",
                 f"{MODELS}/kimi_linear_device.cpp",
                 f"{MODELS}/ltx2.cpp",
                 f"{MODELS}/ltx2_device.cpp",

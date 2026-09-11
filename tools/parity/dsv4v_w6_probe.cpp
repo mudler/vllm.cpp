@@ -73,6 +73,37 @@ std::vector<float> Widen(const uint16_t* p, size_t n) {
   return out;
 }
 
+// W7-CUDA (#2411): WHICH DEVICE THE TOWER RUNS ON, from `DSV4V_PROBE_DEVICE`.
+//
+// W6 ran this probe on the CPU provider only, and hardcoded `kCPU` in both
+// arms. The device paths are W7's, and a device result cannot be obtained by
+// reasoning about a CPU one -- so the provider is selected here and the same
+// binary drives both. Default `cpu`, so every W6 invocation is byte-unchanged.
+vt::DeviceType ProbeDeviceType() {
+  const char* e = std::getenv("DSV4V_PROBE_DEVICE");
+  const std::string want = e != nullptr ? e : "cpu";
+  if (want == "cpu") return vt::DeviceType::kCPU;
+  if (want == "cuda") return vt::DeviceType::kCUDA;
+  std::fprintf(stderr, "FATAL: DSV4V_PROBE_DEVICE='%s' is not cpu or cuda\n",
+               want.c_str());
+  std::exit(2);
+}
+
+// A tensor's bytes as host f32, wherever the tensor lives.
+//
+// `enc.embeds` is allocated with `DeviceBuffer(backend, ...)` inside
+// `EncodeMmDeepseekV4ForCausalLM`, so on a CUDA queue it is DEVICE memory and
+// `Ptr<uint16_t>()` is not host-dereferenceable. W6 read it directly, which is
+// correct on the CPU provider and undefined on any other one.
+std::vector<float> WidenTensor(vt::Backend& backend, vt::Queue& queue,
+                               const vt::Tensor& t) {
+  const size_t n = static_cast<size_t>(t.Numel());
+  std::vector<uint16_t> host(n);
+  backend.Copy(queue, host.data(), t.data, n * vt::SizeOf(vt::DType::kBF16));
+  backend.Synchronize(queue);
+  return Widen(host.data(), n);
+}
+
 // THE F32 ARM (DSV4V_PROBE_F32=1). A MEASUREMENT, NEVER A PRODUCT PATH.
 //
 // llama.cpp's CPU clip graph keeps its residual stream, norms, RoPE, softmax
@@ -154,6 +185,17 @@ int RunF32(const vllm::GgufFile& gguf, const std::vector<uint8_t>& rgb,
           }
   WriteF32(outdir + "/ours-" + tag + "-input.f32", patches, feat, px);
 
+  // THE F32 ARM IS HOST-ONLY, and says so rather than producing a wrong answer.
+  // It builds its tensors directly over `px.data()` and reads `cell_host` back
+  // by plain pointer, so a non-CPU queue here would hand the tower host memory
+  // labelled with a device and read uninitialised bytes out again.
+  if (ProbeDeviceType() != vt::DeviceType::kCPU) {
+    std::fprintf(stderr,
+                 "FATAL: DSV4V_PROBE_F32=1 is a HOST measurement and "
+                 "DSV4V_PROBE_DEVICE names a device. The f32 arm builds "
+                 "tensors over host pointers; it has no device arm.\n");
+    return 2;
+  }
   vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
   vt::Queue queue = backend.CreateQueue();
   vllm::multimodal::DeepSeekV4Vision tower(backend, cfg, w);
@@ -307,8 +349,14 @@ int main(int argc, char** argv) {
   const vllm::ModelRegistration& reg = vllm::ModelRegistry::Resolve(config);
   vllm::DeepseekV4LoadedModel model(reg, vllm::DeepseekV4Weights{},
                                     std::move(runtime));
-  vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
+  // W7-CUDA (#2411): the provider is selected, not assumed. `EncodeMm` resolves
+  // the tower's backend from `queue.device.type`, so this one line is what
+  // decides whether the SHIPPED encode path runs on the host or on the device.
+  const vt::DeviceType device_type = ProbeDeviceType();
+  vt::Backend& backend = vt::GetBackend(device_type);
   vt::Queue queue = backend.CreateQueue();
+  std::printf("provider: %s\n",
+              device_type == vt::DeviceType::kCPU ? "cpu" : "cuda");
 
   // THE PRODUCTION HOOK.
   const vllm::MmEncoderOutput enc =
@@ -321,7 +369,7 @@ int main(int argc, char** argv) {
   const int64_t rows = enc.embeds.shape[0];
   const int64_t cols = enc.embeds.shape[1];
   WriteF32(outdir + "/ours-" + tag + "-block.f32", rows, cols,
-           Widen(enc.embeds.Ptr<uint16_t>(), static_cast<size_t>(rows * cols)));
+           WidenTensor(backend, queue, enc.embeds));
   std::printf("block: %lld x %lld\n", static_cast<long long>(rows),
               static_cast<long long>(cols));
 

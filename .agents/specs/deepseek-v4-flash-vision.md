@@ -741,10 +741,29 @@ above as its red-before input.
   commit before it.
 
 - The first TP4 oracle run and committed evidence are owed by issue #2411 and W1.
-- The unsloth GGUF arm's first load and generation, on the pinned revision and
-  hashes above, is owed by issue #2411 and W3.
-- The first `llama-cpp-dsv4vision` build and run is owed by issue #2411; the
-  oracle file records `gateable = no` until then.
+- **CLOSED BY W6 for the TEXT half, OPEN for the served path.** The unsloth
+  GGUF arm's first load and generation ran on `thor:gpu0`, rc job
+  `a71c6002-4663-4efe-9da8-cda87e6bc4ff`: `deepseek-v4-gen` loaded the pinned
+  `UD-IQ1_S` shards (`layers=43 experts=256 vocab=129280`) and generated
+  greedily from a text prompt. The output is plausible but NOT oracle-gated,
+  and no speed claim is made. See `### W6 evidence`. No request of either kind
+  can be SERVED yet; the entry below names the refusal and its owner.
+- **CLOSED BY W6.** The first `llama-cpp-dsv4vision` build and run.
+  `llama-mtmd-cli` from release `b10766`, built CPU-only on `thor:gpu0`, loaded
+  the 82 GB `UD-IQ1_S` language model and `mmproj-BF16.gguf` together, encoded
+  an image and generated a description of it, rc job
+  `b69b2fb9-23b9-42b8-b755-62b8ee93b6ea`. The oracle file's `gateable` value
+  follows the parity verdict in `### W6 evidence`.
+- **NO DEEPSEEK-V4 REQUEST CAN BE SERVED, text or image, until
+  `KV-DSV4-MULTICACHE` W5 lands (#2455).** `vllm-server --model <shard1>
+  --mmproj <mmproj>` dies at engine start with `server: fatal: vt: cache_dtype:
+  an MLA KV cache has its own quantized page formula upstream (fp8_ds_mla,
+  kv_cache_interface.py:398-410). W1 landed that page formula but no fp8_ds_mla
+  store or read, so a page sized for it would hold bytes nothing writes.`
+  DeepSeek-V4's own KV factory publishes `fp8_ds_mla` specs, and no store or
+  read for that format exists. This is not this row's to fix: row
+  `KV-DSV4-MULTICACHE` W5 and issue #2455 own it. Measured by rc job
+  `a71c6002-4663-4efe-9da8-cda87e6bc4ff`, step C.
 - `exp_probs_b_vl` is ACCOUNTED FOR in all three loader arms by W3B and LOADED
   in the two that materialize a tower, the GGUF arm and the EXL3 carried arm.
   The official dense safetensors arm accounts without materializing, exactly as
@@ -965,10 +984,12 @@ above as its red-before input.
   reached. The four sentinel vectors are consumed by
   `EncodeMmDeepseekV4ForCausalLM`, which places one under each marker token of
   the image block.
-- The pinned `mmproj-BF16.gguf` has never been read by this code. W3A gates the
-  name map, the metadata map and the four layout joins against a synthetic
-  fixture built to the artifact's measured header; the real 934,462,656-byte
-  file is owed by W3 together with the arm's first load and generation.
+- **CLOSED BY W6.** The pinned 934,462,656-byte `mmproj-BF16.gguf` has now
+  been read AND RUN by this code. W3A gated the name map, the metadata map and
+  the four layout joins against a synthetic fixture only. W6 loads the real file
+  through `LoadDeepseekV4VisionRuntime`, runs the tower through
+  `ModelRegistry::EncodeMm`, and compares the block with llama.cpp `b10766` on a
+  real image; see `### W6 evidence`.
 - DeepSeek-V4 DSpark remains owned by
   `MODEL-SPEC-deepseek-v4-dspark-deepseek-v4-for-causal-lm`; this row only
   accounts for and names its tensors.
@@ -1012,6 +1033,196 @@ above as its red-before input.
   the gate does not cover. Widening the fixture is owed by issue #2411 and W3;
   it needs a change to the shared `tests/vllm/gguf_builder.h`, which every GGUF
   test uses, so it is not made inside a W3A repair.
+
+### W6 evidence — the first real-weight run, and vision parity against llama.cpp `b10766`
+
+Every job below ran on `thor:gpu0` through `rc`. Every result was also written to
+`/workspace/dsv4-vision/w6-parity/` (steps A-C: `/workspace/dsv4-vision/w6-out/`)
+on the NAS the workers see as `/workspace`. The artifacts are the pinned
+`unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF` @
+`b977d3c0ea2da58dbc12ddae8fb8951a7b3854d0`, sha256-verified:
+`mmproj-BF16.gguf` (934,462,656 B) and the three `UD-IQ1_S` shards.
+
+**A. PASS: the language model loads.** rc job
+`a71c6002-4663-4efe-9da8-cda87e6bc4ff`, built from row head `4993c72b2`
+(`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF`).
+`deepseek-v4-gen --load-only --gpu` printed `LOADED: layers=43 experts=256
+vocab=129280 has_gguf=1 | open 1.1s load 1508.4s | RSS 64.6 GiB`. The load
+time is almost all first-touch paging off CIFS.
+
+**B. PASS, NOT ORACLE-GATED: text generation.** Same job. `deepseek-v4-gen --gpu
+--kv-cache --max-tokens 24 --prompt "The capital of France is"` generated
+` Paris. The capital of France is Paris. The capital of France is Paris. ...`
+greedily with no stop, ids `11111 16 455 6102 294 8760 344` repeating. `--gpu`
+puts only the keep-quant GEMMs on CUDA; the rest is the CPU queue. "Paris" is
+plausible and is not a token gate: no oracle ran this prompt. **No speed claim is
+made**: the first step took 201.75 s of paging, and the numbers the tool printed
+measure CIFS, not the engine.
+
+**C. BLOCKED, owned elsewhere: the server.** Same job. `vllm-server --model
+<shard1> --mmproj <mmproj>` exits at engine start with:
+
+```text
+server: fatal: vt: cache_dtype: an MLA KV cache has its own quantized page formula upstream (fp8_ds_mla, kv_cache_interface.py:398-410). W1 landed that page formula but no fp8_ds_mla store or read, so a page sized for it would hold bytes nothing writes. EITHER --kv-cache-dtype asked for a non-auto dtype, OR (DeepSeek-V4, #2455) the model's own KV factory published fp8_ds_mla specs and no flag was
+```
+
+No DeepSeek-V4 request can be served, text or image, until `KV-DSV4-MULTICACHE`
+W5 (#2455) lands. `## Owed` records it.
+
+**THE ORACLE BUILDS AND RUNS THE MODEL.** rc job
+`b69b2fb9-23b9-42b8-b755-62b8ee93b6ea`. `ggml-org/llama.cpp` was cloned inside
+the job and checked out at `9400c8946e4da5e7694f2c26d6d4e50e14b690fa`, and the
+job asserted `rev-parse HEAD` against that value; `git describe` printed
+`b10766`. It was built CPU-only and static: `cmake -G Ninja
+-DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=OFF
+-DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF`, targets
+`llama-mtmd-cli` and `dsv4v-oracle-dump`, `-j 4`. `llama-mtmd-cli -m <shard1>
+--mmproj mmproj-BF16.gguf --image img392.png -p "Describe this image in one
+sentence." -n 32 --temp 0 -c 4096 --no-mmproj-offload` loaded the 82 GB
+language model and the projector, encoded the image in 71,076 ms, and answered
+`This image is a colorful, abstract composition featuring a vibrant, swirling
+background of concentric circles in hues of blue, green, purple, and pink,
+overlaid with`. That fits the input: its blue channel is a radial sine, which
+draws concentric rings.
+
+**THE COMPARISON AND WHY IT MEASURES THE TOWER.** The image is 392x392 RGB,
+generated deterministically by `tools/parity/dsv4v_w6_image.py` (rgb sha256
+`fda46a17fe85ba9919956cb535fbcf5b61552b29cb6e5623df7031b55e0dff99`, png sha256
+`3f4aeae0eed47f6f6bd898cadc42cc57ccb23ab86527508626e8057a168c8f9a`, the same
+bytes). NEITHER SIDE RESAMPLES IT, and both halves of that claim were read at the
+code, not assumed. 392 is a multiple of 14, and its area of 153,664 is above the
+147,456 `image_min_pixels` the file carries, so both sides keep 392x392 as the
+target. llama.cpp's `img_tool::resize` then COPIES when source and target sizes
+are equal (`tools/mtmd/mtmd-image.cpp:50-54` at the pin). Our `ProcessImage`
+transforms only when `height != best_height || width != best_width`. The oracle
+logged `preprocess: 392x392 (from 392x392)`. The patch grid is 28x28, the
+aligner grid 10x10, and the block `114 + lead_pad` tokens.
+
+Our side is `tools/parity/dsv4v_w6_probe.cpp`, built from `4993c72b2` plus the
+probe (not in the default build). It drives the SHIPPED path:
+`LoadDeepseekV4VisionRuntime` on the real mmproj, `DeepSeekV4ImageProcessor` on
+the raw RGB, `PrepareDeepSeekV4Inputs`, and `ModelRegistry::EncodeMm`. It runs
+on a `DeepseekV4LoadedModel` that carries only the vision runtime, because
+`encode_mm` reads nothing else. The oracle side is
+`tools/parity/dsv4v_w6_oracle_dump.cpp`, compiled inside the pinned clone
+against its own static `mtmd`. It runs llama.cpp's own `clip_init`,
+`mtmd_image_preprocessor_deepseek4v::preprocess` and `clip_image_encode`, and it
+sets `lead_pad` the way `mtmd.cpp:1461-1470` does. **The driver IS the oracle's
+production path:** `llama-mtmd-cli`'s own `MTMD_DEBUG_EMBEDDINGS` dump, whose
+tokenizer placed the image at `lead_pad = 2`, is byte-identical (`cmp`) to the
+driver's `lead_pad = 2` dump. Both CPU runs are deterministic: a second job
+reproduced the oracle block byte for byte.
+
+**RESULT, for every `lead_pad` 0-3 and for the CLI's own dump** (rc job
+`b69b2fb9-23b9-42b8-b755-62b8ee93b6ea`; `report-lp{0,1,2,3}.json`,
+`report-cli.json`):
+
+| Check | Result |
+|---|---|
+| token count, ours = oracle | 114, 115, 116, 117 for `lead_pad` 0, 1, 2, 3; 116 for the CLI |
+| START, END, every NEWLINE, every PAD (leading and trailing) | **EXACT**, byte-for-byte in f32, on every rung |
+| row placement (N-layout interleave) | the identity is the best cosine match for 100 of 100 image rows, on every rung |
+| input pixels | ours is exactly `bf16(oracle)`; relative L2 0.12% mean |
+| image rows, cosine | mean 0.99899, min 0.96709 |
+| image rows, relative L2 | mean 3.83%, max 28.6% |
+| image rows, absolute | mean 0.00169, max 0.0334, against a row RMS of 0.0717 |
+| vit (after the final RMSNorm), 784 rows | mean cosine 0.99934, min 0.94498, mean relative L2 2.45% |
+
+The sentinels are exact because both sides copy the same f32 vectors, and our
+bf16 narrowing at the join is exact on them: the file stores them as widened
+bf16. The worst "28.6%" row is a LOW-NORM row: its reference RMS is 0.0252, a
+third of the block's, and its absolute error (mean 0.0057) is ordinary.
+
+**LOCALISATION**, rc job `2481ad2a-c109-4002-8ee6-13634a2bd7f5`
+(`tools/parity/dsv4v_w6_floor.sh`; `report-floor.json`, `report-samein.json`):
+
+| Comparison, 100 image rows | cells mean rel L2 | cells mean cos | cells min cos | vit mean rel L2 |
+|---|---|---|---|---|
+| FLOOR: oracle(f32 input) vs oracle(bf16-rounded input) | 1.57% | 0.99986 | 0.99795 | 1.00% |
+| SAME INPUT: ours vs oracle(bf16-rounded input) | 3.06% | 0.99924 | 0.97306 | 1.90% |
+| AS SHIPPED: ours vs oracle(f32 input) | 3.83% | 0.99899 | 0.96709 | 2.45% |
+
+1. **The tower amplifies a small perturbation about fifteenfold.** Rounding the
+   input by about 0.1% (the bf16 step) moves the oracle's OWN output by 1.6%. A
+   few percent is what a precision difference of this size produces in this
+   network, so the raw number is not by itself evidence of a defect.
+2. **With the input rounding taken out, ours is about twice the floor.** The
+   remaining difference is inside the tower.
+3. **The error has no positional structure.** Absolute error does not correlate
+   with row norm (r = -0.006 as shipped, -0.06 at the same input, -0.015 on the
+   floor). The spread across the ten aligner rows and the ten aligner columns is
+   about 3x on the floor itself, and no row or column stands out beyond that. A
+   RoPE-axis, unfold-order or padded-edge defect would load one axis.
+4. **The error does not jump at a stage.** It is present at the ViT output
+   (1.90%) and grows smoothly through the aligner (3.06%).
+
+**THE TWO SIDES DO NOT COMPUTE IN THE SAME PRECISION**, and that is the
+remaining candidate. At the pin, llama.cpp's CPU clip graph rounds to bf16 only
+at each GEMM input (`ggml/src/ggml-cpu/ggml-cpu.c:395-399`,
+`vec_dot_type = GGML_TYPE_BF16`) and keeps its residual stream, norms, RoPE,
+activations and patch merge in f32. Its attention has two branches
+(`tools/mtmd/clip.cpp::clip_graph::build_attn`, `:773-808`): the flash branch
+casts K and V to F16 and accumulates at `GGML_PREC_F32`, and the other branch
+computes QK^T, the softmax and the weighted sum in f32. `AUTO` becomes
+`ENABLED` only inside `warmup()` (`:3699-3701`), and the log line
+`flash attention is enabled|disabled` (`:3732`) says which branch ran. Every
+oracle run here logged `warmup: flash attention is enabled`, so the oracle's K
+and V were F16. Our tower carries every intermediate in bf16, which is the model
+dtype `AGENTS.md` §"Inherit vLLM defaults" requires and which the model author's
+own torch runtime uses.
+
+**THE DTYPE TEST SETTLES IT.** rc job `0edbd4a9-cfd4-47e6-806b-0eb31df06383`
+(`tools/parity/dsv4v_w6_f32.sh`; `report-f32.json`, `report-selfdt.json`). W2
+refuses `compute_dtype != bf16`, so the job deleted that guard IN AN EXTRACTED
+SCRATCH COPY ONLY. It ran the probe's f32 arm (`DSV4V_PROBE_F32=1`): the same
+tower, with weights widened exactly from the file's bf16, f32 activations and the
+exact f32 pixels. Nothing in `src/` changed. A bf16 control from the SAME patched
+binary reproduced the first run's block byte for byte (`cmp`), so the scratch
+patch changed nothing on the production path.
+
+| Comparison, 100 image rows | cells mean rel L2 | cells mean cos | cells min cos | worst row rel L2 | vit mean rel L2 |
+|---|---|---|---|---|---|
+| OURS IN F32 vs oracle(f32 input) | **1.34%** | 0.99986 | 0.99666 | 8.4% | 0.88% |
+| oracle's own floor (above) | 1.57% | 0.99986 | 0.99795 | 8.2% | 1.00% |
+| ours bf16 vs OURS IN F32 | 3.34% | 0.99928 | 0.98445 | 20.0% | 2.07% |
+| ours bf16 vs oracle (as shipped) | 3.83% | 0.99899 | 0.96709 | 28.6% | 2.45% |
+
+**VERDICT: PRECISION, NOT A DEFECT.** Computed in f32, our tower is closer to
+llama.cpp (1.34%) than llama.cpp is to ITSELF when its input moves by one bf16
+step (1.57%), at both the ViT stage and the cells. The residual is llama.cpp's
+own precision: bf16 GEMM inputs and F16 K/V. The shipped gap is our bf16
+intermediate storage, and all of it: our bf16 output is as far from our own f32
+output (3.34%) as it is from llama.cpp (3.83%). The layout, the permutation, the
+2-D RoPE, the unfold order, the aligner and the four sentinels are all right on
+the real weights. No defect was found, and none of the numbers above is left
+unexplained.
+
+**THE BOUND, and where it comes from.** The gate for this tower against
+`llama-cpp-dsv4vision` is three conditions, and each one comes from a measurement:
+
+1. The four sentinel kinds are EXACT and every image row is in its place. They
+   are copies and a permutation, so any error at all is a defect.
+2. THE F32 ARM is within the oracle's own floor: cells mean relative L2
+   `<= 1.57%`, measured 1.34%. This is the condition that tests the function.
+3. THE SHIPPED bf16 path is no farther from the oracle than it is from its own
+   f32 arm plus that floor: cells mean relative L2 `<= 3.34% + 1.57% = 4.9%` and
+   mean cosine `>= 0.998`, measured 3.83% and 0.99899. This says the bf16 path
+   is the f32 function rounded, and nothing else.
+
+A single per-row threshold is NOT the bound. The worst row's relative error
+tracks its NORM, not its position. Relative error correlates with row norm at
+r = -0.42 to -0.52 in every comparison, while absolute error does not
+correlate with it at all (r = -0.006 to -0.12). The worst five rows come from
+a small recurring set of low-norm cells: 26, 36, 69 and 82 are among the worst
+five of the oracle's OWN floor, and cell 6 (row RMS 0.025, a third of the
+block's) heads every other comparison's list. A relative bound on those rows
+would measure the norm, not the tower.
+
+**WHAT THIS DOES NOT SHOW.** It is one image at one size on the CPU provider. It
+does not gate the device paths (W7). It does not gate what the language model
+does with the block, because no DeepSeek-V4 request can be served until #2455
+lands. The model author's own runtime was not run. llama.cpp is the secondary
+oracle, and the f32 arm is what makes the comparison decisive without it.
 
 ### W5 evidence — the request path, and what each mutation proved
 
@@ -1386,7 +1597,27 @@ the row that owns the wiring and issue #2411.
 
 ## Now
 
-`ACTIVE`. W1, W2, W3, W4 and W5 have landed on the row branch.
+`ACTIVE`. W1, W2, W3, W4 and W5 have landed on the row branch, and W6 has run
+its first real-weight gates.
+
+W6 IS THE FIRST TIME THE REAL WEIGHTS RAN, and the vision half is right. On
+`thor:gpu0`, the pinned `UD-IQ1_S` language model loads and generates text, and
+the real `mmproj-BF16.gguf` runs through `ModelRegistry::EncodeMm`. Its token
+block matches llama.cpp `b10766` on a 392x392 image that neither side resamples.
+The token count is the same for all four leading-pad offsets, and the four
+sentinel kinds are byte-exact. Every image row is in its place. The image rows
+agree at a mean cosine of 0.99899. That gap is our bf16 intermediate storage
+and nothing else: the same tower in f32 lands closer to llama.cpp than llama.cpp
+lands to itself under a one-bf16-step input change. `llama-cpp-dsv4vision` built
+and ran the model end to end, so it is now `gateable = yes`. The measurements,
+the job ids and the bound are in `### W6 evidence`.
+
+WHAT W6 DID NOT DO. It could not serve a single request: the server exits at
+engine start on the `fp8_ds_mla` KV cache, which `KV-DSV4-MULTICACHE` W5 owns
+(#2455). No image answer has come from this engine, and a CUDA build would
+still refuse an image step in the device routers, which W7 owns. The text
+generation is plausible but not oracle-gated. No speed was measured. Both are
+under `## Owed`.
 
 W5 IS THE WAVE THAT MADE A USER ABLE TO SEND AN IMAGE. W4 made one reach
 `ModelRegistry::Forward`; every seam above it was still unwired, and
@@ -1414,8 +1645,8 @@ prefill is still not atomic at the scheduler, the container codec is still
 refused rather than implemented, and no served request can GENERATE on a CPU
 build because the runner's gather-logits path reaches
 `DeepseekV4Model::ForwardDevice`. All four are named under `## Owed` above.
-No real artifact has been read or run: W6 owns the first load and generation,
-and W7 owns the device paths.
+When W5 landed no real artifact had been read or run. W6 has since read and run
+both files; see `## Now` and `### W6 evidence`. W7 owns the device paths.
 
 THE W4/W5 MERGE CARRIED A REDUNDANT REFUSAL, and it is removed. Both waves
 closed the chunk-atomicity gap from opposite sides and the merge took both, so
@@ -1463,8 +1694,9 @@ step AND a windowed one, and `DeepseekV4ImageSpans` refuses a prefill chunk that
 carries part of an image block without its markers. The device decode refusal is
 the one no CPU build can execute, and its entry says so.
 
-No real artifact has been read or run by this code: W6 owns the first load and
-generation, W7 owns the device paths.
+When W4 landed no real artifact had been read or run by this code. W6 has since
+loaded both files and compared the vision block with the oracle; W7 owns the
+device paths.
 
 ### W1 evidence
 

@@ -65,12 +65,34 @@ GitHub API. No local llama.cpp working tree was read.
 
 ## Gateability
 
-`gateable = no`. This session read the released source and the artifact headers.
-It did not build llama.cpp at `b10766`, did not load the 77.65 GiB
-`UD-IQ1_S` + `mmproj-BF16` pair, and did not generate a token.
-`AGENTS.md` admits `gateable = yes` only after an oracle demonstrably builds and
-runs the model, so the flag stays `no` and the first leased build-and-run is
-owed by [#2411](https://github.com/mudler/vllm.cpp/issues/2411).
+`gateable = yes`, measured on 11 September 2026 on `thor:gpu0` through
+resource-controller. `AGENTS.md` admits `gateable = yes` only after an oracle
+demonstrably builds and runs the model, and this one did both.
+
+- **It builds.** rc job `b69b2fb9-23b9-42b8-b755-62b8ee93b6ea` cloned
+  `ggml-org/llama.cpp` inside the job, checked out
+  `9400c8946e4da5e7694f2c26d6d4e50e14b690fa`, asserted `rev-parse HEAD`
+  against it (`git describe`: `b10766`), and built CPU-only and static on
+  aarch64: `cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+  -DGGML_CUDA=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF
+  -DLLAMA_BUILD_SERVER=OFF`, targets `llama-mtmd-cli` and the W6 driver
+  `dsv4v-oracle-dump`, `-j 4`. The recipe is
+  `tools/parity/dsv4v_w6_parity.sh`.
+- **It runs the model.** In the same job, `llama-mtmd-cli` loaded the pinned
+  `UD-IQ1_S` shards and `mmproj-BF16.gguf` together, encoded a 392x392 image,
+  and generated a description that fits it.
+- **It is deterministic on the CPU.** A second job,
+  `2481ad2a-c109-4002-8ee6-13634a2bd7f5`, rebuilt it and reproduced the image
+  block byte for byte. The W6 driver's block is byte-identical to
+  `llama-mtmd-cli`'s own `MTMD_DEBUG_EMBEDDINGS` dump.
+
+What it gates and what it does not: the `deepseek4v` tower and token block, on
+the CPU provider. Flash attention was ENABLED in every run
+(`warmup: flash attention is enabled`), so its attention takes F16 K and V, and
+its GEMMs take bf16 inputs. Those are this oracle's own precision, and the row's
+spec measures how far they move it. The raw dumps, logs and reports are on the
+NAS under `/workspace/dsv4-vision/w6-parity/`, and the committed record is the
+spec's `### W6 evidence` section, which the `evidence` field names.
 
 ```oracle-pin
 id = llama-cpp-dsv4vision
@@ -80,6 +102,6 @@ scope = the deepseek4 vision variant only: the deepseek4v clip projector and mmp
 pin = 9400c8946e4da5e7694f2c26d6d4e50e14b690fa
 pin_label = release b10766
 pinned_on = 2026-09-05
-gateable = no
-evidence = #2411
+gateable = yes
+evidence = .agents/specs/deepseek-v4-flash-vision.md
 ```

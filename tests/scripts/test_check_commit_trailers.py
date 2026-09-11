@@ -126,6 +126,17 @@ class CommitMessageContract(unittest.TestCase):
                     "malformed Assisted-by",
                 )
 
+    def test_assisted_by_accepts_slash_in_model_name(self) -> None:
+        """A provider/model identifier such as regolo/glm5.2 uses ``/`` as
+        the separator, and the TOOL slot of the same regex already allows it.
+        The MODEL slot must too, or commits land with a mangled name (#3132)."""
+        message = STRICT_MESSAGE.replace(
+            "Codex:GPT-5 [Codex]", "AGENT:regolo/glm5.2 [maki]"
+        )
+        self.assertEqual(
+            self.checker.validate_commit_message(message, strict=True), []
+        )
+
     def test_human_only_declaration_rejects_assistance_attribution(self) -> None:
         message = STRICT_MESSAGE.replace("AI-Assisted: true", "AI-Assisted: false")
         self.assertInvalid(message, "must omit Assisted-by")

@@ -186,14 +186,23 @@ struct PrefGuard {
   }
 };
 
-void MakeRowMajor(LayoutGuard& l, cudaDataType_t t, int64_t rows, int64_t cols) {
+// Overload with an EXPLICIT leading dimension, for strided views whose row
+// stride exceeds `cols` (e.g. a column slice of a wider output tensor).
+// Mirrors MakeRowMajorBatched's ld parameter (line 202). For a contiguous
+// tensor, ld == cols and this is identical to the 4-arg overload below.
+void MakeRowMajor(LayoutGuard& l, cudaDataType_t t, int64_t rows, int64_t cols,
+                 int64_t ld) {
   CheckLt(cublasLtMatrixLayoutCreate(&l.v, t, static_cast<uint64_t>(rows),
-                                     static_cast<uint64_t>(cols), cols),
+                                     static_cast<uint64_t>(cols), ld),
           "cublasLtMatrixLayoutCreate");
   const cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
   CheckLt(cublasLtMatrixLayoutSetAttribute(l.v, CUBLASLT_MATRIX_LAYOUT_ORDER, &order,
                                            sizeof(order)),
           "set CUBLASLT_MATRIX_LAYOUT_ORDER");
+}
+
+void MakeRowMajor(LayoutGuard& l, cudaDataType_t t, int64_t rows, int64_t cols) {
+  MakeRowMajor(l, t, rows, cols, cols);
 }
 
 // Row-major layout with an EXPLICIT leading dimension (the tensor's row stride,
@@ -1339,13 +1348,24 @@ void CublasLtHgemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& b) {
   const cudaDataType_t ab_type = CUDA_R_16F;
   const cudaDataType_t out_type = c.dtype == DType::kF32 ? CUDA_R_32F : CUDA_R_16F;
 
+  // ldc = c.stride[0]: the output's actual row stride. For a column slice of a
+  // wider output (EXL3 N>32768 slicing), c.stride[0] > n, and using ldc = n
+  // packs rows too tightly so they overwrite each other. The reference
+  // (exllamav3 hgemm.cu:49,72) does the same: ldc = c.stride(-2).
+  // ldb = n (= b.shape[1]): the reconstruct kernel writes B contiguously with
+  // row stride n_slice even when the scratch buffer is wider, so cuBLAS must
+  // read at that same stride, not at b.stride[0].
+  const int64_t lda = a.stride[0];
+  const int64_t ldb = n;
+  const int64_t ldc = c.stride[0];
+
   DescGuard desc;
   CheckLt(cublasLtMatmulDescCreate(&desc.v, CUBLAS_COMPUTE_32F, CUDA_R_32F),
           "cublasLtMatmulDescCreate (hgemm)");
   LayoutGuard la, lb, lc;
-  MakeRowMajor(la, ab_type, m, k);
-  MakeRowMajor(lb, ab_type, k, n);
-  MakeRowMajor(lc, out_type, m, n);
+  MakeRowMajor(la, ab_type, m, k, lda);
+  MakeRowMajor(lb, ab_type, k, n, ldb);
+  MakeRowMajor(lc, out_type, m, n, ldc);
 
   PrefGuard pref;
   CheckLt(cublasLtMatmulPreferenceCreate(&pref.v), "cublasLtMatmulPreferenceCreate (hgemm)");
@@ -1359,9 +1379,9 @@ void CublasLtHgemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& b) {
   key.m = m;
   key.n = n;
   key.k = k;
-  key.lda = k;
-  key.ldb = n;
-  key.ldc = n;
+  key.lda = lda;
+  key.ldb = ldb;
+  key.ldc = ldc;
   key.ab_type = static_cast<int>(ab_type);
   key.out_type = static_cast<int>(out_type);
 

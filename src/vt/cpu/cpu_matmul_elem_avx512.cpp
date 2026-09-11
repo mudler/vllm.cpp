@@ -21,6 +21,7 @@
 
 #include "vt/dtype.h"
 #include "cpu_matmul_elem.h"
+#include "vt/unaligned.h"
 
 namespace vt::cpu {
 namespace {
@@ -118,7 +119,7 @@ void Bt16Avx512(const float* af, const void* bv, int64_t k, float* acc) {
   for (; p < k; ++p) {
     const float av = af[p];
     for (int l = 0; l < kElemLanes; ++l) {
-      acc[l] += av * ElemZ<K>::Cvt(b[static_cast<int64_t>(l) * k + p]);
+      acc[l] += av * ElemZ<K>::Cvt(vt::LoadUnaligned<T>(b + static_cast<int64_t>(l) * k + p));
     }
   }
 }
@@ -174,7 +175,7 @@ void BtM6Avx512(const float* af, int64_t a_stride, const void* bv, int64_t k, fl
     for (int r0 = 0; r0 < kMrAvx512; ++r0) {
       const float av = af[r0 * a_stride + p];
       for (int l = 0; l < kElemLanes; ++l) {
-        acc[r0 * kElemLanes + l] += av * ElemZ<K>::Cvt(b[static_cast<int64_t>(l) * k + p]);
+        acc[r0 * kElemLanes + l] += av * ElemZ<K>::Cvt(vt::LoadUnaligned<T>(b + static_cast<int64_t>(l) * k + p));
       }
     }
   }

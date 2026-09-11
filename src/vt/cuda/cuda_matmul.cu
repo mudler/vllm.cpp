@@ -1327,7 +1327,7 @@ struct Registrar {
 void CublasLtHgemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& b) {
   if (a.dtype != DType::kF16 || b.dtype != DType::kF16 ||
       (c.dtype != DType::kF16 && c.dtype != DType::kF32)) {
-    throw std::runtime_error("vt cuda: CublasLtHgemm: unsupported dtype combo (" +
+    throw std::runtime_error(std::string("vt cuda: CublasLtHgemm: unsupported dtype combo (") +
                              Name(a.dtype) + "," + Name(b.dtype) + ")->" + Name(c.dtype) +
                              "; expected (f16,f16)->f16|f32");
   }

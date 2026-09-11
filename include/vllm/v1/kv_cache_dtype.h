@@ -249,6 +249,18 @@ inline std::string UnservedCacheDTypeReason(std::string_view cache_dtype) {
 // KV-DSV4-MULTICACHE's.
 struct ResolvedCacheDType {
   bool is_fp8 = false;  // quantized fp8 KV (cache pages are 1-byte fp8 / kI8)
+  // The request was the literal string "auto" — "if auto, use model data type"
+  // (`config/cache.py:76`) — rather than a dtype the operator named.
+  //
+  // NOT DERIVABLE FROM `storage`, which is the whole reason it is a field.
+  // `auto` resolves `storage` to the model dtype, so on a bf16 model `auto` and
+  // an explicit `bfloat16` produce byte-identical `ResolvedCacheDType` values.
+  // They are different REQUESTS: `auto` delegates the choice, and `bfloat16`
+  // overrides it. `ApplyCacheDType` has to tell them apart to honour a cache
+  // dtype a model's own factory already resolved (KV-DSV4-MULTICACHE W8 slice 6,
+  // #2455), and inferring it from the dtype would silently treat every explicit
+  // `--kv-cache-dtype bfloat16` as a delegation.
+  bool is_auto = false;
   vt::DType storage = vt::DType::kBF16;  // block-allocation dtype
   vt::Fp8KVCacheDataType fp8_kind = vt::Fp8KVCacheDataType::kAuto;
   // `KVQuantMode` for the resolved string (kv_cache_interface.py:83-97). It
@@ -285,6 +297,7 @@ inline ResolvedCacheDType ParseCacheDType(std::string_view cache_dtype, vt::DTyp
   ResolvedCacheDType r;
   r.quant_mode = GetKvQuantMode(cache_dtype);
   if (cache_dtype == "auto") {
+    r.is_auto = true;
     r.storage = model_dtype;
     r.fp8_kind = vt::Fp8KVCacheDataType::kAuto;
     return r;

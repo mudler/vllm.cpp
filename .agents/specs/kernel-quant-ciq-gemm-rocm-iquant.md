@@ -272,6 +272,55 @@ reason, and they now use IQ2_XS, which no ROCm provider implements.
   the row's actual acceptance criterion, not merely the unit-level dot
   gates.
 
+### End-to-end reload on the reconciled tree, 2026-09-12
+
+The reviewer's ask on pull request #3029 was specific: the pre-reconciliation
+reload evidence named no sha256, reported a calculated footprint rather than a
+measured peak RSS, and compared coherent text rather than tokens. This
+re-runs the same checkpoint on the reconciled tree and closes all three.
+
+`Nail-Qwen3.6-35B-A3B-MTP-IQ4_XS.gguf` (19,389,012,960 B on disk,
+`/home/justin/Nail/`), sha256
+`aeff61097613c4d8e9f418572d58afd14bf5771de236e1dd50869dd809343a23`. The
+file's own GGUF metadata (`general.base_model.0.repo_url`,
+`general.quantized_by`) names the base model as
+`https://huggingface.co/Qwen/Qwen3.6-35B-A3B`, quantized by Unsloth. The
+developer's best recollection of the source repo is
+`peculiar-ragdoll/Nail-Qwen3.6-35B-A3B-GGUF-MTP` (2026-09-12, unverified
+against the file and no revision recorded, since fetch-time provenance
+was not tracked); the sha256 above, not the repo name, is this row's pinned
+identity for the artifact.
+
+Measured on `isravale` (RX 9060 XT, `gfx1200`, ROCm 7.2.3), every GPU command
+under `flock ${GPU_LOCK:-$HOME/gpu.lock}`, `llama-server.service` confirmed
+`inactive` before and after both runs:
+
+```
+VT_DEVICE_WEIGHT_BUDGET_BYTES=13000000000 \
+./build-hip/examples/vllm-cli --model /home/justin/Nail/Nail-Qwen3.6-35B-A3B-MTP-IQ4_XS.gguf \
+  --device auto --max-num-seqs 1 --kv-cache-dtype fp8 --kv-cache-memory 2000000000 \
+  --temperature 0 --prompt "The capital of France is" --max-tokens 16
+```
+
+ROCm run: `--fit` placed 15 of 40 layers' routed experts on CPU to bring the
+19,333,564,672 B (~18.01 GiB) weight footprint under the 13 GB budget; the
+rest ran keep-quant on ROCm. `prompt_tokens=5 completion_tokens=16
+secs=3.562 tok_s=4.492`. **Peak RSS was MEASURED, not calculated**: sampled
+every 200 ms over the process tree via `tools/bench/sample_process_memory.py`
+(`/proc/<pid>/smaps_rollup`), peak **20,135,752 KiB (~19.20 GiB)** over 45
+samples, `peak_mem_available_drop_kib=2,078,764` (~1.98 GiB). Output: " Paris.
+The capital of Germany is Berlin. The capital of Italy is Rome."
+
+CPU run, same prompt, same checkpoint, same seed-free greedy decode
+(`--device cpu`, no ROCm code path involved at all): `prompt_tokens=5
+completion_tokens=16 secs=5.044 tok_s=3.172`. Output: " Paris. The capital of
+Germany is Berlin. The capital of Italy is Rome." -- **byte-identical to the
+ROCm run**, 16/16 completion tokens agreeing under greedy decoding. This is
+the token-level correctness comparison the pre-reconciliation evidence
+lacked: two independently-computed paths (all-CPU vs the ROCm keep-quant
+GEMM this row ports) producing the same decode on the real checkpoint, not
+merely each individually producing readable text.
+
 ## Owed
 
 - The other missing ROCm formats (Q4_0, Q5_0, IQ2_XS, IQ4_NL, IQ3_S,
@@ -283,12 +332,13 @@ reason, and they now use IQ2_XS, which no ROCm provider implements.
   implementation wave for lack of a `rocprofv3` profiling setup on
   `isravale`, not silently dropped. The correctness gates (Tests) are
   unaffected by this being open.
-- A fresh end-to-end reload of the motivating checkpoint on the reconciled
-  tree. `Nail-Qwen3.6-35B-A3B-MTP-IQ4_XS.gguf` loaded and generated on the
-  pre-reconciliation head, and that head's IQ4_XS kernel no longer exists.
-  The artifact also carries no recorded repository revision and no sha256, so
-  `docs/USAGE.md` cannot pin it as this row's gate checkpoint until both are
-  measured.
+- `Nail-Qwen3.6-35B-A3B-MTP-IQ4_XS.gguf`'s exact source revision:
+  `UNRECORDED`. The developer's best recollection names the repo
+  (`peculiar-ragdoll/Nail-Qwen3.6-35B-A3B-GGUF-MTP`, see Tests), but it was
+  not verified against the staged file and no revision was recorded at
+  fetch time. The sha256 pinned under "End-to-end reload on the reconciled
+  tree" is the artifact's identity until this is confirmed or the file is
+  re-fetched by an explicit revision.
 
 ## Stop conditions
 
@@ -321,7 +371,12 @@ was re-measured rather than carried: HIP's project-wide `-ffp-contract=off`
 reaches this translation unit, and the bit-exact oracle case passes with plain
 `*` and `+`.
 
-Remaining before `DONE`: the `ROCM-KQUANT-NWARPS-DECODE` re-measurement, which
-is `PENDING` for want of a `rocprofv3` setup on `isravale`, and a fresh
-end-to-end reload of the motivating checkpoint. The earlier reload ran on the
-pre-reconciliation head and does not carry over.
+The fresh end-to-end reload also landed, on the reconciled tree this time: a
+measured (not calculated) peak RSS, a pinned sha256, and a CPU-vs-ROCm
+token-level comparison producing a byte-identical completion -- see
+"End-to-end reload on the reconciled tree, 2026-09-12" under Tests.
+
+Remaining before `DONE`: the `ROCM-KQUANT-NWARPS-DECODE` re-measurement,
+`PENDING` for want of a `rocprofv3` setup on `isravale`, and confirming the
+checkpoint's exact source revision (Owed; the repo itself is recorded from
+the developer's recollection, unverified).

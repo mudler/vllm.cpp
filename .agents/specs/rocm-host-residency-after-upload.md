@@ -131,7 +131,7 @@ of that variable and the new helper only decides the DEFAULT.
 ### Out of scope
 
 Chunked H2D through a pinned bounce buffer — llama.cpp's 4 x 64 MiB shape — is
-NOT built here. See `## Owed`.
+NOT built here. See `## Deferred, with an issue`.
 
 ### Also in scope
 
@@ -199,9 +199,9 @@ red for each.
   legitimate result and is reported with `wchan` evidence rather than papered
   over.
 
-## Owed
+## Deferred, with an issue
 
-- `ISSUE-LOCAL-01M2BZ5QK4XRETK48CXKSHKRDW` — chunked H2D through a pinned bounce
+- `ISSUE-LOCAL-01M2BZ5QK4XRETK48CXKSHKRDW` (row-owned, not started) covers chunked H2D through a pinned bounce
   buffer, llama.cpp's 4 x 64 MiB shape. Needed only if the stall survives fixes 1
   and 2. Medium-size and touches every staged weight on every backend, so it gets
   its own row, spec and measurement.

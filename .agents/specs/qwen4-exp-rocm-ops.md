@@ -16,11 +16,11 @@
 | Scope | IN: a `kROCM` arm for each of the nine `vt::` operations the `qwen4_exp` forward calls and ROCm does not register — `kQwen4ExpPleConv`, `kQwen4ExpPleGate`, `kQwen4ExpGatedResidual`, `kQwen4ExpGatedResidualWriteBack`, `kQwen4ExpQsaCompress`, `kQwen4ExpQsaGatherAttention`, `kRmsNormGroup`, `kIndexSelect`, `kIndexCopy` — each with its cross-device gate against the CPU oracle, and the device-fit and refusal records that change with them. OUT: the MTP head (still unimplemented on every device); the vision tower (no ROCm-specific work, and the only published GGUF is text-only); multi-sequence decode (the engine clamps `--max-num-seqs` to 1 for this model on every device); any token-exactness claim; any throughput, latency or memory number. |
 | Upstream chain | vLLM is the primary oracle and at the current pin `e126687a9a` it ships a FIRST-PARTY AMD backend for this architecture: `vllm/models/qwen4_exp/amd/`. Its divergence from `nvidia/` is about 840 lines confined to the Triton op layer, with `model.py`, `model_state.py` and `mtp.py` BYTE-IDENTICAL, and it carries `amd/ops/qsa.py` (6 `@triton.jit` kernels including `_compress_qsa_groups_kernel` and `_qsa_sparse_paged_gqa_splitk_kernel`), `amd/ops/hc.py`, `amd/ple_layer.py`, `amd/hyperconnection.py` and `amd/indexer_qsa.py`. `vllm/models/qwen4_exp/__init__.py` states the support surface in its own words: "Qwen4Exp currently supports CUDA and ROCm only". So the AMD arm is a MIRROR, not an extension, and not a transliteration of the CUDA arm. |
 | Our baseline | Every one of the nine has BOTH a CPU and a CUDA implementation in this tree, which is what bounds the work: `cpu_qwen4_exp{,_ple,_qsa}.cpp` and `cuda_qwen4_exp{,_ple,_qsa}.cu`, `cuda_rms_norm_group.cu`, and `kIndexSelect`/`kIndexCopy` in `cpu_ops.cpp` and `cuda_gdn.cu`. About 1709 lines of CUDA across the four qwen4_exp files. `grep -rn 'Qwen4Exp' src/vt/rocm/` returns nothing. |
-| Port map | Each CUDA kernel -> a `.hip` sibling under `src/vt/rocm/`, mirroring the vLLM file structure as AGENTS.md requires: `cuda_qwen4_exp.cu` -> `rocm_qwen4_exp.hip`, `cuda_qwen4_exp_ple.cu` -> `rocm_qwen4_exp_ple.hip`, `cuda_qwen4_exp_qsa.cu` -> `rocm_qwen4_exp_qsa.hip`, `cuda_rms_norm_group.cu` -> `rocm_rms_norm_group.hip`; `kIndexSelect`/`kIndexCopy` join an existing ROCm TU rather than earning a file. **Transcribe from the CPU bodies where the CUDA one uses a primitive RDNA lacks, and from the CUDA one otherwise** — measured, the four qwen4_exp CUDA files use only `__shfl_down_sync`, `atomicAdd` and bf16/fp16 types, with no `__dp4a` and no CUDA-only intrinsic, so most port directly. Read vLLM's `amd/` Triton kernels for the ALGORITHM where ours and theirs disagree, because that is the mirror source. |
+| Port map | Each CUDA kernel -> a `.hip` sibling under `src/vt/rocm/`, mirroring the vLLM file structure as AGENTS.md requires: `cuda_qwen4_exp.cu` -> `rocm_qwen4_exp.hip`, `cuda_qwen4_exp_ple.cu` -> `rocm_qwen4_exp_ple.hip`, `cuda_qwen4_exp_qsa.cu` -> `rocm_qwen4_exp_qsa.hip`, `cuda_rms_norm_group.cu` -> `rocm_rms_norm_group.hip`; `kIndexSelect`/`kIndexCopy` join an existing ROCm TU rather than earning a file, and W2 put them in `src/vt/rocm/rocm_gdn_state.hip` — the TU that already carries the other half of `cuda_gdn.cu`'s indexed data movement. They SELF-REGISTER there in W1's pattern rather than taking an entry in `rocm_ops.hip`, because that file is a surface every ROCm row writes and AGENTS.md "Records" calls such a file a lock. **Transcribe from the CPU bodies where the CUDA one uses a primitive RDNA lacks, and from the CUDA one otherwise** — measured, the four qwen4_exp CUDA files use only `__shfl_down_sync`, `atomicAdd` and bf16/fp16 types, with no `__dp4a` and no CUDA-only intrinsic, so most port directly. Read vLLM's `amd/` Triton kernels for the ALGORITHM where ours and theirs disagree, because that is the mirror source. |
 | Tests to port | vLLM has no C++ test to port. The gate is INHERITED and must not be re-authored: `tests/vt/test_backend_cross_device.cpp` already holds any registered backend to NMSE <= 5e-4 against the CPU oracle, and the sibling cases REQUIRE-prove registration rather than skipping. Each op gains a case there in that shape. The existing `tests/vllm/models/test_qwen4_exp_*_device.cpp` suites are the per-op golden surface. |
 | Gates | G1 per-op cross-device NMSE on `strix:gpu0`. G2 the model LOADS and the forward completes on ROCm with `VT_OP_PROVIDER_STATS=1` showing ZERO reference-tier hits — see D2, on this board a hit is impossible, so a non-zero count means the tier was somehow installed and the run is void. G3 first tokens. G4 token-exactness against an oracle — see `## Owed`, not this row. **No throughput, latency or memory number is admissible until G4.** |
 | Dependencies | The IQ4_NL ROCm GEMM (`QUANT-GGUF-IQ4_NL`, PR #3149) for the `ffn_down_exps`, and #3097's ROCm gather for the n-gram table — BOTH have landed and are in this branch's base: the gather in #3097, the GEMM at `18e2a8c9a` on `origin/main`. Hardware: `strix:gpu0`, the only AMD fleet device, reachable ONLY through an `rc` lease. No CI lane has an AMD runner, so a green CI is not evidence for any arm here. |
-| Work breakdown | `W0` this spec -> `W1` the two elementwise-shaped ops (`kQwen4ExpGatedResidual`, `kQwen4ExpGatedResidualWriteBack`) plus `kRmsNormGroup`, which are the cheapest and prove the file and registration shape -> `W2` `kIndexSelect`/`kIndexCopy` -> `W3` the PLE pair -> `W4` the QSA pair, the hardest, and the one where vLLM's `amd/ops/qsa.py` is the reference rather than the CUDA arm -> `W5` first load and forward on `strix:gpu0` -> `W6` first tokens. Each wave lands with its cross-device case; no wave lands unreached. |
+| Work breakdown | `W0` this spec (LANDED) -> `W1` (LANDED) the two elementwise-shaped ops (`kQwen4ExpGatedResidual`, `kQwen4ExpGatedResidualWriteBack`) plus `kRmsNormGroup`, which are the cheapest and prove the file and registration shape -> `W2` (LANDED) `kIndexSelect`/`kIndexCopy`, the two GENERIC row gather/scatter helpers, which is why D3c records that D3's tie-break has nothing to arbitrate for them -> `W3` the PLE pair -> `W4` the QSA pair, the hardest, and the one where vLLM's `amd/ops/qsa.py` is the reference rather than the CUDA arm -> `W5` first load and forward on `strix:gpu0` -> `W6` first tokens. Each wave lands with its cross-device case; no wave lands unreached. |
 | Risks/decisions | R1 a missing op HARD-REFUSES on this board rather than degrading (D2), so a partial port is not a slow model, it is the same refusal with a different name. R2 wave size: nine ops in one pull request would be unreviewable, and the waves above exist to keep each reviewable. R3 the QSA pair is a gather consumer and not a mask, so a fixture under 2048 tokens of context cannot distinguish a correct port from one attending pooled keys — that bound is stated in `.agents/specs/qwen4-exp-flash-next.md` and applies here. R4 `strix:gpu0` is a single shared device and every gate here needs it. R5 no AMD runner in CI. |
 
 ## D1. Why this row exists now rather than later
@@ -238,6 +238,37 @@ GENERIC `filldata<T>::fill` at `:1193`, which uses the real `operator<<`. The
 fix was correct throughout; only its justification was wrong, and no fixture
 value or kernel moved when the comment was corrected.
 
+## D3c. W2's two ops have NO vLLM counterpart, so D3 does not arbitrate them
+
+D3 says that where our CUDA arm and vLLM's AMD arm disagree, vLLM wins. W1's
+three ops each had an AMD arm to compare against and D3a records what the
+comparison found. **W2's two do not, and a reader who assumed the same procedure
+was followed would be reading a check that never happened**, so the difference is
+recorded rather than left silent.
+
+`vt::IndexSelect` and `vt::IndexCopy` are GENERIC row gather/scatter helpers and
+not `qwen4_exp` kernels. At the pin `e126687a9a`, `vllm/models/qwen4_exp/`
+spells both sides of this behaviour as `torch.index_select` and
+`Tensor.index_copy_` and ships no Triton kernel for either, in `amd/ops/` or in
+`nvidia/ops/`; the AMD backend's 840-line divergence is entirely in the HC, PLE
+and QSA kernels. There is therefore no second definition of this behaviour to
+reconcile and nothing for D3's tie-break to decide.
+
+What that leaves is the ordinary port: the donor is this tree's own CUDA arm
+`src/vt/cuda/cuda_gdn.cu:432-527`, the contract is `CheckIndexRowOp`
+(`src/vt/ops.cpp:3288-3322`), and the CPU arm
+(`src/vt/cpu/cpu_ops.cpp:3048-3085`) is the oracle and the only thing that can
+fail this arm. Upstream still fixes the SEMANTICS through PyTorch's own
+`index_select`/`index_copy_`, which both our arms already answer to; it just
+does not fix an implementation.
+
+**These two ops do no arithmetic**, which is what makes their gate stricter than
+W1's rather than weaker: every output byte is a copy of an input byte, so there
+is no rounding, no re-association and no libm between the arms, and the bar is
+BYTE EQUALITY against the CPU oracle instead of an NMSE band. The NMSE is still
+printed beside it, because it is the statistic this spec quotes mutation margins
+in and a byte comparison cannot say how far a broken arm landed.
+
 ## Tests
 
 Red first, per op, each failing for the intended reason before the arm exists:
@@ -271,22 +302,35 @@ Red first, per op, each failing for the intended reason before the arm exists:
 
 ## Owed
 
-- **W1 LANDS UNREACHED, and this bullet is the record AGENTS.md "Nothing lands
-  dead" requires.** The three arms `kQwen4ExpGatedResidual`,
-  `kQwen4ExpGatedResidualWriteBack` and `kRmsNormGroup` are registered on ROCm
-  and are reached by NO production entry point on that device. The weights load
-  since #3097, but `ModelRegistry::Forward` cannot complete a `qwen4_exp` step
-  on `rocm`: it throws at the first of the six arms that is still missing
+- **W1 AND W2 LAND UNREACHED, and this bullet is the record AGENTS.md "Nothing
+  lands dead" requires.** The five arms `kQwen4ExpGatedResidual`,
+  `kQwen4ExpGatedResidualWriteBack`, `kRmsNormGroup` (W1), `kIndexSelect` and
+  `kIndexCopy` (W2) are registered on ROCm and are reached by NO production
+  entry point on that device. The weights load since #3097, but
+  `ModelRegistry::Forward` cannot complete a `qwen4_exp` step on `rocm`: it
+  throws at the first of the FOUR arms that are still missing
   (`kQwen4ExpPleConv`, `kQwen4ExpPleGate`, `kQwen4ExpQsaCompress`,
-  `kQwen4ExpQsaGatherAttention`, `kIndexSelect`, `kIndexCopy`). Their only
-  caller today is the cross-device suite. **The row that owns the wiring is
-  `MODEL-MM-QWEN4-EXP`, this row, through waves W2 to W4**; the issue that
-  tracks it is this row's own, named in the commit and pull request bodies
-  rather than here, because a row-owned issue is not an owed reference. D2 is
-  why the slice is staged rather than held back: on a board with no reference
-  tier a partial port
-  refuses by name, so there is no half-working forward to ship and no way to
-  reach these three from production until the sixth arm lands.
+  `kQwen4ExpQsaGatherAttention`). Their only caller today is the cross-device
+  suite. **The row that owns the wiring is `MODEL-MM-QWEN4-EXP`, this row,
+  through waves W3 and W4**; the issue that tracks it is this row's own, named
+  in the commit and pull request bodies rather than here, because a row-owned
+  issue is not an owed reference. D2 is why the slice is staged rather than held
+  back: on a board with no reference tier a partial port refuses by name, so
+  there is no half-working forward to ship and no way to reach these five from
+  production until the fourth of the remaining arms lands.
+
+  **W2's two arms are the one part of this slice that is NOT qwen4_exp-only**,
+  and the scope of what that buys is deliberately NOT asserted here.
+  `vt::IndexSelect` and `vt::IndexCopy` are generic row gather/scatter helpers
+  and they have production callers outside this model —
+  `spec_decode/dflash2/speculator.cpp:217-218`, `gpu/runner.cpp:4812,4951`,
+  `models/muse_glimmer_vision.cpp:550` and `models/qwen3_dspark.cpp:185` as well
+  as `qwen4_exp_forward.cpp:447` and `qwen4_exp_qsa_block.cpp:616,678`. Whether
+  any of those reaches a ROCm device today is UNMEASURED by this row and no
+  claim is made either way: this row gates the two arms against the CPU oracle
+  and nothing else. What IS established is the `qwen4_exp` half — the forward
+  still refuses on ROCm at the four missing arms above, so W2 adds no reachable
+  qwen4_exp capability.
 - **The remaining `CAPTURE(DeviceName(dt))` sites in
   `tests/vt/test_backend_cross_device.cpp`**, tracked by
   `ISSUE-LOCAL-01M2A7P3C95W3PBAVT9SC6KKY5`. doctest stringifies a `const char*`
@@ -336,35 +380,129 @@ Red first, per op, each failing for the intended reason before the arm exists:
 
 ## Now
 
-`ACTIVE`, 2026-09-12. **W1 landed three of the nine arms**:
-`kQwen4ExpGatedResidual`, `kQwen4ExpGatedResidualWriteBack` and
-`kRmsNormGroup`, in `src/vt/rocm/rocm_qwen4_exp.hip` and
-`src/vt/rocm/rocm_rms_norm_group.hip`, each with a cross-device case that
-REQUIRE-proves its ROCm registration. Six arms remain owed and the forward
-still refuses on ROCm, because a partial port buys nothing runnable on a board
-with no reference tier (D2). Next action is W2, `kIndexSelect` and
-`kIndexCopy`.
+`ACTIVE`, 2026-09-12. **W2 lands two more of the nine arms**, `kIndexSelect` and
+`kIndexCopy`, in `src/vt/rocm/rocm_gdn_state.hip`, each with a cross-device case
+that REQUIRE-proves its ROCm registration. With W1's three that is FIVE landed
+and FOUR owed — the PLE pair (W3) and the QSA pair (W4) — and the forward still
+refuses on ROCm, because a partial port buys nothing runnable on a board with no
+reference tier (D2). Next action is W3, the PLE pair.
 
-**A fresh review returned FAIL on the GATES, not on the kernels**, and the
-findings are repaired here. The three arms are unchanged; the two fixtures that
-could not fail are widened (D3b), the eps and DIVISION-1 placements are now
-pinned by measurement, and W1's staged, unreached slice is recorded under
-`## Owed` as AGENTS.md requires.
+**These two ops have no vLLM counterpart at all**, so unlike W1 there was no AMD
+arm to compare against and D3's tie-break had nothing to arbitrate. D3c records
+that rather than leaving a reader to assume a check that never happened, and it
+also records the consequence for the gate: with no arithmetic in either kernel
+the bar is BYTE EQUALITY against the CPU oracle, not an NMSE band.
 
-**These are the numbers at the head that LANDS**, re-measured on `strix:gpu0`
-after the rebase onto `51c248190`, `rc` job
-`39b76741-99ee-45da-b323-80c2ec272565`, branch head `adaa830ef`, binary
-sha256 `719715bf..`, a fully cold build (ccache 0 hits of 592 cacheable calls):
-write-back `0`, `rmsnorm_group` `0` at both polarities, mixer injection `0`,
-mixer `mixed` `6.98127e-16` on both `use_combine` arms, full ROCm cross-device
-suite **51 of 51 cases, 84127 assertions, 0 failed**.
+**The W2 numbers, measured on `strix:gpu0`**, `rc` job
+`04c5e7ef-f6d3-4ea8-88cd-93e05e50ca79`, worker `rc-worker-lcjhd`, `gfx1151`,
+ROCm 7.2.4 / HIP 7.2.53211, Release, `-DVLLM_CPP_HIP=ON
+-DVLLM_CPP_HIP_ARCHITECTURES=gfx1151`, built in the lease from a clone of this
+row's branch with `git rev-parse HEAD` asserted equal to the commit under test:
 
-**The suite COUNT moved for a reason that is not this row.** An earlier revision
-of this section recorded `50/50` and `84102` assertions; that was measured at the
-pre-rebase base `97cb6964b`, where `tests/vt/test_backend_cross_device.cpp` held
-47 cases. `origin/main` now holds 48 — `QUANT-GGUF-IQ4_NL` added one between the
-two bases — and W1 adds three, which is 51. The three NMSE values did not move,
-so the count is the only thing the rebase changed.
+| Run | Head | `test_backend_cross_device` |
+|---|---|---|
+| RED | `d9b8b5b67` (test only) | `53 cases / 51 passed / 2 failed / 0 skipped`, `84135 assertions / 2 failed` |
+| GREEN | `52cecd733` (the arms) | `53 cases / 53 passed / 0 failed / 0 skipped`, `84333 assertions / 0 failed`, `Status: SUCCESS!` |
 
-No throughput, latency or memory number is admissible from this row, and W1
-took none.
+**The red is the evidence, not a mishap.** Both failures were the two new cases
+and both were the registration `REQUIRE`, not a number:
+`REQUIRE( vt::OpRegistered(vt::OpId::kIndexSelect, DeviceType::kROCM) ) is NOT
+correct!` and the same for `kIndexCopy`. **Two failed cases against two failed
+assertions is the signature of a ROUTE gap**: nothing computed a wrong answer,
+the work never started. The assertion count RISING by 198 across the pair is
+what shows the device half executed rather than being skipped — in the red run
+both cases aborted at the `REQUIRE` before their bodies ran — and `0 skipped` is
+asserted on the green run, not assumed.
+
+**Every one of the twelve measured NMSE values is `0`**, both ops x `{f32,
+bf16}` x `{packed, padded, padded rank-3}`, and each also passes the byte
+comparison it is graded on. That is the expected result and not a suspiciously
+good one: these ops copy bytes and do no arithmetic, so an arm that addresses
+correctly is bit-identical to the oracle by construction.
+
+**FOUR NUMERICAL MUTATIONS, each red by three orders of magnitude against the
+`5e-4` bar.** Every one was sha256-proven to have changed the test binary
+(`c36081f3..` for the green arm) and every restore left
+`git status --porcelain` empty:
+
+| Mutation | What it breaks | NMSE, layout 0 / 1 / 2 | Ratio to the bar |
+|---|---|---|---|
+| `s1` | `index_select` uses the PACKED row as the base stride | 0 / **1.66989** / **1.56537** | up to 3340x |
+| `s2` | `index_select` addresses by `row` instead of `idx[row]` | **1.37064** / **1.15318** / **1.43775** | up to 2876x |
+| `c1` | `index_copy` uses the PACKED row as the destination stride | 0 / **0.753077** / **0.838575** | up to 1677x |
+| `c2` | `index_copy` writes at the COMPACT offset, ignoring `idx` and the stride | **0.721975** / **0.924202** / **0.804197** | up to 1849x |
+
+The `0`s in the stride rows are the point of the layout axis rather than a hole
+in it: layout 0 is packed, so there the packed row IS the stride and the
+mutation is a no-op. Layouts 1 and 2 pad the base side and both mutations red
+there, and the case fails as a whole (8 failed assertions each). Had the fixture
+carried only the packed layout, both stride claims would have been unmeasurable
+— which is the W1 lesson applied before a review had to find it.
+
+**THE MUTATIONS WERE WRITTEN TO STAY LIVE, because W1 was bitten twice by a
+FALSE one.** This tree builds HIP with `-Wall -Wextra -Werror`, so deleting a
+term usually orphans its parameter, fails the compile, and lets a STALE binary
+pass with the unmutated number. Each mutation above therefore keeps every
+parameter referenced through a branch that is never taken — for example `s1`
+writes `((in_row_stride > 0) ? inner : in_row_stride)`, which removes the stride
+from the arithmetic and keeps it live. All four compiled at `-Werror` with zero
+warnings and all four changed the binary.
+
+**THE REACHABILITY MUTATION REDS BY REFUSAL, which is D2 executed rather than
+argued.** Deleting each `RegisterOp` in the scratch copy — with the kernel left
+in place and referenced, so the deletion is not a false mutation — makes the call
+throw:
+
+```text
+vt: no kernel for op IndexSelect (id 90) on device rocm (type 5), and the
+portable CPU reference tier is NOT eligible: ... this ROCm device reports
+hipDeviceAttributePageableMemoryAccess = 0 ...
+```
+
+and the same for `IndexCopy` (id 91). To reach the throw at all, the same
+scratch edit relaxes the case's `REQUIRE` to a `CHECK` and drops its
+`OpAvailable` guard; with the guard in place the case reds one line earlier, at
+the registration assertion, which is the ordinary red and also correct.
+Restored, the rebuilt binary is sha256-IDENTICAL to the green one, so nothing
+about the landing arm depends on a mutation that was left behind.
+
+**THE FULL SUITE WAS RUN AS A BASE-VERSUS-HEAD PAIR, because a bare failure
+count is not a verdict.** `rc` job `7b593bf9-9448-4d1c-a234-ad17c5d8f61a` built
+all 1429 targets and ran the whole 743-test `ctest` twice in one lease, at the
+base `7b45fcfc7` and at this branch's `52cecd733`:
+
+| Leg | Result | Failing set |
+|---|---|---|
+| base `7b45fcfc7` | `98% tests passed, 18 failed out of 743` | 18 |
+| head `52cecd733` | `98% tests passed, 17 failed out of 743` | 17 |
+
+**`comm` over the two sorted sets finds ZERO tests failing only at the head**,
+so this branch introduces no regression. Seventeen failures are present in BOTH
+legs and are pre-existing on `main` — among them `test_qwen4_exp_runner`,
+`test_qwen4_exp_gguf_weights`, `test_cuda_quant_dot` (a CUDA suite on a build
+with CUDA off), the seven `dflash2_*` suites and `test_ops_residual_rmsnorm`.
+They are NOT diagnosed here and W2 makes no claim about them; they belong to
+their own rows. The eighteenth, `test_ltx2_video`, failed in the BASE leg only
+and passed at the head, which makes it a flake rather than a repair — nothing in
+this branch touches LTX.
+
+**One deviation from the declared gate, recorded rather than quietly
+substituted.** The task asked for a full CPU `ctest`, and the local box has
+16 GiB free on a 447 GiB disk with several sessions building, so a second full
+build there was refused. What ran instead is the full suite on the HIP build in
+the lease, which is a SUPERSET: every CPU test is built and executed, with a
+ROCm backend additionally registered. A CPU-only `ctest` at this head is
+therefore UNRUN, and the base-versus-head pair above is what stands in for it.
+
+**W1's OWN NUMBERS ARE NOT DELETED, they are superseded here and kept in git.**
+Its gate read `51 of 51 cases, 84127 assertions, 0 failed` at `adaa830ef` on the
+base `51c248190`, with write-back `0`, `rmsnorm_group` `0` at both polarities,
+mixer injection `0` and mixer `mixed` `6.98127e-16`. The full W1 record,
+including the two fixtures a fresh review found blind and the margins that
+repaired them, is in D3b above and in the commits `git log --grep
+MODEL-MM-QWEN4-EXP` reaches. The 53-case count here is 51 plus W2's two, and the
+84135-assertion red count is 84127 plus the eight preconditions the two new
+cases assert before they reach the device.
+
+No throughput, latency or memory number is admissible from this row, and W2 took
+none.

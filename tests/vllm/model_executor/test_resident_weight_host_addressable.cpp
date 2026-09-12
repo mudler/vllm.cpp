@@ -971,7 +971,15 @@ TEST_CASE("an ANONYMOUS borrow is never released: MADV_DONTNEED would ZERO it") 
   // those pages. Clear the field and this case is what goes red -- with the
   // wrong bytes, not with a count.
   const PlatformArm arm(false);
-  const size_t nb = static_cast<size_t>(kN * kK) * 2;
+  // BIG ENOUGH TO HAVE INTERIOR PAGES. `DropResidentInteriorPages` madvises
+  // whole pages only, so a 96-byte buffer has nothing to drop and the byte
+  // assertion below would hold whether the discriminator existed or not -- a
+  // tautology wearing the shape of a guarantee. 1 MiB is also over glibc's mmap
+  // threshold, so the block is its own page-aligned anonymous mapping, which is
+  // precisely the memory MADV_DONTNEED zeroes.
+  constexpr int64_t kAnonRows = 512;
+  constexpr int64_t kAnonCols = 1024;
+  const size_t nb = static_cast<size_t>(kAnonRows * kAnonCols) * 2;
   auto* block = new uint8_t[nb];
   for (size_t i = 0; i < nb; ++i) block[i] = static_cast<uint8_t>(i & 0xFF);
   const std::vector<uint8_t> expect(block, block + nb);
@@ -982,8 +990,8 @@ TEST_CASE("an ANONYMOUS borrow is never released: MADV_DONTNEED would ZERO it") 
   OwnedTensor w;
   w.dtype = DType::kBF16;
   w.rank = 2;
-  w.shape[0] = kN;
-  w.shape[1] = kK;
+  w.shape[0] = kAnonRows;
+  w.shape[1] = kAnonCols;
   w.nk = false;
   w.bytes = vllm::OwnedBytes::Borrow(block, nb, std::move(keep));
   // mmap_fd deliberately LEFT AT -1: this is anonymous memory.
@@ -991,9 +999,59 @@ TEST_CASE("an ANONYMOUS borrow is never released: MADV_DONTNEED would ZERO it") 
 
   const vllm::BorrowReleaseStats before = vllm::BorrowReleaseSnapshot();
   Queue q = XpuQueue();
-  (void)vllm::Qwen3_5EmbeddingTable(Fake(), q, w, kN, kK);
+  (void)vllm::Qwen3_5EmbeddingTable(Fake(), q, w, kAnonRows, kAnonCols);
   CHECK(vllm::BorrowReleaseSnapshot().calls == before.calls);
   CHECK(std::memcmp(w.bytes.data(), expect.data(), nb) == 0);
+}
+
+TEST_CASE("a host-addressable device that STAGES anyway still releases nothing") {
+  // THE CASE A SURVIVING MUTATION ASKED FOR, and it is worth saying which one.
+  // Deleting `if (backend.DeviceMemoryIsHostAddressable()) return false;` from
+  // `MaybeReleaseStagedBorrowSource` left every other case in this file green.
+  // The reason is that the obvious host-addressable case never reaches the
+  // helper at all: `ResidentWeight` ALIASES an aligned borrow and returns before
+  // the staging arm. So the guard looked tested and was not.
+  //
+  // It is load-bearing on the path this case takes. A MISALIGNED borrow declines
+  // the alias (`kDeclinedBorrow`) and falls through to staging on a platform
+  // whose kernels CAN read host storage. Releasing there would drop pages the
+  // next kernel reads directly, for no gain: the device copy is not the only
+  // copy that matters when both are the same RAM. Without the guard this case
+  // counts a release; with it, none.
+  const PlatformArm arm(true);  // kernels CAN dereference host storage
+  MappedFile f(1u << 20);
+  REQUIRE(f.ok());
+  f.Prefault();
+  // Offset into the mapping so the borrow is NOT 256-byte aligned. `mmap` always
+  // returns a page boundary, so an unshifted borrow would be aliased in place and
+  // this case would measure the same nothing the aligned one does.
+  const size_t skew = 16;
+  REQUIRE(reinterpret_cast<uintptr_t>(f.data() + skew) % vllm::kDeviceAliasAlignment != 0);
+  const int64_t vocab = 64;
+  const int64_t hidden = ((1 << 20) - 4096) / (64 * 2);
+  const size_t nb = static_cast<size_t>(vocab * hidden) * 2;
+  OwnedTensor w;
+  w.dtype = DType::kBF16;
+  w.rank = 2;
+  w.shape[0] = vocab;
+  w.shape[1] = hidden;
+  w.nk = false;
+  std::shared_ptr<const void> keep(static_cast<const void*>(f.data()),
+                                   [](const void*) {});
+  w.bytes = vllm::OwnedBytes::Borrow(f.data() + skew, nb, std::move(keep));
+  w.mmap_fd = f.fd();  // file-backed, so ONLY the platform guard can refuse it
+
+  const vllm::BorrowReleaseStats before = vllm::BorrowReleaseSnapshot();
+  Queue q = XpuQueue();
+  const Tensor t = vllm::Qwen3_5EmbeddingTable(Fake(), q, w, vocab, hidden);
+
+  // It really did stage: a declined alias is what puts this weight on the arm
+  // the guard sits on. Without this the case could pass by never getting there.
+  REQUIRE(w.d_dev != nullptr);
+  REQUIRE(t.data == w.d_dev.get());
+  CHECK(vllm::BorrowReleaseSnapshot().calls == before.calls);
+  // ...and the host bytes the kernels may still follow are intact and unchanged.
+  CHECK(std::memcmp(w.bytes.data(), t.data, nb) == 0);
 }
 #endif  // __linux__
 

@@ -43,11 +43,18 @@
 #include "vt/rocm/rocm_f16_codec.h"
 #include "vt/rocm/rocm_mmvq_policy.h"
 #include "vt/rocm/rocm_norm_quant_bridge.h"
-#include "vt/rocm/rocm_quant_iq_tables.h"
+#include "vt/rocm/rocm_iq_table_seal.h"
 #include "vt/rocm/rocm_runtime.h"
 
 // Block layouts — the single source of truth (ggml-common.h mirrors).
 #include "vt/cpu/cpu_quant_blocks.h"
+// DotIQ4_NL below reads d_kvalues_iq4nl from this header, generated from the
+// same source the CPU/CUDA tables read (see the header). The device-codebook
+// seal that used to live here moved to rocm_quant_dot.hip, which snapshots
+// the vt::cuda tables its own dots actually index (KERNEL-QUANT-CIQ-GEMM-
+// ROCM-IQUANT, #1940); this file's copy of the IQ2/IQ3 tables has no
+// remaining reader and no seal of its own.
+#include "vt/rocm/rocm_quant_iq_tables.h"
 
 namespace vt::rocm {
 namespace {
@@ -1725,11 +1732,13 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
   if (b.dtype == DType::kQ4_K || b.dtype == DType::kQ5_K || b.dtype == DType::kQ6_K) {
     if (k % kQK_K != 0) throw std::runtime_error("vt rocm: matmul_bt_quant K-quant: K%256!=0");
     const int64_t nsb = k / kQK_K;
-    const size_t w_block_bytes = b.dtype == DType::kQ6_K ? sizeof(BlockQ6_K)
-                                : b.dtype == DType::kQ5_K ? sizeof(BlockQ5_K)
-                                                          : sizeof(BlockQ4_K);
+    const size_t w_block_bytes = b.dtype == DType::kQ6_K    ? sizeof(BlockQ6_K)
+                                : b.dtype == DType::kQ5_K    ? sizeof(BlockQ5_K)
+                                                              : sizeof(BlockQ4_K);
     const size_t w_row_bytes = static_cast<size_t>(nsb) * w_block_bytes;
-    const int fmt = b.dtype == DType::kQ6_K ? 2 : b.dtype == DType::kQ5_K ? 1 : 0;
+    const int fmt = b.dtype == DType::kQ6_K    ? 2
+                  : b.dtype == DType::kQ5_K    ? 1
+                                                : 0;
     const int coop = KQuantDecodeCoopWarps(b.dtype, m, nsb);
     const detail::MmvqRoute mmvq_route = detail::SelectMmvqRoute(
         std::getenv("VT_GEMV_MMVQ"), std::getenv("VT_GEMV_MMVQ_FOLD_MAX"), m,
@@ -1893,8 +1902,8 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
   }
   throw std::runtime_error(
       "vt rocm: internal GDN matmul_bt_quant provider received an unsupported weight dtype "
-      "(GDN-owned: Q8_0/IQ4_NL/Q4_K/Q5_K/Q6_K; wrapper-owned: Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ2_S/IQ1_S/IQ1_XXXS; "
-      "unimplemented: Q4_0/Q5_0/IQ2_XS/IQ3_S/IQ4_XS/MXFP4 -- the ROCm wrapper must delegate only the GDN-owned set)");
+      "(GDN-owned: Q8_0/IQ4_NL/Q4_K/Q5_K/Q6_K; wrapper-owned: Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ2_S/IQ1_S/IQ1_XXXS/IQ4_XS; "
+      "unimplemented: Q4_0/Q5_0/IQ2_XS/IQ3_S/MXFP4 -- the ROCm wrapper must delegate only the GDN-owned set)");
 }
 
 
@@ -1963,16 +1972,18 @@ void MatmulBTQuantGroupedKernelRocmGdn(Queue& q, Tensor& out, const Tensor& act,
     if (k % kQK_K != 0)
       throw std::runtime_error("vt rocm: matmul_bt_quant_grouped K-quant: K must be a multiple of 256");
     const int64_t nsb = k / kQK_K;
-    const size_t w_block_bytes = weight.dtype == DType::kQ4_K ? sizeof(BlockQ4_K)
-                                : weight.dtype == DType::kQ5_K ? sizeof(BlockQ5_K)
-                                                               : sizeof(BlockQ6_K);
+    const size_t w_block_bytes = weight.dtype == DType::kQ4_K    ? sizeof(BlockQ4_K)
+                                : weight.dtype == DType::kQ5_K    ? sizeof(BlockQ5_K)
+                                                                   : sizeof(BlockQ6_K);
     const size_t w_row_bytes = static_cast<size_t>(nsb) * w_block_bytes;
     BlockQ8_K* qact = static_cast<BlockQ8_K*>(EnsureQuantScratch(
         static_cast<size_t>(Pa) * nsb * sizeof(BlockQ8_K), s));
     LaunchQ8KQuantizer(qact, act.data, ActDtOf(act.dtype), act.stride[0], Pa, nsb, s,
                        Q8KProductionRoute::kGrouped, q.device.index);
     const int64_t grid = (P * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
-    const int fmt = weight.dtype == DType::kQ6_K ? 2 : weight.dtype == DType::kQ5_K ? 1 : 0;
+    const int fmt = weight.dtype == DType::kQ6_K    ? 2
+                  : weight.dtype == DType::kQ5_K    ? 1
+                                                     : 0;
     auto launch = [&](auto ot) {
       using OutT = decltype(ot);
       auto* o = static_cast<OutT*>(out.data);
@@ -1987,8 +1998,8 @@ void MatmulBTQuantGroupedKernelRocmGdn(Queue& q, Tensor& out, const Tensor& act,
 
   throw std::runtime_error(
       "vt rocm: internal GDN matmul_bt_quant_grouped provider received an unsupported weight dtype "
-      "(GDN-owned: Q8_0/IQ4_NL/Q4_K/Q5_K/Q6_K; wrapper-owned: Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ2_S/IQ1_S/IQ1_XXXS; "
-      "unimplemented: Q4_0/Q5_0/IQ2_XS/IQ3_S/IQ4_XS/MXFP4 -- the ROCm wrapper must delegate only the GDN-owned set)");
+      "(GDN-owned: Q8_0/IQ4_NL/Q4_K/Q5_K/Q6_K; wrapper-owned: Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ2_S/IQ1_S/IQ1_XXXS/IQ4_XS; "
+      "unimplemented: Q4_0/Q5_0/IQ2_XS/IQ3_S/MXFP4 -- the ROCm wrapper must delegate only the GDN-owned set)");
 }
 
 }  // namespace vt::rocm

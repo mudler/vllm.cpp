@@ -37,6 +37,9 @@
 
 ## News
 
+- **2026-09** **Qwen3.8-27B EXL3 gets a mixed-length serving comparison on GB10.**
+  The [measurement](docs/benchmarks/qwen38-27b-exl3-variadic-gb10.md) covers concurrency 1, 4, and 8.
+  Comparator repetitions remain incomplete, configurations differ, and no correctness gate covers the run.
 - **2026-09** **C ABI 26 exposes more engine controls.** Applications can select the KV cache
   dtype, read speculative acceptance counters, and disable the model-level sliding window.
   See the [C API reference](docs/reference/c-api.md#recent-abi-additions) for defaults and limits.

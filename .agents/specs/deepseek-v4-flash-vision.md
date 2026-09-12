@@ -990,14 +990,43 @@ above as its red-before input.
   the throw now says which tensor and which layer, which is the instrument this
   entry needed and never had.
 
-  **WHAT IS STILL UNMEASURED, and is not guessed here:** the `N` and `K` values,
-  which tensor, and which layer. The throw named none of them by construction,
-  which is why recovering them needs an instrumented device run; the naming
-  commit builds that instrument but does not on its own constitute the
-  measurement. The values land here only when a lease has actually printed them,
-  and until that line exists this entry says UNMEASURED rather than a plausible
-  candidate. It is NOT the aarch64 repack path — the failure is byte-identical
-  with `VT_CPU_QUANT_REPACK=0`.
+  **IT IS NOW MEASURED, and the naming commit was the instrument.** On
+  `thor:gpu0` (sm_110, CUDA 13.0.88, aarch64), rc job
+  `04f39bcb-5636-4043-9cfc-8bdebd4862ec`, `test_deepseek_v4_mm_chat`'s served
+  image reported:
+
+  ```text
+  engine-fatal: EngineCore busy loop threw: vt: deepseek-v4 host GEMM: weight
+  size mismatch: tensor `wq_a` layer 0 want [N=32,K=32] = 1024 elements,
+  got 0 elements
+  ```
+
+  The tensor is `wq_a`, the layer is `0`, and `N=K=32` is the fixture's
+  `q_lora_rank` by `hidden_size`. It is NOT the aarch64 repack path — the failure
+  is byte-identical with `VT_CPU_QUANT_REPACK=0`.
+
+  **`got 0` IS THE FINDING, and it rules the shape hypothesis out.** A wrong
+  shape produces a wrong COUNT; zero means the weight reached NEITHER arm.
+  `DeepseekV4Model::ForwardDevice` built its backend with `gguf=nullptr` and
+  bound only the EXL3 tower, so `ForwardComposeImpl` read
+  `kq_src = be.gguf != nullptr` as false and handed every layer `Lq = nullptr`.
+  Every `Gemm` then fell to the host-float arm — and on a GGUF load the host MLA
+  tower is empty BY DESIGN, which `deepseek_v4_weights.cpp` asserts in as many
+  words (`hl.wq_a.empty() && ...`), because the weight is meant to be consumed
+  keep-quant. Layer 0's `wq_a` is simply the first GEMM the composition performs,
+  which is why the blocker surfaced there rather than somewhere more diagnostic.
+
+  **WHY NO GATE HELD THIS.** The sibling `DeepseekV4Model::Forward` has always
+  dispatched on `has_gguf_weights`; this entry never did, and
+  `git log -S'dev_be.gguf'` finds nothing since `dev_be` arrived in `d7d1ee914`.
+  The registry sends the runner's default `gather_logits` path to
+  `ForwardDevice` unconditionally (`deepseek_v4_registry.cpp:246`), yet no test
+  has ever driven that entry with a GGUF tower: every `ForwardDevice` case under
+  `tests/` belongs to another architecture, and `test_cuda_deepseek_v4.cpp`'s own
+  `ForwardDevice ASSEMBLES` case sets `has_host_weights` with no GGUF tower at
+  all. A CPU build cannot reach it either, because `kDevicePending` refuses
+  first. The unexecuted combination was "device entry + GGUF checkpoint", which
+  is precisely what serving a real checkpoint does.
 
   **THE CROSS-REFERENCES THAT WENT STALE TWICE ARE NOW LINE-FREE.** The comments
   in `deepseek_v4.cpp` and `deepseek_v4_weights.cpp` that quoted this throw cited
@@ -1014,8 +1043,14 @@ above as its red-before input.
   **Giving the fallback arm a named refusal is DONE** (this row's branch, with a
   red-first case in `test_deepseek_v4_forward` that enters through the production
   `DeepseekV4ForwardHost` and asserts the tensor, the layer, both geometries and
-  the actual element count). **Root-causing the mismatch is still owed** by issue
-  #2411 and W7-CUDA, and by the row-owned local issue under
+  the actual element count). **Root-causing it is DONE too, and the repair is
+  committed on this row's branch**: `ForwardDevice` now binds the keep-quant
+  tower when the load took that arm, in the same order `Forward` binds it.
+  **WHAT REMAINS OWED IS THE OUTCOME**, and it is deliberately not asserted from
+  the diagnosis: whether a served image COMPLETES with the tower bound, or stops
+  at a further blocker, is a measurement under a lease. Until that run is
+  recorded here, this entry claims a root cause and a repair, never a working
+  image. Owed by issue #2411 and W7-CUDA, and by the row-owned local issue under
   `.agents/issues/MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm/`. That issue is
   named by DIRECTORY rather than by ID on purpose: a row-owned issue whose stable
   ID appears in a spec's `## Owed` is exactly what

@@ -6949,7 +6949,7 @@ TEST_CASE("qwen4_exp QSA gather attention matches the CPU oracle and is NATIVE o
         // THE READ COUNT IS AN ASSERTION, not a MESSAGE. It is what separates a
         // gather from a dense walk under a mask on the cost axis llama.cpp
         // #27739 measures, and at this context length it is not trivially true:
-        // 49208 against a dense 64440.
+        // 49264 against a dense 64496.
         CHECK(visited == honest_reads);
       }
 
@@ -6973,7 +6973,7 @@ TEST_CASE("qwen4_exp QSA gather attention matches the CPU oracle and is NATIVE o
           if (c == 0) ++untouched;
         }
         // THE PROBE ASSERTS THAT IT HAS SOMETHING TO POISON. With both tokens at
-        // the released budget, 948 of the 3002 cache rows are named by neither
+        // the released budget, 944 of the 3002 cache rows are named by neither
         // selection; at a sub-budget context that number is ZERO and this probe
         // would be vacuous — the same reason the case runs past 2048 at all.
         REQUIRE(untouched > 900);

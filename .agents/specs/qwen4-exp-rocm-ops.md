@@ -740,9 +740,14 @@ REFUSAL.** Each case `REQUIRE`s its ROCm registration before it calls anything,
 so `r1` and `r2` stop there rather than reaching a `GetOp` throw. That the
 throw is what follows on this board is not assumed: W1 MEASURED it, with
 `vt::RmsNormGroup`'s registration neutralised and the kernel left in place, and
-D2 quotes the message the device produced. A guarded case cannot measure the
-refusal twice, and a case that dropped the guard to reach it would be the
-`if (!OpAvailable) continue` shape this file forbids twice in its own comments.
+D2 quotes the message the device produced. Re-measuring it per op adds NOTHING,
+because `GetOp`'s refusal is DEVICE-LEVEL and OP-INDEPENDENT: every dispatch
+site hands the same lookup an `OpId` and `q.device.type`
+(`src/vt/ops.cpp:4738` is one of them), and what it throws when the device
+registers no kernel for that pair does not vary with which op asked. W1
+measured that refusal on this board once. The D2 path is tested where it is
+meaningful, and not re-run per op for a message that would differ only in the
+op's name.
 
 **W3's OWN RECORD IS NOT DELETED, it is superseded here and kept below**, the
 same way W3 kept W2's and W2 kept W1's. Its counts are read against its own

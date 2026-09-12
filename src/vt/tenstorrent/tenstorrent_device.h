@@ -218,6 +218,9 @@ void ResetAllocTraceForTest();
 // observable — the W1 trace proved the decode planes never return to the
 // allocator; this is the red-first probe the reclaim test asserts on.
 int64_t FreeDeviceDramBytesForTest();
+// Total DRAM across banks (capacity, not free) — the platform's probed
+// total for the placement fit (ISSUE-LOCAL-01M2ACXRJYFW7R7BP2ABQS3VY2).
+int64_t DeviceDramTotalBytes();
 #else
 inline int64_t KeepQuantCaptureStagingWrites() { return 0; }
 inline void ResetKeepQuantCaptureStagingWritesForTest() {}
@@ -231,6 +234,7 @@ inline int64_t AllocTraceSnapshotCountForTest() { return 0; }
 inline int64_t AllocTraceMaxDeltaForTest() { return 0; }
 inline void ResetAllocTraceForTest() {}
 inline int64_t FreeDeviceDramBytesForTest() { return 0; }
+inline int64_t DeviceDramTotalBytes() { return 0; }
 #endif
 
 // ITEM 5 (rope): driver-side warm hook — populate the persistent device

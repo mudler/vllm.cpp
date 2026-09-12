@@ -317,15 +317,16 @@ TEST_CASE("ROCm loader admits every format implemented by the quant-dot provider
           GgufResidency::kKeepQuant);
   }
 
-  // These formats have no arm in rocm_quant_dot.hip. Keep them on the named
-  // expansion path instead of handing a discrete queue an unsupported block.
-  // IQ4_NL replaces IQ4_XS here and is the sharper negative of the two: the
-  // pair shares the 16-entry `kValuesIq4nl` codebook, and only IQ4_XS has the
-  // 256-element super-block this provider's Q8_K activation pairs with. An
-  // admission arm that read the codebook instead of the block geometry would
-  // admit both, and this entry is what fails when it does.
-  for (uint32_t ggml_type :
-       {kQ4_0, kIQ2_XS, kIQ4_NL, kMXFP4}) {
+  // These formats have no arm in rocm_quant_dot.hip, so the provider itself
+  // never admits them. IQ4_NL is deliberately NOT in this list: it used to be,
+  // but QUANT-GGUF-IQ4_NL landed after this case did and keeps IQ4_NL on ROCm
+  // through the GDN provider's own dedicated `IQ4NLGemmK` arm instead (Q8_0
+  // activation, 32-element block, not this provider's Q8_K/256-element
+  // shape). `rocm.Route` sees both providers, so it correctly answers
+  // `kKeepQuant` for IQ4_NL now, and asserting `kExpandBf16` here went stale
+  // the moment that row landed -- this loader-level case cannot see which
+  // provider does the keeping, only whether the tensor keeps at all.
+  for (uint32_t ggml_type : {kQ4_0, kIQ2_XS, kMXFP4}) {
     CAPTURE(ggml_type);
     vllm::GgufTensorInfo tensor;
     tensor.name = "blk.0.attn_q.weight";

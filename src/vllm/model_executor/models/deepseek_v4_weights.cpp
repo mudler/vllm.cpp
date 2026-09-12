@@ -75,6 +75,7 @@
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/deepseek_v4_mm.h"  // the official vision name map
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"  // OwnGgufQuantBlocks
 #include "vllm/v1/core/kv_cache_utils.h"  // host_available_memory_bytes
 #include "vt/dtype.h"
@@ -341,10 +342,10 @@ Exl3RankSlice ReadRankSlice(const StIndex& index, const std::string& base, int b
 // refuses a mismatch BY NAME. That is not defensive decoration, and the reason is
 // DIAGNOSTIC rather than numeric. A tensor materialized at the wrong shape does
 // not produce a wrong number: `Gemm`'s host arm is a `MatVec` whose size
-// assertion is unconditional (`deepseek_v4.cpp:413`, a plain `VT_CHECK` and not
+// assertion is unconditional (`deepseek_v4.cpp:504`, a plain `VT_CHECK` and not
 // an `assert`, so it survives `NDEBUG`), and its keep-quant arm checks too. What
 // it produces is an ANONYMOUS throw — `vt: MatVec weight size mismatch at
-// deepseek_v4.cpp:413` — that names neither the tensor, nor the layer, nor the
+// deepseek_v4.cpp:504` — that names neither the tensor, nor the layer, nor the
 // geometry, nor what is missing. Refusing HERE replaces that with a message the
 // reader can act on.
 
@@ -585,6 +586,15 @@ class Exl3CarriedReader {
   // compressor KV projection. Recorded here rather than left for a reader to
   // hunt for the missing slot.
   void Account(const std::string& name) { (void)Take(name); }
+
+  // Is this tensor on the checkpoint at all? Needed for `ffn.gate.bias_vl`,
+  // which the VISION artifact carries on every layer and a TEXT one carries
+  // nowhere -- llama.cpp creates the same tensor `TENSOR_NOT_REQUIRED`
+  // (`src/models/deepseek4.cpp`, PR #28154 at `llama-cpp-dsv4vision`). Every
+  // other carried tensor stays REQUIRED: `Take` throws by name for the ones an
+  // artifact must have, and optionality is opt-in per tensor rather than a
+  // widening of that refusal.
+  bool Has(const std::string& name) const { return index_.count(name) != 0; }
 
   // The stored shape, WITHOUT accounting the tensor. The DSA family's width has
   // to be read before the family can be required to agree with itself, and the
@@ -1231,6 +1241,18 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
       hl.tid2eid = carried.HashTable(f + "gate.tid2eid", {V, topk});
     else
       hl.gate_bias = carried.Float(f + "gate.bias", {ne});
+    // MODEL-MM-deepseek-v4 W3B (#2411): the IMAGE-token routing bias, on EVERY
+    // layer of a DeepSeek-V4-Flash-Vision checkpoint and on no layer of a text
+    // one. It is read OUTSIDE the hash branch on purpose: a text token on a hash
+    // layer routes through `tid2eid` and takes no bias, so the converter emits no
+    // `gate.bias` there, while an image token has no token id to hash and routes
+    // on this bias instead. Reading it inside the `else` would silently drop the
+    // three layers where it is the ONLY routing input an image row has.
+    //
+    // Loading it does NOT make it selected. W4 owns the per-token choice between
+    // the two biases and the hash-layer replacement; see the spec's `## Owed`.
+    if (carried.Has(f + "gate.bias_vl"))
+      hl.gate_bias_vl = carried.Float(f + "gate.bias_vl", {ne});
 
     hl.shared_w1 = carried.Fp8Block(f + "shared_experts.w1", mi, H);
     hl.shared_w2 = carried.Fp8Block(f + "shared_experts.w2", H, mi);
@@ -1293,6 +1315,23 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
     // reader of `DeepseekV4Exl3ResidentBytes`.
     (void)ReportDeepseekV4Exl3Residency(w, l + 1, p.num_hidden_layers,
                                         host_available);
+  }
+
+  // MODEL-MM-deepseek-v4 (#2411): the OFFICIAL vision group on an EXL3-carried
+  // checkpoint. This arm REFUSES any tensor no arm routes, so without this the
+  // 267 vision names would make a vision checkpoint refuse outright rather than
+  // load tower-free. The names come from the same map the materializing reader
+  // uses; `LoadDeepseekV4ForCausalLM` decides whether a tower is built.
+  if (DeepSeekV4ShardsCarryVision(shards)) {
+    for (const std::string& name :
+         DeepSeekV4OfficialVisionExpectedTensors(
+             DeepSeekV4OfficialVisionConfig(config))) {
+      VT_CHECK(index.count(name) != 0,
+               "deepseek-v4 exl3 loader: expected vision tensor missing: " +
+                   name);
+      routed.insert(name);
+      ++accounted;
+    }
   }
 
   // ── totality: every checkpoint tensor is routed or explicitly skipped. ─────
@@ -1417,6 +1456,13 @@ DeepseekV4Weights LoadDeepseekV4ForCausalLMWeights(
       require(f + "gate.tid2eid");
     else
       require(f + "gate.bias");
+    // MODEL-MM-deepseek-v4 W3B (#2411): the vision artifact's image-token
+    // routing bias, on every layer including the hash ones. Conditional because
+    // a TEXT checkpoint carries none, and `require` is a REFUSAL: asking for it
+    // unconditionally would reject every DeepSeek-V4 text checkpoint this arm
+    // already loads. This arm accounts without materializing (see the W2b TODO
+    // below), so the count is the whole obligation it can discharge here.
+    if (have.count(f + "gate.bias_vl") != 0) require(f + "gate.bias_vl");
 
     // Shared expert (FP8-block).
     for (const char* w : {"w1", "w2", "w3"}) {
@@ -1429,6 +1475,26 @@ DeepseekV4Weights LoadDeepseekV4ForCausalLMWeights(
       const std::string ep = f + "experts." + std::to_string(e) + ".";
       for (const char* w : {"w1", "w2", "w3"})
         for (const std::string& suf : expert_suffixes) require(ep + w + suf);
+    }
+  }
+
+  // MODEL-MM-deepseek-v4 (#2411): the OFFICIAL vision group, 267 tensors on the
+  // released artifact. Conditional for the same reason `gate.bias_vl` above is:
+  // a DeepSeek-V4 TEXT checkpoint carries none of them and `require` is a
+  // REFUSAL, so asking unconditionally would reject every text checkpoint this
+  // arm already loads. A checkpoint carrying SOME of the group is not treated as
+  // text -- `DeepSeekV4ShardsCarryVision` keys on the patch embedding, and each
+  // remaining name then refuses by itself.
+  //
+  // Unlike the wave that only COUNTED these, the names enumerated here are the
+  // ones `LoadDeepSeekV4VisionFromSafetensors` actually reads: the accounting
+  // and the materialization share one name map, so a tensor counted here is a
+  // tensor some tower row holds.
+  if (DeepSeekV4ShardsCarryVision(shards)) {
+    for (const std::string& name :
+         DeepSeekV4OfficialVisionExpectedTensors(
+             DeepSeekV4OfficialVisionConfig(config))) {
+      require(name);
     }
   }
 
@@ -1628,6 +1694,43 @@ struct V4GgufCtx {
   // f32 in the file's torch shape.
   OwnedTensor Vec(const std::string& name, GgufTensorRole role) {
     return VecWith(pol, name, role);
+  }
+  // A value tensor whose WIDTH is part of the contract. `Vec` validates the
+  // residency the policy elected and the role it was routed under; it validates
+  // NO geometry, so a `[E-1]` vector published under an unchanged name loads in
+  // silence and is then indexed by expert id — a read past the end of a short
+  // host `std::vector<float>`, not a refusal. That is a live shape here rather
+  // than a hypothetical: a re-quantized artifact keeps its file name, which is
+  // why the porting rule asks for a sha256 beside the repo id. The safetensors
+  // arm already gets this from `carried.Float(..., {ne})`, and the GLM loaders
+  // beside this one already pass their expected width to `LoadVecF32`; this is
+  // the same guarantee for the GGUF arm's two router biases.
+  //
+  // The width is read from the FILE HEADER and refused BEFORE the value is
+  // materialized. Checking it on the loaded tensor instead would dequantize
+  // first and refuse second.
+  //
+  // AN EARLIER VERSION OF THIS COMMENT SAID A DECLARED WIDTH COULD OTHERWISE
+  // TAKE THE MACHINE DOWN. It cannot, and a fresh review was right to ask for
+  // the gate that would prove it. `GgufFile::Open` already bounds every tensor:
+  // `gguf_reader.cpp` refuses a byte size that overflows and then refuses any
+  // span that leaves the data section, so a tensor declaring four billion
+  // elements never reaches this function -- Open refuses the file by name first.
+  // What a materialize-first guard would really cost is the dequantization of a
+  // tensor whose FILE bytes already fit, at most about 4x the bytes on disk for
+  // a Q8_0 vector and 1x for the f32 these two biases actually are. Both router
+  // biases are ALSO checked before the loader is asked to do that work, which is
+  // the reason to keep this ordering. It is a preference for refusing early, not
+  // a bound, and the two NARROW cases in `test_deepseek_v4_mm_loader` gate the
+  // check itself rather than the order in which it runs.
+  OwnedTensor Vec1D(const std::string& name, GgufTensorRole role, int64_t n) {
+    const std::vector<int64_t>& s = g.Get(name).shape;  // throws when missing
+    VT_CHECK(s.size() == 1 && s[0] == n,
+             "deepseek-v4 gguf: " + name + " must be a 1-D [" + std::to_string(n) +
+                 "] vector (n_routed_experts), got rank " +
+                 std::to_string(s.size()) + " first dim " +
+                 std::to_string(s.empty() ? 0 : s[0]));
+    return Vec(name, role);
   }
   // `token_embd.weight`, in BOTH of the roles this model gives it: the GATHER
   // table (`hw.embed`, indexed as a flat host f32 array at deepseek_v4.cpp:1844)
@@ -1944,7 +2047,20 @@ DeepseekV4Weights LoadDeepseekV4FromGguf(const GgufFile& g, const HfConfig& conf
     if (lw.is_hash) {
       lw.tid2eid = ctx.Vec(Blk(l, "ffn_gate_tid2eid.weight"), GgufTensorRole::kVector);
     } else {
-      lw.e_score_bias = ctx.Vec(Blk(l, "exp_probs_b.bias"), GgufTensorRole::kVector);
+      lw.e_score_bias =
+          ctx.Vec1D(Blk(l, "exp_probs_b.bias"), GgufTensorRole::kVector, ne);
+    }
+    // MODEL-MM-deepseek-v4 W3B (#2411): `blk.N.exp_probs_b_vl.bias`, f32 [E], the
+    // bias an IMAGE token routes on. The pinned
+    // `unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF UD-IQ1_S` carries one for every
+    // one of its 43 language layers and nothing else in its first shard; a text
+    // `deepseek4` file carries none, which is why this is OPTIONAL and why the
+    // accounting gate below still passes on both. Outside the hash branch for the
+    // reason the safetensors arm states: on a hash layer this is the only routing
+    // bias an image row has.
+    if (HasGgufTensor(g, Blk(l, "exp_probs_b_vl.bias"))) {
+      lw.e_score_bias_vl =
+          ctx.Vec1D(Blk(l, "exp_probs_b_vl.bias"), GgufTensorRole::kVector, ne);
     }
 
     // DSA compressor (compress_ratio != 0) + Lightning-Indexer (== 4).
@@ -1989,6 +2105,11 @@ DeepseekV4Weights LoadDeepseekV4FromGguf(const GgufFile& g, const HfConfig& conf
     } else {
       hl.gate_bias = HostVec(g, Blk(l, "exp_probs_b.bias"));
     }
+    // The host bridge for the same tensor. It is an [E] vector, so it costs the
+    // same as the text bias beside it and none of the keep-quant memory bound
+    // below applies to it.
+    if (!lw.e_score_bias_vl.Empty())
+      hl.gate_bias_vl = HostVec(g, Blk(l, "exp_probs_b_vl.bias"));
     if (lw.has_compressor) {
       // comp_wgate is keep-quant (in `lw`); only ape/norm are f32 (small V).
       hl.comp_ape = HostVec(g, Blk(l, "attn_compressor_ape.weight"));
@@ -2057,7 +2178,8 @@ int64_t HostBytes(const DeepseekV4HostWeights& hw) {
          vf(hl.wq_b) + vf(hl.wkv) + vf(hl.kv_norm_weight) + vf(hl.attn_sink) +
          vf(hl.wo_a) + vf(hl.wo_b) + vf(hl.idx_wq) + vf(hl.idx_wk) + vf(hl.idx_wproj) +
          vf(hl.comp_wgate) + vf(hl.comp_ape) + vf(hl.comp_norm_weight) +
-         vf(hl.gate_weight) + vf(hl.gate_bias) + vi(hl.tid2eid) + vf(hl.shared_w1) +
+         vf(hl.gate_weight) + vf(hl.gate_bias) + vf(hl.gate_bias_vl) +
+         vi(hl.tid2eid) + vf(hl.shared_w1) +
          vf(hl.shared_w3) + vf(hl.shared_w2) + vf(hl.exp_w1) + vf(hl.exp_w3) +
          vf(hl.exp_w2);
   }
@@ -2076,7 +2198,8 @@ int64_t GgufBytes(const DeepseekV4GgufWeights& gw) {
           &l.kv_a_norm, &l.attn_sink, &l.ffn_norm, &l.hc_attn_base, &l.hc_attn_fn,
           &l.hc_attn_scale, &l.hc_ffn_base, &l.hc_ffn_fn, &l.hc_ffn_scale, &l.moe_gate,
           &l.moe_gate_exps, &l.moe_up_exps, &l.moe_down_exps, &l.shared_gate,
-          &l.shared_up, &l.shared_down, &l.tid2eid, &l.e_score_bias, &l.comp_ape,
+          &l.shared_up, &l.shared_down, &l.tid2eid, &l.e_score_bias,
+          &l.e_score_bias_vl, &l.comp_ape,
           &l.comp_wgate, &l.comp_wkv, &l.comp_norm, &l.idx_wq_b, &l.idx_proj,
           &l.idx_comp_ape, &l.idx_comp_wgate, &l.idx_comp_wkv, &l.idx_comp_norm}) {
       b += OwnedBytesOf(*t);

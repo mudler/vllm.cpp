@@ -58,6 +58,7 @@
 #include <vector>
 
 #include "vllm/config/multimodal.h"
+#include "vllm/transformers_utils/hf_config.h"
 #include "vllm/entrypoints/openai/chat_mm.h"
 #include "vllm/entrypoints/openai/serving_chat.h"
 
@@ -102,6 +103,30 @@ struct MultiModalChatContext {
   // Where `--limit-mm-per-prompt` / `--language-model-only` landed. Borrowed:
   // `BaseProcessingInfo` holds it by reference (context.h:105).
   const vllm::MultiModalConfig* mm_config = nullptr;
+  // The engine's RESOLVED model config, borrowed. This is the half of
+  // upstream's `InputProcessingContext` (registry.py:188-195) that
+  // `config_path` above cannot supply: a `.gguf` checkpoint has NO
+  // `config.json` beside it, and its `vocab_size`, `hidden_size` and the rest
+  // are read out of the file's own metadata by the loader. A factory whose
+  // processor is keyed on a model number -- DeepSeek-V4 spells every image
+  // position `vocab_size + type`, so a wrong one puts the sentinels INSIDE the
+  // vocabulary -- reads it here rather than guessing a default.
+  // Null for a caller that has none; a factory that needs it refuses by name.
+  const vllm::HfConfig* config = nullptr;
+  // The `--mmproj` SECOND FILE the engine was given (`EngineParams::
+  // mmproj_path`), empty when none. It is the only thing at install time that
+  // says whether a two-file vehicle actually arrived with its vision half:
+  // `DeepseekV4ForCausalLM` names both the TEXT checkpoint and the Flash-Vision
+  // one, so the architecture cannot answer it and neither can `config.json`.
+  //
+  // WHY THE ANSWER IS NEEDED HERE AND NOT IN THE ENGINE. A tower-free load
+  // refuses inside `encode_mm`, which runs in the engine's busy loop; throwing
+  // there stops `AsyncLLM` and turns every LATER request, TEXT ONES INCLUDED,
+  // into a 500. That was measured on the dots3-note row before its seam asked
+  // the same question at install (`mm_chat_dots3note.cpp`). Refusing here
+  // installs a REFUSING seam instead: HTTP 400 naming the architecture, text
+  // path untouched.
+  std::string mmproj_path;
 };
 
 // What a factory returns. `chat_fn` OWNS whatever processor state it needs —

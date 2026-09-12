@@ -800,7 +800,9 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/deepseek_v2_weights.cpp
   src/vllm/model_executor/models/deepseek_v2.cpp
   src/vllm/model_executor/models/deepseek_v4_registry.cpp
+  src/vllm/model_executor/models/deepseek_v4_mm.cpp
   src/vllm/model_executor/models/deepseek_v4_weights.cpp
+  src/vllm/model_executor/models/deepseek_v4_vision_weights.cpp
   src/vllm/model_executor/models/deepseek_v4.cpp
   src/vllm/model_executor/models/deepseek_v4_dsa.cpp
   src/vllm/model_executor/models/deepseek_v4_dspark.cpp
@@ -1077,6 +1079,7 @@ add_library(vllm STATIC
   # SAME Qwen3VLVisionWeights from a SECOND GGUF file beside the language one.
   src/vllm/model_executor/models/clip_mmproj_gguf.cpp
   src/vllm/model_executor/models/gemma4_vision.cpp
+  src/vllm/model_executor/models/deepseek_v4_vision.cpp
   src/vllm/model_executor/models/gemma4_audio.cpp
   src/vllm/model_executor/models/whisper_audio.cpp
   src/vllm/model_executor/models/qwen3_vl_text.cpp
@@ -1095,6 +1098,7 @@ add_library(vllm STATIC
   # cubic (dots3-note W6c, #2537).
   src/vllm/multimodal/pil_resize.cpp
   src/vllm/multimodal/qwen3vl_processor.cpp
+  src/vllm/multimodal/deepseek_v4_processor.cpp
   src/vllm/multimodal/audio_processor.cpp
   src/vllm/multimodal/audio_resample.cpp
   # Parakeet / FastConformer audio encoder + CTC head + its log-mel front end
@@ -1259,6 +1263,7 @@ add_library(vllm STATIC
   # registry, and Qwen3-VL's registration into it. The registration TU is
   # SELF-REGISTERING and is reached through vllm's INTERFACE --whole-archive.
   src/vllm/entrypoints/openai/mm_chat_registry.cpp
+  src/vllm/entrypoints/openai/mm_chat_deepseek_v4.cpp
   src/vllm/entrypoints/openai/mm_chat_dots3note.cpp
   src/vllm/entrypoints/openai/mm_chat_qwen3vl.cpp
   src/vllm/entrypoints/openai/serving_utils.cpp

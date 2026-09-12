@@ -224,6 +224,14 @@ struct DeepseekV4LayerHostWeights {
   // MoE router: learned gate + (non-hash) noaux_tc bias OR (hash) tid2eid table.
   std::vector<float> gate_weight;  // [n_routed_experts, H]
   std::vector<float> gate_bias;    // [n_routed_experts]  (non-hash layers)
+  // The VISION routing bias, `layers.N.ffn.gate.bias_vl` on the safetensors
+  // checkpoint and `blk.N.exp_probs_b_vl.bias` in the GGUF. The router adds it
+  // in place of `gate_bias` when the token being routed is an IMAGE token, and
+  // it is present on EVERY layer of a DeepSeek-V4-Flash-Vision artifact -- the
+  // hash layers included, where there is no `gate_bias` at all because a text
+  // token routes through `tid2eid` and takes no bias. Empty on a text
+  // checkpoint, which carries none of these tensors.
+  std::vector<float> gate_bias_vl;  // [n_routed_experts]  (vision artifact only)
   std::vector<int32_t> tid2eid;    // [vocab, num_experts_per_tok] (hash layers)
   // Shared + routed experts (clamped SwiGLU). Routed stored flat over experts.
   HostBf16 shared_w1, shared_w3;            // [moe_inter, H]         (FP8-sourced)
@@ -267,6 +275,10 @@ struct DeepseekV4GgufLayerWeights {
   OwnedTensor moe_gate, moe_gate_exps, moe_up_exps, moe_down_exps;
   OwnedTensor shared_gate, shared_up, shared_down;
   OwnedTensor tid2eid, e_score_bias;
+  // The image-token routing bias (`blk.N.exp_probs_b_vl.bias`, V), on every
+  // layer of a vision artifact and on no layer of a text one. See
+  // `DeepseekV4LayerHostWeights::gate_bias_vl`.
+  OwnedTensor e_score_bias_vl;
   // DSA compressor (compressor layers only) + Lightning-Indexer (indexer layers).
   OwnedTensor comp_ape, comp_wgate, comp_wkv, comp_norm;
   OwnedTensor idx_wq_b, idx_proj;
@@ -647,7 +659,8 @@ std::vector<float> DeepseekV4ForwardHost(
     const DeepseekV4HostWeights& hw, const DeepseekV4Params& p,
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const std::vector<int32_t>& logits_indices = {},
-    V4Miswire miswire = V4Miswire::kNone, V4ForwardTrace* trace = nullptr);
+    V4Miswire miswire = V4Miswire::kNone, V4ForwardTrace* trace = nullptr,
+    const std::vector<float>* inputs_embeds = nullptr);
 
 // W2C — the GGUF keep-quant forward. Runs the SAME composition as
 // DeepseekV4ForwardHost but the big 512-wide MLA linears + the 256 routed/shared
@@ -663,7 +676,8 @@ std::vector<float> DeepseekV4ForwardGguf(
     const DeepseekV4Weights& weights, vt::Queue& queue,
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const std::vector<int32_t>& logits_indices = {},
-    V4Miswire miswire = V4Miswire::kNone, V4ForwardTrace* trace = nullptr);
+    V4Miswire miswire = V4Miswire::kNone, V4ForwardTrace* trace = nullptr,
+    const std::vector<float>* inputs_embeds = nullptr);
 
 // The MLA compressed-latent KV cache for INCREMENTAL decode (ForwardDevice
 // campaign, Stage 1). For the real dense-MLA run (num_key_value_heads=1, no
@@ -777,7 +791,14 @@ std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
                                               // enable the `compress_ratio == 128`
                                               // arm. Null keeps the refusal.
                                               DeepseekV4CompressorState* compressor =
-                                                  nullptr);
+                                                  nullptr,
+                                              // MODEL-MM-deepseek-v4 W4 (#2411):
+                                              // the already-merged [T, H] f32
+                                              // token stream, replacing the
+                                              // embedding lookup. Null on a text
+                                              // step.
+                                              const std::vector<float>*
+                                                  inputs_embeds = nullptr);
 
 // MODEL-DSV4-DSA-COMPOSE W1 (#2286): the paged NON-GGUF forward. The GGUF paged
 // arm binds `gguf`, which forces `dsa_dense` and makes `is_comp` false on every
@@ -789,7 +810,8 @@ std::vector<float> DeepseekV4ForwardExl3Paged(
     std::vector<vt::Tensor>& paged_kv, int64_t kv_base,
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const std::vector<int32_t>& logits_indices = {},
-    DeepseekV4CompressorState* compressor = nullptr);
+    DeepseekV4CompressorState* compressor = nullptr,
+    const std::vector<float>* inputs_embeds = nullptr);
 
 // MODEL-DSV4-PAGED-ENTRY (#2447): the same composition, returning the runner's
 // `ForwardLogits` instead of a flat host vector.
@@ -806,7 +828,14 @@ ForwardLogits DeepseekV4ForwardExl3PagedLogits(
     std::vector<vt::Tensor>& paged_kv, int64_t kv_base,
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const std::vector<int32_t>& logits_indices,
-    DeepseekV4CompressorState* compressor);
+    DeepseekV4CompressorState* compressor,
+    // MODEL-MM-deepseek-v4 W4 (#2411): the ALREADY-MERGED `[num_tokens, hidden]`
+    // row-major f32 token stream, or null on a text step. When present it
+    // REPLACES the embedding lookup: `ModelRegistry::EmbedMm` has already
+    // embedded the ordinary identifiers and scattered the vision rows over the
+    // image span, and the expanded prompt's sentinel identifiers are out of
+    // vocabulary so no lookup could serve them.
+    const std::vector<float>* inputs_embeds = nullptr);
 
 std::vector<float> DeepseekV4ForwardGgufCached(
     const DeepseekV4Weights& weights, vt::Queue& queue, DeepseekV4KvCache& cache,
@@ -843,6 +872,56 @@ void DeepseekV4QHeadRmsNormInplace(std::vector<float>& q, int64_t n_head,
 DeepseekV4Weights LoadDeepseekV4ForCausalLMWeights(
     const std::vector<SafetensorsFile>& shards, const HfConfig& config);
 
+// ── MODEL-MM-deepseek-v4 W4 (#2411): IMAGE-SPAN ATTENTION VISIBILITY ────────
+//
+// `deepseek4.attention.sliding_window` is 128 and one image block is up to 384
+// tokens, so a window applied inside an image span hides more than half of it.
+// The pinned reference lets the tokens of one span attend across the WHOLE span
+// and window-clips only what lies below the span's start.
+//
+// Two upstream statements of the same rule. llama.cpp calls it
+// `swa_full_non_causal` (`llama-hparams.h`, and the `set_input_kq_mask_impl`
+// hunk in `llama-kv-cache.cpp` at `llama-cpp-dsv4vision`): a non-causally
+// decoded batch skips the window mask at and above the span start and applies
+// it normally below. The model author writes the same thing as an index list,
+// `get_window_topk_idxs_visible` (`inference/model.py:289-299`).
+//
+// A TOKEN GATE CANNOT SEE THIS, which is why the two functions below are pure
+// and gated on their INDICES. A 128-token window against a 384-token span is
+// exactly the case where the argmax stays plausible while two thirds of the
+// span is invisible.
+struct DeepseekV4ImageSpan {
+  int64_t begin = 0;  // first GLOBAL position of the span, inclusive
+  int64_t end = 0;    // one past its last GLOBAL position
+};
+
+// The image spans a step carries, read from the step's OWN identifiers.
+//
+// `PrepareDeepSeekV4Inputs` writes `vocab_size + DeepSeekV4ImageTokenType` at
+// every position of an image block, and the block opens with `kImageStart` (0)
+// and closes with `kImageEnd` (4). `base` is the global position of row 0.
+//
+// A block whose start is never closed is REFUSED rather than truncated: the
+// spec requires an image span to fall inside one prefill chunk, and a span cut
+// by a chunk boundary would otherwise be silently half-visible.
+std::vector<DeepseekV4ImageSpan> DeepseekV4ImageSpans(
+    const std::vector<int32_t>& token_ids, int64_t vocab_size, int64_t base = 0);
+
+// The KV rows global position `query` may attend, appended to `out` in
+// ascending order.
+//
+//   * the causal prefix `[lo, query]`, where `lo` is `query - (window - 1)`
+//     when a window applies and 0 when it does not;
+//   * PLUS the whole span containing `query`, when it is inside one -- which is
+//     the only part that is not causal, and the only part a token gate cannot
+//     see.
+//
+// A query OUTSIDE every span takes the ordinary window, including a query after
+// one: llama.cpp exempts the media ubatch, and a later text token is not in it.
+void DeepseekV4VisibleRows(int64_t query, int64_t num_keys, int64_t sliding_window,
+                           const std::vector<DeepseekV4ImageSpan>& spans,
+                           std::vector<int64_t>* out);
+
 // The DeepSeek-V4 forward. STUB (W3-W8): composes the 512-wide MLA block + DSA
 // indexer/compressor + MHC hyper-connections + sqrtsoftplus/hash MoE, none of
 // which are ported yet — both entrypoints VT_CHECK(false, ...) so a forward
@@ -853,13 +932,27 @@ class DeepseekV4Model {
       const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const DeepseekV4Weights& weights,
-      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {});
+      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {},
+    // MODEL-MM-deepseek-v4 W4 (#2411): the ALREADY-MERGED `[num_tokens, hidden]`
+    // row-major f32 token stream, or null on a text step. When present it
+    // REPLACES the embedding lookup: `ModelRegistry::EmbedMm` has already
+    // embedded the ordinary identifiers and scattered the vision rows over the
+    // image span, and the expanded prompt's sentinel identifiers are out of
+    // vocabulary so no lookup could serve them.
+      const std::vector<float>* inputs_embeds = nullptr);
 
   static ForwardLogits ForwardDevice(
       const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
       const v1::CommonAttentionMetadata& attn_meta,
       const std::vector<PagedKvCache>& attn_kv, const DeepseekV4Weights& weights,
-      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {});
+      vt::Queue& queue, const std::vector<int32_t>& logits_indices = {},
+    // MODEL-MM-deepseek-v4 W4 (#2411): the ALREADY-MERGED `[num_tokens, hidden]`
+    // row-major f32 token stream, or null on a text step. When present it
+    // REPLACES the embedding lookup: `ModelRegistry::EmbedMm` has already
+    // embedded the ordinary identifiers and scattered the vision rows over the
+    // image span, and the expanded prompt's sentinel identifiers are out of
+    // vocabulary so no lookup could serve them.
+      const std::vector<float>* inputs_embeds = nullptr);
 };
 
 // ─── MTP (Multi-Token Prediction) self-speculative draft head ────────────────

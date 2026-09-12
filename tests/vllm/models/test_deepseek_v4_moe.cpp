@@ -175,6 +175,104 @@ TEST_CASE("dsv4-moe: HASH route bypasses top-k (tid2eid lookup selects experts)"
   CHECK(rn.topk_weights[1] == doctest::Approx(0.4));
 }
 
+// MODEL-MM-deepseek-v4 W4 (#2411): the VISION routing bias, selected PER TOKEN.
+//
+// THE DECISION, and it is a deliberate divergence. At `llama-cpp-dsv4vision` the
+// selection is per UBATCH -- `const bool is_media = ubatch.embd != nullptr;`,
+// `pr28154.diff` @ `@@ -1275,7 +1280,14 @@` -- and when it is set EVERY layer
+// takes `ffn_exp_probs_b_vl` and the `il < hparams.dsv4_hash_layer_count` branch
+// is skipped WHOLESALE, so `ffn_gate_tid2eid` is never consulted.
+//
+// Per token is chosen, on three grounds:
+//
+//   1. It AGREES with the oracle on every input the oracle can express. A media
+//      ubatch carries no text rows, so "every row is media" and "this row is
+//      media" select identically there.
+//   2. Our step is not a ubatch. This engine batches continuously, and one step
+//      mixes an image request's prefill rows with other requests' decode rows.
+//      A whole-step flag would route another request's TEXT tokens on the vision
+//      bias, which the oracle never does on any batch it can build.
+//   3. The hash question has a per-row answer, and it is the SAME answer the
+//      oracle gives wholesale. A hash layer carries `exp_probs_b_vl` and no
+//      `exp_probs_b`; an image row has no identifier worth hashing, so it takes
+//      the vision bias and the learned route, and a text row in the same step
+//      still hashes. The oracle skips the hash branch for the whole ubatch only
+//      because no text row is there to keep it.
+//
+// THESE ARE SELECTION TESTS, not token tests. Both cases below are built so the
+// vision bias and the text bias choose DIFFERENT experts, and so the hash table
+// names a third set again -- a bias that changed the weights but not the choice
+// would be invisible to a downstream token comparison.
+TEST_CASE("dsv4-moe: the vision bias is selected PER TOKEN, not per step") {
+  // E=4, topk=1. scores = [2, 1, 3, 1.5], so the UNBIASED top-1 is expert 2.
+  const std::vector<float> row = {LogitForSoftplus(4.0), LogitForSoftplus(1.0),
+                                  LogitForSoftplus(9.0), LogitForSoftplus(2.25)};
+  std::vector<float> gating;
+  for (int t = 0; t < 3; ++t) gating.insert(gating.end(), row.begin(), row.end());
+
+  // The text bias hands expert 0 the win; the vision bias hands it to expert 1.
+  // Neither is the unbiased winner, so a router that ignored the bias entirely,
+  // or applied the wrong one, lands on a DIFFERENT expert in each case.
+  const std::vector<float> text_bias = {5.0f, 0.0f, 0.0f, 0.0f};
+  const std::vector<float> vision_bias = {0.0f, 9.0f, 0.0f, 0.0f};
+  // Rows 0 and 2 are text, row 1 is an image row.
+  const std::vector<char> is_media = {0, 1, 0};
+
+  const MoeRouteResult r = SqrtSoftplusRouteTopk(
+      gating, 3, 4, 1, text_bias, /*renorm=*/false, 1.0f, {}, {}, /*vocab=*/4,
+      vision_bias, is_media);
+  REQUIRE(r.topk_ids.size() == 3);
+  CHECK(r.topk_ids[0] == 0);  // text  -> text bias
+  CHECK(r.topk_ids[1] == 1);  // IMAGE -> vision bias
+  CHECK(r.topk_ids[2] == 0);  // text  -> text bias
+  // The WEIGHT still comes from the UNBIASED scores, on both arms.
+  CHECK(r.topk_weights[0] == doctest::Approx(2.0));
+  CHECK(r.topk_weights[1] == doctest::Approx(1.0));
+
+  // An EMPTY mask is every text step, and must be byte-identical to the call
+  // that has no vision bias at all.
+  const MoeRouteResult text_only = SqrtSoftplusRouteTopk(
+      gating, 3, 4, 1, text_bias, false, 1.0f, {}, {}, 4, vision_bias, {});
+  const MoeRouteResult before = SqrtSoftplusRouteTopk(
+      gating, 3, 4, 1, text_bias, false, 1.0f, {}, {}, 4);
+  CHECK(text_only.topk_ids == before.topk_ids);
+  CHECK(text_only.topk_weights == before.topk_weights);
+}
+
+TEST_CASE("dsv4-moe: on a HASH layer an image row leaves the hash route, a text row keeps it") {
+  // vocab=4, E=4, topk=1. The hash table sends every token to expert 3.
+  const std::vector<float> row = {LogitForSoftplus(4.0), LogitForSoftplus(1.0),
+                                  LogitForSoftplus(9.0), LogitForSoftplus(2.25)};
+  std::vector<float> gating;
+  for (int t = 0; t < 2; ++t) gating.insert(gating.end(), row.begin(), row.end());
+  std::vector<int32_t> table(4 * 1, 3);
+  // A hash layer carries NO text bias, which is why the converter drops
+  // `ffn.gate.bias` there. The vision bias is present on every layer.
+  const std::vector<float> vision_bias = {0.0f, 9.0f, 0.0f, 0.0f};
+  const std::vector<int64_t> tokens = {2, 0};
+  const std::vector<char> is_media = {0, 1};
+
+  const MoeRouteResult r = SqrtSoftplusRouteTopk(
+      gating, 2, 4, 1, /*e_score_correction_bias=*/{}, /*renorm=*/false, 1.0f,
+      tokens, table, /*vocab=*/4, vision_bias, is_media);
+  REQUIRE(r.topk_ids.size() == 2);
+  // Row 0 is text: the hash table decides, and it names expert 3 -- which is
+  // neither the unbiased winner (2) nor the vision-biased one (1).
+  CHECK(r.topk_ids[0] == 3);
+  CHECK(r.topk_weights[0] == doctest::Approx(1.5));
+  // Row 1 is an image row: the hash route is REPLACED, and the vision bias
+  // selects expert 1.
+  CHECK(r.topk_ids[1] == 1);
+  CHECK(r.topk_weights[1] == doctest::Approx(1.0));
+
+  // Without the mask the SAME call hashes both rows, which is the behaviour
+  // every text step keeps.
+  const MoeRouteResult text_only = SqrtSoftplusRouteTopk(
+      gating, 2, 4, 1, {}, false, 1.0f, tokens, table, 4, vision_bias, {});
+  CHECK(text_only.topk_ids[0] == 3);
+  CHECK(text_only.topk_ids[1] == 3);
+}
+
 TEST_CASE("dsv4-moe: router f32 == independent f64 reference (randomized top-k + bias)") {
   std::mt19937 rng(0x7A6E);
   std::uniform_real_distribution<float> G(-3.0f, 3.0f);

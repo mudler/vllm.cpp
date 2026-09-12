@@ -355,6 +355,25 @@ std::unique_ptr<LoadedModel> ModelRegistry::Load(const HfConfig& config,
   // function too and where the key is simply absent.
   RefuseUnsupportedFp8BlockQuant(config);
   const ModelFactory& factory = *registration.factory;
+  // MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm W4 (#2411): a projector this
+  // architecture would never open is refused HERE, before any weight byte.
+  //
+  // The failure it stops is silent rather than loud. `--mmproj` names a second
+  // file; a `load_weights` that does not read `ModelSource::mmproj` simply
+  // ignores it, the load succeeds, no tower exists, and the first image request
+  // is answered as text. Sited on the registry rather than in one loader
+  // because the property being checked belongs to the REGISTRATION, so a
+  // per-loader check would have to be written again for every architecture and
+  // would be missing from whichever one is added next.
+  VT_CHECK(source.mmproj == nullptr || factory.consumes_mmproj,
+           std::string("--mmproj: '") + source.mmproj_path +
+               "' was given to architecture '" +
+               std::string(registration.architecture) +
+               "', whose loader reads no multimodal projector. This build "
+               "attaches a projector to the architectures that declare "
+               "`consumes_mmproj`; passing one here would load the language "
+               "model with NO vision tower and answer every image request as "
+               "text");
   factory.parse_config(config);
   std::unique_ptr<LoadedModel> model =
       factory.load_weights(registration, config, source);

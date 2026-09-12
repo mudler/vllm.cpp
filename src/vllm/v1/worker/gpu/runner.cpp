@@ -1876,6 +1876,38 @@ void GPUModelRunner::alloc_recurrent_layer_states(
 std::vector<int32_t> GPUModelRunner::gather_block_table(int group_id,
                                                         int num_reqs,
                                                         int* num_cols) const {
+  // NO SUCH GROUP IS AN EMPTY TABLE, and it used to be an out-of-bounds read.
+  //
+  // `full_attn_group_id_` and `gdn_group_id_` are -1 SENTINELS meaning "this
+  // model published no group of that kind". The GDN call site guards on its
+  // sentinel; the full-attention one does not, and
+  // `MultiGroupBlockTable::operator[]` casts the index to `size_t`, so
+  // `block_tables[-1]` read a `BlockTable` object that does not exist. The
+  // `max_num_blocks_per_req` it produced then decided the step: a garbage 0
+  // gathered an empty table and the request went on to the model, while a
+  // garbage negative made `num_reqs * cols` a ~1.8e19 `size_t` and the engine's
+  // busy loop died with `std::length_error` before any forward ran. Which one
+  // happened moved with the BINARY'S LAYOUT rather than with anything about the
+  // request -- adding one earlier test case to the same suite flipped it -- and
+  // that is issue #3027's `gather_block_table` signature.
+  //
+  // DeepSeek-V4 publishes no `kFullAttention` and no `kMlaAttention` group, so
+  // `full_attn_group_id_` is -1 on EVERY served request for that architecture
+  // and the read above happened on all of them. Whether that group should be
+  // classified as the target attention group is a separate question, owed by
+  // row KV-DSV4-MULTICACHE W3 (#2068); this only makes the sentinel mean what
+  // it says.
+  //
+  // `MakeCommonAttentionMetadata` already tolerates the same sentinel one line
+  // later -- its `group < slot_mapping.size()` is false for -1, so the group's
+  // slot mapping is left empty -- so an empty table is what the rest of the
+  // step is already written against. BYTE-NEUTRAL for every model that
+  // publishes a full-attention group, which is every model shipping today.
+  if (group_id < 0 || static_cast<size_t>(group_id) >=
+                          input_batch_.block_table.block_tables.size()) {
+    *num_cols = 0;
+    return {};
+  }
   const BlockTable& bt = input_batch_.block_table[group_id];
   const int cols = bt.max_num_blocks_per_req;
   *num_cols = cols;

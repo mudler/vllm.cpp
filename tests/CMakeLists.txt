@@ -863,6 +863,26 @@ vllm_cpp_add_test(test_deepseek_v4_dspark_entry vllm/models/test_deepseek_v4_dsp
 vllm_cpp_add_test(test_deepseek_v4_exl3_loader vllm/models/test_deepseek_v4_exl3_loader.cpp)
 target_include_directories(test_deepseek_v4_exl3_loader PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# MODEL-MM-deepseek-v4 W3B (#2411) — `exp_probs_b_vl`, the per-layer MoE routing
+# bias DeepSeek-V4-Flash-Vision adds for image tokens. Drives BOTH weight arms
+# (the `deepseek4` GGUF and the safetensors loader) over hermetic fixtures that
+# carry the tensor on every layer, and pins the text checkpoint's inertness when
+# it is absent. See .agents/specs/deepseek-v4-flash-vision.md.
+vllm_cpp_add_test(test_deepseek_v4_mm_loader vllm/models/test_deepseek_v4_mm_loader.cpp)
+# MODEL-MM-deepseek-v4 (#2411): the pinned OFFICIAL artifact's own metadata,
+# committed verbatim. `config.json` is the released file; the two manifests are
+# derived from it and from shard 1's safetensors HEADER by
+# `scripts/check-deepseek-v4-vision-manifests.py`, which reads two HTTP ranges
+# and never a weight payload. They are what ties this tree's derived tensor map
+# to the 156.287 GiB checkpoint nobody here can stage, so the loader gate can
+# ask a real question about an artifact it cannot open.
+target_compile_definitions(test_deepseek_v4_mm_loader PRIVATE
+  DEEPSEEK_V4_VISION_CONFIG="${CMAKE_SOURCE_DIR}/tests/parity/goldens/deepseek_v4_vision/config.json"
+  DEEPSEEK_V4_VISION_INDEX_MANIFEST="${CMAKE_SOURCE_DIR}/tests/parity/goldens/deepseek_v4_vision/index_manifest.json"
+  DEEPSEEK_V4_VISION_HEADER_MANIFEST="${CMAKE_SOURCE_DIR}/tests/parity/goldens/deepseek_v4_vision/shard1_header_manifest.json")
+target_include_directories(test_deepseek_v4_mm_loader PRIVATE
+                           ${CMAKE_CURRENT_SOURCE_DIR}/vllm ${CMAKE_SOURCE_DIR}/src)
+
 vllm_cpp_add_test(test_deepseek_v4_exl3_device_residency
                   vllm/models/test_deepseek_v4_exl3_device_residency.cpp)
 target_include_directories(test_deepseek_v4_exl3_device_residency
@@ -1612,6 +1632,31 @@ vllm_cpp_add_test(test_kv_offload_connector vllm/v1/test_kv_offload_connector.cp
 vllm_cpp_add_test(test_lmcache_codec vllm/v1/kv_offload/lmcache/test_lmcache_codec.cpp)
 target_compile_definitions(test_lmcache_codec PRIVATE
   TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
+# DeepSeek-V4 Vision W1: pinned prompt encoding and image preprocessing.
+vllm_cpp_add_test(test_deepseek_v4_encoding
+                  vllm/multimodal/test_deepseek_v4_encoding.cpp)
+vllm_cpp_add_test(test_deepseek_v4_image_processor
+                  vllm/multimodal/test_deepseek_v4_image_processor.cpp)
+# DeepSeek-V4 Vision W2: pinned reduced-shape ViT and aligner stage parity.
+vllm_cpp_add_test(test_deepseek_v4_vision
+                  vllm/models/test_deepseek_v4_vision.cpp)
+target_compile_definitions(test_deepseek_v4_vision PRIVATE
+  DEEPSEEK_V4_VISION_GOLDEN="${CMAKE_SOURCE_DIR}/tests/parity/goldens/deepseek_v4_vision/goldens.json")
+# DeepSeek-V4 Vision W3A: the `deepseek4v` arm of the `clip` mmproj reader. It
+# gates the four layout mismatches between what `mmproj-BF16.gguf` stores and
+# what the W2 tower consumes, and every one of them is a silent wrong answer
+# rather than a crash. It proves nothing about reachability: W4 owns the
+# production call site.
+vllm_cpp_add_test(test_deepseek_v4_mmproj
+                  vllm/models/test_deepseek_v4_mmproj.cpp)
+target_include_directories(test_deepseek_v4_mmproj PRIVATE
+                           ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+
+vllm_cpp_add_test(test_deepseek_v4_mm_reach
+                  vllm/models/test_deepseek_v4_mm_reach.cpp)
+target_include_directories(test_deepseek_v4_mm_reach PRIVATE
+                           ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models
+                           ${CMAKE_CURRENT_SOURCE_DIR}/vllm)
 # Multimodal M1 processor-parity gate: C++ Qwen3-VL image pipeline
 # (pixel_values/grid/mm-hash/placeholder-expansion) BIT-identical to the vLLM
 # 0.25.0 oracle fixture (tests/vllm/multimodal/fixtures/qwen3vl).
@@ -2456,6 +2501,17 @@ if(VLLM_CPP_SERVER)
   # added tokens are dots3-note's own image markers).
   vllm_cpp_add_test(test_openai_api_server_dots3_mm_forward
     vllm/entrypoints/openai/test_api_server_dots3_mm_forward.cpp)
+  # MODEL-MM-deepseek-v4 W5 (#2411): the REQUEST path for the third multimodal
+  # architecture. Its own target for the reason the two above have one: a
+  # different tokenizer fixture (one whose added tokens are the pinned DeepSeek
+  # chat template's markers and the `<|deepseek_image|>` placeholder) and a
+  # different processor.
+  vllm_cpp_add_test(test_deepseek_v4_mm_chat
+    vllm/entrypoints/openai/test_deepseek_v4_mm_chat.cpp)
+  # The language and projector GGUF fixtures live beside the model gates, and
+  # they are shared with the W3B/W4 suites so the artifact is described once.
+  target_include_directories(test_deepseek_v4_mm_chat PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/vllm ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
   target_compile_definitions(test_openai_api_server_dots3_mm_forward PRIVATE
     DOTS3_NOTE_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/dots3_note_prev")
   # The tiny-checkpoint fixture header lives beside the model gates, and
@@ -2555,6 +2611,16 @@ if(VLLM_CPP_SERVER)
   vllm_cpp_add_test(test_serve_kv_cache_dtype
     vllm/entrypoints/openai/test_serve_kv_cache_dtype.cpp)
   target_include_directories(test_serve_kv_cache_dtype PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  # MODEL-MM-deepseek-v4 W5 (#2411): --mmproj and the resolved model config
+  # reaching the multimodal chat install through the REAL VllmServerMain. Same
+  # shape and the same reason as the two rows above; it also needs the GGUF
+  # fixtures beside the model gates, because the two lines it holds are only
+  # observable on a checkpoint whose architecture declares multimodal support.
+  vllm_cpp_add_test(test_serve_deepseek_v4_mm
+    vllm/entrypoints/openai/test_serve_deepseek_v4_mm.cpp)
+  target_include_directories(test_serve_deepseek_v4_mm PRIVATE
+    ${CMAKE_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/vllm
+    ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 endif()
 vllm_cpp_add_test(test_outputs vllm/test_outputs.cpp)
 

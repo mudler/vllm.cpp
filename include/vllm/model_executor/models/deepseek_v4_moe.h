@@ -137,13 +137,40 @@ struct MoeRouteResult {
   std::vector<int32_t> topk_ids;      // [M*topk] row-major
   std::vector<float> topk_weights;    // [M*topk] row-major
 };
+//
+// ── MODEL-MM-deepseek-v4 W4 (#2411): THE VISION ROUTING BIAS, PER TOKEN ──────
+//
+// A DeepSeek-V4-Flash-Vision checkpoint carries a SECOND router bias,
+// `exp_probs_b_vl` (`layers.N.ffn.gate.bias_vl` in safetensors), on every one of
+// its 43 language layers, hash layers included. It is the bias the router adds
+// when the token being routed is an IMAGE token, in place of the text bias --
+// and on a hash layer it replaces the `tid2eid` routing itself, because an image
+// token has no meaningful identifier to hash. A text checkpoint carries none of
+// these tensors and `vision_bias` is then empty, which is byte-identical.
+//
+// PER TOKEN, and the divergence from the oracle is deliberate. At
+// `llama-cpp-dsv4vision` the selection is PER UBATCH -- `const bool is_media =
+// ubatch.embd != nullptr;` -- and when it is set every layer takes
+// `ffn_exp_probs_b_vl` and the hash branch is skipped WHOLESALE. That is
+// indistinguishable from the per-token rule on every input llama.cpp can build,
+// because a media ubatch carries no text rows. It is NOT indistinguishable here:
+// this engine batches continuously, one step mixes an image request's prefill
+// rows with other requests' decode rows, and applying a whole-step flag would
+// route another request's TEXT tokens on the vision bias, which the oracle never
+// does. So the per-token rule reduces to the oracle's on the oracle's own
+// inputs and is defined on the inputs the oracle cannot express.
+//
+// `is_media_token` is `[num_tokens]`, non-zero for an image row. Empty means no
+// row is one, which is every text step.
 MoeRouteResult SqrtSoftplusRouteTopk(const std::vector<float>& gating, int64_t num_tokens,
                                      int64_t num_experts, int64_t topk,
                                      const std::vector<float>& e_score_correction_bias,
                                      bool renormalize, float routed_scaling_factor,
                                      const std::vector<int64_t>& input_tokens,
                                      const std::vector<int32_t>& hash_indices_table,
-                                     int64_t vocab_size);
+                                     int64_t vocab_size,
+                                     const std::vector<float>& vision_bias = {},
+                                     const std::vector<char>& is_media_token = {});
 
 // ── (3) clamped SwiGLU expert activation ──────────────────────────────────────
 //

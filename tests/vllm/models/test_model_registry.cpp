@@ -309,6 +309,18 @@ TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo")
       CHECK_FALSE(registration.info.supports_multimodal);
     } else if (registration.architecture == "Qwen3VLForConditionalGeneration" ||
                registration.architecture == "Dots3NoteForCausalLM" ||
+               // MODEL-MM-deepseek-v4 W4 (#2411): `DeepseekV4ForCausalLM` names
+               // BOTH the DeepSeek-V4 text checkpoint and the Flash-Vision one,
+               // so the architecture cannot advertise this conditionally. It
+               // joins this branch on the same terms as `Dots3NoteForCausalLM`
+               // -- `kDeepseekV4Factory` carries `encode_mm` and `embed_mm`, so
+               // a `deepseek4v` projector reaches the model forward -- and it
+               // is NOT hybrid for the same reason: its MLA layers page one
+               // cache and the sliding half is a window on it, not a recurrent
+               // state. What keeps a TEXT checkpoint inert is
+               // `DeepseekV4LoadedModel::has_vision()` being false, which is a
+               // fact about a LOAD and not about a registration.
+               registration.architecture == "DeepseekV4ForCausalLM" ||
                registration.architecture == "Gemma4ForConditionalGeneration" ||
                registration.architecture ==
                    "Gemma4UnifiedForConditionalGeneration" ||

@@ -775,17 +775,25 @@ TEST_CASE("stage-vs-retag: a model larger than the whole box REFUSES without wra
 #if defined(__linux__)
 namespace {
 
-// `VmRSS` in KiB, the figure the KFD's resident-system-memory accounting is
-// about. Returns 0 when it cannot be read, which a case treats as "cannot
-// measure" rather than as a pass.
-size_t VmRssKib() {
+// `RssFile` in KiB: the FILE-backed half of this process's resident set, which
+// is exactly what a GGUF mapping contributes and what the KFD's
+// resident-system-memory accounting walks.
+//
+// `VmRSS` WOULD NOT WORK HERE, and the reason is worth stating because the
+// wrong one reads as the obviously correct one. The staging branch allocates and
+// fills a device buffer of the SAME size as the weight, which on this fake
+// backend is a `malloc` and is ANONYMOUS residency. Total RSS therefore ends
+// roughly where it started: the source went and an equal-sized copy arrived, and
+// a case watching `VmRSS` would measure the difference of two large numbers and
+// call it zero. Splitting the two makes the assertion say what it means.
+size_t RssFileKib() {
   std::FILE* f = std::fopen("/proc/self/status", "r");
   if (f == nullptr) return 0;
   char line[256];
   size_t kib = 0;
   while (std::fgets(line, sizeof(line), f) != nullptr) {
-    if (std::strncmp(line, "VmRSS:", 6) == 0) {
-      kib = static_cast<size_t>(std::strtoull(line + 6, nullptr, 10));
+    if (std::strncmp(line, "RssFile:", 8) == 0) {
+      kib = static_cast<size_t>(std::strtoull(line + 8, nullptr, 10));
       break;
     }
   }
@@ -872,7 +880,7 @@ TEST_CASE("a STAGED borrow's source pages are released, and the RSS says so") {
   REQUIRE(f.ok());
   f.Prefault();
 
-  const size_t rss_resident = VmRssKib();
+  const size_t rss_resident = RssFileKib();
   REQUIRE(rss_resident > 0);  // unreadable /proc is "cannot measure", not a pass
 
   const OwnedTensor w = BorrowWeight(f, kBigVocab, kBigHidden);
@@ -896,7 +904,7 @@ TEST_CASE("a STAGED borrow's source pages are released, and the RSS says so") {
   // span rather than all of it, because the staging copy itself allocated 64 MiB
   // of device (here: malloc'd) memory that is also resident and is supposed to
   // stay: what is asserted is that the SOURCE went, against that background.
-  const size_t rss_after = VmRssKib();
+  const size_t rss_after = RssFileKib();
   CHECK(rss_resident > rss_after);
   CHECK(rss_resident - rss_after >= (f.size() / 2) / 1024);
 

@@ -4236,6 +4236,8 @@ TEST_CASE("fused MoE gate+up+SwiGLU grouped GEMM matches the CPU oracle and is N
       }
     }
   }
+}
+
 // ─── KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT (#1940): the risk this row's spec ────
 // named -- CUDA needed __fmul_rn/__fadd_rn in DotIQ4XS to stay bit-exact
 // against the oracle, because nvcc's default -fmad=true silently contracted

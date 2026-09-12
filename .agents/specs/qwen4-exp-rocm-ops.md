@@ -20,7 +20,7 @@
 | Tests to port | vLLM has no C++ test to port. The gate is INHERITED and must not be re-authored: `tests/vt/test_backend_cross_device.cpp` already holds any registered backend to NMSE <= 5e-4 against the CPU oracle, and the sibling cases REQUIRE-prove registration rather than skipping. Each op gains a case there in that shape. The existing `tests/vllm/models/test_qwen4_exp_*_device.cpp` suites are the per-op golden surface. |
 | Gates | G1 per-op cross-device NMSE on `strix:gpu0`. G2 the model LOADS and the forward completes on ROCm with `VT_OP_PROVIDER_STATS=1` showing ZERO reference-tier hits — see D2, on this board a hit is impossible, so a non-zero count means the tier was somehow installed and the run is void. G3 first tokens. G4 token-exactness against an oracle — see `## Owed`, not this row. **No throughput, latency or memory number is admissible until G4.** |
 | Dependencies | The IQ4_NL ROCm GEMM (`QUANT-GGUF-IQ4_NL`, PR #3149) for the `ffn_down_exps`, and #3097's ROCm gather for the n-gram table — BOTH have landed and are in this branch's base: the gather in #3097, the GEMM at `18e2a8c9a` on `origin/main`. Hardware: `strix:gpu0`, the only AMD fleet device, reachable ONLY through an `rc` lease. No CI lane has an AMD runner, so a green CI is not evidence for any arm here. |
-| Work breakdown | `W0` this spec (LANDED) -> `W1` (LANDED) the two elementwise-shaped ops (`kQwen4ExpGatedResidual`, `kQwen4ExpGatedResidualWriteBack`) plus `kRmsNormGroup`, which are the cheapest and prove the file and registration shape -> `W2` (LANDED) `kIndexSelect`/`kIndexCopy`, the two GENERIC row gather/scatter helpers, which is why D3c records that D3's tie-break has nothing to arbitrate for them -> `W3` the PLE pair -> `W4` the QSA pair, the hardest, and the one where vLLM's `amd/ops/qsa.py` is the reference rather than the CUDA arm -> `W5` first load and forward on `strix:gpu0` -> `W6` first tokens. Each wave lands with its cross-device case; no wave lands unreached. |
+| Work breakdown | `W0` this spec (LANDED) -> `W1` (LANDED) the two elementwise-shaped ops (`kQwen4ExpGatedResidual`, `kQwen4ExpGatedResidualWriteBack`) plus `kRmsNormGroup`, which are the cheapest and prove the file and registration shape -> `W2` (LANDED) `kIndexSelect`/`kIndexCopy`, the two GENERIC row gather/scatter helpers, which is why D3c records that D3's tie-break has nothing to arbitrate for them -> `W3` (LANDED) the PLE pair (`kQwen4ExpPleConv`, `kQwen4ExpPleGate`), where vLLM's AMD backend DOES define both behaviours and D3d records what the comparison found -> `W4` the QSA pair, the hardest, and the one where vLLM's `amd/ops/qsa.py` is the reference rather than the CUDA arm -> `W5` first load and forward on `strix:gpu0` -> `W6` first tokens. Each wave lands with its cross-device case; no wave lands unreached. |
 | Risks/decisions | R1 a missing op HARD-REFUSES on this board rather than degrading (D2), so a partial port is not a slow model, it is the same refusal with a different name. R2 wave size: nine ops in one pull request would be unreviewable, and the waves above exist to keep each reviewable. R3 the QSA pair is a gather consumer and not a mask, so a fixture under 2048 tokens of context cannot distinguish a correct port from one attending pooled keys — that bound is stated in `.agents/specs/qwen4-exp-flash-next.md` and applies here. R4 `strix:gpu0` is a single shared device and every gate here needs it. R5 no AMD runner in CI. |
 
 ## D1. Why this row exists now rather than later
@@ -269,6 +269,83 @@ BYTE EQUALITY against the CPU oracle instead of an NMSE band. The NMSE is still
 printed beside it, because it is the statistic this spec quotes mutation margins
 in and a byte comparison cannot say how far a broken arm landed.
 
+## D3d. W3's mirror: vLLM's AMD PLE layer is PYTORCH, not Triton
+
+D3 makes vLLM's AMD backend the mirror wherever it defines behaviour, and D3c
+records the opposite case, an op it does not define at all. **W3's pair is the
+third shape: vLLM DOES define both behaviours, and it defines them in PyTorch.**
+That is worth recording because the W3 dispatch asserted otherwise — it said
+`amd/ple_layer.py` "carries 4 `@triton.jit` kernels for this component" — and a
+reader who took that on trust would go looking for kernels that are not there.
+MEASURED at the pin `e126687a9a`, with `git show <pin>:<path> | grep -c
+'triton.jit'`: `amd/ops/hc.py` = 5, `amd/ops/qsa.py` = 6, **`amd/ple_layer.py`
+= 0**. The four methods the claim most likely counted are
+`_short_conv_dilated_{decode,prefill,spec}_batched` and
+`_short_conv_dilated_dispatch`, which are plain `torch` bodies. The AMD backend's
+divergence from `nvidia/` in this file is not a kernel rewrite at all: measured,
+185 changed lines, chiefly the FP8 PLE-embedding quant method, the
+`compute_ngram_ids` custom-op split, a dequantize hook and the n-gram workspace
+slicing — **none of which touches either of W3's two ops**, whose bodies are
+byte-identical between `amd/` and `nvidia/`.
+
+**THE ALGORITHMS AGREE, so D3's "where they agree, port ours" applies and both
+ROCm arms are transcriptions of `cuda_qwen4_exp_ple.cu`.** Read against
+`amd/ple_layer.py`:
+
+- The conv is `F.conv1d(history, conv_weights.unsqueeze(1), groups=C,
+  dilation=self.short_conv_dilation)` followed by `F.silu`, over
+  `history = cat(initial_state, x)` with `initial_state` the cached
+  `conv_state_len = (conv_kernel_size - 1) * short_conv_dilation` columns, and
+  the write-back is `next_state = history[..., -self.conv_state_len:]`. That is
+  this tree's op tap for tap, including that the ring stores the RAW input and
+  not the activation, and that a chunk shorter than the window keeps the tail of
+  the old state ahead of it.
+- The gate is
+  `gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())` then
+  `gated_value = gate * value.unsqueeze(-2)`, with
+  `/ math.sqrt(self.hidden_size)` applied to the dot on the line above — which
+  is exactly what `Qwen4ExpPleGateArgs::gate_divisor` holds and why it is held
+  as the divisor rather than its reciprocal. Clamp before the root, sign after
+  it, sigmoid outside, `value` broadcast across the hc axis.
+
+Four differences exist and NONE of them is an algorithm difference:
+
+1. **The null-slot remap.** vLLM's `_short_conv_dilated_decode_batched` remaps a
+   `NULL_BLOCK_ID` state index to slot 0 for a safe gather, ZEROES that row's
+   output, and preserves the slot's prior contents on write-back — the padded
+   rows a FULL cudagraph decode carries. `vt::Qwen4ExpPleConv` has no null-slot
+   concept: its wrapper requires every `conv_state_indices` entry to be in
+   range, and a padded row is expressed as an EMPTY SEGMENT, which both arms
+   early-out on as an identity. This is a caller-side convention, not
+   arithmetic, and nothing in this tree emits `NULL_BLOCK_ID` for this op today.
+   OWED to whichever wave gives ROCm a full-cudagraph padded decode.
+2. **The four-tap accumulation width.** vLLM's AMD conv runs `F.conv1d` at the
+   ACTIVATION dtype — it casts `conv_weights.to(dtype=inputs.dtype)` and
+   `state.to(x_d.dtype)` first — so its taps accumulate at the model dtype. Our
+   CPU oracle accumulates in **double**, to match the W2 host reference term for
+   term at the model's 10240-channel width; the CUDA arm inherited that and this
+   ROCm arm inherits it again. **Ours is kept**, for D3a §1's reason: the CPU arm
+   is the only oracle that can fail this arm, G1 is NMSE against it, and adopting
+   the narrower width would move the ROCm arm away from that oracle while
+   matching a lowering choice rather than a behaviour. **No model-path BUFFER is
+   widened by this** — `x`, `weight`, `out` and the ring are all read and written
+   at the caller's dtype through the same tagged accessors — so this is not the
+   "dtype that is too wide" AGENTS.md names; the double lives in four registers
+   and dies there. gfx1151 runs fp64 at a reduced rate, and a same-width f32
+   variant is a SPEED item for a later wave. No throughput number is admissible
+   from this row in any case, so there is nothing to trade the width against yet.
+3. **`has_initial_states`.** vLLM zeroes the gathered state for a request whose
+   flag is false. `vt::Qwen4ExpPleConv` has no such operand, deliberately: a
+   ZEROED cache row IS the first call's left zero pad, so the obligation is the
+   caller's and the kernel needs no branch. Recorded because it is the most
+   plausible thing for a reader to mistake for a missing feature. This and the
+   null-slot remap are the same kind of difference — vLLM does inside the kernel
+   what this tree's op contract puts outside it.
+4. **The capture fallback.** `_short_conv_fallback` runs the conv for profiling
+   and cudagraph capture WITHOUT updating the state. This tree has no such mode
+   at the op; whether a call updates the ring is the caller's business. Recorded
+   so a reader who finds the method does not look for its arm here.
+
 ## Tests
 
 Red first, per op, each failing for the intended reason before the arm exists:
@@ -302,22 +379,22 @@ Red first, per op, each failing for the intended reason before the arm exists:
 
 ## Owed
 
-- **W1 AND W2 LAND UNREACHED, and this bullet is the record AGENTS.md "Nothing
-  lands dead" requires.** The five arms `kQwen4ExpGatedResidual`,
+- **W1, W2 AND W3 LAND UNREACHED, and this bullet is the record AGENTS.md
+  "Nothing lands dead" requires.** The seven arms `kQwen4ExpGatedResidual`,
   `kQwen4ExpGatedResidualWriteBack`, `kRmsNormGroup` (W1), `kIndexSelect` and
-  `kIndexCopy` (W2) are registered on ROCm and are reached by NO production
-  entry point on that device. The weights load since #3097, but
-  `ModelRegistry::Forward` cannot complete a `qwen4_exp` step on `rocm`: it
-  throws at the first of the FOUR arms that are still missing
-  (`kQwen4ExpPleConv`, `kQwen4ExpPleGate`, `kQwen4ExpQsaCompress`,
+  `kIndexCopy` (W2), `kQwen4ExpPleConv` and `kQwen4ExpPleGate` (W3) are
+  registered on ROCm and are reached by NO production entry point on that
+  device. The weights load since #3097, but `ModelRegistry::Forward` cannot
+  complete a `qwen4_exp` step on `rocm`: it throws at the first of the TWO arms
+  that are still missing (`kQwen4ExpQsaCompress`,
   `kQwen4ExpQsaGatherAttention`). Their only caller today is the cross-device
   suite. **The row that owns the wiring is `MODEL-MM-QWEN4-EXP`, this row,
-  through waves W3 and W4**; the issue that tracks it is this row's own, named
-  in the commit and pull request bodies rather than here, because a row-owned
-  issue is not an owed reference. D2 is why the slice is staged rather than held
-  back: on a board with no reference tier a partial port refuses by name, so
-  there is no half-working forward to ship and no way to reach these five from
-  production until the fourth of the remaining arms lands.
+  through wave W4**; the issue that tracks it is this row's own, named in the
+  commit and pull request bodies rather than here, because a row-owned issue is
+  not an owed reference. D2 is why the slice is staged rather than held back: on
+  a board with no reference tier a partial port refuses by name, so there is no
+  half-working forward to ship and no way to reach these seven from production
+  until the second of the remaining arms lands.
 
   **W2's two arms are the one part of this slice that is NOT qwen4_exp-only**,
   and the scope of what that buys is deliberately NOT asserted here.
@@ -329,8 +406,11 @@ Red first, per op, each failing for the intended reason before the arm exists:
   any of those reaches a ROCm device today is UNMEASURED by this row and no
   claim is made either way: this row gates the two arms against the CPU oracle
   and nothing else. What IS established is the `qwen4_exp` half — the forward
-  still refuses on ROCm at the four missing arms above, so W2 adds no reachable
-  qwen4_exp capability.
+  still refuses on ROCm at the two missing arms above, so neither W2 nor W3 adds
+  a reachable qwen4_exp capability. **W3's two arms, unlike W2's, are
+  `qwen4_exp`-only**: `grep -rn 'Qwen4ExpPleConv\|Qwen4ExpPleGate' src/` reaches
+  `models/qwen4_exp_ple_block.cpp` and nothing else, so there is no second consumer
+  whose reachability would have to be measured separately.
 - **The remaining `CAPTURE(DeviceName(dt))` sites in
   `tests/vt/test_backend_cross_device.cpp`**, tracked by
   `ISSUE-LOCAL-01M2A7P3C95W3PBAVT9SC6KKY5`. doctest stringifies a `const char*`
@@ -379,6 +459,28 @@ Red first, per op, each failing for the intended reason before the arm exists:
   RESOLVED 2026-09-12: it landed at `18e2a8c9a` and is in this branch's base.
 
 ## Now
+
+`ACTIVE`, 2026-09-12. **W3 lands the PLE pair**, `kQwen4ExpPleConv` and
+`kQwen4ExpPleGate`, in `src/vt/rocm/rocm_qwen4_exp_ple.hip`, each with a
+cross-device case that REQUIRE-proves its ROCm registration. With W1's three and
+W2's two that is SEVEN landed and TWO owed — the QSA pair (W4) — and the forward
+still refuses on ROCm, because a partial port buys nothing runnable on a board
+with no reference tier (D2). Next action is W4, the QSA pair, and it is the hard
+one: `amd/ops/qsa.py` is its reference rather than the CUDA arm.
+
+**vLLM's AMD backend DOES define both of these behaviours, and it defines them
+in PYTORCH rather than Triton** — `amd/ple_layer.py` carries zero `@triton.jit`
+kernels, against 5 in `amd/ops/hc.py` and 6 in `amd/ops/qsa.py`. D3d records the
+comparison, the four non-algorithmic differences it found, and why the
+double-width four-tap accumulator is kept rather than narrowed to vLLM's
+activation dtype.
+
+W3's measured numbers are recorded below when the gate runs; until then no
+number in this section is a result.
+
+**W2's OWN RECORD IS NOT DELETED, it is superseded here and kept below**, the
+same way W2 kept W1's. Its counts are read against its own head and not against
+this one: "five landed and four owed" was true at `52cecd733`.
 
 `ACTIVE`, 2026-09-12. **W2 lands two more of the nine arms**, `kIndexSelect` and
 `kIndexCopy`, in `src/vt/rocm/rocm_gdn_state.hip`, each with a cross-device case

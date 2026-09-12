@@ -278,29 +278,16 @@ on the committed fixture); reranking/classify models are not yet registered.
 | Video+audio GENERATION (MiniMax-H3 DiT, LTX-2.5 DiT) | ◐ H3: all three modalities COHERENT on Q4_K_M (t2va, fl2va, ref2va; §8.20); the NVFP4 arm carries the patch grid; GGUF/NVFP4/bf16 loaders, pruned too (§8.21). LTX-2.5: a second lane, `SPIKE`, gated at reduced dims | ✅ H3 (vllm-omni, BF16-only, no quantized arm); LTX-2.5 only through the generic diffusers adapter, no native recipe ([vllm-omni#6066](https://github.com/vllm-project/vllm-omni/issues/6066)) | ☐ | ☐ |
 | Speech / audio GENERATION (TTS, vLLM-Omni lane) | ◐ IndexTTS-2.5: vllm_synthesize renders TEXT to AUDIO on real weights, and the reference clip CONDITIONS it -- CAMPPlus speaker vector into the talker's row 0 and the S2Mel style; two clips give different audio (rms 0.0064 vs rms 0.0956), same clip twice is bit-identical. STRUCTURE only: emotion conditioning is excluded and vLLM-Omni is unpinned, so nothing here is a correctness claim (#634, #633) | ✅ (vllm-omni: MOSS-TTS, Qwen3-TTS, Higgs Audio v3, Voxtral TTS, IndexTTS-2.5) | not assessed | not assessed |
 | MUSIC generation (MiniMax-Music3) | ✓ every stage gated; an HTTP request observed e2e over a REAL SOCKET against a MUSIC-ONLY server (#852, #672, [spec](../.agents/specs/minimax-music3.md) §10); adjacent caption italics match upstream (#1083) | ☐ absent from the pin, from vLLM `main` and from `vllm-omni` | ◐ SGLang-Omni serves the NATIVE layout; its 32 kHz resample and batching are OWED | ☐ |
-| Multimodal over the OpenAI server | ◐ an image chat request now reaches the MODEL FORWARD: the scheduler carries `mm_features` and schedules encoder inputs, the GPU runner runs the vision tower, gathers its rows, merges them and sets `ModelForwardInput::mm` ([#2379](https://github.com/mudler/vllm.cpp/issues/2379)). Gated on a CPU queue over the real `ApiServer` -> `AsyncLLM` -> `Scheduler` -> `GPUModelRunner` -> `ModelRegistry::Forward` chain with a SYNTHETIC tiny Qwen3-VL, so it is a REACHABILITY result and not a token one. Still open: the token-exact gate on real Qwen3-VL-4B weights (GPU), the PNG/JPEG codec, video and audio through the runner, and Qwen3-VL serving ONE sequence per step (its registered forward returns only the last row and refuses a batched step by name) | ✅ | ✅ | ◐ |
-| Per-modality input LIMITS (`--limit-mm-per-prompt`, `--language-model-only`) | ✅ limits, refusals, and the TOWER SKIP: a tower whose every modality sits at 0 is constructed but never loaded. Byte saving measured on **Qwen3-VL-4B-Instruct only**: 0.770 GiB of host RSS at load, `--device cpu`, threshold MET on both pairs, 2026-08-28 (#607). Not a general or a VRAM claim. An earlier 2026-08-24 run read 1.542 GiB, about half of which was our own bf16→f32 widening (#1359); its Qwen3-VL half landed and the rerun measured the 0.499x fall, which is correct rather than a regression. `muse-glimmer-30b` is still unmeasured ([benchmark](benchmarks/memory.md)) | ✅ | ☐ | ☐ |
+| Multimodal over the OpenAI server | ◐ Qwen3-VL images and dots3-note images/audio reach the model. CPU tests use synthetic weights; real-checkpoint token parity remains unverified. PNG/JPEG and video input are unavailable. See [model limits and formats](guides/multimodal-input.md). | ✅ | ✅ | ◐ |
+| Per-modality input LIMITS (`--limit-mm-per-prompt`, `--language-model-only`) | ✅ limits and refusals. Qwen3-VL, MuseGlimmer, and `clip` projector loaders skip tower loading when every modality it serves has limit 0. The dots3-note loader still loads its supported vision and audio towers at zero limits. Byte saving measured on **Qwen3-VL-4B-Instruct only**: 0.770 GiB of host RSS at load, `--device cpu`, threshold MET on both pairs, 2026-08-28 (#607). Not a general or a VRAM claim. An earlier 2026-08-24 run read 1.542 GiB, about half of which was our own bf16→f32 widening (#1359); its Qwen3-VL half landed and the rerun measured the 0.499x fall, which is correct rather than a regression. `muse-glimmer-30b` is still unmeasured ([benchmark](benchmarks/memory.md)) | ✅ | ☐ | ☐ |
 
-Image, video and audio are correct through the CLI and library. Over the HTTP
-API the image path now runs from the request to the model forward: the
-production server attaches the seam in `server_main.cpp`, the scheduler carries
-`mm_features` to the worker and schedules encoder inputs against an encoder
-cache, and the GPU runner runs the vision tower, gathers its output rows, has
-the model merge them into the token embeddings and sets `ModelForwardInput::mm`
-([#2379](https://github.com/mudler/vllm.cpp/issues/2379), which re-files the
-invisible #2300). **What is gated is that the request ARRIVES there**, on a CPU
-queue over the real `ApiServer` -> `AsyncLLM` -> `Scheduler` -> `GPUModelRunner`
--> `ModelRegistry::Forward` chain against a synthetic tiny Qwen3-VL; the
-token-exact gate against real Qwen3-VL-4B weights needs a GPU and a checkpoint
-and is still owed. Four residuals keep the row from ✅: no image codec is
-vendored, so the server accepts raw RGB only and refuses a PNG or JPEG data URI
-first; Qwen3-VL serves ONE sequence per step, because its registered forward
-returns only the last token's logits and now refuses a batched step by name;
-only the `image` modality reaches the runner; and no token number exists. Video,
-audio and multi-image over HTTP are not started, and the seam refuses a
-`video_url` or an `input_audio` part with HTTP 400. Audio **in** is gated. Audio **out** has a
-surface now (`/v1/audio/speech`, `vllm_speech_*` v20), but no family renders
-from a prompt: both refuse, naming what is missing.
+The HTTP support above is tested through the serving stack, including the
+scheduler and model forward. It does not inherit the token gates of the
+single-sequence multimodal drivers. Qwen3-VL accepts one image per prompt;
+dots3-note accepts multiple images. It also accepts audio when its checkpoint
+includes `audio_config`. The [input guide](guides/multimodal-input.md) owns request
+examples, formats, and per-model limits. GGUF multimodal inference and direct
+multimodal requests through `vllm_chat` remain unavailable.
 
 ## Speculative decoding
 
@@ -447,7 +434,7 @@ CPU elementwise GEMM (f32/f16/bf16) runs AVX2 and AVX-512 tiers on x86 where the
 | Qwen3.8-27B, the SECOND NVFP4 artifact (`r0b0tlab/...-MTP-sm121`, a ModelOpt checkpoint) | 2001 names ACCOUNTED per scheme against four committed manifests; LOADS, never RUN: no token gate (#1632) | @`36f717a2`: 208 per-tensor STATIC FP8 + 193 W4A16_NVFP4 modules, both halves load. Not the `unsloth` format ([spec](../.agents/specs/qwen38-27b-quant-arms.md)) |
 | Multi-GPU execution | Hardware-blocked | TP proven equal to tp=1 on CPU; no 2-GPU box to run it |
 | LoRA end to end | CPU brick landed | Unwired standalone; not usable through the server |
-| Multimodal over HTTP | Image request served end to end on CPU; token gate, codec and batching pending | `ROAD-V1-MM` W1-W3 plus `ENG-MM-INPUT-PIPELINE` P2 ([#2379](https://github.com/mudler/vllm.cpp/issues/2379)) landed: `Request.mm_features` now reaches the forward. Open: no token-exact gate on real weights, no image codec (raw RGB only), no video/audio through the runner, and Qwen3-VL serves one sequence per step. Video/audio/multi-image still **refuse** with HTTP 400 rather than drop (#686) |
+| Multimodal over HTTP | Partial; real-checkpoint token gate pending | Qwen3-VL image and dots3-note image/audio requests have CPU tests with synthetic weights. PNG/JPEG and video input remain unavailable; Qwen3-VL serves one sequence per step. See [multimodal input](guides/multimodal-input.md). |
 | Reranking / classify models | Engine side only | Embeddings are LIVE (`LlamaModel`, `vllm_embed`, `/v1/embeddings`); the classify/score heads are landed ops with no registered arch |
 | ROCm | W0 community-verified on 5 gfx archs; classic-dense, GDN-hybrid and EXL3 e2e run all-native; correctness gaps remain | Native: GDN state/conv/postconv/recurrence, MoE combine/gate, keep-quant expert GEMM, narrowing `CastF16`, and EXL3 trellis GEMM (#2433). The measured APU managed-allocation branch now requires recoverable page faults and withdraws the CPU reference tier on gfx1151/gfx1103 (#2511). Use the [ROCm guide](ROCM.md) for the device-specific, wrapped-call-safe derived recount. |
 | Vulkan EXL3 | Native, correctness only | `kCastF16` + `kExl3Gemm` registered and BYTE-identical to the CPU arm on llvmpipe; zero reference-tier hits where S1 measured two (#2530). No real GPU, no checkpoint run, no speed number. `kExl3MoeMlp` needs a grid barrier Vulkan does not have and is owed |

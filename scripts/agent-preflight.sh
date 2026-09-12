@@ -171,6 +171,7 @@ SUITES=(
   test_check_model_checklist
   test_check_supported_models
   test_check_env_doc
+  test_check_deepseek_v4_vision_manifests
   test_checker_text
   test_check_fusion_consistency
   test_check_attention_rung_consistency

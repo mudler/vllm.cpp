@@ -79,9 +79,12 @@ std::vector<float> Widen(const uint16_t* p, size_t n) {
 // arms. The device paths are W7's, and a device result cannot be obtained by
 // reasoning about a CPU one -- so the provider is selected here and the same
 // binary drives both. The default is `cpu`, so every W6 invocation produces
-// BYTE-IDENTICAL `.f32` artifacts. Its stdout is NOT unchanged: `main` now
-// prints one unconditional `provider: <cpu|cuda>` line that W6's runs did not
-// carry, so a log diff against a W6 run shows that line and nothing else.
+// BYTE-IDENTICAL `.f32` artifacts, AND THE F32 ARM'S STDOUT IS UNCHANGED TOO:
+// `main` returns into `RunF32` at `:295`, which is BEFORE the one unconditional
+// `provider: <cpu|cuda>` line it prints at `:365`. THE MMPROJ ARM ALONE gains
+// that line, so a log diff against a W6 mmproj run shows it and nothing else.
+// The f32 arm does reach this function, at `:198`, but only to REFUSE a
+// non-CPU device request; it never reaches the print.
 vt::DeviceType ProbeDeviceType() {
   const char* e = std::getenv("DSV4V_PROBE_DEVICE");
   const std::string want = e != nullptr ? e : "cpu";

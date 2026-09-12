@@ -347,13 +347,13 @@ free.
 ### Multimodal engine
 
 The reusable production seam is
-`include/vllm/model_executor/models/model_registry.h:299-356`:
+`include/vllm/model_executor/models/model_registry.h:397-403`:
 `MultiModalForwardInput::inputs_embeds` is an already-merged BF16 device tensor.
 DeepSeek does not need Qwen MRoPE, DeepStack or Gemma PLE. Its registered forward
 reads `inputs_embeds` when present and otherwise follows the existing token-id
 embedding path.
 
-`include/vllm/multimodal/inputs.h:20-92` already carries per-image patch rows,
+`include/vllm/multimodal/inputs.h:20-136` already carries per-image patch rows,
 grid dimensions, expanded prompt ids and `MultiModalFeatureSpec` offsets. The
 DeepSeek processor can use that container without adding a competing request
 type.
@@ -754,7 +754,7 @@ above as its red-before input.
   that branch -- so both conditions are now REFUSED BY NAME there.
   **THE WINDOWED HALF IS NOW MEASURED, W7-CUDA.** On `thor:gpu0` with
   `VT_V4_DEVICE_ATTN=1`, a CUDA queue and the V4 device kernels all live,
-  `deepseek_v4.cpp:1319` threw by name at `sliding_window 128` — rc job
+  `deepseek_v4.cpp:1325` threw by name at `sliding_window 128` — rc job
   `665b2427-4b85-4e75-916b-d3ad3345ea24`, and see `### W7-CUDA evidence`. The
   refusal is necessary and it is kept.
   **THE IMAGE-SPAN HALF IS STILL UNMEASURED**, and this sentence is the record
@@ -1071,7 +1071,7 @@ above as its red-before input.
   `DeepseekV4Model::ForwardDevice` is what the runner's gather-logits path
   reaches for EVERY request on this architecture, and a CPU build carries no V4
   device kernels, so every served request -- text or image -- is refused by name
-  at `deepseek_v4.cpp:4345`. That refusal is W5's own reachability evidence at
+  at `deepseek_v4.cpp:4415`. That refusal is W5's own reachability evidence at
   the server surface, because nothing short of the registered forward can
   produce it, and serving this architecture on a device is W7-CUDA's.
 
@@ -1160,25 +1160,40 @@ above as its red-before input.
   asserting NOTHING about the theta, so a future variant with a different one
   would be read silently wrong — by llama.cpp as well as by this reader. No
   code change is made here, because there is no key to read.
-- **The windowed `dev_attn` refusal is labelled MEASURED, and NOTHING RE-CHECKS
-  IT.** The label is history from one rc lease run on `thor:gpu0`, job
-  `665b2427-4b85-4e75-916b-d3ad3345ea24`. No committed test sets
-  `VT_V4_DEVICE_ATTN`, so no gate in this tree drives that refusal: it is
-  CUDA-only and a CPU build cannot reach it at all. A regression that deleted or
-  weakened the refusal would leave every gate green and would be visible only on
-  the next manual lease run. A case that sets `VT_V4_DEVICE_ATTN` on a CUDA
-  build is owed by issue #2411 and W7-CUDA.
-- **NO COMMITTED GATE PROTECTS THE W7-CUDA STAGING FIX**, and this is the
-  measured statement of it rather than an estimate. Making
-  `DeepSeekV4Vision::Impl::EnsureResident` a no-op in a scratch copy leaves the
-  whole CPU DeepSeek-V4 family gate GREEN, because `EnsureResident` returns on
-  its first line for a CPU queue with host weights and every CPU case is in
-  exactly that state. The two cases that do measure the staging are in
-  `test_cuda_deepseek_v4.cpp` and need a CUDA queue plus the V4 device kernels,
-  so on any CPU host they return early and the suite exits 77. What this wave's
-  green covers is therefore the CPU arm's unchanged behaviour; the staging
-  itself is covered only by a lease run. Issue #2411 and W7-CUDA own a gate that
-  runs on a leased device.
+- **The windowed `dev_attn` refusal is labelled MEASURED, and NO CTEST GATE
+  RE-CHECKS IT.** The label is history from one rc lease run on `thor:gpu0`, job
+  `665b2427-4b85-4e75-916b-d3ad3345ea24`. One COMMITTED HARNESS DOES DRIVE IT --
+  `tools/parity/dsv4v_w7_cuda.sh:207` runs `test_cuda_deepseek_v4` under
+  `VT_V4_DEVICE_ATTN=1` and greps the log for the refusal -- so "nothing sets
+  the variable" would be wrong. What is true is that the harness is NOT
+  ctest-registered and only a manual lease run on a CUDA build executes it, the
+  refusal being CUDA-only and unreachable from any CPU build. A regression that
+  deleted or weakened the refusal would therefore leave every ctest gate green
+  and would be visible only on the next manual run of that harness. A
+  ctest-registered case that sets `VT_V4_DEVICE_ATTN` on a CUDA build is owed by
+  issue #2411 and W7-CUDA.
+- **THE CPU FAMILY GATE CANNOT SEE THE W7-CUDA STAGING FIX BY ITSELF, and one
+  committed case now can.** Making `DeepSeekV4Vision::Impl::EnsureResident` a
+  no-op in a scratch copy leaves the whole CPU DeepSeek-V4 family gate GREEN,
+  because `EnsureResident` returns on its first line for a CPU queue with host
+  weights and every pre-existing CPU case is in exactly that state. That half is
+  true, and it is why the miss was invisible.
+  **THE OTHER HALF OF THIS ENTRY WAS FALSE AND IS WITHDRAWN.** It said the
+  staging could be covered only by a lease run. `EnsureResident` keys on
+  `queue.device != weights.device` and stages through the backend the tower was
+  CONSTRUCTED with, and neither is a CUDA predicate. `vt::Queue` is a plain
+  aggregate (`include/vt/device.h:131-135`) and `vt::Backend` has six pure
+  virtuals, so a hand-built non-CPU queue and a host-memory fake backend run the
+  staging loop on an ordinary CPU host. `test_deepseek_v4_vision.cpp`'s "stages
+  every per-block weight to the queue's device" does exactly that and COUNTS the
+  staged allocations and copies: 15 at depth 1 and 23 at depth 2, which is
+  `2 + 8*depth + 5`. A loop that staged only block 0 reads 15 at BOTH depths, so
+  it reds the absolute counts and the per-block slope together.
+  The two cases in `test_cuda_deepseek_v4.cpp` still need a CUDA queue plus the
+  V4 device kernels and still exit 77 on a CPU host. What they cover that this
+  one does not is the REAL device -- a genuine H2D copy and a genuine device
+  pointer -- rather than the per-block census. That leased-device gate is still
+  owed by issue #2411 and W7-CUDA.
 - **`tools/parity/dsv4v_w6_compare.py` CONTAINS NO BOUND AND EMITS NO VERDICT.**
   It prints and writes statistics — `mean_rel_l2`, `mean_cos`, `min_cos`,
   sentinel exactness, the permutation summary — and returns 0 whenever the
@@ -1315,7 +1330,7 @@ wave's change, which before the fix touched only `tools/parity/`.
 
 - **The DEVICE decode attention refusal FIRES, and W4's "unmeasured" record is
   now measured.** With `VT_V4_DEVICE_ATTN=1` on a CUDA build at sm_110,
-  `deepseek_v4.cpp:1319` threw by name: *"layer 0 runs the DEVICE decode kernel
+  `deepseek_v4.cpp:1325` threw by name: *"layer 0 runs the DEVICE decode kernel
   at sliding_window 128 ... Refused by name; the windowed device kernel is owed
   by issue #2411 ... Unset VT_V4_DEVICE_ATTN to take the host arm"*. It is
   NECESSARY and it is kept. **Its IMAGE-SPAN half did not fire**, because

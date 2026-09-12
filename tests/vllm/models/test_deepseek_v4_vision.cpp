@@ -6,6 +6,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <limits>
@@ -1329,4 +1331,124 @@ TEST_CASE("DeepSeek-V4 vision refuses every mis-declared capture tensor") {
     CHECK(refused);
   }
   backend.DestroyQueue(queue);
+}
+
+// W7-CUDA repair (#2411). THE PER-BLOCK STAGING IS GATEABLE ON A CPU HOST, and
+// the `## Owed` entry that recorded it as catchable only on a leased device was
+// wrong.
+//
+// `EnsureResident` stages on ONE condition -- `queue.device != weights.device`
+// -- and stages through the backend the tower was CONSTRUCTED with. Neither is a
+// CUDA predicate. `vt::Queue` is a plain aggregate, so a non-CPU queue can be
+// built by hand, and `vt::Backend` has six pure virtuals, so a host-memory fake
+// can answer for a non-CPU device type. Together those give the staging loop a
+// real run on this box and let the staged copies be COUNTED.
+//
+// WHAT THE OLD ENTRY GOT RIGHT, and what this keeps: making `EnsureResident` a
+// no-op leaves every OTHER CPU case green, because it returns on its first line
+// for a CPU queue whose weights are already host-resident. That is precisely why
+// this case hands it a queue on a DIFFERENT device -- the only shape in which
+// the body executes at all.
+//
+// WHY IT THROWS, and why that is the point rather than a weakness. `Forward`
+// calls `EnsureResident` FIRST, before any I/O validation. The patches and the
+// output stay on the host here, so the forward refuses by name immediately after
+// staging. The message is asserted, so a case that stopped reaching the staging
+// loop for some earlier reason cannot pass quietly. Nothing after the refusal is
+// measured, and nothing needs to be: the staging is already done and counted.
+namespace {
+
+class StagingCountingBackend final : public Backend {
+ public:
+  void* Alloc(size_t bytes) override {
+    ++allocations;
+    return std::malloc(bytes == 0 ? 1 : bytes);
+  }
+  void Free(void* pointer) override { std::free(pointer); }
+  void Memset(Queue&, void* pointer, int value, size_t bytes) override {
+    std::memset(pointer, value, bytes);
+  }
+  void Copy(Queue&, void* destination, const void* source, size_t bytes) override {
+    ++copies;
+    std::memcpy(destination, source, bytes);
+  }
+  Queue CreateQueue() override {
+    return Queue{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
+  }
+  bool UnifiedMemory() const override { return true; }
+
+  size_t allocations = 0;
+  size_t copies = 0;
+};
+
+}  // namespace
+
+TEST_CASE("DeepSeek-V4 vision stages every per-block weight to the queue's device") {
+  // The tower's staged tensor census, by construction rather than by
+  // observation: `patch_weight` and `patch_bias`, then eight per block, then the
+  // final norm and the aligner's four. A block the loop skips costs exactly
+  // eight.
+  constexpr size_t kFixedStagedTensors = 7;
+  constexpr size_t kPerBlockStagedTensors = 8;
+
+  Backend& host = vt::GetBackend(vt::DeviceType::kCPU);
+  Queue host_queue = host.CreateQueue();
+  const json& fixture = Goldens().at("fixtures").at(0);
+  const json& test_case = fixture.at("cases").at(0);
+
+  struct Reading {
+    size_t allocations = 0;
+    size_t copies = 0;
+  };
+
+  auto measure = [&](int64_t depth) {
+    DeepSeekV4VisionConfig config = Config(fixture);
+    // The weights are built on the HOST queue, so `weights.patch_weight.device`
+    // is kCPU and the staging condition is genuinely unmet before the call.
+    TensorStore store(host, host_queue);
+    DeepSeekV4VisionWeights weights = Weights(fixture, config, store);
+    while (static_cast<int64_t>(weights.blocks.size()) < depth) {
+      weights.blocks.push_back(weights.blocks[0]);
+    }
+    weights.blocks.resize(static_cast<size_t>(depth));
+    config.depth = depth;
+
+    StagingCountingBackend device;
+    Reading reading;
+    {
+      DeepSeekV4Vision model(device, config, std::move(weights));
+      Queue device_queue{vt::Device{vt::DeviceType::kXPU, 0}, nullptr};
+      Tensor patches = store.Make(test_case.at("patches"), config.compute_dtype,
+                                  {10, config.patch_dim()});
+      Tensor output = store.Empty(config.compute_dtype, {2, config.output_size});
+      // Staged, THEN refused -- and the refusal is named, so this cannot pass by
+      // failing somewhere earlier.
+      CHECK_THROWS_WITH_AS(
+          model.Forward(device_queue, output, patches, 2, 5),
+          "DeepSeek-V4 vision patches and queue must share one device",
+          std::invalid_argument);
+      reading.allocations = device.allocations;
+      reading.copies = device.copies;
+    }
+    return reading;
+  };
+
+  const Reading at_one = measure(1);
+  const Reading at_two = measure(2);
+
+  // Every staged tensor is one Alloc and one Copy, so the two counters agree and
+  // a defect that dropped either half is visible on its own.
+  CHECK(at_one.allocations == kFixedStagedTensors + kPerBlockStagedTensors);
+  CHECK(at_one.copies == at_one.allocations);
+  CHECK(at_two.allocations == kFixedStagedTensors + 2 * kPerBlockStagedTensors);
+  CHECK(at_two.copies == at_two.allocations);
+
+  // THE BOUND THAT SEES A PER-BLOCK MISS. A loop that stages only block 0 reads
+  // 15 at both depths, so the absolute counts above red AND this slope goes to
+  // zero. Asserted separately because a future tower with a different fixed
+  // census would still have to stage eight tensors per block.
+  REQUIRE(at_two.allocations >= at_one.allocations);
+  CHECK(at_two.allocations - at_one.allocations == kPerBlockStagedTensors);
+
+  host.DestroyQueue(host_queue);
 }

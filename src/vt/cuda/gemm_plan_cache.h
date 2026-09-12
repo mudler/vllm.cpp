@@ -67,6 +67,7 @@ enum : int {
   kNn = 0,         // MatmulKernelCuda: row-major NN, no transpose attributes
   kTn = 1,         // MatmulBTKernelCuda: col-major TN (TRANSA=T, TRANSB=N)
   kBatchedNn = 2,  // BatchedMatmulKernelCuda: row-major strided-batched NN
+  kFp16Nn = 3,     // CublasLtHgemm: fp16 row-major NN, for EXL3 reconstruct+cuBLAS
 };
 
 // The FULL key that determines the cublasLtMatmulHeuristicResult_t for the

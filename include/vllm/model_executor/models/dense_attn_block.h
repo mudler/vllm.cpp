@@ -301,8 +301,21 @@ inline DBuf Exl3MatmulD(Dev d, const vt::Tensor& x, const Exl3Weight& w,
   // fused cooperative kernel (`exl3_gemm`) otherwise. The cooperative kernel
   // is faster for small M because it avoids materializing the full weight;
   // cuBLAS wins for large M because the persistent kernel's occupancy drops.
+  //
+  // Upstream's reconstruct path is CUDA-only, and so is our registration of
+  // `kExl3ReconstructGemm`. A backend with no native reconstruct kernel (CPU,
+  // ROCm, Vulkan today) keeps `Exl3Gemm` at every M, as it did before #3150;
+  // a device-blind threshold refused M > 144 there
+  // (ISSUE-LOCAL-01M2BYPW7YTC2B2MY023ETTKQ2). `OpRegistered` excludes the CPU
+  // reference tier, which has no reconstruct kernel to lend anyway.
+  //
+  // No divisibility guard is needed here: `Exl3ReconstructGemm` requires k and
+  // n to be multiples of 128, and `Exl3Gemm` already refuses the same shapes
+  // (src/vt/ops.cpp), so the dispatch cannot turn a served shape into a refusal.
   constexpr int64_t kReconstructThreshold = 144;
-  const bool use_reconstruct = M > kReconstructThreshold;
+  const bool use_reconstruct =
+      M > kReconstructThreshold &&
+      vt::OpRegistered(vt::OpId::kExl3ReconstructGemm, d.q.device.type);
   const int64_t w_cols = N <= 32768 ? N : 32768;
   DBuf w_scratch;
   if (use_reconstruct) {

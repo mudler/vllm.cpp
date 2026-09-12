@@ -2881,6 +2881,9 @@ target_include_directories(test_ops_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # rank-sliced DeepSeek-V4 expert linear (skips when the shard is not mounted).
 vllm_cpp_add_test(test_exl3_dequant vt/test_exl3_dequant.cpp)
 vllm_cpp_add_test(test_exl3_gemm vt/test_exl3_gemm.cpp)
+# ISSUE-LOCAL-01M2BYPW7YTC2B2MY023ETTKQ2: the M > 144 reconstruct dispatch through
+# dense_attn::Exl3MatmulD must fall back to Exl3Gemm where no reconstruct kernel exists.
+vllm_cpp_add_test(test_exl3_matmul_dispatch vt/test_exl3_matmul_dispatch.cpp)
 # MODEL-DSV4-EXL3 W2c: the m<=8 GEMV selection envelope, gated host-side because
 # the sentence this row inherited about it describes a guard exl3_gemv.cu:53 has
 # commented out. W2d: the fused MoE mgemm, its host-side token sort, and the

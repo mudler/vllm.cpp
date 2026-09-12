@@ -1561,15 +1561,42 @@ TEST_CASE("W8 slice 4: the forward WRITES and READS the fp8_ds_mla page (#2455)"
 // rows`. The resolver is gated separately, in `test_deepseek_v4_paged_equiv`.
 // So both ENDS of the wiring were measured and the WIRE between them was not:
 // replacing `rows_per_block` with a literal `0` at the registry's call site
-// built clean and left all four suites green, because nothing drove
+// built clean and left all four suites green.
+//
+// WHY THAT SUBSTITUTION WAS A NO-OP -- and an earlier wording of this comment
+// got the reason WRONG, which is why the true one is stated here with the
+// evidence that settles it. It said "nothing drove
 // `ForwardDeepseekV4ForCausalLM` at all -- its only mention in any test was a
-// COMMENT. That is `.agents/reachability.md`'s "test-only driver" with the
-// drivers one hop too low.
+// COMMENT". That is FALSE, and it was derived from a `git grep` for the
+// symbol, which `.agents/reachability.md` warns answers neither reachability
+// question. `test_deepseek_v4_exl3_loader.cpp`'s "PAGED-ENTRY:
+// `ModelRegistry::Forward` REACHES the EXL3 paged arm (#2447)" already drove
+// this function, through `ModelRegistry::Forward` on a `DeepseekV4ForCausalLM`
+// fixture, before slice 4 was written.
+//
+// The REAL reason is the page FORMAT, not the entry point: every pre-existing
+// case binds `kF32` pages, and on a float page the resolver reports
+// `rows_per_block == 0` by definition. Substituting a literal `0` therefore
+// changes nothing those cases can observe. Proven by execution rather than by
+// reading: under BOTH `rows_per_block` -> `0` mutants every pre-existing case
+// stayed green, and only a case binding a PACKED page can see that argument at
+// all. What was missing was a packed-page driver, not a driver.
 //
 // THIS CASE ENTERS AT `ModelRegistry::Forward`, the entry AGENTS.md names, so
 // the chain under test is the production one: the registry resolves the pages,
 // receives the STORAGE ROW COUNT through `&rows_per_block`, reads `kv_base` off
 // the step, and hands all three to the forward. Break any link and this reds.
+//
+// `kv_base` IS GATED BY GEOMETRY, and it needs a non-zero value to be gated at
+// all. This case drives TWO steps: the first writes storage rows 0..3 from
+// `kv_base = 0`, and the one under test resumes at `kv_base = 4`, so its store
+// must land on rows 4..6 and leave rows 0..3 BYTE-FOR-BYTE as the first step
+// left them. A registry that dropped `kv_base` and passed 0 would write rows
+// 0..2 instead, which both halves of assertion 1 below catch -- rows 4..6 would
+// stay poison, and the history rows would change. An earlier revision set
+// `num_computed_tokens_cpu = {0}`, where a dropped `kv_base` and a carried one
+// produce byte-identical pages -- the comment claimed the link and the case
+// could not see it.
 //
 // WHAT A WRONG ROW COUNT DOES, so the severity is not overstated. It is a LOUD
 // refusal, never silent corruption: `VT_CHECK(packed_page == (rows > 0))` fires
@@ -1646,10 +1673,23 @@ TEST_CASE("W8 slice 4: ModelRegistry::Forward carries rows_per_block to the pack
   vllm::MultiKvCacheIndex mk;
   mk.layer_names = &names;
 
+  // THE STEP RESUMES AT A NON-ZERO kv_base, and that is the whole reason this
+  // value is not 0. `AttentionBlock` writes `slots[t] = kv_base + t`, so the
+  // storage rows the store touches ARE the observable consequence of the
+  // registry reading `kv_base` off the step. At 0 the two behaviours -- carried
+  // and dropped -- produce byte-identical pages and the link is ungated.
+  const int64_t kv_base = 4;
   const std::vector<int32_t> step{1, 2, 3};
-  std::vector<int32_t> pos(step.size());
-  for (size_t i = 0; i < step.size(); ++i) pos[i] = static_cast<int32_t>(i);
   const int64_t n_keys = static_cast<int64_t>(step.size());
+  // The written rows must FIT the block, or the refusal under test would be
+  // replaced by an overrun refusal and this case would red for the wrong reason.
+  REQUIRE(kv_base + n_keys <= rows);
+  std::vector<int32_t> pos(step.size());
+  // ABSOLUTE positions, matching the resumed context: token `t` of this step is
+  // global position `kv_base + t`. That is what `positions` means to the forward
+  // and what RoPE rotates by, so a resumed step is only self-consistent here.
+  for (size_t i = 0; i < step.size(); ++i)
+    pos[i] = static_cast<int32_t>(kv_base + static_cast<int64_t>(i));
   const std::vector<int32_t> li{static_cast<int32_t>(step.size() - 1)};
 
   vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
@@ -1660,7 +1700,9 @@ TEST_CASE("W8 slice 4: ModelRegistry::Forward carries rows_per_block to the pack
   // off `num_computed_tokens_cpu`. Both travel through this struct, so both are
   // part of the seam this case covers.
   attn_meta.num_reqs = 1;
-  attn_meta.num_computed_tokens_cpu = {0};
+  // NON-ZERO, so that dropping the `kv_base` read is a DETECTABLE change rather
+  // than an invisible one.
+  attn_meta.num_computed_tokens_cpu = {static_cast<int32_t>(kv_base)};
 
   vllm::ModelForwardInput in{.token_ids = step,
                              .positions = pos,
@@ -1673,10 +1715,64 @@ TEST_CASE("W8 slice 4: ModelRegistry::Forward carries rows_per_block to the pack
                              .logits_indices = li,
                              .num_reqs = 1};
   in.multi_kv = &mk;
-  // REQUIRED TO REACH THIS ARM, and it is the reason the GGUF paged branch sat
-  // behind an unreachable test surface: `gather_logits` defaults to TRUE and the
-  // branch above returns `ForwardDevice` when it is set.
+  // REQUIRED TO REACH THIS ARM, and it is a NON-DEFAULT branch rather than a
+  // dead one -- stated plainly, because an earlier wording sold it only as "a
+  // surface no test entered" and left a reader to guess whether production ever
+  // takes it. It does. The runner computes
+  // `gather = LogitsGatherEnabled() && step.prompt_logprob_indices.empty()`
+  // (`src/vllm/v1/worker/gpu/runner.cpp:3042-3043`). `LogitsGatherEnabled()` is
+  // TRUE unless `VT_LOGITS_GATHER=0` is set, so on an ordinary step `gather` is
+  // true and the `ForwardDevice` branch above returns first. `gather` goes
+  // FALSE on a real request: one that asked for PROMPT LOGPROBS, which makes
+  // `prompt_logprob_indices` non-empty because the gather seam cannot express
+  // an lm_head row at every prompt position. So this is the branch a
+  // prompt-logprobs request takes, not a branch nothing can reach.
   in.gather_logits = false;
+
+  // ── THE PRIOR STEP, and why this case drives TWO of them ────────────────
+  //
+  // A resumed step ATTENDS its history: `n_keys = kv_base + T`, so rows
+  // 0..kv_base-1 are read back and dequantised. Poison is not a valid
+  // fp8_ds_mla encoding, and reading it produced a NON-FINITE logit -- measured,
+  // not assumed: with rows 0..3 left at 0xA5 this case failed
+  // `REQUIRE(std::isfinite(v))` on the logits. The fix is NOT to relax that
+  // assertion, which would delete the guard rather than satisfy it. It is to
+  // give the step a REAL history, which is also what production hands it.
+  //
+  // So step one writes rows 0..3 from `kv_base = 0`, and the step under test
+  // resumes at `kv_base = 4`. That makes this the decode shape a served request
+  // actually takes, and it leaves the gate two-sided: see the snapshot below.
+  vllm::v1::CommonAttentionMetadata warm_meta{};
+  warm_meta.num_reqs = 1;
+  warm_meta.num_computed_tokens_cpu = {0};
+  std::vector<int32_t> warm_step(static_cast<size_t>(kv_base));
+  std::vector<int32_t> warm_pos(static_cast<size_t>(kv_base));
+  for (int64_t i = 0; i < kv_base; ++i) {
+    warm_step[static_cast<size_t>(i)] = static_cast<int32_t>(4 + i);
+    warm_pos[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  }
+  const std::vector<int32_t> warm_li{static_cast<int32_t>(kv_base - 1)};
+  vllm::ModelForwardInput warm{.token_ids = warm_step,
+                               .positions = warm_pos,
+                               .attn_meta = warm_meta,
+                               .gdn_meta = gdn_meta,
+                               .attn_kv = attn_kv,
+                               .gdn_state = gdn_state,
+                               .config = cfg,
+                               .queue = queue,
+                               .logits_indices = warm_li,
+                               .num_reqs = 1};
+  warm.multi_kv = &mk;
+  warm.gather_logits = false;
+  const vllm::ForwardLogits warm_out = vllm::ModelRegistry::Forward(*model, warm);
+  REQUIRE(warm_out.host.size() == static_cast<size_t>(d.vocab));
+  for (float v : warm_out.host) REQUIRE(std::isfinite(v));
+
+  // THE HISTORY AS THE ENGINE LEFT IT. Rows 0..kv_base-1 now hold real packed
+  // tokens, and the step under test must not touch ONE BYTE of them. A registry
+  // that dropped `kv_base` would rewrite rows 0..T-1, which this snapshot
+  // catches exactly.
+  const std::vector<std::vector<uint8_t>> before = pstore;
 
   // THE STEP. A wrong row count throws out of here rather than returning.
   const vllm::ForwardLogits out = vllm::ModelRegistry::Forward(*model, in);
@@ -1691,15 +1787,38 @@ TEST_CASE("W8 slice 4: ModelRegistry::Forward carries rows_per_block to the pack
   for (int64_t l = 0; l < nlayers; ++l) {
     const std::vector<uint8_t>& blk = pstore[static_cast<size_t>(l)];
     CAPTURE(l);
-    bool moved = false;
+    // PER TOKEN, not once for the whole loop. A single `moved` flag declared
+    // OUTSIDE this loop is satisfied by any ONE token leaving poison, so two of
+    // the three stores could vanish and all three assertions would still pass.
     for (int64_t t = 0; t < n_keys; ++t) {
-      const uint8_t* data = blk.data() + t * P.token_data_size;
+      // ROW `kv_base + t` -- where `slots[t] = kv_base + t` puts this token.
+      const int64_t row = kv_base + t;
+      CAPTURE(t);
+      const uint8_t* data = blk.data() + row * P.token_data_size;
+      bool moved = false;
       for (int64_t i = 0; i < P.token_data_size; ++i)
         if (data[i] != 0xA5) { moved = true; break; }
-      const uint8_t* sc = blk.data() + P.scale_region_offset + t * P.scale_dim;
+      CHECK(moved);
+      const uint8_t* sc = blk.data() + P.scale_region_offset + row * P.scale_dim;
       CHECK(sc[P.token.n_nope_blocks] == 0);
     }
-    CHECK(moved);
+    // AND NOTHING BELOW `kv_base` MOVED. This is the half that catches a
+    // registry which dropped the `kv_base` read and passed 0: the store would
+    // then land on rows 0..T-1, overwriting the history the prior step wrote.
+    // Compared against the SNAPSHOT rather than against poison, because those
+    // rows legitimately hold real tokens by now.
+    const std::vector<uint8_t>& was = before[static_cast<size_t>(l)];
+    for (int64_t r = 0; r < kv_base; ++r) {
+      const uint8_t* now_row = blk.data() + r * P.token_data_size;
+      const uint8_t* was_row = was.data() + r * P.token_data_size;
+      for (int64_t i = 0; i < P.token_data_size; ++i) {
+        if (now_row[i] != was_row[i]) {
+          CAPTURE(r);
+          CAPTURE(i);
+          REQUIRE(now_row[i] == was_row[i]);
+        }
+      }
+    }
     // 2. AND IT STAYED INSIDE ITS BLOCK. `rows * 584` onward is alignment
     //    padding. A row count larger than the page holds overruns into it, and
     //    the whole reason the count travels beside the page is that the rank-2

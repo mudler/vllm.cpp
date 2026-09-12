@@ -2166,10 +2166,19 @@ config parse and upstream's disagree about the layer partition (that would be a
 
   **That refusal is PER STEP, not per layer, and an earlier wording of this
   entry got it wrong.** `ResolveDeepseekV4SwaPages` returns a refusal string on
-  the FIRST compressor layer it meets
-  (`src/vllm/model_executor/models/deepseek_v4.cpp`, the packed-page branch),
-  and `ForwardDeepseekV4ForCausalLM` then does `VT_CHECK(refusal.empty(),
-  refusal)`. No layer binds a page when any layer is refused, so reachability is
+  the FIRST compressor layer it meets, and `ForwardDeepseekV4ForCausalLM` then
+  does `VT_CHECK(refusal.empty(), refusal)`.
+
+  **Which refusal fires first is NOT the packed-page branch, and this entry
+  named the wrong one.** On the released topology the GGUF arm passes
+  `dsa_dense = true`, and the resolver's `DeepseekV4PagedArmComposesCompressor`
+  loop (`src/vllm/model_executor/models/deepseek_v4.cpp`, the loop above the
+  per-layer page-format branch) runs FIRST and refuses layer 2 outright -- a
+  layer whose compressor this arm does not compose would attend the raw prefix.
+  The packed-page branch, which is what the previous wording cited, is never
+  reached on that topology, so it cannot be the clause that refuses. The
+  conclusion below is unchanged; only the clause responsible for it is
+  corrected. No layer binds a page when any layer is refused, so reachability is
   all-or-nothing for the whole step. On the released 43-layer topology, where
   layers 2-42 all carry compressors, ZERO layers bind a packed page and the step
   throws. The packed path is therefore reachable today only on a topology whose

@@ -1667,12 +1667,22 @@ TEST_CASE("W8 slice 4: ModelRegistry::Forward carries rows_per_block on the EXL3
   std::vector<vllm::GdnStateCache> gdn_state;
   const vllm::v1::GDNAttentionMetadata gdn_meta{};
 
+  // THE STEP RESUMES AT A NON-ZERO kv_base, for the same reason as the GGUF
+  // case: `slots[t] = kv_base + t`, so the storage row the store touches is the
+  // observable consequence of the registry reading `kv_base` off the step. At 0
+  // a carried `kv_base` and a dropped one write the same byte, and the link is
+  // ungated. Safe here because this fixture has NO compressor layer, so
+  // `CompressorLayerStep`'s `seen == kv_base` guard (`deepseek_v4_dsa.cpp:423`)
+  // never runs -- that guard is what a resumed step would otherwise meet.
+  const int64_t kv_base = 4;
+  REQUIRE(kv_base < rows);
   const std::vector<int32_t> tok{1};
-  const std::vector<int32_t> pos{0};
+  // ABSOLUTE position, matching the resumed context.
+  const std::vector<int32_t> pos{static_cast<int32_t>(kv_base)};
   const std::vector<int32_t> li{0};
   vllm::v1::CommonAttentionMetadata attn_meta{};
   attn_meta.num_reqs = 1;
-  attn_meta.num_computed_tokens_cpu = {0};
+  attn_meta.num_computed_tokens_cpu = {static_cast<int32_t>(kv_base)};
   vllm::ModelForwardInput in{.token_ids = tok,
                              .positions = pos,
                              .attn_meta = attn_meta,
@@ -1703,12 +1713,23 @@ TEST_CASE("W8 slice 4: ModelRegistry::Forward carries rows_per_block on the EXL3
     const std::vector<uint8_t>& blk = pstore[static_cast<size_t>(l)];
     CAPTURE(l);
     bool moved = false;
-    const uint8_t* data = blk.data();
+    // ROW `kv_base`, where `slots[0] = kv_base + 0` puts this step's one token.
+    const uint8_t* data = blk.data() + kv_base * P.token_data_size;
     for (int64_t i = 0; i < P.token_data_size; ++i)
       if (data[i] != 0xA5) { moved = true; break; }
     CHECK(moved);
-    const uint8_t* sc = blk.data() + P.scale_region_offset;
+    const uint8_t* sc =
+        blk.data() + P.scale_region_offset + kv_base * P.scale_dim;
     CHECK(sc[P.token.n_nope_blocks] == 0);
+    // AND NOTHING LANDED BELOW `kv_base` -- the half that catches a registry
+    // which dropped the `kv_base` read and wrote row 0 instead.
+    int64_t below = 0;
+    for (int64_t r = 0; r < kv_base; ++r) {
+      const uint8_t* d = blk.data() + r * P.token_data_size;
+      for (int64_t i = 0; i < P.token_data_size; ++i)
+        if (d[i] != 0xA5) ++below;
+    }
+    CHECK(below == 0);
     // 2. AND IT STAYED INSIDE ITS BLOCK. Everything from `rows * 584` on is
     //    alignment padding that no store may reach.
     int64_t clobbered = 0;

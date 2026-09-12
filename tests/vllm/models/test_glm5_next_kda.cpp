@@ -28,9 +28,12 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/models/dense_device_glue.h"  // dense_attn::Dev
 #include "vllm/model_executor/models/kimi_kda.h"
 #include "vt/backend.h"
+#include "vt/device.h"
 #include "vt/dtype.h"
+#include "vt/op_provider.h"  // vt::OpRegistered
 
 using namespace vllm::glm5_next_kda;
 
@@ -738,7 +741,11 @@ TEST_CASE("glm5_next kda: the softplus branch changes the whole LAYER, not one g
   for (float z : softplus_arm) CHECK(std::isfinite(z));
 }
 
-TEST_CASE("glm5_next kda: the host layer refuses a non-CPU queue by name") {
+TEST_CASE("glm5_next kda: the host arm refuses a non-CPU queue by name") {
+  // Without `dev`, the host arm runs and refuses a non-CPU queue: the op
+  // dispatches on the queue's device, and host pointers on a CUDA queue is a
+  // crash, not a fallback. With `dev` the device arm dispatches on `dev->q` and
+  // the host arm is skipped; the device-arm test below exercises that path.
   const TinyLayer L = MakeTiny(2, 77);
   vt::Queue cuda{vt::Device{vt::DeviceType::kCUDA, 0}, nullptr};
   bool threw = false;
@@ -749,4 +756,88 @@ TEST_CASE("glm5_next kda: the host layer refuses a non-CPU queue by name") {
     CHECK(std::string(e.what()).find("CPU queue") != std::string::npos);
   }
   CHECK(threw);
+}
+
+namespace {
+
+// The device types whose KDA op is registered AND whose backend is live.
+// On a CPU-only build this returns an empty vector and the device case skips.
+// On CUDA or ROCm it returns that type, so the SAME comparison runs on
+// whichever arm is present. Mirrors `KpoolDeviceTypes` in
+// `test_glm5_next_kpool_device.cpp:116-128`.
+std::vector<vt::DeviceType> KdaDeviceTypes() {
+  std::vector<vt::DeviceType> out;
+  for (vt::DeviceType dt : {vt::DeviceType::kCUDA, vt::DeviceType::kROCM}) {
+    try {
+      vt::GetBackend(dt);
+      if (vt::OpRegistered(vt::OpId::kKdaGatedDeltaRule, dt))
+        out.push_back(dt);
+    } catch (const std::runtime_error&) {
+    }
+  }
+  return out;
+}
+
+struct KdaQueueGuard {
+  vt::Backend& b;
+  vt::Queue q;
+  explicit KdaQueueGuard(vt::Backend& backend)
+      : b(backend), q(backend.CreateQueue()) {}
+  ~KdaQueueGuard() { b.DestroyQueue(q); }
+  KdaQueueGuard(const KdaQueueGuard&) = delete;
+  KdaQueueGuard& operator=(const KdaQueueGuard&) = delete;
+};
+
+}  // namespace
+
+TEST_CASE("glm5_next kda W9c-2: the device arm agrees with the host arm") {
+  // The device arm uploads the delta-recurrence operands, dispatches
+  // `vt::KdaGatedDeltaRule` on `dev->q`, and downloads the output and updated
+  // state. The projections, conv, gates and norms stay on the host, so the only
+  // difference from the host arm is which provider ran the recurrence. On a
+  // CPU-only build this skips loudly; on CUDA or ROCm it runs.
+  const auto types = KdaDeviceTypes();
+  if (types.empty()) {
+    MESSAGE("no CUDA or ROCm backend with kKdaGatedDeltaRule: device-arm gate SKIPPED");
+    return;
+  }
+
+  const int64_t T = 7;
+  const TinyLayer L = MakeTiny(T, 5150);
+  vt::Queue host_q = CpuQ();
+
+  // The host arm is the oracle: same weights, same input, CPU queue, no `dev`.
+  const std::vector<float> host =
+      Glm5NextKdaLayerForward(L.w, L.x, L.dims, T, nullptr, host_q);
+  REQUIRE(!host.empty());
+
+  for (vt::DeviceType dt : types) {
+    CAPTURE(dt);
+    vt::Backend& backend = vt::GetBackend(dt);
+    KdaQueueGuard qg(backend);
+    vllm::dense_attn::Dev dev{backend, qg.q};
+
+    const std::vector<float> devd =
+        Glm5NextKdaLayerForward(L.w, L.x, L.dims, T, nullptr, host_q, &dev);
+    REQUIRE(devd.size() == host.size());
+
+    // The recurrence is f32 on both arms; the difference is reduction order,
+    // not precision. A device arm that downloaded nothing would leave `core`
+    // as zeros, so the magnitude and the non-zero NMSE guard against that.
+    double num = 0.0, den = 0.0, maxabs = 0.0;
+    for (size_t i = 0; i < host.size(); ++i) {
+      REQUIRE(std::isfinite(host[i]));
+      REQUIRE(std::isfinite(devd[i]));
+      const double diff = static_cast<double>(host[i]) - static_cast<double>(devd[i]);
+      num += diff * diff;
+      den += static_cast<double>(host[i]) * static_cast<double>(host[i]);
+      maxabs = std::max(maxabs, std::fabs(static_cast<double>(devd[i])));
+    }
+    const double nmse = den > 0.0 ? num / den : num;
+    MESSAGE("glm5_next KDA device arm NMSE vs host arm (" << dt << "): " << nmse);
+    CHECK(nmse < 1e-5);
+    CHECK(maxabs > 1e-3);
+    CHECK(nmse > 0.0);  // the two arms are DIFFERENT code; an exact 0 here
+                         // would mean the device arm was never selected.
+  }
 }

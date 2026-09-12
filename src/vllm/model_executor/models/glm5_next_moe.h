@@ -346,8 +346,11 @@ std::vector<float> RouterLogits(const MoeDims& d, const std::vector<float>& hidd
 // The whole grouped `noaux_tc` selection, through the shared seam
 // `vt::MoeRouterTopK`.
 //
-// `queue` must be a CPU queue: the op dispatches on the queue's device and
-// handing it host pointers on a CUDA queue is a crash rather than a fallback.
+// When `dev` is null, `queue` must be a CPU queue: the op dispatches on the
+// queue's device and host pointers on a CUDA queue are a crash, not a fallback.
+// When `dev` is non-null the routing op runs on `dev->q` and the logits are
+// uploaded and the routing outputs downloaded, so the result still lands in
+// host vectors.
 //
 // ORDER DEVIATION, recorded. Upstream calls `torch.topk(..., sorted=False)`, so
 // the order of the `num_experts_per_tok` selected ids is unspecified; the seam
@@ -367,7 +370,7 @@ std::vector<float> RouterLogits(const MoeDims& d, const std::vector<float>& hidd
 //   hidden : [num_tokens, hidden_size] row-major
 MoeRouting RouteTopk(const MoeDims& d, const MoeLayerWeights& w,
                      const std::vector<float>& hidden, int64_t num_tokens,
-                     vt::Queue& queue);
+                     vt::Queue& queue, dense_attn::Dev* dev = nullptr);
 
 // `Glm5NextTextExperts._apply_gate` (`:137-142`) for ONE row: split `gate_up`
 // into its gate and up halves, clamp each (the gate MAX-ONLY, the up on BOTH

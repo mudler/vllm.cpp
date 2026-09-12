@@ -54,6 +54,7 @@
 #include "vllm/model_executor/models/deepseek_v4_moe.h"
 #include "vllm/model_executor/models/dense_device_glue.h"  // W9c-3a: dense_attn::Dev
 #include "vt/backend.h"                                    // W9c-3a: vt::GetBackend
+#include "vt/op_provider.h"  // W9c-2: vt::OpRegistered for multi-backend probe
 #include "vllm/model_executor/models/glm5_next.h"
 #include "vllm/model_executor/models/glm5_next_bridge.h"  // W9a: AdmitMoeQuantBanks
 #include "vllm/transformers_utils/hf_config.h"
@@ -350,8 +351,9 @@ TEST_CASE("glm5_next moe: the router refuses a bias of the wrong length and a de
   w.e_score_correction_bias.pop_back();
   CHECK_THROWS_AS(gn::RouteTopk(d, w, hidden, g::kSeq, q), std::exception);
 
-  // A CUDA queue with host pointers is a crash rather than a fallback, so the
-  // host reference refuses by name. The device arm is the assembled forward's.
+  // Without `dev`, the host arm runs and refuses a non-CPU queue by name: the
+  // op dispatches on the queue's device, and host pointers on a CUDA queue is a
+  // crash, not a fallback. With `dev` the device arm dispatches on `dev->q` and\n  // the host arm is skipped; the CUDA device-arm test at line 1160 exercises\n  // that path through `MoeForward`.
   vt::Queue cuda{vt::Device{vt::DeviceType::kCUDA, 0}, nullptr};
   CHECK_THROWS_AS(gn::RouteTopk(d, BigWeights(true), hidden, g::kSeq, cuda),
                   std::exception);
@@ -1251,4 +1253,81 @@ TEST_CASE("glm5_next moe W9c-3a: the CUDA device arm agrees with the host arm "
   CHECK(maxabs > 1e-3);
   CHECK(nmse > 0.0);  // the two arms are DIFFERENT code; an exact 0 here would
                       // mean the device arm was never selected.
+}
+
+namespace {
+
+// The device types whose MoeRouterTopK op is registered AND whose backend is
+// live. Mirrors KdaDeviceTypes in test_glm5_next_kda.cpp.
+std::vector<vt::DeviceType> MoeRouterDeviceTypes() {
+  std::vector<vt::DeviceType> out;
+  for (vt::DeviceType dt : {vt::DeviceType::kCUDA, vt::DeviceType::kROCM}) {
+   try {
+     vt::GetBackend(dt);
+     if (vt::OpRegistered(vt::OpId::kMoeRouterTopK, dt))
+       out.push_back(dt);
+   } catch (const std::runtime_error&) {
+   }
+  }
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("glm5_next moe W9c-2: the RouteTopk device arm agrees with the host arm") {
+  // RouteTopk now carries a `dense_attn::Dev*` parameter. When `dev` is
+  // non-null the router logits are uploaded, `vt::MoeRouterTopK` runs on
+  // `dev->q`, and the weights and ids are downloaded. The host arm's
+  // `RouterLogits` matmul stays on the host either way. On a CPU-only build
+  // this skips loudly; on CUDA or ROCm it runs.
+  const auto types = MoeRouterDeviceTypes();
+  if (types.empty()) {
+   MESSAGE("no CUDA or ROCm backend with kMoeRouterTopK: RouteTopk device-arm gate SKIPPED");
+   return;
+  }
+
+  const gn::MoeDims d = BigDims();
+  const std::vector<float> hidden = Vec(g::kHidden);
+  // The ROCm MoeRouterTopK op implements ungrouped softmax without bias, which
+  // is GLM-5.3-Flash's `noaux_tc` configuration. Bias routers are the host arm's.
+  gn::MoeLayerWeights w = BigWeights(/*with_bias=*/false);
+  vt::Queue host_q = CpuQueue();
+
+  // The host arm is the oracle: same dims, same weights, CPU queue, no `dev`.
+  const gn::MoeRouting host = gn::RouteTopk(d, w, hidden, g::kSeq, host_q);
+  REQUIRE(!host.topk_ids.empty());
+  REQUIRE(!host.topk_weights.empty());
+
+  for (vt::DeviceType dt : types) {
+   CAPTURE(dt);
+   vt::Backend& backend = vt::GetBackend(dt);
+   CudaQueueGuard qg(backend);
+   vllm::dense_attn::Dev dev{backend, qg.q};
+
+   const gn::MoeRouting devd = gn::RouteTopk(d, w, hidden, g::kSeq, host_q, &dev);
+   REQUIRE(devd.topk_ids.size() == host.topk_ids.size());
+   REQUIRE(devd.topk_weights.size() == host.topk_weights.size());
+
+   // The selection is a SET, never a tolerance (header comment lines 21-27).
+   // The device arm feeds the op the SAME logits the host arm computed, so the
+   // selection must be byte-identical. A device arm that downloaded nothing
+   // would leave zeroed ids, which would not match the oracle's.
+   for (size_t i = 0; i < host.topk_ids.size(); ++i) {
+     CHECK(devd.topk_ids[i] == host.topk_ids[i]);
+   }
+
+   // The weights are softmax outputs of the same logits; the only difference
+   // is FP reduction order in the device kernel. Assert a tight band.
+   double maxabs = 0.0;
+   for (size_t i = 0; i < host.topk_weights.size(); ++i) {
+     REQUIRE(std::isfinite(devd.topk_weights[i]));
+     const double diff = std::fabs(static_cast<double>(host.topk_weights[i]) -
+                                   static_cast<double>(devd.topk_weights[i]));
+     maxabs = std::max(maxabs, diff);
+   }
+   MESSAGE("RouteTopk device arm max|dev - host| weights (" << dt << "): " << maxabs);
+   CHECK(maxabs < 1e-5);
+   CHECK(maxabs > 0.0);  // the two arms are DIFFERENT code; an exact 0 would
+                         // mean the device arm was never selected.
+  }
 }

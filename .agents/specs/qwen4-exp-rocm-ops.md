@@ -20,7 +20,7 @@
 | Tests to port | vLLM has no C++ test to port. The gate is INHERITED and must not be re-authored: `tests/vt/test_backend_cross_device.cpp` already holds any registered backend to NMSE <= 5e-4 against the CPU oracle, and the sibling cases REQUIRE-prove registration rather than skipping. Each op gains a case there in that shape. The existing `tests/vllm/models/test_qwen4_exp_*_device.cpp` suites are the per-op golden surface. |
 | Gates | G1 per-op cross-device NMSE on `strix:gpu0`. G2 the model LOADS and the forward completes on ROCm with `VT_OP_PROVIDER_STATS=1` showing ZERO reference-tier hits — see D2, on this board a hit is impossible, so a non-zero count means the tier was somehow installed and the run is void. G3 first tokens. G4 token-exactness against an oracle — see `## Owed`, not this row. **No throughput, latency or memory number is admissible until G4.** |
 | Dependencies | The IQ4_NL ROCm GEMM (`QUANT-GGUF-IQ4_NL`, PR #3149) for the `ffn_down_exps`, and #3097's ROCm gather for the n-gram table — BOTH have landed and are in this branch's base: the gather in #3097, the GEMM at `18e2a8c9a` on `origin/main`. Hardware: `strix:gpu0`, the only AMD fleet device, reachable ONLY through an `rc` lease. No CI lane has an AMD runner, so a green CI is not evidence for any arm here. |
-| Work breakdown | `W0` this spec (LANDED) -> `W1` (LANDED) the two elementwise-shaped ops (`kQwen4ExpGatedResidual`, `kQwen4ExpGatedResidualWriteBack`) plus `kRmsNormGroup`, which are the cheapest and prove the file and registration shape -> `W2` (LANDED) `kIndexSelect`/`kIndexCopy`, the two GENERIC row gather/scatter helpers, which is why D3c records that D3's tie-break has nothing to arbitrate for them -> `W3` (LANDED) the PLE pair (`kQwen4ExpPleConv`, `kQwen4ExpPleGate`), where vLLM's AMD backend DOES define both behaviours and D3d records what the comparison found -> `W4` (LANDED) the QSA pair, the hardest, and the one where vLLM's `amd/ops/qsa.py` is the reference rather than the CUDA arm — D3e records what that comparison found and the eleventh and tenth op it found on the way -> `W5` (LANDED) the DSA INDEXER PAIR, which W4 measured as the remaining refusal, which two rows owned at once and which is landed ONCE — D3g records what the mirror comparison found and D3h the fixture, the twelve mutations and the one equivalent mutant among them -> `W6` first load and forward on `strix:gpu0` -> `W7` first tokens. Each wave lands with its cross-device case; no wave lands unreached. |
+| Work breakdown | `W0` this spec (LANDED) -> `W1` (LANDED) the two elementwise-shaped ops (`kQwen4ExpGatedResidual`, `kQwen4ExpGatedResidualWriteBack`) plus `kRmsNormGroup`, which are the cheapest and prove the file and registration shape -> `W2` (LANDED) `kIndexSelect`/`kIndexCopy`, the two GENERIC row gather/scatter helpers, which is why D3c records that D3's tie-break has nothing to arbitrate for them -> `W3` (LANDED) the PLE pair (`kQwen4ExpPleConv`, `kQwen4ExpPleGate`), where vLLM's AMD backend DOES define both behaviours and D3d records what the comparison found -> `W4` (LANDED) the QSA pair, the hardest, and the one where vLLM's `amd/ops/qsa.py` is the reference rather than the CUDA arm — D3e records what that comparison found and the eleventh and tenth op it found on the way -> `W5` (LANDED) the DSA INDEXER PAIR, which W4 measured as the remaining refusal, which two rows owned at once and which is landed ONCE — D3g records what the mirror comparison found and D3h the fixture, the fifteen mutations, the two equivalent mutants among them and the key guard the first fixture could not execute -> `W6` first load and forward on `strix:gpu0` -> `W7` first tokens. Each wave lands with its cross-device case; no wave lands unreached. |
 | Risks/decisions | R1 a missing op HARD-REFUSES on this board rather than degrading (D2), so a partial port is not a slow model, it is the same refusal with a different name. R2 wave size: nine ops in one pull request would be unreviewable, and the waves above exist to keep each reviewable. R3 the QSA pair is a gather consumer and not a mask, so a fixture under 2048 tokens of context cannot distinguish a correct port from one attending pooled keys — that bound is stated in `.agents/specs/qwen4-exp-flash-next.md` and applies here. R4 `strix:gpu0` is a single shared device and every gate here needs it. R5 no AMD runner in CI. |
 
 ## D1. Why this row exists now rather than later
@@ -561,19 +561,37 @@ outside it. Recorded, not resolved silently — and the gate asserts the ascendi
 order DIRECTLY, so a later reader who does mirror the route finds out from a red
 rather than from a wrong answer.
 
-## D3h. W5's fixture, and the one mutation that PROVES a value gate is blind here
+## D3h. W5's fixture, and the two mutations that PROVE a value gate is blind here
 
 Every wave of this row has recorded a fixture that could not see what it claimed
 to gate — W1's two (D3b), W3's two (D3d §2 and the re-gate), W4's two — always
-after a fresh review found it. **W5's is the first one this row got a MEASUREMENT
-for in advance**, and the measurement is worth more than the assurance:
+after a fresh review found it. W5 predicted one of its own in advance, which is
+`L4` below, and **a fresh review still found a second one the wave had not
+predicted**: the kernel's key guard, which the fixture's key count made
+unreachable. The prediction was worth having and it was not sufficient, and both
+halves of that are recorded here rather than only the flattering one.
 
-**`L4`, the window off-by-one, left the NMSE at EXACTLY `0` in all four
-64-head arms.** The mutation widens the in-window predicate by one key
-(`s >= lo` becomes `s >= lo - 1`), so the arm writes a real logit into a column
-the oracle left at `-inf`. An NMSE computed over the columns both arms made
-finite cannot see that at all: the disagreeing column is simply not in the
-comparison, and the statistic reads `0` — indistinguishable from a perfect arm.
+**`L4`, the window off-by-one, LEAVES THE NMSE UNCHANGED ON ALL EIGHT ARMS, and
+that is forced rather than lucky.** The mutation widens the in-window predicate by
+one key (`s >= lo` becomes `s >= lo - 1`), so the arm writes a real logit into a
+column the oracle left at `-inf`. The NMSE loop admits only the columns BOTH arms
+made finite, and the disagreeing columns are exactly the ones the oracle left
+infinite, so they are never in the comparison: `rf.size()` stays 94 and the
+statistic reads its GREEN value. On the four 64-head arms that value is exactly
+`0`; on the four 96-head arms it is the same 1.99e-14 to 2.84e-14 the green run
+reports, to the last printed digit. A value gate is blind at 96 heads for the same
+reason it is blind at 64, and the first version of this paragraph, which claimed
+the blindness only for the 64-head arms, understated it — a fresh review measured
+the other four.
+
+The arithmetic is small enough to state exactly. The mutation makes THREE columns
+finite that the oracle left `-inf`: one in row 1 (`lo` 5 gains key 4), one in
+row 2 (`lo` 12 gains key 11) and one in row 3, whose window is empty and gains
+key 6. Rows 0 and 4 have `lo == 0` and gain nothing, because `s >= -1` admits no
+key that `s >= 0` did not. Three columns of four bytes is the 12 differing bytes
+every arm reports, and it is the same 12 on all eight because the count is a
+property of the WINDOWS and not of the dtype or the head count.
+
 It reds only because the case asserts the `-inf` PATTERN as a discrete mismatch
 count and the byte count as a bar. A gate built the obvious way, on the NMSE the
 rest of this file quotes, would have shipped this defect green.
@@ -584,6 +602,21 @@ direction, an off-by-one in `topk`, a rank-ordered emission, and the `n == 0`
 path the QSA block runs unconditionally — each carry a discrete assertion
 instead. **For a discrete gate the "margin" is a COUNT, not a ratio**, which is
 why the table below quotes differing indices rather than a multiple of a bar.
+
+**WHERE A RATIO IS QUOTED IT IS THE NARROWEST ARM, not the widest.** A mutation
+that reds eight arms has eight margins, and the number worth writing down is the
+one closest to the bar, because that is the arm that decides whether the gate
+holds. `L5` is where the convention bites: its eight NMSE values span 0.00634266
+to 0.0168696, which is 12.7x the `5e-4` bar at one end and 33.7x at the other, and
+the table quotes 12.7x. An earlier draft of this section quoted 28.8x from a value
+that was not in its own cell, which is how a 12.7x arm comes to read as
+comfortable.
+
+12.7x is tight and it is kept. It is now the NARROWEST numerical margin this row
+has recorded, ahead of `W3`'s `g1` at 39x (§D3d) and `W4`'s `g2` at 147x, and it
+is the same class as both: a bounded margin on a mutation that drops ONE of 64
+lanes from a sum, which is the smallest defect this fold admits. Widening the
+fixture to buy a bigger multiple would measure a fixture and not a kernel.
 
 **THE GREEN NUMBERS, MEASURED ON `strix:gpu0`**, `rc` jobs
 `89191a93-6d36-4b09-a73a-8168b3681d40` (RED) and
@@ -596,6 +629,28 @@ the commit under test:
 |---|---|---|---|
 | RED | `0b605b80a` (test only) | `60 cases / 58 passed / 2 failed / 0 skipped`, `84565 assertions / 2 failed` | `11eedfc2ff9d97b2` |
 | GREEN | `4c9e2042c` (the arm) | `60 cases / 60 passed / 0 failed / 0 skipped`, `84825 assertions / 0 failed`, `Status: SUCCESS!` | `eb7527597b59dd34` |
+| GREEN, AFTER THE REVIEW REPAIR | `8eef4a429` | `60 cases / 60 passed / 0 failed / 0 skipped`, `84833 assertions / 0 failed`, `Status: SUCCESS!` | `00e6e4e82ebf42d7` |
+
+**THE THIRD ROW IS A DIFFERENT FIXTURE, NOT A RE-RUN OF THE SECOND.** The fresh
+review of `4c9e2042c` returned FAIL, and the repair changed the logits case: the
+key count went from 40 to 41 and the logits buffer gained a guard band, which is
+§"the key guard the fixture could not execute" below. That is the whole of the
+`+8` in the assertion count — one `guard_touched` assertion per arm, eight arms.
+The two commits `0b605b80a` and `4c9e2042c` were replayed as `3c415b750` and
+`044d9da17` when the branch was rebased onto `63abad75c`. `git diff --name-only`
+between each pair names exactly one file,
+`tests/scripts/test_check_gemv_invocation_consistency.py`, which is `63abad75c`'s
+own change and is a Python checker test that no C++ translation unit reads, so the
+two binary sha256 values above still identify the arms they name. That is checked
+rather than assumed, because the W3 table three sections down had to make the same
+argument and could state it as an empty diff. `8eef4a429` is likewise the LAST
+commit on this branch that touches a translation unit the suite compiles;
+everything after it writes this spec only, so the third row still identifies the
+branch head's binary. Re-run the gate only if a later change touches compiled
+code. The repair ran as `rc` jobs
+`e92da7db-d978-4882-bf32-59e26ecc3ebd` (the ragged tile alone, which did NOT
+convict) and `8880031c-b0a6-4f92-a849-d2f714d81806` (the guard band and every
+mutation re-measured), on the same device and toolchain.
 
 **The red is the evidence, not a mishap**, and it is the same ROUTE-GAP
 signature W2, W3 and W4 recorded: two failed cases against two failed
@@ -611,11 +666,17 @@ and that is MEASURED rather than predicted — the case reports the differing-BY
 count beside the NMSE because the file header predicts bit-identity from the
 operand list and declines to assert it from a paragraph:
 
-| arm | NMSE | bytes differing of 800 |
+| arm | NMSE | bytes differing of 820 |
 |---|---|---|
 | 64 heads, f32 / bf16, `q_scale` null and non-null (4 arms) | **0** | **0** |
-| 96 heads, f32, null / non-null | 2.86668e-14 / 2.53275e-14 | 83 / 84 |
-| 96 heads, bf16, null / non-null | 1.97433e-14 / 2.06722e-14 | 77 / 72 |
+| 96 heads, f32, null / non-null | 2.83615e-14 / 2.53623e-14 | 84 / 85 |
+| 96 heads, bf16, null / non-null | 1.9906e-14 / 2.06273e-14 | 78 / 73 |
+
+Those are the values at `8eef4a429`, the repaired fixture. At `4c9e2042c` the
+denominator was 800 rather than 820 and the eight numbers were 2.86668e-14,
+2.53275e-14, 1.97433e-14 and 2.06722e-14 over 83, 84, 77 and 72 bytes; one more
+key column moves the last digits and nothing else. The four zeroes are zero in
+both.
 
 The 96-head arms are the only rows that are not zero and the reason is the one
 the kernel header names in advance: above the 64 lanes the fold groups head `h`
@@ -627,20 +688,34 @@ Fourteen orders under the `5e-4` band.
 `n == 0`, `n == topk`, `n == topk + 1`, the whole row, both-ends clamping and a
 short tail.
 
-**TWELVE MUTATIONS, ELEVEN RED, one an EQUIVALENT MUTANT with its analysis.**
-Every one is sha256-proven to have changed the test binary (baseline and
-restored both `eb7527597b59dd34`; each mutant differs), `git status --porcelain`
-showed no tracked modification after every restore, and the restored binary
-re-ran the focused suite green. Focused suite `-tc=*DSA*`, 265 assertions when
-green:
+**FIFTEEN MUTATIONS, THIRTEEN RED, two EQUIVALENT MUTANTS with their analyses.**
+Every one is sha256-proven to have changed the test binary, `git status
+--porcelain` showed no tracked modification after every restore, and the restored
+binary re-ran the focused suite green. Focused suite `-tc=*DSA*`.
+
+**TWO FIXTURES ARE QUOTED BELOW AND THE TABLE SAYS WHICH.** `L1`, `L2`, `L3`,
+`T1`-`T5`, `R1` and `R2` were measured at `4c9e2042c`, the pre-review fixture,
+where the focused suite was 265 assertions green and the baseline and restored
+binary were both `eb7527597b59dd34`. `G1`, `G2`, `G3`, `L4` and `L5` were
+re-measured at `8eef4a429`, the repaired fixture, where the focused suite is 273
+assertions green and the baseline and restored binary are both
+`00e6e4e82ebf42d7`. The difference between the two fixtures is one more key column
+and a guard band; it does not touch the arithmetic `L1`-`L3` and `T1`-`T5` break,
+and their narrowest margin is `701x`, so re-measuring them would move a digit and
+no verdict. That provenance is written here rather than smoothed over,
+because a table that silently mixes two fixtures is the same defect in the record
+that this section reports in the gate.
 
 | Mutation | What it breaks | measured | Verdict |
 |---|---|---|---|
 | `L1` | the ReLU: `max(dot, 0)` becomes `dot` | NMSE **1.26523** / 1.01727 / 1.26653 / 1.0182 at 64 heads, 0.81-0.85 at 96 | **2530x** the bar |
 | `L2` | the per-head `weights` fold, forced to 1 | NMSE **20.9991** and seven more from 14.38 to 21.02 | **41998x** |
 | `L3` | `q_scale`, forced to 1 | **0.350646** / 0.350616 / 0.370761 / 0.370805 on the FOUR `q_scale`-bearing arms; the four null arms are UNCHANGED, which is what shows the mutation is the operand and not a global | **701x** |
-| `L4` | the window's lower bound, `s >= lo - 1` | **NMSE EXACTLY 0** on all four 64-head arms; convicted by `mask_mismatch` and by 12 differing bytes | **a value gate CANNOT see it** — see above |
-| `L5` | the head fold stops one lane short | **0.0143908** / 0.0169238 / 0.00786739 / 0.00636796 | **28.8x**, and 157 differing bytes |
+| `G1` | BOTH `s < num_keys` guards deleted — the fresh reviewer's own mutation | **8 `guard_touched` failures of 8 arms.** NMSE, `mask_mismatch` and the differing-byte count are BIT-IDENTICAL to green on all eight | **only the guard band sees it** — see below |
+| `G2` | the STORE guard alone (`:272`) | identical: 8 failures, and the mutant binary is sha256-EQUAL to `G1`'s | the load-bearing half |
+| `G3` | the `live` guard alone (`:240`) | **SURVIVED, 273/273** | **EQUIVALENT MUTANT** — see below |
+| `L4` | the window's lower bound, `s >= lo - 1` | **THE NMSE IS UNCHANGED BY THE MUTATION ON ALL EIGHT ARMS** — `0`, `0`, `0`, `0`, 2.83615e-14, 2.53623e-14, 1.9906e-14, 2.06273e-14, each equal to its own green value to the last printed digit; convicted by 8 `mask_mismatch` failures and 4 byte-count failures, the bytes rising by exactly 12 on every arm (0 -> 12, 84 -> 96, 85 -> 97, 78 -> 90, 73 -> 85) | **a value gate CANNOT see it** — see above |
+| `L5` | the head fold stops one lane short | 64 heads: **0.0143413** / 0.0168673 / 0.014344 / 0.0168696. 96 heads: 0.00777361 / **0.00634461** / 0.00776191 / **0.00634266**. 12 failed assertions: the NMSE bar on all eight arms and the byte-count bar on the four 64-head arms (157 differing bytes there, 180-194 at 96) | **12.7x** at the narrowest arm, 33.7x at the widest |
 | `T1` | the tie rule inverted to the LARGER index, in all three comparators | **1 / 15 / 24** differing indices of 6 / 30 / 72 | index-exact bar |
 | `T2` | the ascending emission dropped | **0 / 13 / 33** differing indices | index-exact bar |
 | `T3` | `topk` off by one, the last slot never filled | **4 / 14 / 32** differing indices | index-exact bar |
@@ -661,11 +736,98 @@ the fixture sits there at every `topk`, and `T4` and `T3` both red on it. What
 boundary and not a distinct behaviour — which is a fact about the op worth
 having written down, and the reason the CPU arm may keep the `<=`.
 
+### The key guard the fixture could not execute, and the one that is redundant
+
+**A FRESH REVIEW OF `4c9e2042c` DELETED BOTH `s < num_keys` GUARDS FROM THE
+KERNEL AND THE FOCUSED SUITE STAYED GREEN**, with the mutant binary proven
+different by sha256: `2 passed / 0 failed`, `265 assertions`, `Status: SUCCESS!`.
+The kernel is correct; the FIXTURE could not reach the guard. `kS` was 40 keys
+against `kKeyRows = 4`, so all ten grid.y tiles were full,
+`blockIdx.y * kKeyRows + y` never reached `num_keys`, and both guards were dead
+code. In production `num_keys` is arbitrary.
+
+**THE OBVIOUS REPAIR IS HALF A REPAIR, AND THAT WAS MEASURED RATHER THAN
+REASONED.** Making `kS = 41` gives eleven tiles of which the last is ragged by
+three rows, which does execute the guard — and with both guards deleted the suite
+still returned `2 passed / 0 failed` (`rc` job
+`e92da7db-d978-4882-bf32-59e26ecc3ebd`). The stray lanes of row `t` store at
+`t * num_keys + s` with `s >= num_keys`, which is the first columns of row
+`t + 1`, and that row's OWN block writes the same columns. It is a race, and the
+stray block loses it every time for a structural reason: its lanes are out of
+window, so it skips the 128-wide dot loop entirely and stores first, while the
+victim block runs 64 of them and stores last. The correct value lands on top.
+
+**THE LAST ROW HAS NOTHING TO LOSE THE RACE TO.** Its three stray lanes store past
+the end of the tensor, where nothing legitimate writes at all, so an eight-float
+guard band behind the logits buffer — filled with the same poison the rows get,
+and asserted with a discrete `guard_touched == 0` — turns a scheduler-dependent
+symptom into a deterministic one. The two halves are one repair: with a key count
+4 divides there are no stray lanes for the band to catch, and with no band the
+stray lanes are absorbed by the race.
+
+**`G1` IS THE REVIEWER'S OWN MUTATION AND IT NOW REDS ON EVERY ARM**, eight
+`guard_touched` failures of eight. What it does NOT do is move any other number:
+the NMSE, the `mask_mismatch` count and the differing-byte count are bit-identical
+to their green values on all eight arms. This is the second instrument in this
+section that a value gate cannot see, and it is a stronger case than `L4` — `L4`
+at least moves the byte count.
+
+**ONLY THE STORE GUARD IS LOAD-BEARING, AND THE PROOF IS BOTH ANALYTIC AND
+BINARY.** `hi = min(num_keys, win_end[t])`, so `s < hi` already implies
+`s < num_keys` and the copy inside `live` cannot change the value of `live`.
+`G3` deletes that copy alone and SURVIVES, `273/273`, on a binary proven different
+from the baseline (`e4e03c3971f29cc6` against `00e6e4e82ebf42d7`) — an equivalent
+mutant like `T5`, recorded rather than repaired, because no fixture can separate a
+predicate from a weaker predicate it already implies. `G2` deletes the store guard
+alone, and its mutant binary is sha256-EQUAL to `G1`'s: the compiler proves the
+same thing the algebra does, since dropping a provably-true conjunct changes no
+instruction. The kernel keeps both spellings. Removing the redundant one is a
+kernel edit this wave has no reason to make, and the `live` line reads as its own
+documentation with it there.
+
 **`R1`/`R2` ARE `REQUIRE`-LEVEL AND THAT IS SUFFICIENT HERE.** W4's fresh review
 established that `GetOp`'s refusal on this board is device-level and
 op-independent, and D2 records the throw measured on it once already; a landed
 skip-guard to chase the throw a second time would be a gate that measures the
 resolver rather than this arm.
+
+## D3i. The four claims in `include/vt/ops.h` that W5 falsified
+
+**A LANDED ARM FALSIFIES PROSE, AND THE PROSE IS PART OF THE WAVE.** `4c9e2042c`
+registered the pair on `kROCM` and changed no comment. Four claims in
+`include/vt/ops.h` became false in that commit and none was disclosed:
+
+| Site | It said | It now says |
+|---|---|---|
+| the OpId comment for the pair | "CPU + CUDA" | kCPU, kCUDA and kROCM, each with its file |
+| `vt::DsaIndexerLogits` declaration | "CPU + CUDA" | the same three |
+| `vt::DsaTopkSelect` declaration | "CPU + CUDA" | the same three |
+| the `kQwen4ExpQsaCompress` paragraph | "THE ROCm FORWARD STILL REFUSES ... NEITHER has a ROCm arm" | what W5 establishes, and what it does not |
+
+The fourth is the one that matters, because it is not a stale qualifier but an
+INVERTED statement, and W4 authored it. Its replacement says only that the last op
+refusal this row has MEASURED on that board is gone, and then says in its own
+words that nothing has loaded a checkpoint or completed a `ModelRegistry::Forward`
+on a ROCm device, so no claim about the model running follows from a registration.
+It also carries the `rocm_ops.hip:370-375` disclosure that `## Owed` owns.
+
+**THIS HEADER IS NOT THE LOCK THAT `rocm_ops.hip` IS**, and the difference is the
+whole reason one was corrected here and the other was not. `rocm_ops.hip` is a
+registration surface every ROCm row writes, which AGENTS.md "Records" calls a
+lock; `include/vt/ops.h` is the declaration surface of the op being landed, and
+W4's own arm commit `c40d88ee0` edited it for exactly this purpose. The
+superseded wording is quoted beside the date it stopped being true, in the form
+`6ca7fe7b2` and the `kGlm5NextKpoolCompress` paragraph already use in this file.
+
+**THE SWEEP WAS FOR CLAIMS, NOT FOR THE STRING.** The other mentions of the pair
+in that header (`:626`, `:805`, `:2486`, `:4222-4298`) are behavioural or
+compositional — what the ops compute, and why the GLM-5.3 k-pool family cannot be
+built out of them — and a registration does not touch any of them. Every other
+`rocm_ops.hip` citation in the file belongs to an unrelated op family. The
+three-device list is measured rather than asserted:
+`grep -rn 'RegisterOp(OpId::kDsaIndexerLogits\|RegisterOp(OpId::kDsaTopkSelect)' src/`
+reaches `cpu_dsa_indexer.cpp`, `cuda_dsa_indexer.cu` and `rocm_dsa_indexer.hip`
+and nothing else, which is what licenses "NO OTHER DEVICE IS REGISTERED".
 
 ## Tests
 
@@ -819,7 +981,8 @@ sparse step refuses on the same two ops, which `src/vt/rocm/rocm_ops.hip:370-375
 records from the MLA/DSA side.
 
 D3g records the mirror comparison, D3h the fixture, the red/green pair and every
-mutation margin. Next action is W6, the first load and forward on `strix:gpu0`.
+mutation margin, D3i the four header claims the wave falsified. Next action is W6,
+the first load and forward on `strix:gpu0`.
 
 **vLLM's AMD backend DOES define both of W4's behaviours, in Triton, and the
 divergence is not in either of them.** `amd/ops/qsa.py` carries six

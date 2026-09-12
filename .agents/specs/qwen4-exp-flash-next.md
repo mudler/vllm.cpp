@@ -10190,3 +10190,84 @@ with tiny random configs and need neither a checkpoint nor a GPU lease — and b
 inherit a config layer whose boundary is measured, so a golden that disagrees is a
 port defect and not a config question. W6b's mechanism is the unknown that decides
 whether the chosen arm is schedulable, and it should be spiked before W6 is planned.
+
+## The sojufx sparkDash measurement (developer-directed, 2026-09-12)
+
+The developer directed a speed comparison against
+[sojufx/sojufx-Qwen3.8-Flash-Next](https://github.com/MiaAII-Lab/sparkDash) on
+`dgx:gpu0` (NVIDIA GB10, `sm_121a`, aarch64, 128 GB unified memory). sojufx
+publishes numbers from [sparkDash](https://github.com/MiaAII-Lab/sparkDash)
+Decode Bench Structured: 400 output tokens, `temperature=0`, thinking off, at
+concurrency 1/2/4. The benchmark targets an OpenAI-compatible
+`/v1/chat/completions` endpoint with streaming.
+
+**Protocol, reverse-engineered from the sparkDash source.** The prompt is
+`"Count from 1 to 200. Output only the numbers, separated by spaces. No other
+text."` The request body is `max_tokens=400, temperature=0, top_p=1,
+stream=true, stream_options={include_usage: true}, min_tokens=400,
+ignore_eos=true, stop=[], chat_template_kwargs={enable_thinking: false,
+thinking: false, thinking_mode: "disabled"}`. Per-stream decode tok/s is
+`(completion_tokens - 1) / (tLast - tFirst) * 1000`; aggregate decode tok/s is
+`totalDecodeTokens / (max(tLast) - min(tFirst)) * 1000`.
+
+### What each side ran
+
+| | sojufx | vllm.cpp |
+|---|---|---|
+| Artifact | `Mia-AiLab/qwen3.8-Flash-Next-NVFP4` (~128 GB, NVFP4) | `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S (~68 GB) |
+| Runtime | custom vLLM image, MTP speculative decoding (K=3), FP8 KV cache, 8-seq scheduler | `examples/vllm-server`, `--max-num-seqs 1`, no speculative decoding |
+| KV cache | FP8 | 256 blocks x 32 tokens = 8192 max context (reduced from 262144); prefix caching disabled, async scheduling enabled |
+| Device | GB10 (`sm_121a`) | GB10 (`sm_121a`), same box |
+
+### Result
+
+| Concurrency | sojufx (tok/s) | vllm.cpp (tok/s) |
+|---|---|---|
+| C1 | 66.17 | 0.25 |
+| C2 | 109.70 (aggregate) | not measured |
+| C4 | 179.31 (aggregate) | not measured |
+
+vllm.cpp C1: 99 decode tokens in 393.7 s, TTFT 9059 ms, model load ~1000 s
+(~16.7 min) from the CIFS NAS. **The gap is ~264x at C1.** This is directional,
+not a parity result: sojufx uses NVFP4 (~128 GB) with MTP speculative decoding
+and 8-seq scheduling, while vllm.cpp uses UD-IQ1_S (~68 GB) with single-seq
+decode. The comparison was published on the face as `TOKEN_GATE=FAIL` per the
+developer's 2026-09-04 direction, because the token gate does not pass on this
+architecture (3 of 6 disagreements vs llama.cpp free-running, per `## Owed`
+[#2999](https://github.com/mudler/vllm.cpp/issues/2999)).
+
+### The crash the benchmark found, and the fix that landed (#1958)
+
+The benchmark crashed the server under `min_tokens` + `ignore_eos` before the
+fix. `DeviceScratch` in `include/vllm/v1/sample/device_scratch.h` had a 0-copy
+path on unified-memory backends (CPU, GB10): it wrapped the caller's host
+pointer in-place. But `apply_min_tokens` and `apply_logit_bias` in
+`src/vllm/v1/sample/logits_processor/builtin.cpp` pass function-local
+`std::vector`s that are destroyed when the function returns, before the async
+CUDA kernel reads them. On GB10 this produced `illegal memory access`. On
+discrete GPUs the bug was masked because `~DeviceScratch` calls `cudaFree`,
+which synchronizes the queue before the memory becomes invalid.
+
+The fix (commit `1b2a49364`, landed on `main` 2026-09-12) removes the UMA
+0-copy branch: `DeviceScratch` always allocates and copies on every backend.
+The derived tensors are tiny (at most a few hundred int32s), so the copy is
+negligible. Issue
+[#1958](https://github.com/mudler/vllm.cpp/issues/1958) is closed; the fix is
+owned by row `SAMPLE-CORE` (spec: `.agents/specs/sampling-controls-c7.md`).
+
+### Known bottlenecks explaining the gap
+
+The ~264x gap is structural, not a regression. Three causes are identified:
+
+1. **Weight aliasing over UMA.** The UD-IQ1_S artifact is ~68 GB, and the
+   model's weights expand to ~136 GB in the working set. The GB10 device has
+   128 GB of unified memory, so the weights cannot all be resident. The GPU
+   reads them over the UMA interconnect on every step.
+2. **No decode graph for `qwen4_exp`.** Each decode step launches ~1,400
+   kernels, versus 1 for `Qwen3.5ForCausalLM` models that have a fused decode
+   graph. The per-kernel launch overhead dominates at batch size 1.
+3. **Per-step MoE adapter rebuild** ([#2336](https://github.com/mudler/vllm.cpp/issues/2336)).
+   The MoE weight adapter is rebuilt on every forward, which is a known speed
+   ceiling this row measured but did not fix.
+
+None of these is a ceiling. Each names a next hypothesis.

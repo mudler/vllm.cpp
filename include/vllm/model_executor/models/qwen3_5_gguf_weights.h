@@ -127,7 +127,8 @@ OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
 OwnedTensor OwnGgufF16(const GgufTensorInfo& tensor, int64_t n, int64_t k,
                        int64_t row_offset = 0,
                        const GgufFile* mmap_src = nullptr, bool nk = true,
-                       bool elem_kn_repack = false, bool prefault = true);
+                       bool elem_kn_repack = false, bool prefault = true,
+                       std::optional<vt::DType> weight_value_dtype = std::nullopt);
 
 // Build the HfConfig from a GGUF file's metadata (arch prefix qwen35moe /
 // qwen3next / qwen35 [dense]). vocab_size is taken from token_embd's shape

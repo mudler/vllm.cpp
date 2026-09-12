@@ -229,6 +229,64 @@ void SigmoidGateBf16KernelRocm(Queue& q, Tensor& out, const Tensor& attn,
   Check(hipGetLastError(), "sigmoid_gate launch");
 }
 
+// ── Gate-free fused attention preamble (kAttnQkNormRope) ────────────────────
+// Per-head STANDARD RMSNorm(q) + RMSNorm(k) + partial RoPE-from-cache, the
+// Qwen3-dense preamble, in one launch. The normalized value is carried in F32
+// through the rotation and narrowed ONCE, at the store: that is the pinned
+// primary's boundary -- Qwen3Attention applies q_norm/k_norm and then rotary_emb
+// (vllm/model_executor/models/qwen3.py:150-167) and the compiled preamble reads a
+// cos|sin cache narrowed to the query dtype
+// (vllm/model_executor/layers/rotary_embedding/base.py:105-131), so nothing is
+// rounded to bf16 before the rotation. The Tier-0 composite this op realises
+// (RmsNorm into a bf16 buffer, then RopeFromCache over that buffer) rounds twice
+// and measured 1569 of 8448 Q words against the primary on the L33/C2/R0
+// workload; see .agents/specs/rocm-attn-parity.md.
+// The RMSNorm reduction is the shipped one -- same kBlock-strided accumulation
+// and same shared-memory tree as RmsNormRowKernel (rocm_rmsnorm.hip:118-147) --
+// so the f32 carrier keeps the norm's own bits and only the narrowing point
+// moves.
+template <typename T, typename Tid>
+__global__ void AttnQkNormRopeRowK(T* x, const T* w, const T* cache, const Tid* positions,
+                                   int64_t cache_rows, int64_t heads, int64_t dh,
+                                   int64_t row_stride, int rot, float eps, bool neox) {
+  const int64_t row = blockIdx.x;
+  const int64_t pos = static_cast<int64_t>(positions[row / heads]);
+  if (rot <= 0 || pos < 0 || pos >= cache_rows) return;
+  T* xrow = x + row * row_stride;
+  const T* cs = cache + pos * rot;
+  __shared__ float partial[kBlock];
+  float acc = 0.0f;
+  for (int64_t j = threadIdx.x; j < dh; j += kBlock) {
+    const float v = Ld(xrow, j);
+    acc += v * v;
+  }
+  partial[threadIdx.x] = acc;
+  __syncthreads();
+  for (int s = kBlock / 2; s > 0; s /= 2) {
+    if (static_cast<int>(threadIdx.x) < s) partial[threadIdx.x] += partial[threadIdx.x + s];
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(partial[0] / static_cast<float>(dh) + eps);
+  const int64_t half = rot / 2;
+  // One thread per rotation PAIR, both stores from the values read before either
+  // write, because the rotation is in place (RopeFromCacheK, rocm_dense_basic.hip
+  // :699-704). The pair is the only place the bf16 narrowing is deferred.
+  for (int64_t pair = threadIdx.x; pair < half; pair += kBlock) {
+    const int64_t first = neox ? pair : pair * 2;
+    const int64_t second = neox ? pair + half : pair * 2 + 1;
+    const float c = Ld(cs, pair);
+    const float sn = Ld(cs, half + pair);
+    const float x1 = Ld(xrow, first) * inv * Ld(w, first);
+    const float x2 = Ld(xrow, second) * inv * Ld(w, second);
+    St(xrow, first, x1 * c - x2 * sn);
+    St(xrow, second, x1 * sn + x2 * c);
+  }
+  // Outside the rotary width the normed value is only stored, narrowed once.
+  for (int64_t j = rot + threadIdx.x; j < dh; j += kBlock) {
+    St(xrow, j, Ld(xrow, j) * inv * Ld(w, j));
+  }
+}
+
 void AttnQkNormRopeGateKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& gate_out,
                                   const Tensor& qgate, const Tensor& kf,
                                   const Tensor& q_norm, const Tensor& k_norm,
@@ -272,6 +330,70 @@ void AttnQkNormRopeGateKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor
     }
   }
   Check(hipGetLastError(), "attn_qk_norm_rope_gate launch");
+}
+
+// The registered AttnQkNormRopeFn (include/vt/ops.h). The f32 attention arm has
+// no intermediate rounding to remove -- RmsNorm(f32) then RopeFromCache(f32) is
+// already the primary's boundary -- so it keeps the shipped composite's bytes by
+// running that composite, and only the bf16 arm takes the fused kernel.
+void AttnQkNormRopeKernelRocm(Queue& q, Tensor& q3, Tensor& k3, const Tensor& q_norm,
+                              const Tensor& k_norm, const Tensor& cos_sin,
+                              const Tensor& positions, const RmsNormArgs& na,
+                              const RopeArgs& ra) {
+  const int64_t t = q3.shape[0], hq = q3.shape[1], dh = q3.shape[2];
+  const int64_t hkv = k3.shape[1];
+  if (t == 0) return;
+  VT_CHECK(q3.rank == 3 && k3.rank == 3 && k3.shape[2] == dh,
+           "rocm attn_qk_norm_rope: q3/k3 must be [T,H,Dh]");
+  VT_CHECK(q_norm.rank == 1 && q_norm.shape[0] == dh && k_norm.rank == 1 &&
+               k_norm.shape[0] == dh,
+           "rocm attn_qk_norm_rope: q_norm/k_norm must be [Dh]");
+  VT_CHECK(cos_sin.rank == 2 && cos_sin.shape[1] == ra.rotary_dim,
+           "rocm attn_qk_norm_rope: cos_sin must be [rows, rotary_dim]");
+  VT_CHECK(cos_sin.dtype == q3.dtype && q_norm.dtype == q3.dtype && k_norm.dtype == q3.dtype,
+           "rocm attn_qk_norm_rope: weights and cache must match the states' dtype");
+  if (q3.dtype == DType::kF32) {
+    Tensor q2d = q3;
+    q2d.rank = 2;
+    q2d.shape[0] = t * hq;
+    q2d.shape[1] = dh;
+    q2d.stride[0] = dh;
+    q2d.stride[1] = 1;
+    Tensor k2d = k3;
+    k2d.rank = 2;
+    k2d.shape[0] = t * hkv;
+    k2d.shape[1] = dh;
+    k2d.stride[0] = dh;
+    k2d.stride[1] = 1;
+    RmsNorm(q, q2d, q2d, q_norm, na, nullptr);
+    RmsNorm(q, k2d, k2d, k_norm, na, nullptr);
+    RopeFromCache(q, q3, &k3, positions, cos_sin, ra);
+    return;
+  }
+  VT_CHECK(q3.dtype == DType::kBF16,
+           "rocm attn_qk_norm_rope: states must be f32 or bf16");
+  const int64_t rot = ra.rotary_dim;
+  VT_CHECK(rot > 0 && rot % 2 == 0 && rot <= dh,
+           "rocm attn_qk_norm_rope: rotary_dim must be even and <= Dh");
+  hipStream_t s = AsStream(q);
+  auto launch = [&](auto t_tag, auto id_tag) {
+    using T = decltype(t_tag);
+    using Tid = decltype(id_tag);
+    if (hq > 0)
+      AttnQkNormRopeRowK<T, Tid><<<static_cast<unsigned>(t * hq), kBlock, 0, s>>>(
+          q3.Ptr<T>(), q_norm.Ptr<T>(), cos_sin.Ptr<T>(), positions.Ptr<Tid>(),
+          cos_sin.shape[0], hq, dh, q3.stride[1], rot, na.eps, ra.is_neox_style);
+    if (hkv > 0)
+      AttnQkNormRopeRowK<T, Tid><<<static_cast<unsigned>(t * hkv), kBlock, 0, s>>>(
+          k3.Ptr<T>(), k_norm.Ptr<T>(), cos_sin.Ptr<T>(), positions.Ptr<Tid>(),
+          cos_sin.shape[0], hkv, dh, k3.stride[1], rot, na.eps, ra.is_neox_style);
+  };
+  if (positions.dtype == DType::kI32) {
+    launch(__hip_bfloat16{}, int32_t{});
+  } else {
+    launch(__hip_bfloat16{}, int64_t{});
+  }
+  Check(hipGetLastError(), "attn_qk_norm_rope launch");
 }
 
 }  // namespace vt::rocm

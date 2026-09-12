@@ -15,6 +15,8 @@
 #include <type_traits>
 
 #include "vt/ops.h"
+#include "vt/rocm/rocm_device_bind.h"
+#include "vt/rocm/rocm_f16_codec.h"
 
 namespace vt::rocm {
 namespace {
@@ -54,7 +56,7 @@ __device__ inline void Store(T* p, int64_t i, T v) {
 template <typename Tin, typename Tout, typename Tid>
 __global__ void EmbeddingKernel(Tout* out, const Tin* table, const Tid* ids,
                                 int64_t n, int64_t h, int64_t v,
-                                EmbeddingErr* err) {
+                                EmbeddingErr* err, bool round_bf16) {
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        idx < n; idx += step) {
@@ -65,7 +67,12 @@ __global__ void EmbeddingKernel(Tout* out, const Tin* table, const Tid* ids,
       if (atomicCAS(&err->status, 0, 1) == 0) err->id = static_cast<long long>(id);
       id = id < 0 ? 0 : v - 1;
     }
-    if constexpr (std::is_same_v<Tin, Tout>) {
+    if constexpr (std::is_same_v<Tin, uint16_t>) {
+      float value = DF16ToF32(table[id * h + j]);
+      if (round_bf16) value = DBF16ToF32(DF32ToBF16(value));
+      if constexpr (std::is_same_v<Tout, float>) out[idx] = value;
+      else reinterpret_cast<uint16_t*>(out)[idx] = DF32ToBF16(value);
+    } else if constexpr (std::is_same_v<Tin, Tout>) {
       Store(out, idx, Load(table, id * h + j));
     } else if constexpr (std::is_same_v<Tin, float> &&
                          std::is_same_v<Tout, __hip_bfloat16>) {
@@ -87,10 +94,12 @@ void LaunchEmbedding(hipStream_t s, Tensor& out, const Tensor& table,
   if (n == 0) return;
   if (ids.dtype == DType::kI32) {
     EmbeddingKernel<Tin, Tout, int32_t><<<GridFor(n), kBlock, 0, s>>>(
-        out.Ptr<Tout>(), table.Ptr<Tin>(), ids.Ptr<int32_t>(), n, h, v, err);
+        out.Ptr<Tout>(), table.Ptr<Tin>(), ids.Ptr<int32_t>(), n, h, v, err,
+        table.weight_value_dtype == DType::kBF16);
   } else {
     EmbeddingKernel<Tin, Tout, int64_t><<<GridFor(n), kBlock, 0, s>>>(
-        out.Ptr<Tout>(), table.Ptr<Tin>(), ids.Ptr<int64_t>(), n, h, v, err);
+        out.Ptr<Tout>(), table.Ptr<Tin>(), ids.Ptr<int64_t>(), n, h, v, err,
+        table.weight_value_dtype == DType::kBF16);
   }
 }
 
@@ -108,8 +117,10 @@ void LaunchEmbeddingIn(hipStream_t s, Tensor& out, const Tensor& table,
 
 void EmbeddingKernelRocm(Queue& q, Tensor& out, const Tensor& table,
                          const Tensor& ids) {
-  VT_CHECK(table.dtype == DType::kF32 || table.dtype == DType::kBF16,
-           "rocm embedding: unsupported table dtype (f32/bf16 only)");
+  EnsureQueueDevice(q);
+  VT_CHECK(table.dtype == DType::kF32 || table.dtype == DType::kBF16 ||
+               table.dtype == DType::kF16,
+           "rocm embedding: unsupported table dtype (f16/f32/bf16 only)");
   VT_CHECK(out.dtype == DType::kF32 || out.dtype == DType::kBF16,
            "rocm embedding: unsupported out dtype");
   VT_CHECK(ids.dtype == DType::kI32 || ids.dtype == DType::kI64,
@@ -130,6 +141,8 @@ void EmbeddingKernelRocm(Queue& q, Tensor& out, const Tensor& table,
 
   if (table.dtype == DType::kF32) {
     LaunchEmbeddingIn<float>(s, out, table, ids, derr);
+  } else if (table.dtype == DType::kF16) {
+    LaunchEmbeddingIn<uint16_t>(s, out, table, ids, derr);
   } else {
     LaunchEmbeddingIn<__hip_bfloat16>(s, out, table, ids, derr);
   }

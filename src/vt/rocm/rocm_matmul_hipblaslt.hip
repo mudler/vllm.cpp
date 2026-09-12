@@ -25,6 +25,8 @@
 #include <unordered_map>
 #include <vector>
 
+#define VT_ROCM_F16_CONVERSION_IMPLEMENTATION
+#include "rocm_f16_conversion.h"
 #include "vt/grow_only_stream_scratch.h"
 #include "vt/ops.h"
 #include "vt/rocm/rocm_device_bind.h"
@@ -33,6 +35,67 @@
 #include "vt/rocm/rocm_skinny_gemm_arch.h"
 
 namespace vt::rocm {
+F16ScratchStats GetF16ScratchStats() {
+  auto& pool = f16_detail::Pool();
+  std::lock_guard<std::mutex> pool_lock(pool.mutex);
+  F16ScratchStats stats;
+  std::map<uintptr_t, size_t> allocations;
+  const auto record = [&](const auto& allocation) {
+    if (allocation)
+      allocations.emplace(reinterpret_cast<uintptr_t>(allocation->data), allocation->capacity);
+  };
+  stats.stream_count = pool.streams.size();
+  for (const auto& [key, entry] : pool.streams) {
+    std::lock_guard<std::mutex> lock(entry->mutex);
+    if (entry->current) stats.capacity_bytes += entry->current->capacity;
+    stats.high_water_bytes += entry->high_water;
+    record(entry->current);
+    for (const auto& allocation : entry->captured) record(allocation);
+  }
+  for (const auto& [graph, captured] : pool.graphs)
+    for (const auto& allocation : captured) record(allocation);
+  for (const auto& [pointer, bytes] : allocations) {
+    stats.allocation_pointers.push_back(pointer);
+    stats.retained_bytes += bytes;
+  }
+  return stats;
+}
+
+void ResetF16ScratchCapture(const Queue& q) {
+  // Drop owners outside both locks: a final hipFree may wait for device work.
+  auto captured = f16_detail::TakeCaptured(q);
+}
+void RetainF16ScratchCapture(const Queue& q, void* graph) {
+  auto captured = f16_detail::TakeCaptured(q);
+  if (captured.empty()) return;
+  auto& pool = f16_detail::Pool();
+  std::lock_guard<std::mutex> lock(pool.mutex);
+  VT_CHECK(pool.graphs.emplace(graph, std::move(captured)).second,
+           "ROCm F16 conversion: graph ownership already registered");
+}
+void ReleaseF16ScratchQueue(const Queue& q) {
+  std::shared_ptr<f16_detail::Scratch> released;
+  auto& pool = f16_detail::Pool();
+  {
+    std::lock_guard<std::mutex> lock(pool.mutex);
+    const auto found = pool.streams.find(f16_detail::Key(q));
+    if (found == pool.streams.end()) return;
+    released = std::move(found->second);
+    pool.streams.erase(found);
+  }
+}
+void ReleaseF16ScratchGraph(void* graph) {
+  f16_detail::Allocations released;
+  auto& pool = f16_detail::Pool();
+  {
+    std::lock_guard<std::mutex> lock(pool.mutex);
+    const auto found = pool.graphs.find(graph);
+    if (found == pool.graphs.end()) return;
+    released = std::move(found->second);
+    pool.graphs.erase(found);
+  }
+}
+
 namespace {
 
 void CheckHip(hipError_t err, const char* what) {
@@ -489,9 +552,15 @@ bool MatmulBTLt(hipStream_t stream, void* C, const void* A, const void* B, int M
 // with A,B,C stored row-major — i.e. pass dimensions swapped so BLAS
 // writes the transpose layout that coincides with row-major C.
 void MatmulKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
+  EnsureQueueDevice(q);
   const bool bf16 = a.dtype == DType::kBF16 && b.dtype == DType::kBF16;
   const bool f32 = a.dtype == DType::kF32 && b.dtype == DType::kF32;
-  if (!bf16 && !f32) {
+  const bool f16 = a.dtype == DType::kF16 && b.dtype == DType::kF16;
+  const bool float_pair = (a.dtype == DType::kF16 || a.dtype == DType::kBF16 ||
+                           a.dtype == DType::kF32) &&
+                          (b.dtype == DType::kF16 || b.dtype == DType::kBF16 ||
+                           b.dtype == DType::kF32);
+  if (!bf16 && !f32 && !f16 && !float_pair) {
     throw std::runtime_error("vt rocm: matmul: unsupported " + ComboName(a, b, out));
   }
   if (out.dtype != DType::kF32 && out.dtype != DType::kBF16) {
@@ -510,6 +579,21 @@ void MatmulKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   }
   if (a.stride[0] < K) {
     throw std::runtime_error("vt rocm: matmul: bad a stride");
+  }
+
+  if (const char* compute = std::getenv("VT_ROCM_GEMM_COMPUTE")) {
+    VT_CHECK(std::strcmp(compute, "16f") != 0,
+             "ROCm ordinary GEMM refuses VT_ROCM_GEMM_COMPUTE=16f: F32 scalars required");
+    VT_CHECK(std::strcmp(compute, "16bf") != 0 ||
+                 (a.dtype == DType::kBF16 &&
+                  (b.dtype == DType::kBF16 || b.weight_value_dtype == DType::kBF16)),
+             "ROCm ordinary GEMM refuses VT_ROCM_GEMM_COMPUTE=16bf for this input pair");
+  }
+  if (f16_detail::NeedsAdaptation(out, a, b)) {
+    f16_detail::Prepared prepared(q, out, a, b);
+    MatmulKernelRocm(q, prepared.out, prepared.a, prepared.b);
+    prepared.Finish();
+    return;
   }
 
   auto ctx = GetBlas(q.device.index, s);
@@ -543,7 +627,12 @@ void MatmulBTKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
   EnsureQueueDevice(q);
   const bool bf16 = a.dtype == DType::kBF16 && b.dtype == DType::kBF16;
   const bool f32 = a.dtype == DType::kF32 && b.dtype == DType::kF32;
-  if (!bf16 && !f32) {
+  const bool f16 = a.dtype == DType::kF16 && b.dtype == DType::kF16;
+  const bool float_pair = (a.dtype == DType::kF16 || a.dtype == DType::kBF16 ||
+                           a.dtype == DType::kF32) &&
+                          (b.dtype == DType::kF16 || b.dtype == DType::kBF16 ||
+                           b.dtype == DType::kF32);
+  if (!bf16 && !f32 && !f16 && !float_pair) {
     throw std::runtime_error("vt rocm: matmul_bt: unsupported " + ComboName(a, b, out));
   }
   if (out.dtype != DType::kF32 && out.dtype != DType::kBF16) {
@@ -561,6 +650,21 @@ void MatmulBTKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
   }
   if (a.stride[0] < K) {
     throw std::runtime_error("vt rocm: matmul_bt: bad a stride");
+  }
+
+  if (const char* compute = std::getenv("VT_ROCM_GEMM_COMPUTE")) {
+    VT_CHECK(std::strcmp(compute, "16f") != 0,
+             "ROCm ordinary GEMM refuses VT_ROCM_GEMM_COMPUTE=16f: F32 scalars required");
+    VT_CHECK(std::strcmp(compute, "16bf") != 0 ||
+                 (a.dtype == DType::kBF16 &&
+                  (b.dtype == DType::kBF16 || b.weight_value_dtype == DType::kBF16)),
+             "ROCm ordinary GEMM refuses VT_ROCM_GEMM_COMPUTE=16bf for this input pair");
+  }
+  if (f16_detail::NeedsAdaptation(out, a, b)) {
+    f16_detail::Prepared prepared(q, out, a, b);
+    MatmulBTKernelRocm(q, prepared.out, prepared.a, prepared.b);
+    prepared.Finish();
+    return;
   }
 
   // Decode-skinny (M<=4) bf16: the wvSplitK port wins over the 128-tile GEMM

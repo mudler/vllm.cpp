@@ -1,0 +1,15 @@
+{
+  "argv": [
+    "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-cpu/tests/test_ops_residual_rmsnorm"
+  ],
+  "env": {
+    "VT_RESIDUAL_NORM_UPSTREAM": "/home/vikash/.cache/residual-norm-impl/upstream-freeze/results",
+    "OMP_NUM_THREADS": "4",
+    "TMPDIR": "/home/vikash/.cache/residual-norm-repair1/tmp"
+  },
+  "exit_code": 0,
+  "seconds": 45.94254233408719,
+  "log_sha256": "8e281532f0750b8bc3f214f640d3d3db76ef1cdc72de766c702b801339444d68",
+  "binary_sha256": "6470de98c0e5f56cde1e4691d21f8cbe8f1c67c3975d6793fc89e01eb02ec828",
+  "gpu_work": false
+}

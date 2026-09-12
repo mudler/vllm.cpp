@@ -106,6 +106,7 @@ Do not use a run with CPU fallbacks as a performance result.
 | Kernels | [`src/vt/rocm/`](../src/vt/rocm/) | Dense, GDN, attention, sampling, and the contributor-tested Gemma 4 FP8 MoE path |
 | Platform | [`src/vllm/platforms/rocm.cpp`](../src/vllm/platforms/rocm.cpp) | Runtime-verified on five gfx architectures |
 | Attention | [`src/vt/rocm/rocm_paged_attn.hip`](../src/vt/rocm/rocm_paged_attn.hip) | Native paged attention and the SharedK WMMA prefill path |
+| Grouped BF16 experts | [`src/vt/rocm/rocm_moe_grouped_bf16.hip`](../src/vt/rocm/rocm_moe_grouped_bf16.hip) | Native gate/up, weighted down, and preweighted combine through shared MoE operations; component tests pass on gfx1100. The Qwen3 MoE production token gate remains open ([spec](../.agents/specs/rocm-bf16-moe.md)) |
 | Build | [`CMakeLists.txt`](../CMakeLists.txt) | `VLLM_CPP_HIP` configuration and build verified on five architectures |
 | Tests | [`tests/vt/test_rocm_backend.cpp`](../tests/vt/test_rocm_backend.cpp) | Runtime cases pass; the allocation-path case asserts the #2511 coupling on the board it runs on |
 

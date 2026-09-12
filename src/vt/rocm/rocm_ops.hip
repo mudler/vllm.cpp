@@ -86,6 +86,15 @@ void ApplyLogitBiasKernelRocm(Queue& q, Tensor& logits, const Tensor& rows, cons
                               const Tensor& biases);
 // Companion MoE-path op (same TU): elementwise silu(gate)*up.
 void MoeSiluMulKernelRocm(Queue& q, Tensor& out, const Tensor& gate, const Tensor& up);
+void MoeGroupedGemmBf16KernelRocm(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                  const Tensor*, const Tensor&);
+void MoeGroupedGemmBf16GateUpSiluKernelRocm(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                           const Tensor*, const Tensor&, const Tensor&);
+void MoeGroupedGemmBf16GateUpSiluNativeKernelRocm(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                                 const Tensor*, const Tensor&, const Tensor&);
+void MoeGroupedGemmBf16WeightedKernelRocm(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                          const Tensor*, const Tensor&, const Tensor&);
+void MoeCombinePreweightedKernelRocm(Queue&, Tensor&, const Tensor&, const Tensor*, float);
 // MoE-path combine/gate ops (rocm_moe_chain.hip): shared-expert gate and the
 // weighted expert combinations.
 void SharedExpertGateKernelRocm(Queue& q, Tensor& out, const Tensor& sd, const Tensor& gl);
@@ -159,6 +168,7 @@ void RmsNormGatedKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor
                             const Tensor& w, const RmsNormGatedArgs& args);
 void SigmoidGateBf16KernelRocm(Queue& q, Tensor& out, const Tensor& attn,
                                const Tensor& gate);
+void AttnGateSplitKernelRocm(Queue& q, Tensor& query, Tensor& gate, const Tensor& packed);
 // BACKEND-ROCM-EXL3 (rocm_exl3.hip): the fused EXL3 trellis linear, transcribed
 // from the PORTABLE CPU reference (cpu_exl3_kernels.cpp / cpu_exl3_dequant.cpp)
 // and not from the CUDA kernel, whose 90 KiB shared-memory budget, m16n8k16 mma,
@@ -173,6 +183,13 @@ void Exl3GemmKernelRocm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
 void FusedNormRopeKernelRocm(Queue& q, Tensor& latent_out, Tensor& pe_out, const Tensor& x,
                              const Tensor& w, const Tensor& positions, const Tensor& cache,
                              const RmsNormArgs& norm_args, const RopeArgs& rope_args);
+// The gate-free sibling (rocm_gdn_fused.hip): the Qwen3-dense qk-norm + partial
+// RoPE preamble. Registered so the fused-chain recipe `kAttnQkNormRope` takes its
+// fast realisation on ROCm instead of the Tier-0 composite.
+void AttnQkNormRopeKernelRocm(Queue& q, Tensor& q3, Tensor& k3, const Tensor& q_norm,
+                              const Tensor& k_norm, const Tensor& cos_sin,
+                              const Tensor& positions, const RmsNormArgs& na,
+                              const RopeArgs& ra);
 void AttnQkNormRopeGateKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& gate_out,
                                   const Tensor& qgate, const Tensor& kf,
                                   const Tensor& q_norm, const Tensor& k_norm,
@@ -272,6 +289,21 @@ struct Registrar {
                    static_cast<ApplyTokenMaskFn>(&ApplyTokenMaskKernelRocm)));
     RegisterOp(OpId::kMoeSiluMul, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<MoeSiluMulFn>(&MoeSiluMulKernelRocm)));
+    RegisterOp(OpId::kMoeGroupedGemmBf16, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<MoeGroupedGemmBf16Fn>(
+                   &MoeGroupedGemmBf16KernelRocm)));
+    RegisterOp(OpId::kMoeGroupedGemmBf16GateUpSilu, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<MoeGroupedGemmBf16GateUpSiluFn>(
+                   &MoeGroupedGemmBf16GateUpSiluKernelRocm)));
+    RegisterOp(OpId::kMoeGroupedGemmBf16GateUpSiluNative, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<MoeGroupedGemmBf16GateUpSiluNativeFn>(
+                   &MoeGroupedGemmBf16GateUpSiluNativeKernelRocm)));
+    RegisterOp(OpId::kMoeGroupedGemmBf16Weighted, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<MoeGroupedGemmBf16WeightedFn>(
+                   &MoeGroupedGemmBf16WeightedKernelRocm)));
+    RegisterOp(OpId::kMoeCombinePreweighted, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<MoeCombinePreweightedFn>(
+                   &MoeCombinePreweightedKernelRocm)));
     RegisterOp(OpId::kSharedExpertGate, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<SharedExpertGateFn>(&SharedExpertGateKernelRocm)));
@@ -322,6 +354,8 @@ struct Registrar {
     RegisterOp(OpId::kSigmoidGateBf16, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<SigmoidGateBf16Fn>(&SigmoidGateBf16KernelRocm)));
+    RegisterOp(OpId::kAttnGateSplit, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<AttnGateSplitFn>(&AttnGateSplitKernelRocm)));
     RegisterOp(OpId::kExl3Gemm, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<Exl3GemmFn>(&Exl3GemmKernelRocm)));
     RegisterOp(
@@ -330,6 +364,9 @@ struct Registrar {
     RegisterOp(OpId::kAttnQkNormRopeGate, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<AttnQkNormRopeGateFn>(&AttnQkNormRopeGateKernelRocm)));
+    RegisterOp(OpId::kAttnQkNormRope, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<AttnQkNormRopeFn>(&AttnQkNormRopeKernelRocm)));
     // MLA/DSA campaign W1 (#2715). Before these lines each of these four
     // resolved to NO native ROCm kernel: the portable CPU reference tier where
     // it is eligible (which docs/ROCM.md:60-61 disqualifies a performance result

@@ -98,7 +98,12 @@ std::unique_ptr<LoadedModel> LoadQwen3_5DenseModel(
     // `platforms::CurrentPlatform()`. The two disagree on `--device cpu` on a
     // CUDA-capable process, and this hook is where the disagreement reached the
     // loader.
-    const GgufLoadPolicy gguf_policy = GgufLoadPolicy::FromEnv(source.device);
+    const GgufLoadPolicy gguf_policy =
+        GgufLoadPolicy::FromEnv(source.device, detail::ActDType(source.device));
+    VT_CHECK(!gguf_policy.weight_value_dtype || config.torch_dtype.empty() ||
+                 config.torch_dtype == "bfloat16" || config.torch_dtype == "bf16",
+             "Qwen3.5 retained F16 GGUF: this forward resolves BF16 model values; "
+             "an unsupported model dtype cannot silently select BF16 semantics");
     return std::make_unique<Qwen3_5DenseLoadedModel>(
         registration,
         LoadQwen3_5DenseFromGguf(*source.gguf, config, &gguf_policy));

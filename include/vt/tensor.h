@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <initializer_list>
+#include <optional>
 
 #include "vt/device.h"
 #include "vt/dtype.h"
@@ -52,6 +53,11 @@ struct Tensor {
   // on non-CPU devices. Mutually exclusive with the block-quant flags above,
   // which apply to block dtypes this one never does.
   bool elem_kn_repacked = false;
+
+  // Weight-only value contract for ordinary Matmul/MatmulBT B and Embedding
+  // table operands. Storage remains F16; ROCm converts to BF16 or F32 values
+  // before arithmetic. Unset preserves exact storage values.
+  std::optional<DType> weight_value_dtype;
 
   static Tensor Contiguous(void* data, DType dtype, Device device,
                            std::initializer_list<int64_t> shape);

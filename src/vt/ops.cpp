@@ -1,11 +1,14 @@
 // vllm.cpp original (vt runtime, inventory deviation §9.1); no upstream mirror.
 #include "vt/ops.h"
+#include "vt/recipes.h"
 #include "vt/paged_attn_route.h"  // W10 repair (#1865): the uniform-spec shape guard
 
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 // CheckConvCommon asks the BACKEND whether it can address a compressed
@@ -24,6 +27,29 @@ namespace {
 // them at once with zero call-site edits.
 bool IsFloat(DType d) { return d == DType::kF32 || d == DType::kF16 || d == DType::kBF16; }
 bool IsOutFloat(DType d) { return d == DType::kF32 || d == DType::kBF16; }
+// Retained model values are scoped to ordinary weights, never activations.
+void ValidateWeightValues(const Tensor& weight, const Tensor& other,
+                          const Tensor& out, const Queue& q) {
+  VT_CHECK(!other.weight_value_dtype && !out.weight_value_dtype,
+           "weight_value_dtype is invalid on activation, ID, or output operands");
+  if (!weight.weight_value_dtype) return;
+  VT_CHECK(weight.dtype == DType::kF16 &&
+               (*weight.weight_value_dtype == DType::kBF16 ||
+                *weight.weight_value_dtype == DType::kF32),
+           "weight_value_dtype requires F16 storage with BF16 or F32 values");
+  VT_CHECK(q.device.type == DeviceType::kROCM,
+           "weight_value_dtype requires the native ROCm provider");
+}
+
+void* ResolveWeightOp(OpId op, const Queue& q, const Tensor& weight) {
+  void* fn = GetOp(op, q.device.type);
+  if (weight.weight_value_dtype) {
+    const char* selected = GetOpProviderStats(op, q.device.type).last_selected;
+    VT_CHECK(selected && std::strcmp(selected, kNativeProviderName) == 0,
+             "weight_value_dtype requires the native ROCm provider");
+  }
+  return fn;
+}
 }  // namespace
 
 ScalarTypeId ToScalarType(DType dtype) {
@@ -116,6 +142,7 @@ WorkspaceKey MakeWorkspaceKey(const Queue& q, OpId op, WorkspaceSlot slot) {
 }
 
 void Matmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
+  ValidateWeightValues(b, a, out, q);
   VT_CHECK(a.rank == 2 && b.rank == 2 && out.rank == 2, "matmul: rank-2 tensors required");
   VT_CHECK(a.shape[1] == b.shape[0], "matmul: inner dims mismatch");
   VT_CHECK(out.shape[0] == a.shape[0] && out.shape[1] == b.shape[1],
@@ -126,7 +153,7 @@ void Matmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
            "matmul: contiguous tensors required");
   VT_CHECK(a.device == b.device && a.device == out.device && a.device == q.device,
            "matmul: device mismatch");
-  reinterpret_cast<MatmulFn>(GetOp(OpId::kMatmul, q.device.type))(q, out, a, b);
+  reinterpret_cast<MatmulFn>(ResolveWeightOp(OpId::kMatmul, q, b))(q, out, a, b);
 }
 
 void DropinProbe(Queue& q, Tensor& out, const Tensor& in,
@@ -149,6 +176,7 @@ void DropinProbe(Queue& q, Tensor& out, const Tensor& in,
 }
 
 void MatmulBT(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
+  ValidateWeightValues(b, a, out, q);
   // GGUF compute-in-quant (QUANT-GGUF-CIQ-GEMM work row G4). A block-quantized
   // weight is NOT an elementwise tensor — it has no per-element stride and
   // cannot be read by kMatmulBT — but it IS in exactly the [N, K] orientation
@@ -185,7 +213,7 @@ void MatmulBT(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
            "matmul_bt: contiguous weight and output required");
   VT_CHECK(a.device == b.device && a.device == out.device && a.device == q.device,
            "matmul_bt: device mismatch");
-  reinterpret_cast<MatmulFn>(GetOp(OpId::kMatmulBT, q.device.type))(q, out, a, b);
+  reinterpret_cast<MatmulFn>(ResolveWeightOp(OpId::kMatmulBT, q, b))(q, out, a, b);
 }
 
 // vt::MatmulBTQuant — see ops.h. Validation mirrors MatmulBT except for the
@@ -903,7 +931,8 @@ void MoeGroupedGemmNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor&
       q, out, act, expert_ids, row_map, packed_ptrs, scale_ptrs, scale2s);
 }
 
-void MoeGroupedGemmBf16(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
+namespace {
+void ValidateMoeGroupedGemmBf16(Queue& q, const Tensor& out, const Tensor& act, const Tensor& expert_ids,
                         const Tensor* row_map, const Tensor& weight_ptrs) {
   VT_CHECK(out.rank == 2 && act.rank == 2, "moe_grouped_gemm_bf16: out/act must be rank-2");
   const int64_t p = out.shape[0], e = weight_ptrs.shape[0];
@@ -925,11 +954,18 @@ void MoeGroupedGemmBf16(Queue& q, Tensor& out, const Tensor& act, const Tensor& 
                  row_map->device == q.device,
              "moe_grouped_gemm_bf16: row_map must be contiguous i32 [P] on the queue device");
   }
+}
+}  // namespace
+
+void MoeGroupedGemmBf16(Queue& q, Tensor& out, const Tensor& act, const Tensor& expert_ids,
+                        const Tensor* row_map, const Tensor& weight_ptrs) {
+  ValidateMoeGroupedGemmBf16(q, out, act, expert_ids, row_map, weight_ptrs);
   reinterpret_cast<MoeGroupedGemmBf16Fn>(GetOp(OpId::kMoeGroupedGemmBf16, q.device.type))(
       q, out, act, expert_ids, row_map, weight_ptrs);
 }
 
-void MoeGroupedGemmBf16GateUpSilu(Queue& q, Tensor& out, const Tensor& act,
+namespace {
+void ValidateMoeGroupedGemmBf16GateUpSilu(Queue& q, const Tensor& out, const Tensor& act,
                                   const Tensor& expert_ids, const Tensor* row_map,
                                   const Tensor& gate_ptrs, const Tensor& up_ptrs) {
   VT_CHECK(out.rank == 2 && act.rank == 2,
@@ -956,9 +992,66 @@ void MoeGroupedGemmBf16GateUpSilu(Queue& q, Tensor& out, const Tensor& act,
                  row_map->device == q.device,
              "moe_grouped_gemm_bf16_gate_up_silu: row_map must be contiguous i32 [P] on the device");
   }
+}
+}  // namespace
+
+void MoeGroupedGemmBf16GateUpSilu(Queue& q, Tensor& out, const Tensor& act,
+                                  const Tensor& expert_ids, const Tensor* row_map,
+                                  const Tensor& gate_ptrs, const Tensor& up_ptrs) {
+  ValidateMoeGroupedGemmBf16GateUpSilu(q, out, act, expert_ids, row_map, gate_ptrs, up_ptrs);
   reinterpret_cast<MoeGroupedGemmBf16GateUpSiluFn>(
       GetOp(OpId::kMoeGroupedGemmBf16GateUpSilu, q.device.type))(q, out, act, expert_ids, row_map,
                                                                 gate_ptrs, up_ptrs);
+}
+
+void MoeGroupedGemmBf16GateUpSiluNative(Queue& q, Tensor& out, const Tensor& act,
+                                      const Tensor& expert_ids, const Tensor* row_map,
+                                      const Tensor& gate_ptrs, const Tensor& up_ptrs) {
+  ValidateMoeGroupedGemmBf16GateUpSilu(q, out, act, expert_ids, row_map, gate_ptrs, up_ptrs);
+  reinterpret_cast<MoeGroupedGemmBf16GateUpSiluNativeFn>(
+      GetOp(OpId::kMoeGroupedGemmBf16GateUpSiluNative, q.device.type))(
+      q, out, act, expert_ids, row_map, gate_ptrs, up_ptrs);
+}
+
+void MoeGroupedGemmBf16Weighted(Queue& q, Tensor& out, const Tensor& act,
+                               const Tensor& expert_ids, const Tensor* row_map,
+                               const Tensor& weight_ptrs, const Tensor& route_weights) {
+  ValidateMoeGroupedGemmBf16(q, out, act, expert_ids, row_map, weight_ptrs);
+  VT_CHECK(route_weights.rank == 1 && route_weights.Numel() == out.shape[0] &&
+               route_weights.dtype == DType::kF32 && route_weights.IsContiguous() &&
+               route_weights.device == q.device,
+           "moe_grouped_gemm_bf16_weighted: route_weights must be contiguous f32 [P] on the device");
+  reinterpret_cast<MoeGroupedGemmBf16WeightedFn>(
+      GetOp(OpId::kMoeGroupedGemmBf16Weighted, q.device.type))(
+      q, out, act, expert_ids, row_map, weight_ptrs, route_weights);
+}
+
+void MoeCombinePreweighted(Queue& q, Tensor& out, const Tensor& expert_out,
+                           const Tensor* shared, float routed_scale) {
+  VT_CHECK(out.rank == 2 && expert_out.rank == 3 &&
+               expert_out.shape[0] == out.shape[0] && expert_out.shape[2] == out.shape[1],
+           "moe_combine_preweighted: expert_out [T,K,H] must match out [T,H]");
+  VT_CHECK(expert_out.dtype == DType::kBF16 && IsOutFloat(out.dtype),
+           "moe_combine_preweighted: expert_out must be bf16, out must be f32/bf16");
+  VT_CHECK(expert_out.IsContiguous() && out.IsContiguous() &&
+               expert_out.device == q.device && out.device == q.device,
+           "moe_combine_preweighted: contiguous tensors on the queue device required");
+  if (shared != nullptr) {
+    VT_CHECK(shared->rank == 2 && shared->shape[0] == out.shape[0] &&
+                 shared->shape[1] == out.shape[1] && IsOutFloat(shared->dtype) &&
+                 shared->IsContiguous() && shared->device == q.device,
+             "moe_combine_preweighted: shared must be f32/bf16 [T,H] on the queue device");
+  }
+  reinterpret_cast<MoeCombinePreweightedFn>(
+      GetOp(OpId::kMoeCombinePreweighted, q.device.type))(q, out, expert_out, shared, routed_scale);
+}
+
+bool MoeGroupedBf16NativeAvailable(DeviceType device) {
+  return OpRegistered(OpId::kMoeGroupedGemmBf16, device) &&
+         OpRegistered(OpId::kMoeGroupedGemmBf16GateUpSilu, device) &&
+         OpRegistered(OpId::kMoeGroupedGemmBf16GateUpSiluNative, device) &&
+         OpRegistered(OpId::kMoeGroupedGemmBf16Weighted, device) &&
+         OpRegistered(OpId::kMoeCombinePreweighted, device);
 }
 
 void MoeGroupedGemmNvfp4Marlin(Queue& q, Tensor& c, const Tensor& a, const Tensor& b_q_weight,
@@ -1046,6 +1139,88 @@ void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                                                                     residual);
 }
 
+void ResidualRmsNorm(Queue& q, Tensor& out, const Tensor& a, const Tensor& base,
+                     const Tensor* delta, const Tensor& weight,
+                     const ResidualRmsNormArgs& args, Tensor* residual_out) {
+  const auto& desc = args.descriptor;
+  VT_CHECK(desc.expression == ResidualNormExpr::kAdd ||
+               desc.expression == ResidualNormExpr::kDeltaPlusAdd,
+           "residual_rmsnorm: invalid expression order");
+  const bool triple = desc.expression == ResidualNormExpr::kDeltaPlusAdd;
+  VT_CHECK(triple == (delta != nullptr), "residual_rmsnorm: expression operand count mismatch");
+  VT_CHECK(desc.materialize_residual == (residual_out != nullptr),
+           "residual_rmsnorm: materialization descriptor/output mismatch");
+  VT_CHECK(!desc.output_alias_delta || triple,
+           "residual_rmsnorm: output alias requires a delta operand");
+  VT_CHECK(!desc.residual_alias_base || desc.materialize_residual,
+           "residual_rmsnorm: base alias requires residual materialization");
+  VT_CHECK(std::isfinite(args.eps) && args.eps >= 0.0f,
+           "residual_rmsnorm: epsilon must be finite and nonnegative");
+  VT_CHECK(a.rank == 2 && a.shape[0] >= 0 && a.shape[1] > 0,
+           "residual_rmsnorm: expected nonnegative rows and positive hidden width");
+  VT_CHECK(q.device.index >= 0, "residual_rmsnorm: queue device index must be nonnegative");
+  const auto row_bytes = [&](const Tensor& tensor) -> size_t {
+    VT_CHECK(tensor.rank == 2 && tensor.shape[0] == a.shape[0] &&
+                 tensor.shape[1] == a.shape[1], "residual_rmsnorm: row shape mismatch");
+    VT_CHECK(tensor.dtype == DType::kBF16, "residual_rmsnorm: BF16 activation/output required");
+    VT_CHECK(tensor.device == q.device, "residual_rmsnorm: queue/tensor device mismatch");
+    VT_CHECK(tensor.stride[1] == 1 && tensor.stride[0] >= tensor.shape[1],
+             "residual_rmsnorm: unit inner stride and nonoverlapping rows required");
+    if (tensor.shape[0] == 0) return 0;
+    const auto rows = static_cast<uint64_t>(tensor.shape[0]);
+    const auto width = static_cast<uint64_t>(tensor.shape[1]);
+    const auto stride = static_cast<uint64_t>(tensor.stride[0]);
+    const uint64_t max_elements = std::numeric_limits<size_t>::max() / sizeof(uint16_t);
+    VT_CHECK(width <= max_elements && (rows - 1) <= (max_elements - width) / stride,
+             "residual_rmsnorm: row storage span overflow");
+    const size_t bytes = static_cast<size_t>((rows - 1) * stride + width) * sizeof(uint16_t);
+    const uintptr_t start = reinterpret_cast<uintptr_t>(tensor.data);
+    VT_CHECK(start != 0 && start % alignof(uint16_t) == 0 &&
+                 start <= std::numeric_limits<uintptr_t>::max() - bytes,
+             "residual_rmsnorm: invalid or unaligned row data");
+    return bytes;
+  };
+  const size_t a_bytes = row_bytes(a), base_bytes = row_bytes(base), out_bytes = row_bytes(out);
+  const size_t delta_bytes = delta == nullptr ? 0 : row_bytes(*delta);
+  const size_t res_bytes = residual_out == nullptr ? 0 : row_bytes(*residual_out);
+  VT_CHECK(weight.rank == 1 && weight.shape[0] == a.shape[1] && weight.stride[0] == 1 &&
+               weight.dtype == DType::kBF16 && weight.device == q.device,
+           "residual_rmsnorm: gamma must be contiguous BF16 [H] on the queue device");
+  const uintptr_t w_start = reinterpret_cast<uintptr_t>(weight.data);
+  const auto w_width = static_cast<uint64_t>(weight.shape[0]);
+  VT_CHECK(w_width <= std::numeric_limits<size_t>::max() / sizeof(uint16_t),
+           "residual_rmsnorm: gamma storage span overflow");
+  const size_t w_bytes = static_cast<size_t>(w_width) * sizeof(uint16_t);
+  VT_CHECK(w_start != 0 && w_start % alignof(uint16_t) == 0 &&
+               w_start <= std::numeric_limits<uintptr_t>::max() - w_bytes,
+           "residual_rmsnorm: invalid or unaligned gamma data");
+  const auto overlaps = [](const Tensor& lhs, size_t lhs_bytes,
+                            const Tensor& rhs, size_t rhs_bytes) {
+    const uintptr_t left = reinterpret_cast<uintptr_t>(lhs.data);
+    const uintptr_t right = reinterpret_cast<uintptr_t>(rhs.data);
+    return lhs_bytes != 0 && rhs_bytes != 0 && left < right + rhs_bytes && right < left + lhs_bytes;
+  };
+  const auto same_view = [](const Tensor& lhs, const Tensor& rhs) {
+    return lhs.data == rhs.data && lhs.stride[0] == rhs.stride[0];
+  };
+  for (const auto& input : {std::pair<const Tensor*, size_t>{&a, a_bytes},
+                            {&base, base_bytes}, {delta, delta_bytes}, {&weight, w_bytes}}) {
+    if (input.first == nullptr) continue;
+    VT_CHECK(!overlaps(out, out_bytes, *input.first, input.second) ||
+                 (input.first == delta && desc.output_alias_delta && same_view(out, *delta)),
+             "residual_rmsnorm: normalized output overlaps a read-only input");
+    if (residual_out != nullptr)
+      VT_CHECK(!overlaps(*residual_out, res_bytes, *input.first, input.second) ||
+                   (input.first == &base && desc.residual_alias_base && same_view(*residual_out, base)),
+               "residual_rmsnorm: residual output overlaps a read-only input");
+  }
+  VT_CHECK(residual_out == nullptr || !overlaps(out, out_bytes, *residual_out, res_bytes),
+           "residual_rmsnorm: outputs must not overlap");
+  if (a.shape[0] == 0) return;
+  reinterpret_cast<ResidualRmsNormFn>(GetOp(OpId::kResidualRmsNorm, q.device.type))(
+      q, out, a, base, delta, weight, args, residual_out);
+}
+
 void RmsNormGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                   const RmsNormGroupArgs& args) {
   VT_CHECK(x.rank == 2 && out.rank == 2 && weight.rank == 1,
@@ -1101,6 +1276,24 @@ void FusedChainCompositeImpl(Queue& q, const FusedRecipe& r, const FusedBinding&
   for (int s = 0; s < r.n; ++s) {
     const FStep& st = r.steps[s];
     switch (st.op) {
+      case FOp::kResidualRmsNorm: {
+        VT_CHECK(!add_pending, "fused_chain: residual expression cannot consume a pending add");
+        const bool triple = st.residual_norm.expression == ResidualNormExpr::kDeltaPlusAdd;
+        VT_CHECK(st.nin == (triple ? 4 : 3), "fused_chain: residual expression input count");
+        VT_CHECK((st.out2 != kNoOperand) == st.residual_norm.materialize_residual,
+                 "fused_chain: residual expression materialization mismatch");
+        VT_CHECK(st.reduce == FReduce::kMeanSquare && !st.gemma && !st.sigmoid_gate &&
+                     !st.norm_full_width, "fused_chain: invalid residual expression modifiers");
+        Tensor* out = FusedOp(b, st.out, "fused_chain: null residual norm output");
+        Tensor* a = FusedOp(b, st.in[0], "fused_chain: null residual expression a");
+        Tensor* base = FusedOp(b, st.in[1], "fused_chain: null residual expression base");
+        Tensor* delta = triple ? FusedOp(b, st.in[2], "fused_chain: null delta") : nullptr;
+        Tensor* weight = FusedOp(b, st.in[triple ? 3 : 2], "fused_chain: null residual gamma");
+        Tensor* residual = st.out2 == kNoOperand ? nullptr : FusedOp(b, st.out2, "fused_chain: null materialized residual");
+        ResidualRmsNorm(q, *out, *a, *base, delta, *weight,
+                        ResidualRmsNormArgs{p.eps, st.residual_norm}, residual);
+        break;
+      }
       case FOp::kAdd:
         // Residual-add producing the residual stream: fold into the next kRmsNorm.
         VT_CHECK(st.nin == 2 && st.out == st.in[1],
@@ -1299,6 +1492,28 @@ void FusedChain(Queue& q, const FusedRecipe& recipe, const FusedBinding& binding
     return;
   }
   FusedChainComposite(q, recipe, binding, params);
+}
+
+void FusedChain(Queue& q, Tensor& out, const Tensor& a, const Tensor& base,
+                const Tensor* delta, const Tensor& weight,
+                const ResidualRmsNormArgs& args, Tensor* residual_out) {
+  FusedBinding binding{};
+  binding.n = 6;
+  binding.op[0] = const_cast<Tensor*>(&a);
+  binding.op[1] = const_cast<Tensor*>(&base);
+  binding.op[2] = const_cast<Tensor*>(delta);
+  binding.op[3] = const_cast<Tensor*>(&weight);
+  binding.op[4] = &out;
+  binding.op[5] = residual_out;
+  // Preserve mismatched optional arguments until the typed validation can reject
+  // them. A recipe cannot silently hide an unexpected delta or residual output.
+  VT_CHECK((delta != nullptr) == (args.descriptor.expression == ResidualNormExpr::kDeltaPlusAdd),
+           "fused_chain: residual expression operand count mismatch");
+  VT_CHECK((residual_out != nullptr) == args.descriptor.materialize_residual,
+           "fused_chain: residual expression materialization mismatch");
+  FusedParams params{};
+  params.eps = args.eps;
+  FusedChain(q, ResidualRmsNormRecipe(args.descriptor), binding, params);
 }
 
 void FusedChain(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, Tensor* residual,
@@ -1520,6 +1735,7 @@ void Add(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
 }
 
 void Embedding(Queue& q, Tensor& out, const Tensor& table, const Tensor& ids) {
+  ValidateWeightValues(table, ids, out, q);
   VT_CHECK(table.rank == 2 && ids.rank == 1 && out.rank == 2, "embedding: bad ranks");
   VT_CHECK(out.shape[0] == ids.shape[0] && out.shape[1] == table.shape[1],
            "embedding: output shape mismatch");
@@ -1556,7 +1772,7 @@ void Embedding(Queue& q, Tensor& out, const Tensor& table, const Tensor& ids) {
   // here -- GetOp throws naming the op and the device -- rather than dispatch
   // into a kernel that would assert on the dtype one frame later.
   const OpId op = IsBlockQuant(table.dtype) ? OpId::kEmbeddingQuant : OpId::kEmbedding;
-  reinterpret_cast<EmbeddingFn>(GetOp(op, q.device.type))(q, out, table, ids);
+  reinterpret_cast<EmbeddingFn>(ResolveWeightOp(op, q, table))(q, out, table, ids);
 }
 
 void RopeNeox(Queue& q, Tensor& q_states, Tensor& k_states, const Tensor& positions,
@@ -1756,6 +1972,40 @@ void AttnQkNormRopeGate(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& gate_out
            "attn_qk_norm_rope_gate: device mismatch");
   reinterpret_cast<AttnQkNormRopeGateFn>(GetOp(OpId::kAttnQkNormRopeGate, q.device.type))(
       q, q_out, k_out, gate_out, qgate, kf, q_norm, k_norm, cos_sin, norm_args, rope_args);
+}
+
+void AttnQkNormRope(Queue& q, Tensor& q3, Tensor& k3, const Tensor& q_norm,
+                    const Tensor& k_norm, const Tensor& cos_sin, const Tensor& positions,
+                    const RmsNormArgs& norm_args, const RopeArgs& rope_args) {
+  VT_CHECK(q3.rank == 3 && k3.rank == 3, "attn_qk_norm_rope: q3/k3 rank-3 [T,H,Dh]");
+  const int64_t t = q3.shape[0], dh = q3.shape[2];
+  VT_CHECK(k3.shape[0] == t && k3.shape[2] == dh, "attn_qk_norm_rope: k3 must be [T,Hkv,Dh]");
+  VT_CHECK(q3.dtype == k3.dtype, "attn_qk_norm_rope: q3/k3 dtype");
+  VT_CHECK(IsFloat(q3.dtype), "attn_qk_norm_rope: q3/k3 must be f32 or bf16");
+  VT_CHECK(q_norm.rank == 1 && q_norm.shape[0] == dh && k_norm.rank == 1 &&
+               k_norm.shape[0] == dh,
+           "attn_qk_norm_rope: q_norm/k_norm must be [Dh]");
+  VT_CHECK(positions.rank == 1 && positions.shape[0] == t,
+           "attn_qk_norm_rope: positions must be [T]");
+  VT_CHECK(rope_args.rotary_dim > 0 && rope_args.rotary_dim % 2 == 0 &&
+               rope_args.rotary_dim <= dh,
+           "attn_qk_norm_rope: rotary_dim must be even and <= Dh");
+  VT_CHECK(cos_sin.rank == 2 && cos_sin.shape[0] > 0 &&
+               cos_sin.shape[1] == rope_args.rotary_dim,
+           "attn_qk_norm_rope: cos_sin must be [rows, rotary_dim]");
+  VT_CHECK(q3.IsContiguous() && k3.IsContiguous() && q_norm.IsContiguous() &&
+               k_norm.IsContiguous() && cos_sin.IsContiguous() && positions.IsContiguous(),
+           "attn_qk_norm_rope: states/weights/cache/index must be contiguous");
+  // The fused op rotates the in-place operands, so the 2-D alias the composite's
+  // RmsNorm step would have normed is the same memory: [T*H,Dh] with stride Dh.
+  // That alias is a RESHAPE of the rank-3 view, so on a row-major [T,H,Dh] tensor
+  // the row stride is stride[1] == Dh and the INNER dimension is stride[2]. The
+  // check named stride[1] and so refused every Dh > 1 operand — every real call,
+  // the hand-call realization at dense_attn_block.h:648 among them.
+  VT_CHECK(q3.stride[2] == 1 && k3.stride[2] == 1,
+           "attn_qk_norm_rope: the head dimension must be the inner dimension");
+  reinterpret_cast<AttnQkNormRopeFn>(GetOp(OpId::kAttnQkNormRope, q.device.type))(
+      q, q3, k3, q_norm, k_norm, cos_sin, positions, norm_args, rope_args);
 }
 
 namespace {

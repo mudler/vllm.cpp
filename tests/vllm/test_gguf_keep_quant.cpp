@@ -33,6 +33,8 @@
 #include <string>
 #include <vector>
 
+#include <cmath>
+
 #include "gguf_builder.h"
 #include "capi/rocm_quant_gather_fixture.h"
 #include "vllm/config/weight_residency.h"
@@ -41,6 +43,12 @@
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/models/qwen3_5_gguf_weights.h"
+#include "vllm/model_executor/models/model_registry.h"
+#include "vllm/model_executor/models/qwen3_5.h"
+#ifdef VLLM_CPP_HIP
+#include "vt/rocm/rocm_runtime.h"
+#endif
+#include "support/test_env.h"
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -2096,7 +2104,7 @@ void AddF16T(GgufModelBuilder& b, const std::string& name, int64_t out_dim,
 // A tiny DENSE GGUF whose GEMM weights AND token_embd are F16 (norms stay F32) —
 // the "56 f16 tensors" shape of the real 2B bench file, the case keep-f16 exists
 // for. `tied` omits output.weight so the head IS the f16 token_embd.
-std::string BuildDenseF16Gguf(const DenseDims& d, bool tied = false) {
+std::string BuildDenseF16Gguf(const DenseDims& d, bool tied = false, bool gated = false) {
   GgufModelBuilder b;
   b.AddKv(StrKv("general.architecture", "qwen35"));
   b.AddKv(U32Kv("qwen35.embedding_length", static_cast<uint32_t>(d.H)));
@@ -2119,7 +2127,7 @@ std::string BuildDenseF16Gguf(const DenseDims& d, bool tied = false) {
     const std::string p = "blk." + std::to_string(il) + ".";
     AddF32T(b, p + "attn_norm.weight", {d.H}, 1.25F);
     AddF32T(b, p + "post_attention_norm.weight", {d.H}, 1.75F);
-    AddF16T(b, p + "attn_q.weight", d.n_head * d.head_dim, d.H, 0.11F);
+    AddF16T(b, p + "attn_q.weight", (gated ? 2 : 1) * d.n_head * d.head_dim, d.H, 0.11F);
     AddF16T(b, p + "attn_k.weight", d.n_head_kv * d.head_dim, d.H, 0.13F);
     AddF16T(b, p + "attn_v.weight", d.n_head_kv * d.head_dim, d.H, 0.17F);
     AddF16T(b, p + "attn_output.weight", d.H, d.n_head * d.head_dim, 0.19F);
@@ -2817,3 +2825,347 @@ TEST_CASE("#2516: a plan that places NOTHING never overrides the engine") {
                    vllm::GgufTensorRole::kStackedExpertWeight) ==
         vllm::GgufResidency::kExpandBf16);
 }
+
+namespace {
+class ScopedF16Env {
+ public:
+  ScopedF16Env(const char* name, const char* value) : name_(name) {
+    const char* old = std::getenv(name);
+    had_value_ = old != nullptr;
+    if (old != nullptr) old_value_ = old;
+    vllm_test::SetEnv(name, value);
+  }
+  ~ScopedF16Env() {
+    if (!had_value_) {
+      vllm_test::UnsetEnv(name_);
+    } else {
+#if defined(_WIN32)
+      vllm_test::SetEnv(name_, old_value_);
+#else
+      // Preserve an empty POSIX value as distinct from an absent variable.
+      if (::setenv(name_, old_value_.c_str(), 1) != 0) std::terminate();
+#endif
+    }
+  }
+  ScopedF16Env(const ScopedF16Env&) = delete;
+  ScopedF16Env& operator=(const ScopedF16Env&) = delete;
+ private:
+  const char* name_;
+  bool had_value_ = false;
+  std::string old_value_;
+};
+}  // namespace
+
+// BACKEND-ROCM-F16-WEIGHTS (#3092): enter through the registered GGUF loader.
+// A kernel-only F16 change cannot satisfy this admission test.
+TEST_CASE("ROCm F16 production registry retains the embedding table") {
+  ScopedF16Env cpu_ref("VT_CPU_REF", nullptr);
+  ScopedF16Env keep_f16("VT_GGUF_KEEP_F16", nullptr);
+  ScopedF16Env keep_quant("VT_GGUF_KEEP_QUANT", nullptr);
+  for (bool tied : {false, true}) {
+    CAPTURE(tied);
+    const DenseDims d;
+    const TempFile file(BuildDenseF16Gguf(d, tied));
+    const vllm::GgufFile gguf = vllm::GgufFile::Open(file.path());
+    auto config = vllm::HfConfigFromGguf(gguf);
+    REQUIRE(config.torch_dtype == "bfloat16");
+    for (const char* dtype : {"bfloat16", "bf16", ""}) {
+      CAPTURE(std::string(dtype));
+      config.torch_dtype = dtype;
+      auto loaded = vllm::ModelRegistry::Load(
+          config, vllm::ModelSource::FromGguf(gguf, vt::DeviceType::kROCM));
+      const auto* embedding = loaded->shared_embed_tokens();
+      REQUIRE(embedding != nullptr);
+      REQUIRE_MESSAGE(embedding->dtype == vt::DType::kF16,
+                      "the default ROCm registry must retain eligible F16 storage");
+      REQUIRE(embedding->weight_value_dtype == vt::DType::kBF16);
+      REQUIRE(embedding->bytes.size() == gguf.Get("token_embd.weight").nbytes);
+      CHECK(std::memcmp(embedding->bytes.data(), gguf.Get("token_embd.weight").data,
+                        embedding->bytes.size()) == 0);
+    }
+  }
+}
+
+TEST_CASE("ROCm F16 production registry refuses incompatible model values") {
+  ScopedF16Env cpu_ref("VT_CPU_REF", nullptr);
+  ScopedF16Env keep_f16("VT_GGUF_KEEP_F16", nullptr);
+  ScopedF16Env keep_quant("VT_GGUF_KEEP_QUANT", nullptr);
+  const DenseDims d;
+  const TempFile file(BuildDenseF16Gguf(d));
+  const auto gguf = vllm::GgufFile::Open(file.path());
+  auto config = vllm::HfConfigFromGguf(gguf);
+  for (const char* dtype : {"float16", "float32"}) {
+    CAPTURE(std::string(dtype));
+    config.torch_dtype = dtype;
+    CHECK_THROWS_WITH(vllm::ModelRegistry::Load(
+        config, vllm::ModelSource::FromGguf(gguf, vt::DeviceType::kROCM)),
+        doctest::Contains("Qwen3.5 retained F16 GGUF: this forward resolves BF16 model values; "
+                          "an unsupported model dtype cannot silently select BF16 semantics"));
+  }
+}
+
+TEST_CASE("ROCm F16 admission requires explicit model values and eligible roles") {
+  vllm_test::UnsetEnv("VT_CPU_REF");
+  vllm_test::UnsetEnv("VT_GGUF_KEEP_F16");
+  vllm_test::UnsetEnv("VT_GGUF_KEEP_QUANT");
+  CHECK_FALSE(GgufLoadPolicy::FromEnv(vt::DeviceType::kROCM).keep_f16);
+  for (vt::DType dtype : {vt::DType::kBF16, vt::DType::kF32}) {
+    const auto policy = GgufLoadPolicy::FromEnv(vt::DeviceType::kROCM, dtype);
+    CHECK(policy.keep_f16);
+    CHECK(policy.weight_value_dtype == dtype);
+    for (GgufTensorRole role : {GgufTensorRole::kMatmulWeight, GgufTensorRole::kEmbeddingTable})
+      CHECK(RouteGgufTensor(false, true, false, false, role, kF16, {7, 13},
+                            vt::DeviceType::kROCM, dtype) == GgufResidency::kKeepF16);
+    CHECK(RouteGgufTensor(false, true, false, false, GgufTensorRole::kStackedExpertWeight,
+                          kF16, {2, 7, 13}, vt::DeviceType::kROCM, dtype) ==
+          GgufResidency::kExpandBf16);
+    for (GgufTensorRole role : {GgufTensorRole::kTransformedWeight,
+                               GgufTensorRole::kVector, GgufTensorRole::kConvWeight})
+      CHECK(RouteGgufTensor(false, true, false, false, role, kF16, {7, 13},
+                            vt::DeviceType::kROCM, dtype) == GgufResidency::kExpandBf16);
+  }
+  CHECK_THROWS(GgufLoadPolicy::FromEnv(vt::DeviceType::kROCM, vt::DType::kF16));
+  CHECK_THROWS(GgufLoadPolicy::FromEnv(vt::DeviceType::kROCM, vt::DType::kI32));
+  for (auto device : {vt::DeviceType::kCPU, vt::DeviceType::kCUDA}) {
+    const auto old_policy = GgufLoadPolicy::FromEnv(device);
+    const auto with_dtype = GgufLoadPolicy::FromEnv(device, vt::DType::kBF16);
+    CHECK(old_policy.keep_f16 == with_dtype.keep_f16);
+    CHECK(old_policy.expand_nk == with_dtype.expand_nk);
+    CHECK_FALSE(with_dtype.weight_value_dtype.has_value());
+  }
+  for (const char* opt_out : {"VT_GGUF_KEEP_F16", "VT_CPU_REF"}) {
+    vllm_test::SetEnv(opt_out, std::string(opt_out) == "VT_CPU_REF" ? "1" : "0");
+    const auto policy = GgufLoadPolicy::FromEnv(vt::DeviceType::kROCM, vt::DType::kBF16);
+    CHECK_FALSE(policy.keep_f16);
+    const DenseDims d;
+    const TempFile file(BuildDenseF16Gguf(d));
+    const auto gguf = vllm::GgufFile::Open(file.path());
+    const auto config = vllm::HfConfigFromGguf(gguf);
+    auto loaded = vllm::ModelRegistry::Load(config,
+        vllm::ModelSource::FromGguf(gguf, vt::DeviceType::kROCM));
+    REQUIRE(loaded->shared_embed_tokens() != nullptr);
+    CHECK(loaded->shared_embed_tokens()->dtype == vt::DType::kBF16);
+    CHECK_FALSE(loaded->shared_embed_tokens()->weight_value_dtype.has_value());
+    vllm_test::UnsetEnv(opt_out);
+  }
+}
+
+TEST_CASE("ROCm retained F16 mapped and copied tied weights preserve bytes and values") {
+  for (bool mapped : {false, true}) {
+    for (bool tied : {false, true}) {
+      CAPTURE(mapped); CAPTURE(tied);
+      vllm_test::SetEnv("VT_GGUF_MMAP", mapped ? "1" : "0");
+      const DenseDims d;
+      const TempFile file(BuildDenseF16Gguf(d, tied));
+      const auto gguf = vllm::GgufFile::Open(file.path());
+      const auto config = vllm::HfConfigFromGguf(gguf);
+      const auto policy = GgufLoadPolicy::FromEnv(vt::DeviceType::kROCM, vt::DType::kBF16);
+      auto loaded = vllm::ModelRegistry::Load(config,
+          vllm::ModelSource::FromGguf(gguf, vt::DeviceType::kROCM));
+      REQUIRE(loaded->shared_embed_tokens() != nullptr);
+      const auto& embedding = *loaded->shared_embed_tokens();
+      CHECK(embedding.dtype == vt::DType::kF16);
+      CHECK(embedding.weight_value_dtype == vt::DType::kBF16);
+      CHECK(embedding.bytes.borrowed() == (mapped || tied));
+      const auto weights = vllm::LoadQwen3_5DenseFromGguf(gguf, config, &policy);
+      CHECK(weights.lm_head.dtype == vt::DType::kF16);
+      CHECK(weights.lm_head.weight_value_dtype == vt::DType::kBF16);
+      CHECK(weights.layers[0].mlp.gate_proj.weight_value_dtype == vt::DType::kBF16);
+      if (tied) CHECK(weights.lm_head.bytes.data() == weights.embed_tokens.bytes.data());
+      else CHECK(weights.lm_head.bytes.data() != weights.embed_tokens.bytes.data());
+      const auto& source = gguf.Get(tied ? "token_embd.weight" : "output.weight");
+      CHECK(weights.lm_head.bytes.size() == source.nbytes);
+      CHECK(std::memcmp(weights.lm_head.bytes.data(), source.data, source.nbytes) == 0);
+    }
+  }
+  vllm_test::UnsetEnv("VT_GGUF_MMAP");
+}
+
+#ifdef VLLM_CPP_HIP
+#include "rocm_f16_native_observer.h"
+namespace {
+struct F16ForwardObservation {
+  vt::MatmulFn nn = nullptr, bt = nullptr;
+  vt::EmbeddingFn embedding = nullptr;
+  struct Gemm {
+    vt::Tensor output, weight;
+    bool transposed;
+  };
+  std::vector<Gemm> gemms;
+  struct Cast { vt::Tensor output, input; };
+  std::vector<Cast> casts;
+  int marked_gemms = 0, marked_embeddings = 0;
+  static F16ForwardObservation* active;
+  static void Nn(vt::Queue& q, vt::Tensor& out, const vt::Tensor& a, const vt::Tensor& b) {
+    active->nn(q, out, a, b);
+    Observe(out, b, false);
+  }
+  static void Bt(vt::Queue& q, vt::Tensor& out, const vt::Tensor& a, const vt::Tensor& b) {
+    active->bt(q, out, a, b);
+    Observe(out, b, true);
+  }
+  static void Observe(const vt::Tensor& out, const vt::Tensor& b, bool bt) {
+    // Native F16 conversion recursively invokes a prepared GEMM. Record after
+    // it returns so the completed outer call retains the model's weight marker.
+    active->gemms.push_back({out, b, bt});
+    if (!b.weight_value_dtype) return;
+    CHECK(b.dtype == vt::DType::kF16);
+    CHECK(b.weight_value_dtype == vt::DType::kBF16);
+    ++active->marked_gemms;
+  }
+  static bool SameTensor(const vt::Tensor& a, const vt::Tensor& b) {
+    if (a.data != b.data || a.device != b.device || a.dtype != b.dtype ||
+        a.rank != b.rank || a.weight_value_dtype != b.weight_value_dtype) return false;
+    for (int i = 0; i < a.rank; ++i) {
+      if (a.shape[i] != b.shape[i] || a.stride[i] != b.stride[i]) return false;
+    }
+    return true;
+  }
+  int MarkedHeads(const vt::Tensor& logits) const {
+    REQUIRE_FALSE(gemms.empty());
+    // Earlier projections can share this head's width or a recycled output
+    // address. Follow the actual BF16-to-F32 cast into returned logits (#3112).
+    const auto& head = gemms.back();
+    if (head.output.dtype == vt::DType::kBF16) {
+      REQUIRE_FALSE(casts.empty());
+      REQUIRE(SameTensor(casts.back().input, head.output));
+      REQUIRE(SameTensor(casts.back().output, logits));
+    } else {
+      REQUIRE(SameTensor(head.output, logits));
+    }
+    int count = 0;
+    for (const auto& call : gemms) {
+      if (call.weight.weight_value_dtype && call.transposed == head.transposed &&
+          SameTensor(call.weight, head.weight)) ++count;
+    }
+    return count;
+  }
+  static void Widen(vt::Queue& q, vt::Tensor& out, const vt::Tensor& in) {
+    active->casts.push_back({out, in});
+    rocm_f16_test::RealCastF32(q, out, in);
+  }
+  static void Gather(vt::Queue& q, vt::Tensor& out, const vt::Tensor& table,
+                      const vt::Tensor& ids) {
+    if (table.weight_value_dtype) {
+      CHECK(table.dtype == vt::DType::kF16);
+      CHECK(table.weight_value_dtype == vt::DType::kBF16);
+      ++active->marked_embeddings;
+    }
+    active->embedding(q, out, table, ids);
+  }
+  F16ForwardObservation() {
+    const auto device = vt::DeviceType::kROCM;
+    nn = rocm_f16_test::RealNn;
+    REQUIRE(vt::GetOp(vt::OpId::kMatmul, device) == reinterpret_cast<void*>(rocm_f16_test::WrapNn));
+    bt = rocm_f16_test::RealBt;
+    REQUIRE(vt::GetOp(vt::OpId::kMatmulBT, device) == reinterpret_cast<void*>(rocm_f16_test::WrapBt));
+    embedding = rocm_f16_test::RealEmbedding;
+    REQUIRE(vt::GetOp(vt::OpId::kEmbedding, device) == reinterpret_cast<void*>(rocm_f16_test::WrapEmbedding));
+    REQUIRE(vt::GetOp(vt::OpId::kCastF32, device) == reinterpret_cast<void*>(rocm_f16_test::WrapCastF32));
+    for (auto op : {vt::OpId::kMatmul, vt::OpId::kMatmulBT, vt::OpId::kEmbedding,
+                    vt::OpId::kCastF32})
+      REQUIRE(std::string(vt::GetOpProviderStats(op, device).last_selected) == vt::kNativeProviderName);
+    active = this;
+    rocm_f16_test::on_nn = Nn;
+    rocm_f16_test::on_bt = Bt;
+    rocm_f16_test::on_embedding = Gather;
+    rocm_f16_test::on_cast_f32 = Widen;
+  }
+  ~F16ForwardObservation() {
+    rocm_f16_test::on_nn = nullptr;
+    rocm_f16_test::on_bt = nullptr;
+    rocm_f16_test::on_embedding = nullptr;
+    rocm_f16_test::on_cast_f32 = nullptr;
+    active = nullptr;
+  }
+};
+F16ForwardObservation* F16ForwardObservation::active = nullptr;
+
+std::vector<float> F16RegistryForward(const vllm::GgufFile& gguf, bool keep) {
+  if (keep) vllm_test::UnsetEnv("VT_GGUF_KEEP_F16");
+  else vllm_test::SetEnv("VT_GGUF_KEEP_F16", "0");
+  const auto config = vllm::HfConfigFromGguf(gguf);
+  auto loaded = vllm::ModelRegistry::Load(config,
+      vllm::ModelSource::FromGguf(gguf, vt::DeviceType::kROCM));
+  auto& backend = vt::GetBackend(vt::DeviceType::kROCM);
+  auto queue = backend.CreateQueue();
+  struct Resources {
+    vt::Backend& backend;
+    vt::Queue& queue;
+    std::vector<void*> buffers;
+    ~Resources() {
+      backend.Synchronize(queue);
+      for (void* p : buffers) backend.Free(p);
+      backend.DestroyQueue(queue);
+    }
+  } resources{backend, queue, {}};
+  REQUIRE(queue.device.type == vt::DeviceType::kROCM);
+  std::vector<vllm::PagedKvCache> caches;
+  for (int64_t layer = 0; layer < config.num_hidden_layers; ++layer) {
+    const size_t bytes = static_cast<size_t>(2 * 2 * 16 * config.num_key_value_heads * config.head_dim) * 2;
+    void* data = backend.Alloc(bytes);
+    resources.buffers.push_back(data);
+    backend.Memset(queue, data, 0, bytes);
+    vllm::PagedKvCache cache;
+    cache.data = data; cache.dtype = vt::DType::kBF16;
+    cache.num_blocks = 2; cache.block_size = 16;
+    cache.num_kv_heads = config.num_key_value_heads; cache.head_size = config.head_dim;
+    caches.push_back(cache);
+  }
+  const std::vector<int32_t> ids{1, 2, 3}, positions{0, 1, 2}, logits_indices;
+  vllm::v1::CommonAttentionMetadata attention;
+  attention.num_reqs = 1; attention.num_actual_tokens = 3;
+  attention.query_start_loc = {0, 3}; attention.query_start_loc_cpu = attention.query_start_loc;
+  attention.seq_lens = {3}; attention.seq_lens_cpu = attention.seq_lens;
+  attention.max_query_len = 3; attention.max_seq_len = 3;
+  attention.block_table_num_cols = 2; attention.block_table_tensor = {0, 1};
+  attention.slot_mapping = {0, 1, 2}; attention.causal = true;
+  const vllm::v1::GDNAttentionMetadata gdn;
+  std::vector<vllm::GdnStateCache> states;
+  F16ForwardObservation observe;
+  vllm::ModelForwardInput input{ids, positions, attention, gdn, caches, states,
+                                config, queue, logits_indices};
+  input.num_reqs = 1;
+  const auto output = vllm::ModelRegistry::Forward(*loaded, input);
+  backend.Synchronize(queue);
+  REQUIRE(output.on_device());
+  REQUIRE(output.device_tensor.dtype == vt::DType::kF32);
+  REQUIRE(output.rows == 3);
+  REQUIRE(output.vocab == config.vocab_size);
+  const int marked_heads = observe.MarkedHeads(output.device_tensor);
+  if (keep) {
+    CHECK(observe.marked_embeddings == 1);
+    CHECK(marked_heads == 1);
+    CHECK(observe.marked_gemms >= 7 * config.num_hidden_layers + 1);
+  } else {
+    CHECK(observe.marked_embeddings == 0);
+    CHECK(marked_heads == 0);
+    CHECK(observe.marked_gemms == 0);
+  }
+  std::vector<float> result(static_cast<size_t>(3 * config.vocab_size));
+  backend.Copy(queue, result.data(), output.device_tensor.data, result.size() * sizeof(float));
+  backend.Synchronize(queue);
+  return result;
+}
+}  // namespace
+
+TEST_CASE("ROCm F16 production registered forward reaches retained embedding and projection weights") {
+  REQUIRE_MESSAGE(vt::rocm::DeviceAvailable(), "this production execution gate requires a ROCm device");
+  vllm_test::UnsetEnv("VT_CPU_REF");
+  vllm_test::UnsetEnv("VT_GGUF_KEEP_QUANT");
+  for (bool tied : {false, true}) {
+    CAPTURE(tied);
+    const DenseDims dims;
+    const TempFile file(BuildDenseF16Gguf(dims, tied, /*gated=*/true));
+    const auto gguf = vllm::GgufFile::Open(file.path());
+    const auto retained = F16RegistryForward(gguf, true);
+    const auto expanded = F16RegistryForward(gguf, false);
+    REQUIRE(retained.size() == expanded.size());
+    for (size_t i = 0; i < retained.size(); ++i) {
+      CHECK(std::isfinite(retained[i]));
+      CHECK(retained[i] == expanded[i]);
+    }
+  }
+  vllm_test::UnsetEnv("VT_GGUF_KEEP_F16");
+}
+#endif

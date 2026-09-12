@@ -825,6 +825,12 @@ enum class OpId : uint8_t {
   // blocks * BlockElems}. Decode-only (BACKEND-TENSTORRENT-KEEPQUANT W1);
   // the dot provider and the keep-quant predicate arm ride W2.
   kKeepQuantDecode,
+  // Explicit native BF16 MoE numerics. The legacy grouped signatures and
+  // FP32 gate/up intermediates remain unchanged for existing callers.
+  kMoeGroupedGemmBf16GateUpSiluNative,
+  kMoeGroupedGemmBf16Weighted,
+  kMoeCombinePreweighted,
+  kResidualRmsNorm,
   kCount
 };
 
@@ -872,6 +878,11 @@ struct DropinProbeArgs {
 struct RmsNormArgs {
   float eps = 1e-6f;
   bool gemma = false;  // weight applied as (1 + w), GemmaRMSNorm style
+};
+
+struct ResidualRmsNormArgs {
+  float eps = 1e-6f;
+  ResidualNormDesc descriptor{};
 };
 
 // Ungated GROUP RMS norm args (vt::RmsNormGroup). A SIBLING of RmsNormArgs, not
@@ -2187,6 +2198,12 @@ using MoeGroupedGemmBf16Fn =
 using MoeGroupedGemmBf16GateUpSiluFn =
     void (*)(Queue&, Tensor& /*out*/, const Tensor& /*act*/, const Tensor& /*expert_ids*/,
              const Tensor* /*row_map*/, const Tensor& /*gate_ptrs*/, const Tensor& /*up_ptrs*/);
+using MoeGroupedGemmBf16GateUpSiluNativeFn = MoeGroupedGemmBf16GateUpSiluFn;
+using MoeGroupedGemmBf16WeightedFn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*, const Tensor&,
+             const Tensor& /*route_weights*/);
+using MoeCombinePreweightedFn =
+    void (*)(Queue&, Tensor&, const Tensor&, const Tensor* /*shared*/, float /*routed_scale*/);
 // kMatmulBTQuantGrouped: out[P,N], act[P,K] (f32/bf16), weight[E*N,K] block-quant,
 // expert_ids[P] i32 — weight row for (p,n) is expert_ids[p]*N + n.
 using MatmulBTQuantGroupedFn =
@@ -2283,6 +2300,10 @@ using Exl3MoeMlpFn = void (*)(Queue&, Tensor&, const Tensor&, const Exl3MoeExper
                               const Exl3MoeRouting&, const Exl3MoeTemps&, const Exl3MoeArgs&);
 using RmsNormFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const RmsNormArgs&, Tensor*);
+using ResidualRmsNormFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*a*/,
+                                   const Tensor& /*base*/, const Tensor* /*delta*/,
+                                   const Tensor& /*weight*/, const ResidualRmsNormArgs&,
+                                   Tensor* /*residual_out*/);
 // Ungated group RMS norm (vt::RmsNormGroup). Same operand order as RmsNormFn
 // minus the residual, which this op does not carry because its upstream has no
 // residual arm and a knob nobody can set is a divergence with extra steps.
@@ -2628,6 +2649,9 @@ Fn GetTypedOp(OpId op, DeviceType device) {
 
 // out[M,N] = a[M,K] @ b[K,N]; a/b float dtypes (f32/f16/bf16), out f32 or
 // bf16, f32 accumulation, all contiguous, same device.
+// Optional B/table weight_value_dtype preserves F16 storage while applying the
+// resolved BF16/F32 model values on the native ROCm ordinary GEMM/gather path.
+// Activations, outputs, ID operands, other providers, and other storage reject it.
 void Matmul(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
 
 // Test-only ABI probe: a tiny adapter binds Queue/Tensor metadata to a raw
@@ -3237,6 +3261,28 @@ void MoeGroupedGemmBf16GateUpSilu(Queue& q, Tensor& out, const Tensor& act,
                                   const Tensor& expert_ids, const Tensor* row_map,
                                   const Tensor& gate_ptrs, const Tensor& up_ptrs);
 
+// Native BF16 boundaries from vLLM e126687a9a, triton_moe.py:388-527 and
+// activation_kernels.cu:44,165-177: BF16 gate/up, BF16 SiLU, BF16 product.
+// Uses the same pointer-array layout and validation as the legacy sibling.
+void MoeGroupedGemmBf16GateUpSiluNative(Queue& q, Tensor& out, const Tensor& act,
+                                      const Tensor& expert_ids, const Tensor* row_map,
+                                      const Tensor& gate_ptrs, const Tensor& up_ptrs);
+
+// Grouped dot with one FP32 route weight per pair, multiplied BEFORE output
+// conversion (fused_moe.py:593-610 at the same pin). Output is BF16 or FP32.
+void MoeGroupedGemmBf16Weighted(Queue& q, Tensor& out, const Tensor& act,
+                               const Tensor& expert_ids, const Tensor* row_map,
+                               const Tensor& weight_ptrs, const Tensor& route_weights);
+
+// Sum already weighted BF16 expert_out[T,top_k,H] in FP32, then narrow to the
+// BF16/FP32 output. No second route-weight multiplication. Optional shared[T,H]
+// is BF16/FP32 and is added after routed_scale, matching the legacy shared term.
+void MoeCombinePreweighted(Queue& q, Tensor& out, const Tensor& expert_out,
+                           const Tensor* shared = nullptr, float routed_scale = 1.0f);
+
+// Select the complete native sequence through provider availability.
+bool MoeGroupedBf16NativeAvailable(DeviceType device);
+
 // MoeGroupedGemmNvfp4Marlin (lift of vLLM moe_wna16_marlin_gemm, ops.cu:543 —
 // the Marlin W4A16 kernel vLLM selects for the 35B's NVFP4 MoE experts). One
 // launch computes the grouped expert projection over all padded (token,expert)
@@ -3321,6 +3367,22 @@ void MoeRelu2(Queue& q, Tensor& out, const Tensor& x);
 // upstream bf16 need bf16-eps tolerance on the non-gemma path.
 void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
              const RmsNormArgs& args, Tensor* residual = nullptr);
+
+// Compiled BF16 expression: normalize a+base or delta+(a+base), in FP32,
+// multiplying gamma before the single BF16 output conversion. An optional
+// residual output stores the same unrounded expression as BF16. It is never
+// reloaded for normalization. Inputs/output are rank-2 with unit inner stride
+// and nonoverlapping rows. Gamma is contiguous BF16 [H]. Empty rows are legal.
+// Only descriptor-permitted exact aliases can modify an input. No persistent
+// FP32 activation is needed. Other activation/gamma dtypes are refused.
+void ResidualRmsNorm(Queue& q, Tensor& out, const Tensor& a, const Tensor& base,
+                     const Tensor* delta, const Tensor& weight,
+                     const ResidualRmsNormArgs& args, Tensor* residual_out = nullptr);
+
+// The same typed operation through the shared recipe/composite seam.
+void FusedChain(Queue& q, Tensor& out, const Tensor& a, const Tensor& base,
+                const Tensor* delta, const Tensor& weight,
+                const ResidualRmsNormArgs& args, Tensor* residual_out = nullptr);
 
 // UNGATED PER-GROUP RMS NORM — `Qwen4ExpTextRMSNorm` (transformers v5.16.0
 // `models/qwen4_exp/modeling_qwen4_exp.py:158-181`), the `group_size is not
@@ -3636,6 +3698,15 @@ void AttnQkNormRopeGate(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& gate_out
                         const Tensor& qgate, const Tensor& kf, const Tensor& q_norm,
                         const Tensor& k_norm, const Tensor& cos_sin,
                         const RmsNormArgs& norm_args, const RopeArgs& rope_args);
+
+// Gate-free fused attention preamble (the kAttnQkNormRope recipe): per-head
+// standard RMSNorm(q) + RMSNorm(k) + partial RoPE-from-cache, with q3/k3 normed
+// and rotated IN PLACE. A backend that registers no kernel for it is a refusal;
+// the recipe's Tier-0 composite is reached through vt::FusedChain, which is the
+// only caller that falls back.
+void AttnQkNormRope(Queue& q, Tensor& q3, Tensor& k3, const Tensor& q_norm,
+                    const Tensor& k_norm, const Tensor& cos_sin, const Tensor& positions,
+                    const RmsNormArgs& norm_args, const RopeArgs& rope_args);
 
 // --- GDN (Gated DeltaNet) ops. Formula reference: .agents/specs/gdn-semantics.md.
 // All GDN state tensors are caller-allocated f32 and updated IN PLACE

@@ -24,7 +24,10 @@
 #include <cstring>
 #include <vector>
 
+#include <map>
 #include <memory>
+
+#include "vt/ops.h"
 
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"
@@ -979,3 +982,180 @@ TEST_CASE("qwen35 paged MoE: a merged in_proj_ba owner is bit-identical to the s
   for (float v : a.prefill) mag = std::max(mag, std::abs(static_cast<double>(v)));
   CHECK(mag > 0.0);
 }
+
+namespace {
+// BACKEND-ROCM-ATTN-GATE-SPLIT (#3106). This is a local zero-width model
+// regression, not an upstream model-configuration claim. Pinned vLLM e126687a9a
+// rotary_embedding/base.py:178-200 and the measured default dispatch preserve
+// normalized query/key bytes at zero width. The shared primitive still refuses
+// zero. These observers call the real CPU providers and alter no operand.
+struct ZeroRopeObservation {
+  static constexpr const char* kName = "qwen35-zero-rope-observer";
+  static inline ZeroRopeObservation* active = nullptr;
+  static inline vt::RmsNormFn real_norm = nullptr;
+  static inline vt::AttentionFn real_attention = nullptr;
+  static inline vt::PagedAttentionFn real_paged = nullptr;
+  static inline vt::ReshapeAndCacheFn real_cache = nullptr;
+  static inline vt::RopeFn real_rope = nullptr;
+  int64_t width;
+  int norms = 0, query_reads = 0, key_reads = 0, ropes = 0;
+  std::map<void*, std::vector<float>> normalized;
+  explicit ZeroRopeObservation(int64_t head_dim) : width(head_dim) {
+    if (real_norm == nullptr) {
+      const auto cpu = vt::DeviceType::kCPU;
+      real_norm = reinterpret_cast<vt::RmsNormFn>(vt::GetOp(vt::OpId::kRmsNorm, cpu));
+      real_attention = reinterpret_cast<vt::AttentionFn>(vt::GetOp(vt::OpId::kAttention, cpu));
+      real_paged = reinterpret_cast<vt::PagedAttentionFn>(vt::GetOp(vt::OpId::kPagedAttention, cpu));
+      real_cache = reinterpret_cast<vt::ReshapeAndCacheFn>(vt::GetOp(vt::OpId::kReshapeAndCache, cpu));
+      real_rope = reinterpret_cast<vt::RopeFn>(vt::GetOp(vt::OpId::kRopeNeox, cpu));
+      const auto add = [&](vt::OpId operation, auto function) {
+        vt::RegisterOpProvider(operation, cpu,
+                               {kName, 100, nullptr, reinterpret_cast<void*>(function)});
+      };
+      add(vt::OpId::kRmsNorm, &Norm);
+      add(vt::OpId::kAttention, &Attention);
+      add(vt::OpId::kPagedAttention, &Paged);
+      add(vt::OpId::kReshapeAndCache, &Cache);
+      add(vt::OpId::kRopeNeox, &Rope);
+    }
+    active = this;
+    vt::DisableOpProvider(kName, false);
+  }
+  ~ZeroRopeObservation() {
+    vt::DisableOpProvider(kName, true);
+    active = nullptr;
+  }
+  void Read(const vt::Tensor& tensor, bool query) {
+    REQUIRE(tensor.dtype == DType::kF32);
+    const auto found = normalized.find(tensor.data);
+    REQUIRE(found != normalized.end());
+    REQUIRE(found->second.size() == static_cast<size_t>(tensor.Numel()));
+    CHECK(std::memcmp(tensor.data, found->second.data(), tensor.Bytes()) == 0);
+    if (query) ++query_reads;
+    else ++key_reads;
+  }
+  static void Norm(vt::Queue& q, vt::Tensor& out, const vt::Tensor& input,
+                   const vt::Tensor& weight, const vt::RmsNormArgs& args, vt::Tensor* residual) {
+    real_norm(q, out, input, weight, args, residual);
+    if (args.gemma && out.rank == 2 && out.shape[1] == active->width) {
+      REQUIRE(out.dtype == DType::kF32);
+      active->normalized[out.data] = std::vector<float>(out.Ptr<float>(), out.Ptr<float>() + out.Numel());
+      ++active->norms;
+    }
+  }
+  static void Attention(vt::Queue& q, vt::Tensor& out, const vt::Tensor& query,
+                        const vt::Tensor& key, const vt::Tensor& value, const vt::AttentionArgs& args) {
+    active->Read(query, true);
+    active->Read(key, false);
+    real_attention(q, out, query, key, value, args);
+  }
+  static void Cache(vt::Queue& q, const vt::Tensor& key, const vt::Tensor& value,
+                    vt::Tensor& key_cache, vt::Tensor& value_cache, const vt::Tensor& slots) {
+    active->Read(key, false);
+    real_cache(q, key, value, key_cache, value_cache, slots);
+  }
+  static void Paged(vt::Queue& q, vt::Tensor& out, const vt::Tensor& query,
+                    const vt::Tensor& key, const vt::Tensor& value, const vt::Tensor& blocks,
+                    const vt::Tensor& lengths, const vt::Tensor& starts,
+                    const vt::PagedAttentionArgs& args) {
+    active->Read(query, true);
+    real_paged(q, out, query, key, value, blocks, lengths, starts, args);
+  }
+  static void Rope(vt::Queue& q, vt::Tensor& query, vt::Tensor& key,
+                   const vt::Tensor& positions, const vt::RopeArgs& args) {
+    ++active->ropes;
+    real_rope(q, query, key, positions, args);
+  }
+};
+
+void CheckZeroRopeModel(bool paged) {
+  HfConfig c = MakeConfig();
+  c.num_hidden_layers = 1;
+  c.layer_types = {"full_attention"};
+  c.rotary_dim = 0;
+  const auto weights = MakeWeights(c);
+  const std::vector<int32_t> ids{5, 9, 2}, positions{2, 7, 13}, indices;
+  const GDNAttentionMetadata gdn;
+  auto queue = Q();
+  ZeroRopeObservation observation(c.head_dim);
+  if (paged) {
+    CachePool pool(c, 4, 8);
+    const auto attention = PrefillAttnMeta(3, {0}, 8, 0);
+    auto model = vllm::BorrowQwen3_5MoeLoadedModel(weights);
+    ModelForwardInput input{ids, positions, attention, gdn, pool.attn_kv,
+                            pool.gdn_state, c, queue, indices};
+    input.num_reqs = 1;
+    const auto logits = ModelRegistry::Forward(*model, input);
+    CHECK(logits.rows == 3);
+    CHECK(logits.vocab == c.vocab_size);
+  }
+  else {
+    const auto logits = Qwen3_5Model::ForwardDense(ids, positions, weights, c, queue);
+    CHECK(logits.size() == static_cast<size_t>(3 * c.vocab_size));
+    for (float value : logits) CHECK(std::isfinite(value));
+  }
+  CHECK(observation.norms == 2);
+  CHECK(observation.query_reads == 1);
+  CHECK(observation.key_reads == 1);
+  CHECK(observation.ropes == 0);
+}
+
+TEST_CASE("qwen35 zero rotary width preserves normalized query and key in registered forward") {
+  CheckZeroRopeModel(true);
+}
+TEST_CASE("qwen35 zero rotary width preserves normalized query and key in dense forward") {
+  CheckZeroRopeModel(false);
+}
+
+TEST_CASE("qwen35 zero rotary adaptation preserves invalid-width refusals in both model paths") {
+  HfConfig c = MakeConfig();
+  c.num_hidden_layers = 1;
+  c.layer_types = {"full_attention"};
+  const auto weights = MakeWeights(c);
+  const std::vector<int32_t> ids{5, 9, 2}, positions{2, 7, 13}, indices;
+  const GDNAttentionMetadata gdn;
+  auto queue = Q();
+  bool paged = false;
+  SUBCASE("registered paged forward") { paged = true; }
+  SUBCASE("dense forward") {}
+  // A separate CTest invocation sets VT_FUSE_ATTN_PREAMBLE=0 before startup
+  // to preserve these refusals through each unfused RopeNeox call as well.
+  for (int64_t width : {-2, 3, 10}) {
+    c.rotary_dim = width;
+    CAPTURE(width);
+    if (paged) {
+      CachePool pool(c, 4, 8);
+      const auto attention = PrefillAttnMeta(3, {0}, 8, 0);
+      auto model = vllm::BorrowQwen3_5MoeLoadedModel(weights);
+      ModelForwardInput input{ids, positions, attention, gdn, pool.attn_kv,
+                              pool.gdn_state, c, queue, indices};
+      input.num_reqs = 1;
+      CHECK_THROWS_WITH_AS(ModelRegistry::Forward(*model, input),
+                           doctest::Contains("rotary_dim"),
+                           std::runtime_error);
+    }
+    else {
+      CHECK_THROWS_WITH_AS(Qwen3_5Model::ForwardDense(ids, positions, weights, c, queue),
+                           doctest::Contains("rotary_dim"),
+                           std::runtime_error);
+    }
+  }
+}
+
+TEST_CASE("qwen35 zero rotary model adaptation keeps shared primitive zero refusal") {
+  auto queue = Q();
+  const std::vector<int32_t> positions{2, 7, 13};
+  auto pos = vt::Tensor::Contiguous(const_cast<int32_t*>(positions.data()), DType::kI32,
+                                   queue.device, {3});
+  for (DType dtype : {DType::kF32, DType::kBF16}) {
+    CAPTURE(vt::Name(dtype));
+    std::vector<uint8_t> query(3 * 2 * 8 * vt::SizeOf(dtype), 0);
+    std::vector<uint8_t> key(3 * 1 * 8 * vt::SizeOf(dtype), 0);
+    auto qt = vt::Tensor::Contiguous(query.data(), dtype, queue.device, {3, 2, 8});
+    auto kt = vt::Tensor::Contiguous(key.data(), dtype, queue.device, {3, 1, 8});
+    CHECK_THROWS_WITH_AS(vt::RopeNeox(queue, qt, kt, pos, {10000.f, 0}),
+                         doctest::Contains("rope: rotary_dim must be even and <= head_dim"),
+                         std::runtime_error);
+  }
+}
+}  // namespace

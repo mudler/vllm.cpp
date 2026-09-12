@@ -45,6 +45,7 @@
 #include <vector>
 
 #include "vt/backend.h"
+#include "rocm_f16_conversion.h"
 #define VT_GRAPH_DEDUP_HIP 1
 #include "vt/graph_dedup.h"
 #include "vt/graph_dedup_runtime.h"
@@ -201,6 +202,10 @@ RocmMemoryPolicy MemoryPolicy(const DeviceCaps& caps) {
 }
 
 class RocmBackend final : public Backend {
+  struct CaptureScratch {
+    const Queue& queue;
+    ~CaptureScratch() { ResetF16ScratchCapture(queue); }
+  };
  public:
   // Non-throwing by design: constructed during static init by the registrar,
   // which probes the device beforehand. Same contract as CudaBackend.
@@ -214,6 +219,10 @@ class RocmBackend final : public Backend {
 
   int DeviceCapabilityMajor() const override { return major_; }
   int DeviceCapabilityMinor() const override { return minor_; }
+
+  ResidualNormPolicy GetResidualNormPolicy() const override {
+    return ResidualNormPolicy::kCompiledExpression;
+  }
 
   // Both branches satisfy the >= 64B contract Backend::Alloc owes StepArena:
   // hipMalloc aligns to at least 256 bytes as cudaMalloc does, and managed
@@ -275,8 +284,8 @@ class RocmBackend final : public Backend {
     return Queue{Device{DeviceType::kROCM, device_}, stream};
   }
   void DestroyQueue(Queue& q) override {
-    if (q.handle == nullptr) return;
-    Check(hipStreamDestroy(AsStream(q)), "hipStreamDestroy");
+    if (q.handle != nullptr) Check(hipStreamDestroy(AsStream(q)), "hipStreamDestroy");
+    ReleaseF16ScratchQueue(q);
     q.handle = nullptr;
   }
   void Synchronize(Queue& q) override {
@@ -336,19 +345,23 @@ class RocmBackend final : public Backend {
   // process-wide mode change.
   bool SupportsGraphCapture() const override { return true; }
   void BeginCapture(Queue& q) override {
+    ResetF16ScratchCapture(q);
     Check(hipStreamBeginCapture(AsStream(q), hipStreamCaptureModeThreadLocal),
           "hipStreamBeginCapture");
   }
   void EndCapture(Queue& q) override {
+    CaptureScratch cleanup{q};
     hipGraph_t graph = nullptr;
     Check(hipStreamEndCapture(AsStream(q), &graph), "hipStreamEndCapture");
     if (exec_ != nullptr) {
       Check(hipGraphExecDestroy(exec_), "hipGraphExecDestroy");
+      ReleaseF16ScratchGraph(reinterpret_cast<void*>(exec_));
       exec_ = nullptr;
     }
     Check(hipGraphInstantiate(&exec_, graph, nullptr, nullptr, 0),
           "hipGraphInstantiate");
     Check(hipGraphDestroy(graph), "hipGraphDestroy");
+    RetainF16ScratchCapture(q, reinterpret_cast<void*>(exec_));
   }
   void Replay(Queue& q) override {
     Check(hipGraphLaunch(exec_, AsStream(q)), "hipGraphLaunch");
@@ -358,6 +371,7 @@ class RocmBackend final : public Backend {
   // stream graph and hand the exec back as an opaque handle the caller owns and
   // selects per padded batch size. Unlike EndCapture, nothing is stored here.
   void* EndCaptureGraph(Queue& q) override {
+    CaptureScratch cleanup{q};
     hipGraph_t graph = nullptr;
     Check(hipStreamEndCapture(AsStream(q), &graph), "hipStreamEndCapture");
     // ENG-CUDAGRAPH-DEDUP (#1162), the same wiring as the CUDA leg against the same
@@ -368,12 +382,15 @@ class RocmBackend final : public Backend {
       if (dedup_ == nullptr) {
         dedup_ = std::make_unique<vt::GraphDedupRegistry>(vt::graph_dedup_rt::Ops());
       }
-      return dedup_->Register(reinterpret_cast<void*>(graph));
+      void* handle = dedup_->Register(reinterpret_cast<void*>(graph));
+      RetainF16ScratchCapture(q, handle);
+      return handle;
     }
     hipGraphExec_t exec = nullptr;
     Check(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0),
           "hipGraphInstantiate");
     Check(hipGraphDestroy(graph), "hipGraphDestroy");
+    RetainF16ScratchCapture(q, reinterpret_cast<void*>(exec));
     return reinterpret_cast<void*>(exec);
   }
   // NOT ported: the CUDA leg's VT_BENCH_PROFILE_CONTROL block, which drives
@@ -405,10 +422,12 @@ class RocmBackend final : public Backend {
     if (graph == nullptr) return;
     if (dedup_ != nullptr && dedup_->Owns(graph)) {
       dedup_->Destroy(graph);
+      ReleaseF16ScratchGraph(graph);
       return;
     }
     Check(hipGraphExecDestroy(reinterpret_cast<hipGraphExec_t>(graph)),
           "hipGraphExecDestroy");
+    ReleaseF16ScratchGraph(graph);
   }
 
   // THE LOAD-BEARING BOOL. This is what decides whether the portable CPU

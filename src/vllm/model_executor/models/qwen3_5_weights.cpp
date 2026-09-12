@@ -350,6 +350,7 @@ OwnedTensor BorrowWholeOwnedTensor(OwnedTensor& src) {
   OwnedTensor v;
   v.bytes = OwnedBytes::Borrow(src.bytes.data(), src.bytes.size(), std::move(keep));
   v.dtype = src.dtype;
+  v.weight_value_dtype = src.weight_value_dtype;
   v.rank = src.rank;
   for (int i = 0; i < src.rank; ++i) v.shape[i] = src.shape[i];
   v.nk = src.nk;
@@ -522,19 +523,34 @@ bool BorrowStTensorBytes(OwnedTensor& o, const StTensor& t, vt::DType dtype,
 vt::Tensor OwnedTensor::View() const {
   VT_CHECK(!host_released,
            "OwnedTensor::View: host bytes were released after device upload");
+  return ViewOn(const_cast<uint8_t*>(bytes.data()), vt::Device{});
+}
+
+vt::Tensor OwnedTensor::ViewOn(void* data, vt::Device device,
+                               std::vector<int64_t> view_shape) const {
+  if (view_shape.empty()) view_shape.assign(shape, shape + rank);
+  VT_CHECK(view_shape.size() <= vt::kMaxRank,
+           "OwnedTensor::ViewOn: invalid rank");
   vt::Tensor t;
-  t.data = const_cast<uint8_t*>(bytes.data());
+  t.data = data;
   t.dtype = dtype;
-  t.repacked = repacked;  // CIQ G7: carry the i8mm-repack marker to the kernel
-  t.q8_0_aligned = q8_0_aligned;  // Brick 4: carry the CUDA coalesced-Q8_0 marker
-  t.device = vt::Device{};  // default = CPU host
-  t.rank = rank;
+  t.device = device;
+  // ViewOn carries ONLY weight_value_dtype. The LAYOUT markers (repacked,
+  // q8_0_aligned, elem_kn_repacked) are deliberately NOT inherited here: each
+  // ResidentWeight arm owns a different marker set, and copying them centrally
+  // silently changed the CPU-alias lane for every model that shares this helper.
+  // See expert_stream_seam.h, which documents that q8_0_aligned must not reach
+  // a resident view.
+  t.weight_value_dtype = weight_value_dtype;
+  t.rank = static_cast<int>(view_shape.size());
   int64_t stride = 1;
-  for (int i = rank - 1; i >= 0; --i) {
-    t.shape[i] = shape[i];
+  for (int i = t.rank - 1; i >= 0; --i) {
+    VT_CHECK(view_shape[i] >= 0, "OwnedTensor::ViewOn: negative dimension");
+    t.shape[i] = view_shape[i];
     t.stride[i] = stride;
-    stride *= shape[i];
+    stride *= view_shape[i];
   }
+  VT_CHECK(t.rank == 0 || stride == Numel(), "OwnedTensor::ViewOn: numel mismatch");
   return t;
 }
 

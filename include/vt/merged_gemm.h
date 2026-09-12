@@ -116,6 +116,9 @@ inline constexpr MergedGemmGroup kFp8BlockQkv = {
 // op vt::MoeGroupedGemmBf16GateUpSilu / OpId::kMoeGroupedGemmBf16GateUpSilu — the
 // bf16 twin of kMoeGateUpSwiGLUGrouped, BIT-IDENTICAL to {2x MoeGroupedGemmBf16 +
 // MoeSiluMul}. Same family, distinct weight-marshaling seam.
+// The typed native sibling MoeGroupedGemmBf16GateUpSiluNative uses the same
+// representation but rounds gate/up and SiLU through BF16 at the pinned vLLM
+// boundaries. The original sibling retains FP32 intermediates for compatibility.
 //
 // NON-GATED experts are NOT in this family at all, and deliberately get no
 // descriptor. NemotronH's expert (models/nemotron_h.py:126-256 @ 555967922) has

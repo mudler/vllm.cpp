@@ -5,6 +5,7 @@
 
 #include "vt/device.h"
 #include "vt/dtype.h"
+#include "vt/residual_norm.h"
 
 namespace vt {
 
@@ -22,6 +23,12 @@ struct Event {
 class Backend {
  public:
   virtual ~Backend() = default;
+
+  // Numeric policy selected before model execution. CPU reference availability
+  // alone must not change a production backend's residual lifetime.
+  virtual ResidualNormPolicy GetResidualNormPolicy() const {
+    return ResidualNormPolicy::kMaterialized;
+  }
 
   // Returns memory aligned to at least 64 bytes; StepArena depends on this.
   virtual void* Alloc(size_t bytes) = 0;

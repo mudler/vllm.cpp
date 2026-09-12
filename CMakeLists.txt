@@ -1355,6 +1355,7 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_backend.cpp
   src/vt/cpu/cpu_threadpool.cpp
   src/vt/cpu/cpu_ops.cpp
+  src/vt/cpu/cpu_residual_rmsnorm.cpp
   src/vt/cpu/cpu_minimax_h3.cpp
   src/vt/cpu/cpu_ltx2.cpp
   src/vt/cpu/cpu_ltx2_vae.cpp
@@ -1721,9 +1722,11 @@ if(VLLM_CPP_HIP)
     src/vllm/platforms/rocm.cpp
     src/vt/rocm/rocm_backend.hip
     src/vt/rocm/rocm_rmsnorm.hip
+    src/vt/rocm/rocm_residual_rmsnorm.hip
     src/vt/rocm/rocm_embedding.hip
     src/vt/rocm/rocm_embedding_quant.hip
     src/vt/rocm/rocm_dense_basic.hip
+    src/vt/rocm/rocm_attn_gate_split.hip
     src/vt/rocm/rocm_matmul_hipblaslt.hip
     src/vt/rocm/rocm_paged_attn.hip
     src/vt/rocm/rocm_gemma4_experts.hip
@@ -1732,6 +1735,7 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_fp8_channel_gemv.hip
     src/vt/rocm/rocm_moe_router.hip
     src/vt/rocm/rocm_moe_chain.hip
+    src/vt/rocm/rocm_moe_grouped_bf16.hip
     src/vt/rocm/rocm_grouped_gemm.hip
     src/vt/rocm/rocm_moe_gate_up_swiglu.hip
     src/vt/rocm/rocm_exl3.hip
@@ -1753,9 +1757,11 @@ if(VLLM_CPP_HIP)
     set_source_files_properties(
       src/vt/rocm/rocm_backend.hip
       src/vt/rocm/rocm_rmsnorm.hip
+      src/vt/rocm/rocm_residual_rmsnorm.hip
       src/vt/rocm/rocm_embedding.hip
       src/vt/rocm/rocm_embedding_quant.hip
       src/vt/rocm/rocm_dense_basic.hip
+      src/vt/rocm/rocm_attn_gate_split.hip
       src/vt/rocm/rocm_matmul_hipblaslt.hip
       src/vt/rocm/rocm_paged_attn.hip
       src/vt/rocm/rocm_gemma4_experts.hip
@@ -1764,6 +1770,7 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_fp8_channel_gemv.hip
       src/vt/rocm/rocm_moe_router.hip
       src/vt/rocm/rocm_moe_chain.hip
+      src/vt/rocm/rocm_moe_grouped_bf16.hip
       src/vt/rocm/rocm_grouped_gemm.hip
       src/vt/rocm/rocm_moe_gate_up_swiglu.hip
       src/vt/rocm/rocm_exl3.hip

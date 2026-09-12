@@ -169,6 +169,10 @@ struct OwnedTensor {
   int64_t Numel() const;
   // Contiguous view over the current buffer (host/CPU device).
   vt::Tensor View() const;
+  // Build every host/resident descriptor from the same storage and value metadata.
+  vt::Tensor ViewOn(void* data, vt::Device device,
+                    std::vector<int64_t> shape = {}) const;
+  std::optional<vt::DType> weight_value_dtype;
 
   // Return the host byte buffer to the OS once an authoritative device-resident
   // copy exists — the platform residency behavior

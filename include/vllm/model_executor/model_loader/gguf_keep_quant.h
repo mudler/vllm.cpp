@@ -20,6 +20,7 @@
 // set of tensors in the file.
 #pragma once
 
+#include <optional>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -169,7 +170,8 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
                               bool cpu_ref, GgufTensorRole role,
                               uint32_t ggml_type,
                               const std::vector<int64_t>& shape,
-                              vt::DeviceType dev);
+                              vt::DeviceType dev,
+                              std::optional<vt::DType> weight_value_dtype = std::nullopt);
 
 // True when the device this process will actually run the forward on can
 // execute `OpId::kMatmulBTQuant` — i.e. when a block-typed weight has a
@@ -381,7 +383,11 @@ struct GgufLoadPolicy {
   // is the probe/resolution mismatch this parameter exists to remove; a
   // defaulted overload would restore it silently. See
   // `.agents/specs/gguf-residency-resolved-device.md`.
-  static GgufLoadPolicy FromEnv(vt::DeviceType dev);
+  // Only an accepting loader supplies the actual forward dtype. Unwired ROCm
+  // loaders retain their previous BF16 expansion.
+  std::optional<vt::DType> weight_value_dtype;
+  static GgufLoadPolicy FromEnv(
+      vt::DeviceType dev, std::optional<vt::DType> model_dtype = std::nullopt);
 
   // Route one tensor and notify `audit`. This is the ONLY entry point the
   // loader uses, so every routed tensor is observable.

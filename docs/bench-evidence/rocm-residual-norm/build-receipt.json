@@ -1,0 +1,336 @@
+{
+  "base": "94ac5d1742c540fc5cbc2084d0fb74fdfd5dab41",
+  "scope": "Only test translation units rebuilt; immutable production archives copied into private build directories. Scratch mutation replaces one real HIP provider object.",
+  "inputs": {
+    "/home/vikash/vllm.cpp-residual-norm-impl/build-residual-cpu/libvllm.a": {
+      "bytes": 85351758,
+      "sha256": "91c8a0132ada8fc39137d402c009573e7f2e0c39c147f8a7b00162e1f8d6f822"
+    },
+    "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-cpu/libvllm.a": {
+      "bytes": 85351758,
+      "sha256": "91c8a0132ada8fc39137d402c009573e7f2e0c39c147f8a7b00162e1f8d6f822"
+    },
+    "/home/vikash/vllm.cpp-residual-norm-impl/build-residual-cpu/libblake3_vendored.a": {
+      "bytes": 34056,
+      "sha256": "2a639b282d02d8bb3b72a3fdb94b8e99ad2b09955e79577c8c42cfda18257b17"
+    },
+    "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-cpu/libblake3_vendored.a": {
+      "bytes": 34056,
+      "sha256": "2a639b282d02d8bb3b72a3fdb94b8e99ad2b09955e79577c8c42cfda18257b17"
+    },
+    "/home/vikash/.cache/residual-norm-impl/green-freeze-2/build-residual-hip/libvllm.a": {
+      "bytes": 88483988,
+      "sha256": "ee9608029966c7aecb714f786e6c9cb9cafe3d64f27599f1bc638df1dd17e6ea"
+    },
+    "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-hip/libvllm.a": {
+      "bytes": 88483988,
+      "sha256": "ee9608029966c7aecb714f786e6c9cb9cafe3d64f27599f1bc638df1dd17e6ea"
+    },
+    "/home/vikash/vllm.cpp-residual-norm-impl/build-residual-hip/libblake3_vendored.a": {
+      "bytes": 34056,
+      "sha256": "2a639b282d02d8bb3b72a3fdb94b8e99ad2b09955e79577c8c42cfda18257b17"
+    },
+    "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-hip/libblake3_vendored.a": {
+      "bytes": 34056,
+      "sha256": "2a639b282d02d8bb3b72a3fdb94b8e99ad2b09955e79577c8c42cfda18257b17"
+    },
+    "/home/vikash/vllm.cpp-residual-norm-repair1/src/vt/rocm/rocm_residual_rmsnorm.hip": {
+      "bytes": 5420,
+      "sha256": "f2ee1eeeab08bc9a8102056c0ae7e0ddf5eed1fe23b831d5938d7e99be7eb657"
+    }
+  },
+  "outputs": {
+    "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-cpu/tests/test_ops_residual_rmsnorm": {
+      "bytes": 26209432,
+      "sha256": "6470de98c0e5f56cde1e4691d21f8cbe8f1c67c3975d6793fc89e01eb02ec828"
+    },
+    "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-hip/tests/test_ops_residual_rmsnorm": {
+      "bytes": 29318040,
+      "sha256": "04f0ac97f9aad3f3d683ab6c692b6512069348dcc4b04c8fa4824a1befcf1a06"
+    },
+    "/home/vikash/.cache/residual-norm-repair1/wrong-stream/test_ops_residual_rmsnorm": {
+      "bytes": 29318040,
+      "sha256": "f25a4251a2c60a1c8f3fcdd6346661f0694587a3f1467caf9eadbbd20a664235"
+    },
+    "/home/vikash/.cache/residual-norm-repair1/wrong-stream/rocm_residual_rmsnorm.hip": {
+      "bytes": 5389,
+      "sha256": "41aeb8790ba3d6a4e24921f5324174dcdf5fe4b4647b784f71a4dc5c4f94873a"
+    }
+  },
+  "commands": [
+    {
+      "name": "hip-main",
+      "argv": [
+        "/usr/bin/c++",
+        "-isystem",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/third_party",
+        "-O3",
+        "-DNDEBUG",
+        "-std=c++20",
+        "-fPIC",
+        "-ffp-contract=off",
+        "-o",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-hip/main.o",
+        "-c",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/tests/doctest_main.cpp"
+      ],
+      "cwd": "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-hip",
+      "exit_code": 0,
+      "seconds": 3.5146089729387313,
+      "log": "/home/vikash/.cache/residual-norm-repair1/hip-main.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "cpu-main",
+      "argv": [
+        "/usr/bin/c++",
+        "-isystem",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/third_party",
+        "-O3",
+        "-DNDEBUG",
+        "-std=c++20",
+        "-fPIC",
+        "-ffp-contract=off",
+        "-o",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-cpu/main.o",
+        "-c",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/tests/doctest_main.cpp"
+      ],
+      "cwd": "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-cpu",
+      "exit_code": 0,
+      "seconds": 3.5353177699726075,
+      "log": "/home/vikash/.cache/residual-norm-repair1/cpu-main.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "cpu-test",
+      "argv": [
+        "/usr/bin/c++",
+        "-I/home/vikash/vllm.cpp-residual-norm-repair1/tests",
+        "-I/home/vikash/vllm.cpp-residual-norm-repair1/include",
+        "-I/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-cpu/include",
+        "-I/home/vikash/vllm.cpp-residual-norm-repair1/third_party/blake3",
+        "-isystem",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/third_party",
+        "-O3",
+        "-DNDEBUG",
+        "-std=c++20",
+        "-fPIE",
+        "-ffp-contract=off",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-o",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-cpu/test.o",
+        "-c",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/tests/vt/test_ops_residual_rmsnorm.cpp"
+      ],
+      "cwd": "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-cpu",
+      "exit_code": 0,
+      "seconds": 6.466870703035966,
+      "log": "/home/vikash/.cache/residual-norm-repair1/cpu-test.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "hip-test",
+      "argv": [
+        "/usr/bin/c++",
+        "-DVLLM_CPP_HIP",
+        "-D__HIP_PLATFORM_AMD__=1",
+        "-I/home/vikash/vllm.cpp-residual-norm-repair1/tests",
+        "-I/home/vikash/vllm.cpp-residual-norm-repair1/include",
+        "-I/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-hip/include",
+        "-I/opt/rocm/include",
+        "-I/home/vikash/vllm.cpp-residual-norm-repair1/third_party/blake3",
+        "-isystem",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/third_party",
+        "-O3",
+        "-DNDEBUG",
+        "-std=c++20",
+        "-fPIE",
+        "-ffp-contract=off",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-o",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-hip/test.o",
+        "-c",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/tests/vt/test_ops_residual_rmsnorm.cpp"
+      ],
+      "cwd": "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-hip",
+      "exit_code": 0,
+      "seconds": 7.25080132111907,
+      "log": "/home/vikash/.cache/residual-norm-repair1/hip-test.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "cpu-main-archive",
+      "argv": [
+        "ar",
+        "rcs",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-cpu/tests/libvllm_test_main.a",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-cpu/main.o"
+      ],
+      "cwd": "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-cpu",
+      "exit_code": 0,
+      "seconds": 0.04720654105767608,
+      "log": "/home/vikash/.cache/residual-norm-repair1/cpu-main-archive.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "cpu-link",
+      "argv": [
+        "/usr/bin/c++",
+        "-O3",
+        "-DNDEBUG",
+        "-Wl,--whole-archive,/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-cpu/libvllm.a,--no-whole-archive",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-cpu/test.o",
+        "-o",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-cpu/tests/test_ops_residual_rmsnorm",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-cpu/libvllm.a",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-cpu/tests/libvllm_test_main.a",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-cpu/libblake3_vendored.a"
+      ],
+      "cwd": "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-cpu",
+      "exit_code": 0,
+      "seconds": 0.5794992081355304,
+      "log": "/home/vikash/.cache/residual-norm-repair1/cpu-link.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "hip-main-archive",
+      "argv": [
+        "ar",
+        "rcs",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-hip/tests/libvllm_test_main.a",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-hip/main.o"
+      ],
+      "cwd": "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-hip",
+      "exit_code": 0,
+      "seconds": 0.046468702144920826,
+      "log": "/home/vikash/.cache/residual-norm-repair1/hip-main-archive.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "hip-link",
+      "argv": [
+        "/opt/rocm/lib/llvm/bin/clang++",
+        "--rocm-path=/opt/rocm",
+        "-O3",
+        "-DNDEBUG",
+        "--offload-arch=gfx1100",
+        "-Xlinker",
+        "--whole-archive",
+        "-Xlinker",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-hip/libvllm.a",
+        "-Xlinker",
+        "--no-whole-archive",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-hip/test.o",
+        "-o",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-hip/tests/test_ops_residual_rmsnorm",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-hip/libvllm.a",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-hip/tests/libvllm_test_main.a",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-hip/libblake3_vendored.a",
+        "/opt/rocm/lib/libamdhip64.so",
+        "/opt/rocm/lib/libhipblas.so",
+        "/opt/rocm/lib/libhipblaslt.so",
+        "/opt/rocm/lib/libamdhip64.so.7.15.26333-0000000",
+        "-lgcc",
+        "-lgcc",
+        "-lgcc",
+        "-lgcc"
+      ],
+      "cwd": "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-hip",
+      "exit_code": 0,
+      "seconds": 0.13446427206508815,
+      "log": "/home/vikash/.cache/residual-norm-repair1/hip-link.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "wrong-stream-compile",
+      "argv": [
+        "/opt/rocm/lib/llvm/bin/clang++",
+        "-DVLLM_CPP_HIP",
+        "-D__HIP_ROCclr__=1",
+        "-I/home/vikash/vllm.cpp-residual-norm-repair1/include",
+        "-I/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-hip/include",
+        "-I/home/vikash/vllm.cpp-residual-norm-repair1/src",
+        "-I/home/vikash/vllm.cpp-residual-norm-repair1/third_party/blake3",
+        "-isystem",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/third_party",
+        "--rocm-path=/opt/rocm",
+        "-O3",
+        "-DNDEBUG",
+        "-std=c++20",
+        "--offload-arch=gfx1100",
+        "-fPIC",
+        "-ffp-contract=off",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-o",
+        "/home/vikash/.cache/residual-norm-repair1/wrong-stream/rocm_residual_rmsnorm.hip.o",
+        "-x",
+        "hip",
+        "-c",
+        "/home/vikash/.cache/residual-norm-repair1/wrong-stream/rocm_residual_rmsnorm.hip"
+      ],
+      "cwd": "/home/vikash/.cache/residual-norm-repair1/wrong-stream",
+      "exit_code": 0,
+      "seconds": 2.2970829010009766,
+      "log": "/home/vikash/.cache/residual-norm-repair1/wrong-stream-compile.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "wrong-stream-archive",
+      "argv": [
+        "ar",
+        "r",
+        "/home/vikash/.cache/residual-norm-repair1/wrong-stream/libvllm.a",
+        "/home/vikash/.cache/residual-norm-repair1/wrong-stream/rocm_residual_rmsnorm.hip.o"
+      ],
+      "cwd": "/home/vikash/.cache/residual-norm-repair1/wrong-stream",
+      "exit_code": 0,
+      "seconds": 0.4022414069622755,
+      "log": "/home/vikash/.cache/residual-norm-repair1/wrong-stream-archive.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "wrong-stream-link",
+      "argv": [
+        "/opt/rocm/lib/llvm/bin/clang++",
+        "--rocm-path=/opt/rocm",
+        "-O3",
+        "-DNDEBUG",
+        "--offload-arch=gfx1100",
+        "-Xlinker",
+        "--whole-archive",
+        "-Xlinker",
+        "/home/vikash/.cache/residual-norm-repair1/wrong-stream/libvllm.a",
+        "-Xlinker",
+        "--no-whole-archive",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-hip/test.o",
+        "-o",
+        "/home/vikash/.cache/residual-norm-repair1/wrong-stream/test_ops_residual_rmsnorm",
+        "/home/vikash/.cache/residual-norm-repair1/wrong-stream/libvllm.a",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-hip/tests/libvllm_test_main.a",
+        "/home/vikash/vllm.cpp-residual-norm-repair1/build-repair-hip/libblake3_vendored.a",
+        "/opt/rocm/lib/libamdhip64.so",
+        "/opt/rocm/lib/libhipblas.so",
+        "/opt/rocm/lib/libhipblaslt.so",
+        "/opt/rocm/lib/libamdhip64.so.7.15.26333-0000000",
+        "-lgcc",
+        "-lgcc",
+        "-lgcc",
+        "-lgcc"
+      ],
+      "cwd": "/home/vikash/.cache/residual-norm-repair1/wrong-stream",
+      "exit_code": 0,
+      "seconds": 0.12359828595072031,
+      "log": "/home/vikash/.cache/residual-norm-repair1/wrong-stream-link.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "all_inputs_unchanged": true,
+  "max_parallel_compilers": 4
+}

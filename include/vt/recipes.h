@@ -19,6 +19,35 @@
 
 namespace vt {
 
+// Executing vLLM e126687a9a compiled partitions ckic6h6, ctj2x6, and c5slugd.
+// The optional delta has its own input slot. Gamma never occupies an activation
+// slot. The materialized residual is an independent, optional second output.
+constexpr FusedRecipe ResidualRmsNormRecipe(ResidualNormDesc descriptor) {
+  FusedRecipe recipe{};
+  recipe.n = 1;
+  recipe.n_operands = 6;
+  recipe.name = "residual_rms_norm";
+  recipe.operands[0] = {FKind::kRow, "a"};
+  recipe.operands[1] = {FKind::kRow, "base"};
+  recipe.operands[2] = {FKind::kRow, "delta"};
+  recipe.operands[3] = {FKind::kWeight, "weight"};
+  recipe.operands[4] = {FKind::kRow, "out"};
+  recipe.operands[5] = {FKind::kRow, "residual_out"};
+  auto& step = recipe.steps[0];
+  step.op = FOp::kResidualRmsNorm;
+  step.out = 4;
+  step.out2 = descriptor.materialize_residual ? 5 : kNoOperand;
+  step.in[0] = 0;
+  step.in[1] = 1;
+  const bool triple = descriptor.expression == ResidualNormExpr::kDeltaPlusAdd;
+  step.in[2] = triple ? 2 : 3;
+  step.in[3] = 3;
+  step.nin = triple ? 4 : 3;
+  step.reduce = FReduce::kMeanSquare;
+  step.residual_norm = descriptor;
+  return recipe;
+}
+
 // kFusedAddRmsNorm — residual-add + gemma-RMSNorm, the fused_add_rms_norm chain.
 //
 // Transcribes vLLM's add+RMSNorm fusion pattern

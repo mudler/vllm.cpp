@@ -1,0 +1,12 @@
+{
+  "complete": true,
+  "pin": "e126687a9a828d513c01a07cd69f025f27d63280",
+  "cases": 264,
+  "families": {
+    "core": 144,
+    "ir-rms": 60,
+    "ir-add": 60
+  },
+  "payload_files": 1452,
+  "cases_sha256": "fe7347766cac98b9f57664224bb696e3acb3d43619b168c66e0ad4a7bad9f960"
+}

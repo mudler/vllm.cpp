@@ -1,0 +1,39 @@
+ERROR: RECORD ANCHOR REGRESSION in bucket 'stale': 29 > baseline 28. A citation names a line that no longer holds what the prose says it does. Run `python3 scripts/check-agent-record.py --report` for the offenders and repair the anchor. NEVER raise the baseline to pass.
+Record anchors in the `code` / `tests` cells of ACTIVE/ANCHOR-BACKFILL/BUILD-ONLY/DONE/GATING/PARTIAL/READY/UNTRACED rows:
+
+  BROKEN KV-PREFIX-CACHE -> examples/server/main.cpp:126
+  STALE  KV-PREFIX-MATCH-UNIT -> src/vllm/v1/core/kv_cache_utils.cpp:638 expected `resolve_kv_cache_block_sizes`
+  STALE  KV-PREFIX-MATCH-UNIT -> src/vllm/v1/core/kv_cache_utils.cpp:577 expected `get_request_block_hasher`
+  STALE  ENG-ASYNC-SCHED -> src/vllm/v1/engine/core.cpp:91 expected `step_with_batch_queue`
+  STALE  ENG-SGLANG-BEHAVIOR-FLAG -> src/vllm/v1/core/sched/scheduler.cpp:183-243 expected `maybe_reorder_waiting_for_lpm()`
+  STALE  KV-OFFLOAD -> src/vllm/v1/core/block_pool.cpp:139-155 expected `BlockPool::evict_blocks`
+  STALE  KV-EVENTS -> include/vllm/sampling_params.h:251 expected `SamplingParams::extra_args`
+  BROKEN KV-SGLANG-RADIX-CACHE -> examples/server/main.cpp:185
+  STALE  SAMPLE-LOGPROB-TOKEN-IDS -> src/vllm/v1/worker/gpu/input_batch.cpp:306 expected `add_request`
+  STALE  SAMPLE-LOGPROB-TOKEN-IDS -> src/vllm/v1/sample/sampler.cpp:160 expected `GatherSpecificTokenLogprobs`
+  STALE  SERVE-METRICS -> src/vllm/v1/engine/llm_engine.cpp:99 expected `Record`
+  STALE  SERVE-METRICS -> src/vllm/v1/engine/async_llm.cpp:262 expected `IterationStats`
+  STALE  SERVE-METRICS -> src/vllm/entrypoints/openai/api_server.cpp:251 expected `handle_metrics`
+  BROKEN SERVE-STREAM-USAGE -> examples/server/main.cpp:123
+  STALE  SERVE-UTILITY-ENDPOINTS -> src/vllm/entrypoints/openai/api_server.cpp:262 expected `handle_tokenize`
+  STALE  SERVE-UTILITY-ENDPOINTS -> include/vllm/entrypoints/openai/api_server.h:118 expected `set_tokenizer_info_enabled`
+  STALE  ENG-TRAILER-MERGE-ARTIFACTS -> scripts/check-commit-trailers.py:60 expected `join_trailing_trailer_paragraphs`
+  STALE  ENG-FORGE-COAUTHOR -> scripts/check-commit-trailers.py:38 expected `FORGE_ACCOUNT_EMAIL`
+  STALE  SERVE-RECIPE-ARGS -> src/vllm/entrypoints/openai/server_main.cpp:289 expected `kAcceptedInertArgs`
+  STALE  SERVE-ADMIN -> src/vllm/entrypoints/openai/api_server.cpp:488 expected `handle_abort_requests`
+  STALE  SERVE-ADMIN -> include/vllm/entrypoints/openai/api_server.h:156 expected `set_abort_requests`
+  BROKEN SERVE-VIDEOS-REFS -> examples/server/main.cpp:96
+  STALE  ENG-MOE-HOSTFREE -> src/vllm/model_executor/models/qwen3_5.cpp:4472 expected `Qwen3_5Model::PrepareMarlinResident`
+  STALE  ENG-MOE-HOSTFREE -> tests/vllm/test_qwen36_weights.cpp:273 expected `ReleaseHost`
+  STALE  ENG-MOE-LOADSTREAM -> include/vllm/model_executor/models/qwen3_5_weights.h:307 expected `Qwen3_5MoeWeights::load_layer_experts`
+  STALE  ENG-MOE-LOADSTREAM -> src/vllm/entrypoints/model_loader.cpp:365 expected `LoadFromDir`
+  BROKEN MODEL-MM-qwen3-5-qwen3-5-moe-for-conditional-generation -> src/vllm/model_executor/models/registry.cpp:10-20
+  STALE  QUANT-GGUF-NVFP4 -> tests/vllm/test_gguf_nvfp4.cpp:144 expected `DequantNvfp4ToBf16`
+  STALE  QUANT-CT-MXFP4 -> src/vllm/model_executor/model_loader/mxfp4_dequant.cpp:14 expected `E8M0ToF32`
+  STALE  KERNEL-ATTN-DFLASH-BLOCK -> src/vt/cuda/cuda_ops.cu:1300 expected `DFlashBlockAttentionKernelCuda`
+  STALE  KERNEL-ATTN-DFLASH-PAGED-BLOCK -> src/vt/cuda/cuda_ops.cu:1452 expected `DFlashPagedBlockAttentionKernelCuda`
+  STALE  BACKEND-CUDA-SM120 -> cmake/CudaArchFeatures.cmake:216 expected `VT_CUDA_FEATURE_TABLE`
+  STALE  BACKEND-PLATFORM -> include/vt/backend.h:22 expected `vt::Backend`
+  STALE  BACKEND-DISTRIBUTED-COMM -> include/vt/device.h:50 expected `vt::Queue`
+
+record anchors: ok=936, stale=29, broken=5  -> rot 34

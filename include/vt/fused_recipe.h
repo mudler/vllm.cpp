@@ -27,6 +27,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include "vt/residual_norm.h"
 
 namespace vt {
 
@@ -66,6 +67,7 @@ enum class FOp : uint8_t {
   kQuantFp8,      // static per-tensor fp8    -> vt::QuantFp8Static   [composite terminal]
   kQuantFp4,      // dynamic per-group fp4    -> vt::ScaledFp4Quant   [composite terminal]
   kAttnQkNormRopeGate,  // fused attn preamble -> vt::AttnQkNormRopeGate [composite macro]
+  kResidualRmsNorm,  // ordered read-only residual expression -> vt::ResidualRmsNorm
 };
 
 // Row-reduction kind for reducing ops (kRmsNorm). kMeanSquare = mean(a^2) over
@@ -104,7 +106,7 @@ constexpr int kNoFastOp = -1;
 // no heap). The slack is headroom for the finite Class-A pattern set.
 constexpr int kMaxFusedSteps = 8;
 constexpr int kMaxFusedOperands = 8;
-constexpr int kMaxStepIns = 3;
+constexpr int kMaxStepIns = 4;
 
 // One operand slot in the recipe's INDEXED operand table. Steps reference
 // operands by their index into FusedRecipe::operands (== the index into the
@@ -123,7 +125,7 @@ struct FOperandSlot {
 struct FStep {
   FOp op = FOp::kAdd;
   uint8_t out = 0;                     // primary output operand index
-  uint8_t in[kMaxStepIns] = {0, 0, 0};  // input operand indices
+  uint8_t in[kMaxStepIns] = {};         // input operand indices
   uint8_t nin = 0;                     // number of inputs used
   uint8_t out2 = kNoOperand;           // secondary output (e.g. fp4 scale) or kNoOperand
   FReduce reduce = FReduce::kNone;
@@ -141,6 +143,7 @@ struct FStep {
   // full-width) be told apart. Additive: default false keeps every existing
   // recipe byte-identical.
   bool norm_full_width = false;
+  ResidualNormDesc residual_norm{};  // kResidualRmsNorm arithmetic and output aliases
 };
 
 // The declaration: a fixed-size step list + an indexed operand table + live

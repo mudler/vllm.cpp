@@ -170,11 +170,14 @@ bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
   }
 }
 
-// keep-f16 needs an f16-capable MatmulBT on the running device; the ROCm
-// kernel accepts bf16/bf16 and f32/f32 only, so an F16 file weight must
-// expand there rather than be kept and refused at first forward (same review).
-bool DeviceKeepF16Supported(vt::DeviceType dev) {
-  return dev != vt::DeviceType::kROCM;
+// ROCm retention additionally requires the accepting loader's model dtype.
+// This predicate also prevents an unwired loader admitting raw F16 model values.
+bool RequiresF16ValueDType(vt::DeviceType dev) {
+  return dev == vt::DeviceType::kROCM;
+}
+
+bool SupportedF16ValueDType(std::optional<vt::DType> dtype) {
+  return dtype == vt::DType::kBF16 || dtype == vt::DType::kF32;
 }
 
 // The GATHER's admission rule; see the header. A block dtype with a row decoder
@@ -232,7 +235,8 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
                               bool cpu_ref, GgufTensorRole role,
                               uint32_t ggml_type,
                               const std::vector<int64_t>& shape,
-                              vt::DeviceType dev) {
+                              vt::DeviceType dev,
+                              std::optional<vt::DType> weight_value_dtype) {
   // The oracle switch wins over everything (spec gate 2).
   if (cpu_ref) return GgufResidency::kExpandBf16;
 
@@ -281,7 +285,11 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
   // 2. Keep-f16 (an F16 file weight in a verbatim role, incl. the gather table).
   // Independent of keep_quant: F16 is not a block encoding, so a weight is never
   // eligible for both. No block-alignment constraint — f16 is per-element.
-  if (keep_f16 && KeepF16DType(ggml_type) &&
+  const bool f16_consumer = !RequiresF16ValueDType(dev) ||
+      (SupportedF16ValueDType(weight_value_dtype) &&
+       (role == GgufTensorRole::kMatmulWeight ||
+        role == GgufTensorRole::kEmbeddingTable));
+  if (keep_f16 && f16_consumer && KeepF16DType(ggml_type) &&
       KeepF16KDim(role, shape) > 0) {
     return GgufResidency::kKeepF16;
   }
@@ -289,11 +297,17 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
   return GgufResidency::kExpandBf16;
 }
 
-GgufLoadPolicy GgufLoadPolicy::FromEnv(vt::DeviceType dev) {
+GgufLoadPolicy GgufLoadPolicy::FromEnv(
+    vt::DeviceType dev, std::optional<vt::DType> model_dtype) {
   GgufLoadPolicy p;
   // FIRST, because every device-dependent flag below reads it. It is the
   // ENGINE's resolved device, not `CurrentPlatform()`: see the field comment.
   p.device = dev;
+  if (RequiresF16ValueDType(dev) && model_dtype) {
+    VT_CHECK(SupportedF16ValueDType(model_dtype),
+             "GGUF retained F16 weights require resolved BF16 or F32 model values");
+    p.weight_value_dtype = model_dtype;
+  }
   p.cpu_ref = EnvOn("VT_CPU_REF");
   // CIQ G4 flipped this default: keep-quant is ON wherever the running device
   // can execute the quantized GEMM. VT_GGUF_KEEP_QUANT is the two-way
@@ -361,10 +375,11 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv(vt::DeviceType dev) {
   //     revisiting it is QUANT-GGUF-KEEPQ-LOADER's decision and needs the re-take
   //     first. See .agents/specs/oracle-llamacpp-repin-stock.md, row 12.
   //
-  // VT_GGUF_KEEP_F16=0 is the opt-out; rides expand_nk so it is CPU-only and off
-  // under VT_CPU_REF regardless (the oracle load stays byte-identical).
-  p.keep_f16 = EnvOnOr("VT_GGUF_KEEP_F16", p.expand_nk) && p.expand_nk &&
-               DeviceKeepF16Supported(dev);
+  // VT_GGUF_KEEP_F16=0 opts out. ROCm requires explicit model values; other
+  // backends retain their expand_nk prerequisite. VT_CPU_REF always expands.
+  const bool f16_available = RequiresF16ValueDType(dev)
+      ? p.weight_value_dtype.has_value() && !p.cpu_ref : p.expand_nk;
+  p.keep_f16 = EnvOnOr("VT_GGUF_KEEP_F16", f16_available) && f16_available;
   // `QUANT-GGUF-NVFP4` column C. Same shape as the keep-quant default: ON
   // wherever the running device can execute the NVFP4 GEMM (CUDA today; a CPU
   // build keeps expanding, which is correct but unquantized), with
@@ -385,8 +400,9 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv(vt::DeviceType dev) {
   // variable, and it applies the same whole-value polarity `EnvOnOr` did, so an
   // environment-only run resolves byte-for-byte as before. `VT_CPU_REF` still wins
   // over both: the oracle switch is not a residency preference.
-  p.mmap_residency = ResolveGgufMmap(p.keep_quant) && !p.cpu_ref;
-  p.share_tied_head = EnvOnOr("VT_GGUF_SHARE_TIED_HEAD", p.expand_nk) && p.expand_nk;
+  p.mmap_residency = ResolveGgufMmap(p.keep_quant || p.keep_f16) && !p.cpu_ref;
+  const bool share_available = p.expand_nk || p.keep_f16;
+  p.share_tied_head = EnvOnOr("VT_GGUF_SHARE_TIED_HEAD", share_available) && share_available;
   // GDN split-projection orientation. Rides expand_nk (so VT_CPU_REF=1
   // reproduces the historical transpose); VT_GGUF_GDN_NK=0 is the narrow
   // same-binary A/B that reverts only the GDN projections to [K, N].
@@ -465,7 +481,7 @@ GgufResidency GgufLoadPolicy::Route(const GgufTensorInfo& tensor,
                                     GgufTensorRole role) const {
   const GgufResidency r = RouteGgufTensor(
       keep_quant, keep_f16, nvfp4_fp4, cpu_ref, role, tensor.ggml_type,
-      tensor.shape, ComputeDeviceFor(tensor.name, role));
+      tensor.shape, ComputeDeviceFor(tensor.name, role), weight_value_dtype);
   if (audit) audit(tensor.name, role, r);
   return r;
 }
@@ -486,7 +502,8 @@ GgufResidency PeekRoute(const GgufLoadPolicy& policy, const GgufTensorInfo& tens
   // one file, which is the defect #1378 records.
   return RouteGgufTensor(policy.keep_quant, policy.keep_f16, policy.nvfp4_fp4,
                          policy.cpu_ref, role, tensor.ggml_type, tensor.shape,
-                         policy.ComputeDeviceFor(tensor.name, role));
+                         policy.ComputeDeviceFor(tensor.name, role),
+                         policy.weight_value_dtype);
 }
 
 }  // namespace vllm

@@ -20,6 +20,8 @@
 #include <doctest/doctest.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <cstring>
 #include <memory>
 #include <random>
@@ -39,9 +41,15 @@ using vt::DType;
 using vt::Queue;
 using vt::Tensor;
 
-bool HasCuda() {
+// Preserve the CUDA cases and allow the same fixtures on the ROCm provider.
+DeviceType TestDevice() {
+  const char* device = std::getenv("VT_MOE_TEST_DEVICE");
+  return device != nullptr && std::strcmp(device, "rocm") == 0
+             ? DeviceType::kROCM : DeviceType::kCUDA;
+}
+bool HasDevice() {
   try {
-    vt::GetBackend(DeviceType::kCUDA);
+    vt::GetBackend(TestDevice());
     return true;
   } catch (const std::runtime_error&) {
     return false;
@@ -118,7 +126,7 @@ std::vector<uint16_t> RandomBf16(size_t numel, uint32_t seed) {
 // carries.
 void RunFusedGateUpSiluCase(int64_t e_count, int64_t t_rows, int64_t top_k, int64_t k_dim,
                             int64_t i_dim, uint32_t seed) {
-  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Backend& gpu = vt::GetBackend(TestDevice());
   const int64_t P = t_rows * top_k;
 
   std::vector<std::vector<uint16_t>> gate_w(static_cast<size_t>(e_count));
@@ -196,9 +204,9 @@ void RunFusedGateUpSiluCase(int64_t e_count, int64_t t_rows, int64_t top_k, int6
 }  // namespace
 
 // P = 12 < kTileMinRows(32), K=64 -> splits==1 (naive partials) + reduce+SwiGLU.
-TEST_CASE("CUDA moe_grouped_gemm_bf16_gate_up_silu naive path == composite (byte-exact)") {
-  if (!HasCuda()) {
-    MESSAGE("no CUDA backend registered; skipping");
+TEST_CASE("GPU moe_grouped_gemm_bf16_gate_up_silu naive path == composite (byte-exact)") {
+  if (!HasDevice()) {
+    MESSAGE("requested GPU backend is unavailable; skipping");
     return;
   }
   RunFusedGateUpSiluCase(/*e_count=*/5, /*t_rows=*/6, /*top_k=*/2, /*k_dim=*/64, /*i_dim=*/8,
@@ -208,9 +216,9 @@ TEST_CASE("CUDA moe_grouped_gemm_bf16_gate_up_silu naive path == composite (byte
 // P = 6 < kTileMinRows, K=1024 -> MoeSplitKCount picks splits=4: split-K partials
 // reduced in fixed ascending order, then fused SwiGLU. The path where the fold's
 // launch reduction (5 -> 3) actually lands (Qwen3-Coder / DeepSeek-V2 c1 decode).
-TEST_CASE("CUDA moe_grouped_gemm_bf16_gate_up_silu split-K decode == composite (byte-exact)") {
-  if (!HasCuda()) {
-    MESSAGE("no CUDA backend registered; skipping");
+TEST_CASE("GPU moe_grouped_gemm_bf16_gate_up_silu split-K decode == composite (byte-exact)") {
+  if (!HasDevice()) {
+    MESSAGE("requested GPU backend is unavailable; skipping");
     return;
   }
   RunFusedGateUpSiluCase(/*e_count=*/5, /*t_rows=*/3, /*top_k=*/2, /*k_dim=*/1024, /*i_dim=*/8,
@@ -223,9 +231,9 @@ TEST_CASE("CUDA moe_grouped_gemm_bf16_gate_up_silu split-K decode == composite (
 // P = 40 (kTileMinRows <= P) -> BM=16 decode WMMA tile; P = 1024 -> BM=64 prefill
 // WMMA tile. The WMMA branch reuses the tuned grouped GEMM twice + the identical
 // silu-mul, so it is composite-identical by construction — this asserts it.
-TEST_CASE("CUDA moe_grouped_gemm_bf16_gate_up_silu WMMA tiles == composite (byte-exact)") {
-  if (!HasCuda()) {
-    MESSAGE("no CUDA backend registered; skipping");
+TEST_CASE("GPU moe_grouped_gemm_bf16_gate_up_silu WMMA tiles == composite (byte-exact)") {
+  if (!HasDevice()) {
+    MESSAGE("requested GPU backend is unavailable; skipping");
     return;
   }
   RunFusedGateUpSiluCase(/*e_count=*/7, /*t_rows=*/20, /*top_k=*/2, /*k_dim=*/80, /*i_dim=*/130,

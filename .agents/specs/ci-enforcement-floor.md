@@ -42,8 +42,10 @@ role-discipline commits are disjoint from the 35. **41 distinct commits.**
 That count is the measurement at `bacb71109` and is left as measured. A 42nd
 commit, `c00b99c7c`, landed on 2026-08-24 while this row was in flight and moved
 the split to 35 trailers / 7 role discipline. A 43rd, `e1b5df1a6`, landed on
-2026-08-25 and moved it to 35 / 8. `## The 43 forgiven commits`,
-`### The first advance` and `### The second advance` carry them.
+2026-08-25 and moved it to 35 / 8. A 44th, `96c5e4719`, landed on
+2026-09-09 and moved it to 35 / 9. `## The 44 forgiven commits`,
+`### The first advance`, `### The second advance` and
+`### The third advance` carry them.
 
 ### Why no remedy exists
 
@@ -92,8 +94,8 @@ A commit date is author-controlled and can go backwards across a rebase, so a
 date comparison can choose the wrong commit; ancestry on a linear first-parent
 `main` cannot.
 
-The floor is set to `e1b5df1a6b5b30555639e0a0459f79a467544579`, which is the
-last of the 43 commits enumerated below. The floor is the forgiven commit
+The floor is set to `96c5e4719dcb1f859cb9e59573309f16c026b523`, which is the
+last of the 44 commits enumerated below. The floor is the forgiven commit
 itself rather than its child, because the walk is `FLOOR..HEAD` and excludes
 `FLOOR`; every commit after it stays enforced.
 
@@ -343,16 +345,18 @@ Out of scope, deliberately:
   `windows-msvc` reds (#584). Both are inherited and neither is this row's.
 - The PR lane's base selection, which is unchanged.
 
-## The 43 forgiven commits
+## The 44 forgiven commits
 
-Real protocol violations that landed unread between 2026-08-13 and 2026-08-25,
+Real protocol violations that landed unread between 2026-08-13 and 2026-09-09,
 recorded here because after the floor advances no gate will name them again.
 
-35 fail the strict trailer contract and 8 fail role discipline. The two sets are
+35 fail the strict trailer contract and 9 fail role discipline. The two sets are
 disjoint. 41 of them were enumerated when the floor was first recorded at
 `bacb71109`; the 42nd, `c00b99c7c`, arrived afterwards and moved the split from
 35/6 to 35/7 — see `### The first advance`. The 43rd, `e1b5df1a6`, arrived on
-2026-08-25 and moved it to 35/8 — see `### The second advance`.
+2026-08-25 and moved it to 35/8 — see `### The second advance`. The 44th,
+`96c5e4719`, arrived on 2026-09-09 and moved it to 35/9 — see
+`### The third advance`.
 
 ### Fail `check-commit-trailers.py --range` (35)
 
@@ -402,7 +406,7 @@ carries no `FOLLOWING_AGENTS_PROTOCOL` string at all: `7572b0f4e2fb`,
 `e34d71379e70`, `aba8d5ffb77c`, `2d2a66715ef4`, `1757330006f6`. The remaining 15
 carry the marker in a form the strict contract rejects.
 
-### Fail `check-role-discipline.py` (8)
+### Fail `check-role-discipline.py` (9)
 
 Repository changes that reached `main` without arriving on a task branch.
 
@@ -416,6 +420,7 @@ Repository changes that reached `main` without arriving on a task branch.
 | `6e73bdee3ea1` | 2026-08-23 | fix(LTX25-POSITION-CONTRACT): gate the tower positions as integers |
 | `c00b99c7c8b6` | 2026-08-24 | fix(LTX25-DIT-ATTN-ARM-PARSE): match every DiT attention arm exactly and refuse a fourth value |
 | `e1b5df1a6b5b` | 2026-08-25 | fix(LTX25-DIT-ATTN-FA2-HD128): pin the distilled NVFP4 DiT to the artefact every measurement loaded, and hash it |
+| `96c5e4719dcb` | 2026-09-09 | fix(BACKEND-TENSTORRENT-KEEPQUANT): pin the int8-dot sweep for every registered encoding |
 
 `c00b99c7c8b6` is the 42nd. It landed
 `src/vllm/model_executor/models/ltx2_device.cpp` and
@@ -462,14 +467,35 @@ Its message is clean too: it carries `FOLLOWING_AGENTS_PROTOCOL` and passes
 thirty-sixth of the one above, and the split across the 43 is 35 trailers /
 8 role discipline.
 
+`96c5e4719dcb` is the 44th and the newest, authored by Luca Barbato on
+2026-09-09. It changed three paths — `.agents/backend-matrix.md`,
+`src/vt/tenstorrent/tenstorrent_ops.cpp` and
+`tests/vt/test_tenstorrent_backend.cpp` — and reached `main` with no
+`row/<ID>` branch and no `(#N)` in its subject, so `arrives_via_row_pr` finds
+nothing to accept. The checker names only the two feature paths, because
+`.agents/backend-matrix.md` is a record path and is exempt. The checker
+writes one unwrapped line, and this is that line verbatim, copied from
+`python3 scripts/check-role-discipline.py --base e1b5df1a6 --head 96c5e4719`,
+which exits 1:
+
+```
+ERROR: 96c5e4719: repository change (src/vt/tenstorrent/tenstorrent_ops.cpp, tests/vt/test_tenstorrent_backend.cpp) reached main without arriving on a task branch. Work happens in its own worktree on a `row/<ID>` branch and lands through a reviewed PR or an authorized local merge naming that branch; never directly on the shared checkout
+```
+
+Its message is clean too: it carries `FOLLOWING_AGENTS_PROTOCOL` and passes
+`check-commit-trailers.py`, so it is the ninth row of this table and not the
+thirty-sixth of the one above, and the split across the 44 is 35 trailers /
+9 role discipline.
+
 `check-now-current.py` passes over the whole range and forgives nothing.
 
-**Every one of the 43 shas above resolves.** Verified with
+**Every one of the 44 shas above resolves.** Verified with
 `git rev-parse --verify -q '<sha>^{commit}'` over all 42, first at `origin/main`
 `d60692c89` and again at `3574065e7` after the merge, and re-run over all 43 at
-`origin/main` `8853af6bf` for the second advance, every time against the shas
-parsed back out of this committed table rather than a hand-kept copy: 43
-resolved, 0 missing, and all 43 are ancestors of `origin/main` by
+`origin/main` `8853af6bf` for the second advance, and re-run over all 44 at
+`origin/main` `ec23d7b89e71` for the third advance, every time against the shas
+parsed back out of this committed table rather than a hand-kept copy: 44
+resolved, 0 missing, and all 44 are ancestors of `origin/main` by
 `git merge-base --is-ancestor`. This is a full sweep and not a
 spot-check, because after this lands the enumeration is the only witness that
 these violations happened, and an earlier round of this list carried two shas
@@ -573,6 +599,81 @@ costs one reviewed commit per unrepairable violation and buys nothing else; the
 floor stops an unrepairable commit freezing a gate, and if a fourth violation
 lands it will cost a third advance.
 
+### The third advance
+
+**Advanced from `e1b5df1a6` to `96c5e4719` on 2026-09-11, for #3135.** This is
+the third exercise of `### Advancing the floor`, on the same failure the
+mechanism was built for: `agent-record`'s role-discipline step was red on
+`main` with no action any contributor could take to clear it.
+
+**Why it surfaced when it did.** Commit `96c5e4719`
+(`fix(BACKEND-TENSTORRENT-KEEPQUANT): pin the int8-dot sweep for every
+registered encoding`), authored by Luca Barbato on 2026-09-09, reached `main`
+as a direct push — single parent, no `row/<ID>` branch in its history, no
+`(#N)` in its subject — changing `src/vt/tenstorrent/tenstorrent_ops.cpp` and
+`tests/vt/test_tenstorrent_backend.cpp`, both feature paths. The checker writes
+one unwrapped line, and this is that line verbatim, copied from
+`python3 scripts/check-role-discipline.py --base e1b5df1a6 --head origin/main`,
+which exits 1:
+
+```
+ERROR: 96c5e4719: repository change (src/vt/tenstorrent/tenstorrent_ops.cpp, tests/vt/test_tenstorrent_backend.cpp) reached main without arriving on a task branch. Work happens in its own worktree on a `row/<ID>` branch and lands through a reviewed PR or an authorized local merge naming that branch; never directly on the shared checkout
+```
+
+**The advance is minimal by construction, and this was measured rather than
+assumed.** `e1b5df1a6..96c5e4719` is **2164 commits, 555 of them merges**.
+Unlike the first two advances, whose ranges held no merges, this one does, so
+the per-commit check is not equivalent to the range walk: a merge can exempt
+content as reviewed through `merged_pr_content`. **Exactly one commit
+violates**: `96c5e4719`. The floor moved to that commit and no further.
+Setting it to `origin/main` instead would have been the same edit and would
+have forgiven every commit above it unexamined, which is the abuse risk 2 says
+nothing in this mechanism can detect.
+
+That the whole walk names exactly one commit is measured too, and it is the
+same number from both ends. Measured at `origin/main` `ec23d7b89e71`, each rc
+captured as `rc=$?` on the command itself and never after a pipe, because a
+pipe reports its last stage and has misread a red as a green twice in this
+row's history:
+
+| Floor | `check-role-discipline.py --base <floor> --head origin/main` | `ERROR:` lines | `REPORT:` lines |
+|---|---|---|---|
+| `e1b5df1a6` (old) | **rc 1** | 1, `96c5e4719` | 0 |
+| `96c5e4719` (new) | rc 0, `OK: every change on main arrived on a task branch.` | 0 | 0 |
+
+`git merge-base --is-ancestor 96c5e4719dcb1f859cb9e59573309f16c026b523
+origin/main` is rc 0, so the new floor is on this history and the resolver's
+ancestry guard accepts it. `tests/scripts/test_ci_walk_base.py` re-run over the
+new value: 31 tests, 0 failures, 0 errors, with
+`RecordedFloorTests::test_recorded_floor_is_an_ancestor_of_head` reading the
+committed file rather than a literal.
+
+**One test pinned the old value and had to be re-pinned.**
+`tests/scripts/test_check_commit_trailers.py`'s
+`test_the_enforcement_floor_no_longer_claims_the_trailer_steps` asserts the file
+ends with an exact sha, so that #2322 could prove it narrowed the floor's scope
+without moving its value. It is 65/65 green at the base commit, reds with
+exactly that one failure the moment the floor line changes, and is green again
+at 65/65 once re-pinned — a red-before/green-after proof that the pin is live
+and not decorative. The assertion keeps its exact-sha form and its strength;
+only the sha and its message move. Deriving the expected value from this spec's
+table instead would remove the re-pin, but that is a checker-semantics change
+and it is deliberately not made here: an advance having to edit the pin is a
+tripwire that puts the value in front of a reviewer, which is what
+`### Advancing the floor` asks for.
+
+**The arrival rate held.** Measured over `e1b5df1a6..origin/main` at
+`ec23d7b89e71`: **2208 commits, 558 of them merges, spanning 2026-08-25 to
+2026-09-11, and one role-discipline violation.** Seventeen days and 2208
+commits with one violation is consistent with the rate the second advance
+measured (1365 commits, zero violations, over nine days), read as a cluster
+and not a rate.
+
+What the advance still does not do is fix anything. `### Advancing the floor`
+costs one reviewed commit per unrepairable violation and buys nothing else; the
+floor stops an unrepairable commit freezing a gate, and if a fifth violation
+lands it will cost a fourth advance.
+
 ## Gates
 
 | Gate | Command | Result |
@@ -629,7 +730,7 @@ lands it will cost a third advance.
 
 ## Owed
 
-The 43 commits are recorded above rather than owed: no future change can repair
+The 44 commits are recorded above rather than owed: no future change can repair
 them.
 
 - [#2745](https://github.com/mudler/vllm.cpp/issues/2745) —

@@ -208,30 +208,10 @@ inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> s
              std::string("resident weight: EMPTY tensor has no host bytes to "
                          "alias (host-alias arm, dtype ") +
                  vt::Name(w.dtype) + ", rank " + std::to_string(w.rank) + ")");
-    Tensor t = MakeTensor(const_cast<uint8_t*>(w.bytes.data()), w.dtype, d.q.device,
-                          shape);
-    // CIQ G7 / MODEL-MM-QWEN4-EXP W5r (#2031): carry the load-time LAYOUT
-    // markers from the OwnedTensor to the vt::Tensor the kernel actually sees.
-    // `MakeTensor` drops them by default, and this is the only host->kernel
-    // weight-tensor construction on the CPU forward for the 25 models that
-    // inherit this helper, so without these two lines a repacked buffer is read
-    // as a plain one: the i8mm interleave (`block_q8_0x4`) decoded as flat q8_0,
-    // or a [K,N] transposed elementwise buffer read as [N,K]. Both produce
-    // plausible numbers and no crash.
-    //
-    // `qwen3_5.cpp` KEPT A PRIVATE COPY OF THIS HELPER AND ALREADY CARRIES BOTH
-    // (:1055, :1060). This shared one did not, so every model that routes a
-    // keep-quant weight through it was one aarch64 i8mm host away from silent
-    // garbage — `vt::cpu::QuantRepackActive()` is true exactly there, and
-    // `thor`, the box the released Qwen3.8-Flash-Next checkpoint loads on, is
-    // one. It is reachable rather than theoretical for this row specifically:
-    // `qwen4_exp_forward.cpp` hands `hc_*_down`/`hc_*_up` to
-    // `vt::Qwen4ExpGatedResidual` through THIS function (:421-422, :479-480,
-    // :538-539) while it hands `hc_*_inject` through `OwnedTensor::View()`
-    // (:417, :475), which has carried `repacked` all along
-    // (`qwen3_5_weights.cpp:498`) — so the two halves of one op disagreed about
-    // the same flag, and W5p made those two tensors block-quantized operands of
-    // a real quantized GEMM rather than dead float weights.
+    vt::Tensor t = w.ViewOn(const_cast<uint8_t*>(w.bytes.data()), d.q.device, shape);
+    // The CPU-alias arm owns these two markers and ONLY these two, exactly as it
+    // did before ViewOn existed. q8_0_aligned is deliberately absent: setting it
+    // on an aliased host buffer changes which kernel the CPU lane selects.
     t.repacked = w.repacked;
     t.elem_kn_repacked = w.elem_kn_repacked;
     return t;
@@ -266,7 +246,7 @@ inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> s
     // unified-memory box from holding the whole model twice.
     AdoptDeviceBytesAsHost(d.b, w);
   }
-  return MakeTensor(w.d_dev.get(), w.dtype, d.q.device, shape);
+  return w.ViewOn(w.d_dev.get(), d.q.device, shape);
 }
 
 // ── EXL3 (exllamav3 trellis) linear — QUANT-EXL3 W1b (#2181) ────────────────
@@ -634,22 +614,37 @@ inline DBuf AttnBlock(Dev d, const Qwen3DenseAttnWeights& w, const HfConfig& cfg
     // prefill AND decode.
     // Per-head q/k RMSNorm — Qwen3 only (SKIPPED when the model has no qk-norm,
     // e.g. Llama, which leaves w.q_norm/w.k_norm empty). RoPE runs either way.
-    if (has_qk_norm) {
-      Tensor wqn = attn_f32 ? ResidentWeightF32(d, w.q_norm, {Dh})
-                            : ResidentWeight(d, w.q_norm, {Dh});
-      Tensor wkn = attn_f32 ? ResidentWeightF32(d, w.k_norm, {Dh})
-                            : ResidentWeight(d, w.k_norm, {Dh});
-      vt::RmsNorm(d.q, q2, q2, wqn, vt::RmsNormArgs{eps, false});
-      vt::RmsNorm(d.q, k2, k2, wkn, vt::RmsNormArgs{eps, false});
-    }
-    if (RopeCacheEnabled() && rot > 0) {
-      Tensor k3v = k3;
-      vt::RopeFromCache(d.q, q3, &k3v, si.rope_row_idx.t(), si.cos_sin_bf16.t(),
-                        MakeRopeArgs(cfg));
+    // The hand-call takes the registered fused op when the device has one, so
+    // the ADOPT path (FusedChain -> the recipe's fast realisation) and this
+    // fallback agree on every backend, which is the recipe's byte-exact
+    // composite contract. Where no fast op is registered (CPU) both realizations
+    // stay the standalone three-op sequence below.
+    const bool fused_preamble_op =
+        has_qk_norm && rot > 0 && RopeCacheEnabled() && !attn_f32 &&
+        vt::OpRegistered(vt::OpId::kAttnQkNormRope, d.q.device.type);
+    if (fused_preamble_op) {
+      Tensor wqn = ResidentWeight(d, w.q_norm, {Dh});
+      Tensor wkn = ResidentWeight(d, w.k_norm, {Dh});
+      vt::AttnQkNormRope(d.q, q3, k3, wqn, wkn, si.cos_sin_bf16.t(), si.rope_row_idx.t(),
+                         vt::RmsNormArgs{eps, false}, MakeRopeArgs(cfg));
     } else {
-      // DEFAULT (byte-identical, deterministic): in-place bf16 NeoX RoPE with
-      // per-element fp64 cos/sin, mirroring vLLM's rotary_emb bf16 rounding.
-      vt::RopeNeox(d.q, q3, k3, si.positions.t(), MakeRopeArgs(cfg));
+      if (has_qk_norm) {
+        Tensor wqn = attn_f32 ? ResidentWeightF32(d, w.q_norm, {Dh})
+                              : ResidentWeight(d, w.q_norm, {Dh});
+        Tensor wkn = attn_f32 ? ResidentWeightF32(d, w.k_norm, {Dh})
+                              : ResidentWeight(d, w.k_norm, {Dh});
+        vt::RmsNorm(d.q, q2, q2, wqn, vt::RmsNormArgs{eps, false});
+        vt::RmsNorm(d.q, k2, k2, wkn, vt::RmsNormArgs{eps, false});
+      }
+      if (RopeCacheEnabled() && rot > 0) {
+        Tensor k3v = k3;
+        vt::RopeFromCache(d.q, q3, &k3v, si.rope_row_idx.t(), si.cos_sin_bf16.t(),
+                          MakeRopeArgs(cfg));
+      } else {
+        // DEFAULT (byte-identical, deterministic): in-place bf16 NeoX RoPE with
+        // per-element fp64 cos/sin, mirroring vLLM's rotary_emb bf16 rounding.
+        vt::RopeNeox(d.q, q3, k3, si.positions.t(), MakeRopeArgs(cfg));
+      }
     }
   }
 

@@ -183,7 +183,8 @@ OwnedTensor OwnGgufQuantBlocks(const GgufTensorInfo& tensor, int64_t n,
 
 OwnedTensor OwnGgufF16(const GgufTensorInfo& tensor, int64_t n, int64_t k,
                        int64_t row_offset, const GgufFile* mmap_src, bool nk,
-                       bool elem_kn_repack, bool prefault) {
+                       bool elem_kn_repack, bool prefault,
+                       std::optional<vt::DType> weight_value_dtype) {
   VT_CHECK(KeepF16DType(tensor.ggml_type),
            "qwen3_5 gguf: keep-f16 on a non-f16 encoding for " + tensor.name);
   VT_CHECK(n > 0 && k > 0 && row_offset >= 0,
@@ -197,6 +198,7 @@ OwnedTensor OwnGgufF16(const GgufTensorInfo& tensor, int64_t n, int64_t k,
 
   OwnedTensor o;
   o.dtype = vt::DType::kF16;
+  o.weight_value_dtype = weight_value_dtype;
   o.rank = 2;
   o.shape[0] = n;  // N = out features (ggml src0 rows), or vocab for a gather
   o.shape[1] = k;  // K = in features, or H for a gather
@@ -302,7 +304,7 @@ OwnedTensor OwnGgufKeptSlice(const GgufFile& g, const GgufLoadPolicy& pol,
            "qwen3_5 gguf: OwnGgufKeptSlice called for a non-keep residency on " +
                t.name);
   return OwnGgufF16(t, n, k, row_offset, MmapSrc(g, pol), /*nk=*/true,
-                    pol.elem_kn_repack);
+                    pol.elem_kn_repack, /*prefault=*/true, pol.weight_value_dtype);
 }
 
 bool HasTensor(const GgufFile& g, const std::string& name) {
@@ -821,7 +823,8 @@ void LoadEmbedAndHead(const GgufFile& g, const GgufLoadPolicy& pol,
     VT_CHECK(et.shape.size() == 2, "qwen3_5 gguf: token_embd must be 2-D");
     // Embedding gather table: never repacked (EmbeddingKernel reads it row-wise).
     *embed = OwnGgufF16(et, et.shape[0], et.shape[1], 0, MmapSrc(g, pol),
-                        /*nk=*/false, /*elem_kn_repack=*/false);
+                        /*nk=*/false, /*elem_kn_repack=*/false, /*prefault=*/true,
+                        pol.weight_value_dtype);
   } else {
     VT_CHECK(embed_r == GgufResidency::kExpandBf16,
              "qwen3_5 gguf: unexpected embedding-table residency " +
@@ -838,7 +841,7 @@ void LoadEmbedAndHead(const GgufFile& g, const GgufLoadPolicy& pol,
   const GgufResidency head_r =
       RouteGgufTensor(pol.keep_quant, pol.keep_f16, /*nvfp4_fp4=*/false,
                       pol.cpu_ref, GgufTensorRole::kMatmulWeight, ht.ggml_type,
-                      ht.shape, pol.device);
+                      ht.shape, pol.device, pol.weight_value_dtype);
 
   // The two coincide (share one buffer) iff both kept f16, OR both expanded in
   // the file's own [N, K] order (expand_nk). share_tied_head already implies
@@ -862,6 +865,7 @@ void LoadEmbedAndHead(const GgufFile& g, const GgufLoadPolicy& pol,
     std::shared_ptr<const void> owner = embed->bytes.KeepAlive();
     OwnedTensor h;
     h.dtype = embed->dtype;
+    h.weight_value_dtype = embed->weight_value_dtype;
     h.rank = embed->rank;
     for (int i = 0; i < embed->rank; ++i) h.shape[i] = embed->shape[i];
     h.nk = true;  // [N = vocab, K = H], the file's own order

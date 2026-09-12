@@ -1,0 +1,51 @@
+[
+  {
+    "name": "test_rocm_moe_bf16-fusion-1-command.json",
+    "exit_code": 1,
+    "seconds": 2.1759774889796972,
+    "log_sha256": "72df6480041ed42dca4752095ab8edf29c0d17beda32a0a030c665eed69be4b6",
+    "inputs_verified_before_after": 75
+  },
+  {
+    "name": "test_rocm_moe_bf16-fusion-0-command.json",
+    "exit_code": 1,
+    "seconds": 2.1762429990340024,
+    "log_sha256": "72df6480041ed42dca4752095ab8edf29c0d17beda32a0a030c665eed69be4b6",
+    "inputs_verified_before_after": 75
+  },
+  {
+    "name": "test_ops_residual_rmsnorm-fusion-1-command.json",
+    "exit_code": 1,
+    "seconds": 2.878145433962345,
+    "log_sha256": "cab08e83302b93dcc9c9a0c76d8a5820e015cf67f0ad803575d3337914b4bc48",
+    "inputs_verified_before_after": 75
+  },
+  {
+    "name": "test_ops_rmsnorm-fusion-1-command.json",
+    "exit_code": 0,
+    "seconds": 1.2802332111168653,
+    "log_sha256": "71a666e5d823defafcefc982082ff6fe311685116b1976853ffcbfb88039f4d0",
+    "inputs_verified_before_after": 75
+  },
+  {
+    "name": "test_ops_rmsnorm_weight_dtype-fusion-1-command.json",
+    "exit_code": 0,
+    "seconds": 1.2827785040717572,
+    "log_sha256": "bea994619905fbeda785d1d5d234a900b9ca667f2b2ae58bd7773a9fb501a77a",
+    "inputs_verified_before_after": 75
+  },
+  {
+    "name": "test_ops_fused_chain-fusion-1-command.json",
+    "exit_code": 0,
+    "seconds": 1.2671924571041018,
+    "log_sha256": "13b2f01c85fb3a2cc18c028c0d6b16ead12543c5899231336b0e1344739037a6",
+    "inputs_verified_before_after": 75
+  },
+  {
+    "name": "test_fused_chain_additivity-fusion-1-command.json",
+    "exit_code": 0,
+    "seconds": 1.2803919969592243,
+    "log_sha256": "a7ecb03fe56dd2067d78b71b57eba256e71a716f2db8cbefd8e0acbda564a10f",
+    "inputs_verified_before_after": 75
+  }
+]

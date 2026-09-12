@@ -45,6 +45,7 @@ import tools.bench.gemm_tactic_draw_survey as survey
 from tools.bench.gemm_tactic_draw_survey import (
     EXIT_ALGO_KEYSET_DIFFERS,
     EXIT_ARM_MIXED,
+    EXIT_ACT_ARM_MIXED,
     EXIT_ALGO_NO_BF16,
     EXIT_ALGO_SILENT,
     EXIT_BINARY_DIFFERS,
@@ -322,6 +323,7 @@ def _draw_record(
     tactic_offset: int = 0,
     algo_id: str = "21",
     tactic_set: str = "full",
+    modelopt_w4a4: bool = False,
     mean_us: float = 120.0,
     smoke: bool = False,
 ) -> dict:
@@ -347,6 +349,7 @@ def _draw_record(
         "label": label,
         "rc": 0,
         "tactic_set": tactic_set,
+        "modelopt_w4a4": modelopt_w4a4,
         "autotune": autotune,
         "algo": algo,
         "fp4": {
@@ -1805,6 +1808,107 @@ class ShellDriverTest(unittest.TestCase):
         for command in commands:
             self.assertIn("$SMOKE_ARG", command, command)
 
+    def test_every_draw_command_and_the_score_command_carry_the_activation_arm(self) -> None:
+        """The two argument lines a behavioural test provably cannot reach.
+
+        Under `--smoke` `DRAWS=1`, so the main N-draw phase re-invokes with
+        `--draws 1`, `run_draw` early-returns on `draws/draw00/DONE`, and the
+        end-to-end assertion only ever reads the PREFLIGHT's record. The
+        score-phase `--command` line is likewise built as a string and handed to
+        the leg runner. Deleting the arm from either left the whole suite green.
+
+        Textual is the RIGHT instrument here and only here: the defect is an
+        argument missing from a line no executing test reaches, so asserting the
+        line is asserting the thing that breaks.
+        """
+
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        commands, current = [], None
+        for line in text.splitlines():
+            if current is not None:
+                current.append(line)
+            elif '"$SURVEY" draw' in line:
+                current = [line]
+            if current is not None and not line.rstrip().endswith("\\"):
+                commands.append(" ".join(current))
+                current = None
+        self.assertEqual(len(commands), 2, commands)
+        for command in commands:
+            self.assertIn("$W4A4_ARG", command, command)
+
+        leg = [ln for ln in text.splitlines() if "--score-leg {arm}" in ln]
+        self.assertEqual(len(leg), 1, leg)
+        # A leg replaying a frozen map under the OTHER arm executes a different
+        # kernel family from the draw that produced it.
+        self.assertIn("--modelopt-w4a4 $MODELOPT_W4A4", leg[0], leg[0])
+
+    # --- the ACTIVATION arm reaches the bench, on every path -------------
+    def arm_recording_bench(self, root: pathlib.Path, witness: pathlib.Path) -> None:
+        """A bench that reports the activation arm it was actually given.
+
+        `recording_bench` above records WHEN it ran; this one records WHICH GEMM
+        it was told to run. The distinction is the whole point of this arm: a
+        leg that replayed a frozen map under the other arm would execute a
+        different kernel family from the draw that produced it, and its cache
+        metadata would not match.
+        """
+
+        binary = root / "bin" / "vllm-bench"
+        binary.write_text(
+            "#!/bin/bash\n"
+            f'echo "VT_MODELOPT_W4A4=${{VT_MODELOPT_W4A4-unset}}" >> {str(witness)!r}\n'
+            f"cat <<'LOG'\n{self.FROZEN_LOG}\n"
+            "Successful requests:                       4\n"
+            "Total token throughput (tok/s):            1840.55\n"
+            "LOG\n",
+            encoding="utf-8",
+        )
+        binary.chmod(0o755)
+
+    def test_a_scoring_leg_replays_under_the_arm_its_draw_was_taken_on(self) -> None:
+        # THE load-bearing wiring. The leg sets six VT_* variables inline; until
+        # this arm joined them a frozen replay ran the W4A16 Marlin arm while
+        # replaying a map drawn on the CUTLASS fp4-activation GEMM.
+        with tempfile.TemporaryDirectory() as tmp:
+            root, share = self.fake_tree(tmp)
+            witness = pathlib.Path(tmp) / "arm-witness"
+            self.arm_recording_bench(root, witness)
+            done = self.run_driver(
+                "--score-leg", "draw00", "--evidence", str(share), "--src", "",
+                "--model", tmp, "--local-root", str(root), "--num-prompts", "4",
+                "--input-len", "8", "--output-len", "4", "--concurrency", "1",
+                "--seed", "0", "--max-num-batched-tokens", "64",
+                "--modelopt-w4a4", "1",
+            )
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertIn("VT_MODELOPT_W4A4=1", witness.read_text(encoding="utf-8"))
+
+    def _draw_once(self, tmp: str, *extra: str) -> dict:
+        root, share = self.fake_tree(tmp)
+        shutil.rmtree(share / "draws")
+        shutil.rmtree(root / "evidence" / "draws")
+        self.recording_bench(
+            root, share, pathlib.Path(tmp) / "witness", pathlib.Path(tmp) / "src")
+        done = self.run_driver(
+            "--phase", "draw", "--evidence", str(share), "--smoke",
+            "--model", tmp, "--local-root", str(root), *extra,
+        )
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        return json.loads(
+            (share / "draws" / "draw00" / "record.json").read_text(encoding="utf-8"))
+
+    def test_the_draw_phase_carries_the_arm_the_operator_asked_for(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIs(self._draw_once(tmp, "--modelopt-w4a4", "1")
+                          .get("modelopt_w4a4"), True)
+
+    def test_the_arm_defaults_OFF_and_is_recorded_as_such(self) -> None:
+        # Default-off is the SHIPPED behaviour and `#2760` owns whether the
+        # opt-in is correct at all, so a driver that silently defaulted it on
+        # would take an unratified arm on every future run.
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIs(self._draw_once(tmp).get("modelopt_w4a4"), False)
+
     def test_a_refused_reduce_does_not_mark_the_phase_complete(self) -> None:
         # Same polarity as the resume cases: a marker that a FAILED phase writes
         # makes the next run skip the work that did not happen.
@@ -2158,6 +2262,63 @@ class SmokeModeTest(unittest.TestCase):
             config = json.loads(
                 (root / "draw-config.json").read_text(encoding="utf-8"))
             self.assertTrue(config["smoke"])
+
+
+
+class ActivationArmTest(unittest.TestCase):
+    """The NVFP4 ACTIVATION arm, which decides whether any tactic is tuned.
+
+    `VT_MODELOPT_W4A4` consumes a ModelOpt checkpoint's `input_scale`, setting
+    `Nvfp4Weight::alpha` and flipping `IsTrueW4A4()`. Unset, a ModelOpt NVFP4
+    checkpoint routes to the W4A16 Marlin arm, `dense_nvfp4_gemm.h` carries no
+    tactic path, and the survey tunes NOTHING -- it would report a clean run
+    over zero draws. The two arms therefore execute DIFFERENT GEMMs, so pooling
+    them names no path, exactly as the tactic-set arms do.
+    """
+
+    def test_one_root_may_not_hold_two_activation_arms(self) -> None:
+        records = [
+            _draw_record("draw00", modelopt_w4a4=True),
+            _draw_record("draw01", modelopt_w4a4=False, tactic_offset=7),
+        ]
+        code, problems = check_draw_preconditions(records)
+        self.assertEqual(code, EXIT_ACT_ARM_MIXED)
+        self.assertIn("DIFFERENT GEMM", problems[0])
+
+    def test_a_record_without_an_activation_arm_is_refused(self) -> None:
+        # An ambient VT_MODELOPT_W4A4 decides the GEMM, so a draw that did not
+        # record its arm is a draw nobody can attribute afterwards.
+        records = [_draw_record("draw00"), _draw_record("draw01", tactic_offset=7)]
+        records[1].pop("modelopt_w4a4")
+        self.assertEqual(check_draw_preconditions(records)[0], EXIT_ACT_ARM_MIXED)
+
+    def test_a_single_activation_arm_root_passes(self) -> None:
+        records = [
+            _draw_record("draw00", modelopt_w4a4=True),
+            _draw_record("draw01", modelopt_w4a4=True, tactic_offset=7),
+        ]
+        self.assertEqual(check_draw_preconditions(records)[0], EXIT_OK)
+
+    def test_the_arm_is_SET_and_never_inherited(self) -> None:
+        # THE load-bearing case. The operator's ambient shell must not decide
+        # which GEMM a draw measured; the harness sets the variable either way.
+        seen: dict = {}
+
+        def fake_run(command, **kwargs):
+            seen.update(kwargs.get("env") or {})
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"VT_MODELOPT_W4A4": "1"}), \
+                mock.patch.object(survey.subprocess, "run", fake_run):
+            run_draw(
+                0, pathlib.Path(tmp), pathlib.Path("/nonexistent/vllm-bench"),
+                "/nonexistent/model",
+                {"num_prompts": 1, "input_len": 8, "output_len": 4,
+                 "concurrency": 1, "seed": 0, "max_num_batched_tokens": 1},
+                modelopt_w4a4=False,
+            )
+        self.assertEqual(seen.get("VT_MODELOPT_W4A4"), "0")
 
 
 if __name__ == "__main__":

@@ -720,9 +720,21 @@ class LoadedEngine {
   static std::unique_ptr<vllm::v1::Scheduler> MakeScheduler(
       bool async_enabled, vllm::SchedulerConfig scheduler_config,
       vllm::v1::KVCacheConfig kv_cache_config, int block_size,
-      bool enable_caching,
+      int hash_block_size, bool enable_caching,
       vllm::v1::StructuredOutputManager* structured_output_manager,
       std::optional<vllm::SpeculativeConfig> speculative_config = std::nullopt);
+  // The (scheduler_block_size, hash_block_size) pair this engine schedules and
+  // hashes at, derived from the BUILT KV cache config. Mirrors upstream
+  // EngineCore.__init__: `cache_config.block_size = min(g.kv_cache_spec
+  // .block_size for g in kv_cache_groups)` (engine/core.py:335-338 @
+  // e126687a9a) followed by `resolve_kv_cache_block_sizes` (core.py:158-160).
+  // Both steps are needed: the first because an architecture may page a group
+  // smaller than the engine's configured block size, the second because the
+  // scheduler's alignment invariant and the prefix-hash granularity are
+  // different quantities once groups disagree.
+  static std::pair<int, int> ResolveSchedulerBlockSizes(
+      const vllm::v1::KVCacheConfig& kv_cfg, int block_size,
+      bool enable_prefix_caching);
   // SPEC-MTP I5d: build the KV-cache spec, widened for speculation when a spec
   // config is set (the extra GDN k+1 state slots + widened conv row + the
   // `fa_draft` full-attn group, MakeQwen3_5KVCacheSpec num_spec>0). With no spec
@@ -855,6 +867,13 @@ class LoadedEngine {
   int max_num_seqs_;
   int max_num_batched_tokens_;
   bool prefix_caching_enabled_;
+  // The two block sizes the SCHEDULER works in, as distinct from `block_size_`
+  // (which is the size the KV pool was BUILT at). Declared after `kv_cfg_` and
+  // `prefix_caching_enabled_` because both are inputs, and before `scheduler_`
+  // and `block_hasher_`, which are the two consumers. See
+  // ResolveSchedulerBlockSizes.
+  int scheduler_block_size_;
+  int hash_block_size_;
   // ENG-SGLANG-BEHAVIOR-FLAG SW3: jump-forward enable, resolved once from
   // EngineParams::enable_jump_forward + the VT_ENABLE_JUMP_FORWARD env override.
   // Depends only on params + env (no member deps), so its init order is free.

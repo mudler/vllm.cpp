@@ -58,7 +58,7 @@ NOT owed by W1.
 |---|---|---|
 | `kv_cache_utils.py:626-688` `resolve_kv_cache_block_sizes` | `include/vllm/v1/core/kv_cache_utils.h` + `src/vllm/v1/core/kv_cache_utils.cpp` (new free function) | Explicit-parameter signature (cache_block_size, prefix_match_unit, enable_prefix_caching, connector_enabled, dcp) instead of reading `VllmConfig`, since our config surface is threaded, not one dataclass. Returns `std::pair<int,int> {scheduler_block_size, hash_block_size}`. |
 | `config/cache.py:56` `prefix_match_unit` field | `EngineParams`/`model_loader` field (W2) | Deferred to W2; W1 exercises the resolver directly. |
-| scheduler threading of resolved hash_block_size | `scheduler.cpp` (W3) | Deferred; needs the block_pool align path first. |
+| scheduler threading of resolved hash_block_size | `scheduler.cpp` + `model_loader.cpp` (W3) | LANDED 2026-09-12 as the DeepSeek-V4 serve fix: `LoadedEngine::ResolveSchedulerBlockSizes` derives `min(group block_size)` then calls the resolver (`engine/core.py:335-338`, `:158-170`), and the pair rides through `MakeScheduler` into the `Scheduler` / `AsyncScheduler` ctors. Only the case where `hash_block_size` is STRICTLY FINER than a group's block size still needs the block_pool align path. |
 
 ## Tests to port
 
@@ -67,7 +67,7 @@ NOT owed by W1.
 
 ## Gates
 
-- W1: CPU `-Werror` build clean; `test_prefix_match_unit` green; RED-first proven (default ≠ `=16`). No engine behaviour change on the default path (single-group inert; scheduler still passes `block_size`).
+- W1: CPU `-Werror` build clean; `test_prefix_match_unit` green; RED-first proven (default ≠ `=16`). No engine behaviour change on the default path (single-group inert; scheduler still passes `block_size`). SUPERSEDED for the second sentence on 2026-09-12: the engine now derives the pair and the scheduler is threaded (see the port map). The dense default is still byte-identical, because one group at the configured block size resolves to the pair the scheduler was already given.
 - Benchmark: a real matching-unit throughput/hit-rate A/B is a later brick — `docs/BENCHMARKS.md` PENDING.
 
 ## W-breakdown
@@ -75,5 +75,5 @@ NOT owed by W1.
 - W0: this spec + records (records-only commit).
 - W1: `resolve_kv_cache_block_sizes` + tests (this brick).
 - W2: `prefix_match_unit` config/CLI/ABI field + engine-core call site.
-- W3: scheduler threading of `hash_block_size != block_size` (needs block_pool align path from `KV-BLOCK-POOL`) + mamba partial-tail stop; port `test_partial_prefix_cache_primitives.py` un-skipped.
+- W3: scheduler threading of `hash_block_size != block_size` (needs block_pool align path from `KV-BLOCK-POOL`) + mamba partial-tail stop; port `test_partial_prefix_cache_primitives.py` un-skipped. THE THREADING HALF LANDED 2026-09-12 (DeepSeek-V4 serve fix): the engine derives `(scheduler_block_size, hash_block_size)` from the built groups and passes both to the scheduler. What remains is the FINER-THAN-A-GROUP case, which is the part the align path gates, plus the mamba partial-tail stop and the un-skipped port.
 - W4: benchmark the matching-unit effect (hybrid model, hit-rate + throughput A/B vs vLLM).

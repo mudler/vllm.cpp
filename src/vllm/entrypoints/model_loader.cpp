@@ -1445,10 +1445,46 @@ bool LoadedEngine::ResolveAsyncEnabled(
       runner_supports_async, is_pooling_model, spec_decode_incompatible));
 }
 
+std::pair<int, int> LoadedEngine::ResolveSchedulerBlockSizes(
+    const vllm::v1::KVCacheConfig& kv_cfg, int block_size,
+    bool enable_prefix_caching) {
+  // STEP 1 — re-derive the cache block size from the groups that were actually
+  // built. `block_size` is what the engine ASKED to page at (raised to the
+  // architecture's `kv_block_size_floor`); a group may publish a SMALLER page
+  // regardless, because upstream fixes some of them by tensor sharing rather
+  // than by configuration — DeepSeek-V4's SWA cache is a hard 64 tokens
+  // (`vllm/v1/attention/backends/mla/sparse_swa.py:76-83`, `self.block_size =
+  // 64`) and its compressor states are 4 and 8 (`compressor.py:174-186`).
+  // Upstream reconciles the two by writing the minimum back over the
+  // configured value before anything reads it as a scheduling quantity:
+  // `cache_config.block_size = min(g.kv_cache_spec.block_size for g in
+  // kv_cache_groups)` (`vllm/v1/engine/core.py:335-338` @ `e126687a9a`),
+  // guarded by `if kv_cache_groups:` because an attention-free model publishes
+  // none and then keeps the size it paged at.
+  int cache_block_size = block_size;
+  for (const auto& group : kv_cfg.kv_cache_groups) {
+    if (!group.kv_cache_spec) continue;
+    if (group.kv_cache_spec->block_size < cache_block_size) {
+      cache_block_size = group.kv_cache_spec->block_size;
+    }
+  }
+  // STEP 2 — split that into the scheduler's token-alignment invariant and the
+  // prefix-hash granularity (`core.py:158-160`). For one group both are the
+  // cache block size; for several they are the LCM and the GCD. This call is
+  // what makes `resolve_kv_cache_block_sizes` REACHED: it was ported at
+  // `kv_cache_utils.cpp:640` with no production caller, so the engine was
+  // deriving neither value and handing the coordinator the configured size for
+  // both.
+  return vllm::v1::resolve_kv_cache_block_sizes(
+      kv_cfg, cache_block_size, /*prefix_match_unit=*/std::nullopt,
+      enable_prefix_caching, /*connector_enabled=*/false,
+      /*dcp_world_size=*/1);
+}
+
 std::unique_ptr<vllm::v1::Scheduler> LoadedEngine::MakeScheduler(
     bool async_enabled, vllm::SchedulerConfig scheduler_config,
     vllm::v1::KVCacheConfig kv_cache_config, int block_size,
-    bool enable_caching,
+    int hash_block_size, bool enable_caching,
     vllm::v1::StructuredOutputManager* structured_output_manager,
     std::optional<vllm::SpeculativeConfig> speculative_config) {
   if (async_enabled) {
@@ -1460,11 +1496,12 @@ std::unique_ptr<vllm::v1::Scheduler> LoadedEngine::MakeScheduler(
     return std::make_unique<vllm::v1::AsyncScheduler>(
         std::move(scheduler_config), std::move(kv_cache_config), block_size,
         enable_caching, structured_output_manager,
-        std::move(speculative_config));
+        std::move(speculative_config), hash_block_size);
   }
   return std::make_unique<vllm::v1::Scheduler>(
       std::move(scheduler_config), std::move(kv_cache_config), block_size,
-      enable_caching, structured_output_manager, std::move(speculative_config));
+      enable_caching, structured_output_manager, std::move(speculative_config),
+      /*kv_events_config=*/nullptr, /*data_parallel_rank=*/0, hash_block_size);
 }
 
 std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
@@ -2170,6 +2207,19 @@ LoadedEngine::LoadedEngine(HfConfig config,
           params, max_model_len_, ModelRegistry::IsDenseModel(*model_))),
       prefix_caching_enabled_(ResolveEnablePrefixCaching(
           params, model_->registration().info)),
+      // The scheduler's two block sizes, derived from the BUILT `kv_cfg_`
+      // rather than from `block_size_`. Upstream derives them in exactly this
+      // position — after the KV cache config exists and before the Scheduler is
+      // constructed (`vllm/v1/engine/core.py:335-338` then `:158-170` @
+      // `e126687a9a`). See ResolveSchedulerBlockSizes.
+      scheduler_block_size_(
+          ResolveSchedulerBlockSizes(kv_cfg_, block_size_,
+                                     prefix_caching_enabled_)
+              .first),
+      hash_block_size_(
+          ResolveSchedulerBlockSizes(kv_cfg_, block_size_,
+                                     prefix_caching_enabled_)
+              .second),
       // ENG-SGLANG-BEHAVIOR-FLAG SW3: resolve jump-forward once (config field +
       // VT_ENABLE_JUMP_FORWARD env override). Default nullopt+no-env => false =>
       // the byte-identical decode path (jump-forward is inert until enabled).
@@ -2238,7 +2288,7 @@ LoadedEngine::LoadedEngine(HfConfig config,
           MakeSchedulerConfig(
               max_model_len_, max_num_seqs_,
               max_num_batched_tokens_, params.policy),
-          kv_cfg_, block_size_,
+          kv_cfg_, scheduler_block_size_, hash_block_size_,
           /*enable_caching=*/prefix_caching_enabled_,
           &structured_output_manager_, resolved_spec_config_)),
       executor_(runner_),
@@ -2253,9 +2303,14 @@ LoadedEngine::LoadedEngine(HfConfig config,
       // the raw checkpoint context and let through prompts the pool cannot hold.
       input_processor_(tokenizer_, config_, max_model_len_),
       output_processor_(&tokenizer_),
+      // `hash_block_size_`, not `block_size_`: the hasher's granularity must be
+      // the one the coordinator matches against, which is upstream's own
+      // pairing (`get_request_block_hasher(hash_block_size, caching_hash_fn)`,
+      // `vllm/v1/engine/core.py:232` @ `e126687a9a`). Hashing at the configured
+      // size while the pool pages smaller produces hashes no lookup can hit.
       block_hasher_(prefix_caching_enabled_
                         ? vllm::v1::get_request_block_hasher(
-                              block_size_, vllm::v1::sha256_cbor)
+                              hash_block_size_, vllm::v1::sha256_cbor)
                         : nullptr),
       engine_(input_processor_, engine_core_, output_processor_, block_hasher_) {
   (void)hash_ready_;

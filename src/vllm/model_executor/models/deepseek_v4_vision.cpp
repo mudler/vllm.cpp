@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -376,6 +377,63 @@ class DeepSeekV4Vision::Impl {
   const DeepSeekV4VisionConfig& config() const { return config_; }
   Backend& backend() { return backend_; }
 
+  // MODEL-MM-deepseek-v4 W7-CUDA (#2411): STAGE THE TOWER TO THE QUEUE'S DEVICE.
+  //
+  // The `deepseek4v` mmproj reader hands this tower HOST views. Its `HostView`
+  // says so and names the reason ("W4 owns the upload, so this wave keeps every
+  // weight on the default device"), and W4 did the routing rather than the
+  // upload, so nothing ever uploaded them. `ValidateQueue` then refused every
+  // CUDA queue, which MEASURED on thor:gpu0 as
+  // `DeepSeek-V4 vision queue and weights must share one device` on all four
+  // `lead_pad` rungs of the real 934,462,656-byte projector -- the tower could
+  // not run on a device at all.
+  //
+  // ONLY HOST -> DEVICE IS ADDED. A queue on one device with weights already on
+  // a DIFFERENT device still hits the same refusal below, because moving a tower
+  // between two devices is not this wave's capability and answering it from the
+  // wrong memory would be silent. The refusal is narrowed, never deleted.
+  //
+  // Idempotent: after staging, `weights_.patch_weight.device` IS the queue's
+  // device, so every later call returns on the first line. A CPU queue with the
+  // host weights it was loaded with also returns there, so the CPU path keeps
+  // its byte-identical behaviour and pays no allocation.
+  void EnsureResident(Queue& queue) {
+    if (queue.device == weights_.patch_weight.device) return;
+    if (weights_.patch_weight.device.type != vt::DeviceType::kCPU) {
+      Invalid("DeepSeek-V4 vision queue and weights must share one device");
+    }
+    weights_.patch_weight = StageTensor(queue, weights_.patch_weight);
+    weights_.patch_bias = StageTensor(queue, weights_.patch_bias);
+    for (DeepSeekV4VisionBlockWeights& block : weights_.blocks) {
+      block.norm1_weight = StageTensor(queue, block.norm1_weight);
+      block.qkv_weight = StageTensor(queue, block.qkv_weight);
+      block.qkv_bias = StageTensor(queue, block.qkv_bias);
+      block.out_weight = StageTensor(queue, block.out_weight);
+      block.out_bias = StageTensor(queue, block.out_bias);
+      block.norm2_weight = StageTensor(queue, block.norm2_weight);
+      block.mlp_w1_weight = StageTensor(queue, block.mlp_w1_weight);
+      block.mlp_w2_weight = StageTensor(queue, block.mlp_w2_weight);
+    }
+    weights_.final_norm_weight = StageTensor(queue, weights_.final_norm_weight);
+    weights_.aligner_w1_weight = StageTensor(queue, weights_.aligner_w1_weight);
+    weights_.aligner_w1_bias = StageTensor(queue, weights_.aligner_w1_bias);
+    weights_.aligner_w2_weight = StageTensor(queue, weights_.aligner_w2_weight);
+    weights_.aligner_w2_bias = StageTensor(queue, weights_.aligner_w2_bias);
+    backend_.Synchronize(queue);
+
+    // REBUILD THE GATE-UP BORROWS against the tensors that now exist. They were
+    // taken over the HOST tensors in the constructor, and `BorrowResidentWeight`
+    // aliases whatever device its argument declares -- so leaving them alone
+    // would hand the shared `MlpGateUpMethodBase` seam a host pointer labelled
+    // with a device, which is the failure mode `ResidentWeight`'s own comment
+    // describes and no value gate on this host can see.
+    mlp_gate_up_weights_.clear();
+    mlp_gate_up_weights_.reserve(weights_.blocks.size());
+    for (const DeepSeekV4VisionBlockWeights& block : weights_.blocks) {
+      mlp_gate_up_weights_.push_back(BorrowResidentWeight(block.mlp_w1_weight));
+    }
+  }
+
   size_t cached_geometry_count() const { return geometries_.size(); }
 
   DeepSeekV4VisionStorageMarkers mlp_gate_up_markers(int64_t block) const {
@@ -578,6 +636,7 @@ class DeepSeekV4Vision::Impl {
   void VisionForward(Queue& queue, Tensor& output, const Tensor& patches,
                      int64_t height, int64_t width,
                      DeepSeekV4VisionCapture* capture) {
+    EnsureResident(queue);
     ValidateVisionIo(queue, output, patches, height, width, capture);
     Geometry& geometry = GeometryFor(queue, height, width);
     Dev device{backend_, queue};
@@ -718,6 +777,7 @@ class DeepSeekV4Vision::Impl {
   void AlignerForward(Queue& queue, Tensor& output, const Tensor& vision,
                       int64_t height, int64_t width,
                       DeepSeekV4VisionCapture* capture) {
+    EnsureResident(queue);
     ValidateAlignerIo(queue, output, vision, height, width, capture);
     Geometry& geometry = GeometryFor(queue, height, width);
     Dev device{backend_, queue};
@@ -764,11 +824,33 @@ class DeepSeekV4Vision::Impl {
   }
 
  private:
+  // One weight's device copy, uploaded once by `EnsureResident`. A `std::deque`
+  // rather than a `std::vector` because `StageTensor` returns a view of the
+  // element it just appended: a deque never relocates the elements it already
+  // holds, so no earlier weight's storage can move under a tensor pointing at it.
+  Tensor StageTensor(Queue& queue, const Tensor& source) {
+    const std::vector<int64_t> shape(source.shape, source.shape + source.rank);
+    staged_.push_back(PersistentTensor::Upload(backend_, queue, source.dtype,
+                                               shape, source.data));
+    Tensor staged = staged_.back().tensor;
+    // CARRY THE LOAD-TIME STORAGE-LAYOUT MARKERS, for the reason
+    // `BorrowResidentWeight` above states at length: the bytes are the same
+    // bytes, so a marker that described them still describes them, and dropping
+    // one silently changes how a kernel decodes the buffer. False on every
+    // tensor this projector produces today, which is exactly why dropping them
+    // here would be invisible until it was not.
+    staged.repacked = source.repacked;
+    staged.q8_0_aligned = source.q8_0_aligned;
+    staged.elem_kn_repacked = source.elem_kn_repacked;
+    return staged;
+  }
+
   Backend& backend_;
   DeepSeekV4VisionConfig config_;
   DeepSeekV4VisionWeights weights_;
   std::vector<OwnedTensor> mlp_gate_up_weights_;
   std::vector<Geometry> geometries_;
+  std::deque<PersistentTensor> staged_;
 };
 
 DeepSeekV4Vision::DeepSeekV4Vision(Backend& backend,
@@ -789,6 +871,7 @@ void DeepSeekV4Vision::Forward(Queue& queue, Tensor& output,
                                const Tensor& patches, int64_t height,
                                int64_t width,
                                DeepSeekV4VisionCapture* capture) {
+  impl_->EnsureResident(queue);
   impl_->ValidateQueue(queue);
   if (height <= 0 || width <= 0) {
     Invalid("DeepSeek-V4 vision grid dimensions must be positive");

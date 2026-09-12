@@ -114,7 +114,20 @@ tail -5 "$OUT/build.log"
 [ $RC -eq 0 ] || { grep -m15 -E 'error' "$OUT/build.log"; exit 94; }
 
 # --- PROVE IT IS A CUDA BUILD before believing any result below.
-ldd "$SRC/build-cuda/libvllm.so" | grep -Ei 'cudart|cublas' | tee "$OUT/ldd.txt"
+#
+# `ldd` MUST target a linked EXECUTABLE, not the library. CMakeLists.txt:732 is
+# `add_library(vllm STATIC ...)`, so this tree produces `libvllm.a` and there is
+# no `libvllm.so` to inspect -- the first run of this recipe asked for one and
+# got "No such file or directory", which is a broken proof line rather than a
+# finding about the build. The cubin histogram below is the independent proof
+# and it stood on that run: 41 `.cu.o`, all sm_110.
+LDD_TARGET=$(find "$SRC/build-cuda/tests" -maxdepth 1 -name 'test_cuda_deepseek_v4' -type f | head -1)
+if [ -n "$LDD_TARGET" ]; then
+  ldd "$LDD_TARGET" | grep -Ei 'cudart|cublas' | tee "$OUT/ldd.txt"
+  test -s "$OUT/ldd.txt" || echo "### WARNING: no cudart/cublas in $LDD_TARGET -- NOT a CUDA link"
+else
+  echo "### WARNING: no test_cuda_deepseek_v4 executable to ldd; linkage proof OWED"
+fi
 find "$SRC/build-cuda" -name '*.cu.o' | wc -l | tee "$OUT/cu-objects.txt"
 if [ "$CUOBJ" -eq 1 ]; then
   for o in $(find "$SRC/build-cuda" -name '*.cu.o'); do
@@ -204,6 +217,32 @@ for T in test_deepseek_v4_mm_reach test_deepseek_v4_forward test_deepseek_v4_dsa
       > "$OUT/$T-deviceflags.log" 2>&1; step ${T}_deviceflags $?
     echo "--- $T under the device flags:"; tail -12 "$OUT/$T-deviceflags.log"
   fi
+done
+
+# ===========================================================================
+# 4. ATTRIBUTE THE SUITE FAILURES, rather than inferring them.
+# ===========================================================================
+# The first W7-CUDA run had 8 of 20 `mm_reach` cases fail with
+#   "keep-quant expert/group slice requires non-repacked blocks
+#    (disable VT_CPU_QUANT_REPACK for the stacked-expert weights)"
+# That predicate is `vt::cpu::QuantRepackActive()`, which is true only on an
+# aarch64 i8mm HOST -- so the cause is the host architecture, not the device,
+# and thor is aarch64 while the devbox is x86-64 (where these cases are green).
+# Reading that off the message is a hypothesis. Running the same binary with the
+# repack disabled is the measurement, and it is one env var.
+echo "### 4. aarch64 repack attribution (same binary, VT_CPU_QUANT_REPACK=0)"
+for T in test_deepseek_v4_mm_reach test_deepseek_v4_mm_chat; do
+  [ -x "$SRC/build-cuda/tests/$T" ] || continue
+  ( cd "$SRC/build-cuda" && ./tests/$T ) > "$OUT/$T-repack-on.log" 2>&1
+  echo "$T repack ON  rc=$?"
+  ( cd "$SRC/build-cuda" && VT_CPU_QUANT_REPACK=0 ./tests/$T ) \
+    > "$OUT/$T-repack-off.log" 2>&1
+  echo "$T repack OFF rc=$?"
+  echo "--- $T: repack ON vs OFF, doctest totals"
+  grep -E "^\[doctest\] test cases:" "$OUT/$T-repack-on.log" | tail -1
+  grep -E "^\[doctest\] test cases:" "$OUT/$T-repack-off.log" | tail -1
+  echo "--- $T: the served image error under repack OFF (mm_chat only)"
+  grep -n "image: " "$OUT/$T-repack-off.log" | head -3
 done
 
 du -sh "$SRC" "$SRC/build-cuda"

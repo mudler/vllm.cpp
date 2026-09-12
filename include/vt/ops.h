@@ -557,13 +557,18 @@ enum class OpId : uint8_t {
   //     too, saying so: "We cannot use the usual functions/kernels here for the
   //     short conv as the conv1d has dilation".
   //
-  // Registered on kCPU (src/vt/cpu/cpu_qwen4_exp_ple.cpp) and, since W6-CUDA,
-  // on kCUDA (src/vt/cuda/cuda_qwen4_exp_ple.cu). The device arm inherits this
-  // kernel's DOUBLE four-tap accumulator rather than choosing a width of its
-  // own, reads `query_start_loc` and `conv_state_indices` on the DEVICE, and is
-  // gated against the same lane-pinned transformers goldens at all three
-  // dilations (tests/vllm/models/test_qwen4_exp_cuda.cpp). No other device is
-  // registered, so the dispatcher still refuses those BY NAME.
+  // Registered on kCPU (src/vt/cpu/cpu_qwen4_exp_ple.cpp), since W6-CUDA on
+  // kCUDA (src/vt/cuda/cuda_qwen4_exp_ple.cu), and since MODEL-MM-QWEN4-EXP
+  // W3-ROCm on kROCM (src/vt/rocm/rocm_qwen4_exp_ple.hip), which is a
+  // transcription of the CUDA arm. BOTH device arms inherit this kernel's
+  // DOUBLE four-tap accumulator rather than choosing a width of their own, read
+  // `query_start_loc` and `conv_state_indices` on the DEVICE, and are gated
+  // against a CPU oracle at BOTH admitted dtypes: the CUDA arm against the
+  // lane-pinned transformers goldens at all three dilations
+  // (tests/vllm/models/test_qwen4_exp_cuda.cpp), the ROCm arm against the
+  // cross-device NMSE band (tests/vt/test_backend_cross_device.cpp), where the
+  // accumulator WIDTH has its own case on each. NO OTHER DEVICE IS REGISTERED,
+  // so the dispatcher still refuses those BY NAME.
   // Appended before kCount so no existing op's id shifts.
   kQwen4ExpPleConv,
   // MODEL-MM-QWEN4-EXP W5b (#2031) — the Qwen4-Exp 4-branch GATED-RESIDUAL
@@ -588,16 +593,20 @@ enum class OpId : uint8_t {
   // precedent for an architecture's hyper-connection glue as one OpId.
   //
   // Registered on kCPU (cpu_qwen4_exp.cpp) and gated bit-comparably against the
-  // lane-pinned transformers goldens. THE TWO OPS BELOW NOW DIFFER ON DEVICE
-  // COVERAGE, and the difference is the reduction: `kQwen4ExpGatedResidual`
-  // carries a grouped RMS norm whose sum of squares this kernel accumulates in
-  // DOUBLE, so its CUDA arm is still OWED, not written — the spec records the
-  // reduction-width decision it has to make first, with a measured 571x
-  // separation from an f32 block reduction at group size 2560.
-  // `kQwen4ExpGatedResidualWriteBack` has NO reduction at all, so W6-CUDA gave
-  // it a kCUDA arm (src/vt/cuda/cuda_qwen4_exp.cu) that is BYTE-IDENTICAL to
-  // this one — `__fmul_rn`/`__fadd_rn` against the host's `-ffp-contract=off` —
-  // and therefore meets these goldens by exactly the margin this kernel does.
+  // lane-pinned transformers goldens. BOTH OPS NOW HAVE kCUDA
+  // (src/vt/cuda/cuda_qwen4_exp.cu) and kROCM (src/vt/rocm/rocm_qwen4_exp.hip)
+  // arms; this paragraph said `kQwen4ExpGatedResidual`'s CUDA arm was "still
+  // OWED, not written" until 2026-09-12, and both had landed by then. What the
+  // sentence was recording is still true of the DESIGN and is kept as that: the
+  // two ops differ in that `kQwen4ExpGatedResidual` carries a grouped RMS norm
+  // whose sum of squares this kernel accumulates in DOUBLE, so its device arms
+  // had a reduction-width decision to make first — a measured 571x separation
+  // from an f32 block reduction at group size 2560 — while
+  // `kQwen4ExpGatedResidualWriteBack` has NO reduction at all and its arms are
+  // BYTE-IDENTICAL to this one, `__fmul_rn`/`__fadd_rn` against the host's
+  // `-ffp-contract=off`, so they meet these goldens by exactly the margin this
+  // kernel does. NO OTHER DEVICE IS REGISTERED, so the dispatcher still refuses
+  // those BY NAME.
   // Appended before kCount so no existing op's id shifts.
   kQwen4ExpGatedResidual,
   kQwen4ExpGatedResidualWriteBack,
@@ -670,9 +679,13 @@ enum class OpId : uint8_t {
   // NAME. `kRmsNormGatedGroup` is the in-tree precedent for exactly this split
   // ("SIBLING of RmsNormGatedArgs, not a mode of it").
   //
-  // Registered on kCPU only (src/vt/cpu/cpu_ops.cpp). The CUDA arm is OWED, not
-  // written: it cannot be gated on a CPU-only host, and an ungated kernel is
-  // worse than an absent one — the same call W5b-3 and W5b-4 made.
+  // Registered on kCPU (src/vt/cpu/cpu_ops.cpp), on kCUDA since W6-CUDA-B
+  // (src/vt/cuda/cuda_rms_norm_group.cu, #2391) and on kROCM since
+  // MODEL-MM-QWEN4-EXP W1-ROCm (src/vt/rocm/rocm_rms_norm_group.hip). This
+  // paragraph read "kCPU only, the CUDA arm is OWED" until 2026-09-12, by which
+  // time both device arms had landed; it is corrected rather than left, because
+  // a knowingly false statement in a public header is worse than the edit. NO
+  // OTHER DEVICE IS REGISTERED, so the dispatcher still refuses those BY NAME.
   // Appended before kCount so no existing op's id shifts.
   kRmsNormGroup,
   // MODEL-MM-QWEN4-EXP W5e-1 (#2336) — the Qwen4-Exp PLE GATE: the signed
@@ -733,13 +746,17 @@ enum class OpId : uint8_t {
   // `0.5 * value`. The kernel tests `isnan` first. `+/-inf` and `+/-0.0` need
   // no guard and get none; they already match the pin term for term.
   //
-  // Registered on kCPU (src/vt/cpu/cpu_qwen4_exp_ple.cpp) and, since W6-CUDA,
-  // on kCUDA (src/vt/cuda/cuda_qwen4_exp_ple.cu). THE NaN OBLIGATION ABOVE IS
-  // DISCHARGED ON BOTH ARMS: the device kernel tests `isnan` first for the same
-  // reason, and `tests/vllm/models/test_qwen4_exp_cuda.cpp` carries the case
-  // that separates a NaN from the plausible `0.5 * value` a missing guard
-  // returns. No other device is registered, so the dispatcher still refuses
-  // those BY NAME.
+  // Registered on kCPU (src/vt/cpu/cpu_qwen4_exp_ple.cpp), since W6-CUDA on
+  // kCUDA (src/vt/cuda/cuda_qwen4_exp_ple.cu), and since MODEL-MM-QWEN4-EXP
+  // W3-ROCm on kROCM (src/vt/rocm/rocm_qwen4_exp_ple.hip). THE NaN OBLIGATION
+  // ABOVE IS DISCHARGED ON ALL THREE ARMS, and each arm's own suite carries the
+  // case that separates a NaN from the plausible `0.5 * value` a missing guard
+  // returns: `tests/vllm/models/test_qwen4_exp_cuda.cpp` for kCUDA, and a NaN
+  // in the score pool of the gate case in
+  // `tests/vt/test_backend_cross_device.cpp` for kROCM, whose NaN outputs are
+  // asserted AS NaN rather than averaged into a norm — a norm cannot see this
+  // defect, because the missing guard returns a finite number. NO OTHER DEVICE
+  // IS REGISTERED, so the dispatcher still refuses those BY NAME.
   // Appended before kCount so no existing op's id shifts.
   kQwen4ExpPleGate,
   // The DEQUANTIZING GATHER (KGATHER): `vt::Embedding` over a BLOCK-QUANTIZED

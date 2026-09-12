@@ -1388,7 +1388,7 @@ void CublasLtHgemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& b) {
   cublasLtMatmulHeuristicResult_t heur{};
   bool fresh = false;
   if (!GetOrQueryGemmHeuristic(ctx, key, desc.v, la.v, lb.v, lc.v, pref.v,
-                               "cublasLtMatmulAlgoGetHeuristic (hgemm)", &heur, &fresh)) {
+                               "hgemm cublasLtMatmulAlgoGetHeuristic", &heur, &fresh)) {
     throw std::runtime_error("vt cuda: CublasLtHgemm: no cublasLt heuristic for [" +
                              std::to_string(m) + "," + std::to_string(k) + "]x[" +
                              std::to_string(k) + "," + std::to_string(n) + "] (f16,f16)->" +

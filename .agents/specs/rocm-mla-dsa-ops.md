@@ -348,10 +348,10 @@ the same pair because `qwen4_exp`'s QSA block COMPOSES its indexer from them.
 **Two rows owned this gap at once and neither had claimed it**, so the arm was
 written once and both specs reconciled onto it in the same change rather than a
 second kernel being written; that spec's D3g carries the vLLM AMD mirror
-comparison and its D3h the red/green pair, the fixture and twelve mutations, all
-measured on `strix:gpu0`. The pricing above is otherwise sound: the pair IS one
-unit, and the tie rule and ascending emission ARE the load-bearing part, which is
-what that wave's fixture was built around.
+comparison and its D3h the red/green pair, the two fixtures and fifteen
+mutations, all measured on `strix:gpu0`. The pricing above is otherwise sound:
+the pair IS one unit, and the tie rule and ascending emission ARE the
+load-bearing part, which is what that wave's fixture was built around.
 
 **What this does NOT change is the speed axis.** The ROCm GLM-5.3 axis stays
 VOID: nothing has run a SPARSE step on that board since the arm landed, and this

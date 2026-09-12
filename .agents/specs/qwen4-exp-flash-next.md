@@ -10216,7 +10216,7 @@ thinking: false, thinking_mode: "disabled"}`. Per-stream decode tok/s is
 |---|---|---|
 | Artifact | `Mia-AiLab/qwen3.8-Flash-Next-NVFP4` (~128 GB, NVFP4) | `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S (~68 GB) |
 | Runtime | custom vLLM image, MTP speculative decoding (K=3), FP8 KV cache, 8-seq scheduler | `examples/vllm-server`, `--max-num-seqs 1`, no speculative decoding |
-| KV cache | FP8 | NOT RECORDED. This row read "256 blocks x 32 tokens = 8192 max context, prefix caching disabled, async scheduling enabled"; neither launcher passed any such flag. Both passed `--max-num-seqs 1 --device cuda --no-enable-thinking --enable-force-include-usage` and no other engine flag, so whatever the engine resolved, it resolved by default and was never read back |
+| KV cache | FP8 | f16, 256 blocks x 32 tokens = 8192 max context (auto-fit down from 262144); prefix caching disabled, async scheduling enabled at `max_concurrent_batches=2`. NOT PASSED, RESOLVED: neither launcher passed any of it -- both passed `--max-num-seqs 1 --device cuda --no-enable-thinking --enable-force-include-usage` and nothing else -- and the engine prints all three at boot. Re-read on 2026-09-12 on the same artifact, so these are defaults this configuration reproduces, not a recipe another run would have to repeat |
 | Device | GB10 (`sm_121a`) | GB10 (`sm_121a`), same box |
 
 ### Result
@@ -10259,6 +10259,153 @@ The derived tensors are tiny (at most a few hundred int32s), so the copy is
 negligible. Issue
 [#1958](https://github.com/mudler/vllm.cpp/issues/1958) is closed; the fix is
 owned by row `SAMPLE-CORE` (spec: `.agents/specs/sampling-controls-c7.md`).
+
+### W6 scope: hoist the MoE adapter onto the model
+
+Owned by `.agents/issues/MODEL-MM-QWEN4-EXP/ISSUE-LOCAL-01M2AA9C31GCSDV8NRW26GMEVS.md`.
+
+**Change.** `Qwen4ExpMoeBlockWeights` is composed inside the layer loop
+(`qwen4_exp_forward.cpp:673`). Build it ONCE per layer and hold it on the layer's
+weights, exactly as the GDN twin does at `:587` -- `if (!lw.gdn_block.has_value())
+lw.gdn_block.emplace(Qwen4ExpGdnBlockWeights(lw.gdn, p));`. Add the parallel
+`std::optional<MoeBlockWeights>` field beside `gdn_block` on
+`Qwen4ExpLayerWeights` and emplace it the same way. The seam, the config
+projection and `RunQwen4ExpMoeBlock` do not change.
+
+**Why it works.** `ResidentWeight` writes its residency memo (`d_dev`, and the
+host-alias decision) onto the handle it is given.
+`BorrowWholeOwnedTensor` carries every field EXCEPT `d_dev`, so a per-step
+adapter presents a null memo every step and every tower takes the
+`cudaMalloc`+copy arm again. A handle that outlives the step keeps the memo.
+
+**Three constraints the existing comments already state, and a reviewer must
+check each.** (1) `Qwen4ExpMoeBlockWeights` takes a NON-CONST reference and
+mutates it through `OwnedBytes::KeepAlive()`, so it is not a pure function of the
+layer and must not be re-evaluated per placement arm -- the existing code already
+builds it outside the placed body for this reason. (2) The pass-through must stay
+a BORROW. When the GDN adapter spelled the same thing as assignment,
+`OwnedTensor`'s implicit copy DEEP-COPIED ~115 MiB per linear layer per step and
+`ResidentWeight` then handed cuBLASLt a pointer into a buffer destroyed at the
+end of the layer -- `compute-sanitizer` reported it as `Warp illegal address`
+with every declared extent correct (#2476). (3) The hoisted handle must outlive
+every queued kernel that reads it, which holding it on the model satisfies and a
+function-local does not.
+
+**Reachability.** The call site is the production decode path
+(`ForwardQwen4ExpForConditionalGeneration` -> the layer loop), so the mutation
+the fresh reviewer owes is deleting the hoist's call site in a scratch copy and
+confirming the focused gate goes red.
+
+**Tests.** A red-first test that fails for the intended reason. The defect is
+"residency is re-established per step", so the test must observe the SECOND
+forward, not the first: assert that a second decode step over the same layer
+performs no new device staging. `vllm::load_stats::Snapshot().device_upload_bytes`
+is the counter that expresses it and `load_stats::Reset()` exists for tests.
+A test that only checks the output tokens CANNOT see this defect -- the tokens
+were always correct, which is why twelve waves of green gates never caught it.
+
+**Gate.** The row's C++ suite, plus the focused MoE and qwen4_exp tests. The
+speed claim is NOT a gate and must not be asserted from a unit test: it is
+re-measured on `dgx:gpu0` with the same harness as the profile above, by the
+operator, and recorded in `## Outcome`.
+
+**Out of scope.** `BorrowWholeOwnedTensor` itself. Carrying `d_dev` through the
+borrow would fix every caller at once and is the tempting change, but the memo
+records a DEVICE allocation whose lifetime is tied to the source handle, and
+copying that pointer into a second handle that can outlive it is how #2476's
+use-after-free was built. If a sweep of other per-step adapters is wanted it is
+its own row, with its own review.
+
+### The decode-step profile, measured (2026-09-12, `dgx:gpu0`, `51c248190`)
+
+Everything in the section below this one was a hypothesis. This section is the
+measurement that ranks them, and it moves the answer off all of them.
+
+**Harness.** `dgx:gpu0` under an `rc` lease, GB10 `sm_121a`, the released
+`unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S staged to LOCAL disk, server at
+`--max-num-seqs 1 --device cuda` and no other engine flag. Build: `Release`,
+`VLLM_CPP_CUDA_ARCHITECTURES=121a`, tests OFF. COMPILED FEATURE SET ASSERTED:
+`fa2` ENABLED for `[121a]` by the arch table but the FA2 manifest is `[]`,
+because CUTLASS headers are absent and the fetch is opt-in
+(`-DVLLM_CPP_CUTLASS_FETCH=ON`); `marlin-nvfp4` and `cutlass-nvfp4` resolve for
+`[121a]`. NONE OF THE THREE IS REACHABLE BY THIS MODEL: `qwen4_exp` registers
+only `kLinearAttention` (GDN) and `kQwenSparseAttention` (QSA), QSA has its own
+kernel (`cuda_qwen4_exp_qsa.cu`), FA2 lives behind `cuda_paged_attn.cu` /
+`cuda_ops.cu`, and Marlin/NVFP4 are fp4 paths while this artifact is GGUF
+k-quant. The trace confirms it: no FA2 and no NVFP4 kernel appears.
+
+**The speed, reproduced.** 0.25 tok/s, across four server boots and 150+ tokens:
+3.99, 4.00, 4.05, 3.95 s per token, every individual delta inside 3.81-4.23 s.
+The published 0.25 was not an artifact of a truncated stream; it is the steady
+state.
+
+**It is inside the forward.** `VT_ENGINE_STEP_LOG=1`: every token-producing step
+is `model_executed=1` with `elapsed_s` 3.81-4.01, and every other step returns
+in 0.000 s. 26 steps, 20 of which ran the model. Prefill of a 35-token prompt is
+ONE step of 8.9 s, which is the TTFT. No timer, no poll, no stall.
+
+**Where the forward goes.** `nsys`, 60 s window bracketing ~15.2 steady-state
+decode steps, report written to LOCAL disk (the sqlite export fails on the CIFS
+mount with "database is locked" and leaves a report with no `StringIds` table,
+which `nsys stats` then reports as SKIPPED -- a failed export that reads like a
+measurement of nothing):
+
+| | total in window | per step | share |
+|---|---|---|---|
+| `cudaMalloc` | 34.195 s / 5,740 calls | 378 calls, **2.25 s** | 60.5% |
+| `cudaMemcpyAsync` | 12.542 s / 19,878 calls | 1,308 calls, **0.82 s** | 22.2% |
+| `cudaFree` | 9.416 s / 5,741 calls | 378 calls, **0.62 s** | 16.7% |
+| `cudaLaunchKernel` | 0.297 s / 38,006 calls | 2,534 launches, 0.02 s | 0.5% |
+| `cudaStreamSynchronize` | 0.016 s / 5,577 calls | 367 syncs, 0.001 s | ~0.0% |
+| ALL GPU KERNELS | 1.540 s | **0.101 s** | **2.6%** |
+
+Host-to-device traffic is 593,892 MB in the window -- 38 GiB per step over 846
+copies, the largest 471.859 MB, which is exactly one `[512, 640, 2560]` IQ4_NL
+expert tower.
+
+**97% of a decode token is the CUDA allocator and the copies it feeds. 2.6% is
+compute.**
+
+**The 378 allocations per step account for themselves exactly.** 48 layers x
+(3 expert towers + 3 shared-expert weights + router + shared gate) = 384. That
+is `Qwen4ExpMoeBlockWeights`, rebuilt inside the layer loop
+(`qwen4_exp_forward.cpp:673`), handing `ResidentWeight` fresh borrowed views
+whose `d_dev` is null every step, so every tower is `cudaMalloc`ed, copied,
+used and `cudaFree`d per step. A ~470 MB `cudaMalloc` costs 5.96 ms on average
+here and up to 30 ms. `Backend::Alloc` on CUDA is a plain `cudaMalloc`; the
+pooled `cudaMallocAsync` appears separately at 1,424 calls and is not this.
+
+**The fix has a landed precedent twelve lines away.** GDN had the identical
+defect and it was repaired under
+[#2476](https://github.com/mudler/vllm.cpp/issues/2476): `lw.gdn_block` is an
+`optional` built once and held by the model, and the comment there names the
+failure -- a per-step adapter "re-established residency every step". The MoE
+adapter is that bug, unfixed, on the same row.
+
+**What this retires.** Launch overhead is 0.5% and the real count is 2,534, not
+the withdrawn "~1,400". The MoE host round-trip costs 1 ms per step and is a
+CAPTURABILITY defect, not a speed one. Copy bandwidth is 22%, not the bill.
+"Weight aliasing over UMA" has the direction backwards: the weights DECLINE the
+alias (the residency instrument reads `declined_borrow=96.958 GiB` against
+`aliased_in_place=0.014 GiB`, because a GGUF mmap borrow owns no anonymous pages
+and `MakeHostBytesDeviceAliasable` refuses it by name) and are therefore STAGED,
+which is the expensive arm rather than the cheap one.
+
+**Two experiments that measured nothing, recorded so they are not repeated.**
+`VT_QWEN35_GROUPED_MOE=0` came out flat (4.05 vs 4.00 s) and was read as
+refuting the tower-staging hypothesis. It cannot test it: the per-expert arm
+reaches `KqResidentSlice`, whose first line is
+`ResidentWeight(d, w)` over the WHOLE tower before the pointer arithmetic, so
+both arms stage identical bytes. Separately, two `nsys` runs produced empty
+reports -- one exported sqlite onto CIFS, one had its profiler SIGKILLed by the
+harness's own shutdown, which writes no report at all.
+
+**The floor this implies.** Kernel time is 101 ms per token, and the top kernel
+is `HcGroupedNormKernel` at 40.7% (96 instances per step, ~435 us each, ~42 ms
+per token). A memoised adapter puts the step in the neighbourhood of the kernel
+floor; the exact landing point is NOT projected here, because removing the
+allocator can expose host-side cost it currently hides. Re-measure, do not
+assume.
 
 ### Candidate causes, and what is actually known about each
 

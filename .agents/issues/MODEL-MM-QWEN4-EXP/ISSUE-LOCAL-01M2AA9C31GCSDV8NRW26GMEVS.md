@@ -23,3 +23,31 @@ The fix, if the measurement ranks it, is a hoist: build each layer's `MoeBlockWe
 ## Resolution
 
 -
+
+### MEASURED 2026-09-12 on `dgx:gpu0`: this is 97% of the decode step
+
+`nsys`, 60 s window over ~15.2 steady-state decode steps, `51c248190`, GB10,
+released UD-IQ1_S staged locally. Per step: `cudaMalloc` 378 calls / 2.25 s
+(60.5%), `cudaMemcpyAsync` 1,308 calls / 0.82 s (22.2%), `cudaFree` 378 calls /
+0.62 s (16.7%), all GPU kernels 0.101 s (2.6%). Host-to-device traffic is 38 GiB
+per step over 846 copies, largest 471.859 MB -- one `[512, 640, 2560]` IQ4_NL
+expert tower.
+
+The allocation count identifies the caller exactly: 48 layers x (3 expert towers
++ 3 shared-expert weights + router + shared gate) = 384, against 378 measured.
+Nothing else in the forward allocates per step. `Backend::Alloc` on CUDA is a
+plain `cudaMalloc`, and a ~470 MB one costs 5.96 ms average / 30 ms worst here;
+the pooled `cudaMallocAsync` lane is separate at 1,424 calls.
+
+So the cost is the ALLOCATOR, not the copy bandwidth, and the earlier hedge
+about the 256-byte alignment test is resolved: the weights decline the alias
+(`declined_borrow=96.958 GiB` vs `aliased_in_place=0.014 GiB`) because a GGUF
+mmap borrow owns no anonymous pages, so every one of them takes the staging arm.
+
+Decode is 0.25 tok/s and kernel time is 101 ms per token. The fix is the hoist,
+and its precedent is twelve lines away in the same function: GDN carried this
+exact defect and #2476 repaired it by building `lw.gdn_block` once and holding
+it on the model.
+
+DO NOT record an expected speedup here. Removing the allocator can expose
+host-side cost it currently hides; the number comes from the re-measurement.

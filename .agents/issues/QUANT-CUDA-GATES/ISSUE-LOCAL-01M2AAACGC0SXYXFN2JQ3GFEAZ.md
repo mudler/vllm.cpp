@@ -25,3 +25,19 @@ NOT MEASURED YET, and this issue claims no number. The sync count and the per-st
 ## Resolution
 
 -
+
+### MEASURED 2026-09-12: this is a CAPTURABILITY defect, not a speed one
+
+The same `nsys` window that profiled the decode step counts 367
+`cudaStreamSynchronize` calls per step costing **1 ms in total** -- 0.0% of a
+3.95 s step. The host round-trip this issue describes is real and is exactly
+where the structure says it is, but it is not what makes the model slow today:
+97% of the step is `cudaMalloc`/`cudaFree`/memcpy from the per-step MoE adapter
+rebuild (`.agents/issues/MODEL-MM-QWEN4-EXP/ISSUE-LOCAL-01M2AA9C31GCSDV8NRW26GMEVS.md`).
+
+That reorders the work but does not close this. Two things keep it open. Graph
+capture is impossible while the path leaves the device, and the tree says so at
+`qwen3_5.cpp:7191-7193`. And the trace counts 2,534 `cudaLaunchKernel` per step:
+20 ms, which is 0.5% of a 3.95 s step and would be ~20% of a 101 ms one. Both
+arguments get STRONGER once the allocator defect is fixed, so this should be
+scheduled after it and re-measured against the new step, not against this one.

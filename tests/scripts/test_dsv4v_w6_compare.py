@@ -154,6 +154,59 @@ def _dataset(outdir: Path, mode: str = "clean", tag: str = "lp0",
     return outdir
 
 
+def _geometry_rows(kind: str, count: int, dim: int,
+                   rng: _LCG) -> list[list[float]]:
+    """Image rows with a chosen DIRECTIONAL geometry, at a realistic width.
+
+    `shared-<eps>` gives every cell one global component plus `eps` of its own
+    detail, which is what a photograph's sky or wall looks like to a cosine.
+    `flat-<eps>` puts 20 such cells in an otherwise independent image, because
+    `min_best_margin` is a MIN and one flat pair is enough to decide a run.
+    """
+    if kind == "random":
+        return [rng.direction(dim) for _ in range(count)]
+    name, eps = kind.rsplit("-", 1)
+    shared, scale = rng.direction(dim), float(eps)
+    rows = []
+    for index in range(count):
+        detail = rng.direction(dim)
+        flat = name == "shared" or (name == "flat" and index < 20)
+        rows.append([CMP.bf16(shared[j] + scale * detail[j]) for j in range(dim)]
+                    if flat else detail)
+    return rows
+
+
+def _photo_dataset(outdir: Path, kind: str, dim: int = 1280,
+                   factor: float = 1.02) -> Path:
+    """A CLEAN leg whose image rows carry a photograph-shaped geometry.
+
+    The width is the point. The mutation fixture is 16-dimensional pseudo-random
+    rows -- the least photograph-like geometry available, measuring a margin of
+    0.229 -- so it was never evidence for any margin constant.
+    """
+    outdir.mkdir(parents=True, exist_ok=True)
+    types, _cell = CMP.layout(0, 10, 10)
+    rng = _LCG(20260912)
+    image = _geometry_rows(kind, 100, dim, rng)
+    ours, ref, seen = [], [], 0
+    for i, kindof in enumerate(types):
+        if kindof == "IMAGE":
+            base = image[seen]
+            seen += 1
+            row = [CMP.bf16(v * factor) for v in base]
+        else:
+            base = [CMP.bf16(0.25 + 0.001 * ((i + j) % 11)) for j in range(dim)]
+            row = list(base)
+        ours.append(row)
+        ref.append(base)
+    _write(outdir / "ours-lp0-block.f32", ours)
+    _write(outdir / "oracle-lp0-block.f32", ref)
+    _stage(outdir, "lp0", "input", 64, 1.0)
+    _stage(outdir, "lp0", "vit", 64, factor)
+    _stage(outdir, "lp0", "cells", 100, factor)
+    return outdir
+
+
 def _run(directory: Path, tag: str = "lp0", script: Path = COMPARE,
          lead_pad: int = 0) -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -220,7 +273,11 @@ class ComparatorVerdict(unittest.TestCase):
             "sentinels": {k: {"bf16_of_oracle_exact": True, "max_abs": 0.0}
                           for k in ("START", "END", "NEWLINE", "PAD")},
             "permutation": {"identity_is_best": 100, "of": 100,
-                            "min_best_cos": 0.99, "min_best_margin": 0.5},
+                            "min_best_cos": 0.99, "min_best_margin": 0.5,
+                            # The margin is judged against the DATASET's own
+                            # bf16 rounding scale, so a report that carries a
+                            # margin must carry the scale it is judged against.
+                            "bf16_rounding_scale": 4e-06},
             "image_rows": {"rows": 100, "mean_rel_l2": 0.02, "mean_cos": 0.999,
                            "degenerate_rows": 3, "degenerate_row_index": [1, 2, 3]},
             "input": {"bf16_of_oracle_exact": True},
@@ -364,6 +421,67 @@ class ComparatorVerdict(unittest.TestCase):
                 self.assertEqual(done.returncode, 4, done.stdout)
                 self.assertIn("does not DECLARE", done.stdout)
 
+    def test_every_stage_must_be_declared(self) -> None:
+        """THE MEMBERSHIP of `stages`, not the keys inside one rule.
+
+        `PROFILE_KEYS` forced the `stages` KEY to exist and constrained nothing
+        about what was IN it, so deleting a whole stage RULE was the one way
+        left to drop a bound while declaring nothing -- every other judging key
+        had to be written or the run was ERROR. Measured on a leg whose vit file
+        was 100x wrong: dropping the `vit` rule printed `stage 'vit': NOT
+        REQUIRED by this profile`, `VERDICT PASS` and exited 0, while the same
+        data with the rule present exited 1 at 9900.3609%.
+        """
+        for stage in CMP.STAGES:
+            with self.subTest(stage=stage):
+                def drop(data, stage=stage):
+                    del data["profiles"]["shipped_bf16"]["stages"][stage]
+
+                script = _with_bounds(self.tmp, drop, name="norule-" + stage)
+                done = _run(_dataset(self.tmp / ("r-" + stage), mode="drift"),
+                            script=script)
+                self.assertEqual(done.returncode, 4,
+                                 "a dropped stage RULE was judged by nothing:\n"
+                                 + done.stdout)
+                self.assertIn("does not DECLARE stage", done.stdout)
+
+    def test_an_emptied_stages_map_is_an_error(self) -> None:
+        """The measured worst case: every stage rule gone at once."""
+        def strip(data):
+            data["profiles"]["shipped_bf16"]["stages"] = {}
+
+        script = _with_bounds(self.tmp, strip)
+        done = _run(_dataset(self.tmp / "nostages", mode="drift"), script=script)
+        self.assertEqual(done.returncode, 4, done.stdout)
+        self.assertIn("does not DECLARE stage", done.stdout)
+
+    def test_a_stage_declared_absent_must_name_its_reason(self) -> None:
+        """Dropping a stage is allowed. Doing it silently is not."""
+        def blank(data):
+            data["profiles"]["shipped_bf16"]["stages"]["vit"] = None
+
+        script = _with_bounds(self.tmp, blank)
+        done = _run(_dataset(self.tmp / "nullvit", mode="drift"), script=script)
+        self.assertEqual(done.returncode, 4, done.stdout)
+        self.assertIn("declared null without naming a reason", done.stdout)
+
+    def test_a_declared_absent_stage_is_honoured_and_reported(self) -> None:
+        """The CLI profile's real shape: that oracle writes no stage dumps."""
+        def blank(data):
+            profile = data["profiles"]["shipped_bf16"]
+            profile["stages"]["vit"] = None
+            profile["unbounded"]["stages.vit"] = "declared by this test"
+
+        script = _with_bounds(self.tmp, blank)
+        directory = _dataset(self.tmp / "nullvit2")
+        os.remove(directory / "ours-lp0-vit.f32")
+        os.remove(directory / "oracle-lp0-vit.f32")
+        done = _run(directory, script=script)
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertIn(
+            "stage 'vit': NOT REQUIRED (declared null): declared by this test",
+            done.stdout)
+
     def test_a_diagnostic_only_stage_must_still_be_present(self) -> None:
         """`diagnostic_only` used to skip the presence check as well.
 
@@ -424,12 +542,51 @@ class ComparatorVerdict(unittest.TestCase):
         self.assertIn("min_best_margin", done.stdout)
         self.assertIn("not separable enough", done.stdout)
 
+    def test_a_photographic_geometry_is_not_a_separability_failure(self) -> None:
+        """THE FALSE RED THE WITHDRAWN CONSTANT 0.01 WOULD HAVE FIRED.
+
+        `min_best_margin` is a MIN over the cells, so one flat pair decides a
+        run, and flat regions are what a photograph is full of. Measured with
+        the shipped `best_match()` at D=1280: a shared global component with 10%
+        and 5% per-cell detail gives margins 0.00834 and 0.00210, and a 20-cell
+        flat region gives 0.00875 and 0.00221. All four are UNDER the withdrawn
+        0.01, and in every one the identity was still best for 100 of 100 rows,
+        so the constant would have red a dataset whose ordering claim was right.
+        The bound is now this dataset's own bf16 rounding scale.
+        """
+        for kind in ("random", "shared-0.10", "shared-0.05",
+                     "flat-0.10", "flat-0.05"):
+            with self.subTest(geometry=kind):
+                directory = _photo_dataset(self.tmp / ("photo-" + kind), kind)
+                done = _run(directory)
+                self.assertEqual(
+                    done.returncode, 0,
+                    "a correct photographic geometry was red:\n" + done.stdout)
+                permutation = json.loads(
+                    (directory / "report-lp0.json").read_text())["permutation"]
+                # The ordering claim the margin guards HOLDS in every one of
+                # these, which is what makes a red on them a false one.
+                self.assertEqual(permutation["identity_is_best"], 100)
+                self.assertGreater(permutation["min_best_margin"],
+                                   permutation["bf16_rounding_scale"])
+                if kind.endswith("0.05"):
+                    # RED-BEFORE, executably: these two sit under the constant.
+                    self.assertLess(permutation["min_best_margin"], 0.01)
+
     def test_the_margin_is_reported_on_a_clean_leg(self) -> None:
         directory = _dataset(self.tmp / "margin")
         done = _run(directory)
         self.assertEqual(done.returncode, 0, done.stdout)
-        report = json.loads((directory / "report-lp0.json").read_text())
-        self.assertGreater(report["permutation"]["min_best_margin"], 0.01)
+        permutation = json.loads(
+            (directory / "report-lp0.json").read_text())["permutation"]
+        # The bound is DERIVED from this dataset, so the report must carry the
+        # scale it was judged against, that scale must be a real quantity, and
+        # the margin must clear it. Asserting a CONSTANT here is what the 0.01
+        # bound did, and it is what made four correct photographic geometries
+        # red while their ordering claim held.
+        self.assertGreater(permutation["bf16_rounding_scale"], 0.0)
+        self.assertGreater(permutation["min_best_margin"],
+                           permutation["bf16_rounding_scale"])
 
     def test_the_run_says_what_it_judged(self) -> None:
         """`.agents/verification.md`: an instrument states what it measured.
@@ -445,7 +602,13 @@ class ComparatorVerdict(unittest.TestCase):
                      "JUDGED image_rows mean_cos: bound >= 0.998",
                      "JUDGED stage 'input' bf16_of_oracle_exact",
                      "JUDGED stage 'vit' mean_rel_l2: bound <= 0.0307",
-                     "JUDGED stage 'cells': PRESENT and reported"):
+                     "JUDGED stage 'cells': PRESENT and reported",
+                     # THE OUTPUT MUST SAY WHAT KIND OF BOUND THIS IS. It read
+                     # `margin bound >= 0.01` with nothing saying the number was
+                     # declared rather than measured, unlike every `NOT BOUNDED
+                     # (declared null)` line beside it.
+                     "JUDGED permutation: best-match margin bound > ",
+                     "DERIVED from this run's own rows"):
             self.assertIn(line, done.stdout)
 
     def test_undefined_profile_is_an_error(self) -> None:
@@ -510,7 +673,7 @@ DRIVERS = {
         # "any non-zero fails" rule would have turned into a red run.
         "nonzero": {"ctest_cuda": 8, "dev_attn_on": 1},
         "artefacts": {"ctest-cuda.log": CTEST_RECORDED,
-                      "dev-attn-refusal.txt": DEV_ATTN_RECORDED}},
+                      "dev-attn-on.log": DEV_ATTN_RECORDED}},
 }
 
 
@@ -648,7 +811,7 @@ class W7StepClassification(unittest.TestCase):
                                      "test_cuda_deepseek_v4")
         done = self._run({"ctest_cuda": 8, "dev_attn_on": 1},
                          {"ctest-cuda.log": log,
-                          "dev-attn-refusal.txt": DEV_ATTN_RECORDED})
+                          "dev-attn-on.log": DEV_ATTN_RECORDED})
         self.assertNotEqual(done.returncode, 0,
                             "an unattributed suite failure passed:\n" + done.stdout)
         self.assertIn("has NOT attributed it", done.stdout)
@@ -656,15 +819,42 @@ class W7StepClassification(unittest.TestCase):
     def test_a_ctest_failure_with_no_named_test_fails(self) -> None:
         done = self._run({"ctest_cuda": 8, "dev_attn_on": 1},
                          {"ctest-cuda.log": "Segmentation fault\n",
-                          "dev-attn-refusal.txt": DEV_ATTN_RECORDED})
+                          "dev-attn-on.log": DEV_ATTN_RECORDED})
         self.assertNotEqual(done.returncode, 0, done.stdout)
         self.assertIn("UNEXPLAINED ctest_cuda", done.stdout)
 
     def test_a_ctest_failure_with_no_log_fails(self) -> None:
         done = self._run({"ctest_cuda": 8, "dev_attn_on": 1},
-                         {"dev-attn-refusal.txt": DEV_ATTN_RECORDED})
+                         {"dev-attn-on.log": DEV_ATTN_RECORDED})
         self.assertNotEqual(done.returncode, 0, done.stdout)
         self.assertIn("no ctest-cuda.log", done.stdout)
+
+    def test_the_refusal_is_classified_from_the_full_log(self) -> None:
+        """The prefiltered excerpt DROPS two of the three refusal families.
+
+        `dev-attn-refusal.txt` is `grep -iE 'sliding_window|image span|DEVICE
+        decode|2411|refus' dev-attn-on.log | head -20`, and the classifier was
+        applied to THAT FILE. Measured: a log holding `DeepSeek-V4 vision
+        compute dtype must be bf16` classifies rc=0 as the full log and rc=1 as
+        the filtered file, which is 0 BYTES, and `DeepseekV4 DEVICE forward
+        (W7-device) not implemented` does the same. So a real product refusal
+        became `UNEXPLAINED dev_attn_on`, reached `### FAILING STEPS` and failed
+        the job -- on the one leg that runs on every thor lease.
+        """
+        for message in ("DeepSeek-V4 vision compute dtype must be bf16\n",
+                        "DeepseekV4 DEVICE forward (W7-device) not implemented\n",
+                        "DeepSeek-V4 vision qkv weight has the wrong dtype\n"):
+            with self.subTest(message=message[:44]):
+                done = self._run(
+                    {"ctest_cuda": 8, "dev_attn_on": 1},
+                    {"ctest-cuda.log": CTEST_RECORDED,
+                     "dev-attn-on.log": message,
+                     # Exactly what the shipped prefilter leaves behind: nothing.
+                     "dev-attn-refusal.txt": ""})
+                self.assertEqual(
+                    done.returncode, 0,
+                    "a real refusal was read as a crash:\n" + done.stdout)
+                self.assertIn("the recorded refusal is in the log", done.stdout)
 
     def test_a_clean_ctest_run_is_accepted(self) -> None:
         done = self._run({"ctest_cuda": 0, "dev_attn_on": 1},
@@ -682,7 +872,7 @@ class W7StepClassification(unittest.TestCase):
     def test_dev_attn_failing_without_the_refusal_fails(self) -> None:
         done = self._run({"ctest_cuda": 8, "dev_attn_on": 1},
                          {"ctest-cuda.log": CTEST_RECORDED,
-                          "dev-attn-refusal.txt": "Segmentation fault\n"})
+                          "dev-attn-on.log": "Segmentation fault\n"})
         self.assertNotEqual(done.returncode, 0,
                             "a crash was filed as the refusal:\n" + done.stdout)
         self.assertIn("UNEXPLAINED dev_attn_on", done.stdout)
@@ -702,6 +892,18 @@ class RefusalClassifier(unittest.TestCase):
         "DeepSeek-V4 vision patch dtype must equal model dtype",
         DEV_ATTN_RECORDED,
         "DeepseekV4 DEVICE forward (W7-device) not implemented - the tiny-config",
+        # THE FAMILIES THE `.*must ` ANCHOR REJECTED. Counted in
+        # deepseek_v4_vision.cpp: 61 distinct "DeepSeek-V4 vision*" literals, of
+        # which 23 matched that anchor and 38 did not -- every ValidateTensor
+        # label at :103-146 and every overflow refusal. A probe leg refused by
+        # one of these was recorded `_unexplained`, reached ### FAILING STEPS
+        # and failed the job, which is a false red on a real product refusal.
+        "DeepSeek-V4 vision qkv weight has the wrong dtype",
+        "DeepSeek-V4 vision aligner w1 bias has no storage",
+        "DeepSeek-V4 vision final norm weight has the wrong shape",
+        "DeepSeek-V4 vision patch count overflow",
+        "DeepSeek-V4 vision RoPE cache size overflow",
+        "DeepSeek-V4 vision block count does not match depth",
     )
     REJECT = (
         "Assertion failed: n must be positive",

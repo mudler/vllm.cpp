@@ -44,23 +44,40 @@ step() { echo "### STEP $1 RC=$2"; echo "$1 RC=$2" >> "$OUT/steps.txt"; }
 # only when the log carries a refusal THE PRODUCT ACTUALLY EMITS, and every
 # alternative below is read off the source rather than invented:
 #
-#   `DeepSeek-V4 vision ... must ...` is the whole Invalid() vocabulary of
-#     src/vllm/model_executor/models/deepseek_v4_vision.cpp (the helper is at
-#     :32; 27 distinct messages, e.g. :108 and :403 "must share one device",
-#     "compute dtype must be bf16", "patch dtype must equal model dtype").
+#   `DeepSeek-V4 vision ` is the refusal vocabulary of
+#     src/vllm/model_executor/models/deepseek_v4_vision.cpp. COUNTED, not
+#     estimated: that file holds 61 DISTINCT `"DeepSeek-V4 vision*"` literals
+#     and every one of them is an error string -- an argument to the `Invalid()`
+#     helper at :32, an overflow message handed to `CheckedMul` at :38, or a
+#     `ValidateTensor` LABEL (the function is at :80-91) that reaches a log as
+#     `<label> has the wrong dtype|rank|shape`, `<label> must be contiguous` or
+#     `<label> has no storage`. Not one of them is a log line, a banner or a
+#     comment, so the product's own prefix is a sound anchor on its own.
 #   `Refused by name` is the windowed dev_attn refusal, deepseek_v4.cpp:1325.
 #   `DeepseekV4 DEVICE forward (W7-device) not implemented` is kDevicePending,
 #     deepseek_v4.cpp:2138.
 #
-# THE PREVIOUS PATTERN ABSORBED A REAL CRASH. It was
-# `refus|unsupported|share one device|must be`, and `must be` matches ordinary
-# assertion and exception text: measured, `Assertion failed: n must be positive`
-# and `terminate called after throwing an instance of ... vector index must be
-# less than size` were BOTH classified as expected refusals and recorded RC=0.
-# Anchoring every alternative to a string the product owns is what keeps a crash
-# unexplained, which is the outcome that fails the job.
+# THE PREVIOUS ANCHOR COVERED 23 OF THOSE 61 WHILE CLAIMING TO COVER ALL OF
+# THEM. It was `DeepSeek-V4 vision .*must `, and this comment described it as
+# "the whole Invalid() vocabulary ... 27 distinct messages". MEASURED against
+# the file: 61 distinct literals, 23 match and 38 do NOT, the 38 including every
+# `ValidateTensor` label at :103-146 and every overflow refusal. So
+# `DeepSeek-V4 vision qkv weight has the wrong dtype` and `DeepSeek-V4 vision
+# patch count overflow` were both classified as crashes; a probe leg refused by
+# one of them is recorded `_unexplained`, reaches `### FAILING STEPS` and fails
+# the job. That is a FALSE RED on a refusal the product really emitted.
+#
+# THE WIDENING STOPS AT THE PREFIX, and that boundary is the round-4 fix. The
+# pattern before it was `refus|unsupported|share one device|must be`, and
+# `must be` matches ordinary assertion and exception text: measured,
+# `Assertion failed: n must be positive` and `terminate called after throwing an
+# instance of ... vector index must be less than size` were BOTH classified as
+# expected refusals and recorded RC=0. `DeepSeek-V4 vision ` cannot match
+# either, because no assertion and no standard exception carries this product's
+# message prefix. Dropping the `.*must ` tail therefore widens the anchor to the
+# refusals that can fire WITHOUT re-admitting the text round 4 removed.
 refusal_recorded() {
-  grep -qE 'DeepSeek-V4 vision .*must |Refused by name|DeepseekV4 DEVICE forward \(W7-device\) not implemented' "$1"
+  grep -qE 'DeepSeek-V4 vision |Refused by name|DeepseekV4 DEVICE forward \(W7-device\) not implemented' "$1"
 }
 cleanup() { rm -rf "$SRC"; kill "${HB:-}" 2>/dev/null; wait "${HB:-}" 2>/dev/null; }
 trap cleanup EXIT INT TERM
@@ -266,6 +283,10 @@ echo "### 3. the device refusals"
 #     unmeasured. This is the run that can.
 ( cd "$SRC/build-cuda" && VT_V4_DEVICE_ATTN=1 ./tests/test_cuda_deepseek_v4 -s ) \
   > "$OUT/dev-attn-on.log" 2>&1; step dev_attn_on $?
+# FOR A HUMAN READER ONLY. Nothing is JUDGED from this excerpt: it drops two of
+# the three refusal families the classifier is anchored to, and `head -20` drops
+# whatever a noisy log pushes past line 20. classify_dev_attn_on() reads the full
+# log below, as the probe legs above already do.
 grep -iE 'sliding_window|image span|DEVICE decode|2411|refus' "$OUT/dev-attn-on.log" \
   | head -20 | tee "$OUT/dev-attn-refusal.txt"
 
@@ -395,12 +416,22 @@ classify_dev_attn_on() {
     echo "### that the record is updated rather than left to drift."
     return 1
   fi
-  if refusal_recorded "$OUT/dev-attn-refusal.txt"; then
+  # CLASSIFY THE FULL LOG, NEVER THE PREFILTERED EXCERPT. `dev-attn-refusal.txt`
+  # is `grep -iE 'sliding_window|image span|DEVICE decode|2411|refus' | head -20`
+  # of this log, and that prefilter DISCARDS two of the three refusal families
+  # this classifier is anchored to. MEASURED: a log holding `DeepSeek-V4 vision
+  # compute dtype must be bf16` classified rc=0 as the full log and rc=1 as the
+  # filtered file, which was 0 bytes, and so did `DeepseekV4 DEVICE forward
+  # (W7-device) not implemented`. `head -20` is a second route to the same false
+  # red, because 20 noisy `refus` lines ahead of the real refusal drop it too.
+  # The probe legs above always read their full log; this leg did not, and it is
+  # the one that runs on every thor lease.
+  if refusal_recorded "$OUT/dev-attn-on.log"; then
     echo "### dev_attn_on RC=$rc: the recorded refusal is in the log, as expected"
     return 0
   fi
   echo "### UNEXPLAINED dev_attn_on RC=$rc: no refusal this product emits appears"
-  echo "### in $OUT/dev-attn-refusal.txt, so this is a crash and not the refusal."
+  echo "### in $OUT/dev-attn-on.log, so this is a crash and not the refusal."
   return 1
 }
 

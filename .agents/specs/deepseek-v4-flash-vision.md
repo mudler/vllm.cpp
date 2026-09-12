@@ -1251,15 +1251,19 @@ above as its red-before input.
     wrong exited 0 `PASS` with no `BOUND` line, while the same defect at `vit`
     exited 1. No recorded f32-arm measurement exists at that stage to bound it
     with, so the file says so instead of implying a bound.
-  - `best_match_margin_min = 0.01` is the ONE DECLARED number in the bounds file
-    and it says so in its own provenance. It is the precondition the
-    identity-permutation condition never had: an argmax over near-parallel rows
-    is decided by bf16 rounding rather than by content. WHAT IS MEASURED is the
-    degeneracy — a smooth-ramp fixture separates DIFFERENT rows by 7e-7 in cosine
-    while rounding moves a row by about 0.4%, and the identity then read 17 of
-    100 on a CLEAN dataset. WHAT IS NOT MEASURED is the margin of a real
-    392x392 photograph, because `min_best_margin` did not exist until this
-    change; the first real leg to run will report its own value.
+  - The best-match margin is bounded against THIS DATASET's own bf16 rounding
+    scale, DERIVED per run, and no number in the bounds file is consulted. It is
+    the precondition the identity-permutation condition never had: an argmax over
+    near-parallel rows is decided by bf16 rounding rather than by content. The
+    constant that first carried it, `best_match_margin_min = 0.01`, was WITHDRAWN
+    on 2026-09-12 as a false red. Measured with the shipped `best_match()` at
+    realistic width (D=1280; the mutation fixture uses D=16), an ordinary
+    photographic geometry falls under it: a shared global component with 10% and
+    5% per-cell detail gives margins 0.00834 and 0.00210, and a 20-cell flat
+    region gives 0.00875 and 0.00221, while the identity stayed best for 100 of
+    100 rows in all four. `min_best_margin` is a MIN over the cells, so a single
+    flat pair decides a run. The derived scale refuses the degenerate ramp by
+    three and a half decades and clears those four geometries by nearly three.
   - The comparator now NARRATES what it judged, one `JUDGED` line per bound,
     stage and presence-only rule. A verdict that does not say what it covered
     cannot be read for what it left out.
@@ -1292,8 +1296,9 @@ above as its red-before input.
   2026-09-12 THAT CHECK ALSO CARRIES ITS OWN PRECONDITION: an argmax means
   nothing when the reference rows are not separable, so the comparator reports
   the margin between the winner and the runner-up and every judged profile
-  declares `best_match_margin_min`. The bound is DECLARED rather than recorded,
-  because no real leg has reported a margin yet. Making
+  declares `best_match_margin_above_bf16_rounding`. The bound is DERIVED from the
+  rows each run reads rather than declared, so no wave can choose the number that
+  judges it. Making
   the input stage measure ordering on its own would need the oracle's buffer
   written in the ORACLE's order plus a separate declared mapping, which is a
   second description of the layout that could drift from the first; the

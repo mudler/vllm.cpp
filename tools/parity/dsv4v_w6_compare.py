@@ -82,6 +82,34 @@ same effect, because nothing ever read the profile as a whole.
   while rounding moves a row by about 0.4%, which reads as a false red on clean
   data and would read as a false GREEN on genuinely permuted output. The margin
   between the winner and the runner-up is now reported and bounded.
+
+AND THE TWO SHAPES THAT REPAIR LEFT. Both were found by a fifth review and both
+are closed here.
+
+  A STAGE DROPPED FROM `stages` WAS JUDGED BY NOTHING. `PROFILE_KEYS` forced the
+  `stages` KEY to exist and said nothing about its MEMBERSHIP, so every judging
+  key had to be declared while a whole stage RULE could simply be deleted and
+  the run still passed. Measured on a leg whose vit file was 100x wrong:
+  deleting the `vit` rule printed `stage 'vit': NOT REQUIRED by this profile`,
+  `VERDICT PASS` and exited 0, `"stages": {}` did the same, and the identical
+  data with the rule present exited 1 at 9901.8287%. Stage MEMBERSHIP is now
+  declared exactly as keys are: a judged profile names every stage in `STAGES`,
+  and a stage it does not require is written as `null` with its reason under
+  `unbounded` as `stages.<name>`. An omitted stage is ERROR with exit 4.
+
+  A DECLARED CONSTANT IS NOT A MEASUREMENT. `best_match_margin_min` was 0.01,
+  and the bounds file said in its own provenance that it was DECLARED rather
+  than recorded. Measured with the shipped `best_match()` at realistic width
+  (D=1280), the margin falls under 0.01 as soon as per-cell variation is about a
+  tenth of what the cells share -- sky, wall, background -- while the identity
+  stayed best for 100 of 100 rows in every one of those cases: a shared global
+  component with detail 0.10 and 0.05 measured 0.00834 and 0.00210, and a
+  20-cell flat region measured 0.00875 and 0.00221. All four would have RED on a
+  correct run, and the ordering claim the bound guards was right in all four.
+  The margin is now bounded against THIS DATASET's own bf16 rounding scale,
+  which is derived per run by `bf16_rounding_scale()`, cannot be accused of
+  having been picked by the wave it judges, and still refuses the degenerate
+  ramp it was introduced for by three and a half decades.
 """
 import fnmatch
 import json
@@ -105,6 +133,49 @@ def bf16(x):
         return x
     u = (u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000
     return struct.unpack("<f", struct.pack("<I", u))[0]
+
+
+def bf16_ulp(x):
+    """The bf16 grid spacing AT x, whether or not x is already on the grid.
+
+    bf16 carries 8 significand bits, so `ulp(x) = 2**(exponent - 7)` and the
+    RELATIVE spacing is between 2**-8 and 2**-7. This is deliberately the grid
+    spacing rather than the residual `x - bf16(x)`: the residual is exactly ZERO
+    for every value already rounded to bf16, and both sides of this comparison
+    are bf16 by the time they reach a file, so a scale built from the residual
+    would be 0 on real data and bound nothing at all.
+    """
+    (u,) = struct.unpack("<I", struct.pack("<f", float(x)))
+    exponent = (u >> 23) & 0xFF
+    if exponent == 0 or exponent == 0xFF:
+        return 0.0
+    return 2.0 ** (exponent - 127 - 7)
+
+
+def bf16_rounding_scale(rows):
+    """How far bf16 rounding alone can move a row's DIRECTION, worst row.
+
+    This is the quantity the margin has to beat, DERIVED from the dataset being
+    judged rather than declared as a constant. Perturbing every element of a row
+    by at most half a bf16 ULP moves the row by an angle whose sine is at most
+    `||h|| / ||b||`, so the largest cosine change it can produce is
+    `1 - sqrt(1 - (||h||/||b||)**2)`, which is what this returns.
+
+    WHY IT IS COMPARED WITH A COSINE MARGIN. The failure being guarded is the
+    NEAR-PARALLEL one, where every candidate row points almost the same way. The
+    first-order term is then common to the winner and the runner-up and cancels
+    out of their difference, and what is left is exactly this second-order
+    scale. A margin at or below it was chosen by rounding, not by content.
+    """
+    worst = 0.0
+    for row in rows:
+        norm = math.sqrt(sum(v * v for v in row))
+        if norm == 0.0:
+            continue
+        half = math.sqrt(sum((0.5 * bf16_ulp(v)) ** 2 for v in row))
+        ratio = min(1.0, half / norm)
+        worst = max(worst, 1.0 - math.sqrt(max(0.0, 1.0 - ratio * ratio)))
+    return worst
 
 
 def layout(lead_pad, n_llm_h, n_llm_w):
@@ -239,7 +310,7 @@ NUMBER = "number"
 PROFILE_KEYS = {
     "sentinels_bf16_exact": bool,
     "permutation_identity_complete": bool,
-    "best_match_margin_min": NUMBER,
+    "best_match_margin_above_bf16_rounding": bool,
     "mean_rel_l2_max": NUMBER,
     "mean_cos_min": NUMBER,
     "max_degenerate_rows": int,
@@ -324,11 +395,39 @@ def validate_profile(name, profile):
     stages = profile.get("stages")
     if not isinstance(stages, dict):
         return bad
+    # STAGE MEMBERSHIP IS DECLARED EXACTLY AS A JUDGING KEY IS. `PROFILE_KEYS`
+    # forced this dict to EXIST and constrained nothing about what is IN it, so
+    # a whole stage rule could be deleted and that stage was then judged by
+    # nothing -- the one bound in this file that needed no declaration to be
+    # skipped. Measured on a leg whose vit file was 100x wrong: dropping the
+    # `vit` rule exited 0 VERDICT PASS, and so did `"stages": {}`.
+    unbounded = profile.get("unbounded")
+    if not isinstance(unbounded, dict):
+        unbounded = {}
+    for stage in STAGES:
+        if stage not in stages:
+            bad.append(
+                "profile %r does not DECLARE stage %r. A judged profile must "
+                "name every stage it is judged on: an omitted stage is read by "
+                "nothing, so the leg would be judged without it and still pass. "
+                "Write the rule, or write null and give the reason under "
+                "'unbounded' as %r."
+                % (name, stage, "stages.%s" % stage))
     for stage in sorted(stages):
         rule = stages[stage]
         where = "profile %r stage %r" % (name, stage)
         if stage not in STAGES:
             bad.append("%s is not one of %s" % (where, ", ".join(STAGES)))
+            continue
+        if rule is None:
+            reason = unbounded.get("stages.%s" % stage)
+            if not isinstance(reason, str) or not reason.strip():
+                bad.append(
+                    "%s is declared null without naming a reason under "
+                    "'unbounded' as %r. A stage a profile deliberately does not "
+                    "require must say why; silence is how a dropped stage reads "
+                    "as a stage that passed."
+                    % (where, "stages.%s" % stage))
             continue
         if not isinstance(rule, dict):
             bad.append("%s is %r, which is not a rule" % (where, rule))
@@ -501,24 +600,46 @@ def judge(report, tag, bounds):
     # rows it is a false red on clean data and a false GREEN on permuted output.
     # The failure is a property of the DATASET, and the message says so rather
     # than claiming a defect in the tower.
-    margin = profile["best_match_margin_min"]
-    if margin is not None and isinstance(p, dict):
-        got = p.get("min_best_margin")
-        notes.append("permutation: best-match margin bound >= %.6g, value %s"
-                     % (margin, got))
-        if got is None or not math.isfinite(got):
-            bad.append("permutation min_best_margin is %s, so the identity "
-                       "condition rests on an argmax whose separability was "
-                       "never measured" % got)
-        elif got < margin:
-            bad.append(
-                "permutation min_best_margin %.8f is BELOW the bound %.8f. The "
-                "reference rows are not separable enough for an argmax to carry "
-                "the ORDERING claim: rounding to bf16 moves a row by about 0.4%%, "
-                "so a winner this close is chosen by noise. This is a statement "
-                "about the DATASET, not a defect in the tower." % (got, margin))
-    elif margin is None:
-        notes.append("permutation: best-match margin NOT BOUNDED (declared null)")
+    # THE BOUND IS DERIVED FROM THIS RUN'S OWN ROWS, not declared. It was the
+    # constant 0.01, and the bounds file said in its own provenance that the
+    # number was declared rather than recorded. Measured at realistic width
+    # (D=1280), a margin under 0.01 is what an ORDINARY photographic region
+    # produces -- a shared global component with 10% or 5% per-cell detail
+    # measured 0.00834 and 0.00210, a 20-cell flat region 0.00875 and 0.00221 --
+    # and the identity was still best for 100 of 100 rows in every one of them.
+    # `min_best_margin` is a MIN over the image rows, so one flat pair decides
+    # the run, and the constant would have RED four correct datasets.
+    if profile["best_match_margin_above_bf16_rounding"]:
+        if not isinstance(p, dict):
+            bad.append("the profile requires a best-match margin above the bf16 "
+                       "rounding scale and the report carries no permutation")
+        else:
+            got = p.get("min_best_margin")
+            scale = p.get("bf16_rounding_scale")
+            notes.append(
+                "permutation: best-match margin bound > %s, DERIVED from this "
+                "run's own rows as the largest direction change half a bf16 ULP "
+                "can cause -- NOT a declared constant -- value %s" % (scale, got))
+            if got is None or not math.isfinite(got):
+                bad.append("permutation min_best_margin is %s, so the identity "
+                           "condition rests on an argmax whose separability was "
+                           "never measured" % got)
+            elif scale is None or not math.isfinite(scale):
+                bad.append("permutation bf16_rounding_scale is %s, so the margin "
+                           "was judged against nothing. The scale is derived from "
+                           "the rows this run read; its absence is an unjudged "
+                           "separability claim, never a pass." % scale)
+            elif got <= scale:
+                bad.append(
+                    "permutation min_best_margin %.6g is NOT ABOVE this dataset's "
+                    "own bf16 rounding scale %.6g. The reference rows are not "
+                    "separable enough for an argmax to carry the ORDERING claim: "
+                    "rounding to bf16 can move the winner past the runner-up, so "
+                    "a winner this close is chosen by noise. This is a statement "
+                    "about the DATASET, not a defect in the tower." % (got, scale))
+    else:
+        notes.append("permutation: best-match margin NOT REQUIRED to clear the "
+                     "bf16 rounding scale (declared false)")
     stat_name = bounds.get("statistic")
     stat = report.get(stat_name)
     if not isinstance(stat, dict):
@@ -546,9 +667,15 @@ def judge(report, tag, bounds):
     _check_bound(bad, "%s mean_cos" % stat_name, stat.get("mean_cos"),
                  profile["mean_cos_min"], "min", notes)
     for stage in STAGES:
-        rule = profile["stages"].get(stage)
+        # INDEXED, not `.get`-ed, for the same reason the stage rule's own keys
+        # are: validate_profile has already refused a profile that does not
+        # declare every stage, so an OMITTED stage cannot reach this loop and
+        # read as "not required".
+        rule = profile["stages"][stage]
         if rule is None:
-            notes.append("stage %r: NOT REQUIRED by this profile" % stage)
+            notes.append("stage %r: NOT REQUIRED (declared null): %s"
+                         % (stage, profile.get("unbounded", {})
+                            .get("stages.%s" % stage)))
             continue
         _judge_stage(report, stage, rule, bad, notes)
     return ("PASS" if not bad else "FAIL"), bad, notes
@@ -636,7 +763,14 @@ def main():
                              # The winner's lead over the runner-up. A margin at
                              # the scale of bf16 rounding means the argmax above
                              # was decided by noise; the bound is in the profile.
-                             "min_best_margin": min(m for _a, _c, m in hits)}
+                             "min_best_margin": min(m for _a, _c, m in hits),
+                             # WHAT THAT MARGIN IS JUDGED AGAINST, derived from
+                             # the rows this run actually read rather than
+                             # declared as a constant. Both sides are measured
+                             # because either one's rounding can move the argmax.
+                             "bf16_rounding_scale": max(
+                                 bf16_rounding_scale([ours[i] for i in img]),
+                                 bf16_rounding_scale([ref[i] for i in img]))}
     print("permutation", json.dumps(report["permutation"]))
 
     for stage in STAGES:

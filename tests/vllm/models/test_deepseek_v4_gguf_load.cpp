@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -36,10 +37,10 @@
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/model_executor/models/deepseek_v4.h"
 #include "vllm/model_executor/models/deepseek_v4_compressor.h"
+#include "vllm/model_executor/models/model_registry.h"
 #include "vt/device.h"
 #include "vt/dtype.h"
 #include "vt/merged_gemm.h"
-#include "vt/ops.h"
 #include "vt/ops.h"
 #include "vt/tensor.h"
 
@@ -1549,6 +1550,165 @@ TEST_CASE("W8 slice 4: the forward WRITES and READS the fp8_ds_mla page (#2455)"
     if (packed_logits[i] != float_logits[i]) {
       CAPTURE(i);
       REQUIRE(packed_logits[i] == float_logits[i]);
+    }
+  }
+}
+
+// ── W8 slice 4: THE PRODUCTION ENTRY POINT, and the seam only it covers ──────
+//
+// WHY THE CASE ABOVE IS NOT ENOUGH, stated as the review found it. That case
+// enters at `DeepseekV4ForwardGgufPaged` and HAND-PASSES `/*rows_per_block=*/
+// rows`. The resolver is gated separately, in `test_deepseek_v4_paged_equiv`.
+// So both ENDS of the wiring were measured and the WIRE between them was not:
+// replacing `rows_per_block` with a literal `0` at the registry's call site
+// built clean and left all four suites green, because nothing drove
+// `ForwardDeepseekV4ForCausalLM` at all -- its only mention in any test was a
+// COMMENT. That is `.agents/reachability.md`'s "test-only driver" with the
+// drivers one hop too low.
+//
+// THIS CASE ENTERS AT `ModelRegistry::Forward`, the entry AGENTS.md names, so
+// the chain under test is the production one: the registry resolves the pages,
+// receives the STORAGE ROW COUNT through `&rows_per_block`, reads `kv_base` off
+// the step, and hands all three to the forward. Break any link and this reds.
+//
+// WHAT A WRONG ROW COUNT DOES, so the severity is not overstated. It is a LOUD
+// refusal, never silent corruption: `VT_CHECK(packed_page == (rows > 0))` fires
+// inside the layer loop. This case reds by that throw, which is the defect
+// arriving at the caller exactly as a user would meet it.
+TEST_CASE("W8 slice 4: ModelRegistry::Forward carries rows_per_block to the packed page (#2455)") {
+  Dims d;
+  // The packed layout's geometry is upstream's literals, not parameters
+  // (`cache_utils.py:180-183`). The layer loop refuses any other width, so a
+  // packed page is only expressible at 512 NoPE+RoPE with a 64-wide RoPE half.
+  d.head_dim = 512;
+  d.rope = 64;
+  // NO COMPRESSOR ON ANY LAYER. The resolver refuses a compressor layer holding
+  // a packed page, and that refusal is per STEP rather than per layer, so one
+  // compressor here would throw before any page is bound.
+  d.compress_ratios = {0, 0, 0, 0};
+  // A window would make the paged arm legitimately differ from a full-prefix
+  // reference. Nothing below compares against one, but it keeps this case
+  // reading the same geometry as the case above.
+  d.sliding_window = 0;
+
+  TempFile f(BuildGguf(d));
+  // THE PRODUCTION LOAD PATH, not `LoadDeepseekV4FromGguf` directly: this is the
+  // pair `LoadedEngine` uses, and `ModelRegistry::Load` is what attaches the
+  // weights to the registration whose `forward` pointer the step below calls.
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig cfg = vllm::DeepseekV4HfConfigFromGguf(g);
+  const vllm::ModelSource source =
+      vllm::ModelSource::FromGguf(g, vt::DeviceType::kCPU);
+  std::unique_ptr<vllm::LoadedModel> model = vllm::ModelRegistry::Load(cfg, source);
+  REQUIRE(model != nullptr);
+
+  const int64_t nlayers = d.n_layer;
+  const int64_t hd = d.head_dim;
+  REQUIRE(hd == vt::kFp8DsMlaInputDim);
+
+  const int64_t rows = 8;  // STORAGE rows per block -- the value under test
+  const int64_t num_blocks = 4;
+  // From the SHARED packer, never a local `RoundUp(rows * 584, 576)`: a second
+  // derivation of the padding rule is the drift the one packer exists to stop.
+  const vllm::deepseek_v4::Fp8DsMlaPageLayout P =
+      vllm::deepseek_v4::MakeFp8DsMlaPageLayout(
+          vllm::deepseek_v4::MakeFp8DsMlaLayout(vt::kFp8DsMlaNopeDim,
+                                                vt::kFp8DsMlaRopeDim,
+                                                vt::kFp8DsMlaQuantBlock),
+          rows);
+  const int64_t block_bytes = P.padded_block_bytes;
+
+  // POISON, so "the store ran" is an observation rather than a check that zeros
+  // stayed zero.
+  std::vector<std::vector<uint8_t>> pstore(static_cast<size_t>(nlayers));
+  std::vector<vllm::PagedKvCache> attn_kv(static_cast<size_t>(nlayers));
+  std::vector<std::string> names;
+  for (int64_t l = 0; l < nlayers; ++l) {
+    const size_t i = static_cast<size_t>(l);
+    pstore[i].assign(static_cast<size_t>(num_blocks * block_bytes), 0xA5);
+    attn_kv[i].data = pstore[i].data();
+    // THE ARCHITECTURE'S OWN DEFAULT. `MakeDeepseekV4KVCache` publishes the SWA
+    // pages at `kI8` / `fp8_ds_mla`, mirroring upstream (`attention.py:140`),
+    // so this is the shape a real artifact arrives with.
+    attn_kv[i].dtype = vt::DType::kI8;
+    attn_kv[i].num_blocks = num_blocks;
+    attn_kv[i].block_size = rows;
+    attn_kv[i].num_kv_heads = 1;
+    attn_kv[i].head_size = hd;
+    // Filled ONLY by `GPUModelRunner::initialize_kv_cache` in production. The
+    // view (`block_size * head_size` = 4096) and the allocated page disagree by
+    // design here, which is why the resolver reads this field instead.
+    attn_kv[i].page_size_bytes = block_bytes;
+    names.push_back("model.layers." + std::to_string(l) + ".attn.swa_cache");
+  }
+  // Keyed BY NAME, the way the runner publishes it. `ResolveDeepseekV4SwaPages`
+  // derives the same names and refuses one that does not resolve.
+  vllm::MultiKvCacheIndex mk;
+  mk.layer_names = &names;
+
+  const std::vector<int32_t> step{1, 2, 3};
+  std::vector<int32_t> pos(step.size());
+  for (size_t i = 0; i < step.size(); ++i) pos[i] = static_cast<int32_t>(i);
+  const int64_t n_keys = static_cast<int64_t>(step.size());
+  const std::vector<int32_t> li{static_cast<int32_t>(step.size() - 1)};
+
+  vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  std::vector<vllm::GdnStateCache> gdn_state;
+  const vllm::v1::GDNAttentionMetadata gdn_meta{};
+  vllm::v1::CommonAttentionMetadata attn_meta{};
+  // The RESOLVER reads `attn_meta.num_reqs`, and the registry reads `kv_base`
+  // off `num_computed_tokens_cpu`. Both travel through this struct, so both are
+  // part of the seam this case covers.
+  attn_meta.num_reqs = 1;
+  attn_meta.num_computed_tokens_cpu = {0};
+
+  vllm::ModelForwardInput in{.token_ids = step,
+                             .positions = pos,
+                             .attn_meta = attn_meta,
+                             .gdn_meta = gdn_meta,
+                             .attn_kv = attn_kv,
+                             .gdn_state = gdn_state,
+                             .config = cfg,
+                             .queue = queue,
+                             .logits_indices = li,
+                             .num_reqs = 1};
+  in.multi_kv = &mk;
+  // REQUIRED TO REACH THIS ARM, and it is the reason the GGUF paged branch sat
+  // behind an unreachable test surface: `gather_logits` defaults to TRUE and the
+  // branch above returns `ForwardDevice` when it is set.
+  in.gather_logits = false;
+
+  // THE STEP. A wrong row count throws out of here rather than returning.
+  const vllm::ForwardLogits out = vllm::ModelRegistry::Forward(*model, in);
+  CHECK(out.rows == 1);
+  CHECK(out.vocab == d.vocab);
+  REQUIRE(out.host.size() == static_cast<size_t>(out.rows * out.vocab));
+  for (float v : out.host) REQUIRE(std::isfinite(v));
+
+  // 1. THE WRITE REACHED THE PAGE THROUGH THE REGISTRY. Every stored token's
+  //    data region moved off poison, and the 8th scale byte is the explicit zero
+  //    pad upstream writes (`cache_utils.py:148-149`).
+  for (int64_t l = 0; l < nlayers; ++l) {
+    const std::vector<uint8_t>& blk = pstore[static_cast<size_t>(l)];
+    CAPTURE(l);
+    bool moved = false;
+    for (int64_t t = 0; t < n_keys; ++t) {
+      const uint8_t* data = blk.data() + t * P.token_data_size;
+      for (int64_t i = 0; i < P.token_data_size; ++i)
+        if (data[i] != 0xA5) { moved = true; break; }
+      const uint8_t* sc = blk.data() + P.scale_region_offset + t * P.scale_dim;
+      CHECK(sc[P.token.n_nope_blocks] == 0);
+    }
+    CHECK(moved);
+    // 2. AND IT STAYED INSIDE ITS BLOCK. `rows * 584` onward is alignment
+    //    padding. A row count larger than the page holds overruns into it, and
+    //    the whole reason the count travels beside the page is that the rank-2
+    //    byte shape cannot carry it.
+    for (int64_t i = P.real_block_bytes; i < block_bytes; ++i) {
+      if (blk[static_cast<size_t>(i)] != 0xA5) {
+        CAPTURE(i);
+        REQUIRE(blk[static_cast<size_t>(i)] == 0xA5);
+      }
     }
   }
 }

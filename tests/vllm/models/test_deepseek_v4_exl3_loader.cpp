@@ -39,7 +39,9 @@
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"   // F8E4M3ToF32
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/deepseek_v4.h"
+#include "vllm/model_executor/models/deepseek_v4_compressor.h"  // Fp8DsMlaPageLayout
 #include "vllm/model_executor/models/model_registry.h"
+#include "vt/ops.h"                                // kFp8DsMla* geometry
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/model_executor/models/qwen3_5.h"   // PagedKvCache, GdnStateCache
 #include "vllm/v1/attention/backend.h"             // CommonAttentionMetadata
@@ -1580,4 +1582,138 @@ TEST_CASE("dsv4 #2544: the paged arm embeds the async mirror's DEVICE id, not th
                     "embedded the STALE host id (#2544, #1305)");
   MESSAGE("dsv4 device-ids: control moved " << moved << " floats; mirror vs "
           "reference differ in " << differing << " of " << ref.size());
+}
+
+// ── KV-DSV4-MULTICACHE W8 slice 4 (#2455): THE EXL3 ARM OF THE SAME SEAM ─────
+//
+// The case above binds FLOAT pages and says, in a comment written before slice
+// 4, that "the packed arm is refused by name and is owed to KV-DSV4-MULTICACHE
+// W8". Slice 4 is what that comment was waiting for, and this case is the other
+// half of the wiring it landed.
+//
+// WHY IT EXISTS SEPARATELY FROM THE GGUF CASE. `ForwardDeepseekV4ForCausalLM`
+// has TWO junctions that carry the storage row count from
+// `ResolveDeepseekV4SwaPages` into a forward, and they are different lines with
+// different arguments: this one passes `dsa_dense=false` and
+// `have_compressor_state=true`, so its refusals and its DECODE-ONLY bound are
+// not the GGUF arm's. The slice-4 review proved the GGUF junction ungated;
+// nothing measured this one either, and one gate cannot cover both lines.
+//
+// THE DECODE-ONLY BOUND IS WHY THIS STEP IS ONE TOKEN. With carried compressor
+// state the resolver refuses any step carrying more than one token, because the
+// window/compressed merge reshapes the two LSE buffers rather than transposing
+// them (MODEL-DSV4-PAGED-ENTRY, #2447).
+TEST_CASE("W8 slice 4: ModelRegistry::Forward carries rows_per_block on the EXL3 arm (#2455)") {
+  dsv4_exl3_fixture::FixtureOptions opt;
+  opt.layers = 2;
+  // NO COMPRESSOR ON ANY LAYER. A compressor layer holding a PACKED page is
+  // refused by name -- `CompressorLayerStep` attends through
+  // `vt::MlaDecodeAttention`, which takes a rank-3 float cache -- and that
+  // refusal ends the whole STEP rather than skipping the layer.
+  opt.compress_ratios = {0, 0};
+  opt.real_dsa_geometry = false;
+  auto f = dsv4_exl3_fixture::BuildFixture(opt);
+
+  const vllm::ModelSource source = vllm::ModelSource::FromSafetensors(f->shards);
+  std::unique_ptr<vllm::LoadedModel> model =
+      vllm::ModelRegistry::Load(f->config, source);
+  REQUIRE(model != nullptr);
+
+  const vllm::DeepseekV4Params params = vllm::ParseDeepseekV4Params(f->config);
+  const int64_t nlayers = params.num_hidden_layers;
+  const int64_t hd = params.head_dim;
+  REQUIRE(nlayers == 2);
+  // The packed layout is upstream's literals, not parameters
+  // (`cache_utils.py:180-183`). This fixture already writes the real 512-wide
+  // MLA head with a 64-wide RoPE half, which is why a packed page is
+  // expressible here at all.
+  REQUIRE(hd == vt::kFp8DsMlaInputDim);
+
+  const int64_t rows = 8;  // STORAGE rows per block -- the value under test
+  const int64_t num_blocks = 4;
+  // From the SHARED packer. A local `RoundUp(rows * 584, 576)` would be a second
+  // derivation of the padding rule, which is the drift the one packer prevents.
+  const vllm::deepseek_v4::Fp8DsMlaPageLayout P =
+      vllm::deepseek_v4::MakeFp8DsMlaPageLayout(
+          vllm::deepseek_v4::MakeFp8DsMlaLayout(vt::kFp8DsMlaNopeDim,
+                                                vt::kFp8DsMlaRopeDim,
+                                                vt::kFp8DsMlaQuantBlock),
+          rows);
+  const int64_t block_bytes = P.padded_block_bytes;
+
+  // POISON, so "the store ran" is an observation and not a check that zeros
+  // stayed zero.
+  std::vector<std::vector<uint8_t>> pstore(static_cast<size_t>(nlayers));
+  std::vector<vllm::PagedKvCache> attn_kv(static_cast<size_t>(nlayers));
+  std::vector<std::string> names;
+  for (int64_t l = 0; l < nlayers; ++l) {
+    const size_t i = static_cast<size_t>(l);
+    pstore[i].assign(static_cast<size_t>(num_blocks * block_bytes), 0xA5);
+    attn_kv[i].data = pstore[i].data();
+    attn_kv[i].dtype = vt::DType::kI8;  // the architecture's published default
+    attn_kv[i].num_blocks = num_blocks;
+    attn_kv[i].block_size = rows;
+    attn_kv[i].num_kv_heads = 1;
+    attn_kv[i].head_size = hd;
+    // Filled ONLY by `GPUModelRunner::initialize_kv_cache` in production, and
+    // the reason the field exists: the view and the allocated page disagree.
+    attn_kv[i].page_size_bytes = block_bytes;
+    names.push_back("model.layers." + std::to_string(l) + ".attn.swa_cache");
+  }
+  vllm::MultiKvCacheIndex mk;
+  mk.layer_names = &names;
+
+  vt::Queue queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  std::vector<vllm::GdnStateCache> gdn_state;
+  const vllm::v1::GDNAttentionMetadata gdn_meta{};
+
+  const std::vector<int32_t> tok{1};
+  const std::vector<int32_t> pos{0};
+  const std::vector<int32_t> li{0};
+  vllm::v1::CommonAttentionMetadata attn_meta{};
+  attn_meta.num_reqs = 1;
+  attn_meta.num_computed_tokens_cpu = {0};
+  vllm::ModelForwardInput in{.token_ids = tok,
+                             .positions = pos,
+                             .attn_meta = attn_meta,
+                             .gdn_meta = gdn_meta,
+                             .attn_kv = attn_kv,
+                             .gdn_state = gdn_state,
+                             .config = f->config,
+                             .queue = queue,
+                             .logits_indices = li,
+                             .num_reqs = 1};
+  in.multi_kv = &mk;
+  // LEFT AT ITS DEFAULT (true), exactly as the runner sets it. This arm is
+  // tested BEFORE the `gather_logits` branch, which is why it is the arm a
+  // default decode step actually takes.
+  REQUIRE(in.gather_logits);
+
+  // THE STEP. A wrong row count throws out of here rather than returning.
+  const vllm::ForwardLogits out = vllm::ModelRegistry::Forward(*model, in);
+  CHECK(out.rows == 1);
+  CHECK(out.vocab == params.vocab_size);
+  REQUIRE(out.host.size() == static_cast<size_t>(params.vocab_size));
+  CHECK(NonFinite(out.host) == 0);
+
+  // 1. THE WRITE REACHED THE PACKED PAGE THROUGH THE REGISTRY, on every layer.
+  //    The 8th scale byte is the explicit zero pad upstream writes
+  //    (`cache_utils.py:148-149`), so it is asserted rather than assumed.
+  for (int64_t l = 0; l < nlayers; ++l) {
+    const std::vector<uint8_t>& blk = pstore[static_cast<size_t>(l)];
+    CAPTURE(l);
+    bool moved = false;
+    const uint8_t* data = blk.data();
+    for (int64_t i = 0; i < P.token_data_size; ++i)
+      if (data[i] != 0xA5) { moved = true; break; }
+    CHECK(moved);
+    const uint8_t* sc = blk.data() + P.scale_region_offset;
+    CHECK(sc[P.token.n_nope_blocks] == 0);
+    // 2. AND IT STAYED INSIDE ITS BLOCK. Everything from `rows * 584` on is
+    //    alignment padding that no store may reach.
+    int64_t clobbered = 0;
+    for (int64_t i = P.real_block_bytes; i < block_bytes; ++i)
+      if (blk[static_cast<size_t>(i)] != 0xA5) ++clobbered;
+    CHECK(clobbered == 0);
+  }
 }

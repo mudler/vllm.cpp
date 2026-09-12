@@ -208,7 +208,12 @@ ForwardLogits ForwardDeepseekV4ForCausalLM(LoadedModel& model,
     // the difference between the arms readable rather than implicit.
     // W8 slice 4 (#2455): same channel on this arm. A GGUF tower forces every
     // layer dense, so the compressor clause never admits a layer here, and a
-    // packed page is therefore servable on exactly the SWA-only layers.
+    // packed page is servable on a topology whose EVERY layer is SWA-only.
+    // NOT "on the SWA-only layers of any topology", which is what this comment
+    // said until the W8 slice 4 review: the resolver returns a refusal on the
+    // FIRST compressor layer and the `VT_CHECK` below throws the whole STEP, so
+    // no layer binds a page when any layer is refused. On the released 43-layer
+    // artifact, where layers 2-42 carry compressors, that is zero layers.
     int64_t rows_per_block = 0;
     const std::string refusal = ResolveDeepseekV4SwaPages(
         weights.params, *input.multi_kv, input.attn_kv, input.attn_meta.num_reqs,

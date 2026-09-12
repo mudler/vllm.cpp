@@ -2162,10 +2162,19 @@ config parse and upstream's disagree about the layer partition (that would be a
   owed to `MODEL-DSV4-DSA-COMPOSE`
   ([#2286](https://github.com/mudler/vllm.cpp/issues/2286)) and
   `MODEL-DSV4-PAGED-ENTRY`
-  ([#2447](https://github.com/mudler/vllm.cpp/issues/2447)). On the real
-  43-layer artifact every layer 2-42 carries a compressor, so the packed path is
-  reachable today for the SWA-only layers and the rest is named rather than
-  silently unreached. Owned by this row, tracked under
+  ([#2447](https://github.com/mudler/vllm.cpp/issues/2447)).
+
+  **That refusal is PER STEP, not per layer, and an earlier wording of this
+  entry got it wrong.** `ResolveDeepseekV4SwaPages` returns a refusal string on
+  the FIRST compressor layer it meets
+  (`src/vllm/model_executor/models/deepseek_v4.cpp`, the packed-page branch),
+  and `ForwardDeepseekV4ForCausalLM` then does `VT_CHECK(refusal.empty(),
+  refusal)`. No layer binds a page when any layer is refused, so reachability is
+  all-or-nothing for the whole step. On the released 43-layer topology, where
+  layers 2-42 all carry compressors, ZERO layers bind a packed page and the step
+  throws. The packed path is therefore reachable today only on a topology whose
+  every layer is SWA-only, which is what the gate drives; the released artifact
+  is not one. Owned by this row, tracked under
   [#2455](https://github.com/mudler/vllm.cpp/issues/2455).
 
 ## Evidence

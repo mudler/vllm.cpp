@@ -1750,6 +1750,7 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_qwen4_exp.hip
     src/vt/rocm/rocm_qwen4_exp_ple.hip
     src/vt/rocm/rocm_qwen4_exp_qsa.hip
+    src/vt/rocm/rocm_dsa_indexer.hip
     src/vt/rocm/rocm_rms_norm_group.hip
     src/vt/rocm/rocm_quant_dot.hip)
   if(VLLM_CPP_HIP_ARCHITECTURES)
@@ -1789,6 +1790,7 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_qwen4_exp.hip
       src/vt/rocm/rocm_qwen4_exp_ple.hip
       src/vt/rocm/rocm_qwen4_exp_qsa.hip
+      src/vt/rocm/rocm_dsa_indexer.hip
       src/vt/rocm/rocm_rms_norm_group.hip
       src/vt/rocm/rocm_quant_dot.hip
       PROPERTIES HIP_ARCHITECTURES "${VLLM_CPP_HIP_ARCHITECTURES}")

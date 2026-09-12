@@ -135,7 +135,12 @@ enum class OpId : uint8_t {
   // / `DsaTopkSelect`, which stay as the gate's oracle. Ported from
   // `vllm/v1/attention/ops/triton_fp8_mqa_logits.py:120-156` and
   // `vllm/model_executor/layers/sparse_attn_indexer.py:509`
-  // (`ops.top_k_per_row_prefill`) @ `bc2d63e650`. CPU + CUDA. Additive:
+  // (`ops.top_k_per_row_prefill`) @ `bc2d63e650`. Registered on kCPU
+  // (src/vt/cpu/cpu_dsa_indexer.cpp), on kCUDA (src/vt/cuda/cuda_dsa_indexer.cu)
+  // and, since MODEL-MM-QWEN4-EXP W5, on kROCM
+  // (src/vt/rocm/rocm_dsa_indexer.hip). These two lines read "CPU + CUDA" until
+  // 2026-09-12, by which date the kROCM arms had landed. NO OTHER DEVICE IS
+  // REGISTERED, so the dispatcher still refuses those BY NAME. Additive:
   // only a model whose config carries `index_topk` dispatches them.
   kDsaIndexerLogits,
   kDsaTopkSelect,
@@ -666,11 +671,22 @@ enum class OpId : uint8_t {
   // the three unconditional and at preprocessor depth 0. This paragraph read
   // "kCPU only. The CUDA arm is OWED, not written" until 2026-09-12, by which
   // date the CUDA arm had landed, and said the kROCM arms were owed until W4
-  // landed them. THE ROCm FORWARD STILL REFUSES, and not at this pair: the QSA
-  // block composes its indexer from kDsaIndexerLogits and kDsaTopkSelect
-  // (qwen4_exp_qsa_block.cpp:391,403) and NEITHER has a ROCm arm, which
-  // rocm_ops.hip:374 records from the GLM-5.3 side. The spec's `## Owed` owns
-  // that gap. Appended before kCount so no existing op's id shifts.
+  // landed them. It then read "THE ROCm FORWARD STILL REFUSES, and not at this
+  // pair: the QSA block composes its indexer from kDsaIndexerLogits and
+  // kDsaTopkSelect (qwen4_exp_qsa_block.cpp:391,403) and NEITHER has a ROCm
+  // arm" until MODEL-MM-QWEN4-EXP W5 landed BOTH of those arms
+  // (src/vt/rocm/rocm_dsa_indexer.hip), which removes the last op refusal this
+  // row has MEASURED on that board.
+  //
+  // THAT IS NOT A CLAIM THAT THE MODEL RUNS. Nothing has loaded a `qwen4_exp`
+  // checkpoint or completed a `ModelRegistry::Forward` on a ROCm device, so
+  // whether the step completes is UNMEASURED and no claim either way follows
+  // from a registration. W6 owns the first load and forward, and the spec's
+  // `## Owed` owns the gap. The GLM-5.3-side note at rocm_ops.hip:370-375 still
+  // says the pair is absent; that sentence is now false, is left deliberately
+  // because `rocm_ops.hip` is a surface every ROCm row writes, and is owned by
+  // BACKEND-ROCM issue #2715 — again the spec's `## Owed`.
+  // Appended before kCount so no existing op's id shifts.
   kQwen4ExpQsaCompress,
   kQwen4ExpQsaGatherAttention,
   // MODEL-MM-QWEN4-EXP W5d-1 (#2249 item 1) — the UNGATED per-group RMS norm.
@@ -5267,7 +5283,10 @@ void MlaDecodeAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
 // kernel's masked store (`triton_fp8_mqa_logits.py:155-156`), so a plain top-k
 // downstream needs no second mask. The dot and the sum accumulate in f32
 // whatever the operand dtype, which is what `input_precision="ieee"` on a bf16
-// `tl.dot` gives. CPU + CUDA.
+// `tl.dot` gives. Registered on kCPU (src/vt/cpu/cpu_dsa_indexer.cpp), kCUDA
+// (src/vt/cuda/cuda_dsa_indexer.cu) and kROCM
+// (src/vt/rocm/rocm_dsa_indexer.hip, MODEL-MM-QWEN4-EXP W5). This line read
+// "CPU + CUDA" until 2026-09-12, by which date the kROCM arm had landed.
 void DsaIndexerLogits(Queue& q, Tensor& logits, const Tensor& q_states, const Tensor& k,
                       const Tensor& weights, const Tensor& win_start,
                       const Tensor& win_end, const DsaIndexerLogitsArgs& args);
@@ -5292,7 +5311,11 @@ void DsaIndexerLogits(Queue& q, Tensor& logits, const Tensor& q_states, const Te
 //
 // The ascending emission order is not cosmetic: it is what makes a full
 // selection BIT-FOR-BIT equal to no selection at all in vt::MlaDecodeAttention,
-// because the online softmax then sees the identical summation order. CPU + CUDA.
+// because the online softmax then sees the identical summation order.
+// Registered on kCPU (src/vt/cpu/cpu_dsa_indexer.cpp), kCUDA
+// (src/vt/cuda/cuda_dsa_indexer.cu) and kROCM
+// (src/vt/rocm/rocm_dsa_indexer.hip, MODEL-MM-QWEN4-EXP W5). This line read
+// "CPU + CUDA" until 2026-09-12, by which date the kROCM arm had landed.
 void DsaTopkSelect(Queue& q, Tensor& indices, Tensor& counts, const Tensor& logits,
                    const Tensor& win_start, const Tensor& win_end);
 

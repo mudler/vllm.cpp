@@ -475,8 +475,110 @@ comparison, the four non-algorithmic differences it found, and why the
 double-width four-tap accumulator is kept rather than narrowed to vLLM's
 activation dtype.
 
-W3's measured numbers are recorded below when the gate runs; until then no
-number in this section is a result.
+**THE W3 NUMBERS, MEASURED ON `strix:gpu0`**, `rc` jobs
+`651e9026-5118-4868-a794-23770f769460` (red/green) and
+`96e33975-1bc2-42c5-b379-fe3eefaf49b8` (mutations), worker `rc-worker-lcjhd`,
+`gfx1151`, HIP 7.2.53211, Release, `-DVLLM_CPP_HIP=ON
+-DVLLM_CPP_HIP_ARCHITECTURES=gfx1151`, built in the lease from a clone of this
+row's branch with `git rev-parse HEAD` asserted equal to the commit under test:
+
+| Run | Head | `test_backend_cross_device` |
+|---|---|---|
+| RED | `dad7f3fa8` (test only) | `55 cases / 53 passed / 2 failed / 0 skipped`, `84336 assertions / 2 failed` |
+| GREEN | `364bc2547` (the arms) | `55 cases / 55 passed / 0 failed / 0 skipped`, `84383 assertions / 0 failed`, `Status: SUCCESS!` |
+
+**The red is the evidence, not a mishap**, and it is the same ROUTE-gap
+signature W2 recorded: two failed cases against two failed assertions, both the
+registration `REQUIRE` and neither a number —
+`REQUIRE( vt::OpRegistered(vt::OpId::kQwen4ExpPleConv, DeviceType::kROCM) ) is
+NOT correct!` and the same for `kQwen4ExpPleGate`. Nothing computed a wrong
+answer; the work never started. The RED leg also asserts
+`ple_hip_present=NO` on the checked-out tree, so the red is the absence of the
+kernel and not a mis-registration of one that was there. The assertion count
+rises by 47 between the legs, which is what shows the device half EXECUTED
+rather than being skipped, and `0 skipped` is asserted on both legs rather than
+assumed.
+
+**All four measured NMSE values are `0`** — `ple_conv` out and state at both
+`conv_state_indices` polarities, and `ple_gate` at both clamp settings. The two
+arms are BIT-IDENTICAL to the CPU oracle on this fixture. The file header
+predicts exactly this and declines to assert it: every operation on both paths
+is IEEE-exact or spelled with an `_rn` intrinsic except `exp()`, whose double is
+not required to agree between ROCm's device library and glibc. On these inputs
+it does. That is a measurement, not a guarantee, and the gate the arms hold is
+still the `5e-4` band.
+
+**NINE NUMERICAL MUTATIONS, every one red, and every one sha256-proven to have
+changed the test binary** (baseline `c1bf8c4d4004467c`; each mutant differs, and
+`git status --porcelain` was empty after every restore):
+
+| Mutation | What it breaks | measured NMSE | Ratio to the `5e-4` bar |
+|---|---|---|---|
+| `c1` | the conv reads lag `k` instead of `k*dilation` | out **1.65187** / **1.15771** | **3304x** |
+| `c2` | the ring write-back reads column `j` instead of `tokens+j` | state **0.911573** / **0.832072** | **1823x** |
+| `c3` | the conv ignores `conv_state_indices` and uses the sequence index | out **0.640399**, state **1.245** | **2490x** |
+| `c4` | the conv stores the accumulator without SiLU | out **0.723997** / **0.98048** | **1961x** |
+| `c5` | the conv reads a ZERO initial state instead of the ring | out **0.440444** / **0.435505**, state **0.252372** / **0.228514** | **881x** |
+| `g1` | the gate drops the `sqrt(hidden_size)` divisor | **0.019725** | **39x** |
+| `g2` | the gate applies the root UNSIGNED | **0.161139** / **0.493661** | **987x** |
+| `g3` | the gate drops the `clamp_min` floor | **0.128802** | **258x** |
+| `g4` | the gate broadcasts `value` from the wrong token | **0.176019** / **0.146365** | **352x** |
+
+**THE ZEROES IN THAT TABLE ARE THE POINT OF THE AXES, not holes in them**, and
+each is predicted by the kernel rather than excused after the fact. `c1` leaves
+the ring at `0` because the write-back does not read `dilation` at all. `c2`
+leaves the output at `0` because the taps do not read the ring index it moved.
+`c3` is `0` on the `idx=0` subcase because there `rows == nullptr` and the
+mutation is a no-op — which is exactly why the case runs BOTH polarities; had it
+carried only the pointer-free one, the row indirection would have been
+unmeasurable, the W1 lesson applied before a review had to find it. `g1` and
+`g3` each measure at ONE clamp setting and not the other, and that is the
+two-setting design working as intended: at `clamp_min = 4` every score in the
+fixture is inside the floor, so the divisor and the root are irrelevant there
+and only the clamp and the sign can be seen; at upstream's `1e-6` nothing is
+floored, so the clamp is invisible and the divisor is not. **Neither setting
+alone gates this op.**
+
+**`g1` IS THE NARROWEST MARGIN AT 39x AND IT IS REPORTED AS SUCH.** It is nearly
+two orders and not the three the conv mutations reach, because dividing by
+`sqrt(7)` rather than by 1 moves a sigmoid of a square root — a doubly
+compressive chain — and the fixture's scores are `O(1)`. It is a real red (`1`
+failed assertion, `FOCUSED_EXIT=1`) and nothing was widened to make it larger.
+
+**EVERY MUTATION WAS WRITTEN TO STAY LIVE, because W1 was bitten twice by a
+FALSE one.** This tree builds HIP with `-Wall -Wextra -Werror`, so deleting a
+term usually orphans its parameter, fails the compile, and lets a STALE binary
+pass with the unmutated number. Each mutation above keeps every parameter
+referenced through a branch that is never taken — `c1` writes
+`((dilation > 0) ? 1 : dilation)`, `g1` writes `((divisor > 0.0) ? 1.0 : divisor)`
+— and all nine compiled at `-Werror` with zero warnings.
+
+**THE REACHABILITY MUTATION REDS BY REFUSAL, which is D2 executed rather than
+argued.** Re-pointing each `RegisterOp` at a `DeviceType` this build never
+registers — NOT deleting the statement, which would orphan the kernel function
+and fail `-Wunused-function`, giving a false mutation — makes the call throw:
+
+```text
+vt: no kernel for op Qwen4ExpPleConv (id 137) on device rocm (type 5), and the
+portable CPU reference tier is NOT eligible: ... this ROCm device reports
+hipDeviceAttributePageableMemoryAccess = 0 ...
+```
+
+and the same for `Qwen4ExpPleGate` (id 143). To reach the throw at all, the same
+scratch edit relaxes each case's `REQUIRE` to a `CHECK` and disables its
+`OpAvailable` guard; with the guard in place the case reds one line earlier, at
+the registration assertion, which is the ordinary red and also correct.
+Restored, the rebuilt binary is sha256-IDENTICAL to the green one
+(`c1bf8c4d4004467c` both ways), so nothing about the landing arm depends on a
+mutation left behind.
+
+**WHAT W3 DID NOT RUN.** No full `ctest` and no base-versus-head pair: W2 ran
+that on this row's tree two commits ago and found seventeen pre-existing
+failures and zero introduced, and W3 adds one `.hip` translation unit that no
+other target links differently plus two cases in a suite that was run WHOLE
+here, green, at 84383 assertions. A full `ctest` at this head is therefore
+UNRUN and is recorded as such rather than implied. No throughput, latency or
+memory number was taken, and none is admissible from this row.
 
 **W2's OWN RECORD IS NOT DELETED, it is superseded here and kept below**, the
 same way W2 kept W1's. Its counts are read against its own head and not against

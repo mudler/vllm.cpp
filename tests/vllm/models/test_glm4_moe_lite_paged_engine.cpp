@@ -37,6 +37,7 @@
 // body emits a loud SKIP and returns.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -118,49 +119,152 @@ std::vector<int32_t> LoadI32File(const fs::path& p) {
   return out;
 }
 
+// #2839 — the bar SELECTION, derived from the oracle's own capture rather than
+// asserted in prose. `greedy_dist.npy` is [N,T,K]: K independent batch=1 greedy
+// runs of the pinned vLLM. A (prompt,position) cell holding more than one id is
+// a cell vLLM cannot reproduce against itself. Zero such cells means the oracle's
+// greedy decode is DETERMINISTIC, and `CLAUDE.md` §Gates then licenses exactly
+// one bar: STRICT token-exact. A distributional bar is licensed "only when the
+// oracle's greedy decode is non-deterministic", so on this capture it is not.
+int64_t OracleMultiValuedCells(const parity::NpyArray& d) {
+  REQUIRE(d.shape.size() == 3);
+  const int64_t DN = d.shape[0], DT = d.shape[1], DK = d.shape[2];
+  const auto* dd = AsI32(d);
+  int64_t multi = 0;
+  for (int64_t i = 0; i < DN; ++i)
+    for (int64_t j = 0; j < DT; ++j) {
+      std::set<int32_t> s;
+      for (int64_t k = 0; k < DK; ++k) s.insert(dd[(i * DT + j) * DK + k]);
+      if (s.size() > 1) ++multi;
+    }
+  return multi;
+}
+
+// Is `tid` among the K ids the oracle's own runs produced at (i,j)? This is the
+// SECOND conjunct of the near-tie definition in this file's header, which was
+// stated there and implemented nowhere: `greedy_dist.npy` was read only for the
+// self-determinism count. It is only ever consulted on the non-deterministic
+// arm, because the deterministic arm has no near-tie band to qualify.
+bool InsideOracleTopK(const parity::NpyArray& d, int64_t i, int64_t j, int32_t tid) {
+  const int64_t DT = d.shape[1], DK = d.shape[2];
+  const auto* dd = AsI32(d);
+  for (int64_t k = 0; k < DK; ++k)
+    if (dd[(i * DT + j) * DK + k] == tid) return true;
+  return false;
+}
+
 }  // namespace
 
-// GLM-4.7-Flash (`Glm4MoeLiteForCausalLM`) — the GLM/DSA G1 SACRED gate.
-TEST_CASE("glm4-moe-lite paged-engine greedy token-exact gate (dgx-only, SACRED)") {
-  const std::string snap = FindGlm47Snapshot();
-  if (snap.empty()) {
-    MESSAGE(
-        "SKIP (dgx-only): GLM-4.7-Flash checkpoint absent — "
-        "zai-org/GLM-4.7-Flash snapshot not present under "
-        "~/.cache/huggingface/hub/");
-    return;
-  }
+// #2839 — THE COMMITTED ARTIFACTS, GATED WITH NO CHECKPOINT.
+//
+// The SACRED case below needs a 31.2B snapshot, so on every host without one it
+// measured nothing while reporting a pass. Everything it compares, however, is
+// committed: the oracle's ids, the oracle's K-run distribution, and this
+// engine's own ids, which the SACRED case REQUIREs the live engine to reproduce
+// token for token before it compares anything. So the comparison itself needs no
+// checkpoint and runs wherever the suite runs.
+//
+// THIS CASE IS EXPECTED TO FAIL, and that is the point. Do not soften it. The
+// two admissible exits are a forward repair that makes it 128/128, or a
+// re-capture of the teacher-forced artifact plus an explicit ratification of a
+// distributional bar over a deterministic oracle. Weakening the assertion is
+// neither. See `.agents/specs/glm4-moe-lite-gate-2839.md`.
+TEST_CASE("glm4-moe-lite committed goldens: the oracle is deterministic, so the bar is STRICT") {
   const fs::path gdir = fs::path(PARITY_GOLDENS_DIR) / "glm4_moe_lite_greedy";
-  if (!fs::exists(gdir / "greedy_ids.npy")) {
-    MESSAGE("SKIP: GLM-4.7-Flash greedy golden absent — capture on dgx: "
-            "scripts/glm4-moe-lite-oracle-capture.py --runs 5");
-    return;
-  }
+  REQUIRE_MESSAGE(fs::exists(gdir / "greedy_dist.npy"),
+                  "glm4-moe-lite: greedy_dist.npy is committed and selects the "
+                  "bar; without it no bar is licensed at all");
+  const parity::NpyArray d = parity::LoadNpy((gdir / "greedy_dist.npy").string());
+  const int64_t multi_cells = OracleMultiValuedCells(d);
+  MESSAGE("glm4-moe-lite: vLLM self-determinism over K=" << d.shape[2]
+          << " batch=1 runs — multi-valued (prompt,pos) cells = " << multi_cells);
+  REQUIRE_MESSAGE(multi_cells == 0,
+                  "glm4-moe-lite: the oracle is NOT self-deterministic on this "
+                  "capture; re-derive the bar, do not loosen it");
 
-  // ---- GATE SELECTION: re-assert vLLM's own self-determinism -----------------
-  int64_t multi_cells = -1;
-  if (fs::exists(gdir / "greedy_dist.npy")) {
-    const parity::NpyArray d = parity::LoadNpy((gdir / "greedy_dist.npy").string());
-    REQUIRE(d.shape.size() == 3);
-    const int64_t DN = d.shape[0], DT = d.shape[1], DK = d.shape[2];
-    const auto* dd = AsI32(d);
-    multi_cells = 0;
-    for (int64_t i = 0; i < DN; ++i)
-      for (int64_t j = 0; j < DT; ++j) {
-        std::set<int32_t> s;
-        for (int64_t k = 0; k < DK; ++k) s.insert(dd[(i * DT + j) * DK + k]);
-        if (s.size() > 1) ++multi_cells;
+  const parity::NpyArray g = parity::LoadNpy((gdir / "greedy_ids.npy").string());
+  const parity::NpyArray o = parity::LoadNpy((gdir / "our_ids.npy").string());
+  REQUIRE(g.dtype == "<i4");
+  REQUIRE(o.dtype == "<i4");
+  REQUIRE(g.shape.size() == 2);
+  REQUIRE(o.shape == g.shape);
+  const int64_t N = g.shape[0], T = g.shape[1];
+  const int32_t* gd = AsI32(g);
+  const int32_t* od = AsI32(o);
+
+  // The near-tie band this file has been applying instead. It is reported so the
+  // failure below is not mistaken for a regression: the band never rejected
+  // anything, because the artifact it reads is identically zero.
+  const parity::NpyArray gap =
+      parity::LoadNpy((gdir / "neartie_gap_mnats.npy").string());
+  REQUIRE(gap.shape == g.shape);
+  const int32_t* gpd = AsI32(gap);
+  int32_t gap_max = 0;
+  for (int64_t k = 0; k < N * T; ++k) gap_max = std::max(gap_max, gpd[k]);
+  MESSAGE("glm4-moe-lite: committed teacher-forced gap max = " << gap_max
+          << " mnats against a " << kNearTieMnats
+          << " mnat band, so `gap > band` has no failure mode on this artifact");
+
+  int64_t exact_positions = 0;
+  int64_t exact_prompts = 0;
+  std::string per_prompt;
+  for (int64_t i = 0; i < N; ++i) {
+    int64_t bad = 0;
+    for (int64_t j = 0; j < T; ++j) {
+      if (od[i * T + j] == gd[i * T + j]) {
+        ++exact_positions;
+      } else {
+        ++bad;
       }
-    const std::string verdict =
-        multi_cells == 0
-            ? std::string(" (DETERMINISTIC -> the STRICT bar is well-posed)")
-            : std::string(" (NON-DET: RE-DERIVE the bar via teacher-forcing, do "
-                          "not loosen it)");
-    MESSAGE("glm4-moe-lite: vLLM self-determinism over K=" << DK
-            << " runs (batch=1 capture) — multi-valued (prompt,pos) cells = "
-            << multi_cells << verdict);
-    CHECK(multi_cells == 0);
+    }
+    if (bad == 0) ++exact_prompts;
+    per_prompt += (i == 0 ? "" : ",") + std::to_string(bad);
   }
+  MESSAGE("glm4-moe-lite STRICT vs vLLM 0.25.0: positions " << exact_positions
+          << "/" << (N * T) << ", prompts exact " << exact_prompts << "/" << N
+          << ", per-prompt mismatch [" << per_prompt << "]");
+  CHECK_MESSAGE(exact_positions == N * T,
+                "glm4-moe-lite FAILS the STRICT bar its own oracle capture "
+                "licenses: " << exact_positions << " of " << (N * T)
+                << " positions match. Repair the forward or re-derive the bar "
+                   "with a ratification; do not widen this assertion.");
+  CHECK_MESSAGE(exact_prompts == N,
+                "glm4-moe-lite: " << exact_prompts << " of " << N
+                << " prompts are token-exact against the pinned oracle");
+}
+
+// GLM-4.7-Flash (`Glm4MoeLiteForCausalLM`) — the GLM/DSA G1 SACRED gate.
+//
+// #2839: the checkpoint predicate is a doctest::skip rather than an early
+// `return`. An early return makes doctest report a PASSED case with zero
+// assertions, so on every host without a 31.2B snapshot this gate reported a
+// pass having measured nothing.
+TEST_CASE("glm4-moe-lite paged-engine greedy token-exact gate (dgx-only, SACRED)" *
+          doctest::skip(FindGlm47Snapshot().empty())) {
+  const std::string snap = FindGlm47Snapshot();
+  REQUIRE(!snap.empty());
+  const fs::path gdir = fs::path(PARITY_GOLDENS_DIR) / "glm4_moe_lite_greedy";
+  // The goldens are COMMITTED. Their absence is a broken checkout, not an
+  // environment, so it is a hard failure and no longer an early return.
+  REQUIRE_MESSAGE(fs::exists(gdir / "greedy_ids.npy"),
+                  "glm4-moe-lite: committed greedy golden missing — re-capture "
+                  "on dgx: scripts/glm4-moe-lite-oracle-capture.py --runs 5");
+
+  // ---- GATE SELECTION: the oracle's own self-determinism picks the bar ------
+  REQUIRE_MESSAGE(fs::exists(gdir / "greedy_dist.npy"),
+                  "glm4-moe-lite: greedy_dist.npy is what SELECTS the bar; "
+                  "without it neither STRICT nor the near-tie band is licensed");
+  const parity::NpyArray dist =
+      parity::LoadNpy((gdir / "greedy_dist.npy").string());
+  const int64_t multi_cells = OracleMultiValuedCells(dist);
+  const bool oracle_deterministic = multi_cells == 0;
+  MESSAGE("glm4-moe-lite: vLLM self-determinism over K=" << dist.shape[2]
+          << " runs (batch=1 capture) — multi-valued (prompt,pos) cells = "
+          << multi_cells
+          << (oracle_deterministic
+                  ? " (DETERMINISTIC -> STRICT token-exact is the bar, and it is "
+                    "the bar this case applies)"
+                  : " (NON-DET -> the near-tie band applies, both conjuncts)"));
 
   const parity::NpyArray g = parity::LoadNpy((gdir / "greedy_ids.npy").string());
   REQUIRE(g.dtype == "<i4");
@@ -179,12 +283,12 @@ TEST_CASE("glm4-moe-lite paged-engine greedy token-exact gate (dgx-only, SACRED)
   const bool have_gap = fs::exists(gdir / "our_ids.npy") &&
                         fs::exists(gdir / "neartie_gap_mnats.npy");
   const bool dump_mode = std::getenv("VT_GLM_DUMP_IDS") != nullptr;
-  if (!have_gap && !dump_mode) {
-    MESSAGE("SKIP: GLM-4.7-Flash teacher-forced goldens absent — re-run with "
-            "VT_GLM_DUMP_IDS=1 to write our_ids.i32, then "
-            "scripts/glm4-moe-lite-neartie-gap.py");
-    return;
-  }
+  // Both are committed, so their absence outside DUMP MODE is a broken checkout.
+  // #2839: this used to `return`, which doctest reports as a passed case.
+  REQUIRE_MESSAGE((have_gap || dump_mode),
+                  "glm4-moe-lite: committed teacher-forced goldens missing — "
+                  "re-run with VT_GLM_DUMP_IDS=1 to write our_ids.i32, then "
+                  "scripts/glm4-moe-lite-neartie-gap.py");
 
   MESSAGE("glm4-moe-lite: loading via FromModelDir(" << snap
           << ") — MLA (576-wide latent, q_lora branch, QK 256 / V 256 prefill, "
@@ -305,7 +409,22 @@ TEST_CASE("glm4-moe-lite paged-engine greedy token-exact gate (dgx-only, SACRED)
         worst_i = static_cast<int>(i);
         worst_j = static_cast<int>(j);
       }
-      if (mn > kNearTieMnats) {
+      // #2839 — THE BAR. `oracle_deterministic` is measured above from the
+      // oracle's own K-run capture, and `CLAUDE.md` §Gates licenses the
+      // distributional band ONLY on a non-deterministic oracle. On this capture
+      // the oracle reproduces itself exactly, so a divergence is a divergence.
+      //
+      // What stood here was the band alone, read off `neartie_gap_mnats.npy`,
+      // which is identically zero at all 128 positions — so `mn > 500` was false
+      // everywhere and `prompt_ok` could not become false. The near-tie arm also
+      // now applies BOTH conjuncts this file's own header states: within the
+      // band AND our token inside vLLM's top-K.
+      const bool position_ok =
+          oracle_deterministic
+              ? got[static_cast<size_t>(j)] == gd[i * T + j]
+              : (mn <= kNearTieMnats &&
+                 InsideOracleTopK(dist, i, j, got[static_cast<size_t>(j)]));
+      if (!position_ok) {
         prompt_ok = false;
         if (first_bad < 0) first_bad = static_cast<int>(j);
       }
@@ -320,8 +439,10 @@ TEST_CASE("glm4-moe-lite paged-engine greedy token-exact gate (dgx-only, SACRED)
       MESSAGE("glm4-moe-lite FORWARD DIVERGENCE prompt[" << i << "] tok=" << first_bad
               << " our=" << got[static_cast<size_t>(first_bad)]
               << " vLLM_greedy=" << gd[i * T + first_bad]
-              << " gap=" << (gapd[i * T + first_bad] / 1000.0) << " nats (> "
-              << (kNearTieMnats / 1000.0) << ")  \"" << out.outputs[0].text << "\"");
+              << " bar=" << (oracle_deterministic ? "STRICT" : "near-tie")
+              << " committed gap=" << (gapd[i * T + first_bad] / 1000.0)
+              << " nats (band " << (kNearTieMnats / 1000.0) << ")  \""
+              << out.outputs[0].text << "\"");
     } else if (exact) {
       ++strict_exact;
     } else {
@@ -339,7 +460,9 @@ TEST_CASE("glm4-moe-lite paged-engine greedy token-exact gate (dgx-only, SACRED)
   }
 
   const vllm::MlaBatchSplitStats serial_stats = vllm::GetMlaBatchSplitStats();
-  MESSAGE("glm4-moe-lite correctness gate: " << (strict_exact + neartie_only) << "/"
+  MESSAGE("glm4-moe-lite correctness gate (bar="
+          << (oracle_deterministic ? "STRICT" : "near-tie")
+          << "): " << (strict_exact + neartie_only) << "/"
           << N << " prompts PASS  (STRICT token-exact " << strict_exact << "/" << N
           << "; near-tie-band only " << neartie_only << "/" << N
           << "; tokens strictly exact " << exact_tokens << "/" << total_tokens

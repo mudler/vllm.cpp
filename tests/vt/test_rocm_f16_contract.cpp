@@ -140,7 +140,7 @@ TEST_CASE("OwnedTensor views preserve empty and zero-extent descriptors") {
   }
 }
 
-TEST_CASE("F16 value metadata travels with each existing layout flag") {
+TEST_CASE("F16 value metadata travels through ViewOn; layout markers do not") {
   for (int flag : {0, 1, 2, 3}) {
     CAPTURE(flag);
     OwnedTensor original = Weight();
@@ -150,16 +150,19 @@ TEST_CASE("F16 value metadata travels with each existing layout flag") {
     auto check = [&](const Tensor& view) {
       CHECK(view.weight_value_dtype == DType::kBF16);
       CHECK(view.dtype == DType::kF16);
-      CHECK(view.repacked == original.repacked);
-      CHECK(view.q8_0_aligned == original.q8_0_aligned);
-      CHECK(view.elem_kn_repacked == original.elem_kn_repacked);
+      // ViewOn carries weight_value_dtype but NOT layout markers. Each
+      // ResidentWeight arm owns a different marker set and sets them
+      // explicitly after the call. See qwen3_5_weights.cpp ViewOn comment.
+      CHECK(view.repacked == false);
+      CHECK(view.q8_0_aligned == false);
+      CHECK(view.elem_kn_repacked == false);
     };
     OwnedTensor copy = original;
     OwnedTensor moved = std::move(copy);
     check(moved.View());
     check(moved.View().View({3, 2}));
     check(moved.ViewOn(moved.bytes.data(), Device{DeviceType::kXPU, 0}, {3, 2}));
-    if (!original.repacked) check(moved.View().Slice(0, 1, 2));
+    check(moved.View().Slice(0, 1, 2));
     OwnedTensor borrowed = vllm::BorrowWholeOwnedTensor(original);
     check(borrowed.View());
   }

@@ -971,6 +971,11 @@ full-runtime operations need their own owning issue before that scope expands.
 
 ## Owed
 
+- [#3153](https://github.com/mudler/vllm.cpp/issues/3153)
+  (`ISSUE-GH-3153`), owned by `BACKEND-ROCM-F16-WEIGHTS`, tracks the
+  test_rocm_f16_contract failure where the test expects ViewOn to propagate
+  layout markers it deliberately does not. Fixed by correcting the test to
+  verify the actual contract.
 - [#2773](https://github.com/mudler/vllm.cpp/issues/2773), owned by
   `BACKEND-ROCM`, owes diagnosis of this fixture's unchanged-baseline F16-D1
   repeated-engine failure and F16-P128 primary comparison mismatch. The inputs

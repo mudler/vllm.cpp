@@ -5577,3 +5577,308 @@ TEST_CASE("qwen4_exp gated-residual MIXER matches the CPU oracle and is NATIVE o
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// W2 of `.agents/specs/qwen4-exp-rocm-ops.md`: the two ROW GATHER/SCATTER ops
+// the `qwen4_exp` forward reaches, `vt::IndexSelect` and `vt::IndexCopy`.
+// Row MODEL-MM-QWEN4-EXP, issue ISSUE-LOCAL-01M2A1DTCZQVAH7M193XT9PN2V.
+//
+// THE BAR HERE IS BYTE EQUALITY, NOT NMSE, and that is a property of the ops
+// rather than a stricter choice: neither one does any arithmetic. Every output
+// byte is a copy of an input byte, so the two arms cannot differ by rounding,
+// re-association or a libm, and a tolerance would only hide a defect. The NMSE
+// is still computed and printed beside it, because it is the statistic this
+// spec quotes every mutation margin in and `got == ref` cannot say HOW far a
+// broken arm landed from the oracle.
+//
+// WHAT THE FIXTURES HAVE TO BE ABLE TO SEE, each of which a plausible port gets
+// wrong and none of which a naive fixture can catch:
+//
+//  * THE INDEX. `idx` is non-monotonic, does not start at 0, reaches the LAST
+//    base row, and (for the gather) repeats one — which is not a contrived
+//    shape but the production one: the `hc` widen at
+//    `qwen4_exp_forward.cpp:434-447` gathers with `idx[i] = i / hc`, so every
+//    index appears `hc` times. An arm that ignored `idx` and copied row-for-row
+//    would read the identity, and the case asserts the index is NOT the
+//    identity so that stays impossible.
+//  * THE BASE-SIDE OUTER STRIDE. The op contract (`src/vt/ops.cpp:3310-3318`)
+//    lets the [N, D...] side carry an outer row stride LARGER than its packed
+//    row, and the QSA cache arm passes exactly that. Layouts 1 and 2 below set
+//    `stride[0] = 10` over a packed row of 6, so an arm that used the packed
+//    row as the stride addresses the wrong rows entirely.
+//  * THE RANK. `inner` is `Numel() / rows` and NOT `shape[1]`; layout 2 is
+//    rank 3 ([N, 2, 3]), where the two differ. A rank-2-only arm passes
+//    layouts 0 and 1 and fails this one.
+//  * THE DIRECTION. `IndexCopy` compares the WHOLE padded destination, so a
+//    swapped source/destination, a clobbered padding column and an overwritten
+//    untouched row are each visible.
+//
+// Registration is `REQUIRE`d on ROCm for the reason the three W1 cases above
+// give: on `gfx1151` the portable reference tier is not installed (spec D2), so
+// a missing arm is a refusal by name and not a slow path.
+//
+// PORT PROVENANCE, and it differs from W1's. These two ops are generic
+// gather/scatter helpers rather than `qwen4_exp` kernels, and vLLM's
+// `qwen4_exp/amd/` backend contains NO counterpart for either: upstream spells
+// both as `torch.index_select` / `Tensor.index_copy_` and ships no Triton
+// kernel to mirror. So the spec's D3 tie-break ("where they disagree, vLLM
+// wins") has nothing to arbitrate here, and the donor is this tree's own CUDA
+// arm (`src/vt/cuda/cuda_gdn.cu:432-527`) with the CPU arm
+// (`src/vt/cpu/cpu_ops.cpp:3048-3085`) as the contract and the oracle.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Widen a raw row buffer to f32 so ONE NMSE describes either dtype arm. The
+// bf16 widening is EXACT, so this compares the same numbers the byte
+// comparison beside it compares, never a rounded view of them.
+std::vector<float> WidenRows(const std::vector<uint8_t>& bytes, DType dt) {
+  const size_t esz = vt::SizeOf(dt);
+  const size_t n = bytes.size() / esz;
+  std::vector<float> out(n, 0.0f);
+  for (size_t i = 0; i < n; ++i) {
+    if (dt == DType::kF32) {
+      float v = 0.0f;
+      std::memcpy(&v, bytes.data() + i * esz, sizeof(float));
+      out[i] = v;
+    } else {
+      uint16_t b = 0;
+      std::memcpy(&b, bytes.data() + i * esz, sizeof(uint16_t));
+      out[i] = vt::BF16ToF32(b);
+    }
+  }
+  return out;
+}
+
+// f32 values -> the raw bytes of `dt`. The bf16 arm rounds through the CPU
+// backend's own cast op (`Bf16Bits`), so this never reimplements the codec.
+std::vector<uint8_t> PackRows(const std::vector<float>& v, DType dt) {
+  if (dt == DType::kF32) {
+    std::vector<uint8_t> out(v.size() * sizeof(float));
+    std::memcpy(out.data(), v.data(), out.size());
+    return out;
+  }
+  const std::vector<uint16_t> bits = Bf16Bits(v);
+  std::vector<uint8_t> out(bits.size() * sizeof(uint16_t));
+  std::memcpy(out.data(), bits.data(), out.size());
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("index_select gathers rows BIT-EXACTLY against the CPU oracle and is NATIVE on ROCm") {
+  constexpr int64_t kN = 11, kD = 6, kM = 7, kPad = 10;
+  // Non-monotonic, not starting at 0, reaching the last row, and REPEATING
+  // row 10 and row 3 — the production shape of the `hc` widen.
+  const std::vector<int32_t> idx = {7, 0, 10, 3, 3, 1, 10};
+  REQUIRE(static_cast<int64_t>(idx.size()) == kM);
+  // The fixture asserts its own strength rather than assuming it: an identity
+  // index would let an arm that ignored `idx` pass.
+  bool identity = true;
+  for (size_t i = 0; i < idx.size(); ++i)
+    if (idx[i] != static_cast<int32_t>(i)) identity = false;
+  REQUIRE_FALSE(identity);
+  REQUIRE(kPad > kD);  // layouts 1 and 2 are genuinely padded
+
+  if (RocmBuilt()) {
+    REQUIRE(vt::OpRegistered(vt::OpId::kIndexSelect, DeviceType::kROCM));
+  }
+
+  for (DType et : {DType::kF32, DType::kBF16}) {
+    const size_t esz = vt::SizeOf(et);
+    CAPTURE(esz);
+    for (int layout = 0; layout < 3; ++layout) {  // 0 packed, 1 padded, 2 padded rank-3
+      CAPTURE(layout);
+      const int64_t pad = layout == 0 ? kD : kPad;
+      const bool rank3 = layout == 2;
+
+      auto MakeBase = [&](void* p, Device d) {
+        Tensor t = rank3 ? Tensor::Contiguous(p, et, d, {kN, 2, 3})
+                         : Tensor::Contiguous(p, et, d, {kN, kD});
+        t.stride[0] = pad;  // the padded outer row stride the contract allows
+        return t;
+      };
+      auto MakeOut = [&](void* p, Device d) {
+        return rank3 ? Tensor::Contiguous(p, et, d, {kM, 2, 3})
+                     : Tensor::Contiguous(p, et, d, {kM, kD});
+      };
+
+      const size_t base_elems = static_cast<size_t>(kN) * static_cast<size_t>(pad);
+      const std::vector<float> base_f = RandomVec(base_elems, 5171 + static_cast<uint32_t>(layout));
+      const std::vector<uint8_t> base_bytes = PackRows(base_f, et);
+      const size_t out_bytes = static_cast<size_t>(kM) * static_cast<size_t>(kD) * esz;
+
+      std::vector<uint8_t> ref(out_bytes, 0xCD);
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<uint8_t> hb = base_bytes;
+        std::vector<int32_t> ci = idx;
+        Tensor tin = MakeBase(hb.data(), cd);
+        Tensor tout = MakeOut(ref.data(), cd);
+        Tensor tidx = TI32(ci.data(), cd, kM);
+        vt::IndexSelect(cq, tout, tin, tidx);
+        cpu.DestroyQueue(cq);
+      }
+      // THE ORACLE HALF, WHICH RUNS ON EVERY BUILD. The device loop below is
+      // empty on a CPU-only build, so without this the case would report a
+      // green having measured nothing. It also re-derives the answer from the
+      // index rather than trusting the op that produced it.
+      const size_t row_bytes = static_cast<size_t>(kD) * esz;
+      for (int64_t i = 0; i < kM; ++i) {
+        const size_t src = static_cast<size_t>(idx[static_cast<size_t>(i)]) *
+                           static_cast<size_t>(pad) * esz;
+        CHECK(std::memcmp(ref.data() + static_cast<size_t>(i) * row_bytes,
+                          base_bytes.data() + src, row_bytes) == 0);
+      }
+
+      for (DeviceType dt : RegisteredDevices()) {
+        if (!OpAvailable(vt::OpId::kIndexSelect, dt)) continue;
+        CAPTURE(DeviceTag(dt));
+        vt::Backend& dev = vt::GetBackend(dt);
+        Queue q = dev.CreateQueue();
+        const Device d{dt, 0};
+        DevBufBytes dbase(dev, q, base_bytes.size());
+        DevBufBytes dout(dev, q, out_bytes);
+        DevBufI32 didx(dev, q, static_cast<size_t>(kM));
+        dbase.Upload(base_bytes.data());
+        didx.Upload(idx);
+        // POISON THE DESTINATION. A kernel that launched nothing would
+        // otherwise be graded against whatever the allocator handed back.
+        const std::vector<uint8_t> poison(out_bytes, 0xA5);
+        dout.Upload(poison.data());
+        Tensor tin = MakeBase(dbase.ptr(), d);
+        Tensor tout = MakeOut(dout.ptr(), d);
+        Tensor tidx = TI32(didx.ptr(), d, kM);
+        const unsigned long long hits_before = vt::GetReferenceTierHits();
+        vt::IndexSelect(q, tout, tin, tidx);
+        dev.Synchronize(q);
+        CHECK(vt::GetReferenceTierHits() == hits_before);
+        std::vector<uint8_t> got(out_bytes, 0);
+        dout.Download(got.data());
+        CHECK(got == ref);
+        const double nmse = Nmse(WidenRows(ref, et), WidenRows(got, et));
+        MESSAGE("index_select NMSE " << DeviceTag(dt) << " esz=" << esz
+                                     << " layout=" << layout << " = " << nmse);
+        CHECK(nmse <= kNmseTol);
+        dev.DestroyQueue(q);
+      }
+    }
+  }
+}
+
+TEST_CASE("index_copy scatters rows BIT-EXACTLY against the CPU oracle and is NATIVE on ROCm") {
+  constexpr int64_t kN = 11, kD = 6, kM = 5, kPad = 10;
+  // DISTINCT, non-monotonic, not starting at 0, reaching the last row. Distinct
+  // because a repeated destination row is a write race whose winner no device
+  // defines; the gather case above carries the duplicate half.
+  const std::vector<int32_t> idx = {7, 0, 10, 3, 1};
+  REQUIRE(static_cast<int64_t>(idx.size()) == kM);
+  bool dup = false;
+  for (size_t a = 0; a < idx.size(); ++a)
+    for (size_t b = a + 1; b < idx.size(); ++b)
+      if (idx[a] == idx[b]) dup = true;
+  REQUIRE_FALSE(dup);
+  REQUIRE(kM < kN);  // there ARE untouched rows for the case to protect
+
+  if (RocmBuilt()) {
+    REQUIRE(vt::OpRegistered(vt::OpId::kIndexCopy, DeviceType::kROCM));
+  }
+
+  for (DType et : {DType::kF32, DType::kBF16}) {
+    const size_t esz = vt::SizeOf(et);
+    CAPTURE(esz);
+    for (int layout = 0; layout < 3; ++layout) {  // 0 packed, 1 padded, 2 padded rank-3
+      CAPTURE(layout);
+      const int64_t pad = layout == 0 ? kD : kPad;
+      const bool rank3 = layout == 2;
+
+      auto MakeBase = [&](void* p, Device d) {
+        Tensor t = rank3 ? Tensor::Contiguous(p, et, d, {kN, 2, 3})
+                         : Tensor::Contiguous(p, et, d, {kN, kD});
+        t.stride[0] = pad;
+        return t;
+      };
+      auto MakeIn = [&](void* p, Device d) {
+        return rank3 ? Tensor::Contiguous(p, et, d, {kM, 2, 3})
+                     : Tensor::Contiguous(p, et, d, {kM, kD});
+      };
+
+      const size_t base_elems = static_cast<size_t>(kN) * static_cast<size_t>(pad);
+      // The destination arrives PRE-FILLED, not zeroed: every untouched row and
+      // every padding column must survive the scatter byte for byte, and a
+      // zeroed destination could not tell "preserved" from "cleared".
+      const std::vector<float> dest_f = RandomVec(base_elems, 6271 + static_cast<uint32_t>(layout));
+      const std::vector<uint8_t> dest0 = PackRows(dest_f, et);
+      const std::vector<float> src_f =
+          RandomVec(static_cast<size_t>(kM) * static_cast<size_t>(kD),
+                    6371 + static_cast<uint32_t>(layout));
+      const std::vector<uint8_t> src_bytes = PackRows(src_f, et);
+
+      std::vector<uint8_t> ref = dest0;
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<uint8_t> hs = src_bytes;
+        std::vector<int32_t> ci = idx;
+        Tensor tout = MakeBase(ref.data(), cd);
+        Tensor tin = MakeIn(hs.data(), cd);
+        Tensor tidx = TI32(ci.data(), cd, kM);
+        vt::IndexCopy(cq, tout, tin, tidx);
+        cpu.DestroyQueue(cq);
+      }
+      // THE ORACLE HALF, RE-DERIVED: the addressed rows carry the source, and
+      // every other byte of the padded buffer — untouched rows AND padding
+      // columns — is unchanged.
+      const size_t row_bytes = static_cast<size_t>(kD) * esz;
+      const size_t pad_bytes = static_cast<size_t>(pad) * esz;
+      std::vector<bool> touched(static_cast<size_t>(kN), false);
+      for (int64_t i = 0; i < kM; ++i) {
+        const size_t dst = static_cast<size_t>(idx[static_cast<size_t>(i)]) * pad_bytes;
+        touched[static_cast<size_t>(idx[static_cast<size_t>(i)])] = true;
+        CHECK(std::memcmp(ref.data() + dst,
+                          src_bytes.data() + static_cast<size_t>(i) * row_bytes,
+                          row_bytes) == 0);
+        // the padding columns of a TOUCHED row are still the destination's
+        CHECK(std::memcmp(ref.data() + dst + row_bytes, dest0.data() + dst + row_bytes,
+                          pad_bytes - row_bytes) == 0);
+      }
+      for (int64_t r = 0; r < kN; ++r) {
+        if (touched[static_cast<size_t>(r)]) continue;
+        CHECK(std::memcmp(ref.data() + static_cast<size_t>(r) * pad_bytes,
+                          dest0.data() + static_cast<size_t>(r) * pad_bytes,
+                          pad_bytes) == 0);
+      }
+
+      for (DeviceType dt : RegisteredDevices()) {
+        if (!OpAvailable(vt::OpId::kIndexCopy, dt)) continue;
+        CAPTURE(DeviceTag(dt));
+        vt::Backend& dev = vt::GetBackend(dt);
+        Queue q = dev.CreateQueue();
+        const Device d{dt, 0};
+        DevBufBytes dbase(dev, q, dest0.size());
+        DevBufBytes dsrc(dev, q, src_bytes.size());
+        DevBufI32 didx(dev, q, static_cast<size_t>(kM));
+        dbase.Upload(dest0.data());
+        dsrc.Upload(src_bytes.data());
+        didx.Upload(idx);
+        Tensor tout = MakeBase(dbase.ptr(), d);
+        Tensor tin = MakeIn(dsrc.ptr(), d);
+        Tensor tidx = TI32(didx.ptr(), d, kM);
+        const unsigned long long hits_before = vt::GetReferenceTierHits();
+        vt::IndexCopy(q, tout, tin, tidx);
+        dev.Synchronize(q);
+        CHECK(vt::GetReferenceTierHits() == hits_before);
+        std::vector<uint8_t> got(dest0.size(), 0);
+        dbase.Download(got.data());
+        CHECK(got == ref);  // the WHOLE padded destination, not only the rows
+        const double nmse = Nmse(WidenRows(ref, et), WidenRows(got, et));
+        MESSAGE("index_copy NMSE " << DeviceTag(dt) << " esz=" << esz
+                                   << " layout=" << layout << " = " << nmse);
+        CHECK(nmse <= kNmseTol);
+        dev.DestroyQueue(q);
+      }
+    }
+  }
+}

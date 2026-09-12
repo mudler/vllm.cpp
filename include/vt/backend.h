@@ -255,6 +255,14 @@ class Backend {
   // shared — capture is a stream-global mode.)
   virtual void* EndCaptureGraph(Queue& q);
   virtual void ReplayGraph(Queue& q, void* graph);
+
+  // Capture/replay instrumentation (T2b): how many graph captures finished and
+  // how many graph replays launched, process-wide. The decode-graph reachability
+  // test asserts on these so a gate that silently disengages (test driving five
+  // eager steps and passing) reds instead of passing vacuously. Backends without
+  // capture report zeros.
+  virtual int64_t GraphsCaptured() const { return 0; }
+  virtual int64_t GraphReplays() const { return 0; }
   virtual void DestroyGraph(void* graph);
 };
 

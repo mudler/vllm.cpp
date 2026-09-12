@@ -743,6 +743,12 @@ them.
   history it newly names, which `AGENTS.md` routes to a row and a fresh review
   rather than an in-flow fix.
 
+- `ISSUE-GH-3155` — `sanitize-cpu (address,undefined)` fails on every PR with
+  a UBSan alignment error inside `LoadUnaligned<T>` calls in the AVX2 and AVX512
+  element matmul kernels. The compiler optimises the `memcpy` in `LoadUnaligned`
+  into a direct load, which UBSan flags. The fix adds
+  `__attribute__((no_sanitize("alignment")))` to the function.
+
 
 ## Outcome
 

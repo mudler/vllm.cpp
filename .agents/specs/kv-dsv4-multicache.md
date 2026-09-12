@@ -1787,6 +1787,77 @@ Findings 4 and 5 are record repairs, made while the append-only index row is
 still correctable. Finding 6 is #2085, owed with its own line.
 
 
+### W8 slice 4 third-repair-round evidence
+
+A third independent review of `714c342d4` PASSED all five claims and returned
+three findings, none of which falsified a claim. This round repairs them.
+
+**THE BUILD CONFIGURATION IS RECORDED HERE BECAUSE IT WAS THE FINDING.** The
+slice-4 rounds above record md5s and pass counts and name no build type, so the
+numbers could not be reproduced from the record alone — and the lane this
+document declares (`CPU Release`, `:1155` and `:1716`) turned out not to compile
+the suite at all. Measured in `/home/mudler/.cache/kv-w8-s4-repair3`:
+
+| axis | value |
+|---|---|
+| build type | `Release` (`-O3 -DNDEBUG`) |
+| configure | `cmake -S . -B build-rel -G Ninja -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF` |
+| compiler | `g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0` |
+| cmake / generator | `3.28.3` / Ninja |
+| per-TU flags, verbatim | `-O3 -DNDEBUG -std=c++20 -fPIE -ffp-contract=off -Wall -Wextra -Werror` |
+
+**FINDING 3 — THE DECLARED GATE LANE DID NOT BUILD, and it was pre-existing.**
+In CPU Release the suite failed `-Werror=stringop-overflow=` at
+`test_deepseek_v4_gguf_load.cpp:1468`, inside the case this row landed at
+`0ca5f1b13`; every measurement above was in fact taken in `RelWithDebInfo`. The
+diagnostic names its own cause: a `memset` bound "between 9223372036854775808
+and 18446744073709551615", i.e. `[2^63, 2^64)` — the range a NEGATIVE `int64_t`
+occupies once cast to `size_t`. `padded_block_bytes` is an `int64_t` the shared
+packer returns, nothing in that TU proves it non-negative, and at `-O3` GCC
+inlines `vector::assign` to that `memset`. **The repair establishes the bound
+(`REQUIRE(block_bytes > 0)` / `REQUIRE(num_blocks > 0)`) at all three sites that
+size a page buffer this way, rather than suppressing the diagnostic**: a pragma
+would have left an unproven precondition standing under every index derived from
+the same value.
+
+**FINDING 1 — THE EXL3 CASE RESUMED OVER HISTORY NOTHING WROTE.** It set
+`kv_base = 4` with no prior step, so rows 0..3 were still `0xA5` and
+`CHECK(NonFinite(out.host) == 0)` was a property of the fp8 decoder applied to
+poison. It now drives a real history, **in four one-token steps rather than the
+GGUF sibling's single four-token one, and that shape is forced**: this junction
+passes `have_compressor_state = true` (`deepseek_v4_registry.cpp:184`), so
+`deepseek_v4.cpp:3743` refuses any step carrying more than one token. The source
+comment's existing reason — that `CompressorLayerStep`'s `seen == kv_base` guard
+never runs on a compressor-free fixture — was accurate and is kept; what it
+omitted was that the history still had to be written by something.
+
+**FINDING 2 — THE HISTORY COMPARISON COVERED ONLY THE DATA REGION.** A token's
+8 scale bytes sit at `scale_region_offset + row * scale_dim`, in a different
+region from its 576 data bytes (`cache_utils.py:59-66`), so a defect rewriting
+only history SCALE bytes moved no data byte and passed both arms unseen. Both
+comparisons now cover both regions.
+
+| what | result |
+|---|---|
+| red before (Finding 3), CPU Release | `ninja rc=1` at `555/559`; `error: 'void* __builtin_memset(void*, int, long unsigned int)' specified bound between 9223372036854775808 and 18446744073709551615 exceeds maximum object size 9223372036854775807 [-Werror=stringop-overflow=]`, inlined from `vector::assign` at `test_deepseek_v4_gguf_load.cpp:1468:42` |
+| green after | `ninja rc=0`, ZERO diagnostics; `test_deepseek_v4_gguf_load` **21 cases / 1143 assertions**, `test_deepseek_v4_exl3_loader` **23 cases / 640 assertions**, both SUCCESS |
+| assertion deltas | `+4` GGUF and `+10` EXL3 against `714c342d4`'s 1139/630, accounted exactly: two bound assertions per packed-page case, plus the four warm steps' two assertions each. Case counts UNCHANGED at 21 and 23 |
+| binaries present vs registered | **2 present, 750 registered.** Only the two named targets were built; the rest of the registered suite was NOT built and is therefore not a pass. Stated rather than implied |
+
+Two mutations, each recorded as build rc, then the binary md5 DELTA, and only
+then the verdict — a mutant that fails to compile leaves the old binary and
+reports a green that measured nothing.
+
+| mutation | ninja | binary md5 | run | verdict |
+|---|---|---|---|---|
+| **Finding 1**: `kv_base` -> literal `0` at the EXL3 junction (`deepseek_v4_registry.cpp:187-190`) | rc=0 | `45864b73…` -> `30830261…` | 23 cases, 2 failed, **6 assertions failed**: `:1782` `CHECK(moved)`, `:1785` the zero scale pad and `:1810` `CHECK(below == 0)`, on both layers, beside the pre-existing `:1317` | RED — giving the case a real history did not weaken the `kv_base` gate |
+| **Finding 2**: corrupt ONLY history scale bytes (one XOR on row 0's scale byte in `Fp8DsMlaStoreToken`, touching no data byte) | rc=0 | `49ef573d…` -> `5f500753…`, `45864b73…` -> `964992a4…` | GGUF: **the single failing assertion is `:1854` `REQUIRE(now_sc[i] == was_sc[i])`** — the NEW scale comparison — while `:1843`, the old data-only one, stayed GREEN under the identical mutant. EXL3: `:1810` `CHECK(below == 0)` on both layers | RED where the old assertion was BLIND — which is the whole claim |
+
+Both files restored byte-for-byte, sha256 verified equal
+(`deepseek_v4_registry.cpp` `3aba8a41…`, `deepseek_v4_compressor.cpp`
+`90dbb48d…`), rebuilt, and both binaries returned to their green-after md5s with
+both suites green again.
+
 
 ## Gates
 

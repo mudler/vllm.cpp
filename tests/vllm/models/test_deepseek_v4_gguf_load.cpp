@@ -1453,6 +1453,19 @@ TEST_CASE("W8 slice 4: the forward WRITES and READS the fp8_ds_mla page (#2455)"
                                                 vt::kFp8DsMlaQuantBlock),
           rows);
   const int64_t block_bytes = P.padded_block_bytes;
+  // THE PAGE GEOMETRY IS ASSERTED BEFORE IT IS USED AS A SIZE, and this is a
+  // real precondition rather than defensive noise. `padded_block_bytes` is an
+  // `int64_t` the shared packer returns, and nothing in this TU proves it
+  // non-negative, so `static_cast<size_t>(num_blocks * block_bytes)` below has
+  // the range [2^63, 2^64) as far as the optimizer is concerned -- a negative
+  // int64 reinterpreted as a size. At -O3 GCC 13 inlines the `assign` to a
+  // `memset` and reports exactly that: a bound "between 9223372036854775808 and
+  // 18446744073709551615 exceeds maximum object size"
+  // (`-Werror=stringop-overflow=`), which failed the CPU Release lane this row
+  // declares as its gate. Establishing the bound is the fix; a pragma would
+  // only have hidden an unproven precondition on every index below.
+  REQUIRE(block_bytes > 0);
+  REQUIRE(num_blocks > 0);
 
   const std::vector<int32_t> step{1, 2, 3};
   std::vector<int32_t> pos(step.size());
@@ -1644,6 +1657,12 @@ TEST_CASE("W8 slice 4: ModelRegistry::Forward carries rows_per_block to the pack
                                                 vt::kFp8DsMlaQuantBlock),
           rows);
   const int64_t block_bytes = P.padded_block_bytes;
+  // ASSERTED BEFORE IT IS USED AS A SIZE, for the reason spelled out in the
+  // case above: `padded_block_bytes` is an `int64_t` this TU cannot prove
+  // non-negative, so the `static_cast<size_t>` below otherwise carries the
+  // [2^63, 2^64) range into a `memset` bound at -O3.
+  REQUIRE(block_bytes > 0);
+  REQUIRE(num_blocks > 0);
 
   // POISON, so "the store ran" is an observation rather than a check that zeros
   // stayed zero.
@@ -1807,6 +1826,12 @@ TEST_CASE("W8 slice 4: ModelRegistry::Forward carries rows_per_block to the pack
     // then land on rows 0..T-1, overwriting the history the prior step wrote.
     // Compared against the SNAPSHOT rather than against poison, because those
     // rows legitimately hold real tokens by now.
+    //
+    // BOTH REGIONS, and the data region alone is not enough. A token's 8 scale
+    // bytes live at `scale_region_offset + row * scale_dim`, in a DIFFERENT
+    // region from its 576 data bytes (`cache_utils.py:59-66`). A defect that
+    // rewrote only the history's SCALE bytes therefore moves no data byte at
+    // all, and a data-only comparison passed it unseen.
     const std::vector<uint8_t>& was = before[static_cast<size_t>(l)];
     for (int64_t r = 0; r < kv_base; ++r) {
       const uint8_t* now_row = blk.data() + r * P.token_data_size;
@@ -1816,6 +1841,17 @@ TEST_CASE("W8 slice 4: ModelRegistry::Forward carries rows_per_block to the pack
           CAPTURE(r);
           CAPTURE(i);
           REQUIRE(now_row[i] == was_row[i]);
+        }
+      }
+      const uint8_t* now_sc =
+          blk.data() + P.scale_region_offset + r * P.scale_dim;
+      const uint8_t* was_sc =
+          was.data() + P.scale_region_offset + r * P.scale_dim;
+      for (int64_t i = 0; i < P.scale_dim; ++i) {
+        if (now_sc[i] != was_sc[i]) {
+          CAPTURE(r);
+          CAPTURE(i);
+          REQUIRE(now_sc[i] == was_sc[i]);
         }
       }
     }

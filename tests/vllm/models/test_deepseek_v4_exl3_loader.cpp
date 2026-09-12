@@ -1640,6 +1640,13 @@ TEST_CASE("W8 slice 4: ModelRegistry::Forward carries rows_per_block on the EXL3
                                                 vt::kFp8DsMlaQuantBlock),
           rows);
   const int64_t block_bytes = P.padded_block_bytes;
+  // ASSERTED BEFORE IT IS USED AS A SIZE. `padded_block_bytes` is an `int64_t`
+  // the shared packer returns and this TU cannot prove non-negative, so the
+  // `static_cast<size_t>` below otherwise carries the [2^63, 2^64) range into a
+  // `memset` bound once -O3 inlines the `assign` -- the CPU Release failure the
+  // GGUF sibling hit at `-Werror=stringop-overflow=`.
+  REQUIRE(block_bytes > 0);
+  REQUIRE(num_blocks > 0);
 
   // POISON, so "the store ran" is an observation and not a check that zeros
   // stayed zero.
@@ -1674,6 +1681,11 @@ TEST_CASE("W8 slice 4: ModelRegistry::Forward carries rows_per_block on the EXL3
   // ungated. Safe here because this fixture has NO compressor layer, so
   // `CompressorLayerStep`'s `seen == kv_base` guard (`deepseek_v4_dsa.cpp:423`)
   // never runs -- that guard is what a resumed step would otherwise meet.
+  //
+  // THAT REASON IS ABOUT THE GUARD, NOT ABOUT THE HISTORY, and an earlier
+  // wording stopped there and left the other half unsaid. The rows below
+  // `kv_base` still have to be WRITTEN by something, or this case resumes over
+  // bytes nothing ever stored. They are, by the warm steps below.
   const int64_t kv_base = 4;
   REQUIRE(kv_base < rows);
   const std::vector<int32_t> tok{1};
@@ -1699,6 +1711,56 @@ TEST_CASE("W8 slice 4: ModelRegistry::Forward carries rows_per_block on the EXL3
   // default decode step actually takes.
   REQUIRE(in.gather_logits);
 
+  // ── THE PRIOR STEPS, and why this case drives FOUR of them ──────────────
+  //
+  // A resumed step ATTENDS its history: `n_keys = kv_base + T`, so rows
+  // 0..kv_base-1 are read back and dequantised (`deepseek_v4.cpp:1268`). Left
+  // at 0xA5 that history is FICTITIOUS: the case would resume over bytes
+  // nothing ever wrote, `CHECK(NonFinite(out.host) == 0)` below would be a
+  // property of the fp8 decoder applied to poison rather than a statement about
+  // this arm, and the decode shape would be one production never takes. The
+  // GGUF sibling was given a real history for exactly this reason.
+  //
+  // FOUR STEPS RATHER THAN ONE, and that is forced rather than stylistic. This
+  // junction passes `have_compressor_state = true`
+  // (`deepseek_v4_registry.cpp:184`), so `deepseek_v4.cpp:3743` REFUSES any step
+  // carrying more than one token: the composed arm's window/compressed merge
+  // reshapes the two LSE buffers instead of transposing them. The GGUF sibling
+  // passes `dsa_dense = true` with no carried state and can warm its history in
+  // one four-token step; this arm cannot. So the history is written one token
+  // per step at `kv_base` 0, 1, 2 and 3 -- which is also exactly the decode
+  // shape a served request takes.
+  for (int64_t w = 0; w < kv_base; ++w) {
+    vllm::v1::CommonAttentionMetadata warm_meta{};
+    warm_meta.num_reqs = 1;
+    warm_meta.num_computed_tokens_cpu = {static_cast<int32_t>(w)};
+    const std::vector<int32_t> warm_tok{1};
+    // ABSOLUTE position, matching the context this step resumes at.
+    const std::vector<int32_t> warm_pos{static_cast<int32_t>(w)};
+    vllm::ModelForwardInput warm{.token_ids = warm_tok,
+                                 .positions = warm_pos,
+                                 .attn_meta = warm_meta,
+                                 .gdn_meta = gdn_meta,
+                                 .attn_kv = attn_kv,
+                                 .gdn_state = gdn_state,
+                                 .config = f->config,
+                                 .queue = queue,
+                                 .logits_indices = li,
+                                 .num_reqs = 1};
+    warm.multi_kv = &mk;
+    const vllm::ForwardLogits warm_out =
+        vllm::ModelRegistry::Forward(*model, warm);
+    CAPTURE(w);
+    REQUIRE(warm_out.host.size() == static_cast<size_t>(params.vocab_size));
+    // A REAL statement about this arm: each warm step after the first resumes
+    // over rows its predecessors actually wrote.
+    CHECK(NonFinite(warm_out.host) == 0);
+  }
+
+  // THE HISTORY AS THE ENGINE LEFT IT. Rows 0..kv_base-1 now hold real packed
+  // tokens, and the step under test must not touch ONE BYTE of them.
+  const std::vector<std::vector<uint8_t>> before = pstore;
+
   // THE STEP. A wrong row count throws out of here rather than returning.
   const vllm::ForwardLogits out = vllm::ModelRegistry::Forward(*model, in);
   CHECK(out.rows == 1);
@@ -1721,13 +1783,29 @@ TEST_CASE("W8 slice 4: ModelRegistry::Forward carries rows_per_block on the EXL3
     const uint8_t* sc =
         blk.data() + P.scale_region_offset + kv_base * P.scale_dim;
     CHECK(sc[P.token.n_nope_blocks] == 0);
-    // AND NOTHING LANDED BELOW `kv_base` -- the half that catches a registry
-    // which dropped the `kv_base` read and wrote row 0 instead.
+    // AND NOTHING BELOW `kv_base` MOVED -- the half that catches a registry
+    // which dropped the `kv_base` read and wrote row 0 instead. Compared
+    // against the SNAPSHOT rather than against poison, because those rows hold
+    // real packed tokens by now.
+    //
+    // BOTH REGIONS, and the data region alone is not enough. A token's 8 scale
+    // bytes live at `scale_region_offset + row * scale_dim`, in a DIFFERENT
+    // region from its 576 data bytes (`cache_utils.py:59-66`), so a defect that
+    // rewrote only the history's SCALE bytes moves no data byte and passed a
+    // data-only comparison unseen.
+    const std::vector<uint8_t>& was = before[static_cast<size_t>(l)];
     int64_t below = 0;
     for (int64_t r = 0; r < kv_base; ++r) {
-      const uint8_t* d = blk.data() + r * P.token_data_size;
+      const uint8_t* now_d = blk.data() + r * P.token_data_size;
+      const uint8_t* was_d = was.data() + r * P.token_data_size;
       for (int64_t i = 0; i < P.token_data_size; ++i)
-        if (d[i] != 0xA5) ++below;
+        if (now_d[i] != was_d[i]) ++below;
+      const uint8_t* now_s =
+          blk.data() + P.scale_region_offset + r * P.scale_dim;
+      const uint8_t* was_s =
+          was.data() + P.scale_region_offset + r * P.scale_dim;
+      for (int64_t i = 0; i < P.scale_dim; ++i)
+        if (now_s[i] != was_s[i]) ++below;
     }
     CHECK(below == 0);
     // 2. AND IT STAYED INSIDE ITS BLOCK. Everything from `rows * 584` on is

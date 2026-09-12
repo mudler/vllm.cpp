@@ -942,16 +942,27 @@ above as its red-before input.
   |---|---|---|
   | 1 | `fp8_ds_mla` KV cache at engine start | **NOT what stops a CUDA build.** W6 measured it on a CPU build; `KV-DSV4-MULTICACHE` W5 (#2455) owns it and it is untouched here |
   | 2 | `DeepSeek-V4 vision queue and weights must share one device` | **CLOSED by W7-CUDA.** See `### W7-CUDA evidence` |
-  | 3 | `vt: MatVec weight size mismatch at deepseek_v4.cpp:504` | **LIVE. This entry.** |
+  | 3 | the host GEMM's weight size mismatch, thrown as the anonymous `vt: MatVec weight size mismatch` until it was named | **LIVE, and now NAMED. This entry.** |
 
   **THE EXACT FAILING INVOCATION.** `test_deepseek_v4_mm_chat`'s served image
-  request dies with
+  request died with
   `engine-fatal: EngineCore busy loop threw: vt: MatVec weight size mismatch at
-  deepseek_v4.cpp:504`. `MatVec` has exactly ONE call site in that file, `:567`,
-  inside `Gemm`'s HOST-FLOAT FALLBACK:
-  `const std::vector<float> y = MatVec(wf32, &x[t * K], N, K);` — so `out = N`,
-  `in = K`, and the guard that fires is
-  `VT_CHECK(static_cast<int64_t>(w.size()) == out * in, ...)` at `:504`.
+  deepseek_v4.cpp:504`. `MatVec` has exactly ONE call site in that file, inside
+  `Gemm`'s HOST-FLOAT FALLBACK:
+  `const std::vector<float> y = MatVec(wf32, &x[t * K], N, K, tensor, layer);`
+  — so `out = N`, `in = K`, and the guard that fires is
+  `VT_CHECK(static_cast<int64_t>(w.size()) == out * in, ...)`.
+
+  **THE MESSAGE IS NO LONGER THAT ONE, and no line number is quoted here on
+  purpose.** Since the named-refusal commit on this row's branch the guard reads
+
+  ```text
+  vt: deepseek-v4 host GEMM: weight size mismatch: tensor `<name>` layer <n>
+  want [N=..,K=..] = .. elements, got .. elements
+  ```
+
+  A citation by LINE NUMBER is what went stale three times on this entry
+  already, so the guard is named by its message and its function instead.
 
   **IT IS NOT THE DEVICE GEMM PATH**, and calling it one would be wrong. `Gemm`
   takes its keep-quant arm only when
@@ -962,34 +973,54 @@ above as its red-before input.
   `VT_CHECK(deepseek_v4::V4DeviceKernelsAvailable(), kDevicePending)`, so only a
   build with the V4 device kernels can get this far.
 
-  **THE ASYMMETRY IS THE FINDING.** The keep-quant arm carries a NAMED shape
-  refusal (`keep-quant GEMM: weight shape mismatch: want [N=..,K=..] got [..]`)
-  while this fallback arm's guard is ANONYMOUS. The same wrong shape is
-  diagnosable on one arm and nameless on the other. The tree already says what
-  that costs: `deepseek_v4_weights.cpp:346` records that the assertion is
-  "unconditional (a plain `VT_CHECK` and not an `assert`, so it survives
-  `NDEBUG`)" and that the throw "names neither the tensor, nor the layer, nor
-  the geometry, nor what is missing".
+  **THE ASYMMETRY WAS THE FINDING, AND IT IS NOW CLOSED.** The keep-quant arm
+  carried a NAMED shape refusal
+  (`keep-quant GEMM: weight shape mismatch: want [N=..,K=..] got [..]`) while
+  this fallback arm's guard was ANONYMOUS, so the same wrong shape was
+  diagnosable on one arm and nameless on the other. Both arms now take the
+  tensor name and the layer index and refuse in the same vocabulary. The labels
+  are REQUIRED rather than defaulted, because a defaulted label leaves a call
+  site anonymous — which is the defect itself — and requiring them makes a
+  forgotten site a `-Werror` build failure rather than a silent gap;
+  `check-tree-compiles` compiled 685 of 685 translation units in scope, which is
+  what proves no site was missed.
 
-  **WHAT IS UNMEASURED, and is not guessed here:** the `N` and `K` values, which
-  tensor, and which layer. This throw names none of them by construction, so
-  recovering them needs an instrumented device run. It is NOT the aarch64 repack
-  path — the failure is byte-identical with `VT_CPU_QUANT_REPACK=0`.
+  **CLOSING THE ASYMMETRY IS A DIAGNOSTIC, NOT THE REPAIR.** The wrong shape is
+  still thrown and a served image still does not complete. What changed is that
+  the throw now says which tensor and which layer, which is the instrument this
+  entry needed and never had.
 
-  **A STALE CROSS-REFERENCE a reader will otherwise chase, and it is THREE
-  places rather than four.** `deepseek_v4.cpp:728` and `:734`,
-  `deepseek_v4.cpp:832` and `deepseek_v4_weights.cpp:344` and `:347` cited this
-  throw as `deepseek_v4.cpp:413`. `deepseek_v4_weights.cpp:1068` names the same
-  anonymous message and carries NO line number, so it was never stale; this
-  record said four and the tree says three. The guard sits at `:504`, which is
-  what the measured failure reports, and the three stale citations are corrected
-  to `:504` here. A fourth `:413` citation lives in
+  **WHAT IS STILL UNMEASURED, and is not guessed here:** the `N` and `K` values,
+  which tensor, and which layer. The throw named none of them by construction,
+  which is why recovering them needs an instrumented device run; the naming
+  commit builds that instrument but does not on its own constitute the
+  measurement. The values land here only when a lease has actually printed them,
+  and until that line exists this entry says UNMEASURED rather than a plausible
+  candidate. It is NOT the aarch64 repack path — the failure is byte-identical
+  with `VT_CPU_QUANT_REPACK=0`.
+
+  **THE CROSS-REFERENCES THAT WENT STALE TWICE ARE NOW LINE-FREE.** The comments
+  in `deepseek_v4.cpp` and `deepseek_v4_weights.cpp` that quoted this throw cited
+  it first as `deepseek_v4.cpp:413` and then as `:504`; each correction went
+  stale the next time the file moved. The naming commit rewrites those comments
+  to quote the MESSAGE and to say what the by-name loader refusals still buy over
+  it — they name WHAT IS MISSING and every mismatched tensor at once, which a
+  per-GEMM throw reports one at a time and only for the tensor whose GEMM runs
+  first — and it removes the line numbers rather than correcting them a third
+  time. A `:413` citation still lives in
   `tests/vllm/models/test_deepseek_v4_exl3_forward.cpp:443,446`, which belongs to
   `MODEL-DSV4-EXL3` and is left to that row.
 
-  Root-causing it, and giving the fallback arm a named refusal, are owed by
-  issue #2411 and W7-CUDA, and by the row-owned local issue this repair filed
-  for it under `.agents/issues/MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm/`.
+  **Giving the fallback arm a named refusal is DONE** (this row's branch, with a
+  red-first case in `test_deepseek_v4_forward` that enters through the production
+  `DeepseekV4ForwardHost` and asserts the tensor, the layer, both geometries and
+  the actual element count). **Root-causing the mismatch is still owed** by issue
+  #2411 and W7-CUDA, and by the row-owned local issue under
+  `.agents/issues/MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm/`. That issue is
+  named by DIRECTORY rather than by ID on purpose: a row-owned issue whose stable
+  ID appears in a spec's `## Owed` is exactly what
+  `scripts/check-agent-record.py` refuses, because an ID listed as owed is how a
+  ROWLESS issue is tracked and a row-owned one is tracked by its directory.
 
 - **`test_deepseek_v4_mm_chat`'s image branch encodes a CPU-ONLY PREMISE and
   fails on any CUDA build.** Its else-branch asserts the served error names

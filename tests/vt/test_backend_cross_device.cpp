@@ -6993,7 +6993,8 @@ TEST_CASE("qwen4_exp QSA gather attention matches the CPU oracle and is NATIVE o
         MESSAGE("qwen4_exp qsa_gather NaN probe " << DeviceTag(dt) << " esz=" << esz << ": "
                                                   << untouched
                                                   << " unselected cache rows poisoned, output "
-                                                  << (nan_finite ? "FINITE" : "NON-FINITE")
+                                                  << std::string(nan_finite ? "FINITE"
+                                                                              : "NON-FINITE")
                                                   << " and bit-identical to the clean run");
       }
       dev.DestroyQueue(q);

@@ -334,6 +334,25 @@ Four differences exist and NONE of them is an algorithm difference:
    and dies there. gfx1151 runs fp64 at a reduced rate, and a same-width f32
    variant is a SPEED item for a later wave. No throughput number is admissible
    from this row in any case, so there is nothing to trade the width against yet.
+
+   **THE WIDTH IS NOW MEASURED ON THIS DEVICE, and until 2026-09-12 it was
+   not.** A fresh review narrowed `double acc` to `float acc` in the HIP kernel
+   and the cross-device gate stayed green at NMSE `3.05e-15`, eleven orders
+   under the `5e-4` bar: the fixture is well-scaled, and well-scaled data cannot
+   separate the two widths. A paragraph in a spec arguing for a width that the
+   row's own gate cannot see is the failure this campaign has now hit four
+   times, so the case was written rather than the paragraph softened.
+   `tests/vt/test_backend_cross_device.cpp`, "qwen4_exp PLE conv keeps the
+   DOUBLE four-tap accumulator on ROCm too", is the CUDA arm's own
+   accumulator case (`tests/vllm/models/test_qwen4_exp_cuda.cpp:648`) ported to
+   this file's harness: taps of `1.0, 2^40, -2^40, 0` at dilation 3, where a
+   double accumulator yields `silu(1.0) = 0.731` and an f32 one yields
+   `silu(0) = 0`. It is held to that double answer DIRECTLY as well as to the
+   CPU arm, so it cannot be satisfied by two arms being wrong together, and it
+   runs at f32 only on purpose: `silu(1.0)` rounds to bf16 with ~3e-3 of error,
+   six times this file's band, so a bf16 arm of THIS case would not separate the
+   widths it exists to separate. The dtype surface is gated by the two cases
+   beside it instead.
 3. **`has_initial_states`.** vLLM zeroes the gathered state for a request whose
    flag is false. `vt::Qwen4ExpPleConv` has no such operand, deliberately: a
    ZEROED cache row IS the first call's left zero pad, so the obligation is the
@@ -465,8 +484,11 @@ Red first, per op, each failing for the intended reason before the arm exists:
 cross-device case that REQUIRE-proves its ROCm registration. With W1's three and
 W2's two that is SEVEN landed and TWO owed — the QSA pair (W4) — and the forward
 still refuses on ROCm, because a partial port buys nothing runnable on a board
-with no reference tier (D2). Next action is W4, the QSA pair, and it is the hard
-one: `amd/ops/qsa.py` is its reference rather than the CUDA arm.
+with no reference tier (D2). A fresh review then returned FAIL on the GATE
+rather than on the arms, finding no numerical defect and three guarantees no
+test could detect the removal of; "The re-gate" below records what was added and
+what it measures. Next action is W4, the QSA pair, and it is the hard one:
+`amd/ops/qsa.py` is its reference rather than the CUDA arm.
 
 **vLLM's AMD backend DOES define both of these behaviours, and it defines them
 in PYTORCH rather than Triton** — `amd/ple_layer.py` carries zero `@triton.jit`
@@ -544,6 +566,80 @@ two orders and not the three the conv mutations reach, because dividing by
 `sqrt(7)` rather than by 1 moves a sigmoid of a square root — a doubly
 compressive chain — and the fixture's scores are `O(1)`. It is a real red (`1`
 failed assertion, `FOCUSED_EXIT=1`) and nothing was widened to make it larger.
+**A fresh review predicted `40.6x` on that axis ANALYTICALLY from the fixture's
+score pool before running it, then swept the score scale — x1 -> 40.6, x2 ->
+44.5, x4 -> 36.9, x8 -> 24.3 — and showed the margin is bounded by the
+sigmoid-of-sqrt double compression and not by the data. The fixture is within
+~12% of the best achievable there, so the 39x is a PROPERTY of the operation and
+widening it is not available.**
+
+### The re-gate: three guarantees the first W3 gate could not see
+
+**A fresh review found NO numerical defect and three unmeasured guarantees**, and
+the arms are byte-unchanged by the repair: only
+`tests/vt/test_backend_cross_device.cpp` and `include/vt/ops.h` comments moved.
+Measured on `strix:gpu0`, `rc` job `04237742-71ee-4f51-9deb-659ecea6ebcd`, worker
+`rc-worker-lcjhd`, `gfx1151`, ROCm 7.2.4 / HIP 7.2.53211, Release,
+`-DVLLM_CPP_HIP=ON -DVLLM_CPP_HIP_ARCHITECTURES=gfx1151`, built in the lease from
+a clone of this row's branch with `git rev-parse HEAD` asserted equal to
+`ec2cc004b`, the commit under test.
+
+| Leg | `test_backend_cross_device` | binary sha256 (16) |
+|---|---|---|
+| GREEN | `56 cases / 56 passed / 0 failed / 0 skipped`, `84459 assertions / 0 failed`, `Status: SUCCESS!` | `6ef94c6e85e571c4` |
+| `m1` bf16 + f16 STORE branches corrupted | `56 / 54 passed / 2 failed`, `6 failed assertions` | `683c498bc6be0fa2` |
+| `m2` the gate's `isnan` guard neutered | `56 / 55 passed / 1 failed`, `28 failed assertions` | `baf560e84e2d86e2` |
+| `m3` the conv's `double acc` narrowed to `float` | `56 / 55 passed / 1 failed`, `4 failed assertions` | `9329918ac4d39fc9` |
+| RESTORED | `56 / 56 passed / 0 failed`, `84459 / 0 failed` | `6ef94c6e85e571c4` |
+
+The restored binary is sha256-IDENTICAL to the green one and
+`git status --porcelain` was EMPTY after each of the three restores, so nothing
+that lands depends on a mutation left behind. All four builds compiled with ZERO
+warnings at `-Wall -Wextra -Werror`; each mutation keeps every parameter
+referenced, `m2` through `if (isnan(g) && clamp_min < 0.0)`, a branch that the
+wrapper's `clamp_min > 0` check makes unreachable.
+
+**`m1` REDS ON THE bf16 ARM AND ONLY THERE, which is the finding executed.**
+
+| axis | `esz=4` (f32) | `esz=2` (bf16) | vs the `5e-4` bar |
+|---|---|---|---|
+| `ple_conv` out | 0 / 0 | **1.28969** / **1.18958** | **2579x** |
+| `ple_conv` state | 0 / 0 | **0.384644** / **0.387493** | **775x** |
+| `ple_gate` | 0 / 0 | **1.50736** / **1.01205** | **3015x** |
+
+The zeroes in the `esz=4` column are the point of the dtype axis rather than
+holes in it: the mutation corrupts the f16 and bf16 STORE branches and leaves the
+f32 one alone, so at f32 it is a no-op by construction. The gate as it stood
+before this repair ran that column and nothing else, which is why it measured
+`2 passed | 0 failed` against a binary the reviewer had proven changed.
+
+**`m2` IS INVISIBLE TO EVERY NUMBER IN THE TABLE, and that is the whole reason
+it needs an `isnan` assertion.** Under the neutered guard all four `ple_gate`
+NMSE values stay exactly `0` — a missing guard returns `sigmoid(0) * value`, a
+finite and perfectly plausible number, so no norm can separate it from the right
+answer. The 28 failed assertions are 28 `CHECK(std::isnan(got_f[i]))`, which is
+`kH = 7` poisoned outputs x 2 dtypes x 2 clamp settings. **A norm was never going
+to gate this; only an `isnan` test was.**
+
+**`m3` REDS ONLY IN ITS OWN CASE, at f32, and the two numbers beside it say why
+both restrictions are deliberate.** The narrowed accumulator returns
+`silu(0) = 0` where the double returns `silu(1.0) = 0.731059`, and the tap-width
+case holds the device to that double answer directly: three `CHECK(fabs(g -
+want) < 1e-6)` failures at `|delta| = 0.731059`, a **731059x** margin, plus its
+cross-arm `Nmse`. In the ORDINARY conv case the same mutation measures
+`3.04781e-15` and `2.52542e-15` at `esz=4` — the reviewer's `3.05e-15`,
+reproduced — and exactly `0` at `esz=2`, because bf16's 8-bit significand
+absorbs the difference. So a well-scaled fixture cannot see this at f32 and a
+bf16 fixture cannot see it at all: the width needs a cancellation fixture of its
+own, which is what was ported.
+
+**WHAT THE RE-GATE DID NOT RE-RUN.** The RED leg. The two arms are byte-unchanged
+by this repair, so the registration `REQUIRE`s that reddened at `dad7f3fa8`
+(pre-rebase identity of `ae592b719`) still red for the same reason and re-running
+them would measure the same route gap twice. The three mutations above ARE the
+red-before evidence for the three assertions this repair adds, each run against
+a binary proven changed. No full `ctest` at this head either, recorded as UNRUN
+rather than implied, and no throughput, latency or memory number was taken.
 
 **EVERY MUTATION WAS WRITTEN TO STAY LIVE, because W1 was bitten twice by a
 FALSE one.** This tree builds HIP with `-Wall -Wextra -Werror`, so deleting a
@@ -575,23 +671,32 @@ mutation left behind.
 **WHAT W3 DID NOT RUN.** No full `ctest` and no base-versus-head pair: W2 ran
 that on this row's tree two commits ago and found seventeen pre-existing
 failures and zero introduced, and W3 adds one `.hip` translation unit that no
-other target links differently plus two cases in a suite that was run WHOLE
-here, green, at 84383 assertions. A full `ctest` at this head is therefore
+other target links differently plus THREE cases in a suite that was run WHOLE
+here, green — 84383 assertions at `364bc2547`, and 84459 after the re-gate below
+added the third case and the two dtype arms. A full `ctest` at this head is therefore
 UNRUN and is recorded as such rather than implied. No throughput, latency or
 memory number was taken, and none is admissible from this row.
 
-**ONE LOCAL GATE FAILS AND IT IS NOT THIS ROW'S.** `scripts/agent-preflight.sh
---staged` at `baffa7b8d` runs to completion and exits 1 on `tools suites`, with
-the five argument-starved SKIPs the banner expects. All 50 failures are in
-`tests/tools/test_strix_vllm_oracle.py` and 75 of them carry the same message,
-`ValueError: disk headroom exhausted` from that tool's OWN guard at
-`tools/bench/strix_vllm_oracle/worker.py:252-257`, which refuses to build when
-`shutil.disk_usage(...).free` is below its floor. The dev box was at 98% of
-447 GB with 12 GB free. `git diff origin/main..HEAD -- tools/ tests/tools/
-scripts/` is EMPTY, so every file that suite exercises is byte-identical to
-`main`, and no file this branch touches is named anywhere in it. The guard is
-working; the host is full. Recorded rather than left for a reviewer to
-rediscover, and NOT filed as a bug, because nothing is defective.
+**ONE LOCAL GATE FAILS AND IT IS NOT THIS ROW'S, and the CAUSE recorded here
+until 2026-09-12 was stale.** `scripts/agent-preflight.sh` runs to completion and
+exits 1 on `tools suites`, with the argument-starved SKIPs the banner expects.
+This paragraph read `ValueError: disk headroom exhausted` from
+`tools/bench/strix_vllm_oracle/worker.py`; a fresh review measured the CURRENT
+failure as `c8-leg-runner: NOT ADMISSIBLE — see fold.reasons`
+(`tools/bench/c8_leg_runner.py:141`), and a rerun on this branch reproduces that
+message and no disk-headroom message at all. The stale cause is corrected rather
+than left, because a wrong cause sends the next reader to the wrong file.
+
+**THE CONCLUSION IS UNCHANGED, AND IT IS NOW HELD BY A BASE COMPARISON RATHER
+THAN BY AN ARGUMENT.** The same review ran the same preflight on `origin/main`
+in a separate worktree and got the IDENTICAL failure set — `role-undeclared`
+plus `tools suites` — carrying the identical `c8-leg-runner` message. The
+failure is therefore present on `main` without this branch, which is stronger
+evidence than reading the diff. `git diff origin/main..HEAD -- tools/
+tests/tools/ scripts/` is EMPTY as well, so every file that suite exercises is
+byte-identical to `main` and no file this branch touches is named anywhere in
+it. NOT filed as a bug by this row: the base leg says it is not this branch's,
+and diagnosing somebody else's leg runner is not this row's scope.
 
 **W2's OWN RECORD IS NOT DELETED, it is superseded here and kept below**, the
 same way W2 kept W1's. Its counts are read against its own head and not against

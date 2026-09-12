@@ -16,6 +16,8 @@
 
 #include <cmath>
 #include <cstdint>
+#include <exception>
+#include <string>
 #include <vector>
 
 #include "support/max_abs_diff.h"
@@ -306,4 +308,79 @@ TEST_CASE("deepseek-v4 W7: RED-first — a miswired interleave changes the outpu
       hw, p, kTokens, kPositions, {}, V4Miswire::kNoAttnSink, nullptr);
   CHECK(AllFinite(no_sink));
   CHECK(MaxAbsDiff(base, no_sink) > 1e-5f);
+}
+
+// MODEL-MM-deepseek-v4 W7-CUDA (#2411, ISSUE-LOCAL-01M29KEXRT2GCS6C53DT2S3SPX):
+// THE HOST GEMM REFUSES BY NAME.
+//
+// A served image on a CUDA build died in `vt: MatVec weight size mismatch at
+// deepseek_v4.cpp:504` -- `Gemm`'s host-float fallback, whose guard named no
+// tensor, no layer and no geometry, while the sibling keep-quant arm refused the
+// SAME wrong shape by name. Which tensor and which layer were UNMEASURED for
+// exactly that reason: the throw carried none of it, so recovering the geometry
+// needed an instrumented device run.
+//
+// RED-FIRST, and what each case reads before the repair: both assert content the
+// anonymous string does not contain, so both fail on the old message and pass on
+// the new one. The `CHECK_FALSE(... "MatVec weight size mismatch")` line is not
+// decoration -- it is what stops the refusal regressing to a string that merely
+// ALSO mentions a tensor name somewhere.
+//
+// The entry point is the PRODUCTION one. `DeepseekV4ForwardHost` is declared in
+// `include/vllm/model_executor/models/deepseek_v4.h` and reaches the same `Gemm`
+// host arm the served request reaches. Nothing here constructs `Gemm` or `MatVec`
+// by hand, and neither could be: both are file-local to `deepseek_v4.cpp`.
+TEST_CASE("deepseek-v4 W7-CUDA: the host GEMM names the tensor, layer and geometry") {
+  const DeepseekV4Params p = TinyParams();
+
+  auto throw_message = [&](const DeepseekV4HostWeights& w) {
+    try {
+      DeepseekV4ForwardHost(w, p, kTokens, kPositions, {}, V4Miswire::kNone, nullptr);
+    } catch (const std::exception& e) {
+      return std::string(e.what());
+    }
+    return std::string();
+  };
+  auto mentions = [](const std::string& hay, const std::string& needle) {
+    return hay.find(needle) != std::string::npos;
+  };
+
+  SUBCASE("a NOT-layer-scoped weight names itself and both geometries") {
+    // `lm_head` is [vocab, H] = [12, 8] = 96 elements. One short is a size the
+    // guard must reject, and the message must say BY HOW MUCH.
+    DeepseekV4HostWeights hw = TinyWeights(p);
+    REQUIRE(hw.lm_head.size() == static_cast<size_t>(p.vocab_size * p.hidden_size));
+    hw.lm_head.pop_back();
+
+    const std::string msg = throw_message(hw);
+    REQUIRE_FALSE(msg.empty());
+    CHECK(mentions(msg, "host GEMM"));
+    CHECK(mentions(msg, "tensor `lm_head`"));
+    CHECK(mentions(msg, "(not layer-scoped)"));  // lm_head belongs to no layer
+    CHECK(mentions(msg, "want [N=12,K=8]"));     // vocab_size, hidden_size
+    CHECK(mentions(msg, "= 96 elements"));       // what the geometry needs
+    CHECK(mentions(msg, "got 95 elements"));     // what the tensor actually holds
+    // The anonymous form this case exists to retire.
+    CHECK_FALSE(mentions(msg, "MatVec weight size mismatch"));
+  }
+
+  SUBCASE("a LAYER-SCOPED weight names its own layer, and not a constant") {
+    // `wq_a` is [q_lora_rank, H] = [4, 8] = 32 elements, and EVERY layer carries
+    // one. Breaking layer 2 must name LAYER 2 -- a message hard-coding a layer, or
+    // reporting the first layer it walked, passes the tensor check and fails here.
+    DeepseekV4HostWeights hw = TinyWeights(p);
+    REQUIRE(p.num_hidden_layers > 3);
+    REQUIRE(hw.layers[2].wq_a.size() ==
+            static_cast<size_t>(p.q_lora_rank * p.hidden_size));
+    hw.layers[2].wq_a.pop_back();
+
+    const std::string msg = throw_message(hw);
+    REQUIRE_FALSE(msg.empty());
+    CHECK(mentions(msg, "tensor `wq_a`"));
+    CHECK(mentions(msg, "layer 2"));
+    CHECK_FALSE(mentions(msg, "layer 0"));
+    CHECK(mentions(msg, "want [N=4,K=8]"));
+    CHECK(mentions(msg, "got 31 elements"));
+    CHECK_FALSE(mentions(msg, "MatVec weight size mismatch"));
+  }
 }

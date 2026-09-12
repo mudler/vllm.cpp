@@ -496,12 +496,39 @@ float Dot(const uint16_t* a, const float* b, int64_t n) {
   return acc;
 }
 
+// WHICH host GEMM a refusal is about, in the sibling keep-quant arm's vocabulary.
+// `layer` is the decoder layer index, or -1 when the call is not layer-scoped (the
+// final `lm_head`, the MTP head's own projections).
+//
+// W7-CUDA (#2411, ISSUE-LOCAL-01M29KEXRT2GCS6C53DT2S3SPX): a served image on a
+// CUDA build died in `vt: MatVec weight size mismatch at deepseek_v4.cpp:504`,
+// which named no tensor, no layer and no geometry -- while the keep-quant arm
+// refused the SAME wrong shape by name. Recovering the geometry needed an
+// instrumented device run precisely because this string carried none of it. The
+// two identifiers below are what close that asymmetry, and they are REQUIRED
+// rather than defaulted: a defaulted label leaves a call site anonymous, which is
+// the defect itself.
+std::string V4GemmSite(const char* tensor, int64_t layer) {
+  return std::string("tensor `") + tensor + "` " +
+         (layer >= 0 ? "layer " + std::to_string(layer)
+                     : std::string("(not layer-scoped)"));
+}
+
 // y[o] = Σ_i W[o*in + i] * x[i]  (W is [out, in] row-major).
 // `W` is `std::vector<float>` or `HostBf16`; `Dot` overloads on the element type,
 // so the bf16 carried tower and the f32 remainder share one body (W1d, #2186).
+//
+// `tensor` and `layer` are read ONLY by the refusal below. `VT_CHECK` evaluates
+// its message inside the failure branch, so naming the site costs nothing on the
+// path that succeeds.
 template <typename W>
-std::vector<float> MatVec(const W& w, const float* x, int64_t out, int64_t in) {
-  VT_CHECK(static_cast<int64_t>(w.size()) == out * in, "MatVec weight size mismatch");
+std::vector<float> MatVec(const W& w, const float* x, int64_t out, int64_t in,
+                          const char* tensor, int64_t layer) {
+  VT_CHECK(static_cast<int64_t>(w.size()) == out * in,
+           "deepseek-v4 host GEMM: weight size mismatch: " + V4GemmSite(tensor, layer) +
+               " want [N=" + std::to_string(out) + ",K=" + std::to_string(in) +
+               "] = " + std::to_string(out * in) + " elements, got " +
+               std::to_string(static_cast<int64_t>(w.size())) + " elements");
   std::vector<float> y(static_cast<size_t>(out));
   for (int64_t o = 0; o < out; ++o) y[static_cast<size_t>(o)] = Dot(&w[o * in], x, in);
   return y;
@@ -529,11 +556,13 @@ const std::vector<float> kNoHostWeights;
 template <typename W>
 std::vector<float> Gemm(const V4Backend& be, const OwnedTensor* wq,
                         const W& wf32, const std::vector<float>& x,
-                        int64_t T, int64_t N, int64_t K, bool defer_sync = false) {
+                        int64_t T, int64_t N, int64_t K, const char* tensor,
+                        int64_t layer, bool defer_sync = false) {
   if (be.gguf != nullptr && wq != nullptr && !wq->Empty()) {
     VT_CHECK(be.q != nullptr, "deepseek-v4 keep-quant GEMM needs a queue");
     VT_CHECK(wq->rank == 2 && wq->shape[0] == N && wq->shape[1] == K,
-             "deepseek-v4 keep-quant GEMM: weight shape mismatch: want [N=" +
+             "deepseek-v4 keep-quant GEMM: weight shape mismatch: " +
+                 V4GemmSite(tensor, layer) + " want [N=" +
                  std::to_string(N) + ",K=" + std::to_string(K) + "] got [" +
                  std::to_string(wq->shape[0]) + "," + std::to_string(wq->shape[1]) +
                  "] rank=" + std::to_string(wq->rank));
@@ -564,7 +593,7 @@ std::vector<float> Gemm(const V4Backend& be, const OwnedTensor* wq,
   }
   std::vector<float> out(static_cast<size_t>(T) * N);
   for (int64_t t = 0; t < T; ++t) {
-    const std::vector<float> y = MatVec(wf32, &x[t * K], N, K);
+    const std::vector<float> y = MatVec(wf32, &x[t * K], N, K, tensor, layer);
     for (int64_t n = 0; n < N; ++n) out[t * N + n] = y[static_cast<size_t>(n)];
   }
   return out;
@@ -621,7 +650,7 @@ std::vector<float> GroupedOutputLoraGguf(const V4Backend& be, const OwnedTensor&
                                          const OwnedTensor& wo_b,
                                          const std::vector<float>& o, int64_t T,
                                          int64_t nh, int64_t hd, int64_t ng,
-                                         int64_t olr, int64_t H) {
+                                         int64_t olr, int64_t H, int64_t layer) {
   VT_CHECK(ng > 0 && nh % ng == 0, "grouped o-LoRA: n_heads % n_groups != 0");
   const int64_t ipg = nh * hd / ng;  // in_per_group
   const int64_t z_dim = ng * olr;
@@ -643,7 +672,8 @@ std::vector<float> GroupedOutputLoraGguf(const V4Backend& be, const OwnedTensor&
     for (int64_t t = 0; t < T; ++t)
       for (int64_t d = 0; d < olr; ++d)
         z[t * z_dim + g * olr + d] = zg[static_cast<size_t>(g)][t * olr + d];
-  return Gemm(be, &wo_b, /*wf32=*/kNoHostWeights, z, T, H, z_dim);  // [T,H] (final; drains normally)
+  // [T,H] (final; drains normally)
+  return Gemm(be, &wo_b, /*wf32=*/kNoHostWeights, z, T, H, z_dim, "wo_b", layer);
 }
 
 // Grouped keep-quant expert GEMM (re-scoped Stage 2): out[P,N] where
@@ -723,18 +753,23 @@ std::vector<float> Slice(const std::vector<float>& v, int64_t off, int64_t len) 
 // `coff = 1 + (compress_ratio == 4)` (vllm/models/deepseek_v4/compressor.py:247-248)
 // — so the two can now disagree.
 //
-// AND A DISAGREEMENT HERE IS ANONYMOUS, NOT SILENT. Be exact about what this
+// AND A DISAGREEMENT HERE IS NAMED, NOT SILENT. Be exact about what this
 // buys, because overstating it is the defect #1964 was filed for. `Gemm`'s host
-// arm is a `MatVec` whose size assertion is UNCONDITIONAL — `deepseek_v4.cpp:504`
-// is a plain `VT_CHECK`, a throw rather than an `assert`, so `NDEBUG` does not
-// remove it — and its keep-quant arm checks the shape too. A [2*head_dim,
-// hidden_size] weight read at a [head_dim, hidden_size] stride therefore does NOT
-// produce a plausible wrong number. It throws
+// arm is a `MatVec` whose size assertion is UNCONDITIONAL — a plain `VT_CHECK`,
+// a throw rather than an `assert`, so `NDEBUG` does not remove it — and its
+// keep-quant arm checks the shape too. A [2*head_dim, hidden_size] weight read at
+// a [head_dim, hidden_size] stride therefore does NOT produce a plausible wrong
+// number. It throws
 //
-//     vt: MatVec weight size mismatch at deepseek_v4.cpp:504
+//     vt: deepseek-v4 host GEMM: weight size mismatch: tensor `comp_wgate`
+//     layer <n> want [N=<hd>,K=<H>] = <N*K> elements, got <2*N*K> elements
 //
-// which names no tensor, no layer, no geometry and no missing capability, from
-// the middle of a forward, on a checkpoint that loaded successfully.
+// W7-CUDA (#2411, ISSUE-LOCAL-01M29KEXRT2GCS6C53DT2S3SPX) gave that throw the
+// tensor, the layer and both geometries; before it, the message was the bare
+// `MatVec weight size mismatch` and named none of them. The refusal below still
+// earns its place: it names the MISSING CAPABILITY and every mismatched tensor at
+// once, which a per-GEMM throw reports one at a time and only for the tensor whose
+// GEMM happens to run first.
 //
 // So this is a DIAGNOSTICS improvement, and that is the whole of it: it replaces
 // an anonymous crash with a precise named refusal, listing EVERY mismatched
@@ -828,8 +863,9 @@ void RequireDsaGeometryOrRefuse(const DeepseekV4LayerHostWeights& L,
           std::to_string(layer) +
           " — the checkpoint carries this layer's DSA tensors at a geometry this "
           "forward does not implement. Reading the widened `comp_wgate` at the "
-          "width it DOES index throws an anonymous `MatVec weight size mismatch` "
-          "from inside the forward (deepseek_v4.cpp:504) that names none of this. "
+          "width it DOES index throws `deepseek-v4 host GEMM: weight size "
+          "mismatch` from inside the forward, which names that ONE tensor's "
+          "geometry but not the missing capability or the other mismatches. "
           "(That is the message the REAL geometry produces, because `comp_wgate`'s "
           "Gemm runs first. A `comp_ape`- or `comp_norm_weight`-only mismatch "
           "instead throws `ape size mismatch` / `rms_weight size mismatch` from "
@@ -904,7 +940,8 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   // 1. q [T,nh,hd] and raw kv latent [T,hd] (num_key_value_heads=1 MLA). The MLA
   //    linears (wq_a, wq_b, wkv) run the keep-quant GEMM (Gemm) — the whole batch
   //    at once — then the per-token RMSNorm(q_norm/kv_norm) + per-head RoPE.
-  std::vector<float> qa = Gemm(be, Lq != nullptr ? &Lq->wq_a : nullptr, L.wq_a, x, T, qlr, H);
+  std::vector<float> qa =
+      Gemm(be, Lq != nullptr ? &Lq->wq_a : nullptr, L.wq_a, x, T, qlr, H, "wq_a", layer);
   for (int64_t t = 0; t < T; ++t) {
     const std::vector<float> n = RmsNorm(Slice(qa, t * qlr, qlr), L.q_norm_weight, eps);
     for (int64_t i = 0; i < qlr; ++i) qa[t * qlr + i] = n[static_cast<size_t>(i)];
@@ -922,7 +959,8 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
                      p.rope_beta_fast, p.rope_beta_slow);
   };
   std::vector<float> q =
-      Gemm(be, Lq != nullptr ? &Lq->wq_b : nullptr, L.wq_b, qa, T, nh * hd, qlr);
+      Gemm(be, Lq != nullptr ? &Lq->wq_b : nullptr, L.wq_b, qa, T, nh * hd, qlr, "wq_b",
+           layer);
   // Per-head query RMS-norm (ds4 head_rms_norm_inplace, AFTER wq_b, BEFORE RoPE) — the
   // MLA query normalization our forward previously omitted (#188: q was rel-L2 ~0.96
   // vs ds4 at L00 with a bit-exact input; the KV latent already has its attn_kv_a_norm).
@@ -934,7 +972,8 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     char nm[64]; std::snprintf(nm, sizeof(nm), "ours_q_L%02lld", static_cast<long long>(layer));
     DumpAct(nm, Slice(q, 0, nh * hd));  // #188 q operand (post-proj+rope), t=0
   }
-  std::vector<float> kraw = Gemm(be, Lq != nullptr ? &Lq->wkv : nullptr, L.wkv, x, T, hd, H);
+  std::vector<float> kraw =
+      Gemm(be, Lq != nullptr ? &Lq->wkv : nullptr, L.wkv, x, T, hd, H, "wkv", layer);
   for (int64_t t = 0; t < T; ++t) {
     std::vector<float> kv = RmsNorm(Slice(kraw, t * hd, hd), L.kv_norm_weight, eps);
     rope_layer(&kv[nope], positions[static_cast<size_t>(t)]);
@@ -959,7 +998,8 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     const int64_t win = 2;  // tiny pooling window (device gather addressing = W7 seam)
     // compressor pool-score projection (keep-quant comp_wgate) : [T,H] -> [T,hd].
     std::vector<float> score =
-        Gemm(be, Lq != nullptr ? &Lq->comp_wgate : nullptr, L.comp_wgate, x, T, hd, H);
+        Gemm(be, Lq != nullptr ? &Lq->comp_wgate : nullptr, L.comp_wgate, x, T, hd, H,
+             "comp_wgate", layer);
     std::vector<int64_t> pos64(positions.begin(), positions.end());
     score = DispSaveScoreApe(be, score, L.comp_ape, pos64, T, hd, cr);
     for (int64_t t = 0; t < T; ++t) {
@@ -1125,12 +1165,14 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     const std::vector<float> iq =
         idx_q_from_qr
             ? Gemm(be, Lq != nullptr ? &Lq->idx_wq_b : nullptr, L.idx_wq, qa, T,
-                   inh * ihd, qlr)
+                   inh * ihd, qlr, "idx_wq", layer)
             : Gemm(be, Lq != nullptr ? &Lq->idx_wq_b : nullptr, L.idx_wq, x, T,
-                   inh * ihd, H);
+                   inh * ihd, H, "idx_wq", layer);
     const std::vector<float> ik =
-        Gemm(be, Lq != nullptr ? &Lq->idx_comp_wkv : nullptr, L.idx_wk, x, T, ihd, H);
-    const std::vector<float> wproj = Gemm(be, nullptr, L.idx_wproj, x, T, inh, H);
+        Gemm(be, Lq != nullptr ? &Lq->idx_comp_wkv : nullptr, L.idx_wk, x, T, ihd, H,
+             "idx_wk", layer);
+    const std::vector<float> wproj =
+        Gemm(be, nullptr, L.idx_wproj, x, T, inh, H, "idx_wproj", layer);
     const std::vector<float> folded = DispWeightFold(be, wproj, T, inh, ihd);
     std::vector<int64_t> ws(static_cast<size_t>(T)), we(static_cast<size_t>(T));
     for (int64_t t = 0; t < T; ++t) {
@@ -1243,10 +1285,11 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
         const std::vector<float> iq =
             static_cast<int64_t>(L.idx_wq.size()) == inh * ihd * qlr
                 ? Gemm(be, Lq != nullptr ? &Lq->idx_wq_b : nullptr, L.idx_wq, qa, T,
-                       inh * ihd, qlr)
+                       inh * ihd, qlr, "idx_wq", layer)
                 : Gemm(be, Lq != nullptr ? &Lq->idx_wq_b : nullptr, L.idx_wq, x, T,
-                       inh * ihd, H);
-        const std::vector<float> wproj = Gemm(be, nullptr, L.idx_wproj, x, T, inh, H);
+                       inh * ihd, H, "idx_wq", layer);
+        const std::vector<float> wproj =
+            Gemm(be, nullptr, L.idx_wproj, x, T, inh, H, "idx_wproj", layer);
         const std::vector<float> folded = DispWeightFold(be, wproj, T, inh, ihd);
         sel_rows = deepseek_v4::IndexerSelectCompressed(
             iq, irows, folded, pos64, T,
@@ -1264,7 +1307,7 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
       const std::vector<float> comp_kv =
           L.comp_wkv.empty()
               ? deck
-              : Gemm(be, /*kq=*/nullptr, L.comp_wkv, x, T, comp_w, H);
+              : Gemm(be, /*kq=*/nullptr, L.comp_wkv, x, T, comp_w, H, "comp_wkv", layer);
       o = deepseek_v4::CompressorLayerStep(
           *be.q, x, comp_kv, q, L.comp_wgate, L.comp_ape, L.comp_norm_weight, L.attn_sink,
           (*be.paged_kv)[static_cast<size_t>(layer)],
@@ -1385,7 +1428,7 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   //    GGUF source; the host/device-synthetic path keeps the f32 primitive.
   if (be.gguf != nullptr && Lq != nullptr) {
     return GroupedOutputLoraGguf(be, Lq->wo_a, Lq->wo_b, o, T, nh, hd, p.o_groups,
-                                 p.o_lora_rank, H);
+                                 p.o_lora_rank, H, layer);
   }
   return DispGroupedOLora(be, o, L.wo_a, L.wo_b, T, nh, hd, p.o_groups, p.o_lora_rank, H);
 }
@@ -1854,7 +1897,8 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
 
   // router gating logits [T, ne] (keep-quant moe_gate).
   const std::vector<float> gating =
-      Gemm(be, kq ? &Lq->moe_gate : nullptr, L.gate_weight, x, T, ne, H);
+      Gemm(be, kq ? &Lq->moe_gate : nullptr, L.gate_weight, x, T, ne, H, "gate_weight",
+           layer);
   std::vector<int64_t> in_tokens;
   std::vector<int32_t> hashtab;
   std::vector<float> bias;
@@ -2008,8 +2052,10 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
       // phase 1: gate + up. Shared expert stays a per-expert Gemm; the topk routed
       // experts collapse into ONE grouped kMatmulBTQuantGrouped launch each when
       // grouped_moe (else the Stage-2 per-expert GemmRowSlice batch).
-      g[0] = Gemm(be, &Lq->shared_gate, kNoHostWeights, x1, 1, mi, H, /*defer_sync=*/true);
-      u[0] = Gemm(be, &Lq->shared_up, kNoHostWeights, x1, 1, mi, H, /*defer_sync=*/true);
+      g[0] = Gemm(be, &Lq->shared_gate, kNoHostWeights, x1, 1, mi, H, "shared_gate", layer,
+                  /*defer_sync=*/true);
+      u[0] = Gemm(be, &Lq->shared_up, kNoHostWeights, x1, 1, mi, H, "shared_up", layer,
+                  /*defer_sync=*/true);
       if (grouped) {
         std::vector<float> xrep(static_cast<size_t>(topk) * H);  // topk copies of x1
         for (int64_t j = 0; j < topk; ++j)
@@ -2033,7 +2079,8 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
       // phase 2: host clamped-SwiGLU
       for (int64_t a = 0; a < A; ++a) act[static_cast<size_t>(a)] = swiglu(g[a], u[a]);
       // phase 3: down. Shared per-expert; routed grouped when grouped_moe.
-      eo[0] = Gemm(be, &Lq->shared_down, kNoHostWeights, act[0], 1, H, mi, /*defer_sync=*/true);
+      eo[0] = Gemm(be, &Lq->shared_down, kNoHostWeights, act[0], 1, H, mi, "shared_down",
+                   layer, /*defer_sync=*/true);
       if (grouped) {
         std::vector<float> adown(static_cast<size_t>(topk) * mi);
         for (int64_t j = 0; j < topk; ++j)
@@ -3347,7 +3394,7 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
         (*mtp_residual_out)[ri * hc * H + i] = all_res[r * hc * H + i];
   }
   const OwnedTensor* lmq = be.gguf != nullptr ? &be.gguf->lm_head : nullptr;
-  return Gemm(be, lmq, hw.lm_head, hsel, R, V, H);
+  return Gemm(be, lmq, hw.lm_head, hsel, R, V, H, "lm_head", /*layer=*/-1);
 }
 
 // Public host oracle: the composition on the portable host references.
@@ -3617,8 +3664,10 @@ std::vector<float> DeepseekV4MtpDraftLogitsHost(
   }
 
   // 3. hidden[T,hc,H] = h_proj(prev) + e_proj(emb).unsqueeze(-2) (:139-141).
-  const std::vector<float> e_out = Gemm(be, nullptr, mw.e_proj, emb, T, H, H);       // [T,H]
-  const std::vector<float> h_out = Gemm(be, nullptr, mw.h_proj, prev, T * hc, H, H);  // [T*hc,H]
+  const std::vector<float> e_out =
+      Gemm(be, nullptr, mw.e_proj, emb, T, H, H, "e_proj", mtp_layer);  // [T,H]
+  const std::vector<float> h_out =
+      Gemm(be, nullptr, mw.h_proj, prev, T * hc, H, H, "h_proj", mtp_layer);  // [T*hc,H]
   std::vector<float> hidden(static_cast<size_t>(T) * hc * H);
   for (int64_t t = 0; t < T; ++t)
     for (int64_t i = 0; i < hc; ++i)
@@ -3696,7 +3745,7 @@ std::vector<float> DeepseekV4MtpDraftLogitsHost(
     h = RmsNorm(h, mw.shared_norm_weight, eps);
     for (int64_t d = 0; d < H; ++d) hsel[ri * H + d] = h[static_cast<size_t>(d)];
   }
-  return Gemm(be, nullptr, mw.lm_head, hsel, R, V, H);
+  return Gemm(be, nullptr, mw.lm_head, hsel, R, V, H, "mtp.lm_head", /*layer=*/-1);
 }
 
 // W2C — the GGUF keep-quant forward. The SAME composition as the host oracle, but
@@ -4022,7 +4071,8 @@ void DeepseekV4ExpertProbe(const DeepseekV4Weights& weights, vt::Queue& queue,
       if (std::fread(din.data(), sizeof(float), static_cast<size_t>(H), fi) != static_cast<size_t>(H)) { std::fclose(fi); return; }
       std::fclose(fi);
       const int64_t ne = p.n_routed_experts;
-      const std::vector<float> myg = Gemm(be, &Lq.moe_gate, kNoHostWeights, din, 1, ne, H);
+      const std::vector<float> myg =
+          Gemm(be, &Lq.moe_gate, kNoHostWeights, din, 1, ne, H, "moe_gate", layer);
       double dr = 0; for (float v : din) dr += (double)v * v;
       std::fprintf(stderr, "[gate-xcheck] on ds4's router input (rms=%.4f): OUR logit[33]=%.4f logit[233]=%.4f\n",
                    std::sqrt(dr / H), myg[33], myg[233]);

@@ -3270,8 +3270,12 @@ void MoeGroupedGemmNvfp4(Queue& q, Tensor& out, const Tensor& act, const Tensor&
 // MoeGroupedGemmNvfp4 (naive one-thread-per-output for small/decode P; expert-
 // counting-sort + bf16 WMMA tensor-core tiles for large/prefill P) — the fp4
 // on-the-fly decode is replaced by a direct bf16 weight read. f32 accumulation,
-// out f32 (gate/up, matching the reference MatmulF32) or bf16 (down). CUDA only
-// (the CPU/GGUF MoE path keeps the per-expert MatmulBf16 reference).
+// out f32 (gate/up, matching the reference MatmulF32) or bf16 (down).
+// Registered on kCUDA (src/vt/cuda/cuda_matmul_nvfp4.cu:2722) and on kROCM
+// (src/vt/rocm/rocm_ops.hip:292); the CPU/GGUF MoE path registers no arm here
+// and keeps the per-expert MatmulBf16 reference. This line read "CUDA only"
+// until 2026-09-12, by which date the kROCM arm had landed and the
+// kMoeGroupedGemmBf16GateUpSilu paragraph in the OpId enum already cited it.
 //   act          [*, K] bf16 (row(p) selects the source row)
 //   expert_ids   [P] i32 (device) — per-pair expert id (router top-k, viewed [P])
 //   row_map      [P] i32 (device) or nullptr — pair p -> source act row
@@ -3294,7 +3298,11 @@ void MoeGroupedGemmBf16(Queue& q, Tensor& out, const Tensor& act, const Tensor& 
 // to that composite in every launch regime — the decode/non-WMMA path fuses the two
 // GEMMs into one grouped launch + a reduce+SwiGLU launch (reusing the exact split-K
 // sequential-k accumulation and the MoeSiluMul math); the WMMA path reuses the
-// grouped-GEMM dispatch twice + the identical silu-mul. CUDA only.
+// grouped-GEMM dispatch twice + the identical silu-mul. Registered on kCUDA
+// (src/vt/cuda/cuda_matmul_nvfp4.cu:2725) and on kROCM
+// (src/vt/rocm/rocm_ops.hip:295), exactly like MoeGroupedGemmBf16 above. This
+// line read "CUDA only" until 2026-09-12, by which date the kROCM arm had
+// landed.
 //   out          [P, N] bf16 (the per-(token,slot) silu(gate)*up)
 //   act          [*, K] bf16
 //   expert_ids   [P] i32 (device)
@@ -3486,7 +3494,12 @@ void RmsNormGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
 //     each opcode to the already-registered standalone vt:: op — BYTE-EXACT to the
 //     unfused sequence the model hand-calls (kRmsNorm->RmsNorm, kSiluMul->
 //     MoeSiluMul, kQuantFp4->ScaledFp4Quant, ...). Correct on every backend that
-//     registers the constituent ops; the fp8 quant terminal is CUDA-only.
+//     registers the constituent ops, the fp8 quant terminal included: this
+//     bullet said "the fp8 quant terminal is CUDA-only" from 1115648d6
+//     (2026-07-20) until 2026-09-12, and kQuantFp8Static gained its kCPU arm in
+//     f270b4b0a (2026-08-15, src/vt/cpu/cpu_ops.cpp:4241, #468/#842), so the
+//     terminal the walker dispatches is kCPU + kCUDA. The clause is DELETED
+//     rather than narrowed, because it named no arm that is still owed.
 //   Tier 1 (interpreter): a single-pass backend kernel for Tier-1-able recipes
 //     (all steps elementwise/kRmsNorm, e.g. kFusedAddRmsNorm); the perf tier.
 //
@@ -4256,7 +4269,14 @@ void Qwen4ExpGatedResidualWriteBack(Queue& q, Tensor& hyper, const Tensor& block
 // is upstream's zero-initialised polarity and NOT vLLM's `out * weight`;
 // cos/sin [>= num_keys, rotary_dim] f32, the FULL-position tables, of which this
 // op reads row `compress_ratio * b`; block_keys [num_keys / compress_ratio, D]
-// f32/bf16 OUT. CPU only; the CUDA arm is owed.
+// f32/bf16 OUT. Registered on kCPU (src/vt/cpu/cpu_qwen4_exp_qsa.cpp:354) and
+// on kCUDA (src/vt/cuda/cuda_qwen4_exp_qsa.cu:641 — unconditional, at
+// preprocessor depth 0). This line read "CPU only; the CUDA arm is owed" until
+// 2026-09-12, by which date the CUDA arm had landed; the kQwen4ExpQsaCompress
+// paragraph in the OpId enum above already said so, and a header that
+// contradicts itself about its own arms is worse than the edit. The kROCM arm
+// IS owed and MODEL-MM-QWEN4-EXP W4 owns it; until it lands a ROCm queue
+// refuses this op BY NAME through the ordinary GetOp message.
 void Qwen4ExpQsaCompress(Queue& q, Tensor& block_keys, const Tensor& raw_keys,
                          const Tensor& k_norm_weight, const Tensor& cos,
                          const Tensor& sin, const Qwen4ExpQsaCompressArgs& args);
@@ -4304,7 +4324,12 @@ void Qwen4ExpQsaCompress(Queue& q, Tensor& block_keys, const Tensor& raw_keys,
 // block_ids [T, block_topk] i32, ascending, `-1` = no block;
 // kv_lens [T] i32, the causal visible length per query token;
 // out [T, num_q_heads, head_dim] f32/bf16. GQA: num_q_heads % num_kv_heads == 0.
-// CPU only; the CUDA arm is owed.
+// Registered on kCPU (src/vt/cpu/cpu_qwen4_exp_qsa.cpp:357) and on kCUDA
+// (src/vt/cuda/cuda_qwen4_exp_qsa.cu:644 — unconditional, at preprocessor depth
+// 0). This line read "CPU only; the CUDA arm is owed" until 2026-09-12, by
+// which date the CUDA arm had landed. The kROCM arm IS owed and
+// MODEL-MM-QWEN4-EXP W4 owns it; until it lands a ROCm queue refuses this op BY
+// NAME through the ordinary GetOp message.
 void Qwen4ExpQsaGatherAttention(Queue& q, Tensor& out, const Tensor& query,
                                 const Tensor& key, const Tensor& value,
                                 const Tensor& block_ids, const Tensor& kv_lens,
@@ -5009,9 +5034,12 @@ void ReshapeAndCache(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache
 // 555967922. k_scale/v_scale are the per-tensor scales BaseKVCacheMethod loads
 // from the checkpoint (kv_cache.py:108-191); both must be > 0. Same shape/stride
 // contract as ReshapeAndCache; the ONLY difference is the fp8 store. Implemented
-// on CPU (W1, src/vt/cpu/cpu_cache.cpp) and CUDA (W2, src/vt/cuda/cuda_cache.cu,
-// gated byte-for-byte against the CPU arm); a backend that registers no provider
-// refuses by name in GetOp. kFp8E5M2 is a named later brick (spec W5).
+// on CPU (W1, src/vt/cpu/cpu_cache.cpp), CUDA (W2, src/vt/cuda/cuda_cache.cu,
+// gated byte-for-byte against the CPU arm) and ROCm (W6,
+// src/vt/rocm/rocm_ops.hip:253, landed 191f64608 / #2065); a backend that
+// registers no provider refuses by name in GetOp. This paragraph named only CPU
+// and CUDA until 2026-09-12, while PagedAttentionArgs::kv_cache_dtype above
+// already recorded the ROCm arm of the matching READ path. kFp8E5M2 is a named later brick (spec W5).
 void ReshapeAndCacheFp8(Queue& q, const Tensor& k, const Tensor& v, Tensor& k_cache,
                         Tensor& v_cache, const Tensor& slot_mapping, Fp8KVCacheDataType kind,
                         float k_scale, float v_scale);
@@ -5270,7 +5298,13 @@ void DsaTopkSelect(Queue& q, Tensor& indices, Tensor& counts, const Tensor& logi
 // (`forward` `:821-875`, with `get_visible_tokens` `:877-895` folded in as a
 // predicate and `append_visible_tail` `:972-1022` as the tail write). vLLM
 // implements `glm5_next` at no revision, so transformers is the reference here
-// under AGENTS.md "When vLLM has no implementation". CUDA only.
+// under AGENTS.md "When vLLM has no implementation". BOTH ops of this family are
+// registered on kCUDA (src/vt/cuda/cuda_glm5_next.cu:561,564) and on kROCM
+// (src/vt/rocm/rocm_ops.hip:345,348); there is deliberately NO CPU provider,
+// because the CPU answer is `glm5_next_dsa.cpp` and registering the oracle under
+// these ids would make the seam its own oracle — see the
+// kGlm5NextKpoolCompress paragraph in the OpId enum. This line read "CUDA only"
+// until 2026-09-12, by which date the kROCM arms had landed.
 //
 //   packed       f32 [batch, kv_len, 2 * head_dim + 1] — `concat[k, gate, valid]`
 //                (`:798-801`), the FULL key history the pool grid is re-formed

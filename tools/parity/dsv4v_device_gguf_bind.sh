@@ -5,9 +5,12 @@
 # Row `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm`, issue #2411 and
 # ISSUE-LOCAL-01M29KEXRT2GCS6C53DT2S3SPX.
 #
-#   rc cp ./head2.tar.gz thor:gpu0:/workspace/dsv4v-matvec/
+#   rc cp ./head3.tar.gz thor:gpu0:/workspace/dsv4v-matvec/
 #   rc run -d thor:gpu0 --max-runtime 180m -- \
-#     bash /workspace/dsv4v-matvec/dsv4v_device_gguf_bind.sh
+#     bash -c 'TARBALL=head3.tar.gz bash /workspace/dsv4v-matvec/dsv4v_device_gguf_bind.sh'
+#
+# `TARBALL` names the staged tree to measure and defaults to `head2.tar.gz`,
+# which is the tree the first run of this recipe measured.
 #
 # WHAT THIS MEASURES. The previous wave (out-20260912-223721) recorded, from the
 # served image on a CUDA build:
@@ -20,11 +23,15 @@
 # served-image test against the tree that binds it, and gates on ONE question:
 # does that refusal still name `wq_a` layer 0?
 #
-# THE GATE IS THE MESSAGE, NOT THE EXIT CODE. `test_deepseek_v4_mm_chat` also
-# carries the separately-filed CPU-only-premise assertion (it expects the served
-# error to name `W7-device`, which a CUDA build can never emit), so the suite
-# exits non-zero whatever happens to the image. Reading rc here would measure
-# that unrelated case. The `image: ` line is the measurement.
+# THE GATE IS THE MESSAGE AND THE COUNTED LINE, NEVER THE RAW EXIT CODE.
+# `test_deepseek_v4_mm_chat` used to carry a CPU-only-premise assertion -- it
+# expected the served error to name `W7-device`, which a build carrying the V4
+# device kernels can NEVER emit, because `kDevicePending` fires only when they
+# are absent. Measured on this box before that was repaired, the suite read
+# `test cases: 8 | 7 passed | 1 failed` with that one assertion as the failure.
+# The expectation is now device-aware, so the suite must be GREEN here and
+# `mm_chat_suite_green` gates on `0 failed` read off doctest's COUNTED line.
+# The raw exit code is still not the gate, and `Status:` never is.
 #
 # `pipefail` so a `cmd | tee f` reports the command's status and not tee's.
 set -uo pipefail
@@ -35,6 +42,11 @@ OUT=$W/bind-$STAMP; mkdir -p "$OUT"
 SRC=/tmp/dsv4v-bind
 ARCH=110
 NEED_GB=${NEED_GB:-60}
+# Which staged tree to measure. Named rather than hard-coded, so a later wave
+# does not have to OVERWRITE an earlier wave's tarball to reuse this recipe --
+# overwriting is how a run ends up measuring a tree nobody can identify after
+# the fact.
+TARBALL=${TARBALL:-head2.tar.gz}
 
 free_gb() { df -BG --output=avail /tmp | tail -1 | tr -dc '0-9'; }
 step() { echo "### STEP $1 RC=$2"; echo "$1 RC=$2" >> "$OUT/steps.txt"; }
@@ -81,7 +93,8 @@ case "$(nvcc --version | grep -o 'release [0-9]*' | head -1)" in
 esac
 
 mkdir -p "$SRC"
-tar -xzf "$W/head2.tar.gz" -C "$SRC" || { step untar 92; exit 92; }
+echo "### measuring tarball: $TARBALL"
+tar -xzf "$W/$TARBALL" -C "$SRC" || { step untar 92; exit 92; }
 test -f "$SRC/CMakeLists.txt" || { echo "FATAL: untar"; step untar 92; exit 92; }
 
 # ASSERT THE TREE REALLY CARRIES THE FIX. A staging slip that shipped the
@@ -110,6 +123,18 @@ echo "### the served image, with the tower bound"
 "$SRC/b/tests/test_deepseek_v4_mm_chat" -s > "$OUT/mm_chat.log" 2>&1
 echo "mm_chat exit=$? (RECORDED, NOT GATED -- see the header)"
 doctest_line "$OUT/mm_chat.log"; step mm_chat_ran $?
+
+# THE SUITE MUST BE GREEN once the image expectation is device-aware. Before
+# that repair this suite read `test cases: 8 | 7 passed | 1 failed` on this box,
+# the single failure being the unsatisfiable `W7-device` assertion. Read the
+# COUNTED line; `Status:` prints SUCCESS even when a filter selected nothing.
+if grep -E '^\[doctest\] test cases:' "$OUT/mm_chat.log" | tail -1 | grep -q '0 failed'; then
+  step mm_chat_suite_green 0
+else
+  echo "mm_chat is NOT green; the failing assertions are:"
+  grep -E 'ERROR:' "$OUT/mm_chat.log" | head -10
+  step mm_chat_suite_green 1
+fi
 echo "--- the image: line ---"
 grep -n 'image: ' "$OUT/mm_chat.log" | head -5
 echo "--- any host-GEMM refusal left ---"
@@ -146,7 +171,7 @@ echo "### steps"; cat "$OUT/steps.txt"
 # what separates "never ran" from "ran and returned 0". `image_served` is
 # RECORDED rather than required: whether an image serves is what the log says.
 EXPECTED="toolkit_install tree_carries_fix configure build mm_chat_ran
-          image_past_wq_a forward_suite mm_reach"
+          image_past_wq_a mm_chat_suite_green forward_suite mm_reach"
 step_rc() { sed -n "s/^$1 RC=\([0-9]*\)\$/\1/p" "$OUT/steps.txt" | tail -1; }
 FAIL=0
 for s in $EXPECTED; do

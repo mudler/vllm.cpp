@@ -16,4 +16,6 @@ The image branch of test_deepseek_v4_mm_chat asserts that the served error names
 
 ## Resolution
 
--
+2026-09-12 REPAIRED on this row's branch, and the CUDA expectation is MEASURED rather than assumed. The image branch now selects on vllm::deepseek_v4::V4DeviceKernelsAvailable() - the same symbol test_cuda_deepseek_v4.cpp uses, so the two suites agree on what 'this build carries the V4 device kernels' means. Without the kernels the case keeps the old expectation, because kDevicePending is exactly the refusal ForwardDevice's first guard emits there. With them, the kDevicePending refusal cannot fire at all, so the case asserts what a CUDA build DOES answer: measured on thor:gpu0 (sm_110, CUDA 13.0.88), rc job 1b46515d-8caf-4c49-823e-efc7a1f3e3f4, the request travels the whole registered forward and stops at the MoE router's named vision-bias refusal (an image step routes on exp_probs_b_vl, and the device router takes one bias per call with no per-row selector; that device arm is owed by #2411 W7-CUDA).
+
+IT ASSERTS THE REFUSAL, NOT MERELY 'NOT W7-device'. A bare inequality would accept ANY failure, including a regression that stopped the request earlier - which this row has already lived through twice (the vision-residency refusal, then the host GEMM's wq_a layer 0). When W7-CUDA lands the per-row bias, the request stops failing and takes the 'served' branch instead.

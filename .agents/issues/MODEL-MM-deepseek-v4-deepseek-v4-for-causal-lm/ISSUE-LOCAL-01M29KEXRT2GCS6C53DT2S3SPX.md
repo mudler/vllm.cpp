@@ -1,14 +1,14 @@
 ID: ISSUE-LOCAL-01M29KEXRT2GCS6C53DT2S3SPX
 Title: DeepSeek-V4 vision: a served image on a CUDA build dies in an anonymous 'vt: MatVec weight size mismatch'
 Row: MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm
-State: OPEN
+State: CLOSED
 Kind: bug
 GitHub: -
 Mirror: PENDING
 Availability: FULL
 Created: 2026-09-12
 Updated: 2026-09-12
-Closed: -
+Closed: 2026-09-12
 
 ## Problem
 
@@ -22,8 +22,14 @@ ROOT CAUSE. 'got 0' is what rules the shape hypothesis out: a wrong shape gives 
 
 REPAIR COMMITTED on this row's branch: ForwardDevice binds the keep-quant tower when the load took that arm. It binds rather than delegating to DeepseekV4ForwardGguf, because the four device op families are the point of that entry; binding gguf sets dsa_dense, which turns the indexer and compressor arms off on every layer exactly as the GGUF sibling already does.
 
-THIS ISSUE STAYS OPEN until a lease records what the served image does with the tower bound. Whether an image COMPLETES is a separate measurement and is not inferred from the diagnosis - it may yet stop at a further blocker, which would be named rather than guessed.
+2026-09-12 THE LEASE RECORDED IT, on thor:gpu0, rc job 1b46515d-8caf-4c49-823e-efc7a1f3e3f4 against the exact tree of commit 81b050ae9. The wq_a refusal is GONE (step image_past_wq_a RC=0) and the request now travels the whole registered forward. It does NOT yet serve (step image_served RC=1): it stops at a DIFFERENT and pre-existing refusal, the MoE router's named one - an image step routes on the vision bias exp_probs_b_vl while the device router takes one bias per call with no per-row selector, so it refuses by name rather than routing image rows on the text bias. That device arm is W4-era code and is already owed by #2411 W7-CUDA; it is not a regression from this repair. No suite regressed: test_deepseek_v4_forward 7 of 7 passed and test_deepseek_v4_mm_reach 20 of 20 passed under VT_CPU_QUANT_REPACK=0.
 
 ## Resolution
 
--
+2026-09-12 CLOSED. Both owed halves are done and each was measured on thor:gpu0 rather than argued.
+
+(1) NAMED. Gemm's host-float arm refuses in the keep-quant arm's own vocabulary - 'deepseek-v4 host GEMM: weight size mismatch: tensor `<name>` layer <n> want [N=..,K=..] = .. elements, got .. elements' - and the keep-quant arm carries the same tensor/layer identifiers so both name the same thing. The labels are REQUIRED, not defaulted, so a forgotten call site is a -Werror failure; check-tree-compiles compiled 685 of 685 translation units in scope. Red-first through the production entry DeepseekV4ForwardHost, rc job 04f39bcb-5636-4043-9cfc-8bdebd4862ec: base binary md5 e4cb32adefff556a13424a4d904640d1 read 'test cases: 1 | 0 passed | 1 failed', head binary md5 f68f07d4dfd0c1795b9c509a3924ca7e read '1 | 1 passed | 0 failed', the two md5s differ (so the green is not the red binary re-run), and the full suite stayed 7 of 7.
+
+(2) ROOT-CAUSED AND REPAIRED. The measured throw named 'tensor `wq_a` layer 0 want [N=32,K=32] = 1024 elements, got 0 elements'. 'got 0' ruled out the shape hypothesis - a wrong shape gives a wrong count, zero means the weight reached NEITHER arm. DeepseekV4Model::ForwardDevice never bound the keep-quant tower, so every layer got Lq = nullptr and every Gemm fell to a host tower the loader leaves empty by design on a GGUF load. ForwardDevice now binds it, mirroring the sibling Forward. Verified on thor (job 1b46515d): the wq_a refusal is gone.
+
+WHAT THIS ISSUE DOES NOT CLAIM, and why it still closes: a served image does not yet complete. It now stops at the MoE vision-bias device router, which is W4-era code with its own named refusal and is already owed by #2411 W7-CUDA. That is a different blocker with a different owner, and keeping this issue open for it would make the record say the anonymous MatVec refusal is still live when it is not.

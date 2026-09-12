@@ -931,10 +931,11 @@ above as its red-before input.
   `b10766` inside W6's declared bound; see `### W7-CUDA evidence`. What CUDA
   still cannot do is listed in the four entries below.
 
-- **`vt: MatVec weight size mismatch` IS NOW THE FIRST BLOCKER FOR A SERVED
-  IMAGE ON CUDA. It SUPERSEDES vision residency, which W7-CUDA fixed.**
+- **THE HOST GEMM's WEIGHT SIZE MISMATCH IS CLOSED. The first blocker for a
+  served image on CUDA is now the MoE VISION-BIAS DEVICE ROUTER**, which is
+  W4-era code carrying its own named refusal and is owed by #2411 W7-CUDA.
 
-  **THE BLOCKER ORDER ON THIS ROW HAS MOVED THREE TIMES UNDER MEASUREMENT, and
+  **THE BLOCKER ORDER ON THIS ROW HAS MOVED FOUR TIMES UNDER MEASUREMENT, and
   each move was only visible because the previous blocker was genuinely
   repaired.** A reader needs to know which are closed and which is live:
 
@@ -942,7 +943,8 @@ above as its red-before input.
   |---|---|---|
   | 1 | `fp8_ds_mla` KV cache at engine start | **NOT what stops a CUDA build.** W6 measured it on a CPU build; `KV-DSV4-MULTICACHE` W5 (#2455) owns it and it is untouched here |
   | 2 | `DeepSeek-V4 vision queue and weights must share one device` | **CLOSED by W7-CUDA.** See `### W7-CUDA evidence` |
-  | 3 | the host GEMM's weight size mismatch, thrown as the anonymous `vt: MatVec weight size mismatch` until it was named | **LIVE, and now NAMED. This entry.** |
+  | 3 | the host GEMM's weight size mismatch, thrown as the anonymous `vt: MatVec weight size mismatch` until it was named | **CLOSED.** Named, then root-caused to `ForwardDevice` never binding the keep-quant tower, then repaired. Measured gone on `thor:gpu0`, rc job `1b46515d-8caf-4c49-823e-efc7a1f3e3f4`. This entry |
+  | 4 | `deepseek-v4 MoE: this step carries image rows, which route on the vision bias `exp_probs_b_vl`, and the device router takes one bias for the whole call with no per-row selector` | **LIVE.** W4-era code refusing BY NAME rather than routing image rows on the text bias. The device arm is owed by #2411 W7-CUDA; it is not a regression from blocker 3's repair |
 
   **THE EXACT FAILING INVOCATION.** `test_deepseek_v4_mm_chat`'s served image
   request died with

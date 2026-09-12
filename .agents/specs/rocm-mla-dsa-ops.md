@@ -338,14 +338,40 @@ W1 landed at `928d89a9b`. **W3 landed by [#2926](https://github.com/mudler/vllm.
 together with `kMlaPrefillAttention`, which this spec placed under `## Owed`
 rather than in a wave -- see `.agents/specs/rocm-mla-attention-nonflash.md`
 for why the two ship together and why the decode arm is a single-pass
-kernel rather than the split this spec priced. W2 (the DSA indexer pair)
-is unclaimed, so a SPARSE step still has no native path.
+kernel rather than the split this spec priced.
+
+**W2 IS LANDED, BY ANOTHER ROW, AND IN ONE ARM RATHER THAN TWO.**
+`kDsaIndexerLogits` and `kDsaTopkSelect` are registered on `kROCM` from
+`src/vt/rocm/rocm_dsa_indexer.hip`, landed as W5 of
+`.agents/specs/qwen4-exp-rocm-ops.md` under row `MODEL-MM-QWEN4-EXP`, which owed
+the same pair because `qwen4_exp`'s QSA block COMPOSES its indexer from them.
+**Two rows owned this gap at once and neither had claimed it**, so the arm was
+written once and both specs reconciled onto it in the same change rather than a
+second kernel being written; that spec's D3g carries the vLLM AMD mirror
+comparison and its D3h the red/green pair, the fixture and twelve mutations, all
+measured on `strix:gpu0`. The pricing above is otherwise sound: the pair IS one
+unit, and the tie rule and ascending emission ARE the load-bearing part, which is
+what that wave's fixture was built around.
+
+**What this does NOT change is the speed axis.** The ROCm GLM-5.3 axis stays
+VOID: nothing has run a SPARSE step on that board since the arm landed, and this
+spec's `## Owed` keeps the entry until something does. The two ops no longer
+refuse; that is the whole of the claim.
 
 ## Owed
 
 - `kMlaDecodeAttention` on ROCm — W3. Owner `BACKEND-ROCM`, issue #2715.
-- `kDsaIndexerLogits` + `kDsaTopkSelect` on ROCm — W2. Owner `BACKEND-ROCM`,
-  issue #2715.
+- ~~`kDsaIndexerLogits` + `kDsaTopkSelect` on ROCm — W2.~~ LANDED 2026-09-12 in
+  `src/vt/rocm/rocm_dsa_indexer.hip` as W5 of
+  `.agents/specs/qwen4-exp-rocm-ops.md`. See `## Now`.
+- **`src/vt/rocm/rocm_ops.hip:370-375` now carries a FALSE sentence that came
+  from this spec's W1** — "The DSA indexer pair (kDsaIndexerLogits,
+  kDsaTopkSelect) is still absent, so the GLM-5.3 speed axis stays VOID and a
+  SPARSE step still refuses." The absence half is no longer true; the VOID half
+  still is. The correction is one comment line and it was NOT taken by the wave
+  that landed the arm, because `rocm_ops.hip` is a surface every ROCm row writes
+  and AGENTS.md "Records" calls such a file a lock. Owner `BACKEND-ROCM`, issue
+  #2715: the next row to edit that file for its own reasons should carry it.
 - `kMlaPrefillAttention` on ROCm — NOT a port. Owner `BACKEND-ROCM`, issue
   #2715. Its CUDA arm is the vendored FA-2 launcher behind `VLLM_CPP_FLASH_ATTN`,
   so a ROCm arm is a new kernel written against the CPU reference. Measured on
@@ -356,4 +382,7 @@ is unclaimed, so a SPARSE step still has no native path.
 - `kFusedChain` on ROCm — **non-gating**. Owner `BACKEND-ROCM`, issue #2715.
   Reached only under `VT_FUSED_TIER=1`, which is a rejected performance arm on
   every backend that measured it, so it cannot disqualify a default run.
-- The ROCm speed axis for GLM-5.3 stays **VOID** until W2 and W3 both land.
+- The ROCm speed axis for GLM-5.3 stays **VOID**. W2 and W3 have both landed, so
+  the axis is now MEASURABLE and UNMEASURED, which is a different state from the
+  one this line used to describe: nothing has run a SPARSE step on `strix:gpu0`
+  since, and an unrun axis is never a pass.

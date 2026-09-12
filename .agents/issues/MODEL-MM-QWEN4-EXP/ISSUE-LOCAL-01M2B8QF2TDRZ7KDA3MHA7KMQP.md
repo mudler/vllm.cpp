@@ -1,14 +1,14 @@
 ID: ISSUE-LOCAL-01M2B8QF2TDRZ7KDA3MHA7KMQP
 Title: backend(ROCm): the qwen4_exp forward still refuses after W4, at the DSA indexer pair
-Row: -
-State: OPEN
+Row: MODEL-MM-QWEN4-EXP
+State: CLOSED
 Kind: bug
 GitHub: -
 Mirror: PENDING
 Availability: FULL
 Created: 2026-09-12
 Updated: 2026-09-12
-Closed: -
+Closed: 2026-09-12
 
 ## Problem
 
@@ -22,4 +22,4 @@ What this owes: a wave that gives both indexer ops a ROCm arm, gated against the
 
 ## Resolution
 
--
+RESOLVED 2026-09-12 by W5 of `.agents/specs/qwen4-exp-rocm-ops.md`. `src/vt/rocm/rocm_dsa_indexer.hip` registers `vt::DsaIndexerLogits` and `vt::DsaTopkSelect` on `kROCM`, self-registering in W1's pattern with `rocm_ops.hip` untouched. Measured on `strix:gpu0` (gfx1151, ROCm 7.2.4 / HIP 7.2.53211): RED at 0b605b80a, 60 cases / 58 passed / 2 failed, both failures the registration REQUIREs and neither a number; GREEN at 4c9e2042c, 60 cases / 60 passed / 0 failed / 0 skipped, 84825 assertions. The logits arm is BIT-IDENTICAL to the CPU oracle in all four arms at the released 64-head geometry (0 differing bytes of 800) and 2e-14 at 96 heads; the selector is INDEX-EXACT (0 differing indices and 0 differing counts at topk 1, 5 and 12). Twelve mutations, eleven red and one an equivalent mutant with its analysis; spec D3h has the table and D3g the vLLM AMD mirror comparison. TWO ROWS OWNED THIS PAIR: it is also W2 of `.agents/specs/rocm-mla-dsa-ops.md` under BACKEND-ROCM / #2715, reconciled onto the one arm in the same change. WHAT THIS DOES NOT MEAN: it removes the last KNOWN op refusal for qwen4_exp on ROCm, and nothing has loaded a checkpoint or completed a forward on that board; W6 owns that and no token or performance claim follows from this wave.

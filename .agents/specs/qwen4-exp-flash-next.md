@@ -10316,6 +10316,57 @@ copying that pointer into a second handle that can outlive it is how #2476's
 use-after-free was built. If a sweep of other per-step adapters is wanted it is
 its own row, with its own review.
 
+**Device residency changes, and that is the mechanism rather than a side
+effect.** The `d_dev` deleter that `ResidentWeight` installs
+(`include/vllm/model_executor/models/dense_attn_block.h:243`,
+`w.d_dev = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); })`) hangs off
+whichever handle was staged. Today that handle is the per-layer temporary, so
+the deleter runs at the end of each layer -- those are the 378 `cudaFree` calls
+per step the profile above measured. After the hoist the deleter hangs off a
+model-held handle, so every expert tower stays device-resident for the life of
+the model. Steady-state DEVICE footprint therefore moves from roughly one
+layer's towers to the whole set. That is exactly what makes the memo survive the
+step; it is not an incidental cost, and no correctness claim depends on it. The
+risk it creates is capacity, not tokens: on a unified-memory box a model whose
+host mapping and device allocations are both live can fail to fit, and that
+failure presents as an allocation error rather than as a slow number.
+`AdoptDeviceBytesAsHost` is the lever that would collapse the host mirror onto
+the device block, and IT DOES NOT APPLY TO THIS ARTIFACT. Its first branch needs
+`w.mmap_src != nullptr && w.bytes.borrowed()`, and `OwnedTensor::mmap_src`
+(`include/vllm/model_executor/models/qwen3_5_weights.h:119`) has exactly one
+producer in the tree: `o.mmap_src = t.data;` at
+`src/vllm/model_executor/models/qwen3_5_weights.cpp:517`, inside
+`BorrowStTensorBytes` (`:491`), which takes an `StTensor` and is therefore the
+SAFETENSORS direct-upload path. `grep -rn '\.mmap_src\s*=' src/ include/`
+returns five hits and the other four are clears to `nullptr`. No GGUF path
+assigns it, which is what the tree comment at `:265-266` already states and what
+the header contract at `:112-118` turns on. The `MmapSrc(g, pol)` helper at
+`qwen4_exp_weights.cpp:123` is NOT that field: it returns a `const GgufFile*`
+whose only use inside `OwnGgufQuantBlocks` is `DropSpanResidency`, and the two
+share nothing but a name. So on a GGUF weight adoption returns early, the host
+mirror survives, and both copies are real.
+
+The expectation that follows, stated so the measurement can refute it: the
+released UD-IQ1_S artifact is held twice -- roughly 68 GiB of host mapping plus
+roughly 68 GiB of device allocations on a 128 GB unified-memory box. Confirming
+or refuting that is what the peak-device-memory axis below is for. Nothing here
+predicts what the box does with it.
+
+**The re-measurement must capture PEAK DEVICE MEMORY beside step time.** A step
+time alone cannot see the paragraph above. The operator's `dgx:gpu0` run records
+peak device bytes for both arms on the same harness, and the arm that is faster
+but does not fit is not an improvement.
+
+**The focused gate is NOT `test_qwen4_exp_layer_loop` alone.** It must include
+`test_qwen4_exp_moe` and `test_qwen4_exp_moe_sel_fp`. The reviewer's M5 mutation
+deep-copied all six expert-tower entries instead of borrowing them, and the new
+layer-loop file stayed fully green (470 of 470 assertions). The mutation was
+caught only by the pre-existing W5d-4 cases, whose assertion is the borrow
+identity itself -- `mw.expert_gate_kq.bytes.data() == s.w.gate_exps.bytes.data()`
+(`tests/vllm/models/test_qwen4_exp_moe.cpp:567`). The borrow guarantee with the
+largest blast radius, constraint (2) above and the whole of #2476, is pinned
+there and nowhere else.
+
 ### The decode-step profile, measured (2026-09-12, `dgx:gpu0`, `51c248190`)
 
 Everything in the section below this one was a hypothesis. This section is the

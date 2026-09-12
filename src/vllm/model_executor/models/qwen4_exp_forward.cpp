@@ -647,31 +647,41 @@ Qwen4ExpTextModelOutput Qwen4ExpTextModelForward(
 
     // ─── :1240  hidden_states = self.mlp(hidden_states) ─────────────────────
     // Through the SHARED sparse-MoE seam, which is what W5d-4's adapter exists
-    // for; this loop composes `Qwen4ExpMoeBlockWeights` per layer rather than a
-    // second MoE path.
+    // for; this loop composes `Qwen4ExpMoeBlockWeights` ONCE PER LAYER and
+    // holds it on that layer, rather than writing a second MoE path.
     {
+      // BUILT ONCE AND HELD BY THE MODEL, exactly as `lw.gdn_block` above is
+      // and for the same reason (W6,
+      // `ISSUE-LOCAL-01M2AA9C31GCSDV8NRW26GMEVS`). A `MoeBlockWeights` composed
+      // HERE is a set of handles this scope owns, and `BorrowWholeOwnedTensor`
+      // carries every field EXCEPT `d_dev` — so each step presented
+      // `ResidentWeight` a null residency memo and each of the three expert
+      // towers, the three shared-expert projections, the router and the shared
+      // gate took the staging arm again. Measured on `dgx:gpu0` (2026-09-12,
+      // `51c248190`, GB10, released UD-IQ1_S): 378 `cudaMalloc` calls per decode
+      // step against the 48 x 8 = 384 this composition asks for, 2.25 s of the
+      // step inside the allocator against 0.101 s in every GPU kernel together.
+      // `lw.moe_block` outlives every step, so the memo written onto its handles
+      // is still there on the next one.
+      //
       // NON-CONST by W5d-4's own contract: the per-expert views BORROW the
       // tower's bytes and `OwnedBytes::KeepAlive()` converts the owned buffer
-      // into a shared read-only one IN PLACE. Rebuilding the adapter per layer
-      // per STEP is the third risk #2336 §3 names — it loses
-      // `ResidentWeight::d_dev` and re-uploads the tower on a device arm — and
-      // it is a SPEED ceiling this wave inherits rather than a wrong answer;
-      // the spec's `## Owed` carries the hoist.
+      // into a shared read-only one IN PLACE. That is also why the adapter is
+      // not a pure function of the layer and is built OUTSIDE the placed body
+      // rather than inside the lambda: it must not be re-evaluated per
+      // placement arm.
       //
-      // "RATHER THAN A WRONG ANSWER" HOLDS HERE ONLY BECAUSE THE ADAPTER
-      // BORROWS. `Qwen4ExpMoeBlockWeights` passes the towers through
-      // `BorrowWhole`, so the buffer a queued kernel reads belongs to the model
-      // and the per-step rebuild costs residency work and nothing else. The GDN
-      // adapter next door spelled the same pass-through as assignment, which
-      // deep-copies, and there the per-step rebuild was a freed operand
-      // underneath a queued GEMM (issue #2476). Whoever hoists this must not
-      // read the sentence above as a general licence.
-      // Built OUTSIDE the placed body on purpose: `Qwen4ExpMoeBlockWeights`
-      // takes a non-const reference and mutates it via `OwnedBytes::KeepAlive()`,
-      // so it is not a pure function of the layer and must not be re-evaluated
-      // per placement arm.
-      MoeBlockWeights mw = Qwen4ExpMoeBlockWeights(
-          w.layers[static_cast<size_t>(il)].moe, p);
+      // THE PASS-THROUGH STAYS A BORROW, and the hoist does not make that
+      // optional. `Qwen4ExpMoeBlockWeights` passes the towers through
+      // `BorrowWhole`, so the buffer a queued kernel reads belongs to the
+      // model. The GDN adapter next door spelled the same pass-through as
+      // assignment, which deep-copies ~115 MiB per linear layer per step and
+      // left a freed operand underneath a queued GEMM (issue #2476). Holding
+      // the adapter makes the handles outlive the kernels; it does not make a
+      // copy safe.
+      if (!lw.moe_block.has_value())
+        lw.moe_block.emplace(Qwen4ExpMoeBlockWeights(lw.moe, p));
+      const MoeBlockWeights& mw = *lw.moe_block;
 
       // ENG-HYBRID-PLACEMENT (#2424): through the SHARED placement seam, inert by
       // construction when this layer is not placed. The block already has the

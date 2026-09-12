@@ -6577,6 +6577,24 @@ TEST_CASE("qwen4_exp QSA compressor matches the CPU oracle and is NATIVE on ROCm
                                                << " differing bytes " << diff_bytes << " of "
                                                << got.size());
         CHECK(nmse <= kNmseTol);
+        // AND THE BYTE COUNT IS AN ASSERTION, not only a MESSAGE, because the
+        // NMSE band alone CANNOT SEE this op's intermediate-rounding contract.
+        // MEASURED: dropping `MaybeBf16` from the rope's final add — the whole
+        // of what `round_intermediates_to_bf16` buys at that store — SURVIVED
+        // the 5e-4 band at NMSE 1.16317e-06, 0.0023x the bar, while changing
+        // 399 of 3072 bytes. Three of the four arms cannot see it at all: with
+        // `round=0` the helper is the identity, and on a bf16 tensor `StoreAt`
+        // has already rounded, so only the f32 `round=1` arm carries the axis
+        // and it carries it as BYTES. Widening the fixture is not available
+        // here — the difference IS one bf16 rounding — so the bar becomes the
+        // one this arm actually guarantees. It is not a tightening chosen to
+        // pass: the file's own header predicts bit-identity from the operand
+        // list (no transcendental, `sqrtf` and `__frcp_rn` correctly rounded by
+        // IEEE-754 on both sides, every reduction in the host's order), the
+        // CUDA sibling already gates the same op with a `memcmp`, and the
+        // unmutated arm measured 0 differing bytes in all four arms on
+        // gfx1151.
+        CHECK(diff_bytes == 0);
         dev.DestroyQueue(q);
       }
     }
@@ -6597,7 +6615,17 @@ TEST_CASE("qwen4_exp QSA gather attention matches the CPU oracle and is NATIVE o
   constexpr int64_t kKvShort = 2051;
   constexpr int64_t kBudgetBlocks = 512;
   constexpr int64_t kTopk = 520;  // > budget, so the `-1` TERMINATOR is exercised
-  constexpr int64_t T = 3;
+  // A FOURTH TOKEN AT kv_len 7 IS NOT DECORATION AND IT IS NOT THE DECODE SHAPE
+  // EITHER, it is what makes the RAGGED TAIL measurable. MEASURED on the
+  // three-token fixture: deleting the tail from the selection count moved the
+  // NMSE to 0.000919392, only 1.84x the 5e-4 bar — because the tail is at most
+  // `compress_ratio - 1` = 3 rows by construction, and 2 rows out of 2050
+  // cannot move a softmax far. The fixture cannot be widened by making the tail
+  // bigger, so it is widened by giving one token a context the tail DOMINATES:
+  // at kv_len 7 the tail is 3 of 7 attended rows. The long tokens keep the
+  // sparsity axis; this one keeps the tail axis.
+  constexpr int64_t kKvTiny = 7;
+  constexpr int64_t T = 4;
   // 4 query heads over 2 KV heads: `groups` is 2, so a kernel that used `h`
   // where it needed `h / groups` reads the wrong KV head and cannot pass.
   constexpr int64_t HQ = 4;
@@ -6623,7 +6651,6 @@ TEST_CASE("qwen4_exp QSA gather attention matches the CPU oracle and is NATIVE o
   // of `block_ids` for every token cannot pass; token 2 selects all 512 of its
   // complete blocks, which is the sub-budget control.
   std::vector<int32_t> ids(static_cast<size_t>(T) * kTopk, -1);
-  std::vector<int64_t> selcount(T, 0);
   {
     auto put = [&](int64_t t, const std::vector<int64_t>& blocks) {
       REQUIRE(static_cast<int64_t>(blocks.size()) <= kTopk);
@@ -6631,32 +6658,24 @@ TEST_CASE("qwen4_exp QSA gather attention matches the CPU oracle and is NATIVE o
         ids[static_cast<size_t>(t) * kTopk + j] = static_cast<int32_t>(blocks[j]);
       }
     };
-    std::vector<int64_t> b0, b1, b2;
+    std::vector<int64_t> b0, b1, b2, b3;
     for (int64_t b = 0; b < 256; ++b) b0.push_back(b);
     for (int64_t b = 494; b < 750; ++b) b0.push_back(b);
     for (int64_t b = 1; b < 257; ++b) b1.push_back(b);
     for (int64_t b = 493; b < 749; ++b) b1.push_back(b);
     for (int64_t b = 0; b < 512; ++b) b2.push_back(b);
+    b3.push_back(0);  // the tiny token's ONE complete block
     REQUIRE(static_cast<int64_t>(b0.size()) == kBudgetBlocks);
     REQUIRE(static_cast<int64_t>(b1.size()) == kBudgetBlocks);
     REQUIRE(static_cast<int64_t>(b2.size()) == kBudgetBlocks);
     put(0, b0);
     put(1, b1);
     put(2, b2);
+    put(3, b3);
   }
-  const std::vector<int32_t> lens = {static_cast<int32_t>(kKvLong),
-                                     static_cast<int32_t>(kKvLong),
-                                     static_cast<int32_t>(kKvShort)};
-  int64_t dense_reads = 0;
-  for (int64_t t = 0; t < T; ++t) {
-    const int64_t kv = lens[static_cast<size_t>(t)];
-    selcount[static_cast<size_t>(t)] = kBudgetBlocks * kQsaCR + (kv - (kv / kQsaCR) * kQsaCR);
-    dense_reads += kv * HQ * 2;
-  }
-  // Two softmax passes per (token, head), COUNTED AT THE READ.
-  int64_t honest_reads = 0;
-  for (int64_t t = 0; t < T; ++t) honest_reads += selcount[static_cast<size_t>(t)] * HQ * 2;
-  REQUIRE(honest_reads < dense_reads);
+  const std::vector<int32_t> lens = {
+      static_cast<int32_t>(kKvLong), static_cast<int32_t>(kKvLong),
+      static_cast<int32_t>(kKvShort), static_cast<int32_t>(kKvTiny)};
 
   // The expansion of one token's selection into RAW ROW indices, which the test
   // needs for the pooled-key control and the NaN probe below. It is the same
@@ -6674,9 +6693,20 @@ TEST_CASE("qwen4_exp QSA gather attention matches the CPU oracle and is NATIVE o
     for (int64_t p = complete * kQsaCR; p < kv; ++p) rows.push_back(p);
     return rows;
   };
+  // THE COUNTS ARE DERIVED FROM THE EXPANSION, not from the budget: the tokens
+  // no longer all select `kBudgetBlocks`, and a hand-written count would be a
+  // second implementation of the rule the op documents.
+  std::vector<int64_t> selcount(T, 0);
+  int64_t dense_reads = 0, honest_reads = 0;
   for (int64_t t = 0; t < T; ++t) {
-    REQUIRE(static_cast<int64_t>(rows_for(t).size()) == selcount[static_cast<size_t>(t)]);
+    selcount[static_cast<size_t>(t)] = static_cast<int64_t>(rows_for(t).size());
+    dense_reads += lens[static_cast<size_t>(t)] * HQ * 2;  // two softmax passes
+    honest_reads += selcount[static_cast<size_t>(t)] * HQ * 2;
   }
+  REQUIRE(honest_reads < dense_reads);
+  // Token 3's tail is 3 of its 7 attended rows, which is the point of it.
+  REQUIRE(selcount[3] == kKvTiny);  // one complete block expanded, plus the tail
+  REQUIRE(kKvTiny - (kKvTiny / kQsaCR) * kQsaCR == kQsaCR - 1);  // the WIDEST tail there is
 
   vt::Qwen4ExpQsaAttnArgs args;
   args.scale = kScale;

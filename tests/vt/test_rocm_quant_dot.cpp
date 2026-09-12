@@ -32,6 +32,7 @@
 #include "vt/quant.h"
 #include "vt/rocm/rocm_mmvq_policy.h"
 #include "vt/rocm/rocm_norm_quant_bridge.h"
+#include "vt/rocm/rocm_runtime.h"
 #include "vt/tensor.h"
 
 // Compile the exact scratch policy used by the HIP provider with host fakes.
@@ -1138,5 +1139,89 @@ TEST_CASE(
       vt::rocm::Q8KRouteDispatchCountForTest(true, true);
   CHECK(grouped_q8k_routes == 9);
 #endif
+  gpu.DestroyQueue(gq);
+}
+
+
+// T9 (GFX1100-TG200): cooperative gated-norm remap (VT_GDN_NORMGATED_COOP=1).
+// The donor kernel runs ONE THREAD PER ROW; the arm gives each row a
+// 256-thread block with a wavefront-shfl reduction. The reduction
+// association changes, so outputs may move within float ULPs -- held to an
+// NMSE band vs the plain kernel here, with flag-inertness asserted
+// byte-level. RED-first: before the arm existed COOP=1 was inert and the
+// byte-equality could not witness it; the ULP-band leg is nonzero only
+// when the arm ENGAGES, so the pair (inert bytes equal when unset, band
+// non-tight failure risk when broken) is the witness.
+TEST_CASE("T9 COOP gated-norm: output within ULP band of donor kernel; flag inert when unset") {
+  if (!vt::rocm::DeviceAvailable()) {
+    MESSAGE("no AMD GPU on this host; ROCm keep-quant gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue gq = gpu.CreateQueue();
+  for (int64_t d : {int64_t{256}, int64_t{2560}}) {
+    const int64_t rows = 4;
+    CAPTURE(d);
+    std::mt19937 rng(0x7C00U + static_cast<unsigned>(d));
+    std::vector<uint16_t> abf(rows * d), gb(rows * d), gw(d);
+    for (auto& v : abf) v = vt::F32ToBF16(static_cast<float>(static_cast<int>(rng() % 2001) - 1000) / 500.0F);
+    for (auto& v : gb) v = vt::F32ToBF16(static_cast<float>(static_cast<int>(rng() % 2001) - 1000) / 500.0F);
+    for (auto& v : gw) v = vt::F32ToBF16(0.5F);
+    void* d_a = gpu.Alloc(abf.size() * 2);
+    void* d_g = gpu.Alloc(gb.size() * 2);
+    void* d_w = gpu.Alloc(gw.size() * 2);
+    gpu.Copy(gq, d_a, abf.data(), abf.size() * 2);
+    gpu.Copy(gq, d_g, gb.data(), gb.size() * 2);
+    gpu.Copy(gq, d_w, gw.data(), gw.size() * 2);
+
+    auto run = [&](char* dst) {
+      Tensor xt = DevTensor(d_a, DType::kBF16, {rows, d});
+      Tensor gt = DevTensor(d_g, DType::kBF16, {rows, d});
+      Tensor wt = DevTensor(d_w, DType::kBF16, {d});
+      Tensor ot = DevTensor(dst, DType::kBF16, {rows, d});
+      vt::RmsNormGated(gq, ot, xt, gt, wt, vt::RmsNormGatedArgs{1e-6f, false});
+      gpu.Synchronize(gq);
+    };
+    std::vector<unsigned char> plain(abf.size() * 2), coop(abf.size() * 2);
+    void* d_o = gpu.Alloc(abf.size() * 2);
+    {
+      ::unsetenv("VT_GDN_NORMGATED_COOP");
+      run(static_cast<char*>(d_o));
+      gpu.Copy(gq, plain.data(), d_o, plain.size());
+      ::setenv("VT_GDN_NORMGATED_COOP", "1", 1);
+      run(static_cast<char*>(d_o));
+      gpu.Copy(gq, coop.data(), d_o, coop.size());
+      gpu.Synchronize(gq);
+    }
+    double num = 0.0, den = 0.0;
+    bool identical = true;
+    for (size_t i = 0; i < abf.size(); ++i) {
+      const unsigned pb = plain[i * 2] | (plain[i * 2 + 1] << 8);
+      const unsigned cb = coop[i * 2] | (coop[i * 2 + 1] << 8);
+      if (pb != cb) identical = false;
+      const float p = vt::BF16ToF32(static_cast<uint16_t>(pb));
+      const float c = vt::BF16ToF32(static_cast<uint16_t>(cb));
+      num += (p - c) * (p - c);
+      den += p * p;
+    }
+    // Informational only: whether the reassociation flips a rounded bit is
+    // data-dependent. ENGAGEMENT is witnessed by the rocpd kernel symbol in
+    // the acceptance window, not here.
+    CAPTURE(identical);
+    const double nmse = den > 0 ? num / den : 0.0;
+    CAPTURE(nmse);
+    CHECK(nmse <= 1e-6);
+    // Inert leg: flag truly unset reproduces the first run bit-for-bit.
+    std::vector<unsigned char> again(abf.size() * 2);
+    ::unsetenv("VT_GDN_NORMGATED_COOP");
+    run(static_cast<char*>(d_o));
+    gpu.Copy(gq, again.data(), d_o, again.size());
+    gpu.Synchronize(gq);
+    CHECK(again == plain);
+    gpu.Free(d_o);
+    gpu.Free(d_a);
+    gpu.Free(d_g);
+    gpu.Free(d_w);
+  }
   gpu.DestroyQueue(gq);
 }

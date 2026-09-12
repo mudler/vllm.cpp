@@ -279,10 +279,15 @@ enum class OpId : uint8_t {
   // --- Collective transport ops (BACKEND-DISTRIBUTED-COMM W2) -----------------
   // The vt::Communicator collectives, deferred from W1 (a direct method was the
   // cleaner W1 gate; W2 routes them through OpProvider so a backend SUPPLIES the
-  // transport — CPU in-process reduce, NCCL on kCUDA, MLX-ring on kMETAL). Each
-  // is dispatched on the queue's DeviceType and hands the bound Communicator its
-  // device-specific data plane. Mirrors DeviceCommunicatorBase.all_reduce:215 /
-  // all_gather:219 / send:321 / recv:328 (base_device_communicator.py). See
+  // transport). Two arms are registered, and only two: CPU in-process reduce
+  // (src/vt/communicator.cpp:297-302) and NCCL on kCUDA
+  // (src/vt/cuda/nccl_communicator.cu:152-158). This paragraph also read
+  // "MLX-ring on kMETAL" until 2026-09-12; no kMETAL registration exists for any
+  // of these four ids, so that transport is OWED and a Metal queue refuses all
+  // four BY NAME. Each is dispatched on the queue's DeviceType and hands the
+  // bound Communicator its device-specific data plane. Mirrors
+  // DeviceCommunicatorBase.all_reduce:215 / all_gather:219 / send:321 /
+  // recv:328 (base_device_communicator.py). See
   // vt::CommAllReduceFn (include/vt/communicator.h). Additive: nothing on the
   // world_size==1 single-GPU path dispatches them (the collective returns before
   // the lookup — parallel_state.py:638 bypass).
@@ -350,7 +355,9 @@ enum class OpId : uint8_t {
   // f32 [P,I] HBM round-trips; in the WMMA regime it reuses LaunchGroupedBf16
   // twice + the byte-identical silu-mul. BIT-IDENTICAL to {2x kMoeGroupedGemmBf16
   // (f32 out) + kMoeSiluMul (bf16 out)} in every regime — that composite is the
-  // golden the A/B unit test gates against. CUDA-only (like kMoeGroupedGemmBf16).
+  // golden the A/B unit test gates against. Registered on kCUDA
+  // (src/vt/cuda/cuda_matmul_nvfp4.cu:2725) and on kROCM
+  // (src/vt/rocm/rocm_ops.hip:295), like kMoeGroupedGemmBf16 (:2722 and :292).
   // Appended before kCount so no existing op's id shifts.
   kMoeGroupedGemmBf16GateUpSilu,
   // Laguna-S-2.1 device-resident-decode glue table (the 5 small host ops the
@@ -653,9 +660,12 @@ enum class OpId : uint8_t {
   // flash attention, so a mask-shaped port passes every value comparison and
   // forfeits the long-context lever this row exists for.
   //
-  // Registered on kCPU only (src/vt/cpu/cpu_qwen4_exp_qsa.cpp). The CUDA arm is
-  // OWED, not written: it cannot be gated on a CPU-only host, and an ungated
-  // kernel is worse than an absent one.
+  // Registered on kCPU (src/vt/cpu/cpu_qwen4_exp_qsa.cpp:354,357) and on kCUDA
+  // (src/vt/cuda/cuda_qwen4_exp_qsa.cu:641,644 — unconditional, at preprocessor
+  // depth 0). This paragraph read "kCPU only. The CUDA arm is OWED, not
+  // written" until 2026-09-12, by which date the CUDA arm had landed. The kROCM
+  // arms ARE owed and MODEL-MM-QWEN4-EXP W4 owns them; until they land, a ROCm
+  // queue refuses this pair BY NAME through the ordinary GetOp message.
   // Appended before kCount so no existing op's id shifts.
   kQwen4ExpQsaCompress,
   kQwen4ExpQsaGatherAttention,
@@ -672,9 +682,10 @@ enum class OpId : uint8_t {
   //
   // Adding `group_size` to `RmsNormArgs` instead was REJECTED, and the reason is
   // the silent-wrong-answer shape this row keeps meeting. `kRmsNorm` is
-  // registered on five backends; a new field on its args struct is ignored by
-  // every kernel that is not taught to read it, so a CUDA or Metal caller would
-  // get a whole-row norm back from a grouped request, with no crash and no
+  // registered on six backends (kCPU, kCUDA, kROCM, kVULKAN, kTENSTORRENT and
+  // kMETAL); a new field on its args struct is ignored by every kernel that is
+  // not taught to read it, so a CUDA or Metal caller would get a whole-row norm
+  // back from a grouped request, with no crash and no
   // refusal. A separate OpId cannot do that: an unregistered device refuses BY
   // NAME. `kRmsNormGatedGroup` is the in-tree precedent for exactly this split
   // ("SIBLING of RmsNormGatedArgs, not a mode of it").
@@ -725,12 +736,12 @@ enum class OpId : uint8_t {
   // arithmetic as `kRmsNormGroup` above: the candidate hosts are registered on
   // MORE THAN ONE backend, so a new field would be silently IGNORED by every
   // arm that does not learn it and the caller would get a wrong answer with no
-  // crash and no refusal. `kSigmoidGateBf16` has FOUR registered arms — kCPU
-  // (cpu_ops.cpp), kROCM (rocm_ops.hip), kVULKAN (vulkan_ops.cpp) and
-  // kTENSTORRENT (tenstorrent_ops.cpp) — and `kMulColVecF32` has TWO (kCPU,
-  // kCUDA). Three arms and one arm respectively would answer a broadcast
-  // request with an elementwise product. An unregistered device refuses BY NAME
-  // instead.
+  // crash and no refusal. `kSigmoidGateBf16` has FIVE registered arms — kCPU
+  // (cpu_ops.cpp), kCUDA (cuda_glue.cu), kROCM (rocm_ops.hip), kVULKAN
+  // (vulkan_ops.cpp) and kTENSTORRENT (tenstorrent_ops.cpp) — and
+  // `kMulColVecF32` has TWO (kCPU, kCUDA). Four arms and one arm respectively
+  // would answer a broadcast request with an elementwise product. An
+  // unregistered device refuses BY NAME instead.
   //
   // THE CLAMP ORDER IS THE TRAP. `clamp_min` is applied BEFORE the square root,
   // so the floor on |output| is sqrt(1e-6) = 1e-3 and not 1e-6, and tiny scores
@@ -775,10 +786,11 @@ enum class OpId : uint8_t {
   // that registers only `kEmbedding` refuses a block table BY NAME through the
   // ordinary GetOp message instead of silently gathering garbage. Registered on
   // kCPU (src/vt/cpu/cpu_ops.cpp, the same kernel — it already branches on the
-  // table dtype) and on kCUDA (src/vt/cuda/cuda_ops.cu, decoders in
-  // src/vt/cuda/cuda_quant_dequant.cuh). METAL, VULKAN, ROCM and TENSTORRENT
-  // are NOT registered: each of their gather kernels asserts a float table by
-  // name, and their arms are owed.
+  // table dtype), on kCUDA (src/vt/cuda/cuda_ops.cu, decoders in
+  // src/vt/cuda/cuda_quant_dequant.cuh) and on kROCM
+  // (src/vt/rocm/rocm_ops.hip:207). METAL, VULKAN and TENSTORRENT are NOT
+  // registered: each of their gather kernels asserts a float table by name, and
+  // their arms are owed.
   // Appended before kCount so no existing op's id shifts.
   kEmbeddingQuant,
   // MODEL-MM-GLM53-FLASH W9c-0 ([#2415]) — GLM-5.3-Flash's K-POOL DSA indexer,
@@ -830,8 +842,9 @@ enum class OpId : uint8_t {
   // softmax would put the model path on the 1/64-rate pipe to be more precise
   // than the thing it mirrors.
   //
-  // Registered on kCUDA ONLY (src/vt/cuda/cuda_glm5_next.cu). There is
-  // deliberately NO CPU provider: the CPU answer is `glm5_next_dsa.cpp`, which
+  // Registered on kCUDA (src/vt/cuda/cuda_glm5_next.cu:561,564) and on kROCM
+  // (src/vt/rocm/rocm_ops.hip:345,348). There is deliberately NO CPU provider:
+  // the CPU answer is `glm5_next_dsa.cpp`, which
   // is this family's ORACLE, and registering it a second time under these ids
   // would make the seam its own oracle. A CPU queue is therefore refused BY NAME
   // by the dispatcher.

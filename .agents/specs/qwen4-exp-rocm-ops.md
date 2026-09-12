@@ -592,6 +592,20 @@ a clone of this row's branch with `git rev-parse HEAD` asserted equal to
 | `m3` the conv's `double acc` narrowed to `float` | `56 / 55 passed / 1 failed`, `4 failed assertions` | `9329918ac4d39fc9` |
 | RESTORED | `56 / 56 passed / 0 failed`, `84459 / 0 failed` | `6ef94c6e85e571c4` |
 
+**THE TABLE ABOVE MEASURES `ec2cc004b`, NOT THIS BRANCH'S HEAD**, and a later
+reader comparing SHAs should not read that as a stale gate. Two things moved
+under that id and neither reaches a compiled file. First, the branch was rebased
+onto `3cafbcaf7` after the measurement, which replayed `ec2cc004b` as
+`c9b7b67c9`: `git diff ec2cc004b c9b7b67c9 -- src include tests CMakeLists.txt
+cmake` is EMPTY, and the whole difference between the two ids is four
+`.agents/issues/` files and `.agents/specs/qwen4-exp-flash-next.md`, which no
+translation unit reads. Second, every commit after it on
+`row/MODEL-MM-QWEN4-EXP-ROCM-W3` touches only this spec, `include/vt/ops.h`
+COMMENTS and files under `.agents/`; no `.hip`, `.cu`, `.cpp` or `.h`
+declaration moved. So no translation unit the suite compiles changes, and the
+four binary sha256 values above still identify the arms they name. Re-run the
+gate at the head only if a later change touches compiled code.
+
 The restored binary is sha256-IDENTICAL to the green one and
 `git status --porcelain` was EMPTY after each of the three restores, so nothing
 that lands depends on a mutation left behind. All four builds compiled with ZERO

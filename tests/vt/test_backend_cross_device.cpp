@@ -7031,3 +7031,459 @@ TEST_CASE("qwen4_exp QSA gather attention matches the CPU oracle and is NATIVE o
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// MODEL-MM-QWEN4-EXP W5 (`.agents/specs/qwen4-exp-rocm-ops.md`) — the DSA
+// indexer pair, `vt::DsaIndexerLogits` and `vt::DsaTopkSelect`, the TENTH and
+// ELEVENTH ops the nine-op scope missed (spec D3f) and the ones the `qwen4_exp`
+// forward refuses at on gfx1151 after W4. Donor `src/vt/cuda/cuda_dsa_indexer.cu`,
+// oracle `src/vt/cpu/cpu_dsa_indexer.cpp`, mirror-comparison in spec D3g.
+// The same pair is `.agents/specs/rocm-mla-dsa-ops.md`'s W2 under `BACKEND-ROCM`
+// / #2715, and GLM-5.3's sparse step is its second consumer; one arm serves both.
+//
+// THE FIXTURE IS THE HARD PART AND IT IS DESIGNED FIRST, because FIVE fixtures
+// in this campaign shipped unable to see the defect they claimed to gate (spec
+// D3b, D3d §2, the W3 re-gate, and W4's two repaired axes). This wave's trap is
+// a different SHAPE from all five, and naming it is the point of this header:
+//
+//   **`vt::DsaTopkSelect` IS A DISCRETE SELECTOR AND NO TOLERANCE CAN GRADE IT.**
+//
+// Every output it produces is an INDEX. A wrong-but-adjacent pick moves no float
+// at all, so an NMSE over the selected indices — or over anything downstream of
+// them — is bimodal, not graded: it either flips a whole attended row or reads
+// exactly zero. Four failure modes are invisible to any value band and each one
+// gets a DISCRETE assertion below instead:
+//
+//   1. THE TIE-BREAK DIRECTION. The ReLU in `DsaIndexerLogits` makes an exact
+//      `0.0` an ordinary logit value, so ties are ordinary rather than exotic,
+//      and the op's contract breaks them toward the SMALLER key index. The rows
+//      below put a LONG EXACT-ZERO RUN across the top-k boundary on purpose, so
+//      the tie rule alone decides part of the selected set.
+//   2. AN OFF-BY-ONE IN `topk`. A row is run at n == topk and at n == topk + 1 —
+//      the two sides of the short-context branch, and the second is the shape
+//      where exactly ONE candidate is dropped.
+//   3. THE EMISSION ORDER. The contract is ASCENDING BY KEY, which is what makes
+//      a full selection reproduce dense attention bit for bit in
+//      `vt::MlaDecodeAttention`. This is also where vLLM's AMD backend diverges
+//      (spec D3g §2: it routes to `ops.top_k_per_row_decode`, a rank-ordered
+//      sort), so the order is asserted DIRECTLY as well as by equality.
+//   4. THE `n == 0` PATH, which runs UNCONDITIONALLY in production —
+//      `qwen4_exp_qsa_block.cpp:403` calls the op even at `nb == 0`, where the
+//      all-`-1`/zero-count selection it writes IS upstream's
+//      `num_complete_blocks == 0` branch.
+//
+// So the bar for the selector is EXACT INTEGER EQUALITY against the CPU oracle,
+// on indices and on counts, and the "margin" of a mutation here is a COUNT of
+// differing indices and not a ratio — a discrete gate has bimodal error, not a
+// tolerance.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The released indexer geometry: `index_head_dim` 128 and `index_n_heads` 64,
+// neither reduced. 64 is load-bearing for the bit-exactness bar below — the HIP
+// arm gives one head to one lane and folds in ascending lane order, which IS the
+// host's ascending head order only while `index_n_heads <= 64` — so the 96-head
+// arm beside it is what gates the STRIDED head loop, and it is gated on the NMSE
+// band instead. A fixture that ran only one of the two would leave half of the
+// kernel's head partition unexecuted.
+constexpr int64_t kDsaD = 128;
+
+// A device-resident i32 buffer, uploaded and downloaded through Backend::Copy
+// like DevBuf/DevBufBytes beside it.
+std::vector<int32_t> DsaDownloadI32(DevBufBytes& b, size_t n) {
+  std::vector<int32_t> out(n, 0);
+  b.Download(out.data());
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("DSA indexer logits match the CPU oracle and are NATIVE on ROCm") {
+  // 5 query rows, each carrying a DIFFERENT window shape, because the masked
+  // store is half of this op: `win_start`/`win_end` are clamped to [0, num_keys)
+  // and everything outside stays `-inf`.
+  constexpr int64_t kT = 5;
+  constexpr int64_t kS = 40;  // 10 key tiles of 4 — more than one grid.y tile
+  const std::vector<int32_t> ws = {-3, 5, 12, 7, 0};
+  //                                ^   ^   ^   ^  ^
+  //  -3: clamps up to 0 | 5: mid-row start | 12..13: a SINGLE candidate
+  //  7..7: an EMPTY window, the whole row -inf | 0..50: clamps down to 40
+  const std::vector<int32_t> we = {17, 40, 13, 7, 50};
+  REQUIRE(static_cast<int64_t>(ws.size()) == kT);
+
+  if (RocmBuilt()) {
+    REQUIRE(vt::OpRegistered(vt::OpId::kDsaIndexerLogits, DeviceType::kROCM));
+  }
+
+  // BOTH HEAD COUNTS. 64 is the released config and the arm where the ROCm
+  // kernel's head fold is the host's exact order; 96 is not a multiple of the
+  // lane count, so lanes 0..31 carry TWO heads and lanes 32..63 carry one, which
+  // is the only way the strided head loop is executed at all.
+  for (int64_t kH : {static_cast<int64_t>(64), static_cast<int64_t>(96)}) {
+    CAPTURE(kH);
+    // BOTH DTYPE ARMS. q/k/weights share one float dtype by contract and the
+    // logits are f32 on both sides whatever it is, which is upstream's
+    // `input_precision="ieee"` accumulation.
+    for (DType et : {DType::kF32, DType::kBF16}) {
+      const size_t esz = vt::SizeOf(et);
+      CAPTURE(esz);
+      // ±2 operands over a 128-wide dot leave roughly HALF the per-head dots
+      // NEGATIVE, which is what makes the ReLU falsifiable: on data where every
+      // dot is positive, `max(dot, 0)` and `dot` are the same function.
+      const std::vector<float> qf = RandomVec(static_cast<size_t>(kT * kH * kDsaD), 5501);
+      const std::vector<float> kf = RandomVec(static_cast<size_t>(kS * kDsaD), 5502);
+      // The gate weights VARY IN SIGN AND MAGNITUDE across heads. A constant
+      // weight vector would let an arm that ignored `weights` pass.
+      const std::vector<float> wf = RandomVec(static_cast<size_t>(kT * kH), 5503);
+      // `q_scale` is the ONE member of the fold a selection could ever see (the
+      // other two are global positive constants), so BOTH its arms run: null is
+      // upstream's unquantized path and what the QSA consumer passes, non-null is
+      // the fp8 path. Kept strictly positive, as a quantization scale is.
+      const std::vector<float> qsf =
+          RandomVec(static_cast<size_t>(kT * kH), 5504, 0.25f, 3.0f);
+
+      const std::vector<uint8_t> qb = PackRows(qf, et);
+      const std::vector<uint8_t> kb = PackRows(kf, et);
+      const std::vector<uint8_t> wb = PackRows(wf, et);
+
+      for (int use_qs = 0; use_qs <= 1; ++use_qs) {
+        CAPTURE(use_qs);
+        std::vector<float> ref(static_cast<size_t>(kT * kS), 0.0f);
+        {
+          vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+          Queue cq = cpu.CreateQueue();
+          const Device cd{DeviceType::kCPU, 0};
+          std::vector<uint8_t> cq_b = qb, ck_b = kb, cw_b = wb;
+          std::vector<float> cqs = qsf;
+          std::vector<int32_t> cws = ws, cwe = we;
+          Tensor tlg = T2(ref.data(), cd, kT, kS);
+          Tensor tq = Tensor::Contiguous(cq_b.data(), et, cd, {kT, kH, kDsaD});
+          Tensor tk = Tensor::Contiguous(ck_b.data(), et, cd, {kS, kDsaD});
+          Tensor tw = Tensor::Contiguous(cw_b.data(), et, cd, {kT, kH});
+          Tensor tqs = T2(cqs.data(), cd, kT, kH);
+          Tensor tws = TI32(cws.data(), cd, kT);
+          Tensor twe = TI32(cwe.data(), cd, kT);
+          vt::DsaIndexerLogitsArgs a;
+          // The released DeepSeek values, BOTH != 1 on purpose: a fold that
+          // dropped either would otherwise be an identity here.
+          a.softmax_scale = 1.0f / std::sqrt(static_cast<float>(kDsaD));
+          a.n_head_scale = 1.0f / std::sqrt(static_cast<float>(kH));
+          a.q_scale = use_qs != 0 ? &tqs : nullptr;
+          vt::DsaIndexerLogits(cq, tlg, tq, tk, tw, tws, twe, a);
+          cpu.DestroyQueue(cq);
+        }
+
+        // FIXTURE HEALTH, ASSERTED ON THE ORACLE, because a device arm graded
+        // against an oracle nobody checked is a green that measured nothing.
+        {
+          size_t ninf = 0, nfinite = 0, nneg = 0;
+          for (int64_t t = 0; t < kT; ++t) {
+            for (int64_t s = 0; s < kS; ++s) {
+              const float v = ref[static_cast<size_t>(t * kS + s)];
+              if (std::isinf(v)) {
+                ++ninf;
+              } else {
+                ++nfinite;
+                if (v < 0.0f) ++nneg;
+              }
+            }
+          }
+          // The window shapes above leave 17 + 35 + 1 + 0 + 40 = 93 in-window
+          // columns of 200. If either number collapsed, the masked store and the
+          // arithmetic would stop being separable.
+          REQUIRE(nfinite == 93);
+          REQUIRE(ninf == 107);
+          // AND THE ReLU IS FALSIFIABLE ON THIS DATA. A sign-varying weight
+          // vector over ReLU'd (non-negative) per-head dots must produce both
+          // signs of logit; if every logit came out one sign, the fixture could
+          // not tell `max(dot,0)` from `dot`.
+          REQUIRE(nneg > 0);
+          REQUIRE(nneg < nfinite);
+        }
+
+        for (DeviceType dt : RegisteredDevices()) {
+          if (!OpAvailable(vt::OpId::kDsaIndexerLogits, dt)) continue;
+          CAPTURE(DeviceTag(dt));
+          vt::Backend& dev = vt::GetBackend(dt);
+          Queue q = dev.CreateQueue();
+          const Device d{dt, 0};
+          DevBuf dlg(dev, q, static_cast<size_t>(kT * kS));
+          DevBufBytes dq(dev, q, qb.size()), dk(dev, q, kb.size()), dw(dev, q, wb.size());
+          DevBuf dqs(dev, q, qsf.size());
+          DevBufBytes dws(dev, q, sizeof(int32_t) * static_cast<size_t>(kT));
+          DevBufBytes dwe(dev, q, sizeof(int32_t) * static_cast<size_t>(kT));
+          // POISON THE DESTINATION with a finite, wrong value: every element of
+          // the row is owed a value — the in-window ones a logit and the rest an
+          // `-inf` — so a kernel that launched nothing must not be graded against
+          // a zeroed buffer, and a kernel that skipped the mask must not inherit
+          // an `-inf` it did not write.
+          dlg.Upload(std::vector<float>(static_cast<size_t>(kT * kS), -12345.0f));
+          dq.Upload(qb.data());
+          dk.Upload(kb.data());
+          dw.Upload(wb.data());
+          dqs.Upload(qsf);
+          dws.Upload(ws.data());
+          dwe.Upload(we.data());
+          Tensor tlg = T2(dlg.ptr(), d, kT, kS);
+          Tensor tq = Tensor::Contiguous(dq.ptr(), et, d, {kT, kH, kDsaD});
+          Tensor tk = Tensor::Contiguous(dk.ptr(), et, d, {kS, kDsaD});
+          Tensor tw = Tensor::Contiguous(dw.ptr(), et, d, {kT, kH});
+          Tensor tqs = T2(dqs.ptr(), d, kT, kH);
+          Tensor tws = TI32(dws.ptr(), d, kT);
+          Tensor twe = TI32(dwe.ptr(), d, kT);
+          vt::DsaIndexerLogitsArgs a;
+          a.softmax_scale = 1.0f / std::sqrt(static_cast<float>(kDsaD));
+          a.n_head_scale = 1.0f / std::sqrt(static_cast<float>(kH));
+          a.q_scale = use_qs != 0 ? &tqs : nullptr;
+          // `OpRegistered` says a native provider EXISTS; this says the call did
+          // not fall through to the portable tier anyway. On gfx1151 the tier
+          // cannot be installed at all (spec D2), so a non-zero delta means the
+          // run is void rather than merely slow.
+          const unsigned long long hits_before = vt::GetReferenceTierHits();
+          vt::DsaIndexerLogits(q, tlg, tq, tk, tw, tws, twe, a);
+          dev.Synchronize(q);
+          CHECK(vt::GetReferenceTierHits() == hits_before);
+          const std::vector<float> got = dlg.Download();
+
+          // 1. THE MASK IS A DISCRETE ASSERTION, not a tolerance. `-inf` is a
+          //    SENTINEL: a window off-by-one either writes a logit where an
+          //    `-inf` belongs or the reverse, and no NMSE can grade that — the
+          //    difference is infinite in one direction and unbounded in the
+          //    other, so it would read as a crash rather than a measurement.
+          size_t mask_mismatch = 0;
+          for (size_t i = 0; i < got.size(); ++i) {
+            const bool ri = std::isinf(ref[i]) && ref[i] < 0.0f;
+            const bool gi = std::isinf(got[i]) && got[i] < 0.0f;
+            if (ri != gi) ++mask_mismatch;
+          }
+          CHECK(mask_mismatch == 0);
+
+          // 2. THE VALUES, over the FINITE columns only.
+          std::vector<float> rf, gf;
+          for (size_t i = 0; i < got.size(); ++i) {
+            if (std::isfinite(ref[i]) && std::isfinite(got[i])) {
+              rf.push_back(ref[i]);
+              gf.push_back(got[i]);
+            }
+          }
+          REQUIRE(rf.size() == 93);
+          const double nmse = Nmse(rf, gf);
+
+          // 3. AND THE BYTES, because this op CONTAINS NO TRANSCENDENTAL — every
+          //    operation is a multiply, an add, a `max` against zero and a
+          //    compare, the HIP build pins `-ffp-contract=off`, and both the dot
+          //    and (at kH <= 64) the head fold run in the host's ascending order.
+          //    So bit-identity is PREDICTED by the operand list and MEASURED
+          //    here rather than inferred from the NMSE, exactly as W4's
+          //    compressor case reports it.
+          size_t diff_bytes = 0;
+          for (size_t i = 0; i < got.size(); ++i) {
+            uint32_t rb = 0, gb = 0;
+            std::memcpy(&rb, &ref[i], sizeof(uint32_t));
+            std::memcpy(&gb, &got[i], sizeof(uint32_t));
+            for (int b = 0; b < 4; ++b) {
+              if (((rb >> (8 * b)) & 0xffu) != ((gb >> (8 * b)) & 0xffu)) ++diff_bytes;
+            }
+          }
+          MESSAGE("dsa_indexer_logits NMSE " << DeviceTag(dt) << " heads=" << kH
+                                             << " esz=" << esz << " qscale=" << use_qs << " = "
+                                             << nmse << " differing bytes " << diff_bytes
+                                             << " of " << (got.size() * 4));
+          CHECK(nmse <= kNmseTol);
+          if (kH <= 64) {
+            // ONLY THIS ARM. Above the lane count the fold groups head `h` with
+            // head `h + 64` before the others, which is a different ASSOCIATION
+            // of the same sum and so a different rounding; the `5e-4` band is the
+            // bar there and the byte count is reported but not asserted. That
+            // boundary is a property of the kernel's head partition and is
+            // stated in its header, not a tolerance chosen after a failure.
+            CHECK(diff_bytes == 0);
+          }
+          dev.DestroyQueue(q);
+        }
+      }
+    }
+  }
+}
+
+TEST_CASE("DSA top-k selection is INDEX-EXACT against the CPU oracle and NATIVE on ROCm") {
+  // NO TOLERANCE APPEARS IN THIS CASE. See the section header: every output is an
+  // index, so the bar is exact integer equality and the failure modes a value
+  // band cannot see get discrete assertions.
+  constexpr int64_t kT = 6;
+  constexpr int64_t kS = 37;  // not a power of two, and not a multiple of 256
+
+  if (RocmBuilt()) {
+    REQUIRE(vt::OpRegistered(vt::OpId::kDsaTopkSelect, DeviceType::kROCM));
+  }
+
+  for (int64_t topk : {static_cast<int64_t>(1), static_cast<int64_t>(5),
+                       static_cast<int64_t>(12)}) {
+    CAPTURE(topk);
+    // THE ROW WINDOWS ARE THE BRANCH MATRIX, and two of them are defined in terms
+    // of `topk` so the boundary is hit at EVERY topk rather than at one.
+    //   r0  n == 0        — the UNCONDITIONAL path: `qwen4_exp_qsa_block.cpp:403`
+    //                       calls this op even at `nb == 0`, and the all-`-1`,
+    //                       zero-count selection it must write IS upstream's
+    //                       `num_complete_blocks == 0` branch.
+    //   r1  n == topk     — the last row the short-context branch owns.
+    //   r2  n == topk + 1 — the FIRST row of the full branch, where exactly ONE
+    //                       candidate is dropped and an off-by-one in `k` or a
+    //                       flipped tie rule has nowhere to hide.
+    //   r3  the whole row — the full branch at its widest.
+    //   r4  clamped both ends (`win_start` < 0 and `win_end` > num_keys).
+    //   r5  a short tail near the end of the row.
+    const std::vector<int32_t> ws = {-5, 2, 2, 0, -3, 30};
+    const std::vector<int32_t> we = {0,
+                                     static_cast<int32_t>(2 + topk),
+                                     static_cast<int32_t>(2 + topk + 1),
+                                     static_cast<int32_t>(kS),
+                                     100,
+                                     static_cast<int32_t>(kS)};
+    REQUIRE(static_cast<int64_t>(ws.size()) == kT);
+
+    // THE LOGITS ARE BUILT BY HAND, NOT BY THE INDEXER, because the tie structure
+    // is the whole point and a random matrix has no exact ties in it. Each row
+    // gets THREE distinct positives at NON-MONOTONIC positions, a few distinct
+    // negatives, and EXACT `0.0` everywhere else — which is not a contrivance:
+    // `DsaIndexerLogits` ReLUs each head's dot, so a key whose every head dots
+    // negative scores EXACTLY 0.0 and a long zero run is the ORDINARY shape of
+    // this op's output. At topk 5 and 12 the selection boundary falls INSIDE that
+    // zero run, so the tie rule alone decides part of the answer.
+    std::vector<float> lg(static_cast<size_t>(kT * kS), 0.0f);
+    for (int64_t t = 0; t < kT; ++t) {
+      float* row = lg.data() + t * kS;
+      row[5] = 3.0f + static_cast<float>(t);
+      row[20] = 2.0f + static_cast<float>(t);
+      row[11] = 1.0f + static_cast<float>(t);
+      row[2] = -1.0f - static_cast<float>(t);
+      row[33] = -2.0f - static_cast<float>(t);
+      row[17] = -0.5f;
+    }
+    {
+      // THE FIXTURE ASSERTS ITS OWN TIE STRUCTURE. Without this the case could
+      // silently become a distinct-values fixture — the exact shape that cannot
+      // see a tie-break direction at all — if the values above were ever edited.
+      size_t zeros = 0;
+      for (int64_t s = 0; s < kS; ++s) {
+        if (lg[static_cast<size_t>(s)] == 0.0f) ++zeros;
+      }
+      REQUIRE(zeros == 31);
+      REQUIRE(static_cast<int64_t>(zeros) > topk);
+    }
+
+    std::vector<int32_t> ref_idx(static_cast<size_t>(kT * topk), 0);
+    std::vector<int32_t> ref_cnt(static_cast<size_t>(kT), 0);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> clg = lg;
+      std::vector<int32_t> cws = ws, cwe = we;
+      Tensor tidx = Tensor::Contiguous(ref_idx.data(), DType::kI32, cd, {kT, topk});
+      Tensor tcnt = Tensor::Contiguous(ref_cnt.data(), DType::kI32, cd, {kT});
+      Tensor tlg = T2(clg.data(), cd, kT, kS);
+      Tensor tws = TI32(cws.data(), cd, kT);
+      Tensor twe = TI32(cwe.data(), cd, kT);
+      vt::DsaTopkSelect(cq, tidx, tcnt, tlg, tws, twe);
+      cpu.DestroyQueue(cq);
+    }
+
+    // FIXTURE HEALTH ON THE ORACLE — every branch this matrix claims to reach is
+    // asserted REACHED, by its count, before any device is graded against it.
+    REQUIRE(ref_cnt[0] == 0);                            // n == 0
+    REQUIRE(ref_cnt[1] == static_cast<int32_t>(topk));   // n == topk, short branch
+    REQUIRE(ref_cnt[2] == static_cast<int32_t>(topk));   // n == topk+1, full branch
+    REQUIRE(ref_cnt[3] == static_cast<int32_t>(std::min<int64_t>(kS, topk)));
+    REQUIRE(ref_cnt[4] == static_cast<int32_t>(std::min<int64_t>(kS, topk)));
+    REQUIRE(ref_cnt[5] == static_cast<int32_t>(std::min<int64_t>(7, topk)));
+    // AND THE TIE RULE IS EXERCISED rather than assumed: at topk >= 5 row 3's
+    // selection must reach past the three positives into the exact-zero run, so
+    // at least one selected index carries a logit of exactly 0.0. If it did not,
+    // the tie-break mutation below could not red and this case would be grading
+    // only the distinct-value ordering.
+    if (topk >= 5) {
+      size_t tied = 0;
+      for (int64_t i = 0; i < topk; ++i) {
+        const int32_t s = ref_idx[static_cast<size_t>(3 * topk + i)];
+        if (s >= 0 && lg[static_cast<size_t>(3 * kS + s)] == 0.0f) ++tied;
+      }
+      REQUIRE(tied >= 2);
+    }
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kDsaTopkSelect, dt)) continue;
+      CAPTURE(DeviceTag(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBufBytes didx(dev, q, sizeof(int32_t) * static_cast<size_t>(kT * topk));
+      DevBufBytes dcnt(dev, q, sizeof(int32_t) * static_cast<size_t>(kT));
+      DevBuf dlg(dev, q, lg.size());
+      DevBufBytes dws(dev, q, sizeof(int32_t) * static_cast<size_t>(kT));
+      DevBufBytes dwe(dev, q, sizeof(int32_t) * static_cast<size_t>(kT));
+      // POISON BOTH OUTPUTS WITH A VALID-LOOKING INDEX, not with -1 and not with
+      // zero: -1 is this op's own "no token" sentinel and 0 is a legal key, so
+      // either would let a kernel that wrote nothing inherit a plausible answer.
+      // 0x7f7f7f7f is 2139062143, outside every window here.
+      const std::vector<int32_t> poison_i(static_cast<size_t>(kT * topk), 0x7f7f7f7f);
+      const std::vector<int32_t> poison_c(static_cast<size_t>(kT), 0x7f7f7f7f);
+      didx.Upload(poison_i.data());
+      dcnt.Upload(poison_c.data());
+      dlg.Upload(lg);
+      dws.Upload(ws.data());
+      dwe.Upload(we.data());
+      Tensor tidx = Tensor::Contiguous(didx.ptr(), DType::kI32, d, {kT, topk});
+      Tensor tcnt = Tensor::Contiguous(dcnt.ptr(), DType::kI32, d, {kT});
+      Tensor tlg = T2(dlg.ptr(), d, kT, kS);
+      Tensor tws = TI32(dws.ptr(), d, kT);
+      Tensor twe = TI32(dwe.ptr(), d, kT);
+      const unsigned long long hits_before = vt::GetReferenceTierHits();
+      vt::DsaTopkSelect(q, tidx, tcnt, tlg, tws, twe);
+      dev.Synchronize(q);
+      CHECK(vt::GetReferenceTierHits() == hits_before);
+      const std::vector<int32_t> got_idx =
+          DsaDownloadI32(didx, static_cast<size_t>(kT * topk));
+      const std::vector<int32_t> got_cnt = DsaDownloadI32(dcnt, static_cast<size_t>(kT));
+
+      // A. COUNTS, exactly.
+      size_t cnt_diff = 0;
+      for (size_t i = 0; i < got_cnt.size(); ++i) {
+        if (got_cnt[i] != ref_cnt[i]) ++cnt_diff;
+      }
+      CHECK(cnt_diff == 0);
+
+      // B. INDICES, exactly — including the `-1` tail, because a kernel that left
+      //    the tail unwritten is a kernel a downstream gather would read garbage
+      //    from.
+      size_t idx_diff = 0;
+      for (size_t i = 0; i < got_idx.size(); ++i) {
+        if (got_idx[i] != ref_idx[i]) ++idx_diff;
+      }
+      MESSAGE("dsa_topk_select " << DeviceTag(dt) << " topk=" << topk
+                                 << ": differing indices " << idx_diff << " of "
+                                 << got_idx.size() << ", differing counts " << cnt_diff);
+      CHECK(idx_diff == 0);
+
+      // C. THE EMISSION ORDER, ASSERTED DIRECTLY and not only through B, because
+      //    this is the one part of the contract vLLM's AMD backend does NOT share
+      //    (spec D3g §2 — `ops.top_k_per_row_decode` emits by RANK) and a reader
+      //    who later "mirrors" that route would break exactly this. Ascending and
+      //    STRICTLY so over the live prefix; `-1` from the count onward.
+      for (int64_t t = 0; t < kT; ++t) {
+        const int32_t c = got_cnt[static_cast<size_t>(t)];
+        REQUIRE(c >= 0);
+        REQUIRE(c <= static_cast<int32_t>(topk));
+        for (int64_t i = 1; i < c; ++i) {
+          CHECK(got_idx[static_cast<size_t>(t * topk + i)] >
+                got_idx[static_cast<size_t>(t * topk + i - 1)]);
+        }
+        for (int64_t i = c; i < topk; ++i) {
+          CHECK(got_idx[static_cast<size_t>(t * topk + i)] == -1);
+        }
+      }
+      dev.DestroyQueue(q);
+    }
+  }
+}

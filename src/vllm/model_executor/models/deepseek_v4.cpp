@@ -4475,6 +4475,41 @@ ForwardLogits DeepseekV4Model::ForwardDevice(
     (void)StageDeepseekV4Exl3TowerToDevice(queue, weights.exl3);
     dev_be.exl3 = &weights.exl3;
   }
+  // MODEL-MM-deepseek-v4 W7-CUDA (#2411,
+  // ISSUE-LOCAL-01M29KEXRT2GCS6C53DT2S3SPX): BIND THE KEEP-QUANT TOWER, in the
+  // same order `DeepseekV4Model::Forward` binds it (exl3 first, then gguf).
+  //
+  // WITHOUT THIS A GGUF CHECKPOINT CANNOT SERVE A SINGLE TOKEN HERE, and the
+  // failure was measured rather than reasoned about: on `thor:gpu0` a served
+  // image died with
+  //
+  //   vt: deepseek-v4 host GEMM: weight size mismatch: tensor `wq_a` layer 0
+  //   want [N=32,K=32] = 1024 elements, got 0 elements
+  //
+  // `got 0` is the tell, and it is not a wrong shape. `ForwardComposeImpl` reads
+  // `kq_src = be.gguf != nullptr` (:3217) and hands every layer `Lq = nullptr`
+  // when it is false, so every `Gemm` falls to the HOST-float arm -- and on a
+  // GGUF load the host MLA tower is EMPTY BY DESIGN, which
+  // `deepseek_v4_weights.cpp` asserts in as many words (`hl.wq_a.empty() && ...`).
+  // The weight reached neither arm. Layer 0's `wq_a` is simply the first GEMM the
+  // composition performs, so it is where the omission surfaces.
+  //
+  // WHY NOBODY SAW IT: the sibling `Forward` DOES dispatch on
+  // `has_gguf_weights`, but the registry sends the runner's default
+  // `gather_logits` path HERE unconditionally (deepseek_v4_registry.cpp:246),
+  // and no gate has ever driven this entry with a GGUF tower -- every
+  // `ForwardDevice` case in `tests/` belongs to another architecture, and
+  // `test_cuda_deepseek_v4.cpp` carries a host fixture only. A CPU build cannot
+  // reach the defect either, because `kDevicePending` above refuses first.
+  //
+  // THIS BINDS THE TOWER RATHER THAN DELEGATING to `DeepseekV4ForwardGguf`,
+  // because the device op families (kDeepseekV4{Mhc,Dsa,Compressor,Moe}) are the
+  // whole point of this entry and delegating would silently drop them. It is not
+  // a new combination: `Gemm`'s keep-quant arm already retags the block views to
+  // the queue's device, and binding `gguf` sets `dsa_dense` (:926), which turns
+  // the indexer/compressor arms off on every layer -- exactly what the GGUF
+  // sibling already does, so the DSA arms cannot see a half-bound backend.
+  if (weights.has_gguf_weights) dev_be.gguf = &weights.gguf;
   std::vector<float> flat =
       ForwardComposeImpl(weights.host, weights.params, token_ids, positions, logits_indices,
                          V4Miswire::kNone, /*trace=*/nullptr, dev_be);

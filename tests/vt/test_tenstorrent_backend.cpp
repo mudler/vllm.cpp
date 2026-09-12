@@ -7834,3 +7834,160 @@ TEST_CASE("kTENSTORRENT keep-quant decode planes return to the allocator (#3042)
   }
 }
 
+// W4d W2 (#3042) red-first, the chunk-loop sl_alias guard: a SINGLE-chunk
+// weight runs the dense chunk loop exactly once with c0 == 0 && c1 == N, and
+// that full-extent window is the one case where ttnn::slice returns its INPUT
+// (tt-metal slice.cpp:182) — the staged slice IS the resident word shadow,
+// so the forced reclaim must skip it or the cache entry dies mid-call.
+// Mutation (red-first): sl_alias=false at
+// src/vt/tenstorrent/tenstorrent_ops.cpp:2901 force-frees the shadow, the
+// second call's cache hit returns the dead tensor and must throw "Tensor is
+// not allocated" (or lose residency, the free-memory bar below) — the
+// mutation evidence is captured in the queued device phase (the GPU is
+// occupied by the 27B gate run).
+TEST_CASE("kTENSTORRENT single-chunk keep-quant decode keeps the word shadow resident (#3042)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBTQuant, vt::DeviceType::kTENSTORRENT));
+
+  // The guard under test lives in the W4a chunk decode, which the f32-out
+  // dense arm reaches only with the int8-dot env unset; the alloc trace
+  // would spam stderr behind the numbers under test.
+  const char* const trace_prev = std::getenv("VT_TT_ALLOC_TRACE");
+  const bool trace_had = trace_prev != nullptr;
+  const std::string trace_saved = trace_had ? std::string(trace_prev) : std::string();
+  const char* const int8dot_prev = std::getenv("VT_TT_KEEPQUANT_INT8DOT");
+  const bool int8dot_had = int8dot_prev != nullptr;
+  const std::string int8dot_saved = int8dot_had ? std::string(int8dot_prev) : std::string();
+  ::unsetenv("VT_TT_KEEPQUANT_INT8DOT");
+  ::unsetenv("VT_TT_ALLOC_TRACE");
+
+  Backend& backend = *vt::TryGetBackend(DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+
+  // Pin the production chunk policy: chunk == N is the single-iteration
+  // shape under test, and a leaked non-zero override from another case
+  // would silently re-chunk it (and un-exercise the alias).
+  vt::tenstorrent::KeepQuantChunkRowsOverrideForTest(0);
+  struct ChunkReset {
+    ~ChunkReset() { vt::tenstorrent::KeepQuantChunkRowsOverrideForTest(0); }
+  } chunk_reset;
+
+  // Shape: plane budget 256 MiB / (K*4) = 32768 rows per chunk against
+  // N=8192 -> chunk = min(N, max(32768, ceil(N/8))) = N — ONE chunk
+  // iteration, c0 == 0 && c1 == N, the exact window where the slice is its
+  // own input.
+  constexpr int64_t M = 1, N = 8192;
+  const int64_t kBlockBytes = vt::BlockBytes(vt::DType::kQ4_K);
+  const int64_t kBlockElems = vt::BlockElems(vt::DType::kQ4_K);
+  const int64_t K = 8 * kBlockElems;  // 2048; 8 blocks per row
+
+  std::mt19937 rng(20260912u);
+  std::vector<uint8_t> packed(static_cast<size_t>(N * (K / kBlockElems) * kBlockBytes));
+  for (int64_t b = 0; b < N * (K / kBlockElems); ++b) {
+    uint8_t* blk = packed.data() + b * kBlockBytes;
+    const uint16_t d =
+        vt::F32ToF16(0.05f + 0.35f * static_cast<float>(rng() % 64) / 64.0f);
+    std::memcpy(blk + 0, &d, sizeof(d));
+    const uint16_t ls =
+        vt::F32ToF16(0.005f + 0.02f * static_cast<float>(rng() % 32) / 32.0f);
+    std::memcpy(blk + 2, &ls, sizeof(ls));
+    for (int i = 0; i < 12; ++i) blk[4 + i] = static_cast<uint8_t>(rng() & 0xFF);
+    for (int i = 0; i < 128; ++i) blk[16 + i] = static_cast<uint8_t>(rng() & 0xFF);
+  }
+  std::vector<uint16_t> a_bf(static_cast<size_t>(M * K));
+  for (auto& v : a_bf)
+    v = vt::F32ToBF16((static_cast<float>(rng() % 401) - 200.0f) / 100.0f);
+
+  // Warm-up: a small matmul settles the device/JIT init allocations so the
+  // baseline below measures residency, not first-touch.
+  {
+    constexpr int64_t sM = 4, sN = 8;
+    const int64_t sK = 2 * kBlockElems;
+    std::vector<uint8_t> s_packed(static_cast<size_t>(sN * 2 * kBlockBytes));
+    for (int64_t b = 0; b < sN * 2; ++b) {
+      uint8_t* blk = s_packed.data() + b * kBlockBytes;
+      const uint16_t d = vt::F32ToF16(0.2f);
+      std::memcpy(blk + 0, &d, sizeof(d));
+      const uint16_t ls = vt::F32ToF16(0.01f);
+      std::memcpy(blk + 2, &ls, sizeof(ls));
+    }
+    std::vector<uint16_t> s_a(static_cast<size_t>(sM * sK),
+                              vt::F32ToBF16(0.5f));
+    void* mem_a = backend.Alloc(sM * sK * sizeof(uint16_t));
+    void* mem_b = backend.Alloc(s_packed.size());
+    void* mem_o = backend.Alloc(sM * sN * sizeof(float));
+    backend.Copy(q, mem_a, s_a.data(), s_a.size() * sizeof(uint16_t));
+    backend.Copy(q, mem_b, s_packed.data(), s_packed.size());
+    Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {sM, sK});
+    Tensor b_t = Tensor::Contiguous(mem_b, vt::DType::kQ4_K,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {sN, sK});
+    Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {sM, sN});
+    vt::MatmulBT(q, o_t, a_t, b_t);
+    backend.Free(mem_a);
+    backend.Free(mem_b);
+    backend.Free(mem_o);
+  }
+
+  // ONE host weight buffer held across BOTH calls: the word shadow is keyed
+  // by the host pointer, so the second call must hit the cache and decode
+  // from the SAME resident words the first call staged — the exact state
+  // the sl_alias guard protects.
+  void* mem_a = backend.Alloc(M * K * sizeof(uint16_t));
+  void* mem_b = backend.Alloc(packed.size());
+  void* mem_o = backend.Alloc(M * N * sizeof(float));
+  backend.Copy(q, mem_a, a_bf.data(), a_bf.size() * sizeof(uint16_t));
+  backend.Copy(q, mem_b, packed.data(), packed.size());
+  Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                  Device{vt::DeviceType::kTENSTORRENT, 0}, {M, K});
+  Tensor b_t = Tensor::Contiguous(mem_b, vt::DType::kQ4_K,
+                                  Device{vt::DeviceType::kTENSTORRENT, 0}, {N, K});
+  Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                  Device{vt::DeviceType::kTENSTORRENT, 0}, {M, N});
+
+  const int64_t free0 = vt::tenstorrent::FreeDeviceDramBytesForTest();
+  vt::MatmulBT(q, o_t, a_t, b_t);
+  const int64_t free1 = vt::tenstorrent::FreeDeviceDramBytesForTest();
+  vt::MatmulBT(q, o_t, a_t, b_t);
+  const int64_t free2 = vt::tenstorrent::FreeDeviceDramBytesForTest();
+  std::vector<float> out(static_cast<size_t>(M * N), 0.0f);
+  backend.Copy(q, out.data(), mem_o, out.size() * sizeof(float));
+
+  // The shadow is ~1 MiB of i32 words and both calls' decode planes are
+  // reclaimed in-call; 256 MiB slack covers allocator alignment and
+  // kernel-cache residue. Under the mutation the shadow is force-freed and
+  // the second call throws before this bar is even reached — the uncaught
+  // exception IS the red.
+  constexpr int64_t kSlack = 256ll << 20;
+  const std::string drop1_msg =
+      "first single-chunk keep-quant call lost residency: free fell from " +
+      std::to_string(free0) + " to " + std::to_string(free1) + " bytes (drop " +
+      std::to_string(free0 - free1) + ")";
+  const std::string drop2_msg =
+      "second single-chunk keep-quant call lost residency: free fell from " +
+      std::to_string(free0) + " to " + std::to_string(free2) + " bytes (drop " +
+      std::to_string(free0 - free2) + ")";
+  CHECK_MESSAGE(free1 >= free0 - kSlack, drop1_msg);
+  CHECK_MESSAGE(free2 >= free0 - kSlack, drop2_msg);
+
+  // UnregisterHostBuffer drops the word shadow with the host weight buffer —
+  // the designed teardown, run only after both calls survived on it.
+  backend.Free(mem_a);
+  backend.Free(mem_b);
+  backend.Free(mem_o);
+
+  if (trace_had) {
+    ::setenv("VT_TT_ALLOC_TRACE", trace_saved.c_str(), 1);
+  } else {
+    ::unsetenv("VT_TT_ALLOC_TRACE");
+  }
+  if (int8dot_had) {
+    ::setenv("VT_TT_KEEPQUANT_INT8DOT", int8dot_saved.c_str(), 1);
+  } else {
+    ::unsetenv("VT_TT_KEEPQUANT_INT8DOT");
+  }
+}

@@ -9631,8 +9631,28 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
         layer.is_linear_attention ? nullptr : &attn_kv[static_cast<size_t>(fa_idx++)];
     const GdnStateCache* gs =
         layer.is_linear_attention ? &gdn_state[static_cast<size_t>(gdn_idx++)] : nullptr;
+#ifdef VLLM_CPP_TENSTORRENT
+    // W4d (#3042) attribution: the chunk-loop ledger brackets only the
+    // keep-quant webs; 13 GB of the 27B first pass lands in the spans this
+    // pair now brackets (attention, GDN, norms, rolls).
+    char tt_lbl[48];
+    if (vt::tenstorrent::DeviceAvailable()) {
+      std::snprintf(tt_lbl, sizeof tt_lbl, "block/%lld/pre",
+                    static_cast<long long>(l));
+      vt::tenstorrent::AllocTraceSnapshot(vt::tenstorrent::SharedMeshDevice(),
+                                          tt_lbl);
+    }
+#endif
     RunDenseLayerPaged(d, layer, config, hidden, res, sdi, attn_meta,
                        gdn_meta, kv, gs, T, l);
+#ifdef VLLM_CPP_TENSTORRENT
+    if (vt::tenstorrent::DeviceAvailable()) {
+      std::snprintf(tt_lbl, sizeof tt_lbl, "block/%lld/post",
+                    static_cast<long long>(l));
+      vt::tenstorrent::AllocTraceSnapshot(vt::tenstorrent::SharedMeshDevice(),
+                                          tt_lbl);
+    }
+#endif
     // DFlash DF-AUX-TAPS: capture (hidden+res) at configured boundaries. Inert
     // (no-op) when aux_out is null — every non-DFlash caller.
     MaybeCaptureAuxTap(d, l, aux_layer_ids, aux_out, hidden.t(), res.t(), T, H);

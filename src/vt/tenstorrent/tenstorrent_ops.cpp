@@ -2878,6 +2878,7 @@ void MatmulBTQuantGroupedKernel(Queue&, Tensor& out, const Tensor& act,
     // trade VT_TT_TRACE_REGION_MB records on its axis.
     if (plane_env_set)
       chunk = std::min(chunk, std::max<int64_t>(plane_bytes / (K * 4), 1));
+    AllocTraceSnapshot(device, "KQuantGrouped/chunk-loop/pre");
     std::vector<ttnn::Tensor> partials;
     partials.reserve(static_cast<size_t>((N + chunk - 1) / chunk));
     for (int64_t c0 = 0; c0 < N; c0 += chunk) {
@@ -2912,6 +2913,7 @@ void MatmulBTQuantGroupedKernel(Queue&, Tensor& out, const Tensor& act,
       TTReclaimPlanes(device, {&part, &partf});
       partials.push_back(std::move(partl));
     }
+    AllocTraceSnapshot(device, "KQuantGrouped/chunk-loop/post");
     ttnn::Tensor assembled =
         partials.size() == 1
             ? std::move(partials[0])
@@ -2980,9 +2982,15 @@ void MatmulBTQuantGroupedKernel(Queue&, Tensor& out, const Tensor& act,
         ttsl::SmallVector<uint32_t>{1u, 1u});
     ttnn::Tensor wf = DecodeKeepQuantWordsF32(sl, enc, N, nb, device);
     // W4d W2 (#3042): the same reclaim as the chunk loop — the staged slice
-    // and decode output die into the typecast/to_layout chain. The E == 1
-    // window is full-extent, so sl is the shadow itself there (slice()
-    // returns its input) and the reclaim must skip it.
+    // and decode output die into the typecast/to_layout chain. The sl_alias
+    // guard below is DEFENSIVE ONLY: this lambda runs in the E > 1 arm,
+    // where the word shadow always holds E*N*nb rows, so the identity's
+    // second term — words.logical_shape()[0] == N*nb, the full-extent window
+    // where slice() returns its input — can never hold (it would demand
+    // E == 1, and the E == 1 arm returned long before this lambda). The
+    // reclaim never actually skips sl today; the guard stays so the shadow
+    // is checked, not assumed, if this lambda is ever shared with the
+    // single-expert arm.
     const bool sl_alias =
         w0 == 0 &&
         static_cast<int64_t>(words.logical_shape()[0]) == N * nb;
@@ -7364,20 +7372,6 @@ ttnn::Tensor CachedRepeatIdx(uint64_t t, uint64_t heads, uint64_t half,
 
 namespace {
 
-ttnn::Tensor CachedScratchRowId(uint32_t usl, MeshDevice& device) {
-  const std::array<uint64_t, 4> key{0, 1, usl, 0};
-  std::lock_guard<std::mutex> g(ConvTileCacheMutex());
-  auto it = ConvTileCacheMap().find(key);
-  if (it != ConvTileCacheMap().end()) return it->second.dev;
-  VT_CHECK(!tt_capture_active(),
-           "tenstorrent causal_conv1d_update: scratch-row id not warmed — the "
-           "cold step must build it before the captured region");
-  ConvTileEntry e;
-  e.dev = UploadIdxU32(std::vector<uint32_t>{usl}, ttnn::Shape({1}),
-                       ttnn::Layout::ROW_MAJOR, device);
-  ConvTileCacheMap().emplace(key, std::move(e));
-  return ConvTileCacheMap()[key].dev;
-}
 ttnn::Tensor CachedAccBase(uint32_t R, MeshDevice& device) {
   const std::array<uint64_t, 4> key{0, 2, R, 0};
   std::lock_guard<std::mutex> g(ConvTileCacheMutex());
@@ -7745,13 +7739,28 @@ void CausalConv1dUpdateKernel(Queue&, Tensor& out, const Tensor& x, const Tensor
                         ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
     }
   }
-  ttnn::Tensor bid = CachedScratchRowId(usl, device);
-  T = ttnn::reshape(
-      ttnn::indexed_fill(
-          bid,
-          ttnn::reshape(T, ttnn::Shape({usl + 1, R, 1, 1})),
-          ttnn::reshape(xT, ttnn::Shape({1, R, 1, 1})), std::nullopt, /*dim=*/0),
-      ttnn::Shape({usl + 1, R}));
+  // The scratch row is the LAST state row (index usl), and the fill never
+  // reads its old content — "write x's row into the scratch row" is therefore
+  // exactly concat(history rows, xT), rank-2 TILE end to end. The rank-4
+  // indexed_fill this replaces was the W4d 27B wall twice over: a rank-4 view
+  // on the TILE state re-pads the trailing 1-dims to 32x32 per element (the
+  // x1024 blowup — ~1.6 GB per decode step at R = 102400), and the ROW_MAJOR
+  // rescue dies inside tt-metal's all-RM indexed_fill at op scale (conv
+  // oracle max_abs 0.17 under every view/reshape variant, against a bit-clean
+  // baseline). concat touches only {usl+1, R} planes — 13 MB at 27B — and
+  // reinterprets nothing.
+  if (xT.dtype() != T.dtype()) xT = ttnn::typecast(std::move(xT), T.dtype());
+  T = usl == 0
+          ? xT
+          : ttnn::concat(
+                std::vector<ttnn::Tensor>{
+                    ttnn::slice(T, ttsl::SmallVector<uint32_t>{0u, 0u},
+                                ttsl::SmallVector<uint32_t>{
+                                    static_cast<uint32_t>(usl),
+                                    static_cast<uint32_t>(R)},
+                                ttsl::SmallVector<uint32_t>{1u, 1u}),
+                    xT},
+                /*dim=*/0);
 
   // MAC source: rows [0..width-1, scratch sl] — constant per geometry.
   std::vector<uint32_t> mac_rows;

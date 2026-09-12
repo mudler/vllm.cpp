@@ -3445,6 +3445,12 @@ vllm_cpp_add_test(test_paged_attn_route vt/test_paged_attn_route.cpp)
 # switch, memcmp over every dtype the switch handled (spec §3, issue #391).
 vllm_cpp_add_test(test_ops_paged_attn_dtype vt/test_ops_paged_attn_dtype.cpp)
 vllm_cpp_add_test(test_ops_sample vt/test_ops_sample.cpp)
+if(UNIX)
+  add_test(NAME test_rocm_sample_scratch
+    COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tests/scripts/test_rocm_sample_scratch.py")
+  set_tests_properties(test_rocm_sample_scratch PROPERTIES
+    ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}")
+endif()
 vllm_cpp_add_test(test_gemma4_rocm_fp8_seams vt/test_gemma4_rocm_fp8_seams.cpp)
 vllm_cpp_add_test(test_ops_getblas_dualslot vt/test_ops_getblas_dualslot.cpp)
 target_compile_definitions(test_ops_getblas_dualslot PRIVATE

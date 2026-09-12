@@ -10,9 +10,12 @@
 #include <doctest/doctest.h>
 
 #include <cmath>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <limits>
+#include <thread>
 #include <vector>
 
 #include "vt/backend.h"
@@ -948,6 +951,170 @@ TEST_CASE("ROCm apply_min_p / penalties surface matches CPU mask pattern") {
   }
 }
 
+TEST_CASE("ROCm random_sample: unwarmed capture refuses and warmed retry recovers") {
+  if (!HasRocm()) {
+    MESSAGE("no ROCm backend registered; capture recovery gate PENDING");
+    return;
+  }
+  const char* fast = std::getenv("VT_FAST_RANDOM_SAMPLE");
+  const char* split = std::getenv("VT_SAMPLE_SPLIT");
+  if ((fast != nullptr && fast[0] == '0') ||
+      (split != nullptr && split[0] == '0')) {
+    MESSAGE("split sampler disabled; its cold-allocation refusal is inapplicable");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  REQUIRE(gpu.SupportsGraphCapture());
+  QueueGuard queue(gpu);
+  constexpr int64_t vocab = 8192;
+  std::vector<float> probs(static_cast<size_t>(vocab), 0.0f);
+  probs[11] = 1.0f;
+  int64_t seed = 12345;
+  RocmDeviceTensor dp(gpu, queue.q, DType::kF32, {1, vocab}, probs.data());
+  RocmDeviceTensor ds(gpu, queue.q, DType::kI64, {1}, &seed);
+  RocmDeviceTensor out(gpu, queue.q, DType::kI64, {1});
+  gpu.Synchronize(queue.q);
+  auto sample = [&] { vt::RandomSample(queue.q, out.tensor(), dp.tensor(), ds.tensor()); };
+  auto check_token = [&](int64_t expected) {
+    int64_t token = -1;
+    out.Download(queue.q, &token);
+    CHECK(token == expected);
+  };
+  auto set_token = [&](int64_t token) {
+    std::fill(probs.begin(), probs.end(), 0.0f);
+    probs[static_cast<size_t>(token)] = 1.0f;
+    gpu.Copy(queue.q, dp.tensor().data, probs.data(), probs.size() * sizeof(float));
+  };
+
+  // #3062: no allocation node may be cached as process-owned eager scratch.
+  // The backend requires warmup, so refuse before allocating or launching.
+  gpu.BeginCapture(queue.q);
+  std::string refusal;
+  try {
+    sample();
+  } catch (const std::runtime_error& error) {
+    refusal = error.what();
+  }
+  // The query/refusal must leave an empty capture that can end normally.
+  void* empty = gpu.EndCaptureGraph(queue.q);
+  gpu.DestroyGraph(empty);
+  REQUIRE_MESSAGE(!refusal.empty(), "unwarmed split capture must refuse before allocating scratch");
+  CHECK(refusal.find("pre-warm") != std::string::npos);
+
+  sample(); // Eager warmup after refusal must allocate a usable slab.
+  check_token(11);
+  gpu.BeginCapture(queue.q);
+  sample();
+  struct Graph {
+    Backend& backend;
+    void* value;
+    ~Graph() { if (value != nullptr) backend.DestroyGraph(value); }
+  } graph{gpu, gpu.EndCaptureGraph(queue.q)};
+  set_token(37);
+  sample(); // Eager access before the graph's first execution.
+  check_token(37);
+  set_token(73);
+  gpu.ReplayGraph(queue.q, graph.value);
+  check_token(73);
+  gpu.DestroyGraph(graph.value);
+  graph.value = nullptr;
+  set_token(113);
+  sample(); // Destroying the graph must not destroy the cached allocation.
+  check_token(113);
+}
+
+TEST_CASE("ROCm random_sample: concurrent queues retain independent graph scratch") {
+  if (!HasRocm()) {
+    MESSAGE("no ROCm backend registered; device scratch gate PENDING");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  REQUIRE(gpu.SupportsGraphCapture());
+  constexpr int64_t rows = 64, vocab = 8192, rounds = 256;
+  QueueGuard qa(gpu), qb(gpu);
+  std::vector<float> pa(static_cast<size_t>(rows * vocab), 0.0f), pb(pa);
+  for (int64_t row = 0; row < rows; ++row) {
+    pa[static_cast<size_t>(row * vocab + 11)] = 1.0f;
+    pb[static_cast<size_t>(row * vocab + vocab - 11)] = 1.0f;
+  }
+  std::vector<int64_t> seeds(static_cast<size_t>(rows), 12345);
+  RocmDeviceTensor da(gpu, qa.q, DType::kF32, {rows, vocab}, pa.data());
+  RocmDeviceTensor db(gpu, qb.q, DType::kF32, {rows, vocab}, pb.data());
+  RocmDeviceTensor sa(gpu, qa.q, DType::kI64, {rows}, seeds.data());
+  RocmDeviceTensor sb(gpu, qb.q, DType::kI64, {rows}, seeds.data());
+  RocmDeviceTensor oa(gpu, qa.q, DType::kI64, {rows});
+  RocmDeviceTensor ob(gpu, qb.q, DType::kI64, {rows});
+  gpu.Synchronize(qa.q);
+  gpu.Synchronize(qb.q);
+
+  // Capture the small batch first, grow afterward, then replay the small graph.
+  // This checks that later calls cannot invalidate the graph's baked pointers.
+  da.tensor().shape[0] = 1;
+  sa.tensor().shape[0] = 1;
+  oa.tensor().shape[0] = 1;
+  vt::RandomSample(qa.q, oa.tensor(), da.tensor(), sa.tensor());
+  gpu.Synchronize(qa.q);
+  gpu.BeginCapture(qa.q);
+  vt::RandomSample(qa.q, oa.tensor(), da.tensor(), sa.tensor());
+  struct Graph {
+    Backend& backend;
+    void* value;
+    ~Graph() { backend.DestroyGraph(value); }
+  } ga{gpu, gpu.EndCaptureGraph(qa.q)};
+  da.tensor().shape[0] = rows;
+  sa.tensor().shape[0] = rows;
+  oa.tensor().shape[0] = rows;
+  vt::RandomSample(qa.q, oa.tensor(), da.tensor(), sa.tensor());
+  gpu.Synchronize(qa.q);
+  gpu.ReplayGraph(qa.q, ga.value);
+  std::vector<int64_t> first(static_cast<size_t>(rows));
+  oa.Download(qa.q, first.data());
+  CHECK(first[0] == 11);
+
+  // Both captured graphs now refer to the same maximum-size allocation on the
+  // unfixed dispatcher. Interleaving their phases can substitute another
+  // queue's token. One-hot distributions remove numerical-tolerance ambiguity.
+  gpu.BeginCapture(qa.q);
+  vt::RandomSample(qa.q, oa.tensor(), da.tensor(), sa.tensor());
+  Graph ga_full{gpu, gpu.EndCaptureGraph(qa.q)};
+  vt::RandomSample(qb.q, ob.tensor(), db.tensor(), sb.tensor());
+  gpu.Synchronize(qb.q);
+  gpu.BeginCapture(qb.q);
+  vt::RandomSample(qb.q, ob.tensor(), db.tensor(), sb.tensor());
+  Graph gb{gpu, gpu.EndCaptureGraph(qb.q)};
+  struct Pinned {
+    Backend& backend;
+    void* value;
+    ~Pinned() { backend.FreePinned(value); }
+  } ha{gpu, gpu.AllocPinned(static_cast<size_t>(rounds * rows) * sizeof(int64_t))},
+    hb{gpu, gpu.AllocPinned(static_cast<size_t>(rounds * rows) * sizeof(int64_t))};
+  std::atomic<int> ready{0};
+  std::exception_ptr errors[2];
+  auto submit = [&](int lane, Queue& q, void* graph, Tensor& out, void* host) {
+    ready.fetch_add(1);
+    while (ready.load() != 2) std::this_thread::yield();
+    try {
+      for (int64_t i = 0; i < rounds; ++i) {
+        gpu.ReplayGraph(q, graph);
+        gpu.Copy(q, static_cast<int64_t*>(host) + i * rows, out.data,
+                 static_cast<size_t>(rows) * sizeof(int64_t));
+      }
+      gpu.Synchronize(q);
+    } catch (...) {
+      errors[lane] = std::current_exception();
+    }
+  };
+  std::thread a(submit, 0, std::ref(qa.q), ga_full.value, std::ref(oa.tensor()), ha.value);
+  std::thread b(submit, 1, std::ref(qb.q), gb.value, std::ref(ob.tensor()), hb.value);
+  a.join();
+  b.join();
+  for (const auto& error : errors) if (error) std::rethrow_exception(error);
+  for (int64_t i = 0; i < rounds * rows; ++i) {
+    REQUIRE(static_cast<int64_t*>(ha.value)[i] == 11);
+    REQUIRE(static_cast<int64_t*>(hb.value)[i] == vocab - 11);
+  }
+}
+
 TEST_CASE("ROCm random_sample agrees with CPU on the vast majority of rows") {
   // Same contract as the CUDA case above: host and device compute q = -log(U)
   // in double via different libm (host libm vs ROCm device libm), so ~1 ULP
@@ -990,6 +1157,66 @@ TEST_CASE("ROCm random_sample agrees with CPU on the vast majority of rows") {
   vt::RandomSample(gq.q, did.tensor(), dp.tensor(), ds.tensor());
   std::vector<int64_t> id_gpu(static_cast<size_t>(N));
   did.Download(gq.q, id_gpu.data());
+  size_t agree = 0;
+  for (size_t i = 0; i < id_cpu.size(); ++i)
+    if (id_gpu[i] == id_cpu[i]) ++agree;
+  CHECK(agree >= static_cast<size_t>(0.98 * static_cast<double>(N)));
+}
+
+TEST_CASE("ROCm random_sample: the split-phase path agrees with CPU") {
+  // The case above runs V=128, which is below the v>=4096 bar in
+  // RandomSampleKernelRocm, so it takes the single-block kernel and never
+  // reaches RandomSampleSplitAK/BK at all. This case picks V and N to select
+  // the split path (v >= 4096 && n <= 64), which is the default for a
+  // production vocab, so the two-phase reduction has coverage of its own.
+  //
+  // Same statistical contract as the single-block case: host and device
+  // compute q = -log(U) in double through different libm, so ~1 ULP can flip
+  // a near-tied argmax. >=98% agreement, not bit-exact.
+  if (!HasRocm()) {
+    MESSAGE("no ROCm backend registered; skipping");
+    return;
+  }
+  const int64_t N = 8, V = 8192;  // v >= 4096 and n <= 64 selects the split path
+  auto logits = RandomLogits(static_cast<size_t>(N * V), 4243);
+  std::vector<float> probs(static_cast<size_t>(N * V));
+  for (int64_t i = 0; i < N; ++i) {
+    float mx = -std::numeric_limits<float>::infinity();
+    for (int64_t j = 0; j < V; ++j) mx = std::max(mx, logits[static_cast<size_t>(i * V + j)]);
+    float sum = 0.0f;
+    for (int64_t j = 0; j < V; ++j) {
+      const float e = std::exp(logits[static_cast<size_t>(i * V + j)] - mx);
+      probs[static_cast<size_t>(i * V + j)] = e;
+      sum += e;
+    }
+    for (int64_t j = 0; j < V; ++j) probs[static_cast<size_t>(i * V + j)] /= sum;
+  }
+  std::vector<int64_t> seeds(static_cast<size_t>(N));
+  for (int64_t i = 0; i < N; ++i) seeds[static_cast<size_t>(i)] = 4300 + i;
+
+  std::vector<int64_t> id_cpu(static_cast<size_t>(N), -1);
+  Tensor tp = MakeT(probs.data(), DType::kF32, Cpu(), {N, V});
+  Tensor ts = MakeT(seeds.data(), DType::kI64, Cpu(), {N});
+  Tensor ti = MakeT(id_cpu.data(), DType::kI64, Cpu(), {N});
+  Queue cq = Q();
+  vt::RandomSample(cq, ti, tp, ts);
+
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  QueueGuard gq(gpu);
+  RocmDeviceTensor dp(gpu, gq.q, DType::kF32, {N, V}, probs.data());
+  RocmDeviceTensor ds(gpu, gq.q, DType::kI64, {N}, seeds.data());
+  RocmDeviceTensor did(gpu, gq.q, DType::kI64, {N});
+  vt::RandomSample(gq.q, did.tensor(), dp.tensor(), ds.tensor());
+  std::vector<int64_t> id_gpu(static_cast<size_t>(N));
+  did.Download(gq.q, id_gpu.data());
+
+  // Every id the split reduction emits must at least be a legal column. The
+  // overflow this case was written for wrote a float bit pattern over
+  // sh_idx[0], so the emitted id landed far outside [0, V).
+  for (int64_t i = 0; i < N; ++i) {
+    CHECK(id_gpu[static_cast<size_t>(i)] >= 0);
+    CHECK(id_gpu[static_cast<size_t>(i)] < V);
+  }
   size_t agree = 0;
   for (size_t i = 0; i < id_cpu.size(); ++i)
     if (id_gpu[i] == id_cpu[i]) ++agree;

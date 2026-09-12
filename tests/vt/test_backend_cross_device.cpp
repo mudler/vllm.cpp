@@ -5883,18 +5883,33 @@ TEST_CASE("index_copy scatters rows BIT-EXACTLY against the CPU oracle and is NA
   }
 }
 
+
 // ---------------------------------------------------------------------------
 // W3 of `.agents/specs/qwen4-exp-rocm-ops.md` — the qwen4_exp PLE pair,
 // `vt::Qwen4ExpPleConv` and `vt::Qwen4ExpPleGate`, row MODEL-MM-QWEN4-EXP,
 // issue ISSUE-LOCAL-01M2A1DTCZQVAH7M193XT9PN2V.
 //
-// THE TWO CASES BELOW ARE WRITTEN TO BE ABLE TO FAIL, which is the W1 lesson
+// THE THREE CASES BELOW ARE WRITTEN TO BE ABLE TO FAIL, which is the W1 lesson
 // this file already carries twice (spec D3b). A fixture whose data sits where
 // the guarantee has no leverage is indistinguishable from one that passes, and
 // W1 shipped exactly that: deleting a load-bearing stage measured 0.98x the bar.
 // Each fixture value below that exists to give a guarantee leverage says so
 // beside itself, and the spec's `## Now` records the measured margin for every
-// mutation these two cases are expected to catch.
+// mutation these three cases are expected to catch.
+//
+// THREE OF THOSE GUARANTEES WERE ADDED AFTER A FRESH REVIEW FOUND THEM
+// UNMEASURED, and each is named where it is now measured rather than only here:
+// the f16/bf16 STORE branches of both kernels (every operand below runs at
+// `kF32` AND at `kBF16`, the shape the two W2 cases above already use), the
+// `isnan` guard in the gate's signed square root (the score pool carries a NaN
+// and the NaN outputs are checked as NaN, not averaged), and the conv's DOUBLE
+// four-tap accumulator (its own case, ported from the CUDA arm's). The first
+// mattered most: with every tensor at `kF32` the reviewer corrupted BOTH store
+// branches of both kernels, the binary changed, it compiled clean at `-Werror`,
+// and all four NMSE values stayed 0. bf16 is the PRODUCTION path —
+// `src/vllm/model_executor/models/qwen4_exp_ple_block.cpp:286-292` says "every
+// buffer below carries `hidden`'s dtype, so a bf16 model moves bf16 bytes
+// through all of it" — so an f32-only fixture gated the arm nobody runs.
 // ---------------------------------------------------------------------------
 
 TEST_CASE("qwen4_exp PLE dilated causal conv matches the CPU oracle and is NATIVE on ROCm") {
@@ -5944,94 +5959,247 @@ TEST_CASE("qwen4_exp PLE dilated causal conv matches the CPU oracle and is NATIV
     REQUIRE(vt::OpRegistered(vt::OpId::kQwen4ExpPleConv, DeviceType::kROCM));
   }
 
-  for (int use_indices = 1; use_indices >= 0; --use_indices) {
-    CAPTURE(use_indices);
-    std::vector<float> ref_out(xn, 0.0f);
-    std::vector<float> ref_state = state0;  // IN PLACE: the ring is read AND written
-    {
-      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
-      Queue cq = cpu.CreateQueue();
-      const Device cd{DeviceType::kCPU, 0};
-      std::vector<float> cx = x, cw = weight;
-      std::vector<int32_t> cq_sl = qsl, cr = rows_idx;
-      Tensor to = T2(ref_out.data(), cd, T, kC);
-      Tensor tx = T2(cx.data(), cd, T, kC);
-      Tensor tw = T2(cw.data(), cd, kC, kK);
-      Tensor ts = Tensor::Contiguous(ref_state.data(), DType::kF32, cd,
-                                     {kRows, kC, kStateLen});
-      Tensor tq = TI32(cq_sl.data(), cd, kSeqs + 1);
-      Tensor tr = TI32(cr.data(), cd, kSeqs);
-      vt::Qwen4ExpPleConv(cq, to, tx, tw, ts, tq, use_indices ? &tr : nullptr, args);
-      cpu.DestroyQueue(cq);
-    }
+  // BOTH DTYPE ARMS. `x`, `weight`, `out` AND the ring all carry the model dtype
+  // (ops.cpp admits f32 or bf16 for the ring and cites `cache_utils.py:1019-1023`
+  // for why), so a bf16 model moves bf16 bytes through all four and a device
+  // kernel's bf16 STORE branch is on the production path. With this loop absent
+  // that branch was dead weight nothing could falsify — the finding this arm was
+  // sent back for. The loop is the shape the `index_select` / `index_copy` cases
+  // above already use, not a new one.
+  for (DType et : {DType::kF32, DType::kBF16}) {
+    const size_t esz = vt::SizeOf(et);
+    CAPTURE(esz);
+    // Round ONCE, here, and feed both arms the same bytes: a fixture that
+    // rounded per arm would be comparing two different inputs.
+    const std::vector<uint8_t> xb = PackRows(x, et);
+    const std::vector<uint8_t> wb = PackRows(weight, et);
+    const std::vector<uint8_t> sb0 = PackRows(state0, et);
 
-    // FIXTURE HEALTH, asserted on the ORACLE rather than hoped for. Without
-    // these three an arm that wrote nothing, or wrote everywhere, would be
-    // compared against an oracle nobody checked had done anything either.
-    {
-      bool out_nonzero = false;
-      for (float v : ref_out) {
-        if (v != 0.0f) out_nonzero = true;
+    for (int use_indices = 1; use_indices >= 0; --use_indices) {
+      CAPTURE(use_indices);
+      std::vector<uint8_t> ref_out(xn * esz, 0);
+      std::vector<uint8_t> ref_state = sb0;  // IN PLACE: the ring is read AND written
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<uint8_t> cx = xb, cw = wb;
+        std::vector<int32_t> cq_sl = qsl, cr = rows_idx;
+        Tensor to = Tensor::Contiguous(ref_out.data(), et, cd, {T, kC});
+        Tensor tx = Tensor::Contiguous(cx.data(), et, cd, {T, kC});
+        Tensor tw = Tensor::Contiguous(cw.data(), et, cd, {kC, kK});
+        Tensor ts = Tensor::Contiguous(ref_state.data(), et, cd, {kRows, kC, kStateLen});
+        Tensor tq = TI32(cq_sl.data(), cd, kSeqs + 1);
+        Tensor tr = TI32(cr.data(), cd, kSeqs);
+        vt::Qwen4ExpPleConv(cq, to, tx, tw, ts, tq, use_indices ? &tr : nullptr, args);
+        cpu.DestroyQueue(cq);
       }
-      REQUIRE(out_nonzero);
-      // The addressed rows MOVED ...
-      for (int64_t s = 0; s < kSeqs; ++s) {
-        const int64_t row = use_indices ? rows_idx[static_cast<size_t>(s)] : s;
-        bool moved = false;
-        for (int64_t i = 0; i < kC * kStateLen; ++i) {
-          const size_t o = static_cast<size_t>(row) * kC * kStateLen + static_cast<size_t>(i);
-          if (ref_state[o] != state0[o]) moved = true;
-        }
-        REQUIRE(moved);
-      }
-      // ... and every row the index list does NOT name is byte-unchanged, which
-      // is the only thing that makes the row indirection falsifiable at all.
-      if (use_indices) {
-        for (int64_t row : {0, 2, 5}) {
-          const size_t o = static_cast<size_t>(row) * kC * kStateLen;
-          CHECK(std::memcmp(ref_state.data() + o, state0.data() + o,
-                            static_cast<size_t>(kC * kStateLen) * sizeof(float)) == 0);
-        }
-      }
-    }
+      const std::vector<float> ref_out_f = WidenRows(ref_out, et);
 
-    for (DeviceType dt : RegisteredDevices()) {
-      if (!OpAvailable(vt::OpId::kQwen4ExpPleConv, dt)) continue;
-      CAPTURE(DeviceTag(dt));
-      vt::Backend& dev = vt::GetBackend(dt);
-      Queue q = dev.CreateQueue();
-      const Device d{dt, 0};
-      DevBuf dout(dev, q, xn), dx(dev, q, xn), dw(dev, q, wn), ds(dev, q, sn);
-      DevBufI32 dqsl(dev, q, qsl.size()), drows(dev, q, rows_idx.size());
-      dout.Upload(std::vector<float>(xn, 0.0f));
-      dx.Upload(x);
-      dw.Upload(weight);
-      ds.Upload(state0);
-      dqsl.Upload(qsl);
-      drows.Upload(rows_idx);
-      Tensor to = T2(dout.ptr(), d, T, kC);
-      Tensor tx = T2(dx.ptr(), d, T, kC);
-      Tensor tw = T2(dw.ptr(), d, kC, kK);
-      Tensor ts = Tensor::Contiguous(ds.ptr(), DType::kF32, d, {kRows, kC, kStateLen});
-      Tensor tq = TI32(dqsl.ptr(), d, kSeqs + 1);
-      Tensor tr = TI32(drows.ptr(), d, kSeqs);
-      // `OpRegistered` says a native provider EXISTS; this says the call did not
-      // fall through to the portable tier anyway. On gfx1151 the tier cannot be
-      // installed at all (spec D2), so a non-zero delta here means the run is
-      // void rather than merely slow.
-      const unsigned long long hits_before = vt::GetReferenceTierHits();
-      vt::Qwen4ExpPleConv(q, to, tx, tw, ts, tq, use_indices ? &tr : nullptr, args);
-      dev.Synchronize(q);
-      CHECK(vt::GetReferenceTierHits() == hits_before);
-      const double nmse_out = Nmse(ref_out, dout.Download());
-      const double nmse_state = Nmse(ref_state, ds.Download());
-      MESSAGE("qwen4_exp ple_conv NMSE " << DeviceTag(dt) << " idx=" << use_indices
-                                         << " out = " << nmse_out
-                                         << " state = " << nmse_state);
-      CHECK(nmse_out <= kNmseTol);
-      CHECK(nmse_state <= kNmseTol);
-      dev.DestroyQueue(q);
+      // FIXTURE HEALTH, asserted on the ORACLE rather than hoped for. Without
+      // these three an arm that wrote nothing, or wrote everywhere, would be
+      // compared against an oracle nobody checked had done anything either.
+      {
+        bool out_nonzero = false;
+        for (float v : ref_out_f) {
+          if (v != 0.0f) out_nonzero = true;
+        }
+        REQUIRE(out_nonzero);
+        const size_t row_bytes = static_cast<size_t>(kC * kStateLen) * esz;
+        // The addressed rows MOVED ...
+        for (int64_t s = 0; s < kSeqs; ++s) {
+          const int64_t row = use_indices ? rows_idx[static_cast<size_t>(s)] : s;
+          const size_t o = static_cast<size_t>(row) * row_bytes;
+          REQUIRE(std::memcmp(ref_state.data() + o, sb0.data() + o, row_bytes) != 0);
+        }
+        // ... and every row the index list does NOT name is byte-unchanged, which
+        // is the only thing that makes the row indirection falsifiable at all.
+        if (use_indices) {
+          for (int64_t row : {0, 2, 5}) {
+            const size_t o = static_cast<size_t>(row) * row_bytes;
+            CHECK(std::memcmp(ref_state.data() + o, sb0.data() + o, row_bytes) == 0);
+          }
+        }
+      }
+
+      for (DeviceType dt : RegisteredDevices()) {
+        if (!OpAvailable(vt::OpId::kQwen4ExpPleConv, dt)) continue;
+        CAPTURE(DeviceTag(dt));
+        vt::Backend& dev = vt::GetBackend(dt);
+        Queue q = dev.CreateQueue();
+        const Device d{dt, 0};
+        DevBufBytes dout(dev, q, xn * esz), dx(dev, q, xn * esz);
+        DevBufBytes dw(dev, q, wn * esz), ds(dev, q, sn * esz);
+        DevBufI32 dqsl(dev, q, qsl.size()), drows(dev, q, rows_idx.size());
+        // POISON THE DESTINATION. Every one of the 16 tokens is inside a
+        // segment, so the kernel owes a value for every element; graded against
+        // a zeroed buffer, a kernel that launched nothing would be graded
+        // against whatever the allocator handed back.
+        const std::vector<uint8_t> poison(xn * esz, 0xA5);
+        dout.Upload(poison.data());
+        dx.Upload(xb.data());
+        dw.Upload(wb.data());
+        ds.Upload(sb0.data());
+        dqsl.Upload(qsl);
+        drows.Upload(rows_idx);
+        Tensor to = Tensor::Contiguous(dout.ptr(), et, d, {T, kC});
+        Tensor tx = Tensor::Contiguous(dx.ptr(), et, d, {T, kC});
+        Tensor tw = Tensor::Contiguous(dw.ptr(), et, d, {kC, kK});
+        Tensor ts = Tensor::Contiguous(ds.ptr(), et, d, {kRows, kC, kStateLen});
+        Tensor tq = TI32(dqsl.ptr(), d, kSeqs + 1);
+        Tensor tr = TI32(drows.ptr(), d, kSeqs);
+        // `OpRegistered` says a native provider EXISTS; this says the call did not
+        // fall through to the portable tier anyway. On gfx1151 the tier cannot be
+        // installed at all (spec D2), so a non-zero delta here means the run is
+        // void rather than merely slow.
+        const unsigned long long hits_before = vt::GetReferenceTierHits();
+        vt::Qwen4ExpPleConv(q, to, tx, tw, ts, tq, use_indices ? &tr : nullptr, args);
+        dev.Synchronize(q);
+        CHECK(vt::GetReferenceTierHits() == hits_before);
+        std::vector<uint8_t> got_out(xn * esz, 0), got_state(sn * esz, 0);
+        dout.Download(got_out.data());
+        ds.Download(got_state.data());
+        const double nmse_out = Nmse(ref_out_f, WidenRows(got_out, et));
+        const double nmse_state =
+            Nmse(WidenRows(ref_state, et), WidenRows(got_state, et));
+        MESSAGE("qwen4_exp ple_conv NMSE " << DeviceTag(dt) << " esz=" << esz
+                                           << " idx=" << use_indices
+                                           << " out = " << nmse_out
+                                           << " state = " << nmse_state);
+        CHECK(nmse_out <= kNmseTol);
+        CHECK(nmse_state <= kNmseTol);
+        dev.DestroyQueue(q);
+      }
     }
+  }
+}
+
+// The conv's four taps accumulate in DOUBLE, and until this case existed on the
+// device side nothing but CUDA measured it: narrowing `double acc` to `float
+// acc` in the HIP kernel left the cross-device gate green at NMSE 3.05e-15,
+// eleven orders under the bar. Spec D3d §2 spends a paragraph on WHY the width
+// is kept against vLLM's activation-dtype `F.conv1d`, and on a board whose fp64
+// rate is reduced a width nothing checks is a cost nobody can justify.
+//
+// PORTED FROM `tests/vllm/models/test_qwen4_exp_cuda.cpp:648` — "CUDA
+// vt::Qwen4ExpPleConv keeps the double tap accumulator" — fixture, reasoning and
+// the `silu(1.0)` target unchanged, re-expressed against this file's
+// cross-device harness so every registered backend is held to it.
+TEST_CASE("qwen4_exp PLE conv keeps the DOUBLE four-tap accumulator on ROCm too") {
+  // WELL-SCALED DATA CANNOT SEE THIS, and neither can magnitude-separated data
+  // laid out carelessly. The donor's first draft put `big + c` in one input
+  // element: at big = 2^40 an f32 ulp is 2^17, so `c` was lost ON THE STORE and
+  // both arms agreed trivially. Adjacent `+big, -big` does not work either,
+  // because a SEQUENTIAL f32 accumulator cancels them before the small term
+  // arrives and keeps it exactly.
+  //
+  // What separates the two widths is the small term arriving FIRST, ahead of a
+  // cancelling pair. Tap k reads `hist[t + k*dilation]`, so at dilation 3 the
+  // four taps of output 0 are hist[0], hist[3], hist[6], hist[9]. Set those to
+  // 1.0, 2^40, -2^40, 0 and the two accumulators disagree completely:
+  //
+  //   double: ((0 + 1) + 2^40) - 2^40 + 0  ==  1.0        -> silu(1) = 0.7310586
+  //   float:  1 + 2^40 rounds to 2^40, so  ==  0.0        -> silu(0) = 0.0
+  //
+  // The case is therefore held to the DOUBLE answer DIRECTLY as well as to the
+  // CPU arm, so it states what it is measuring and cannot be satisfied by two
+  // arms being wrong together.
+  constexpr int64_t kK = 4;
+  constexpr int64_t kD = 3;
+  constexpr int64_t kStateLen = (kK - 1) * kD;  // 9
+  constexpr int64_t kC = 3;
+  constexpr int64_t kTokens = 4;
+  constexpr int64_t kSeqs = 1;
+  // f32 ONLY, and that is the point rather than an omission: 2^40 and 1.0 are
+  // both exact in bf16, but `silu(1.0) = 0.731` rounds to bf16 with ~3e-3 of
+  // error, which is six times the 5e-4 band this file grades on. The dtype
+  // surface is gated by the case above; this one gates a WIDTH and needs the
+  // narrow answer and the wide one to stay apart after the store.
+  const float big = 1099511627776.0f;  // 2^40, exactly representable in f32
+  const std::vector<float> x(static_cast<size_t>(kTokens * kC), 0.0f);
+  const std::vector<float> weight(static_cast<size_t>(kC * kK), 1.0f);
+  std::vector<float> state0(static_cast<size_t>(kC * kStateLen), 0.0f);
+  for (int64_t c = 0; c < kC; ++c) {
+    state0[static_cast<size_t>(c * kStateLen + 0)] = 1.0f;
+    state0[static_cast<size_t>(c * kStateLen + 3)] = big;
+    state0[static_cast<size_t>(c * kStateLen + 6)] = -big;
+  }
+  const std::vector<int32_t> qsl = {0, static_cast<int32_t>(kTokens)};
+
+  vt::Qwen4ExpPleConvArgs args;
+  args.dilation = kD;
+
+  if (RocmBuilt()) {
+    REQUIRE(vt::OpRegistered(vt::OpId::kQwen4ExpPleConv, DeviceType::kROCM));
+  }
+
+  // silu(1.0) in double, which is what a double accumulator must produce.
+  const double want = 1.0 * (1.0 / (1.0 + std::exp(-1.0)));
+
+  const size_t xn = x.size();
+  const size_t wn = weight.size();
+  const size_t sn = state0.size();
+
+  std::vector<float> ref_out(xn, 0.0f);
+  std::vector<float> ref_state = state0;
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> cx = x, cw = weight;
+    std::vector<int32_t> cq_sl = qsl;
+    Tensor to = T2(ref_out.data(), cd, kTokens, kC);
+    Tensor tx = T2(cx.data(), cd, kTokens, kC);
+    Tensor tw = T2(cw.data(), cd, kC, kK);
+    Tensor ts = Tensor::Contiguous(ref_state.data(), DType::kF32, cd, {1, kC, kStateLen});
+    Tensor tq = TI32(cq_sl.data(), cd, kSeqs + 1);
+    vt::Qwen4ExpPleConv(cq, to, tx, tw, ts, tq, nullptr, args);
+    cpu.DestroyQueue(cq);
+  }
+  // THE ORACLE HALF, WHICH RUNS ON EVERY BUILD, and it is the whole point of
+  // the case: the CPU arm keeps the width too, so a reader on a CPU-only host
+  // still learns whether the reference answer is silu(1) or silu(0).
+  INFO("a float accumulator gives silu(0) = 0.0 here; a double one gives " << want);
+  for (int64_t c = 0; c < kC; ++c) {
+    CAPTURE(c);
+    CHECK(std::fabs(static_cast<double>(ref_out[static_cast<size_t>(c)]) - want) < 1.0e-6);
+  }
+
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!OpAvailable(vt::OpId::kQwen4ExpPleConv, dt)) continue;
+    CAPTURE(DeviceTag(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+    DevBuf dout(dev, q, xn), dx(dev, q, xn), dw(dev, q, wn), ds(dev, q, sn);
+    dout.Upload(std::vector<float>(xn, -1.0f));  // poison: silu never returns -1
+    dx.Upload(x);
+    dw.Upload(weight);
+    ds.Upload(state0);
+    std::vector<int32_t> hq = qsl;
+    DevBufI32 dqsl(dev, q, hq.size());
+    dqsl.Upload(hq);
+    Tensor to = T2(dout.ptr(), d, kTokens, kC);
+    Tensor tx = T2(dx.ptr(), d, kTokens, kC);
+    Tensor tw = T2(dw.ptr(), d, kC, kK);
+    Tensor ts = Tensor::Contiguous(ds.ptr(), DType::kF32, d, {1, kC, kStateLen});
+    Tensor tq = TI32(dqsl.ptr(), d, kSeqs + 1);
+    const unsigned long long hits_before = vt::GetReferenceTierHits();
+    vt::Qwen4ExpPleConv(q, to, tx, tw, ts, tq, nullptr, args);
+    dev.Synchronize(q);
+    CHECK(vt::GetReferenceTierHits() == hits_before);
+    const std::vector<float> got = dout.Download();
+    for (int64_t c = 0; c < kC; ++c) {
+      CAPTURE(c);
+      const double g = static_cast<double>(got[static_cast<size_t>(c)]);
+      MESSAGE("qwen4_exp ple_conv tap width " << DeviceTag(dt) << " c=" << c
+                                              << " got = " << g << " want = " << want);
+      CHECK(std::fabs(g - want) < 1.0e-6);
+    }
+    // And the two arms still agree with each other everywhere else in the block.
+    CHECK(Nmse(ref_out, got) <= kNmseTol);
+    CHECK(Nmse(ref_state, ds.Download()) <= kNmseTol);
+    dev.DestroyQueue(q);
   }
 }
 
@@ -6041,17 +6209,29 @@ TEST_CASE("qwen4_exp PLE signed-sqrt gate matches the CPU oracle and is NATIVE o
   // that flattened (H, hc) instead of (hc, H) produces a buffer of exactly the
   // right size holding a transposed answer — which is the defect the op's own
   // wrapper says it exists to catch.
-  constexpr int64_t T = 5, kHc = 3, kH = 7;
+  constexpr int64_t T = 6, kHc = 3, kH = 7;
   constexpr int64_t kFlat = kHc * kH;
   const size_t sn = static_cast<size_t>(T) * kHc;
   const size_t vn = static_cast<size_t>(T) * kH;
   const size_t on = static_cast<size_t>(T) * kFlat;
 
-  // THE SCORES ARE WRITTEN OUT, NOT RANDOM, because four of this op's branches
+  // THE SCORES ARE WRITTEN OUT, NOT RANDOM, because five of this op's branches
   // are reachable only from specific values and a uniform sample hits none of
   // them: `torch.sign`'s ZERO arm (a fully masked row scores exactly 0), the
-  // negative branch that makes the root SIGNED, and the clamp band. A random
-  // vector would exercise the two big branches only.
+  // negative branch that makes the root SIGNED, the clamp band, and the `isnan`
+  // guard. A random vector would exercise the two big branches only.
+  //
+  // THE NaN IS THE GUARD'S ONLY WITNESS, and it was added after a fresh review
+  // neutered `if (isnan(g)) return g;` in the HIP kernel and watched the gate
+  // stay green. `include/vt/ops.h` states the obligation — upstream propagates
+  // NaN because `sign(NaN) == 0` but `NaN * 0.0 == NaN`, while every comparison
+  // in a naive signed sqrt is false for NaN so the zero arm returns 0 and
+  // sigmoids to a perfectly plausible `0.5 * value`. The CUDA arm has a
+  // dedicated case for it; the HIP file's comment pointed at the CPU suite,
+  // which never runs on ROCm. Below, the NaN outputs are checked AS NaN and
+  // excluded from the NMSE, because an average over a poison value is not a
+  // measurement of anything.
+  const float kNaN = std::numeric_limits<float>::quiet_NaN();
   std::vector<float> score(sn);
   {
     const std::vector<float> pool = {
@@ -6059,7 +6239,8 @@ TEST_CASE("qwen4_exp PLE signed-sqrt gate matches the CPU oracle and is NATIVE o
         -0.0f,  1e-4f,  -1e-4f,  // negative zero, and two values deep in the band
         0.75f,  -1.25f, 2.0f,    //
         -2.75f, 0.25f,  -0.5f,   //
-        1.5f,   -1.75f, 0.125f};
+        1.5f,   -1.75f, 0.125f,  //
+        kNaN,   2.25f,  -2.25f};  // the guard's witness, in ONE (t, j) slot
     REQUIRE(pool.size() == sn);
     score = pool;
   }
@@ -6088,70 +6269,113 @@ TEST_CASE("qwen4_exp PLE signed-sqrt gate matches the CPU oracle and is NATIVE o
     REQUIRE(vt::OpRegistered(vt::OpId::kQwen4ExpPleGate, DeviceType::kROCM));
   }
 
-  for (const ArgCase& ac : arg_cases) {
-    CAPTURE(ac.clamp_min);
-    vt::Qwen4ExpPleGateArgs args;
-    args.gate_divisor = ac.divisor;
-    args.clamp_min = ac.clamp_min;
+  // BOTH DTYPE ARMS for `out` and `value`. `score` is f32 by the op contract —
+  // it is the argument of a sigmoid AND of a square root — so it never varies.
+  // See the conv case above for why this loop exists.
+  for (DType et : {DType::kF32, DType::kBF16}) {
+    const size_t esz = vt::SizeOf(et);
+    CAPTURE(esz);
+    const std::vector<uint8_t> vb = PackRows(value, et);
+    // The ROUNDED values both arms actually see, so the health check below
+    // divides by the number the kernels multiplied and not by the pre-cast one.
+    const std::vector<float> value_f = WidenRows(vb, et);
 
-    std::vector<float> ref(on, 0.0f);
-    {
-      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
-      Queue cq = cpu.CreateQueue();
-      const Device cd{DeviceType::kCPU, 0};
-      std::vector<float> cs = score, cv = value;
-      Tensor to = T2(ref.data(), cd, T, kFlat);
-      Tensor ts = T2(cs.data(), cd, T, kHc);
-      Tensor tv = T2(cv.data(), cd, T, kH);
-      vt::Qwen4ExpPleGate(cq, to, ts, tv, args);
-      cpu.DestroyQueue(cq);
-    }
+    for (const ArgCase& ac : arg_cases) {
+      CAPTURE(ac.clamp_min);
+      vt::Qwen4ExpPleGateArgs args;
+      args.gate_divisor = ac.divisor;
+      args.clamp_min = ac.clamp_min;
 
-    // FIXTURE HEALTH. The gate weight is a sigmoid, so it lives in (0, 1) and a
-    // fixture whose weights all sat near 0.5 could not separate a broken sign,
-    // a dropped divisor or a missing sqrt from a correct arm. `out = w * value`
-    // and `value` is strictly positive here, so `out/value` IS the weight and
-    // the spread below is measured rather than assumed.
-    {
-      double w_lo = 2.0, w_hi = -1.0;
-      for (int64_t t = 0; t < T; ++t) {
-        for (int64_t j = 0; j < kHc; ++j) {
-          for (int64_t h = 0; h < kH; ++h) {
-            const double w =
-                static_cast<double>(ref[static_cast<size_t>(t * kFlat + j * kH + h)]) /
-                static_cast<double>(value[static_cast<size_t>(t * kH + h)]);
-            if (w < w_lo) w_lo = w;
-            if (w > w_hi) w_hi = w;
+      std::vector<uint8_t> ref(on * esz, 0);
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<float> cs = score;
+        std::vector<uint8_t> cv = vb;
+        Tensor to = Tensor::Contiguous(ref.data(), et, cd, {T, kFlat});
+        Tensor ts = T2(cs.data(), cd, T, kHc);
+        Tensor tv = Tensor::Contiguous(cv.data(), et, cd, {T, kH});
+        vt::Qwen4ExpPleGate(cq, to, ts, tv, args);
+        cpu.DestroyQueue(cq);
+      }
+      const std::vector<float> ref_f = WidenRows(ref, et);
+
+      // FIXTURE HEALTH. The gate weight is a sigmoid, so it lives in (0, 1) and a
+      // fixture whose weights all sat near 0.5 could not separate a broken sign,
+      // a dropped divisor or a missing sqrt from a correct arm. `out = w * value`
+      // and `value` is strictly positive here, so `out/value` IS the weight and
+      // the spread below is measured rather than assumed.
+      {
+        double w_lo = 2.0, w_hi = -1.0;
+        size_t ref_nans = 0;
+        for (int64_t t = 0; t < T; ++t) {
+          for (int64_t j = 0; j < kHc; ++j) {
+            for (int64_t h = 0; h < kH; ++h) {
+              const float r = ref_f[static_cast<size_t>(t * kFlat + j * kH + h)];
+              if (std::isnan(r)) {
+                ++ref_nans;
+                continue;
+              }
+              const double w = static_cast<double>(r) /
+                               static_cast<double>(value_f[static_cast<size_t>(t * kH + h)]);
+              if (w < w_lo) w_lo = w;
+              if (w > w_hi) w_hi = w;
+            }
           }
         }
+        CAPTURE(w_lo);
+        CAPTURE(w_hi);
+        REQUIRE(w_hi - w_lo > 0.5);
+        // The ORACLE propagates the NaN, and over exactly its own (t, j) row.
+        // Without this the device check below could pass vacuously against a
+        // reference that had already swallowed it.
+        REQUIRE(ref_nans == static_cast<size_t>(kH));
       }
-      CAPTURE(w_lo);
-      CAPTURE(w_hi);
-      REQUIRE(w_hi - w_lo > 0.5);
-    }
 
-    for (DeviceType dt : RegisteredDevices()) {
-      if (!OpAvailable(vt::OpId::kQwen4ExpPleGate, dt)) continue;
-      CAPTURE(DeviceTag(dt));
-      vt::Backend& dev = vt::GetBackend(dt);
-      Queue q = dev.CreateQueue();
-      const Device d{dt, 0};
-      DevBuf dout(dev, q, on), dsc(dev, q, sn), dval(dev, q, vn);
-      dout.Upload(std::vector<float>(on, 0.0f));
-      dsc.Upload(score);
-      dval.Upload(value);
-      Tensor to = T2(dout.ptr(), d, T, kFlat);
-      Tensor ts = T2(dsc.ptr(), d, T, kHc);
-      Tensor tv = T2(dval.ptr(), d, T, kH);
-      const unsigned long long hits_before = vt::GetReferenceTierHits();
-      vt::Qwen4ExpPleGate(q, to, ts, tv, args);
-      dev.Synchronize(q);
-      CHECK(vt::GetReferenceTierHits() == hits_before);
-      const double nmse = Nmse(ref, dout.Download());
-      MESSAGE("qwen4_exp ple_gate NMSE " << DeviceTag(dt) << " clamp=" << ac.clamp_min
-                                         << " = " << nmse);
-      CHECK(nmse <= kNmseTol);
-      dev.DestroyQueue(q);
+      for (DeviceType dt : RegisteredDevices()) {
+        if (!OpAvailable(vt::OpId::kQwen4ExpPleGate, dt)) continue;
+        CAPTURE(DeviceTag(dt));
+        vt::Backend& dev = vt::GetBackend(dt);
+        Queue q = dev.CreateQueue();
+        const Device d{dt, 0};
+        DevBufBytes dout(dev, q, on * esz), dval(dev, q, vn * esz);
+        DevBuf dsc(dev, q, sn);
+        const std::vector<uint8_t> poison(on * esz, 0xA5);
+        dout.Upload(poison.data());
+        dsc.Upload(score);
+        dval.Upload(vb.data());
+        Tensor to = Tensor::Contiguous(dout.ptr(), et, d, {T, kFlat});
+        Tensor ts = T2(dsc.ptr(), d, T, kHc);
+        Tensor tv = Tensor::Contiguous(dval.ptr(), et, d, {T, kH});
+        const unsigned long long hits_before = vt::GetReferenceTierHits();
+        vt::Qwen4ExpPleGate(q, to, ts, tv, args);
+        dev.Synchronize(q);
+        CHECK(vt::GetReferenceTierHits() == hits_before);
+        std::vector<uint8_t> got(on * esz, 0);
+        dout.Download(got.data());
+        const std::vector<float> got_f = WidenRows(got, et);
+        // THE NaN HALF IS CHECKED, NOT AVERAGED. A missing `isnan` guard returns
+        // `sigmoid(0) * value` here — a finite, plausible number — so it has to
+        // be caught by an `isnan` assertion and can never be caught by a norm.
+        std::vector<float> ref_fin, got_fin;
+        size_t nan_seen = 0;
+        for (size_t i = 0; i < ref_f.size(); ++i) {
+          if (std::isnan(ref_f[i])) {
+            ++nan_seen;
+            CHECK(std::isnan(got_f[i]));
+            continue;
+          }
+          ref_fin.push_back(ref_f[i]);
+          got_fin.push_back(got_f[i]);
+        }
+        CHECK(nan_seen == static_cast<size_t>(kH));
+        const double nmse = Nmse(ref_fin, got_fin);
+        MESSAGE("qwen4_exp ple_gate NMSE " << DeviceTag(dt) << " esz=" << esz
+                                           << " clamp=" << ac.clamp_min << " = " << nmse);
+        CHECK(nmse <= kNmseTol);
+        dev.DestroyQueue(q);
+      }
     }
   }
 }

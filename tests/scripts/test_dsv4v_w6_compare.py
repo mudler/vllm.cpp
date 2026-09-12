@@ -10,7 +10,8 @@ data that should fail, and the readback could not tell a step that never ran
 from one that passed. This file PERFORMS each failure and fails if the harness
 shrugs it off.
 
-Every case below was RED against the harness as it stood at eb6009f6c:
+Every case below was RED against the harness as it stood at eb6009f6c or at
+6e55cc113:
 
   a zero image row on both sides   VERDICT PASS, exit 0, while 99 other rows
                                    were 50% off
@@ -20,6 +21,15 @@ Every case below was RED against the harness as it stood at eb6009f6c:
   a profile with no `judged` key   VERDICT DIAGNOSTIC, exit 0, on 50%-off data
   a steps file missing a step      failed_steps=0, exit 0
   an empty steps file              failed_steps=0, exit 0
+  a profile missing ANY OTHER
+    judging key                    VERDICT PASS, exit 0, on 50%-off data
+  an absent `cells` stage          VERDICT PASS, exit 0, though both the module
+                                   docstring and the bounds file say its
+                                   presence is reported
+  the f32 arm's `input` stage
+    100x wrong                     VERDICT PASS, exit 0, with no BOUND line
+  a crash in the device probe      filed as an expected refusal, RC=0
+  a failed W6 run                  printed its `### W6_*_DONE` banner anyway
 
 THE FIXTURE ROWS MUST BE PAIRWISE DISTINCT IN DIRECTION. A first version built
 them from a smooth ramp, which made every image row near-parallel (cosine
@@ -28,7 +38,11 @@ about 0.4%. The rounding noise swamped the angular separation, the argmax in
 best_match() became arbitrary, and the identity-permutation condition failed on
 every dataset including the clean one -- so each case exited 1 for a reason that
 had nothing to do with what it meant to test. Independent pseudo-random
-directions separate by far more than the rounding noise.
+directions separate by far more than the rounding noise. That fixture defect is
+now also a PROPERTY THE COMPARATOR CHECKS, because the same degeneracy is a
+false GREEN on genuinely permuted output: `_block(mode="parallel")` below builds
+the degenerate shape on purpose and the comparator must refuse to read an
+ordering claim off it.
 """
 
 from __future__ import annotations
@@ -80,16 +94,25 @@ def _write(path: Path, rows: list[list[float]]) -> None:
             handle.write(struct.pack("<%df" % c, *row))
 
 
-def _block(outdir: Path, tag: str, lead_pad: int, mode: str) -> None:
+def _block(outdir: Path, tag: str, lead_pad: int, mode: str,
+           factor: float = 1.02) -> None:
     """Write a token block. `mode` selects the defect under test."""
     types, _cell = CMP.layout(lead_pad, 10, 10)
     rng = _LCG(20260912)
-    factor = 1.02 if mode == "clean" else 1.5
+    if mode == "drift":
+        factor = 1.5
     ours, ref = [], []
     seen = 0
     for i, kind in enumerate(types):
         if kind == "IMAGE":
-            base = rng.direction(COLS)
+            if mode == "parallel":
+                # THE DEGENERATE SHAPE, on purpose: a smooth ramp makes every
+                # image row near-parallel to every other, so the argmax that
+                # carries the ordering claim is decided by bf16 rounding.
+                base = [CMP.bf16(0.5 + 0.01 * seen + 0.001 * j)
+                        for j in range(COLS)]
+            else:
+                base = rng.direction(COLS)
             if mode == "zero" and seen == 0:
                 # A row that is ZERO ON BOTH SIDES. It sits at image index 0
                 # deliberately: best_match maps a zero row to argmax 0, so
@@ -120,13 +143,14 @@ def _stage(outdir: Path, tag: str, stage: str, rows: int, factor: float,
     _write(outdir / ("oracle-%s-%s.f32" % (tag, stage)), ref)
 
 
-def _dataset(outdir: Path, mode: str = "clean", tag: str = "lp0") -> Path:
+def _dataset(outdir: Path, mode: str = "clean", tag: str = "lp0",
+             factor: float = 1.02) -> Path:
     """A faithful leg: a block plus the three stage dumps a real run writes."""
     outdir.mkdir(parents=True, exist_ok=True)
-    _block(outdir, tag, 0, mode)
-    _stage(outdir, tag, "input", 64, 1.0)     # exactly bf16(oracle)
-    _stage(outdir, tag, "vit", 64, 1.02)      # inside the recorded 3.07%
-    _stage(outdir, tag, "cells", 100, 1.02)
+    _block(outdir, tag, 0, mode, factor)
+    _stage(outdir, tag, "input", 64, 1.0)        # exactly bf16(oracle)
+    _stage(outdir, tag, "vit", 64, factor)       # inside the recorded bound
+    _stage(outdir, tag, "cells", 100, factor)
     return outdir
 
 
@@ -137,9 +161,9 @@ def _run(directory: Path, tag: str = "lp0", script: Path = COMPARE,
         capture_output=True, text=True)
 
 
-def _with_bounds(tmp: Path, mutate) -> Path:
+def _with_bounds(tmp: Path, mutate, name: str = "mutated") -> Path:
     """A copy of the comparator whose bounds file has been mutated beside it."""
-    home = tmp / "mutated"
+    home = tmp / name
     home.mkdir(parents=True, exist_ok=True)
     shutil.copy(COMPARE, home / COMPARE.name)
     data = json.loads(BOUNDS.read_text())
@@ -161,6 +185,12 @@ class ComparatorVerdict(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("VERDICT PASS", done.stdout)
 
+    def test_the_f32_leg_passes(self) -> None:
+        """The other judged profile, on data inside its tighter bound."""
+        done = _run(_dataset(self.tmp / "f32", tag="f32", factor=1.005), tag="f32")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("VERDICT PASS", done.stdout)
+
     def test_zero_row_cannot_disable_the_bounds(self) -> None:
         """One row zero on BOTH sides used to make every bound a no-op.
 
@@ -174,6 +204,37 @@ class ComparatorVerdict(unittest.TestCase):
         self.assertIn("VERDICT FAIL", done.stdout)
         self.assertIn("degenerate", done.stdout)
         self.assertIn("NOT FINITE", done.stdout)
+
+    def test_the_degenerate_row_rule_is_load_bearing(self) -> None:
+        """Deleting the degenerate-row refusal alone must turn something red.
+
+        It cannot be shown through a data file: stats() returns nan for ANY
+        zero-norm row, so on file data the degenerate rule and the isfinite
+        guard always fire together and the case above is carried by whichever
+        remains. Judging a REPORT directly separates them, and this is the case
+        that reds when the `max_degenerate_rows` refusal in judge() is removed
+        while every other rule stands.
+        """
+        bounds = json.loads(BOUNDS.read_text())
+        report = {
+            "sentinels": {k: {"bf16_of_oracle_exact": True, "max_abs": 0.0}
+                          for k in ("START", "END", "NEWLINE", "PAD")},
+            "permutation": {"identity_is_best": 100, "of": 100,
+                            "min_best_cos": 0.99, "min_best_margin": 0.5},
+            "image_rows": {"rows": 100, "mean_rel_l2": 0.02, "mean_cos": 0.999,
+                           "degenerate_rows": 3, "degenerate_row_index": [1, 2, 3]},
+            "input": {"bf16_of_oracle_exact": True},
+            "vit": {"mean_rel_l2": 0.02, "mean_cos": 0.999, "degenerate_rows": 0},
+            "cells": {"rows": 100},
+        }
+        verdict, bad, _notes = CMP.judge(report, "lp0", bounds)
+        self.assertEqual(verdict, "FAIL", bad)
+        self.assertTrue(any("degenerate" in line for line in bad), bad)
+        # THE CONTROL: the identical report with no degenerate row passes, so
+        # the verdict above is that rule and nothing else.
+        report["image_rows"]["degenerate_rows"] = 0
+        report["image_rows"]["degenerate_row_index"] = []
+        self.assertEqual(CMP.judge(report, "lp0", bounds)[0], "PASS")
 
     def test_drifted_leg_still_fails(self) -> None:
         """The control: the same 50%-off data with no zero row."""
@@ -217,6 +278,176 @@ class ComparatorVerdict(unittest.TestCase):
         self.assertEqual(done.returncode, 4, done.stdout)
         self.assertIn("VERDICT ERROR", done.stdout)
 
+    def test_every_judging_key_must_be_declared(self) -> None:
+        """THE CLASS, not the instance.
+
+        `judged` was hardened first and every other judging key kept the same
+        shape: read with `profile.get(...)`, silently unbounded when absent.
+        Measured on 50%-off data, tag lp0: dropping `mean_rel_l2_max` exited 0
+        PASS, dropping it with `mean_cos_min` exited 0 PASS, and a profile
+        holding only `judged` exited 0 PASS. Each key is dropped here on its own
+        and the run must ERROR rather than judge the leg without that bound.
+        """
+        for key in sorted(CMP.PROFILE_KEYS):
+            with self.subTest(key=key):
+                def drop(data, key=key):
+                    del data["profiles"]["shipped_bf16"][key]
+
+                script = _with_bounds(self.tmp, drop, name="drop-" + key)
+                done = _run(_dataset(self.tmp / ("k-" + key), mode="drift"),
+                            script=script)
+                self.assertEqual(done.returncode, 4,
+                                 "dropping %r was judged anyway:\n%s"
+                                 % (key, done.stdout))
+                self.assertIn("does not DECLARE", done.stdout)
+
+    def test_dropping_every_key_but_judged_is_an_error(self) -> None:
+        """The measured worst case: a profile holding `judged` alone passed."""
+        def strip(data):
+            data["profiles"]["shipped_bf16"] = {"judged": True}
+
+        script = _with_bounds(self.tmp, strip)
+        done = _run(_dataset(self.tmp / "bare", mode="drift"), script=script)
+        self.assertEqual(done.returncode, 4, done.stdout)
+        self.assertIn("VERDICT ERROR", done.stdout)
+
+    def test_a_mistyped_judging_key_is_an_error(self) -> None:
+        """A typo is not a bound, and it used to read as one."""
+        def typo(data):
+            profile = data["profiles"]["shipped_bf16"]
+            profile["mean_rel_l2_mx"] = profile.pop("mean_rel_l2_max")
+
+        script = _with_bounds(self.tmp, typo)
+        done = _run(_dataset(self.tmp / "typo", mode="drift"), script=script)
+        self.assertEqual(done.returncode, 4, done.stdout)
+        self.assertIn("unknown key", done.stdout)
+
+    def test_a_wrongly_typed_bound_is_an_error(self) -> None:
+        def wrong(data):
+            data["profiles"]["shipped_bf16"]["mean_rel_l2_max"] = True
+
+        script = _with_bounds(self.tmp, wrong)
+        done = _run(_dataset(self.tmp / "typed", mode="drift"), script=script)
+        self.assertEqual(done.returncode, 4, done.stdout)
+        self.assertIn("which is not a number", done.stdout)
+
+    def test_a_null_bound_must_name_its_reason(self) -> None:
+        """Unapplying a bound is allowed. Doing it silently is not."""
+        def blank(data):
+            data["profiles"]["shipped_bf16"]["mean_cos_min"] = None
+
+        script = _with_bounds(self.tmp, blank)
+        done = _run(_dataset(self.tmp / "null1", mode="drift"), script=script)
+        self.assertEqual(done.returncode, 4, done.stdout)
+        self.assertIn("without naming a reason", done.stdout)
+
+    def test_a_declared_null_bound_is_honoured_and_reported(self) -> None:
+        def blank(data):
+            profile = data["profiles"]["shipped_bf16"]
+            profile["mean_cos_min"] = None
+            profile["unbounded"]["mean_cos_min"] = "declared by this test"
+
+        script = _with_bounds(self.tmp, blank)
+        done = _run(_dataset(self.tmp / "null2"), script=script)
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertIn("mean_cos: NOT BOUNDED (declared null)", done.stdout)
+
+    def test_every_stage_key_must_be_declared(self) -> None:
+        for key in sorted(CMP.STAGE_KEYS):
+            with self.subTest(key=key):
+                def drop(data, key=key):
+                    del data["profiles"]["shipped_bf16"]["stages"]["vit"][key]
+
+                script = _with_bounds(self.tmp, drop, name="stage-" + key)
+                done = _run(_dataset(self.tmp / ("s-" + key), mode="drift"),
+                            script=script)
+                self.assertEqual(done.returncode, 4, done.stdout)
+                self.assertIn("does not DECLARE", done.stdout)
+
+    def test_a_diagnostic_only_stage_must_still_be_present(self) -> None:
+        """`diagnostic_only` used to skip the presence check as well.
+
+        Measured at 6e55cc113 for `shipped_bf16`: the `cells` files removed
+        exited 0 PASS, against a bounds file that says its presence is reported.
+        """
+        directory = _dataset(self.tmp / "nocells")
+        os.remove(directory / "ours-lp0-cells.f32")
+        os.remove(directory / "oracle-lp0-cells.f32")
+        done = _run(directory)
+        self.assertNotEqual(done.returncode, 0,
+                            "an absent diagnostic stage passed:\n" + done.stdout)
+        self.assertIn("stage 'cells' is ABSENT", done.stdout)
+
+    def test_a_diagnostic_only_stage_is_reported_not_judged(self) -> None:
+        """The declared behaviour, so the silence is deliberate and visible."""
+        directory = _dataset(self.tmp / "bigcells")
+        _stage(directory, "lp0", "cells", 100, 100.0)
+        done = _run(directory)
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertIn("stage 'cells': PRESENT and reported, magnitude NOT judged",
+                      done.stdout)
+
+    def test_the_f32_input_stage_is_presence_only_and_says_so(self) -> None:
+        """Finding 3: it was bounded by nothing and the file implied otherwise.
+
+        Measured at 6e55cc113: an `input` stage 100x wrong on the f32 leg exited
+        0 PASS with no BOUND line at all, while a `vit` stage 100x wrong exited
+        1. The bounds file now declares each of that stage's magnitude keys as
+        null with its reason, so the run SAYS the stage is presence-only, and
+        presence is enforced.
+        """
+        directory = _dataset(self.tmp / "f32in", tag="f32", factor=1.005)
+        _stage(directory, "f32", "input", 64, 100.0)
+        done = _run(directory, tag="f32")
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertIn("stage 'input' mean_rel_l2: NOT BOUNDED (declared null)",
+                      done.stdout)
+        os.remove(directory / "ours-f32-input.f32")
+        os.remove(directory / "oracle-f32-input.f32")
+        gone = _run(directory, tag="f32")
+        self.assertNotEqual(gone.returncode, 0, gone.stdout)
+        self.assertIn("stage 'input' is ABSENT", gone.stdout)
+
+    def test_near_parallel_rows_cannot_carry_the_ordering_claim(self) -> None:
+        """The permutation condition needs the reference rows to be separable.
+
+        Measured: a smooth ramp separates DIFFERENT rows by 7e-7 in cosine while
+        rounding a row to bf16 moves each element by about 0.4%, so the argmax
+        is decided by noise. That reads as a false red on clean data and as a
+        false GREEN on genuinely permuted output, and the comparator asserted
+        nothing about it.
+        """
+        done = _run(_dataset(self.tmp / "parallel", mode="parallel"))
+        self.assertNotEqual(done.returncode, 0,
+                            "an arbitrary argmax passed as ordering evidence:\n"
+                            + done.stdout)
+        self.assertIn("min_best_margin", done.stdout)
+        self.assertIn("not separable enough", done.stdout)
+
+    def test_the_margin_is_reported_on_a_clean_leg(self) -> None:
+        directory = _dataset(self.tmp / "margin")
+        done = _run(directory)
+        self.assertEqual(done.returncode, 0, done.stdout)
+        report = json.loads((directory / "report-lp0.json").read_text())
+        self.assertGreater(report["permutation"]["min_best_margin"], 0.01)
+
+    def test_the_run_says_what_it_judged(self) -> None:
+        """`.agents/verification.md`: an instrument states what it measured.
+
+        The output was `VERDICT PASS tag=lp0 profile=shipped_bf16` and nothing
+        else, so a stage that went unjudged looked exactly like one that passed.
+        """
+        done = _run(_dataset(self.tmp / "narrate"))
+        self.assertEqual(done.returncode, 0, done.stdout)
+        for line in ("JUDGED profile 'shipped_bf16', judged",
+                     "JUDGED sentinels: all 4 kinds required exactly bf16(oracle)",
+                     "JUDGED image_rows mean_rel_l2: bound <= 0.049",
+                     "JUDGED image_rows mean_cos: bound >= 0.998",
+                     "JUDGED stage 'input' bf16_of_oracle_exact",
+                     "JUDGED stage 'vit' mean_rel_l2: bound <= 0.0307",
+                     "JUDGED stage 'cells': PRESENT and reported"):
+            self.assertIn(line, done.stdout)
+
     def test_undefined_profile_is_an_error(self) -> None:
         def repoint(data):
             data["tag_rules"] = [["lp0", "no_such_profile"]] + data["tag_rules"]
@@ -236,18 +467,60 @@ class ComparatorVerdict(unittest.TestCase):
         self.assertIn("VERDICT UNJUDGED", done.stdout)
 
 
+# The recorded shape of the W7-CUDA run this row already measured on `thor`:
+# `ctest -R 'deepseek_v4|clip_mmproj_gguf'` reported 24 of 27 passed
+# (`.agents/specs/deepseek-v4-flash-vision.md:1370`), the three failures being
+# the ones the spec attributes at :1006-1018, :1019-1024 and :994-1004.
+CTEST_RECORDED = """\
+The following tests FAILED:
+\t  7 - test_deepseek_v4_mm_reach (Failed)
+\t 11 - test_deepseek_v4_mm_chat (Failed)
+\t 19 - test_serve_deepseek_v4_mm (Timeout)
+Errors while running CTest
+"""
+# The dev_attn refusal as `deepseek_v4.cpp:1325` emits it, quoted by the spec at
+# :1377-1383.
+DEV_ATTN_RECORDED = (
+    "deepseek-v4 attention: layer 0 runs the DEVICE decode kernel at "
+    "sliding_window 128. ... Refused by name; the windowed device kernel is "
+    "owed by issue #2411. Unset VT_V4_DEVICE_ATTN to take the host arm\n")
+
 # Each driver's readback block is self-contained: it reads only $OUT (and
-# $RUN_CLI in the parity driver) and runs entirely on the steps file. Extracting
-# it from its own `EXPECTED=` line to the end of the file and executing THAT is
-# what makes these cases test the shipped block rather than a copy of its logic.
+# $RUN_CLI in the parity driver) and runs entirely on the steps file and the
+# artefacts the job left beside it. Extracting it from its own `EXPECTED=` line
+# to the end of the file -- plus the shipped `refusal_recorded` function where
+# the driver defines one -- and executing THAT is what makes these cases test
+# the shipped block rather than a copy of its logic.
 DRIVERS = {
-    "dsv4v_w6_parity.sh": ("steps.txt", []),
-    "dsv4v_w6_floor.sh": ("floor-steps.txt", []),
-    "dsv4v_w6_f32.sh": ("f32-steps.txt", []),
-    "dsv4v_w7_cuda.sh": ("steps.txt",
-                         ["compare_cuda_lp0", "compare_cuda_lp1",
-                          "compare_cuda_lp2", "compare_cuda_lp3"]),
+    "dsv4v_w6_parity.sh": {
+        "steps": "steps.txt", "extra": [], "banner": "W6_PARITY_DONE",
+        "failed": "W6_PARITY_FAILED", "nonzero": {}, "artefacts": {}},
+    "dsv4v_w6_floor.sh": {
+        "steps": "floor-steps.txt", "extra": [], "banner": "W6_FLOOR_DONE",
+        "failed": "W6_FLOOR_FAILED", "nonzero": {}, "artefacts": {}},
+    "dsv4v_w6_f32.sh": {
+        "steps": "f32-steps.txt", "extra": [], "banner": "W6_F32_DONE",
+        "failed": "W6_F32_FAILED", "nonzero": {}, "artefacts": {}},
+    "dsv4v_w7_cuda.sh": {
+        "steps": "steps.txt",
+        "extra": ["compare_cuda_lp0", "compare_cuda_lp1",
+                  "compare_cuda_lp2", "compare_cuda_lp3"],
+        "banner": "W7_CUDA_DONE", "failed": "W7_CUDA_FAILED",
+        # The outcomes the spec RECORDS for this box, which a bare
+        # "any non-zero fails" rule would have turned into a red run.
+        "nonzero": {"ctest_cuda": 8, "dev_attn_on": 1},
+        "artefacts": {"ctest-cuda.log": CTEST_RECORDED,
+                      "dev-attn-refusal.txt": DEV_ATTN_RECORDED}},
 }
+
+
+def _readback_block(driver: str) -> str:
+    text = (PARITY / driver).read_text()
+    prefix = ""
+    if "refusal_recorded() {" in text:
+        start = text.index("refusal_recorded() {")
+        prefix = text[start:text.index("\n}\n", start) + 3]
+    return prefix + text[text.index("EXPECTED="):]
 
 
 class DriverStepReadback(unittest.TestCase):
@@ -257,38 +530,46 @@ class DriverStepReadback(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="dsv4v-steps-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
-    def _block_and_steps(self, driver: str) -> tuple[Path, list[str]]:
+    def _expected(self, driver: str) -> list[str]:
         text = (PARITY / driver).read_text()
-        start = text.index("EXPECTED=")
-        block = self.tmp / (driver + ".readback")
-        block.write_text(text[start:])
         match = re.search(r'EXPECTED="([^"]*)"', text)
         assert match, driver
-        expected = match.group(1).split() + DRIVERS[driver][1]
-        return block, expected
+        return match.group(1).split() + DRIVERS[driver]["extra"]
 
-    def _run(self, driver: str, lines: list[str]) -> subprocess.CompletedProcess:
-        block, _ = self._block_and_steps(driver)
+    def _recorded(self, driver: str) -> list[str]:
+        """The step lines of a run that went exactly as the record says."""
+        nonzero = DRIVERS[driver]["nonzero"]
+        return ["%s RC=%d" % (s, nonzero.get(s, 0)) for s in self._expected(driver)]
+
+    def _run(self, driver: str, lines: list[str],
+             artefacts: dict | None = None) -> subprocess.CompletedProcess:
+        block = self.tmp / (driver + ".readback")
+        block.write_text(_readback_block(driver))
         out = self.tmp / driver
         out.mkdir(exist_ok=True)
-        (out / DRIVERS[driver][0]).write_text("".join(l + "\n" for l in lines))
+        (out / DRIVERS[driver]["steps"]).write_text(
+            "".join(line + "\n" for line in lines))
+        for name, body in (DRIVERS[driver]["artefacts"]
+                           if artefacts is None else artefacts).items():
+            (out / name).write_text(body)
         env = dict(os.environ, OUT=str(out), RUN_CLI="0")
         return subprocess.run(["bash", str(block)], capture_output=True,
                               text=True, env=env)
 
-    def test_complete_run_passes(self) -> None:
+    def test_the_recorded_run_passes(self) -> None:
+        """The repair must not red the run this row already measured."""
         for driver in DRIVERS:
             with self.subTest(driver=driver):
-                _, expected = self._block_and_steps(driver)
-                done = self._run(driver, ["%s RC=0" % s for s in expected])
+                done = self._run(driver, self._recorded(driver))
                 self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertIn(DRIVERS[driver]["banner"], done.stdout)
+                self.assertNotIn(DRIVERS[driver]["failed"], done.stdout)
 
     def test_a_missing_expected_step_fails(self) -> None:
         """`awk '!/ RC=0$/' | wc -l` counted an ABSENT step as zero failures."""
         for driver in DRIVERS:
             with self.subTest(driver=driver):
-                _, expected = self._block_and_steps(driver)
-                done = self._run(driver, ["%s RC=0" % s for s in expected[1:]])
+                done = self._run(driver, self._recorded(driver)[1:])
                 self.assertNotEqual(done.returncode, 0,
                                     "a step that never ran passed:\n" + done.stdout)
                 self.assertIn("MISSING", done.stdout)
@@ -303,23 +584,159 @@ class DriverStepReadback(unittest.TestCase):
     def test_a_failing_step_fails(self) -> None:
         for driver in DRIVERS:
             with self.subTest(driver=driver):
-                _, expected = self._block_and_steps(driver)
-                lines = ["%s RC=0" % s for s in expected]
-                lines[-1] = "%s RC=7" % expected[-1]
+                lines = self._recorded(driver)
+                first = self._expected(driver)[0]
+                self.assertNotIn(first, DRIVERS[driver]["nonzero"])
+                lines[0] = "%s RC=7" % first
                 done = self._run(driver, lines)
                 self.assertNotEqual(done.returncode, 0, done.stdout)
                 self.assertIn("FAILING STEPS", done.stdout)
+
+    def test_the_done_banner_is_unreachable_on_a_failed_run(self) -> None:
+        """EXECUTED, not asserted on the text.
+
+        `dsv4v_w6_parity.sh`, `_floor.sh` and `_f32.sh` each printed their
+        `### W6_*_DONE` banner and THEN exited 1, so a log grep for the banner
+        read a failed run as a finished one. The previous version of this case
+        checked only that the string `[ "$BAD" -eq 0 ]` appeared in the file,
+        which all four drivers satisfied while three of them still printed it.
+        """
+        for driver in DRIVERS:
+            with self.subTest(driver=driver):
+                lines = self._recorded(driver)
+                lines[0] = "%s RC=7" % self._expected(driver)[0]
+                done = self._run(driver, lines)
+                self.assertNotEqual(done.returncode, 0, done.stdout)
+                self.assertNotIn(DRIVERS[driver]["banner"], done.stdout)
+                self.assertIn(DRIVERS[driver]["failed"], done.stdout)
 
     def test_a_malformed_line_fails(self) -> None:
         """The W7-CUDA driver used to write a bare `cpu_control identical`."""
         for driver in DRIVERS:
             with self.subTest(driver=driver):
-                _, expected = self._block_and_steps(driver)
-                lines = ["%s RC=0" % s for s in expected] + ["cpu_control identical"]
-                done = self._run(driver, lines)
+                done = self._run(driver,
+                                 self._recorded(driver) + ["cpu_control identical"])
                 self.assertNotEqual(done.returncode, 0,
                                     "an unparsable step line passed:\n" + done.stdout)
                 self.assertIn("MALFORMED", done.stdout)
+
+
+class W7StepClassification(unittest.TestCase):
+    """A recorded expectation must not become an excuse for any outcome."""
+
+    DRIVER = "dsv4v_w7_cuda.sh"
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsv4v-w7-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.helper = DriverStepReadback("test_the_recorded_run_passes")
+        self.helper.tmp = self.tmp
+
+    def _run(self, steps: dict, artefacts: dict) -> subprocess.CompletedProcess:
+        lines = ["%s RC=%d" % (s, steps.get(s, 0))
+                 for s in self.helper._expected(self.DRIVER)]
+        return self.helper._run(self.DRIVER, lines, artefacts)
+
+    def test_the_attributed_ctest_failures_are_accepted(self) -> None:
+        done = self._run({"ctest_cuda": 8, "dev_attn_on": 1},
+                         DRIVERS[self.DRIVER]["artefacts"])
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("ATTRIBUTED by the spec", done.stdout)
+
+    def test_an_unattributed_ctest_failure_fails(self) -> None:
+        log = CTEST_RECORDED.replace("test_deepseek_v4_mm_chat",
+                                     "test_cuda_deepseek_v4")
+        done = self._run({"ctest_cuda": 8, "dev_attn_on": 1},
+                         {"ctest-cuda.log": log,
+                          "dev-attn-refusal.txt": DEV_ATTN_RECORDED})
+        self.assertNotEqual(done.returncode, 0,
+                            "an unattributed suite failure passed:\n" + done.stdout)
+        self.assertIn("has NOT attributed it", done.stdout)
+
+    def test_a_ctest_failure_with_no_named_test_fails(self) -> None:
+        done = self._run({"ctest_cuda": 8, "dev_attn_on": 1},
+                         {"ctest-cuda.log": "Segmentation fault\n",
+                          "dev-attn-refusal.txt": DEV_ATTN_RECORDED})
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertIn("UNEXPLAINED ctest_cuda", done.stdout)
+
+    def test_a_ctest_failure_with_no_log_fails(self) -> None:
+        done = self._run({"ctest_cuda": 8, "dev_attn_on": 1},
+                         {"dev-attn-refusal.txt": DEV_ATTN_RECORDED})
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertIn("no ctest-cuda.log", done.stdout)
+
+    def test_a_clean_ctest_run_is_accepted(self) -> None:
+        done = self._run({"ctest_cuda": 0, "dev_attn_on": 1},
+                         DRIVERS[self.DRIVER]["artefacts"])
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+    def test_dev_attn_passing_falsifies_the_record(self) -> None:
+        """The POINT of that step is that the path refuses."""
+        done = self._run({"ctest_cuda": 8, "dev_attn_on": 0},
+                         DRIVERS[self.DRIVER]["artefacts"])
+        self.assertNotEqual(done.returncode, 0,
+                            "a refusal that stopped firing passed:\n" + done.stdout)
+        self.assertIn("FALSIFIES the record", done.stdout)
+
+    def test_dev_attn_failing_without_the_refusal_fails(self) -> None:
+        done = self._run({"ctest_cuda": 8, "dev_attn_on": 1},
+                         {"ctest-cuda.log": CTEST_RECORDED,
+                          "dev-attn-refusal.txt": "Segmentation fault\n"})
+        self.assertNotEqual(done.returncode, 0,
+                            "a crash was filed as the refusal:\n" + done.stdout)
+        self.assertIn("UNEXPLAINED dev_attn_on", done.stdout)
+
+
+class RefusalClassifier(unittest.TestCase):
+    """The shipped `refusal_recorded` function, executed on real message text.
+
+    It was `grep -iE 'refus|unsupported|share one device|must be'`, and `must be`
+    matches ordinary assertion and exception text: the two CRASH lines below were
+    both filed as expected refusals with RC=0.
+    """
+
+    ACCEPT = (
+        "terminate called: DeepSeek-V4 vision weights must share one device",
+        "DeepSeek-V4 vision compute dtype must be bf16",
+        "DeepSeek-V4 vision patch dtype must equal model dtype",
+        DEV_ATTN_RECORDED,
+        "DeepseekV4 DEVICE forward (W7-device) not implemented - the tiny-config",
+    )
+    REJECT = (
+        "Assertion failed: n must be positive",
+        "terminate called after throwing an instance of 'std::out_of_range': "
+        "vector index must be less than size",
+        "Segmentation fault",
+        "CUDA error: an illegal memory access was encountered",
+        "unsupported thing happened somewhere else",
+    )
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="dsv4v-refusal-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        text = (PARITY / "dsv4v_w7_cuda.sh").read_text()
+        start = text.index("refusal_recorded() {")
+        self.fn = text[start:text.index("\n}\n", start) + 3]
+
+    def _classify(self, message: str) -> int:
+        log = self.tmp / "probe.log"
+        log.write_text(message + "\n")
+        script = self.tmp / "classify.sh"
+        script.write_text(self.fn + '\nrefusal_recorded "$1"\n')
+        return subprocess.run(["bash", str(script), str(log)]).returncode
+
+    def test_a_product_refusal_is_recorded(self) -> None:
+        for message in self.ACCEPT:
+            with self.subTest(message=message[:40]):
+                self.assertEqual(self._classify(message), 0)
+
+    def test_a_crash_is_not_a_refusal(self) -> None:
+        for message in self.REJECT:
+            with self.subTest(message=message[:40]):
+                self.assertNotEqual(
+                    self._classify(message), 0,
+                    "a crash would be filed as the expected refusal")
 
 
 class DriverContract(unittest.TestCase):
@@ -338,13 +755,6 @@ class DriverContract(unittest.TestCase):
             with self.subTest(driver=driver):
                 text = (PARITY / driver).read_text()
                 self.assertRegex(text, r"(?m)^set -uo pipefail$")
-
-    def test_the_done_banner_is_guarded(self) -> None:
-        """A DONE banner must not be reachable when a step failed."""
-        for driver in DRIVERS:
-            with self.subTest(driver=driver):
-                text = (PARITY / driver).read_text()
-                self.assertIn('[ "$BAD" -eq 0 ]', text)
 
     def test_every_load_bearing_control_records_a_step(self) -> None:
         """The byte-for-byte controls the file headers call load-bearing.

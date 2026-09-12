@@ -8,12 +8,21 @@
     "later wave cannot derive a bound from the very run it is judging. Every",
     "number below was measured BEFORE the run it now judges, by the rc job named",
     "beside it, and every one of them is reproduced in the spec's",
-    "`### W6 evidence` section.",
+    "`### W6 evidence` section. The ONE exception is `best_match_margin_min`,",
+    "which is DECLARED rather than recorded and says so in its own provenance.",
     "",
-    "EVERY PROFILE MUST CARRY AN EXPLICIT `judged`. The comparator treats a",
-    "missing or non-boolean key as an ERROR rather than defaulting it to false:",
-    "the default USED to downgrade an incomplete judged profile to DIAGNOSTIC,",
-    "which exited 0 on data that was 50% off."
+    "EVERY JUDGED PROFILE DECLARES EVERY JUDGING KEY. The comparator validates a",
+    "resolved profile against `PROFILE_KEYS` and `STAGE_KEYS` before it judges",
+    "anything, and a missing key, a key of the wrong type and an unknown key are",
+    "each an ERROR with exit 4. Writing the key is not a formality: until",
+    "2026-09-12 an ABSENT key was read by nothing and the leg was judged without",
+    "that bound, so dropping `mean_rel_l2_max` from `shipped_bf16` printed",
+    "VERDICT PASS at rc 0 on data whose every image row was 50% off, and a",
+    "profile holding only `judged` did the same.",
+    "",
+    "A BOUND THAT IS DELIBERATELY NOT APPLIED IS WRITTEN AS `null` AND NAMES ITS",
+    "REASON UNDER `unbounded`. That is the whole difference between a bound this",
+    "project decided not to set and a bound somebody forgot."
   ],
   "statistic": "image_rows",
   "_statistic_note": [
@@ -37,20 +46,32 @@
     "that the error does not jump at a stage, so that sentence rested on nothing",
     "executable until these rules existed.",
     "",
-    "A stage that is deliberately NOT bounded carries `diagnostic_only` with its",
-    "reason, so the silence is stated rather than inferred."
+    "A `diagnostic_only` stage is PRESENCE-ONLY, and presence is still required.",
+    "The comparator used to skip such a stage before the presence check, so an",
+    "absent `cells` and a `cells` 100x wrong both exited 0. A diagnostic_only",
+    "stage therefore carries NO other key: a rule that judges no magnitude must",
+    "not also be able to hide a bound it failed to declare."
   ],
   "profiles": {
     "shipped_bf16": {
       "judged": true,
       "sentinels_bf16_exact": true,
       "permutation_identity_complete": true,
+      "best_match_margin_min": 0.01,
       "mean_rel_l2_max": 0.049,
       "mean_cos_min": 0.998,
       "max_degenerate_rows": 0,
       "stages": {
         "input": {
           "bf16_of_oracle_exact": true,
+          "mean_rel_l2_max": null,
+          "mean_cos_min": null,
+          "max_degenerate_rows": null,
+          "unbounded": {
+            "mean_rel_l2_max": "The assertion on this stage is EXACTNESS, which is strictly stronger than any relative-L2 bound: if ours is exactly bf16(oracle) then no magnitude bound can add anything, and if it is not, the exactness rule has already failed. The spec records 0.12% mean relative L2 here as a reported value and sets no bound on it.",
+            "mean_cos_min": "The same: exactness already covers it, and the spec records no cosine floor for the input pixels.",
+            "max_degenerate_rows": "A patch that normalises to exactly zero is legitimate data rather than a defect, and no bound on this stage depends on rel_l2 or cos being defined, so a zero row here disables nothing. This is NOT the argument that applies to `image_rows`, where a zero row means the tower produced nothing for an aligner cell."
+          },
           "_provenance": [
             "The W6 evidence table records 'ours is exactly bf16(oracle)' for the",
             "input pixels on every rung. It is an EXACTNESS claim, so it is",
@@ -58,11 +79,18 @@
             "EVIDENCE: the oracle dump writes this file in OUR patch-row order,",
             "so it measures the normalisation ARITHMETIC and asserts the",
             "ordering. The ordering evidence is the block-level permutation",
-            "check, which requires the identity for every image row."
+            "check, which requires the identity for every image row AND a",
+            "best-match margin that makes the argmax mean something."
           ]
         },
         "vit": {
+          "bf16_of_oracle_exact": false,
           "mean_rel_l2_max": 0.0307,
+          "mean_cos_min": null,
+          "max_degenerate_rows": 0,
+          "unbounded": {
+            "mean_cos_min": "The spec records a vit mean cosine of 0.99934 as a measured value and declares no floor for it. Choosing one here would be a fresh bound invented by the wave that is judged by it, which is the thing this file exists to prevent."
+          },
           "_provenance": [
             "Built the same way as this profile's 3-condition cells bound, from",
             "the same two recorded measurements at the VIT stage rather than at",
@@ -78,7 +106,12 @@
             "",
             "Like the cells bound, this is a REGRESSION CATCHER rather than",
             "independent evidence, and for the same triangle-inequality reason.",
-            "Its value is that a vit-stage regression can now fail a run at all."
+            "Its value is that a vit-stage regression can now fail a run at all.",
+            "",
+            "max_degenerate_rows 0: a vit row is a post-RMSNorm hidden state, so",
+            "a zero-norm one means the tower produced nothing for that patch. It",
+            "is a defect in its own right and it also makes this stage's",
+            "mean_rel_l2 nan, which the comparator refuses separately."
           ]
         },
         "cells": {
@@ -87,10 +120,12 @@
             "The `-cells.f32` stage is the aligner output BEFORE the block",
             "layout: the same rows the judged `image_rows` statistic already",
             "covers, in a different order. Bounding it would be a second",
-            "description of one measurement. Its presence is still reported."
+            "description of one measurement. Its presence IS required and is",
+            "reported; only its magnitude is unjudged."
           ]
         }
       },
+      "unbounded": {},
       "_provenance": [
         "Conditions (1) and (3) of the three the spec's `THE BOUND` section sets.",
         "",
@@ -113,17 +148,37 @@
         "nan, and `nan > limit` and `nan < limit` are both False, so it silently",
         "disabled BOTH magnitude bounds above for every row. Measured: 99 rows",
         "50% off plus one zero row printed VERDICT PASS and exited 0. An",
-        "all-zero aligner cell is also a defect in its own right."
+        "all-zero aligner cell is also a defect in its own right.",
+        "",
+        "best_match_margin_min 0.01 IS DECLARED, NOT RECORDED, and it is the",
+        "only such number in this file. It is the floor under the gap between",
+        "the winning reference row's cosine and the runner-up's, minimised over",
+        "our image rows, and it is the precondition the identity-permutation",
+        "condition above never had: an argmax over near-parallel rows is decided",
+        "by rounding rather than by content. WHAT IS MEASURED: a smooth-ramp",
+        "fixture separated DIFFERENT rows by 7e-7 in cosine while rounding a row",
+        "to bf16 moves each element by about 0.4%, and the identity then read",
+        "'best for 17 of 100' on a CLEAN dataset; the pseudo-random fixture the",
+        "mutation tests use measures a margin of 0.229. WHAT IS NOT MEASURED:",
+        "the margin of a real 392x392 photograph on this tower, because no",
+        "recorded run reports one -- `min_best_margin` did not exist until",
+        "2026-09-12. 0.01 sits about one and a half decades under the fixture",
+        "and four decades over the degenerate case, and the first real leg that",
+        "runs will report its own value. If a legitimate real run falls below",
+        "it, the number to change is this one and the reason is a measurement,",
+        "not a relaxation."
       ]
     },
     "shipped_bf16_block_only": {
       "judged": true,
       "sentinels_bf16_exact": true,
       "permutation_identity_complete": true,
+      "best_match_margin_min": 0.01,
       "mean_rel_l2_max": 0.049,
       "mean_cos_min": 0.998,
       "max_degenerate_rows": 0,
       "stages": {},
+      "unbounded": {},
       "_provenance": [
         "`shipped_bf16` with NO stage requirements, for the end-to-end CLI leg",
         "only. llama-mtmd-cli is driven through MTMD_DEBUG_EMBEDDINGS, which",
@@ -142,19 +197,38 @@
       "judged": true,
       "sentinels_bf16_exact": true,
       "permutation_identity_complete": true,
+      "best_match_margin_min": 0.01,
       "mean_rel_l2_max": 0.0157,
+      "mean_cos_min": null,
       "max_degenerate_rows": 0,
       "stages": {
         "input": {
+          "bf16_of_oracle_exact": false,
+          "mean_rel_l2_max": null,
+          "mean_cos_min": null,
+          "max_degenerate_rows": null,
+          "unbounded": {
+            "mean_rel_l2_max": "PRESENCE-ONLY, and this says so rather than leaving a reader to infer a bound. The previous wording -- 'REQUIRED but NOT held to bf16 exactness' -- reads as 'held to something else', and nothing else was ever applied: measured, an `input` stage 100x wrong exited 0 PASS on this profile with no BOUND line printed, while a `vit` stage 100x wrong exited 1. There is no recorded f32-arm measurement at the input stage to bound it with. What this stage still proves is that the dump EXISTS and has the oracle's shape, which is what makes the vit and block numbers below numbers about the same image.",
+            "mean_cos_min": "The same: no recorded f32-arm input measurement exists, and a bound invented here would be a fresh one.",
+            "max_degenerate_rows": "See `shipped_bf16`: a patch that normalises to exactly zero is legitimate data, and no bound on this stage depends on rel_l2 or cos being defined."
+          },
           "_provenance": [
-            "REQUIRED but NOT held to bf16 exactness. The f32 arm feeds the",
-            "exact f32 pixels rather than the bf16-narrowed ones, so",
-            "bf16_of_oracle_exact is the wrong assertion for this leg and",
-            "asserting it would fail a correct run."
+            "REQUIRED, PRESENCE-ONLY. The f32 arm feeds the exact f32 pixels",
+            "rather than the bf16-narrowed ones, so bf16_of_oracle_exact is the",
+            "wrong assertion for this leg and asserting it would fail a correct",
+            "run. No other recorded number exists for this stage on this arm, so",
+            "nothing is asserted about its magnitude and the file says that in",
+            "`unbounded` instead of leaving the silence to be read as a bound."
           ]
         },
         "vit": {
+          "bf16_of_oracle_exact": false,
           "mean_rel_l2_max": 0.01,
+          "mean_cos_min": null,
+          "max_degenerate_rows": 0,
+          "unbounded": {
+            "mean_cos_min": "The spec records no vit cosine floor for this arm either; see `shipped_bf16`."
+          },
           "_provenance": [
             "Condition (2) at the VIT stage: the f32 arm inside the oracle's own",
             "floor. The oracle's bf16-input floor is 1.00% at vit (rc job",
@@ -172,16 +246,16 @@
           "_provenance": ["See `shipped_bf16`: the same rows as the judged statistic."]
         }
       },
+      "unbounded": {
+        "mean_cos_min": "The spec records no cosine floor for condition (2), and inventing one here would be a fresh bound rather than a recorded one."
+      },
       "_provenance": [
         "Condition (2): the f32 arm is within the oracle's OWN floor, cells mean",
         "relative L2 <= 1.57%, measured 1.34% (rc job",
         "0edbd4a9-cfd4-47e6-806b-0eb31df06383). This is the condition that tests",
         "the FUNCTION: the floor is the oracle measured against itself with its",
         "input moved by one bf16 step, so it is a bound our arm can fail without",
-        "any arithmetic elsewhere changing.",
-        "",
-        "No mean_cos bound: the spec records none for this condition, and",
-        "inventing one here would be a fresh bound rather than a recorded one."
+        "any arithmetic elsewhere changing."
       ]
     },
     "diagnostic": {

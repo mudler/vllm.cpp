@@ -1231,6 +1231,54 @@ above as its red-before input.
   unmatched tag is deliberately not a pass. The three drivers now also READ
   `steps.txt` BACK and exit non-zero when any step failed, which nothing did
   before, so a failing comparison could not reach the job's exit status at all.
+- **CLOSED 2026-09-12, the SAME DAY, by a second repair: the shape the first one
+  fixed one key at a time.** Hardening `judged` left every other judging key read
+  with `profile.get(...)`, and a bound whose limit is `None` is not applied, so a
+  profile that simply OMITTED a key was judged without it. Measured on data whose
+  every image row was 50% off: dropping `mean_rel_l2_max` exited 0 `PASS`,
+  dropping it with `mean_cos_min` exited 0 `PASS`, and a profile holding `judged`
+  alone exited 0 `PASS`. A judged profile must now DECLARE every key in the
+  comparator's `PROFILE_KEYS` and `STAGE_KEYS`, the resolved profile is validated
+  BEFORE anything is judged, and a missing, mistyped or wrongly typed key is
+  `ERROR` with exit 4. A bound that is deliberately not applied is written as
+  `null` and names its reason under `unbounded`. Four things follow from that
+  file becoming complete rather than partial:
+  - A `diagnostic_only` stage is still REQUIRED TO BE PRESENT. The flag used to
+    be tested before the presence check, so an absent `cells` stage exited 0
+    `PASS` against a bounds file that says its presence is reported.
+  - The f32 arm's `input` stage is declared PRESENCE-ONLY, with the reason, and
+    not left to be read as bounded. It was held to nothing: an `input` stage 100x
+    wrong exited 0 `PASS` with no `BOUND` line, while the same defect at `vit`
+    exited 1. No recorded f32-arm measurement exists at that stage to bound it
+    with, so the file says so instead of implying a bound.
+  - `best_match_margin_min = 0.01` is the ONE DECLARED number in the bounds file
+    and it says so in its own provenance. It is the precondition the
+    identity-permutation condition never had: an argmax over near-parallel rows
+    is decided by bf16 rounding rather than by content. WHAT IS MEASURED is the
+    degeneracy — a smooth-ramp fixture separates DIFFERENT rows by 7e-7 in cosine
+    while rounding moves a row by about 0.4%, and the identity then read 17 of
+    100 on a CLEAN dataset. WHAT IS NOT MEASURED is the margin of a real
+    392x392 photograph, because `min_best_margin` did not exist until this
+    change; the first real leg to run will report its own value.
+  - The comparator now NARRATES what it judged, one `JUDGED` line per bound,
+    stage and presence-only rule. A verdict that does not say what it covered
+    cannot be read for what it left out.
+  The drivers are repaired in the same change. `dsv4v_w6_parity.sh`,
+  `dsv4v_w6_floor.sh` and `dsv4v_w6_f32.sh` each PRINTED their `### W6_*_DONE`
+  banner and then exited 1, so a log grep for the banner read a failed run as a
+  finished one; the exit now comes first, as `dsv4v_w7_cuda.sh` already did. That
+  driver's refusal classifier matched the bare string `must be`, which ordinary
+  assertion and exception text carries, so a crash was filed as the expected
+  device refusal with `RC=0`; every alternative is now anchored to a message the
+  product owns. And its step readback no longer requires every step to be zero,
+  because THIS ROW'S OWN RECORDED RUN would fail that rule: `ctest_cuda` and
+  `dev_attn_on` are judged against the outcomes recorded above in `## Owed` and
+  in `### W7-CUDA evidence` — the aarch64 i8mm repack failures, the
+  `test_serve_deepseek_v4_mm` timeout, the `test_deepseek_v4_mm_chat` CPU-only
+  premise, and the device decode refusal whose firing is the point of the step.
+  An UNEXPECTED outcome still fails: an unattributed suite, a non-zero with no
+  named failing test, and a `dev_attn_on` that PASSES all fail the job, the last
+  because a refusal that quietly stopped firing falsifies the record.
 - **The `input` stage line asserts our patch ordering rather than measuring it,
   and that is recorded rather than changed.** `dsv4v_w6_oracle_dump.cpp`
   rearranges the oracle's normalised buffer into OUR claimed patch-row order
@@ -1240,7 +1288,12 @@ above as its red-before input.
   order. The gate as a whole is NOT blind to ordering: the block-level
   permutation check best-matches every image row against the oracle's own block
   and requires the identity, and that is where W6's and W7-CUDA's ordering
-  evidence comes from. The comment at the rearranging loop now says so. Making
+  evidence comes from. The comment at the rearranging loop now says so. SINCE
+  2026-09-12 THAT CHECK ALSO CARRIES ITS OWN PRECONDITION: an argmax means
+  nothing when the reference rows are not separable, so the comparator reports
+  the margin between the winner and the runner-up and every judged profile
+  declares `best_match_margin_min`. The bound is DECLARED rather than recorded,
+  because no real leg has reported a margin yet. Making
   the input stage measure ordering on its own would need the oracle's buffer
   written in the ORACLE's order plus a separate declared mapping, which is a
   second description of the layout that could drift from the first; the

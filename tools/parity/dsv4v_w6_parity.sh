@@ -160,5 +160,9 @@ else
       || { echo "### MISSING EXPECTED STEP: $s -- it never ran"; BAD=1; }
   done
 fi
-echo "### W6_PARITY_DONE failed_steps=$BAD"
-[ "$BAD" -eq 0 ] || exit 1
+# THE DONE BANNER IS WHAT A READER GREPS FOR, so it must not be reachable on a
+# failed run. This printed `### W6_PARITY_DONE failed_steps=1` and THEN exited 1,
+# so a log grep for the banner read a failed job as a finished one. The exit now
+# comes first and the banner carries a literal 0, as dsv4v_w7_cuda.sh already did.
+[ "$BAD" -eq 0 ] || { echo "### W6_PARITY_FAILED"; exit 1; }
+echo "### W6_PARITY_DONE failed_steps=0"

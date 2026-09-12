@@ -121,5 +121,8 @@ else
       || { echo "### MISSING EXPECTED STEP: $s -- it never ran"; BAD=1; }
   done
 fi
-echo "### W6_F32_DONE failed_steps=$BAD"
-[ "$BAD" -eq 0 ] || exit 1
+# THE DONE BANNER MUST NOT BE REACHABLE ON A FAILED RUN; see dsv4v_w6_parity.sh.
+# This printed `### W6_F32_DONE failed_steps=1` and then exited 1, so a log grep
+# for the banner read a failed job as a finished one.
+[ "$BAD" -eq 0 ] || { echo "### W6_F32_FAILED"; exit 1; }
+echo "### W6_F32_DONE failed_steps=0"

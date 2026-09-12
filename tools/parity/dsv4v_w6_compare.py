@@ -49,6 +49,39 @@ on synthetic data and all closed here:
   nothing executable. Stages a profile declares are now REQUIRED to be present
   and are judged against recorded bounds; a stage that is deliberately unbounded
   says so in the profile with its reason, and an absent one always fails.
+
+AND THE SHAPE THOSE THREE REPAIRS EACH LEFT IN PLACE ONE KEY AT A TIME. Each of
+them hardened the key it was about, and every OTHER judging key kept the same
+fail-open shape: it was read with `profile.get(...)`, and `_check_bound` returns
+silently when the limit is `None`, so a judged profile that simply OMITTED a key
+was judged without that bound and still exited 0. Measured on data whose every
+image row was 50% off, tag `lp0`, profile `shipped_bf16`: dropping
+`mean_rel_l2_max` printed `VERDICT PASS` at rc 0, dropping `mean_rel_l2_max` and
+`mean_cos_min` together printed `VERDICT PASS` at rc 0, and a profile holding
+`judged` and nothing else printed `VERDICT PASS` at rc 0. A mistyped key had the
+same effect, because nothing ever read the profile as a whole.
+
+  A KEY THAT IS ABSENT IS NOT A KEY THAT IS UNBOUNDED. The judging keys are
+  DECLARED once in `PROFILE_KEYS` and `STAGE_KEYS` below and the resolved profile
+  is validated against them BEFORE anything is judged. A missing key, a key of
+  the wrong type, and an unknown key are each an ERROR with exit 4, exactly as a
+  missing `judged` is. A bound a profile deliberately does not apply is written
+  as `null` and names its reason under `unbounded`, so the silence is stated.
+  Fixing this per key is what produced this paragraph; it is fixed as a class.
+
+  A PRESENCE-ONLY STAGE IS STILL REQUIRED TO BE PRESENT. `diagnostic_only` used
+  to `continue` before the presence check, so for `shipped_bf16` an absent
+  `cells` stage exited 0 and a `cells` stage 100x wrong exited 0, against a
+  docstring and a bounds file that both say its presence is reported.
+
+  AN ARBITRARY ARGMAX IS NOT A PERMUTATION RESULT. `best_match` asserts nothing
+  about the reference rows being separable, and the spec leans on the
+  identity-permutation condition as the ORDERING evidence. On rows that are
+  near-parallel the argmax is decided by bf16 rounding rather than by content:
+  measured, a smooth-ramp fixture separated DIFFERENT rows by 7e-7 in cosine
+  while rounding moves a row by about 0.4%, which reads as a false red on clean
+  data and would read as a false GREEN on genuinely permuted output. The margin
+  between the winner and the runner-up is now reported and bounded.
 """
 import fnmatch
 import json
@@ -136,17 +169,32 @@ def matrix_summary(name, ours, ref):
 
 
 def best_match(ours, ref):
-    """For each of our rows, the reference row with the highest cosine."""
+    """For each of our rows: the best reference row, its cosine, and the MARGIN.
+
+    The margin is the winner's cosine minus the runner-up's, and it is what makes
+    an argmax mean anything. The identity-permutation condition is the spec's
+    ORDERING evidence -- the input stage cannot supply it, because the oracle
+    dump writes that file in our own patch-row order -- and until 2026-09-12 it
+    rested on an argmax with no separability precondition at all.
+
+    MEASURED, and this is why the margin is reported: a smooth-ramp fixture made
+    every reference row near-parallel, cosine 0.9999988 between DIFFERENT rows,
+    while rounding a row to bf16 moves each element by about 0.4%. The rounding
+    swamped the separation, the argmax became arbitrary, and the identity was
+    best for 17 of 100 rows on a CLEAN dataset. The same degeneracy is a false
+    GREEN on genuinely permuted output, because any row then matches any row.
+    """
     norms = [math.sqrt(sum(x * x for x in r)) or 1.0 for r in ref]
     hits = []
-    for i, a in enumerate(ours):
+    for a in ours:
         na = math.sqrt(sum(x * x for x in a)) or 1.0
-        best, arg = -2.0, -1
-        for j, b in enumerate(ref):
-            c = sum(x * y for x, y in zip(a, b)) / (na * norms[j])
-            if c > best:
-                best, arg = c, j
-        hits.append((arg, best))
+        cos = [sum(x * y for x, y in zip(a, b)) / (na * norms[j])
+               for j, b in enumerate(ref)]
+        # `sorted` is stable, so a tie keeps the lowest index and the winner is
+        # the same row the previous strict-greater-than scan chose.
+        order = sorted(range(len(cos)), key=lambda j: cos[j], reverse=True)
+        runner_up = cos[order[1]] if len(order) > 1 else -1.0
+        hits.append((order[0], cos[order[0]], cos[order[0]] - runner_up))
     return hits
 
 
@@ -173,14 +221,152 @@ def profile_for(tag, bounds):
     return None
 
 
-def _check_bound(bad, label, value, limit, kind):
+# ── THE PROFILE SCHEMA ─────────────────────────────────────────────────────
+# EVERY JUDGING KEY IS DECLARED HERE, and a judged profile must declare every
+# one of them. The value `None` (JSON `null`) means the bound is deliberately
+# not applied, and the profile must then name the reason under `unbounded`.
+#
+# This exists because hardening the keys ONE AT A TIME did not work. `judged`
+# was made mandatory on 2026-09-12 and every other judging key kept the same
+# shape: read with `profile.get(...)`, silently unbounded when absent. Dropping
+# `mean_rel_l2_max` from `shipped_bf16` exited 0 PASS on data 50% off; dropping
+# `mean_rel_l2_max` and `mean_cos_min` exited 0 PASS; a profile holding only
+# `judged` exited 0 PASS. Validating the resolved profile against this schema
+# BEFORE anything is judged is what closes the shape rather than the instances:
+# a missing key, a key of the wrong type and an unknown (mistyped) key are each
+# an ERROR, because none of them is a bound and all three used to read as one.
+NUMBER = "number"
+PROFILE_KEYS = {
+    "sentinels_bf16_exact": bool,
+    "permutation_identity_complete": bool,
+    "best_match_margin_min": NUMBER,
+    "mean_rel_l2_max": NUMBER,
+    "mean_cos_min": NUMBER,
+    "max_degenerate_rows": int,
+    "stages": dict,
+}
+STAGE_KEYS = {
+    "bf16_of_oracle_exact": bool,
+    "mean_rel_l2_max": NUMBER,
+    "mean_cos_min": NUMBER,
+    "max_degenerate_rows": int,
+}
+# Keys that carry no bound and are therefore not schema violations.
+META_KEYS = ("judged", "unbounded", "diagnostic_only")
+
+
+def _is_typed(value, want):
+    """`isinstance(True, int)` is True, so a bool must not satisfy a number."""
+    if want is bool:
+        return isinstance(value, bool)
+    if isinstance(value, bool):
+        return False
+    if want is NUMBER:
+        return isinstance(value, (int, float))
+    return isinstance(value, want)
+
+
+def _validate_keys(where, mapping, schema, bad):
+    """Every key of `schema` DECLARED, correctly typed, and nothing invented."""
+    unbounded = mapping.get("unbounded", {})
+    if not isinstance(unbounded, dict):
+        bad.append("%s has a non-object 'unbounded' %r" % (where, unbounded))
+        unbounded = {}
+    for key in sorted(schema):
+        if key not in mapping:
+            bad.append(
+                "%s does not DECLARE %r. A judged profile must declare every key "
+                "it is judged on: an absent key is read by nothing, so the leg "
+                "would be judged without that bound and still pass. Write the "
+                "bound, or write null and give the reason under 'unbounded'."
+                % (where, key))
+            continue
+        value = mapping[key]
+        if value is None:
+            reason = unbounded.get(key)
+            if not isinstance(reason, str) or not reason.strip():
+                bad.append(
+                    "%s declares %r as null without naming a reason under "
+                    "'unbounded'. A bound that is deliberately not applied must "
+                    "say why; silence is how an unbounded key reads as a bound."
+                    % (where, key))
+            continue
+        if not _is_typed(value, schema[key]):
+            bad.append("%s declares %r as %r, which is not a %s"
+                       % (where, key, value,
+                          schema[key] if isinstance(schema[key], str)
+                          else schema[key].__name__))
+    for key in sorted(mapping):
+        if key.startswith("_") or key in META_KEYS or key in schema:
+            continue
+        bad.append(
+            "%s declares unknown key %r. A MISTYPED key is not a bound: nothing "
+            "reads it, and the bound it was meant to be would be absent."
+            % (where, key))
+
+
+def validate_profile(name, profile):
+    """The whole profile, checked ONCE and up front. Returns [error lines]."""
+    bad = []
+    # A MISSING `judged` KEY IS AN ERROR. It used to default to False, so an
+    # incomplete profile silently downgraded a judged leg to DIAGNOSTIC and
+    # exited 0 on data that was 50% off.
+    if "judged" not in profile:
+        return ["profile %r has no 'judged' key. An incomplete profile is an "
+                "ERROR: it must not silently downgrade a judged leg to a "
+                "diagnostic one." % name]
+    if not isinstance(profile["judged"], bool):
+        return ["profile %r has a non-boolean 'judged' value %r"
+                % (name, profile["judged"])]
+    if not profile["judged"]:
+        return bad
+    _validate_keys("profile %r" % name, profile, PROFILE_KEYS, bad)
+    stages = profile.get("stages")
+    if not isinstance(stages, dict):
+        return bad
+    for stage in sorted(stages):
+        rule = stages[stage]
+        where = "profile %r stage %r" % (name, stage)
+        if stage not in STAGES:
+            bad.append("%s is not one of %s" % (where, ", ".join(STAGES)))
+            continue
+        if not isinstance(rule, dict):
+            bad.append("%s is %r, which is not a rule" % (where, rule))
+            continue
+        flag = rule.get("diagnostic_only", False)
+        if not isinstance(flag, bool):
+            bad.append("%s has a non-boolean 'diagnostic_only' %r" % (where, flag))
+            continue
+        if flag:
+            # PRESENCE-ONLY, and presence is still REQUIRED. A stage that says
+            # nothing about its magnitude must not also say nothing about any
+            # bound it forgot to declare, so no judging key may appear here.
+            for key in sorted(rule):
+                if not key.startswith("_") and key not in META_KEYS:
+                    bad.append("%s is diagnostic_only and must carry no bound, "
+                               "but it declares %r" % (where, key))
+            continue
+        _validate_keys(where, rule, STAGE_KEYS, bad)
+    return bad
+
+
+def _check_bound(bad, label, value, limit, kind, notes=None):
     """Compare one statistic, FAIL-CLOSED on a missing or non-finite value.
 
     `nan > limit` and `nan < limit` are both False, so a non-finite statistic
     used to satisfy every bound at once. It is a failure here instead.
+
+    `limit is None` is reachable ONLY through a profile that declares the key as
+    null with a reason: `validate_profile` refuses an absent one.
     """
     if limit is None:
+        if notes is not None:
+            notes.append("%s: NOT BOUNDED (declared null), value %s"
+                         % (label, value))
         return
+    if notes is not None:
+        notes.append("%s: bound %s %.6g, value %s"
+                     % (label, ">=" if kind == "min" else "<=", limit, value))
     if value is None:
         bad.append("%s is MISSING from the report, so its recorded bound could "
                    "not be applied" % label)
@@ -197,8 +383,16 @@ def _check_bound(bad, label, value, limit, kind):
                    % (label, value, limit))
 
 
-def _judge_stage(report, stage, rule, bad):
-    """Apply a profile's recorded rule for ONE stage of the report."""
+def _judge_stage(report, stage, rule, bad, notes):
+    """Apply a profile's recorded rule for ONE stage of the report.
+
+    PRESENCE IS CHECKED FIRST AND ALWAYS, `diagnostic_only` included. The
+    `diagnostic_only` test used to sit in the caller and `continue` BEFORE this
+    function ran, so for `shipped_bf16` an absent `cells` stage exited 0 PASS and
+    a `cells` stage 100x wrong exited 0 PASS -- against this module's own
+    docstring and against the bounds file, which both say its presence is
+    reported. Not judging a magnitude is not the same as not looking.
+    """
     got = report.get(stage, "absent")
     if got == "absent":
         bad.append("stage %r is ABSENT from the report and the recorded profile "
@@ -214,89 +408,150 @@ def _judge_stage(report, stage, rule, bad):
         bad.append("stage %r is %r, which is not a summary this bound can be "
                    "applied to" % (stage, got))
         return
-    if rule.get("bf16_of_oracle_exact") and not got.get("bf16_of_oracle_exact"):
-        bad.append("stage %r is not exactly bf16(oracle), which the recorded "
-                   "profile requires" % stage)
-    if rule.get("max_degenerate_rows") is not None:
+    if rule.get("diagnostic_only"):
+        notes.append("stage %r: PRESENT and reported, magnitude NOT judged "
+                     "(diagnostic_only)" % stage)
+        return
+    # Every key below is indexed rather than `.get`-ed: validate_profile has
+    # already refused a rule that does not declare all four, so an absent key
+    # cannot reach this function and read as "no bound".
+    if rule["bf16_of_oracle_exact"]:
+        notes.append("stage %r bf16_of_oracle_exact: REQUIRED, got %s"
+                     % (stage, got.get("bf16_of_oracle_exact")))
+        if not got.get("bf16_of_oracle_exact"):
+            bad.append("stage %r is not exactly bf16(oracle), which the recorded "
+                       "profile requires" % stage)
+    else:
+        notes.append("stage %r bf16_of_oracle_exact: not required" % stage)
+    limit = rule["max_degenerate_rows"]
+    if limit is None:
+        notes.append("stage %r: degenerate rows NOT BOUNDED (declared null)"
+                     % stage)
+    else:
         n = got.get("degenerate_rows")
-        if n is None or n > rule["max_degenerate_rows"]:
+        notes.append("stage %r: at most %d degenerate (zero-norm) rows, got %s"
+                     % (stage, limit, n))
+        if n is None or n > limit:
             bad.append("stage %r has %s degenerate (zero-norm) rows, above the "
-                       "recorded maximum %d" % (stage, n,
-                                                rule["max_degenerate_rows"]))
+                       "recorded maximum %d" % (stage, n, limit))
     _check_bound(bad, "stage %r mean_rel_l2" % stage, got.get("mean_rel_l2"),
-                 rule.get("mean_rel_l2_max"), "max")
+                 rule["mean_rel_l2_max"], "max", notes)
     _check_bound(bad, "stage %r mean_cos" % stage, got.get("mean_cos"),
-                 rule.get("mean_cos_min"), "min")
+                 rule["mean_cos_min"], "min", notes)
 
 
 def judge(report, tag, bounds):
-    """Apply the recorded profile. Returns (verdict, [failure lines])."""
+    """Apply the recorded profile. Returns (verdict, [failures], [notes]).
+
+    `notes` is what the run SAYS IT JUDGED. `.agents/verification.md` requires an
+    instrument to state what it measured in its own output, and this one printed
+    `VERDICT PASS tag=lp0 profile=shipped_bf16` and nothing else: which stages
+    were judged, which were presence-only and which bounds were applied were all
+    invisible to a reader of the run, so a stage silently going unjudged looked
+    exactly like a stage that passed.
+    """
     name = profile_for(tag, bounds)
     if name is None:
         return "UNJUDGED", [
             "no rule in %s matches tag %r, so NOTHING was judged. Add a rule for "
             "this leg; do not read this as a pass."
-            % (os.path.basename(BOUNDS_PATH), tag)]
+            % (os.path.basename(BOUNDS_PATH), tag)], []
     profile = bounds.get("profiles", {}).get(name)
     if profile is None:
         return "ERROR", [
             "tag %r maps to profile %r, which %s does not define. An unresolvable "
             "profile is an ERROR, never a pass."
-            % (tag, name, os.path.basename(BOUNDS_PATH))]
-    # A MISSING `judged` KEY IS AN ERROR. It used to default to False, so an
-    # incomplete profile silently downgraded a judged leg to DIAGNOSTIC and
-    # exited 0 on data that was 50% off.
-    if "judged" not in profile:
-        return "ERROR", [
-            "profile %r has no 'judged' key. An incomplete profile is an ERROR: "
-            "it must not silently downgrade a judged leg to a diagnostic one."
-            % name]
-    if not isinstance(profile["judged"], bool):
-        return "ERROR", [
-            "profile %r has a non-boolean 'judged' value %r"
-            % (name, profile["judged"])]
+            % (tag, name, os.path.basename(BOUNDS_PATH))], []
+    # THE WHOLE PROFILE IS VALIDATED BEFORE ANYTHING IS JUDGED. Judging first and
+    # checking a key on the way past is the shape that let five separate bounds
+    # be absent and unnoticed.
+    broken = validate_profile(name, profile)
+    if broken:
+        return "ERROR", broken, []
     if not profile["judged"]:
-        return "DIAGNOSTIC", []
+        return "DIAGNOSTIC", [], ["profile %r is explicitly judged: false, so "
+                                  "NOTHING here is a bound" % name]
 
-    bad = []
-    if profile.get("sentinels_bf16_exact"):
-        for kind, s in sorted(report["sentinels"].items()):
-            if not s["bf16_of_oracle_exact"]:
-                bad.append("sentinel %s is not exactly bf16(oracle), max_abs %g"
-                           % (kind, s["max_abs"]))
-    if profile.get("permutation_identity_complete"):
-        p = report["permutation"]
-        if p["identity_is_best"] != p["of"]:
-            bad.append("permutation: the identity is best for only %d of %d "
-                       "image rows" % (p["identity_is_best"], p["of"]))
-    stat_name = bounds["statistic"]
+    bad, notes = [], ["profile %r, judged" % name]
+    if profile["sentinels_bf16_exact"]:
+        sentinels = report.get("sentinels")
+        if not isinstance(sentinels, dict) or not sentinels:
+            bad.append("the profile requires exact sentinels and the report "
+                       "carries none")
+        else:
+            notes.append("sentinels: all %d kinds required exactly bf16(oracle)"
+                         % len(sentinels))
+            for kind, s in sorted(sentinels.items()):
+                if not s["bf16_of_oracle_exact"]:
+                    bad.append("sentinel %s is not exactly bf16(oracle), max_abs "
+                               "%g" % (kind, s["max_abs"]))
+    p = report.get("permutation")
+    if profile["permutation_identity_complete"]:
+        if not isinstance(p, dict):
+            bad.append("the profile requires a complete identity permutation and "
+                       "the report carries no permutation")
+        else:
+            notes.append("permutation: the identity required for all %d image "
+                         "rows, got %d" % (p["of"], p["identity_is_best"]))
+            if p["identity_is_best"] != p["of"]:
+                bad.append("permutation: the identity is best for only %d of %d "
+                           "image rows" % (p["identity_is_best"], p["of"]))
+    # THE ARGMAX ABOVE NEEDS THE REFERENCE ROWS TO BE SEPARABLE. Without a margin
+    # the permutation condition reports an arbitrary winner: on near-parallel
+    # rows it is a false red on clean data and a false GREEN on permuted output.
+    # The failure is a property of the DATASET, and the message says so rather
+    # than claiming a defect in the tower.
+    margin = profile["best_match_margin_min"]
+    if margin is not None and isinstance(p, dict):
+        got = p.get("min_best_margin")
+        notes.append("permutation: best-match margin bound >= %.6g, value %s"
+                     % (margin, got))
+        if got is None or not math.isfinite(got):
+            bad.append("permutation min_best_margin is %s, so the identity "
+                       "condition rests on an argmax whose separability was "
+                       "never measured" % got)
+        elif got < margin:
+            bad.append(
+                "permutation min_best_margin %.8f is BELOW the bound %.8f. The "
+                "reference rows are not separable enough for an argmax to carry "
+                "the ORDERING claim: rounding to bf16 moves a row by about 0.4%%, "
+                "so a winner this close is chosen by noise. This is a statement "
+                "about the DATASET, not a defect in the tower." % (got, margin))
+    elif margin is None:
+        notes.append("permutation: best-match margin NOT BOUNDED (declared null)")
+    stat_name = bounds.get("statistic")
     stat = report.get(stat_name)
     if not isinstance(stat, dict):
         return "ERROR", ["the judged statistic %r is absent from the report"
-                         % stat_name]
+                         % stat_name], notes
+    notes.append("judged statistic: %r over %s rows"
+                 % (stat_name, stat.get("rows")))
     # A DEGENERATE ROW IS A DEFECT, not an average to absorb. An all-zero image
     # row means the tower produced nothing for that aligner cell, and it is also
     # the exact shape that used to turn both bounds below into no-ops.
-    limit = profile.get("max_degenerate_rows")
+    limit = profile["max_degenerate_rows"]
     if limit is not None:
         n = stat.get("degenerate_rows")
+        notes.append("%s: at most %d degenerate (zero-norm) rows, got %s"
+                     % (stat_name, limit, n))
         if n is None or n > limit:
             bad.append("%s has %s degenerate (zero-norm) rows at index %s, above "
                        "the recorded maximum %d. A zero row makes rel_l2 and cos "
                        "undefined, which would disable the bounds below."
                        % (stat_name, n, stat.get("degenerate_row_index"), limit))
+    else:
+        notes.append("%s: degenerate rows NOT BOUNDED (declared null)" % stat_name)
     _check_bound(bad, "%s mean_rel_l2" % stat_name, stat.get("mean_rel_l2"),
-                 profile.get("mean_rel_l2_max"), "max")
+                 profile["mean_rel_l2_max"], "max", notes)
     _check_bound(bad, "%s mean_cos" % stat_name, stat.get("mean_cos"),
-                 profile.get("mean_cos_min"), "min")
-    for stage, rule in sorted(profile.get("stages", {}).items()):
-        if stage not in STAGES:
-            return "ERROR", ["profile %r declares unknown stage %r"
-                             % (name, stage)]
-        if rule.get("diagnostic_only"):
+                 profile["mean_cos_min"], "min", notes)
+    for stage in STAGES:
+        rule = profile["stages"].get(stage)
+        if rule is None:
+            notes.append("stage %r: NOT REQUIRED by this profile" % stage)
             continue
-        _judge_stage(report, stage, rule, bad)
-    return ("PASS" if not bad else "FAIL"), bad
+        _judge_stage(report, stage, rule, bad, notes)
+    return ("PASS" if not bad else "FAIL"), bad, notes
 
 
 def main():
@@ -375,9 +630,13 @@ def main():
     # PERMUTATION: does a re-ordering of our image rows collapse the error? If
     # the identity is already the best match for every row, no permutation can.
     hits = best_match([ours[i] for i in img], [ref[i] for i in img])
-    ident = sum(1 for k, (arg, _) in enumerate(hits) if arg == k)
+    ident = sum(1 for k, (arg, _c, _m) in enumerate(hits) if arg == k)
     report["permutation"] = {"identity_is_best": ident, "of": len(img),
-                             "min_best_cos": min(c for _, c in hits)}
+                             "min_best_cos": min(c for _a, c, _m in hits),
+                             # The winner's lead over the runner-up. A margin at
+                             # the scale of bf16 rounding means the argmax above
+                             # was decided by noise; the bound is in the profile.
+                             "min_best_margin": min(m for _a, _c, m in hits)}
     print("permutation", json.dumps(report["permutation"]))
 
     for stage in STAGES:
@@ -415,12 +674,18 @@ def main():
 
     bounds = load_bounds()
     profile = profile_for(tag, bounds)
-    verdict, failures = judge(report, tag, bounds)
+    verdict, failures, notes = judge(report, tag, bounds)
     report["verdict"] = verdict
     report["bound_profile"] = profile
     report["bound_failures"] = failures
+    report["judged"] = notes
     json.dump(report, open(os.path.join(d, "report-%s.json" % tag), "w"), indent=1)
     print("REPORT", os.path.join(d, "report-%s.json" % tag))
+    # SAY WHAT WAS JUDGED. A verdict with no account of what it covered cannot be
+    # read for what it LEFT OUT, which is the failure every repair on this file
+    # has been about.
+    for line in notes:
+        print("JUDGED", line)
     for line in failures:
         print("BOUND", line)
     print("VERDICT %s tag=%s profile=%s" % (verdict, tag, profile))

@@ -7104,11 +7104,34 @@ TEST_CASE("DSA indexer logits match the CPU oracle and are NATIVE on ROCm") {
   // store is half of this op: `win_start`/`win_end` are clamped to [0, num_keys)
   // and everything outside stays `-inf`.
   constexpr int64_t kT = 5;
-  constexpr int64_t kS = 40;  // 10 key tiles of 4 — more than one grid.y tile
+  // NOT A MULTIPLE of the ROCm kernel's `kKeyRows = 4`
+  // (`src/vt/rocm/rocm_dsa_indexer.hip:217`), and that is the whole reason for
+  // the value. 41 keys is 11 grid.y tiles, so it is still more than one tile,
+  // and the LAST TILE IS RAGGED: three of its four key rows are past the end.
+  // Those three lanes are the only condition under which the kernel's two
+  // `s < num_keys` guards (`:240` and `:272`) ever execute. This case used 40,
+  // which 4 divides exactly, so both guards were DEAD: a fresh review deleted
+  // BOTH, proved the binary changed, and the focused suite still returned
+  // `2 passed / 0 failed`. Spec D3h, MINOR-1.
+  //
+  // A RAGGED TILE ON ITS OWN IS NOT ENOUGH, and that was MEASURED here rather
+  // than assumed: the stray lanes of rows 0..3 land in the first columns of the
+  // NEXT row, which their own block also writes, and the stray block wins no
+  // race because it skips the dot loop and finishes first. The guard band on
+  // the logits buffer below is the other half of this repair; the two work only
+  // together, because with a key count 4 divides there are no stray lanes for
+  // the band to catch.
+  //
+  // Of the kernel's two `s < num_keys` guards only the STORE one is
+  // load-bearing. The copy in `live` is redundant by construction —
+  // `hi = min(num_keys, win_end[t])`, so `s < hi` already implies
+  // `s < num_keys` — and deleting it alone is an EQUIVALENT MUTANT. Spec D3h
+  // carries that proof.
+  constexpr int64_t kS = 41;
   const std::vector<int32_t> ws = {-3, 5, 12, 7, 0};
   //                                ^   ^   ^   ^  ^
   //  -3: clamps up to 0 | 5: mid-row start | 12..13: a SINGLE candidate
-  //  7..7: an EMPTY window, the whole row -inf | 0..50: clamps down to 40
+  //  7..7: an EMPTY window, the whole row -inf | 0..50: clamps down to 41
   const std::vector<int32_t> we = {17, 40, 13, 7, 50};
   REQUIRE(static_cast<int64_t>(ws.size()) == kT);
 
@@ -7189,11 +7212,13 @@ TEST_CASE("DSA indexer logits match the CPU oracle and are NATIVE on ROCm") {
               }
             }
           }
-          // The window shapes above leave 17 + 35 + 1 + 0 + 40 = 93 in-window
-          // columns of 200. If either number collapsed, the masked store and the
-          // arithmetic would stop being separable.
-          REQUIRE(nfinite == 93);
-          REQUIRE(ninf == 107);
+          // The window shapes above leave 17 + 35 + 1 + 0 + 41 = 94 in-window
+          // columns of 205. Each term is one row's clamped window width:
+          // `[0,17)`, `[5,40)`, `[12,13)`, the empty `[7,7)` and `[0,41)` after
+          // `we[4] = 50` clamps to `num_keys`. If either number collapsed, the
+          // masked store and the arithmetic would stop being separable.
+          REQUIRE(nfinite == 94);
+          REQUIRE(ninf == 111);
           // AND THE ReLU IS FALSIFIABLE ON THIS DATA. A sign-varying weight
           // vector over ReLU'd (non-negative) per-head dots must produce both
           // signs of logit; if every logit came out one sign, the fixture could
@@ -7208,7 +7233,25 @@ TEST_CASE("DSA indexer logits match the CPU oracle and are NATIVE on ROCm") {
           vt::Backend& dev = vt::GetBackend(dt);
           Queue q = dev.CreateQueue();
           const Device d{dt, 0};
-          DevBuf dlg(dev, q, static_cast<size_t>(kT * kS));
+          // A GUARD BAND PAST THE END OF THE LOGITS. The mask assertion below
+          // cannot convict a missing `s < num_keys` on the STORE, and that is
+          // measured rather than feared: with `kS = 41` the stray lanes of the
+          // last tile store `-inf` into the first columns of row `t + 1`, which
+          // is a RACE against that row's own block — and the stray block is the
+          // fast one (its lanes are out of window and skip the dot loop) while
+          // the victim block runs 64 dots of 128, so the correct value lands
+          // LAST and wins. Deleting the guard and re-running returned
+          // `2 passed / 0 failed` for exactly that reason (spec D3h).
+          //
+          // The LAST row has no `t + 1` to race with: its three stray lanes
+          // store past the end of the tensor, where nothing legitimate writes at
+          // all. Eight floats of poison behind the logits therefore make the
+          // defect DETERMINISTIC instead of scheduler-dependent. Eight because
+          // the overrun is at most `kKeyRows - 1 = 3` floats and a band wider
+          // than the overrun costs nothing.
+          constexpr int64_t kGuardFloats = 8;
+          constexpr float kPoison = -12345.0f;
+          DevBuf dlg(dev, q, static_cast<size_t>(kT * kS + kGuardFloats));
           DevBufBytes dq(dev, q, qb.size()), dk(dev, q, kb.size()), dw(dev, q, wb.size());
           DevBuf dqs(dev, q, qsf.size());
           DevBufBytes dws(dev, q, sizeof(int32_t) * static_cast<size_t>(kT));
@@ -7218,7 +7261,7 @@ TEST_CASE("DSA indexer logits match the CPU oracle and are NATIVE on ROCm") {
           // `-inf` — so a kernel that launched nothing must not be graded against
           // a zeroed buffer, and a kernel that skipped the mask must not inherit
           // an `-inf` it did not write.
-          dlg.Upload(std::vector<float>(static_cast<size_t>(kT * kS), -12345.0f));
+          dlg.Upload(std::vector<float>(static_cast<size_t>(kT * kS + kGuardFloats), kPoison));
           dq.Upload(qb.data());
           dk.Upload(kb.data());
           dw.Upload(wb.data());
@@ -7244,7 +7287,19 @@ TEST_CASE("DSA indexer logits match the CPU oracle and are NATIVE on ROCm") {
           vt::DsaIndexerLogits(q, tlg, tq, tk, tw, tws, twe, a);
           dev.Synchronize(q);
           CHECK(vt::GetReferenceTierHits() == hits_before);
-          const std::vector<float> got = dlg.Download();
+          const std::vector<float> raw = dlg.Download();
+          const std::vector<float> got(raw.begin(),
+                                       raw.begin() + static_cast<std::ptrdiff_t>(kT * kS));
+
+          // 0. NOTHING WROTE PAST THE LAST ROW. This is the assertion that holds
+          //    the kernel's store guard, and it is discrete for the same reason
+          //    the mask is: an overrun writes a value nobody owns, so there is
+          //    no band to grade it against.
+          size_t guard_touched = 0;
+          for (size_t i = static_cast<size_t>(kT * kS); i < raw.size(); ++i) {
+            if (raw[i] != kPoison) ++guard_touched;
+          }
+          CHECK(guard_touched == 0);
 
           // 1. THE MASK IS A DISCRETE ASSERTION, not a tolerance. `-inf` is a
           //    SENTINEL: a window off-by-one either writes a logit where an
@@ -7267,7 +7322,7 @@ TEST_CASE("DSA indexer logits match the CPU oracle and are NATIVE on ROCm") {
               gf.push_back(got[i]);
             }
           }
-          REQUIRE(rf.size() == 93);
+          REQUIRE(rf.size() == 94);
           const double nmse = Nmse(rf, gf);
 
           // 3. AND THE BYTES, because this op CONTAINS NO TRANSCENDENTAL — every

@@ -69,11 +69,12 @@ class OutputDtypeInvariantTests(unittest.TestCase):
     def test_shipped_tree_is_green_out_dtype(self) -> None:
         text = mod.MATMUL_CU.read_text(encoding="utf-8")
         sites = output_layout_sites(text)
-        # The sweep really found the five C/D layout sites (Matmul, MatmulBT,
-        # BatchedMatmul, fp8 plan, and GetOrQueryGemmHeuristic's shared layout
+        # The sweep really found the six C/D layout sites (Matmul, MatmulBT,
+        # BatchedMatmul, fp8 plan, GetOrQueryGemmHeuristic's shared layout
         # after FIX-CUBLASLT-CAPTURE-1732 routed the three bf16/f32 lanes
-        # through one cached query) — a non-vacuous green.
-        self.assertEqual(len(sites), 5)
+        # through one cached query, and the EXL3 reconstruct GEMM added by
+        # QUANT-EXL3) — a non-vacuous green.
+        self.assertEqual(len(sites), 6)
         self.assertTrue(all(dtype == "out_type" for _, dtype in sites))
         self.assertEqual(hardcoded_output_dtype_sites(text), [])
 

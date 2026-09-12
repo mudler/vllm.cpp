@@ -10,7 +10,15 @@
 # Our side is the row head tarball pinned by sha256, with the W6 probe files
 # overlaid from w6-parity/src (their sha256s are printed). The oracle side is a
 # fresh clone of ggml-org/llama.cpp at release b10766, built CPU-only and static.
-set -u
+#
+# `pipefail` IS LOAD-BEARING, not hygiene. Without it `cmd | tee f; step name $?`
+# records TEE's status, and tee succeeds whenever it can write the file. The
+# image generator below is the whole gate's input, and a failure of it recorded
+# `image RC=0` while the sweep went on to read whatever `img392.rgb` a previous
+# run had left in `$OUT`, which is a persistent NAS directory nothing clears.
+# There is no `set -e` here, so `pipefail` changes nothing except the value the
+# `$?` and `${PIPESTATUS[0]}` readers below see.
+set -uo pipefail
 W=/workspace/dsv4-vision
 OUT=$W/w6-parity; mkdir -p "$OUT"
 OVL=$OUT/src
@@ -43,17 +51,24 @@ mkdir -p "$SRC/tools/parity"
 for f in dsv4v_w6_probe.cpp dsv4v_w6_oracle_dump.cpp dsv4v_w6_image.py dsv4v_w6_compare.py dsv4v_w6_parity.sh; do
   cp "$OVL/tools/parity/$f" "$SRC/tools/parity/$f" || { step overlay 92; exit 92; }
 done
-sha256sum "$SRC"/tools/parity/dsv4v_w6_* | tee "$OUT/overlay.sha256"
+sha256sum "$SRC"/tools/parity/dsv4v_w6_* | tee "$OUT/overlay.sha256"; step overlay_sha "${PIPESTATUS[0]}"
 printf '\nadd_executable(dsv4v-w6-probe ${CMAKE_SOURCE_DIR}/tools/parity/dsv4v_w6_probe.cpp)\ntarget_link_libraries(dsv4v-w6-probe PRIVATE vllm::vllm)\n' >> "$SRC/examples/CMakeLists.txt"
 
 echo "### image"
-python3 "$SRC/tools/parity/dsv4v_w6_image.py" "$OUT/img392" | tee "$OUT/image.txt"; step image $?
+rm -f "$OUT/img392.rgb" "$OUT/img392.png"
+python3 "$SRC/tools/parity/dsv4v_w6_image.py" "$OUT/img392" | tee "$OUT/image.txt"; IMG_RC=${PIPESTATUS[0]}; step image $IMG_RC
+# The image is the one input BOTH sides read. A stale one from a previous run
+# would compare two towers on an artefact this run never produced, so refuse
+# here rather than sweep against it.
+[ $IMG_RC -eq 0 ] && [ -s "$OUT/img392.rgb" ] || { echo "FATAL: image generator failed (rc=$IMG_RC)"; exit 98; }
 
 echo "### oracle: llama.cpp b10766, CPU, static"
 git clone -q https://github.com/ggml-org/llama.cpp "$LC" && git -C "$LC" checkout -q "$LC_PIN"; step clone $?
 HEAD_SHA=$(git -C "$LC" rev-parse HEAD); echo "oracle HEAD $HEAD_SHA"
 [ "$HEAD_SHA" = "$LC_PIN" ] || { echo "FATAL oracle head mismatch"; step pin 96; exit 96; }
-git -C "$LC" describe --tags --exact-match 2>/dev/null | tee "$OUT/oracle-tag.txt"
+# Not gated: the pin is already asserted by SHA above, and a commit with no
+# exact tag is a normal state for this read.
+git -C "$LC" describe --tags --exact-match 2>/dev/null | tee "$OUT/oracle-tag.txt" || true
 cp "$SRC/tools/parity/dsv4v_w6_oracle_dump.cpp" "$LC/tools/mtmd/"
 printf '\nadd_executable(dsv4v-oracle-dump dsv4v_w6_oracle_dump.cpp)\ntarget_link_libraries(dsv4v-oracle-dump PRIVATE mtmd ggml)\n' >> "$LC/tools/mtmd/CMakeLists.txt"
 cmake -S "$LC" -B "$LC/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
@@ -93,11 +108,27 @@ if [ "$RUN_CLI" = 1 ]; then
   tail -8 "$OUT/oracle-cli.log"
   if [ -f "$OUT/oracle-cli-block.f32" ]; then
     N=$(python3 -c "import struct;print(struct.unpack('<i',open('$OUT/oracle-cli-block.f32','rb').read(4))[0])")
+    # 114 is THIS image's token count at lead_pad 0, so the subtraction only
+    # yields a lead_pad for the 392x392 image above. Guard it: a different image
+    # gives an LP outside 0..3, and the copies below would then silently pick up
+    # `ours-lp<junk>-*.f32` -- either absent, or worse, left by a previous run.
     LP=$((N - 114)); echo "cli block rows=$N lead_pad=$LP"
-    for s in block input vit cells; do cp "$OUT/ours-lp$LP-$s.f32" "$OUT/ours-cli-$s.f32"; done
+    if [ "$LP" -lt 0 ] || [ "$LP" -gt 3 ]; then
+      echo "FATAL: cli block rows=$N gives lead_pad=$LP, outside 0..3. The CLI"
+      echo "ran on an image this sweep did not measure; refusing to compare."
+      step cli_lead_pad 97
+      exit 97
+    fi
+    for s in block input vit cells; do cp "$OUT/ours-lp$LP-$s.f32" "$OUT/ours-cli-$s.f32" || { step cli_copy 97; exit 97; }; done
     python3 "$SRC/tools/parity/dsv4v_w6_compare.py" "$OUT" cli $LP 10 10 > "$OUT/compare-cli.txt" 2>&1; step compare_cli $?
     cat "$OUT/compare-cli.txt"
   fi
 fi
 echo "### steps"; cat "$OUT/steps.txt"
-echo "### W6_PARITY_DONE"
+# READ THE STEPS BACK. Recording a status nothing ever reads is the same defect
+# as not recording one: before this, every leg could fail and the job still
+# ended on `W6_PARITY_DONE` with rc 0. `compare_*` now carries the comparator's
+# own bound verdict, so a drifted run fails HERE.
+BAD=$(awk '!/ RC=0$/' "$OUT/steps.txt" | wc -l)
+echo "### W6_PARITY_DONE failed_steps=$BAD"
+[ "$BAD" -eq 0 ] || { echo "### FAILING STEPS:"; awk '!/ RC=0$/' "$OUT/steps.txt"; exit 1; }

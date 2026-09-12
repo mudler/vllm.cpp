@@ -13,7 +13,12 @@
 # oracle(f32 input) against oracle(bf16-rounded input): the distance the input
 # rounding ALONE moves the oracle's output through 32 blocks. ours-vs-oracle is
 # judged against that number rather than against a bound picked to pass.
-set -u
+#
+# `pipefail` is required for the same reason `dsv4v_w6_parity.sh` states: a
+# `cmd | tee f` pipeline otherwise reports TEE's status to `$?`, and tee
+# succeeds whenever it can write the file. No `set -e` here, so this changes
+# only the value the status readers below see.
+set -uo pipefail
 W=/workspace/dsv4-vision
 OUT=$W/w6-parity
 OVL=$OUT/src/tools/parity
@@ -27,7 +32,7 @@ trap cleanup EXIT INT TERM
 : > "$OUT/floor-steps.txt"
 ( while true; do sleep 60; echo "### hb $(date -u +%H:%M:%S)"; done ) &
 HB=$!
-sha256sum "$OVL"/dsv4v_w6_* | tee "$OUT/floor-overlay.sha256"
+sha256sum "$OVL"/dsv4v_w6_* | tee "$OUT/floor-overlay.sha256"; step overlay_sha "${PIPESTATUS[0]}"
 
 git clone -q https://github.com/ggml-org/llama.cpp "$LC" && git -C "$LC" checkout -q "$LC_PIN"; step clone $?
 [ "$(git -C "$LC" rev-parse HEAD)" = "$LC_PIN" ] || { step pin 96; exit 96; }
@@ -70,4 +75,9 @@ for LP in 0 1 2 3; do
   grep -E '^\[vit\]|^structure|^\[block' "$OUT/compare-lp$LP.txt"
 done
 echo "### steps"; cat "$OUT/floor-steps.txt"
-echo "### W6_FLOOR_DONE"
+# READ THE STEPS BACK; see the same block in dsv4v_w6_parity.sh. The `floor` and
+# `samein` comparisons are DIAGNOSTIC profiles and pass by construction, but the
+# `recompare_lp*` legs carry the shipped bf16 bound and can fail here.
+BAD=$(awk '!/ RC=0$/' "$OUT/floor-steps.txt" | wc -l)
+echo "### W6_FLOOR_DONE failed_steps=$BAD"
+[ "$BAD" -eq 0 ] || { echo "### FAILING STEPS:"; awk '!/ RC=0$/' "$OUT/floor-steps.txt"; exit 1; }

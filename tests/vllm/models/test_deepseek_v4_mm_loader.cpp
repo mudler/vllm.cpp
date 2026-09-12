@@ -562,6 +562,19 @@ FixtureOptions OfficialVisionOptions() {
   return opt;
 }
 
+// The OTHER vehicle's shape: `quant_method` stays "exl3" and
+// `dense_routed_experts` stays false, so `BuildVisionFixture` writes the four
+// EXL3 rank shards and `IsExl3Checkpoint` routes the load into
+// `LoadDeepseekV4Exl3` instead of the dense name-map arm.
+//
+// THIS IS WHY THE EXL3 ARM'S VISION ACCOUNTING WAS UNGATED. Every vision case in
+// this file used `OfficialVisionOptions`, which is the RELEASED vehicle's dense
+// shape, so no case ever reached the EXL3 arm's own copy of the block. Deleting
+// that block left BOTH loader suites fully green -- 16 of 16 here and 22 of 22
+// in `test_deepseek_v4_exl3_loader` -- while its dense twin reds exactly one
+// case (fresh review, 2026-09-12).
+FixtureOptions Exl3VisionOptions() { return TwoLayerHashOptions(); }
+
 nlohmann::json ReadJsonFixture(const std::string& path) {
   std::ifstream in(path);
   REQUIRE_MESSAGE(in.good(), "cannot open fixture ", path);
@@ -594,6 +607,49 @@ std::string IndexClass(const std::string& name) {
 }
 
 }  // namespace
+
+TEST_CASE("dsv4 vision safetensors: the EXL3 arm ROUTES and ACCOUNTS FOR the official vision group") {
+  const FixtureOptions opt = Exl3VisionOptions();
+
+  // The same checkpoint through the same arm WITHOUT the vision group, so the
+  // group is counted as a DIFFERENCE rather than as an absolute. A change to the
+  // carried half then cannot absorb a miscounted vision tensor.
+  auto text = BuildStFixture(opt, /*vision=*/true);
+  vllm::DeepseekV4Weights wt;
+  const std::string text_msg = ThrowMessage([&] {
+    wt = vllm::LoadDeepseekV4ForCausalLMWeights(text->shards, text->config);
+  });
+  CAPTURE(text_msg);
+  REQUIRE(text_msg.empty());
+  REQUIRE(wt.has_exl3_weights);
+
+  auto vision = BuildVisionFixture(opt);
+  vllm::DeepseekV4Weights wv;
+  const std::string msg = ThrowMessage([&] {
+    wv = vllm::LoadDeepseekV4ForCausalLMWeights(vision->shards, vision->config);
+  });
+  // THE RED THIS CASE EXISTS FOR. This arm's totality pass REFUSES BY NAME any
+  // checkpoint tensor no arm routes, so with the vision accounting block gone
+  // the load throws on `vision.patch_embed.proj.weight` and this line fails
+  // carrying that refusal as its message.
+  CAPTURE(msg);
+  REQUIRE(msg.empty());
+
+  // It took the EXL3 arm. Without this, the case would pass against the DENSE
+  // twin's vision block, which the `OfficialVisionOptions` cases already gate.
+  REQUIRE(wv.has_exl3_weights);
+
+  // Counted EXACTLY once each. The difference alone would be a tautology,
+  // because the loader walks this same list; the independent `27` pins the
+  // list's SIZE to this fixture's geometry -- 2 + 8 per block + 1 + 4 + 4 at
+  // depth 2 -- which is the rule that gives the released 267 at depth 32.
+  const std::vector<std::string> group =
+      vllm::DeepSeekV4OfficialVisionExpectedTensors(
+          vllm::DeepSeekV4OfficialVisionConfig(vision->config));
+  CHECK(group.size() == 27);
+  CHECK(wv.accounted_tensors ==
+        wt.accounted_tensors + static_cast<int64_t>(group.size()));
+}
 
 TEST_CASE("official vision safetensors fill every W2 field and outlive the shards") {
   const FixtureOptions opt = OfficialVisionOptions();

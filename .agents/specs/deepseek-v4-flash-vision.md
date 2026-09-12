@@ -1194,15 +1194,35 @@ above as its red-before input.
   one does not is the REAL device -- a genuine H2D copy and a genuine device
   pointer -- rather than the per-block census. That leased-device gate is still
   owed by issue #2411 and W7-CUDA.
-- **`tools/parity/dsv4v_w6_compare.py` CONTAINS NO BOUND AND EMITS NO VERDICT.**
-  It prints and writes statistics — `mean_rel_l2`, `mean_cos`, `min_cos`,
-  sentinel exactness, the permutation summary — and returns 0 whenever the
-  shapes match. The only `verdict` key it ever writes is `SHAPE_MISMATCH`. The
-  `<= 4.9%` cells mean relative L2 and `>= 0.998` mean cosine judgement recorded
-  in `### W6 evidence` and `### W7-CUDA evidence` is therefore PROSE ARITHMETIC
-  performed by a reader against that output, not something the harness checks. A
-  future run that drifted past the bound would still exit 0. Teaching the
-  comparator its bound and a pass/fail verdict is owed by issue #2411.
+- **CLOSED 2026-09-12: `tools/parity/dsv4v_w6_compare.py` NOW CARRIES ITS BOUND
+  AND EMITS A VERDICT.** It used to print and write statistics — `mean_rel_l2`,
+  `mean_cos`, `min_cos`, sentinel exactness, the permutation summary — and return
+  0 whenever the shapes matched, with `SHAPE_MISMATCH` the only `verdict` key it
+  ever wrote; the `<= 4.9%` and `>= 0.998` judgement in `### W6 evidence` and
+  `### W7-CUDA evidence` was PROSE ARITHMETIC a reader did against that output,
+  and a drifted run still exited 0. It now reads
+  `tools/parity/dsv4v_w6_bounds.json` — a committed record of the measurements,
+  each with the rc job that produced it, kept OUT of the comparator so that no
+  wave can derive a bound from the run it is judging — classifies the tag into a
+  recorded profile, and exits 0 `PASS`/`DIAGNOSTIC`, 1 the bound was exceeded, 2
+  `SHAPE_MISMATCH`, 3 the tag matches no rule and NOTHING was judged. An
+  unmatched tag is deliberately not a pass. The three drivers now also READ
+  `steps.txt` BACK and exit non-zero when any step failed, which nothing did
+  before, so a failing comparison could not reach the job's exit status at all.
+- **The `input` stage line asserts our patch ordering rather than measuring it,
+  and that is recorded rather than changed.** `dsv4v_w6_oracle_dump.cpp`
+  rearranges the oracle's normalised buffer into OUR claimed patch-row order
+  before writing `oracle-<tag>-input.f32`, so if our patch order were wrong that
+  file would still compare exact. The stage therefore measures the normalisation
+  ARITHMETIC — mean, standard deviation, the bf16 narrowing — and nothing about
+  order. The gate as a whole is NOT blind to ordering: the block-level
+  permutation check best-matches every image row against the oracle's own block
+  and requires the identity, and that is where W6's and W7-CUDA's ordering
+  evidence comes from. The comment at the rearranging loop now says so. Making
+  the input stage measure ordering on its own would need the oracle's buffer
+  written in the ORACLE's order plus a separate declared mapping, which is a
+  second description of the layout that could drift from the first; the
+  permutation check already covers it downstream, so this was recorded instead.
 - Four `clip.*` keys the real `mmproj-BF16.gguf` carries are read by nothing in
   this tree yet, and they are the PREPROCESSOR CONTRACT that W4 and W5 owe
   under issue #2411: `clip.vision.image_size = 672`,
@@ -1309,7 +1329,10 @@ set three conditions. (1) the four sentinel kinds are exact and every image row
 is in its place — **met**, exactly, on every rung. (3) the shipped bf16 path is
 no farther from the oracle than it is from its own f32 arm plus the oracle's own
 floor, `<= 3.34% + 1.57% = 4.9%` cells mean relative L2 with mean cosine
-`>= 0.998` — measured **2.884%** and **0.99939**, so **met**. Condition (2) is
+`>= 0.998` — measured **2.884%** and **0.99939**, so **met**. READ CONDITION (3)
+AS THE REGRESSION CATCHER IT IS: `THE BOUND` above records why it is close to an
+identity given the other two, and why the weight of this table sits on the
+sentinel and permutation rows. Condition (2) is
 about the f32 arm and no f32 device arm was run; it is untouched by this wave.
 The device arm is CLOSER to the oracle than our own CPU arm is, and the residual
 has W6's structure rather than a defect's: relative error tracks row norm
@@ -1436,7 +1459,7 @@ reproduced the oracle block byte for byte.
 | token count, ours = oracle | 114, 115, 116, 117 for `lead_pad` 0, 1, 2, 3; 116 for the CLI |
 | START, END, every NEWLINE, every PAD (leading and trailing) | **EXACT**, byte-for-byte in f32, on every rung |
 | row placement (N-layout interleave) | the identity is the best cosine match for 100 of 100 image rows, on every rung |
-| input pixels | ours is exactly `bf16(oracle)`; relative L2 0.12% mean |
+| input pixels | ours is exactly `bf16(oracle)`; relative L2 0.12% mean. A VALUE check only — the oracle dump writes this file in OUR patch-row order, so it asserts the ordering rather than measuring it; the permutation row below is the ordering evidence |
 | image rows, cosine | mean 0.99899, min 0.96709 |
 | image rows, relative L2 | mean 3.83%, max 28.6% |
 | image rows, absolute | mean 0.00169, max 0.0334, against a row RMS of 0.0717 |
@@ -1522,6 +1545,31 @@ unexplained.
    f32 arm plus that floor: cells mean relative L2 `<= 3.34% + 1.57% = 4.9%` and
    mean cosine `>= 0.998`, measured 3.83% and 0.99899. This says the bf16 path
    is the f32 function rounded, and nothing else.
+
+**CONDITION 3 IS ALMOST AN IDENTITY, AND MUST NOT BE QUOTED AS INDEPENDENT
+EVIDENCE.** Both of its addends were measured in the SAME session as the 3.83%
+it judges, and condition (2) independently establishes
+`ours_f32 <-> oracle = 1.34% <= 1.57%`. The triangle inequality over
+`ours_bf16 <-> ours_f32 = 3.34%` and that 1.34% already forces
+`ours_bf16 <-> oracle <= 4.68% < 4.9%`. So passing condition (3), GIVEN
+conditions (1) and (2), tells a reader almost nothing that the other two did not
+already tell them. Nobody may write "the shipped bf16 path passed an independent
+4.9% bound", because there is no session in which conditions (1) and (2) hold and
+condition (3) can still fail by a small margin.
+
+What condition (3) IS: a regression catcher, and the recorded gate. A gross
+change -- a broken aligner, a wrong norm, a dtype that is not the one measured --
+moves the number far past 4.9% and trips it, and it is now enforced by
+`tools/parity/dsv4v_w6_compare.py` against `tools/parity/dsv4v_w6_bounds.json`
+rather than by a reader's arithmetic. It is kept for that, not deleted, and the
+bounds file says the same thing beside the number.
+
+**THE CONDITIONS THAT DO THE REAL WORK ARE (1) AND (2).** Condition (1) is
+sentinel exactness and the identity permutation -- copies and a placement, where
+any error at all is a defect, and which can fail with the tower's precision
+entirely unchanged. Condition (2) is the f32 arm inside the oracle's own floor,
+which is the condition that tests the FUNCTION. Read a W6 or W7-CUDA result by
+those two first.
 
 A single per-row threshold is NOT the bound. The worst row's relative error
 tracks its NORM, not its position. Relative error correlates with row norm at
@@ -1927,7 +1975,9 @@ ran on the real 934,462,656-byte projector at every `lead_pad` rung and matched
 llama.cpp `b10766` DIRECTLY: the four sentinel kinds byte-exact, the identity
 permutation best for 100 of 100 rows, cells at 2.884% mean relative L2 and
 0.99939 mean cosine — inside W6's declared bound of 4.9% and 0.998, and closer
-to the oracle than our own CPU arm. W4's windowed `dev_attn` refusal, which no
+to the oracle than our own CPU arm. That bound is the recorded gate rather than
+independent evidence, for the reason `THE BOUND` records; the byte-exact
+sentinels and the 100-of-100 identity permutation are what carry this result. W4's windowed `dev_attn` refusal, which no
 CPU build could execute, FIRED and is now measured. The numbers, the job ids and
 what stays unmeasured are in `### W7-CUDA evidence`.
 

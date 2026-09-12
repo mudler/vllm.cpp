@@ -16,7 +16,12 @@
 # A same-binary bf16 CONTROL runs too and must reproduce the first W6 run's
 # block byte for byte, which proves deleting the guard changed nothing on the
 # production bf16 path.
-set -u
+#
+# `pipefail` is required for the same reason `dsv4v_w6_parity.sh` states: a
+# `cmd | tee f` pipeline otherwise reports TEE's status to `$?`, and tee
+# succeeds whenever it can write the file. No `set -e` here, so this changes
+# only the value the status readers below see.
+set -uo pipefail
 W=/workspace/dsv4-vision
 OUT=$W/w6-parity
 OVL=$OUT/src/tools/parity
@@ -35,7 +40,7 @@ test -f "$OUT/oracle-f32in-block.f32" || { echo "FATAL: run dsv4v_w6_floor.sh fi
 test "$(sha256sum "$TAR" | awk '{print $1}')" = "$TAR_SHA" || { step tarsha 91; exit 91; }
 rm -rf "$SRC"; mkdir -p "$SRC" && tar -xf "$TAR" -C "$SRC" || { step untar 92; exit 92; }
 cp "$OVL"/dsv4v_w6_* "$SRC/tools/parity/"
-sha256sum "$SRC"/tools/parity/dsv4v_w6_* | tee "$OUT/f32-overlay.sha256"
+sha256sum "$SRC"/tools/parity/dsv4v_w6_* | tee "$OUT/f32-overlay.sha256"; step overlay_sha "${PIPESTATUS[0]}"
 printf '\nadd_executable(dsv4v-w6-probe ${CMAKE_SOURCE_DIR}/tools/parity/dsv4v_w6_probe.cpp)\ntarget_link_libraries(dsv4v-w6-probe PRIVATE vllm::vllm)\n' >> "$SRC/examples/CMakeLists.txt"
 
 echo "### scratch patch: delete the bf16-only guard"
@@ -77,4 +82,9 @@ done
 python3 "$OVL/dsv4v_w6_compare.py" "$OUT" selfdt 0 10 10 > "$OUT/compare-selfdt.txt" 2>&1; step compare_selfdt $?
 cat "$OUT/compare-selfdt.txt"
 echo "### steps"; cat "$OUT/f32-steps.txt"
-echo "### W6_F32_DONE"
+# READ THE STEPS BACK; see the same block in dsv4v_w6_parity.sh. `compare_f32`
+# carries condition (2), the f32 arm inside the oracle's own floor, which is the
+# condition that tests the function -- so a regression there fails this job.
+BAD=$(awk '!/ RC=0$/' "$OUT/f32-steps.txt" | wc -l)
+echo "### W6_F32_DONE failed_steps=$BAD"
+[ "$BAD" -eq 0 ] || { echo "### FAILING STEPS:"; awk '!/ RC=0$/' "$OUT/f32-steps.txt"; exit 1; }

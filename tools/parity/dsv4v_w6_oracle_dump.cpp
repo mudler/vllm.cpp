@@ -161,6 +161,20 @@ int main(int argc, char** argv) {
 
   // The normalised input, rearranged into our patch-row order
   // [(vy*nvx+vx)][(c*P+dy)*P+dx], so the two inputs compare element-wise.
+  //
+  // READ THE `input` STAGE AS A VALUE CHECK ONLY. This loop imposes OUR claimed
+  // patch-row order on the oracle's buffer, so `ours-<tag>-input.f32` against
+  // `oracle-<tag>-input.f32` measures the normalisation ARITHMETIC (the mean,
+  // the standard deviation and the bf16 narrowing) and ASSERTS the ordering
+  // rather than measuring it. If our patch order were wrong, this file would
+  // still compare exact, because both sides would have been written in the same
+  // wrong order.
+  //
+  // Nothing is blind as a result: ordering is measured DOWNSTREAM, by the
+  // block-level permutation check in `dsv4v_w6_compare.py`, which best-matches
+  // every one of our image rows against the oracle's own block and requires the
+  // identity. The `input` line simply says less than its name suggests, and the
+  // gate's ordering evidence is the permutation line, never this one.
   const int P = hp->patch_size;
   const int nvx = e.nx() / P, nvy = e.ny() / P, cols = 3 * P * P;
   const std::vector<float>& buf = e.get_ro_buf();

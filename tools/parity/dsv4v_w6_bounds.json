@@ -1,0 +1,93 @@
+{
+  "_what_this_is": [
+    "The RECORDED bounds dsv4v_w6_compare.py judges against, for the DeepSeek-V4",
+    "vision tower versus the `llama-cpp-dsv4vision` oracle (llama.cpp b10766).",
+    "Row MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm, issue #2411.",
+    "",
+    "The bounds live in a committed file rather than in the comparator so that a",
+    "later wave cannot derive a bound from the very run it is judging. Every",
+    "number below was measured BEFORE the run it now judges, by the rc job named",
+    "beside it, and every one of them is reproduced in the spec's",
+    "`### W6 evidence` section."
+  ],
+  "statistic": "image_rows",
+  "_statistic_note": [
+    "`image_rows` is the per-row summary over the IMAGE rows of the token block",
+    "-- the aligner cells. The spec calls this 'cells mean relative L2'; it is",
+    "the same statistic under the spec's name, and it is the one the recorded",
+    "3.83% / 2.884% figures refer to."
+  ],
+  "profiles": {
+    "shipped_bf16": {
+      "judged": true,
+      "sentinels_bf16_exact": true,
+      "permutation_identity_complete": true,
+      "mean_rel_l2_max": 0.049,
+      "mean_cos_min": 0.998,
+      "_provenance": [
+        "Conditions (1) and (3) of the three the spec's `THE BOUND` section sets.",
+        "",
+        "(1) sentinels exact + identity permutation. These are COPIES and a",
+        "PERMUTATION, so any error at all is a defect. This is the half of the",
+        "profile that does real work: it can fail without the tower changing",
+        "precision at all.",
+        "",
+        "(3) mean_rel_l2 <= 0.049 = 3.34% (ours bf16 vs OURS IN F32, rc job",
+        "0edbd4a9-cfd4-47e6-806b-0eb31df06383) + 1.57% (the oracle's own bf16",
+        "input floor, rc job 2481ad2a-c109-4002-8ee6-13634a2bd7f5), with",
+        "mean_cos >= 0.998. READ THE SPEC BEFORE QUOTING THIS NUMBER: given that",
+        "condition (2) holds, the triangle inequality already forces this bound,",
+        "so it is close to an identity rather than an independent test. It is",
+        "kept because it is the recorded gate and a gross regression still trips",
+        "it, not because passing it is separate evidence."
+      ]
+    },
+    "f32_arm": {
+      "judged": true,
+      "sentinels_bf16_exact": true,
+      "permutation_identity_complete": true,
+      "mean_rel_l2_max": 0.0157,
+      "_provenance": [
+        "Condition (2): the f32 arm is within the oracle's OWN floor, cells mean",
+        "relative L2 <= 1.57%, measured 1.34% (rc job",
+        "0edbd4a9-cfd4-47e6-806b-0eb31df06383). This is the condition that tests",
+        "the FUNCTION: the floor is the oracle measured against itself with its",
+        "input moved by one bf16 step, so it is a bound our arm can fail without",
+        "any arithmetic elsewhere changing.",
+        "",
+        "No mean_cos bound: the spec records none for this condition, and",
+        "inventing one here would be a fresh bound rather than a recorded one."
+      ]
+    },
+    "diagnostic": {
+      "judged": false,
+      "_provenance": [
+        "Localisation legs that measure a PERTURBATION rather than our agreement",
+        "with the oracle: the oracle against itself (floor), ours against the",
+        "oracle on a shared bf16 input (samein), and our bf16 arm against our own",
+        "f32 arm (selfdt). A 'failure' of one of these is not a defect claim, so",
+        "they are reported and not judged. They are listed EXPLICITLY rather than",
+        "reached by a default, because a default is how an unjudged tag becomes",
+        "an accidental pass."
+      ]
+    }
+  },
+  "tag_rules": [
+    ["lp0", "shipped_bf16"],
+    ["lp1", "shipped_bf16"],
+    ["lp2", "shipped_bf16"],
+    ["lp3", "shipped_bf16"],
+    ["cli", "shipped_bf16"],
+    ["cuda-lp*", "shipped_bf16"],
+    ["f32", "f32_arm"],
+    ["floor", "diagnostic"],
+    ["samein", "diagnostic"],
+    ["selfdt", "diagnostic"]
+  ],
+  "_unmatched_tag_note": [
+    "A tag no rule matches is UNJUDGED and exits 3. That is deliberate and it is",
+    "the whole point of this file: the defect being repaired here is a harness",
+    "that exited 0 while judging nothing, so 'no rule matched' must never be",
+    "reported as a pass. Add a rule for a new leg instead."
+  ]
+}

@@ -11,7 +11,17 @@ numpy.
 Usage: dsv4v_w6_compare.py <dir> <tag> <lead_pad> <n_llm_h> <n_llm_w>
   reads <dir>/{ours,oracle}-<tag>-block.f32, and when present the stage files
   -vit.f32, -cells.f32 and -input.f32.
+
+IT ENFORCES A BOUND AND EXITS ON IT. Exit 0 PASS or DIAGNOSTIC, 1 the recorded
+bound was exceeded, 2 SHAPE_MISMATCH, 3 the tag falls under no recorded rule and
+so nothing was judged. Until 2026-09-12 this script returned 0 for every shape
+that matched, whatever the magnitude, and the `<= 4.9%` judgement in the spec was
+prose arithmetic a reader did against its output; a drifting run produced a
+well-formed report, `RC=0` and no signal. The bounds are READ from
+`dsv4v_w6_bounds.json` beside this file rather than written here, so no wave can
+derive a bound from the run it is judging.
 """
+import fnmatch
 import json
 import math
 import os
@@ -98,6 +108,64 @@ def best_match(ours, ref):
                 best, arg = c, j
         hits.append((arg, best))
     return hits
+
+
+# ── THE BOUND ──────────────────────────────────────────────────────────────
+# The numbers judged against are NOT written here. They are recorded
+# measurements and they live beside this file, with the rc job that produced
+# each one, so that a reader can see what was measured and when.
+BOUNDS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "dsv4v_w6_bounds.json")
+EXIT = {"PASS": 0, "DIAGNOSTIC": 0, "FAIL": 1, "UNJUDGED": 3}
+
+
+def load_bounds(path=BOUNDS_PATH):
+    with open(path) as f:
+        return json.load(f)
+
+
+def profile_for(tag, bounds):
+    """The recorded profile this tag falls under, or None when no rule matches."""
+    for pattern, name in bounds["tag_rules"]:
+        if fnmatch.fnmatchcase(tag, pattern):
+            return name
+    return None
+
+
+def judge(report, tag, bounds):
+    """Apply the recorded profile. Returns (verdict, [failure lines])."""
+    name = profile_for(tag, bounds)
+    if name is None:
+        return "UNJUDGED", [
+            "no rule in %s matches tag %r, so NOTHING was judged. Add a rule for "
+            "this leg; do not read this as a pass."
+            % (os.path.basename(BOUNDS_PATH), tag)]
+    profile = bounds["profiles"][name]
+    if not profile.get("judged", False):
+        return "DIAGNOSTIC", []
+
+    bad = []
+    if profile.get("sentinels_bf16_exact"):
+        for kind, s in sorted(report["sentinels"].items()):
+            if not s["bf16_of_oracle_exact"]:
+                bad.append("sentinel %s is not exactly bf16(oracle), max_abs %g"
+                           % (kind, s["max_abs"]))
+    if profile.get("permutation_identity_complete"):
+        p = report["permutation"]
+        if p["identity_is_best"] != p["of"]:
+            bad.append("permutation: the identity is best for only %d of %d "
+                       "image rows" % (p["identity_is_best"], p["of"]))
+    stat = report[bounds["statistic"]]
+    limit = profile.get("mean_rel_l2_max")
+    if limit is not None and stat["mean_rel_l2"] > limit:
+        bad.append("%s mean_rel_l2 %.4f%% EXCEEDS the recorded bound %.4f%%"
+                   % (bounds["statistic"], 100.0 * stat["mean_rel_l2"],
+                      100.0 * limit))
+    limit = profile.get("mean_cos_min")
+    if limit is not None and stat["mean_cos"] < limit:
+        bad.append("%s mean_cos %.6f is BELOW the recorded bound %.6f"
+                   % (bounds["statistic"], stat["mean_cos"], limit))
+    return ("PASS" if not bad else "FAIL"), bad
 
 
 def main():
@@ -207,9 +275,18 @@ def main():
                 x == bf16(y) for ra, rb in zip(a[2], b[2]) for x, y in zip(ra, rb))
         report[stage] = s
 
+    bounds = load_bounds()
+    profile = profile_for(tag, bounds)
+    verdict, failures = judge(report, tag, bounds)
+    report["verdict"] = verdict
+    report["bound_profile"] = profile
+    report["bound_failures"] = failures
     json.dump(report, open(os.path.join(d, "report-%s.json" % tag), "w"), indent=1)
     print("REPORT", os.path.join(d, "report-%s.json" % tag))
-    return 0
+    for line in failures:
+        print("BOUND", line)
+    print("VERDICT %s tag=%s profile=%s" % (verdict, tag, profile))
+    return EXIT[verdict]
 
 
 if __name__ == "__main__":

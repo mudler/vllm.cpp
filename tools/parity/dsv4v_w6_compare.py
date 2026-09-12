@@ -14,12 +14,41 @@ Usage: dsv4v_w6_compare.py <dir> <tag> <lead_pad> <n_llm_h> <n_llm_w>
 
 IT ENFORCES A BOUND AND EXITS ON IT. Exit 0 PASS or DIAGNOSTIC, 1 the recorded
 bound was exceeded, 2 SHAPE_MISMATCH, 3 the tag falls under no recorded rule and
-so nothing was judged. Until 2026-09-12 this script returned 0 for every shape
-that matched, whatever the magnitude, and the `<= 4.9%` judgement in the spec was
-prose arithmetic a reader did against its output; a drifting run produced a
-well-formed report, `RC=0` and no signal. The bounds are READ from
+so nothing was judged, 4 the run could not be judged because the recorded
+profile or the data is malformed. Until 2026-09-12 this script returned 0 for
+every shape that matched, whatever the magnitude, and the `<= 4.9%` judgement in
+the spec was prose arithmetic a reader did against its output; a drifting run
+produced a well-formed report, `RC=0` and no signal. The bounds are READ from
 `dsv4v_w6_bounds.json` beside this file rather than written here, so no wave can
 derive a bound from the run it is judging.
+
+THREE WAYS THIS SCRIPT COULD STILL REPORT SUCCESS OVER A FAILURE, all measured
+on synthetic data and all closed here:
+
+  A NON-FINITE STATISTIC IS NOT A PASS. One image row that is zero on BOTH sides
+  makes stats() return nan for that row's rel_l2 and cos. The mean over rows is
+  then nan, and BOTH bound tests are False -- `nan > 0.049` is False and
+  `nan < 0.998` is False -- so a single degenerate row silently disabled both
+  magnitude bounds for all 100 rows. Measured: 99 rows 50% off plus one zero row
+  printed `VERDICT PASS` and exited 0, while the identical data without the zero
+  row exited 1 at 50.0000%. Every judged statistic is now required to be FINITE
+  before it is compared, and a judged profile refuses a degenerate row outright:
+  an all-zero image row means the tower produced nothing for that aligner cell,
+  which is a defect to report and never an average to absorb.
+
+  A MISSING `judged` KEY IS NOT A DIAGNOSTIC. `profile.get("judged", False)`
+  meant an incomplete or malformed profile read as DIAGNOSTIC and exited 0 on
+  50%-off data. `judged` must now be present and boolean, the profile must exist
+  in the file, and anything else is ERROR with a non-zero exit. Only an EXPLICIT
+  `judged: false` is a diagnostic leg.
+
+  AN ABSENT STAGE IS NOT A PASSING STAGE. Only `image_rows` was ever judged, so a
+  vit or cells stage that was 100x wrong, shape-mismatched, or missing from the
+  report entirely still printed `VERDICT PASS`. The spec cites the vit numbers as
+  evidence that the error does not jump at a stage, so that sentence rested on
+  nothing executable. Stages a profile declares are now REQUIRED to be present
+  and are judged against recorded bounds; a stage that is deliberately unbounded
+  says so in the profile with its reason, and an absent one always fails.
 """
 import fnmatch
 import json
@@ -76,11 +105,17 @@ def stats(a, b):
         "cos": dot / (na * nb) if na and nb else float("nan"),
         "rel_l2": nd / nb if nb else float("nan"),
         "ref_rms": nb / math.sqrt(len(b)),
+        # The two norms are reported so a DEGENERATE row is nameable rather than
+        # only showing up as a nan that both bound tests then ignore.
+        "our_norm": na,
+        "ref_norm": nb,
     }
 
 
 def matrix_summary(name, ours, ref):
     per = [stats(a, b) for a, b in zip(ours, ref)]
+    degenerate = [i for i, p in enumerate(per)
+                  if p["ref_norm"] == 0.0 or p["our_norm"] == 0.0]
     out = {
         "rows": len(per),
         "max_abs": max(p["max_abs"] for p in per),
@@ -90,6 +125,11 @@ def matrix_summary(name, ours, ref):
         "max_rel_l2": max(p["rel_l2"] for p in per),
         "mean_rel_l2": sum(p["rel_l2"] for p in per) / len(per),
         "ref_rms": math.sqrt(sum(p["ref_rms"] ** 2 for p in per) / len(per)),
+        # A row with a zero norm on either side has an UNDEFINED cos and rel_l2.
+        # Counting them here is what lets judge() refuse rather than average a
+        # nan into a bound test that then silently passes.
+        "degenerate_rows": len(degenerate),
+        "degenerate_row_index": degenerate[:8],
     }
     print("[%s] %s" % (name, json.dumps(out)))
     return out, per
@@ -116,7 +156,8 @@ def best_match(ours, ref):
 # each one, so that a reader can see what was measured and when.
 BOUNDS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "dsv4v_w6_bounds.json")
-EXIT = {"PASS": 0, "DIAGNOSTIC": 0, "FAIL": 1, "UNJUDGED": 3}
+EXIT = {"PASS": 0, "DIAGNOSTIC": 0, "FAIL": 1, "UNJUDGED": 3, "ERROR": 4}
+STAGES = ("input", "vit", "cells")
 
 
 def load_bounds(path=BOUNDS_PATH):
@@ -132,6 +173,62 @@ def profile_for(tag, bounds):
     return None
 
 
+def _check_bound(bad, label, value, limit, kind):
+    """Compare one statistic, FAIL-CLOSED on a missing or non-finite value.
+
+    `nan > limit` and `nan < limit` are both False, so a non-finite statistic
+    used to satisfy every bound at once. It is a failure here instead.
+    """
+    if limit is None:
+        return
+    if value is None:
+        bad.append("%s is MISSING from the report, so its recorded bound could "
+                   "not be applied" % label)
+        return
+    if not math.isfinite(value):
+        bad.append("%s is %s, which is NOT FINITE. A bound cannot be applied to "
+                   "it and this is a FAILURE, never a pass." % (label, value))
+        return
+    if kind == "max" and value > limit:
+        bad.append("%s %.4f%% EXCEEDS the recorded bound %.4f%%"
+                   % (label, 100.0 * value, 100.0 * limit))
+    elif kind == "min" and value < limit:
+        bad.append("%s %.6f is BELOW the recorded bound %.6f"
+                   % (label, value, limit))
+
+
+def _judge_stage(report, stage, rule, bad):
+    """Apply a profile's recorded rule for ONE stage of the report."""
+    got = report.get(stage, "absent")
+    if got == "absent":
+        bad.append("stage %r is ABSENT from the report and the recorded profile "
+                   "REQUIRES it. A stage that never ran is not a stage that "
+                   "passed." % stage)
+        return
+    if isinstance(got, dict) and "shape_mismatch" in got:
+        bad.append("stage %r SHAPE MISMATCH %s -- the two sides are not the same "
+                   "array and nothing about their agreement was measured"
+                   % (stage, got["shape_mismatch"]))
+        return
+    if not isinstance(got, dict):
+        bad.append("stage %r is %r, which is not a summary this bound can be "
+                   "applied to" % (stage, got))
+        return
+    if rule.get("bf16_of_oracle_exact") and not got.get("bf16_of_oracle_exact"):
+        bad.append("stage %r is not exactly bf16(oracle), which the recorded "
+                   "profile requires" % stage)
+    if rule.get("max_degenerate_rows") is not None:
+        n = got.get("degenerate_rows")
+        if n is None or n > rule["max_degenerate_rows"]:
+            bad.append("stage %r has %s degenerate (zero-norm) rows, above the "
+                       "recorded maximum %d" % (stage, n,
+                                                rule["max_degenerate_rows"]))
+    _check_bound(bad, "stage %r mean_rel_l2" % stage, got.get("mean_rel_l2"),
+                 rule.get("mean_rel_l2_max"), "max")
+    _check_bound(bad, "stage %r mean_cos" % stage, got.get("mean_cos"),
+                 rule.get("mean_cos_min"), "min")
+
+
 def judge(report, tag, bounds):
     """Apply the recorded profile. Returns (verdict, [failure lines])."""
     name = profile_for(tag, bounds)
@@ -140,8 +237,25 @@ def judge(report, tag, bounds):
             "no rule in %s matches tag %r, so NOTHING was judged. Add a rule for "
             "this leg; do not read this as a pass."
             % (os.path.basename(BOUNDS_PATH), tag)]
-    profile = bounds["profiles"][name]
-    if not profile.get("judged", False):
+    profile = bounds.get("profiles", {}).get(name)
+    if profile is None:
+        return "ERROR", [
+            "tag %r maps to profile %r, which %s does not define. An unresolvable "
+            "profile is an ERROR, never a pass."
+            % (tag, name, os.path.basename(BOUNDS_PATH))]
+    # A MISSING `judged` KEY IS AN ERROR. It used to default to False, so an
+    # incomplete profile silently downgraded a judged leg to DIAGNOSTIC and
+    # exited 0 on data that was 50% off.
+    if "judged" not in profile:
+        return "ERROR", [
+            "profile %r has no 'judged' key. An incomplete profile is an ERROR: "
+            "it must not silently downgrade a judged leg to a diagnostic one."
+            % name]
+    if not isinstance(profile["judged"], bool):
+        return "ERROR", [
+            "profile %r has a non-boolean 'judged' value %r"
+            % (name, profile["judged"])]
+    if not profile["judged"]:
         return "DIAGNOSTIC", []
 
     bad = []
@@ -155,16 +269,33 @@ def judge(report, tag, bounds):
         if p["identity_is_best"] != p["of"]:
             bad.append("permutation: the identity is best for only %d of %d "
                        "image rows" % (p["identity_is_best"], p["of"]))
-    stat = report[bounds["statistic"]]
-    limit = profile.get("mean_rel_l2_max")
-    if limit is not None and stat["mean_rel_l2"] > limit:
-        bad.append("%s mean_rel_l2 %.4f%% EXCEEDS the recorded bound %.4f%%"
-                   % (bounds["statistic"], 100.0 * stat["mean_rel_l2"],
-                      100.0 * limit))
-    limit = profile.get("mean_cos_min")
-    if limit is not None and stat["mean_cos"] < limit:
-        bad.append("%s mean_cos %.6f is BELOW the recorded bound %.6f"
-                   % (bounds["statistic"], stat["mean_cos"], limit))
+    stat_name = bounds["statistic"]
+    stat = report.get(stat_name)
+    if not isinstance(stat, dict):
+        return "ERROR", ["the judged statistic %r is absent from the report"
+                         % stat_name]
+    # A DEGENERATE ROW IS A DEFECT, not an average to absorb. An all-zero image
+    # row means the tower produced nothing for that aligner cell, and it is also
+    # the exact shape that used to turn both bounds below into no-ops.
+    limit = profile.get("max_degenerate_rows")
+    if limit is not None:
+        n = stat.get("degenerate_rows")
+        if n is None or n > limit:
+            bad.append("%s has %s degenerate (zero-norm) rows at index %s, above "
+                       "the recorded maximum %d. A zero row makes rel_l2 and cos "
+                       "undefined, which would disable the bounds below."
+                       % (stat_name, n, stat.get("degenerate_row_index"), limit))
+    _check_bound(bad, "%s mean_rel_l2" % stat_name, stat.get("mean_rel_l2"),
+                 profile.get("mean_rel_l2_max"), "max")
+    _check_bound(bad, "%s mean_cos" % stat_name, stat.get("mean_cos"),
+                 profile.get("mean_cos_min"), "min")
+    for stage, rule in sorted(profile.get("stages", {}).items()):
+        if stage not in STAGES:
+            return "ERROR", ["profile %r declares unknown stage %r"
+                             % (name, stage)]
+        if rule.get("diagnostic_only"):
+            continue
+        _judge_stage(report, stage, rule, bad)
     return ("PASS" if not bad else "FAIL"), bad
 
 
@@ -249,7 +380,7 @@ def main():
                              "min_best_cos": min(c for _, c in hits)}
     print("permutation", json.dumps(report["permutation"]))
 
-    for stage in ("input", "vit", "cells"):
+    for stage in STAGES:
         po = os.path.join(d, "ours-%s-%s.f32" % (tag, stage))
         pr = os.path.join(d, "oracle-%s-%s.f32" % (tag, stage))
         if not (os.path.exists(po) and os.path.exists(pr)):
@@ -257,6 +388,7 @@ def main():
             continue
         a = load(po); b = load(pr)
         grid = math.isqrt(a[0])
+        relaid_out = False
         if (stage == "vit" and a[:2] != b[:2] and grid * grid == a[0]
                 and b[1] == grid and b[0] == a[1] * grid):
             # The first W6 run captured llama.cpp's permuted+cont view of
@@ -265,11 +397,17 @@ def main():
             flat = [x for row in b[2] for x in row]
             b = (a[0], a[1], [[flat[(c * g + p // g) * g + p % g] for c in range(a[1])]
                               for p in range(a[0])])
+            relaid_out = True
         if a[:2] != b[:2]:
             report[stage] = {"shape_mismatch": [a[:2], b[:2]]}
             print(stage, report[stage])
             continue
         s, _ = matrix_summary(stage, a[2], b[2])
+        # RECORD the re-layout. It applies a GUESSED permutation when a numeric
+        # coincidence holds, and a reader of report-<tag>.json could not
+        # previously tell whether the vit numbers came from the file as written
+        # or from this re-indexing.
+        s["oracle_relaid_out"] = relaid_out
         if stage == "input":
             s["bf16_of_oracle_exact"] = all(
                 x == bf16(y) for ra, rb in zip(a[2], b[2]) for x, y in zip(ra, rb))

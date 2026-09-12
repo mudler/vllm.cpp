@@ -8,14 +8,37 @@
     "later wave cannot derive a bound from the very run it is judging. Every",
     "number below was measured BEFORE the run it now judges, by the rc job named",
     "beside it, and every one of them is reproduced in the spec's",
-    "`### W6 evidence` section."
+    "`### W6 evidence` section.",
+    "",
+    "EVERY PROFILE MUST CARRY AN EXPLICIT `judged`. The comparator treats a",
+    "missing or non-boolean key as an ERROR rather than defaulting it to false:",
+    "the default USED to downgrade an incomplete judged profile to DIAGNOSTIC,",
+    "which exited 0 on data that was 50% off."
   ],
   "statistic": "image_rows",
   "_statistic_note": [
     "`image_rows` is the per-row summary over the IMAGE rows of the token block",
     "-- the aligner cells. The spec calls this 'cells mean relative L2'; it is",
     "the same statistic under the spec's name, and it is the one the recorded",
-    "3.83% / 2.884% figures refer to."
+    "3.83% / 2.884% figures refer to.",
+    "",
+    "It is NOT the `-cells.f32` STAGE file, which holds the same aligner rows in",
+    "their pre-layout order. That is why every profile below marks the `cells`",
+    "stage diagnostic_only: judging it would re-judge this statistic under a",
+    "second name, and a second description of one quantity is a thing that can",
+    "drift from the first."
+  ],
+  "_stages_note": [
+    "`stages` names what a profile requires of the input/vit/cells dumps. A stage",
+    "listed here MUST be present in the report: a stage that never ran is not a",
+    "stage that passed, and until 2026-09-12 an ABSENT stage, a 100x-wrong stage",
+    "and a shape-mismatched stage all still printed VERDICT PASS, because only",
+    "`image_rows` was ever judged. The spec cites the vit numbers as evidence",
+    "that the error does not jump at a stage, so that sentence rested on nothing",
+    "executable until these rules existed.",
+    "",
+    "A stage that is deliberately NOT bounded carries `diagnostic_only` with its",
+    "reason, so the silence is stated rather than inferred."
   ],
   "profiles": {
     "shipped_bf16": {
@@ -24,6 +47,50 @@
       "permutation_identity_complete": true,
       "mean_rel_l2_max": 0.049,
       "mean_cos_min": 0.998,
+      "max_degenerate_rows": 0,
+      "stages": {
+        "input": {
+          "bf16_of_oracle_exact": true,
+          "_provenance": [
+            "The W6 evidence table records 'ours is exactly bf16(oracle)' for the",
+            "input pixels on every rung. It is an EXACTNESS claim, so it is",
+            "judged as one. READ THE SPEC BEFORE QUOTING IT AS ORDERING",
+            "EVIDENCE: the oracle dump writes this file in OUR patch-row order,",
+            "so it measures the normalisation ARITHMETIC and asserts the",
+            "ordering. The ordering evidence is the block-level permutation",
+            "check, which requires the identity for every image row."
+          ]
+        },
+        "vit": {
+          "mean_rel_l2_max": 0.0307,
+          "_provenance": [
+            "Built the same way as this profile's 3-condition cells bound, from",
+            "the same two recorded measurements at the VIT stage rather than at",
+            "the cells: 2.07% (ours bf16 vs OURS IN F32, vit column, rc job",
+            "0edbd4a9-cfd4-47e6-806b-0eb31df06383) + 1.00% (the oracle's own",
+            "bf16-input floor, vit column, rc job",
+            "2481ad2a-c109-4002-8ee6-13634a2bd7f5) = 3.07%.",
+            "",
+            "Measured INSIDE it on every leg that has run: 2.45% on the W6 CPU",
+            "arm against the oracle, 1.872% on the W7-CUDA arm against the same",
+            "oracle (rc job c472faab), and 1.51% on the W7-CUDA arm against our",
+            "own CPU block (rc job 665b2427-4b85-4e75-916b-d3ad3345ea24).",
+            "",
+            "Like the cells bound, this is a REGRESSION CATCHER rather than",
+            "independent evidence, and for the same triangle-inequality reason.",
+            "Its value is that a vit-stage regression can now fail a run at all."
+          ]
+        },
+        "cells": {
+          "diagnostic_only": true,
+          "_provenance": [
+            "The `-cells.f32` stage is the aligner output BEFORE the block",
+            "layout: the same rows the judged `image_rows` statistic already",
+            "covers, in a different order. Bounding it would be a second",
+            "description of one measurement. Its presence is still reported."
+          ]
+        }
+      },
       "_provenance": [
         "Conditions (1) and (3) of the three the spec's `THE BOUND` section sets.",
         "",
@@ -39,7 +106,36 @@
         "condition (2) holds, the triangle inequality already forces this bound,",
         "so it is close to an identity rather than an independent test. It is",
         "kept because it is the recorded gate and a gross regression still trips",
-        "it, not because passing it is separate evidence."
+        "it, not because passing it is separate evidence.",
+        "",
+        "max_degenerate_rows 0: an image row whose norm is zero on either side",
+        "has an UNDEFINED rel_l2 and cos. One such row made the mean over rows",
+        "nan, and `nan > limit` and `nan < limit` are both False, so it silently",
+        "disabled BOTH magnitude bounds above for every row. Measured: 99 rows",
+        "50% off plus one zero row printed VERDICT PASS and exited 0. An",
+        "all-zero aligner cell is also a defect in its own right."
+      ]
+    },
+    "shipped_bf16_block_only": {
+      "judged": true,
+      "sentinels_bf16_exact": true,
+      "permutation_identity_complete": true,
+      "mean_rel_l2_max": 0.049,
+      "mean_cos_min": 0.998,
+      "max_degenerate_rows": 0,
+      "stages": {},
+      "_provenance": [
+        "`shipped_bf16` with NO stage requirements, for the end-to-end CLI leg",
+        "only. llama-mtmd-cli is driven through MTMD_DEBUG_EMBEDDINGS, which",
+        "writes the token BLOCK and nothing else, so oracle-cli-input.f32,",
+        "-vit.f32 and -cells.f32 do not exist and never did. Requiring them here",
+        "would fail that leg for a reason that is not a defect.",
+        "",
+        "It is a SEPARATE profile rather than a relaxation of `shipped_bf16`",
+        "because the difference is a property of how the oracle is driven, and",
+        "naming it keeps the stage requirement intact everywhere else. The block",
+        "bounds are identical: this leg is judged exactly as hard on everything",
+        "it does produce."
       ]
     },
     "f32_arm": {
@@ -47,6 +143,35 @@
       "sentinels_bf16_exact": true,
       "permutation_identity_complete": true,
       "mean_rel_l2_max": 0.0157,
+      "max_degenerate_rows": 0,
+      "stages": {
+        "input": {
+          "_provenance": [
+            "REQUIRED but NOT held to bf16 exactness. The f32 arm feeds the",
+            "exact f32 pixels rather than the bf16-narrowed ones, so",
+            "bf16_of_oracle_exact is the wrong assertion for this leg and",
+            "asserting it would fail a correct run."
+          ]
+        },
+        "vit": {
+          "mean_rel_l2_max": 0.01,
+          "_provenance": [
+            "Condition (2) at the VIT stage: the f32 arm inside the oracle's own",
+            "floor. The oracle's bf16-input floor is 1.00% at vit (rc job",
+            "2481ad2a-c109-4002-8ee6-13634a2bd7f5) and our f32 arm measured",
+            "0.88% against it (rc job 0edbd4a9-cfd4-47e6-806b-0eb31df06383).",
+            "",
+            "Like the cells form of condition (2), this is the rule that tests",
+            "the FUNCTION rather than restating an identity: the floor is the",
+            "oracle measured against itself with its input moved by one bf16",
+            "step, so our arm can fail it without anything else changing."
+          ]
+        },
+        "cells": {
+          "diagnostic_only": true,
+          "_provenance": ["See `shipped_bf16`: the same rows as the judged statistic."]
+        }
+      },
       "_provenance": [
         "Condition (2): the f32 arm is within the oracle's OWN floor, cells mean",
         "relative L2 <= 1.57%, measured 1.34% (rc job",
@@ -77,7 +202,7 @@
     ["lp1", "shipped_bf16"],
     ["lp2", "shipped_bf16"],
     ["lp3", "shipped_bf16"],
-    ["cli", "shipped_bf16"],
+    ["cli", "shipped_bf16_block_only"],
     ["cuda-lp*", "shipped_bf16"],
     ["f32", "f32_arm"],
     ["floor", "diagnostic"],

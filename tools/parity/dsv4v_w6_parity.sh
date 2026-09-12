@@ -122,6 +122,11 @@ if [ "$RUN_CLI" = 1 ]; then
     for s in block input vit cells; do cp "$OUT/ours-lp$LP-$s.f32" "$OUT/ours-cli-$s.f32" || { step cli_copy 97; exit 97; }; done
     python3 "$SRC/tools/parity/dsv4v_w6_compare.py" "$OUT" cli $LP 10 10 > "$OUT/compare-cli.txt" 2>&1; step compare_cli $?
     cat "$OUT/compare-cli.txt"
+  else
+    # The CLI produced no block. That is a leg that never ran, and it must not
+    # be indistinguishable from one that passed.
+    echo "FATAL: llama-mtmd-cli wrote no $OUT/oracle-cli-block.f32"
+    step cli_block_missing 1
   fi
 fi
 echo "### steps"; cat "$OUT/steps.txt"
@@ -129,6 +134,31 @@ echo "### steps"; cat "$OUT/steps.txt"
 # as not recording one: before this, every leg could fail and the job still
 # ended on `W6_PARITY_DONE` with rc 0. `compare_*` now carries the comparator's
 # own bound verdict, so a drifted run fails HERE.
-BAD=$(awk '!/ RC=0$/' "$OUT/steps.txt" | wc -l)
+# COUNTING NON-ZERO LINES IS NOT ENOUGH, which is the half this readback
+# originally missed. `awk '!/ RC=0$/' | wc -l` counts an ABSENT step as zero
+# failures, so a steps.txt holding only `ours_build RC=0` -- every comparison
+# never having run -- gave BAD=0 and exit 0, and so did an empty file. The
+# expected list makes a step that never ran distinguishable from one that
+# passed.
+EXPECTED="overlay_sha image clone oracle_configure oracle_build ours_configure
+          ours_build oracle_lp0 ours_lp0 compare_lp0 oracle_lp1 ours_lp1
+          compare_lp1 oracle_lp2 ours_lp2 compare_lp2 oracle_lp3 ours_lp3
+          compare_lp3"
+[ "$RUN_CLI" = 1 ] && EXPECTED="$EXPECTED oracle_cli"
+BAD=0
+if [ ! -s "$OUT/steps.txt" ]; then
+  echo "### FATAL: steps.txt is empty or absent -- NOTHING was recorded"; BAD=1
+else
+  if grep -qvE '^[A-Za-z0-9_]+ RC=[0-9]+$' "$OUT/steps.txt"; then
+    echo "### MALFORMED STEP LINES:"; grep -vE '^[A-Za-z0-9_]+ RC=[0-9]+$' "$OUT/steps.txt"; BAD=1
+  fi
+  if awk '!/ RC=0$/' "$OUT/steps.txt" | grep -q .; then
+    echo "### FAILING STEPS:"; awk '!/ RC=0$/' "$OUT/steps.txt"; BAD=1
+  fi
+  for s in $EXPECTED; do
+    grep -qE "^$s RC=" "$OUT/steps.txt" \
+      || { echo "### MISSING EXPECTED STEP: $s -- it never ran"; BAD=1; }
+  done
+fi
 echo "### W6_PARITY_DONE failed_steps=$BAD"
-[ "$BAD" -eq 0 ] || { echo "### FAILING STEPS:"; awk '!/ RC=0$/' "$OUT/steps.txt"; exit 1; }
+[ "$BAD" -eq 0 ] || exit 1

@@ -19,7 +19,16 @@
 #
 # Everything lands in /workspace/dsv4-vision/w7-out/ as well as on stdout,
 # because rc logs age out within a day.
-set -u
+#
+# `pipefail` is required for the same reason `dsv4v_w6_parity.sh` states: a
+# `cmd | tee f` pipeline otherwise reports TEE's status, and tee succeeds
+# whenever it can write the file. There is no `set -e` here, so this changes
+# only the value the status readers see. THIS DRIVER WAS LEFT OUT of the
+# 2026-09-12 repair that gave the other three `pipefail` and a steps readback,
+# and it is the driver that produced the 2.884% / 0.99939 / 1.872% figures the
+# spec quotes: it recorded steps nothing ever read and ended on its DONE banner
+# whatever they said.
+set -uo pipefail
 W=/workspace/dsv4-vision
 OUT=$W/w7-out; mkdir -p "$OUT"
 P6=$W/w6-parity
@@ -166,32 +175,60 @@ test -n "$PROBE" || { echo "FATAL: no probe binary"; step probe_missing 94; exit
 "$PROBE" "$MMPROJ" "$P6/img392.rgb" 392 392 0 "$OUT" cpuctl \
   > "$OUT/probe-cpuctl.log" 2>&1; step probe_cpu $?
 tail -3 "$OUT/probe-cpuctl.log"
+# THIS CONTROL IS LOAD-BEARING, so it records a STEP like every other check.
+# It previously wrote the bare line "cpu_control identical" into steps.txt --
+# not `<name> RC=<n>`, so no readback could ever parse it -- and the DIFFERS
+# branch recorded nothing at all, which made "this build is not W6's" a message
+# on stdout rather than a result. Every device number below rests on this
+# comparison holding.
 if cmp -s "$OUT/ours-cpuctl-block.f32" "$P6/ours-lp0-block.f32"; then
   echo "CPU_CONTROL_IDENTICAL: this build reproduces W6's CPU block byte for byte"
-  echo "cpu_control identical" >> "$OUT/steps.txt"
+  step cpu_control 0
 else
   echo "CPU_CONTROL_DIFFERS: this build's CPU block is NOT W6's. Any device"
-  echo "comparison below is against THIS build's CPU arm, not against W6's."
+  echo "comparison below would be against THIS build's CPU arm, not against W6's."
+  step cpu_control 1
 fi
 
 # The device arm, at every lead_pad rung W6 measured.
 for LP in 0 1 2 3; do
   DSV4V_PROBE_DEVICE=cuda "$PROBE" "$MMPROJ" "$P6/img392.rgb" 392 392 $LP "$OUT" cuda-lp$LP \
-    > "$OUT/probe-cuda-lp$LP.log" 2>&1; RC=$?; step probe_cuda_lp$LP $RC
+    > "$OUT/probe-cuda-lp$LP.log" 2>&1; RC=$?
   echo "--- lead_pad $LP rc=$RC"
   tail -5 "$OUT/probe-cuda-lp$LP.log"
   if [ $RC -ne 0 ]; then
+    # A REFUSAL IS A RECORDED RESULT ON THIS BOX, NOT A FAILING STEP. thor is
+    # sm_110, outside the vendored FA-2 arch set, so an FA-2-gated path can only
+    # refuse here and the message is what this job came to collect. It is
+    # recorded under its OWN step name so that the readback below still fails on
+    # a non-zero exit nobody can explain: an unexplained crash must not be
+    # filed as "the expected refusal".
     echo "DEVICE ARM REFUSED at lead_pad $LP -- the message is the result:"
     grep -iE 'refus|device|FATAL|what|share one device' "$OUT/probe-cuda-lp$LP.log" | head -5
+    if grep -qiE 'refus|unsupported|share one device|must be' "$OUT/probe-cuda-lp$LP.log"; then
+      step probe_cuda_lp${LP}_refused 0
+    else
+      echo "UNEXPLAINED non-zero exit $RC with no refusal message in the log."
+      step probe_cuda_lp${LP}_unexplained "$RC"
+    fi
     continue
   fi
+  step probe_cuda_lp$LP 0
   # Compare the DEVICE block against W6's CPU block with W6's own script and
   # statistics, so the number is judged against the recorded bound and not a
   # fresh one. "oracle" here is the CPU arm; the file names say so.
-  cp "$P6/ours-lp$LP-block.f32" "$OUT/oracle-cuda-lp$LP-block.f32"
-  cp "$P6/ours-lp$LP-vit.f32"   "$OUT/oracle-cuda-lp$LP-vit.f32"
-  cp "$P6/ours-lp$LP-cells.f32" "$OUT/oracle-cuda-lp$LP-cells.f32"
-  cp "$P6/ours-lp$LP-input.f32" "$OUT/oracle-cuda-lp$LP-input.f32"
+  #
+  # EVERY COPY IS CHECKED, and the destination is removed first. $OUT is a
+  # persistent NAS directory nothing clears, so a failed `cp` used to leave the
+  # PREVIOUS run's file in place and the comparator judged that instead --
+  # silently, against a stale artefact this run never produced.
+  CPRC=0
+  for s in block vit cells input; do
+    rm -f "$OUT/oracle-cuda-lp$LP-$s.f32"
+    cp "$P6/ours-lp$LP-$s.f32" "$OUT/oracle-cuda-lp$LP-$s.f32" || CPRC=1
+  done
+  step stage_copy_cuda_lp$LP $CPRC
+  [ $CPRC -eq 0 ] || { echo "FATAL: staging W6's lp$LP files failed; refusing to compare"; continue; }
   python3 "$SRC/tools/parity/dsv4v_w6_compare.py" "$OUT" cuda-lp$LP $LP 10 10 \
     > "$OUT/compare-cuda-lp$LP.txt" 2>&1; step compare_cuda_lp$LP $?
   cat "$OUT/compare-cuda-lp$LP.txt"
@@ -248,4 +285,38 @@ done
 du -sh "$SRC" "$SRC/build-cuda"
 echo "### /tmp free at end: $(free_gb) GiB"
 echo "### steps"; cat "$OUT/steps.txt"
-echo "### W7_CUDA_DONE"
+
+# READ THE STEPS BACK, AND KNOW WHICH ONES WERE EXPECTED. Recording a status
+# nothing reads is the same defect as not recording one, and this driver did not
+# read its own steps.txt at all: every leg could fail and the job still ended on
+# `W7_CUDA_DONE` with rc 0.
+#
+# COUNTING NON-ZERO LINES IS NOT ENOUGH, which is the second half. `awk
+# '!/ RC=0$/' | wc -l` counts an ABSENT step as zero failures, so a steps.txt
+# holding only `configure RC=0` and `build RC=0` -- every comparison never
+# having run -- passed, and so did an empty file. The expected list below is
+# what makes a step that never ran distinguishable from one that passed.
+EXPECTED="toolkit_install configure reconfigure build ctest_cuda cuda_kernels
+          probe_cpu cpu_control dev_attn_on"
+BAD=0
+if [ ! -s "$OUT/steps.txt" ]; then
+  echo "### FATAL: steps.txt is empty or absent -- NOTHING was recorded"; BAD=1
+else
+  if grep -qvE '^[A-Za-z0-9_]+ RC=[0-9]+$' "$OUT/steps.txt"; then
+    echo "### MALFORMED STEP LINES (a line no readback can parse):"
+    grep -vE '^[A-Za-z0-9_]+ RC=[0-9]+$' "$OUT/steps.txt"; BAD=1
+  fi
+  if awk '!/ RC=0$/' "$OUT/steps.txt" | grep -q .; then
+    echo "### FAILING STEPS:"; awk '!/ RC=0$/' "$OUT/steps.txt"; BAD=1
+  fi
+  for s in $EXPECTED; do
+    grep -qE "^$s RC=" "$OUT/steps.txt" \
+      || { echo "### MISSING EXPECTED STEP: $s -- it never ran"; BAD=1; }
+  done
+  for LP in 0 1 2 3; do
+    grep -qE "^(compare_cuda_lp$LP|probe_cuda_lp${LP}_refused) RC=" "$OUT/steps.txt" \
+      || { echo "### MISSING lead_pad $LP: neither a comparison nor a recorded refusal"; BAD=1; }
+  done
+fi
+[ "$BAD" -eq 0 ] || { echo "### W7_CUDA_FAILED"; exit 1; }
+echo "### W7_CUDA_DONE failed_steps=0"

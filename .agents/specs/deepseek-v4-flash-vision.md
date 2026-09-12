@@ -684,6 +684,28 @@ manifest is a semantic checker change and is owed below, with the measurement
 above as its red-before input.
 
 ## Owed
+- **THE W7-CUDA NUMBERS WERE PRODUCED BY A DRIVER THAT COULD NOT DETECT A FAILED
+  STEP, AND THEY HAVE NOT BEEN RE-RUN SINCE IT WAS REPAIRED.** The 2.884% cells
+  mean relative L2, the 0.99939 cells mean cosine and the 1.872% vit mean
+  relative L2 quoted in `### W7-CUDA evidence`, in the verdict paragraph beside
+  it and in `## Now` all come from `tools/parity/dsv4v_w7_cuda.sh` (rc jobs
+  `c472faab` and `665b2427-4b85-4e75-916b-d3ad3345ea24`). THE NUMBERS ARE NOT
+  WITHDRAWN: they were produced red-first, the CPU control in that same job
+  reproduced W6's block byte for byte, and nothing measured since contradicts
+  them. What a reader must know is the state of the harness AROUND them. At the
+  time of that run this driver alone carried `set -u` with no `pipefail`, wrote
+  a line into its own `steps.txt` that no readback could parse, never read
+  `steps.txt` back at all, and ended on `### W7_CUDA_DONE` with no exit status
+  derived from any step; its `cp` of W6's blocks into the comparison directory
+  was unchecked, and its CPU control printed `CPU_CONTROL_DIFFERS` without
+  recording a failure. So that job could not have reported a failed leg, and the
+  figures rest on the legs having in fact succeeded rather than on the job
+  having been able to say so. The driver now takes `pipefail`, records a real
+  `RC=` line per step including the control, checks every copy, reads its steps
+  back against an EXPECTED list, and cannot reach its DONE banner when a step
+  failed. RE-RUNNING THE W7-CUDA JOB UNDER THE REPAIRED DRIVER IS OWED and needs
+  a `thor:gpu0` lease, which the repair wave did not hold. Owed by issue #2411
+  and W7-CUDA.
 - **THE OFFICIAL SAFETENSORS VISION ARM LOADS, AND ITS REAL PAYLOAD HAS NEVER
   BEEN READ.** `src/vllm/model_executor/models/deepseek_v4_vision_weights.cpp`
   materializes the released 267-tensor BF16 vision group out of the checkpoint's

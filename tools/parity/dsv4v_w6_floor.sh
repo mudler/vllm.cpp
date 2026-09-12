@@ -49,24 +49,38 @@ ODUMP=$(find "$LC/build" -name dsv4v-oracle-dump -type f | head -1)
 # it reproduces the first run's block bit for bit.
 "$ODUMP" "$MMPROJ" "$OUT/img392.rgb" 392 392 0 "$OUT" f32in $THREADS > "$OUT/oracle-f32in.log" 2>&1; step oracle_f32in $?
 grep -E 'captured|block|FATAL' "$OUT/oracle-f32in.log"
-cmp "$OUT/oracle-f32in-block.f32" "$OUT/oracle-lp0-block.f32" && echo "REPRODUCIBLE: oracle block identical to the first run"
+# THIS CONTROL IS LOAD-BEARING and now records a step. It asserts the oracle
+# reproduces its own first-run block bit for bit; if it does not, every number
+# below is measured against a different oracle than the spec records.
+cmp "$OUT/oracle-f32in-block.f32" "$OUT/oracle-lp0-block.f32"; step oracle_reproducible $?
+echo "REPRODUCIBLE (rc above): oracle block identical to the first run"
 # B: the oracle on bf16-rounded input.
 DSV4V_ROUND_INPUT_BF16=1 "$ODUMP" "$MMPROJ" "$OUT/img392.rgb" 392 392 0 "$OUT" bf16in $THREADS > "$OUT/oracle-bf16in.log" 2>&1; step oracle_bf16in $?
 grep -E 'rounded|captured|block|FATAL' "$OUT/oracle-bf16in.log"
 
 # FLOOR: "ours" := oracle(bf16 input), "oracle" := oracle(f32 input).
+# EVERY COPY IS CHECKED and the destination removed first: $OUT is a persistent
+# NAS directory nothing clears, so a failed `cp` left the PREVIOUS run's file
+# for the comparator to judge, silently and against an artefact this run never
+# produced.
+CPRC=0
 for s in block input vit cells; do
-  cp "$OUT/oracle-bf16in-$s.f32" "$OUT/ours-floor-$s.f32"
-  cp "$OUT/oracle-f32in-$s.f32" "$OUT/oracle-floor-$s.f32"
+  rm -f "$OUT/ours-floor-$s.f32" "$OUT/oracle-floor-$s.f32"
+  cp "$OUT/oracle-bf16in-$s.f32" "$OUT/ours-floor-$s.f32" || CPRC=1
+  cp "$OUT/oracle-f32in-$s.f32" "$OUT/oracle-floor-$s.f32" || CPRC=1
 done
+step copy_floor $CPRC
 python3 "$OVL/dsv4v_w6_compare.py" "$OUT" floor 0 10 10 > "$OUT/compare-floor.txt" 2>&1; step compare_floor $?
 cat "$OUT/compare-floor.txt"
 # OURS vs the oracle on the SAME bf16 input: the tower difference with the
 # input rounding taken out.
+CPRC=0
 for s in block input vit cells; do
-  cp "$OUT/ours-lp0-$s.f32" "$OUT/ours-samein-$s.f32"
-  cp "$OUT/oracle-bf16in-$s.f32" "$OUT/oracle-samein-$s.f32"
+  rm -f "$OUT/ours-samein-$s.f32" "$OUT/oracle-samein-$s.f32"
+  cp "$OUT/ours-lp0-$s.f32" "$OUT/ours-samein-$s.f32" || CPRC=1
+  cp "$OUT/oracle-bf16in-$s.f32" "$OUT/oracle-samein-$s.f32" || CPRC=1
 done
+step copy_samein $CPRC
 python3 "$OVL/dsv4v_w6_compare.py" "$OUT" samein 0 10 10 > "$OUT/compare-samein.txt" 2>&1; step compare_samein $?
 cat "$OUT/compare-samein.txt"
 # The four lead_pad rungs again, now with the vit stage and the structure lines.
@@ -78,6 +92,28 @@ echo "### steps"; cat "$OUT/floor-steps.txt"
 # READ THE STEPS BACK; see the same block in dsv4v_w6_parity.sh. The `floor` and
 # `samein` comparisons are DIAGNOSTIC profiles and pass by construction, but the
 # `recompare_lp*` legs carry the shipped bf16 bound and can fail here.
-BAD=$(awk '!/ RC=0$/' "$OUT/floor-steps.txt" | wc -l)
+# COUNTING NON-ZERO LINES IS NOT ENOUGH: `awk '!/ RC=0$/' | wc -l` counts an
+# ABSENT step as zero failures, so a steps file holding only the early steps --
+# every comparison never having run -- passed, and so did an empty file. The
+# expected list is what makes a step that never ran distinguishable from one
+# that passed.
+EXPECTED="overlay_sha clone configure build oracle_f32in oracle_bf16in
+          oracle_reproducible copy_floor compare_floor copy_samein
+          compare_samein recompare_lp0 recompare_lp1 recompare_lp2 recompare_lp3"
+BAD=0
+if [ ! -s "$OUT/floor-steps.txt" ]; then
+  echo "### FATAL: floor-steps.txt is empty or absent -- NOTHING was recorded"; BAD=1
+else
+  if grep -qvE '^[A-Za-z0-9_]+ RC=[0-9]+$' "$OUT/floor-steps.txt"; then
+    echo "### MALFORMED STEP LINES:"; grep -vE '^[A-Za-z0-9_]+ RC=[0-9]+$' "$OUT/floor-steps.txt"; BAD=1
+  fi
+  if awk '!/ RC=0$/' "$OUT/floor-steps.txt" | grep -q .; then
+    echo "### FAILING STEPS:"; awk '!/ RC=0$/' "$OUT/floor-steps.txt"; BAD=1
+  fi
+  for s in $EXPECTED; do
+    grep -qE "^$s RC=" "$OUT/floor-steps.txt" \
+      || { echo "### MISSING EXPECTED STEP: $s -- it never ran"; BAD=1; }
+  done
+fi
 echo "### W6_FLOOR_DONE failed_steps=$BAD"
-[ "$BAD" -eq 0 ] || { echo "### FAILING STEPS:"; awk '!/ RC=0$/' "$OUT/floor-steps.txt"; exit 1; }
+[ "$BAD" -eq 0 ] || exit 1

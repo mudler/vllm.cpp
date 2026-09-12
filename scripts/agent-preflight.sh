@@ -182,6 +182,7 @@ SUITES=(
   test_check_test_registration
   test_check_snapshot_pins
   test_check_oracle_pins
+  test_dsv4v_w6_compare
   test_cpu_x86_llamacpp_floor
   test_audit_live_rows
   test_check_gate_commands

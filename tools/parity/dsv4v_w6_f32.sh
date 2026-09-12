@@ -66,25 +66,60 @@ PROBE=$(find "$SRC/build" -name dsv4v-w6-probe -type f | head -1)
 
 echo "### control: the production bf16 path from the patched binary"
 "$PROBE" "$MMPROJ" "$OUT/img392.rgb" 392 392 0 "$OUT" bf16ctl > "$OUT/ours-bf16ctl.log" 2>&1; step control $?
-cmp "$OUT/ours-bf16ctl-block.f32" "$OUT/ours-lp0-block.f32" && echo "CONTROL_IDENTICAL: bf16 path unchanged by the scratch patch"
+# THIS CONTROL IS LOAD-BEARING and now records a step. It is what proves the
+# scratch patch that deletes the bf16-only guard changed NOTHING on the
+# production bf16 path; without it the f32 number below is measured by a binary
+# nobody has shown to be equivalent on the shipped arm.
+cmp "$OUT/ours-bf16ctl-block.f32" "$OUT/ours-lp0-block.f32"; step control_identical $?
+echo "CONTROL_IDENTICAL (rc above): bf16 path unchanged by the scratch patch"
 
 echo "### f32 arm"
 DSV4V_PROBE_F32=1 "$PROBE" "$MMPROJ" "$OUT/img392.rgb" 392 392 0 "$OUT" f32 > "$OUT/ours-f32.log" 2>&1; step f32 $?
 tail -3 "$OUT/ours-f32.log"
-for s in block input vit cells; do cp "$OUT/oracle-f32in-$s.f32" "$OUT/oracle-f32-$s.f32"; done
+# EVERY COPY IS CHECKED and the destination removed first: $OUT is a persistent
+# NAS directory nothing clears, so a failed `cp` left the PREVIOUS run's file
+# for the comparator to judge.
+CPRC=0
+for s in block input vit cells; do
+  rm -f "$OUT/oracle-f32-$s.f32"
+  cp "$OUT/oracle-f32in-$s.f32" "$OUT/oracle-f32-$s.f32" || CPRC=1
+done
+step copy_f32 $CPRC
 python3 "$OVL/dsv4v_w6_compare.py" "$OUT" f32 0 10 10 > "$OUT/compare-f32.txt" 2>&1; step compare_f32 $?
 cat "$OUT/compare-f32.txt"
 # And ours-f32 against ours-bf16: how far our own dtype moves our own output.
+CPRC=0
 for s in block input vit cells; do
-  cp "$OUT/ours-f32-$s.f32" "$OUT/oracle-selfdt-$s.f32"
-  cp "$OUT/ours-lp0-$s.f32" "$OUT/ours-selfdt-$s.f32"
+  rm -f "$OUT/oracle-selfdt-$s.f32" "$OUT/ours-selfdt-$s.f32"
+  cp "$OUT/ours-f32-$s.f32" "$OUT/oracle-selfdt-$s.f32" || CPRC=1
+  cp "$OUT/ours-lp0-$s.f32" "$OUT/ours-selfdt-$s.f32" || CPRC=1
 done
+step copy_selfdt $CPRC
 python3 "$OVL/dsv4v_w6_compare.py" "$OUT" selfdt 0 10 10 > "$OUT/compare-selfdt.txt" 2>&1; step compare_selfdt $?
 cat "$OUT/compare-selfdt.txt"
 echo "### steps"; cat "$OUT/f32-steps.txt"
 # READ THE STEPS BACK; see the same block in dsv4v_w6_parity.sh. `compare_f32`
 # carries condition (2), the f32 arm inside the oracle's own floor, which is the
 # condition that tests the function -- so a regression there fails this job.
-BAD=$(awk '!/ RC=0$/' "$OUT/f32-steps.txt" | wc -l)
+# COUNTING NON-ZERO LINES IS NOT ENOUGH: `awk '!/ RC=0$/' | wc -l` counts an
+# ABSENT step as zero failures, so a steps file in which `compare_f32` never ran
+# at all still passed, and so did an empty file.
+EXPECTED="overlay_sha patch configure build control control_identical f32
+          copy_f32 compare_f32 copy_selfdt compare_selfdt"
+BAD=0
+if [ ! -s "$OUT/f32-steps.txt" ]; then
+  echo "### FATAL: f32-steps.txt is empty or absent -- NOTHING was recorded"; BAD=1
+else
+  if grep -qvE '^[A-Za-z0-9_]+ RC=[0-9]+$' "$OUT/f32-steps.txt"; then
+    echo "### MALFORMED STEP LINES:"; grep -vE '^[A-Za-z0-9_]+ RC=[0-9]+$' "$OUT/f32-steps.txt"; BAD=1
+  fi
+  if awk '!/ RC=0$/' "$OUT/f32-steps.txt" | grep -q .; then
+    echo "### FAILING STEPS:"; awk '!/ RC=0$/' "$OUT/f32-steps.txt"; BAD=1
+  fi
+  for s in $EXPECTED; do
+    grep -qE "^$s RC=" "$OUT/f32-steps.txt" \
+      || { echo "### MISSING EXPECTED STEP: $s -- it never ran"; BAD=1; }
+  done
+fi
 echo "### W6_F32_DONE failed_steps=$BAD"
-[ "$BAD" -eq 0 ] || { echo "### FAILING STEPS:"; awk '!/ RC=0$/' "$OUT/f32-steps.txt"; exit 1; }
+[ "$BAD" -eq 0 ] || exit 1

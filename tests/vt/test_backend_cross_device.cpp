@@ -5882,3 +5882,276 @@ TEST_CASE("index_copy scatters rows BIT-EXACTLY against the CPU oracle and is NA
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// W3 of `.agents/specs/qwen4-exp-rocm-ops.md` — the qwen4_exp PLE pair,
+// `vt::Qwen4ExpPleConv` and `vt::Qwen4ExpPleGate`, row MODEL-MM-QWEN4-EXP,
+// issue ISSUE-LOCAL-01M2A1DTCZQVAH7M193XT9PN2V.
+//
+// THE TWO CASES BELOW ARE WRITTEN TO BE ABLE TO FAIL, which is the W1 lesson
+// this file already carries twice (spec D3b). A fixture whose data sits where
+// the guarantee has no leverage is indistinguishable from one that passes, and
+// W1 shipped exactly that: deleting a load-bearing stage measured 0.98x the bar.
+// Each fixture value below that exists to give a guarantee leverage says so
+// beside itself, and the spec's `## Now` records the measured margin for every
+// mutation these two cases are expected to catch.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("qwen4_exp PLE dilated causal conv matches the CPU oracle and is NATIVE on ROCm") {
+  // THE GEOMETRY IS THE RELEASED CONFIG'S, not a reduced one. `Qwen3.8-Flash-Next`
+  // has `conv_kernel_size = 4` and `conv_dilation = ngram_size = 3`, so the ring
+  // is `(K-1)*dilation = 9` columns wide and the four taps read lags
+  // {9, 6, 3, 0}. A REDUCED fixture is the trap here: at dilation 1 the taps are
+  // {3, 2, 1, 0} and a kernel that ignored `dilation` entirely would compute the
+  // same numbers, so the dilation axis would be UNMEASURABLE — the
+  // "reduced fixture degenerates the axis it claims to gate" failure.
+  constexpr int64_t kK = 4;
+  constexpr int64_t kD = 3;
+  constexpr int64_t kStateLen = (kK - 1) * kD;  // 9, and the wrapper checks it
+  // 5 channels: not a multiple of the 256-thread block and not a power of two,
+  // so a kernel that decomposed `idx` into (seq, channel) the other way round
+  // cannot pass by accident.
+  constexpr int64_t kC = 5;
+  constexpr int64_t kRows = 6;  // MORE cache rows than sequences — see below
+  constexpr int64_t kSeqs = 3;
+  constexpr int64_t T = 16;
+  // 12 / 3 / 1 tokens. THREE SEGMENT LENGTHS ON PURPOSE, because the write-back
+  // takes a different shape in each: 12 > 9 replaces the whole ring, 3 < 9 keeps
+  // the tail of the OLD state ahead of the new columns, and 1 is the decode
+  // shape the engine actually runs. A single-length fixture cannot see a
+  // write-back that shifted by the wrong amount.
+  const std::vector<int32_t> qsl = {0, 12, 15, 16};
+  // Shuffled and NOT the identity, so `conv_state_indices` is load-bearing: rows
+  // 0, 2 and 5 are never addressed and must come back byte-unchanged.
+  const std::vector<int32_t> rows_idx = {4, 1, 3};
+
+  const size_t xn = static_cast<size_t>(T) * kC;
+  const size_t wn = static_cast<size_t>(kC) * kK;
+  const size_t sn = static_cast<size_t>(kRows) * kC * kStateLen;
+
+  const std::vector<float> x = RandomVec(xn, 7701);
+  // +/-1 weights against +/-2 inputs put the four-tap accumulator in SiLU's
+  // KNEE rather than its near-linear part, which is what W1's mixer fixture got
+  // wrong (spec D3b): SiLU is not homogeneous, and a fixture that only ever
+  // evaluates it where it looks linear cannot separate a misplaced scale.
+  const std::vector<float> weight = RandomVec(wn, 7702, -1.0f, 1.0f);
+  const std::vector<float> state0 = RandomVec(sn, 7703);
+
+  vt::Qwen4ExpPleConvArgs args;
+  args.dilation = kD;
+
+  if (RocmBuilt()) {
+    REQUIRE(vt::OpRegistered(vt::OpId::kQwen4ExpPleConv, DeviceType::kROCM));
+  }
+
+  for (int use_indices = 1; use_indices >= 0; --use_indices) {
+    CAPTURE(use_indices);
+    std::vector<float> ref_out(xn, 0.0f);
+    std::vector<float> ref_state = state0;  // IN PLACE: the ring is read AND written
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> cx = x, cw = weight;
+      std::vector<int32_t> cq_sl = qsl, cr = rows_idx;
+      Tensor to = T2(ref_out.data(), cd, T, kC);
+      Tensor tx = T2(cx.data(), cd, T, kC);
+      Tensor tw = T2(cw.data(), cd, kC, kK);
+      Tensor ts = Tensor::Contiguous(ref_state.data(), DType::kF32, cd,
+                                     {kRows, kC, kStateLen});
+      Tensor tq = TI32(cq_sl.data(), cd, kSeqs + 1);
+      Tensor tr = TI32(cr.data(), cd, kSeqs);
+      vt::Qwen4ExpPleConv(cq, to, tx, tw, ts, tq, use_indices ? &tr : nullptr, args);
+      cpu.DestroyQueue(cq);
+    }
+
+    // FIXTURE HEALTH, asserted on the ORACLE rather than hoped for. Without
+    // these three an arm that wrote nothing, or wrote everywhere, would be
+    // compared against an oracle nobody checked had done anything either.
+    {
+      bool out_nonzero = false;
+      for (float v : ref_out) {
+        if (v != 0.0f) out_nonzero = true;
+      }
+      REQUIRE(out_nonzero);
+      // The addressed rows MOVED ...
+      for (int64_t s = 0; s < kSeqs; ++s) {
+        const int64_t row = use_indices ? rows_idx[static_cast<size_t>(s)] : s;
+        bool moved = false;
+        for (int64_t i = 0; i < kC * kStateLen; ++i) {
+          const size_t o = static_cast<size_t>(row) * kC * kStateLen + static_cast<size_t>(i);
+          if (ref_state[o] != state0[o]) moved = true;
+        }
+        REQUIRE(moved);
+      }
+      // ... and every row the index list does NOT name is byte-unchanged, which
+      // is the only thing that makes the row indirection falsifiable at all.
+      if (use_indices) {
+        for (int64_t row : {0, 2, 5}) {
+          const size_t o = static_cast<size_t>(row) * kC * kStateLen;
+          CHECK(std::memcmp(ref_state.data() + o, state0.data() + o,
+                            static_cast<size_t>(kC * kStateLen) * sizeof(float)) == 0);
+        }
+      }
+    }
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kQwen4ExpPleConv, dt)) continue;
+      CAPTURE(DeviceTag(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBuf dout(dev, q, xn), dx(dev, q, xn), dw(dev, q, wn), ds(dev, q, sn);
+      DevBufI32 dqsl(dev, q, qsl.size()), drows(dev, q, rows_idx.size());
+      dout.Upload(std::vector<float>(xn, 0.0f));
+      dx.Upload(x);
+      dw.Upload(weight);
+      ds.Upload(state0);
+      dqsl.Upload(qsl);
+      drows.Upload(rows_idx);
+      Tensor to = T2(dout.ptr(), d, T, kC);
+      Tensor tx = T2(dx.ptr(), d, T, kC);
+      Tensor tw = T2(dw.ptr(), d, kC, kK);
+      Tensor ts = Tensor::Contiguous(ds.ptr(), DType::kF32, d, {kRows, kC, kStateLen});
+      Tensor tq = TI32(dqsl.ptr(), d, kSeqs + 1);
+      Tensor tr = TI32(drows.ptr(), d, kSeqs);
+      // `OpRegistered` says a native provider EXISTS; this says the call did not
+      // fall through to the portable tier anyway. On gfx1151 the tier cannot be
+      // installed at all (spec D2), so a non-zero delta here means the run is
+      // void rather than merely slow.
+      const unsigned long long hits_before = vt::GetReferenceTierHits();
+      vt::Qwen4ExpPleConv(q, to, tx, tw, ts, tq, use_indices ? &tr : nullptr, args);
+      dev.Synchronize(q);
+      CHECK(vt::GetReferenceTierHits() == hits_before);
+      const double nmse_out = Nmse(ref_out, dout.Download());
+      const double nmse_state = Nmse(ref_state, ds.Download());
+      MESSAGE("qwen4_exp ple_conv NMSE " << DeviceTag(dt) << " idx=" << use_indices
+                                         << " out = " << nmse_out
+                                         << " state = " << nmse_state);
+      CHECK(nmse_out <= kNmseTol);
+      CHECK(nmse_state <= kNmseTol);
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+TEST_CASE("qwen4_exp PLE signed-sqrt gate matches the CPU oracle and is NATIVE on ROCm") {
+  // hc = 3 and H = 7: neither is a power of two, so the flattened `[T, hc*H]`
+  // output index cannot be reconstructed by an accidental shift, and a kernel
+  // that flattened (H, hc) instead of (hc, H) produces a buffer of exactly the
+  // right size holding a transposed answer — which is the defect the op's own
+  // wrapper says it exists to catch.
+  constexpr int64_t T = 5, kHc = 3, kH = 7;
+  constexpr int64_t kFlat = kHc * kH;
+  const size_t sn = static_cast<size_t>(T) * kHc;
+  const size_t vn = static_cast<size_t>(T) * kH;
+  const size_t on = static_cast<size_t>(T) * kFlat;
+
+  // THE SCORES ARE WRITTEN OUT, NOT RANDOM, because four of this op's branches
+  // are reachable only from specific values and a uniform sample hits none of
+  // them: `torch.sign`'s ZERO arm (a fully masked row scores exactly 0), the
+  // negative branch that makes the root SIGNED, and the clamp band. A random
+  // vector would exercise the two big branches only.
+  std::vector<float> score(sn);
+  {
+    const std::vector<float> pool = {
+        3.5f,   -3.5f,  0.0f,    // big both ways, and the exact zero
+        -0.0f,  1e-4f,  -1e-4f,  // negative zero, and two values deep in the band
+        0.75f,  -1.25f, 2.0f,    //
+        -2.75f, 0.25f,  -0.5f,   //
+        1.5f,   -1.75f, 0.125f};
+    REQUIRE(pool.size() == sn);
+    score = pool;
+  }
+  // +/-2 values, and NOT centred on zero: a value near 0 cannot show a wrong
+  // gate weight whatever the weight is.
+  const std::vector<float> value = RandomVec(vn, 7711, 0.5f, 2.5f);
+
+  // TWO ARGUMENT SETS, and the second one is the reason this case can see the
+  // clamp at all. At upstream's literal `clamp_min = 1e-6` the floor puts
+  // |root| at 1e-3 and `sigmoid(1e-3)` differs from `sigmoid(0)` in the fourth
+  // decimal, so EVERY way of breaking the clamp survives an NMSE bar of 5e-4 —
+  // the same blindness spec D3b found in W1's eps placement. `clamp_min = 4`
+  // floors the root at 2 and `sigmoid(2) = 0.881` against `sigmoid(1e-4)`, so
+  // the band values above move by ~43%. The production value is kept BESIDE it
+  // rather than replaced, because an arm gated only at an unused setting is an
+  // arm gated at nothing.
+  struct ArgCase {
+    float divisor;
+    float clamp_min;
+  };
+  const std::vector<ArgCase> arg_cases = {
+      {2.6457513f, 1e-6f},  // math.sqrt(7), upstream's literal clamp
+      {2.6457513f, 4.0f}};  // the separating clamp
+
+  if (RocmBuilt()) {
+    REQUIRE(vt::OpRegistered(vt::OpId::kQwen4ExpPleGate, DeviceType::kROCM));
+  }
+
+  for (const ArgCase& ac : arg_cases) {
+    CAPTURE(ac.clamp_min);
+    vt::Qwen4ExpPleGateArgs args;
+    args.gate_divisor = ac.divisor;
+    args.clamp_min = ac.clamp_min;
+
+    std::vector<float> ref(on, 0.0f);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> cs = score, cv = value;
+      Tensor to = T2(ref.data(), cd, T, kFlat);
+      Tensor ts = T2(cs.data(), cd, T, kHc);
+      Tensor tv = T2(cv.data(), cd, T, kH);
+      vt::Qwen4ExpPleGate(cq, to, ts, tv, args);
+      cpu.DestroyQueue(cq);
+    }
+
+    // FIXTURE HEALTH. The gate weight is a sigmoid, so it lives in (0, 1) and a
+    // fixture whose weights all sat near 0.5 could not separate a broken sign,
+    // a dropped divisor or a missing sqrt from a correct arm. `out = w * value`
+    // and `value` is strictly positive here, so `out/value` IS the weight and
+    // the spread below is measured rather than assumed.
+    {
+      double w_lo = 2.0, w_hi = -1.0;
+      for (int64_t t = 0; t < T; ++t) {
+        for (int64_t j = 0; j < kHc; ++j) {
+          for (int64_t h = 0; h < kH; ++h) {
+            const double w =
+                static_cast<double>(ref[static_cast<size_t>(t * kFlat + j * kH + h)]) /
+                static_cast<double>(value[static_cast<size_t>(t * kH + h)]);
+            if (w < w_lo) w_lo = w;
+            if (w > w_hi) w_hi = w;
+          }
+        }
+      }
+      CAPTURE(w_lo);
+      CAPTURE(w_hi);
+      REQUIRE(w_hi - w_lo > 0.5);
+    }
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kQwen4ExpPleGate, dt)) continue;
+      CAPTURE(DeviceTag(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBuf dout(dev, q, on), dsc(dev, q, sn), dval(dev, q, vn);
+      dout.Upload(std::vector<float>(on, 0.0f));
+      dsc.Upload(score);
+      dval.Upload(value);
+      Tensor to = T2(dout.ptr(), d, T, kFlat);
+      Tensor ts = T2(dsc.ptr(), d, T, kHc);
+      Tensor tv = T2(dval.ptr(), d, T, kH);
+      const unsigned long long hits_before = vt::GetReferenceTierHits();
+      vt::Qwen4ExpPleGate(q, to, ts, tv, args);
+      dev.Synchronize(q);
+      CHECK(vt::GetReferenceTierHits() == hits_before);
+      const double nmse = Nmse(ref, dout.Download());
+      MESSAGE("qwen4_exp ple_gate NMSE " << DeviceTag(dt) << " clamp=" << ac.clamp_min
+                                         << " = " << nmse);
+      CHECK(nmse <= kNmseTol);
+      dev.DestroyQueue(q);
+    }
+  }
+}

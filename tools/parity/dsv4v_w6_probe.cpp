@@ -78,7 +78,10 @@ std::vector<float> Widen(const uint16_t* p, size_t n) {
 // W6 ran this probe on the CPU provider only, and hardcoded `kCPU` in both
 // arms. The device paths are W7's, and a device result cannot be obtained by
 // reasoning about a CPU one -- so the provider is selected here and the same
-// binary drives both. Default `cpu`, so every W6 invocation is byte-unchanged.
+// binary drives both. The default is `cpu`, so every W6 invocation produces
+// BYTE-IDENTICAL `.f32` artifacts. Its stdout is NOT unchanged: `main` now
+// prints one unconditional `provider: <cpu|cuda>` line that W6's runs did not
+// carry, so a log diff against a W6 run shows that line and nothing else.
 vt::DeviceType ProbeDeviceType() {
   const char* e = std::getenv("DSV4V_PROBE_DEVICE");
   const std::string want = e != nullptr ? e : "cpu";
@@ -183,12 +186,15 @@ int RunF32(const vllm::GgufFile& gguf, const std::vector<uint8_t>& rgb,
             px[static_cast<size_t>((vh * gw + vw) * feat + (c * P + dy) * P + dx)] =
                 ((static_cast<float>(raw) / 255.0f) - 0.5f) / 0.5f;
           }
-  WriteF32(outdir + "/ours-" + tag + "-input.f32", patches, feat, px);
-
   // THE F32 ARM IS HOST-ONLY, and says so rather than producing a wrong answer.
   // It builds its tensors directly over `px.data()` and reads `cell_host` back
   // by plain pointer, so a non-CPU queue here would hand the tower host memory
   // labelled with a device and read uninitialised bytes out again.
+  //
+  // REFUSED BEFORE THE FIRST ARTIFACT IS WRITTEN. This check stood after the
+  // `-input.f32` write, so a device request left one valid-looking file on disk
+  // and no others; a later `dsv4v_w6_compare.py` run reads whatever it finds by
+  // name and cannot tell that partial set from a complete one.
   if (ProbeDeviceType() != vt::DeviceType::kCPU) {
     std::fprintf(stderr,
                  "FATAL: DSV4V_PROBE_F32=1 is a HOST measurement and "
@@ -196,6 +202,7 @@ int RunF32(const vllm::GgufFile& gguf, const std::vector<uint8_t>& rgb,
                  "tensors over host pointers; it has no device arm.\n");
     return 2;
   }
+  WriteF32(outdir + "/ours-" + tag + "-input.f32", patches, feat, px);
   vt::Backend& backend = vt::GetBackend(vt::DeviceType::kCPU);
   vt::Queue queue = backend.CreateQueue();
   vllm::multimodal::DeepSeekV4Vision tower(backend, cfg, w);

@@ -342,10 +342,10 @@ Exl3RankSlice ReadRankSlice(const StIndex& index, const std::string& base, int b
 // refuses a mismatch BY NAME. That is not defensive decoration, and the reason is
 // DIAGNOSTIC rather than numeric. A tensor materialized at the wrong shape does
 // not produce a wrong number: `Gemm`'s host arm is a `MatVec` whose size
-// assertion is unconditional (`deepseek_v4.cpp:413`, a plain `VT_CHECK` and not
+// assertion is unconditional (`deepseek_v4.cpp:504`, a plain `VT_CHECK` and not
 // an `assert`, so it survives `NDEBUG`), and its keep-quant arm checks too. What
 // it produces is an ANONYMOUS throw — `vt: MatVec weight size mismatch at
-// deepseek_v4.cpp:413` — that names neither the tensor, nor the layer, nor the
+// deepseek_v4.cpp:504` — that names neither the tensor, nor the layer, nor the
 // geometry, nor what is missing. Refusing HERE replaces that with a message the
 // reader can act on.
 

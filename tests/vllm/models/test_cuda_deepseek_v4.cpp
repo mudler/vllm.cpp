@@ -1347,7 +1347,13 @@ TinyVisionTower MakeTinyVisionTower() {
   t.cfg.patch_size = 2;
   t.cfg.hidden_size = 8;
   t.cfg.num_heads = 2;      // head_dim 4, which the config requires to be % 4
-  t.cfg.depth = 1;
+  // DEPTH 2, NOT 1, and the reason is the shape of the staging code. W7-CUDA's
+  // `EnsureResident` stages the tower block by block in a loop over
+  // `weights_.blocks`, so a regression that dropped a block would land on an
+  // index the loop reaches after the first. At depth 1 that loop has one
+  // iteration and every such regression is invisible. Two is the smallest depth
+  // that executes the loop more than once; the production projector has 32.
+  t.cfg.depth = 2;
   t.cfg.intermediate_size = 4;
   t.cfg.output_size = 8;
   t.cfg.downsample_ratio = 2;
@@ -1359,11 +1365,14 @@ TinyVisionTower MakeTinyVisionTower() {
   const int64_t O = t.cfg.output_size;
 
   Rng r;
+  const int64_t D = t.cfg.depth;
   // ONE arena, sized first and never resized, so every view below stays valid.
-  const int64_t nbf = H * PD + H + (3 * H * H + 3 * H + H * H + H + 2 * I * H + H * I)
+  const int64_t nbf = H * PD + H
+                    + D * (3 * H * H + 3 * H + H * H + H + 2 * I * H + H * I)
                     + O * AI + O + O * O + O;
   t.bf16 = Bf16Of(Rand(r, nbf, -0.3f, 0.3f));
-  t.f32.resize(static_cast<size_t>(3 * H), 1.0f);
+  // Two RMSNorm weights per block, plus the tower's final norm.
+  t.f32.resize(static_cast<size_t>((2 * D + 1) * H), 1.0f);
   for (auto& v : t.f32) v = 1.0f + r.next(-0.05f, 0.05f);
 
   const vt::Device cpu{vt::DeviceType::kCPU, 0};
@@ -1386,16 +1395,21 @@ TinyVisionTower MakeTinyVisionTower() {
 
   t.weights.patch_weight = take({H, PD});
   t.weights.patch_bias = take({H});
-  vllm::multimodal::DeepSeekV4VisionBlockWeights b;
-  b.norm1_weight = takef({H});
-  b.qkv_weight = take({3 * H, H});
-  b.qkv_bias = take({3 * H});
-  b.out_weight = take({H, H});
-  b.out_bias = take({H});
-  b.norm2_weight = takef({H});
-  b.mlp_w1_weight = take({2 * I, H});
-  b.mlp_w2_weight = take({H, I});
-  t.weights.blocks.push_back(b);
+  // One distinct weight set per block: every block takes its own slice of the
+  // arena, so no two blocks alias and a block read in place of another is a
+  // different answer rather than the same one.
+  for (int64_t layer = 0; layer < D; ++layer) {
+    vllm::multimodal::DeepSeekV4VisionBlockWeights b;
+    b.norm1_weight = takef({H});
+    b.qkv_weight = take({3 * H, H});
+    b.qkv_bias = take({3 * H});
+    b.out_weight = take({H, H});
+    b.out_bias = take({H});
+    b.norm2_weight = takef({H});
+    b.mlp_w1_weight = take({2 * I, H});
+    b.mlp_w2_weight = take({H, I});
+    t.weights.blocks.push_back(b);
+  }
   t.weights.final_norm_weight = takef({H});
   t.weights.aligner_w1_weight = take({O, AI});
   t.weights.aligner_w1_bias = take({O});
@@ -1454,6 +1468,22 @@ TEST_CASE("W7-CUDA: the vision tower STAGES to the device and matches the CPU ar
   std::vector<uint16_t> dev_out(static_cast<size_t>(rows * O), 0);
   gpu.Copy(gq.q, dev_out.data(), dobuf, dev_out.size() * bf);
   gpu.Synchronize(gq.q);
+
+  // (0) EVERY BLOCK WAS STAGED, not only block 0. Destroy the host arena the
+  //     weights were built over and run the SAME already-staged tower again.
+  //     A weight that was never copied still points into this memory, so a miss
+  //     on ANY index -- `EnsureResident`'s per-block loop is where a regression
+  //     would land -- changes this second answer. Both comparisons below run
+  //     against `dev_out`, which was captured before the arena was destroyed.
+  for (auto& v : t.bf16) v = 0;
+  for (auto& v : t.f32) v = 0.0f;
+  std::vector<uint16_t> dev_again(static_cast<size_t>(rows * O), 0);
+  tower.Forward(gq.q, o, p, gh, gw);
+  gpu.Synchronize(gq.q);
+  gpu.Copy(gq.q, dev_again.data(), dobuf, dev_again.size() * bf);
+  gpu.Synchronize(gq.q);
+  CHECK(dev_again == dev_out);
+
   gpu.Free(dp);
   gpu.Free(dobuf);
 
@@ -1515,6 +1545,30 @@ TEST_CASE("W7-CUDA: a tower already staged to one device still REFUSES a foreign
   CHECK(thrown.find("must share one device") != std::string::npos);
   gpu.Free(dp);
   gpu.Free(dobuf);
+}
+
+// W7-CUDA repair (#2411). THE FIXTURE CANNOT DEGENERATE BACK TO ONE BLOCK.
+//
+// The two device cases above are the only gate on `EnsureResident`, and what
+// they can detect depends entirely on this fixture's depth: at depth 1 the
+// per-block staging loop runs once and no block-index regression is reachable.
+// That state is what this case forbids, and it is the one part of the coverage
+// a host with no CUDA can still check -- the device cases themselves return
+// early here and the suite exits 77.
+TEST_CASE("W7-CUDA: the tiny vision fixture keeps more than one block") {
+  TinyVisionTower t = MakeTinyVisionTower();
+  REQUIRE(t.cfg.depth >= 2);
+  REQUIRE(static_cast<int64_t>(t.weights.blocks.size()) == t.cfg.depth);
+  // ...and the blocks are distinct storage, so reading one in place of another
+  // is an observable difference rather than the same bytes twice.
+  for (size_t i = 1; i < t.weights.blocks.size(); ++i) {
+    CHECK(t.weights.blocks[i].qkv_weight.data !=
+          t.weights.blocks[i - 1].qkv_weight.data);
+    CHECK(t.weights.blocks[i].mlp_w1_weight.data !=
+          t.weights.blocks[i - 1].mlp_w1_weight.data);
+    CHECK(t.weights.blocks[i].norm1_weight.data !=
+          t.weights.blocks[i - 1].norm1_weight.data);
+  }
 }
 
 // Exit 77 -> CTest reports SKIPPED. The real rc comes FIRST: a genuine failure

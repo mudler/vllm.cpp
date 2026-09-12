@@ -725,13 +725,13 @@ std::vector<float> Slice(const std::vector<float>& v, int64_t off, int64_t len) 
 //
 // AND A DISAGREEMENT HERE IS ANONYMOUS, NOT SILENT. Be exact about what this
 // buys, because overstating it is the defect #1964 was filed for. `Gemm`'s host
-// arm is a `MatVec` whose size assertion is UNCONDITIONAL — `deepseek_v4.cpp:413`
+// arm is a `MatVec` whose size assertion is UNCONDITIONAL — `deepseek_v4.cpp:504`
 // is a plain `VT_CHECK`, a throw rather than an `assert`, so `NDEBUG` does not
 // remove it — and its keep-quant arm checks the shape too. A [2*head_dim,
 // hidden_size] weight read at a [head_dim, hidden_size] stride therefore does NOT
 // produce a plausible wrong number. It throws
 //
-//     vt: MatVec weight size mismatch at deepseek_v4.cpp:413
+//     vt: MatVec weight size mismatch at deepseek_v4.cpp:504
 //
 // which names no tensor, no layer, no geometry and no missing capability, from
 // the middle of a forward, on a checkpoint that loaded successfully.
@@ -829,7 +829,7 @@ void RequireDsaGeometryOrRefuse(const DeepseekV4LayerHostWeights& L,
           " — the checkpoint carries this layer's DSA tensors at a geometry this "
           "forward does not implement. Reading the widened `comp_wgate` at the "
           "width it DOES index throws an anonymous `MatVec weight size mismatch` "
-          "from inside the forward (deepseek_v4.cpp:413) that names none of this. "
+          "from inside the forward (deepseek_v4.cpp:504) that names none of this. "
           "(That is the message the REAL geometry produces, because `comp_wgate`'s "
           "Gemm runs first. A `comp_ape`- or `comp_norm_weight`-only mismatch "
           "instead throws `ape size mismatch` / `rms_weight size mismatch` from "
@@ -1314,7 +1314,13 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     //
     // NOT EXECUTABLE ON A CPU BUILD, and no gate here claims otherwise:
     // `dev_attn` needs a non-CPU queue, `VT_V4_DEVICE_ATTN` and the V4 device
-    // kernels together. The spec's `## Owed` records it as unmeasured.
+    // kernels together. THE WINDOWED REFUSAL BELOW IS MEASURED: it threw by
+    // name on `thor:gpu0` (sm_110) at `sliding_window 128`, recorded with its
+    // rc job id in `.agents/specs/deepseek-v4-flash-vision.md` under
+    // `### W7-CUDA evidence`. That measurement came from a LEASE RUN and not
+    // from any committed test, so nothing in this tree re-checks it. The
+    // IMAGE-SPAN refusal that follows it has still never executed, and the
+    // spec's `## Owed` records that half as unmeasured.
     const int64_t dev_window = p.has_compressor(layer) ? 0 : p.sliding_window;
     VT_CHECK(dev_window == 0,
              "deepseek-v4 attention: layer " + std::to_string(layer) +

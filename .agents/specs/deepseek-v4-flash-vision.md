@@ -954,14 +954,20 @@ above as its red-before input.
   recovering them needs an instrumented device run. It is NOT the aarch64 repack
   path — the failure is byte-identical with `VT_CPU_QUANT_REPACK=0`.
 
-  **A STALE CROSS-REFERENCE a reader will otherwise chase:**
-  `deepseek_v4.cpp:734`, `deepseek_v4.cpp:831`, `deepseek_v4_weights.cpp:346`
-  and `deepseek_v4_weights.cpp:1068` all cite this throw as
-  `deepseek_v4.cpp:413`. The guard now sits at `:504`, which is what the
-  measured failure reports; the line moved and those comments did not follow.
+  **A STALE CROSS-REFERENCE a reader will otherwise chase, and it is THREE
+  places rather than four.** `deepseek_v4.cpp:728` and `:734`,
+  `deepseek_v4.cpp:832` and `deepseek_v4_weights.cpp:344` and `:347` cited this
+  throw as `deepseek_v4.cpp:413`. `deepseek_v4_weights.cpp:1068` names the same
+  anonymous message and carries NO line number, so it was never stale; this
+  record said four and the tree says three. The guard sits at `:504`, which is
+  what the measured failure reports, and the three stale citations are corrected
+  to `:504` here. A fourth `:413` citation lives in
+  `tests/vllm/models/test_deepseek_v4_exl3_forward.cpp:443,446`, which belongs to
+  `MODEL-DSV4-EXL3` and is left to that row.
 
   Root-causing it, and giving the fallback arm a named refusal, are owed by
-  issue #2411 and W7-CUDA.
+  issue #2411 and W7-CUDA, and by the row-owned local issue this repair filed
+  for it under `.agents/issues/MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm/`.
 
 - **`test_deepseek_v4_mm_chat`'s image branch encodes a CPU-ONLY PREMISE and
   fails on any CUDA build.** Its else-branch asserts the served error names
@@ -971,7 +977,9 @@ above as its red-before input.
   therefore cannot fire, and the assertion can never hold. One assertion of 650
   fails for this reason (the sibling `deepseek_v4.cpp` check now passes, because
   the new message names that file). The case needs a device-aware expectation
-  rather than a CPU-shaped one; owed by issue #2411 and W7-CUDA.
+  rather than a CPU-shaped one; owed by issue #2411 and W7-CUDA, and by its own
+  row-owned local issue under
+  `.agents/issues/MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm/`.
 
 - **8 of 20 `test_deepseek_v4_mm_reach` cases FAIL ON AARCH64, and the cause is
   the i8mm quant repack rather than the device.** Every one throws
@@ -983,12 +991,15 @@ above as its red-before input.
   `20 | 20 passed | 0 failed`. `vt::cpu::QuantRepackActive()` is true only on an
   aarch64 i8mm host, which is why these cases are green on the x86-64 devbox and
   red on `thor`. The row's gate therefore cannot run clean on an aarch64 host
-  without that flag. Owed by issue #2411.
+  without that flag. Owed by issue #2411, and by its own row-owned local issue
+  under `.agents/issues/MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm/`.
 
 - **`test_serve_deepseek_v4_mm` TIMES OUT at 1800 s on a CUDA build, and why is
   UNKNOWN.** It produced no output before CTest killed it, on both the red and
   the green run, so nothing here attributes it. It is not asserted to be related
-  to the vision path. Owed by issue #2411 and W7-CUDA.
+  to the vision path. Owed by issue #2411 and W7-CUDA, and by its own row-owned
+  local issue under
+  `.agents/issues/MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm/`.
 - **CLOSED BY W4.** The W2 vision tower and aligner were unreachable from a
   production entry point, and are not any more. `DeepseekV4LoadedModel::
   vision_tower` builds `DeepSeekV4Vision` and `EncodeMmDeepseekV4ForCausalLM`
@@ -1149,6 +1160,34 @@ above as its red-before input.
   asserting NOTHING about the theta, so a future variant with a different one
   would be read silently wrong — by llama.cpp as well as by this reader. No
   code change is made here, because there is no key to read.
+- **The windowed `dev_attn` refusal is labelled MEASURED, and NOTHING RE-CHECKS
+  IT.** The label is history from one rc lease run on `thor:gpu0`, job
+  `665b2427-4b85-4e75-916b-d3ad3345ea24`. No committed test sets
+  `VT_V4_DEVICE_ATTN`, so no gate in this tree drives that refusal: it is
+  CUDA-only and a CPU build cannot reach it at all. A regression that deleted or
+  weakened the refusal would leave every gate green and would be visible only on
+  the next manual lease run. A case that sets `VT_V4_DEVICE_ATTN` on a CUDA
+  build is owed by issue #2411 and W7-CUDA.
+- **NO COMMITTED GATE PROTECTS THE W7-CUDA STAGING FIX**, and this is the
+  measured statement of it rather than an estimate. Making
+  `DeepSeekV4Vision::Impl::EnsureResident` a no-op in a scratch copy leaves the
+  whole CPU DeepSeek-V4 family gate GREEN, because `EnsureResident` returns on
+  its first line for a CPU queue with host weights and every CPU case is in
+  exactly that state. The two cases that do measure the staging are in
+  `test_cuda_deepseek_v4.cpp` and need a CUDA queue plus the V4 device kernels,
+  so on any CPU host they return early and the suite exits 77. What this wave's
+  green covers is therefore the CPU arm's unchanged behaviour; the staging
+  itself is covered only by a lease run. Issue #2411 and W7-CUDA own a gate that
+  runs on a leased device.
+- **`tools/parity/dsv4v_w6_compare.py` CONTAINS NO BOUND AND EMITS NO VERDICT.**
+  It prints and writes statistics — `mean_rel_l2`, `mean_cos`, `min_cos`,
+  sentinel exactness, the permutation summary — and returns 0 whenever the
+  shapes match. The only `verdict` key it ever writes is `SHAPE_MISMATCH`. The
+  `<= 4.9%` cells mean relative L2 and `>= 0.998` mean cosine judgement recorded
+  in `### W6 evidence` and `### W7-CUDA evidence` is therefore PROSE ARITHMETIC
+  performed by a reader against that output, not something the harness checks. A
+  future run that drifted past the bound would still exit 0. Teaching the
+  comparator its bound and a pass/fail verdict is owed by issue #2411.
 - Four `clip.*` keys the real `mmproj-BF16.gguf` carries are read by nothing in
   this tree yet, and they are the PREPROCESSOR CONTRACT that W4 and W5 owe
   under issue #2411: `clip.vision.image_size = 672`,

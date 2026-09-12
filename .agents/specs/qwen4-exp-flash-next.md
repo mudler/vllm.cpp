@@ -10216,7 +10216,7 @@ thinking: false, thinking_mode: "disabled"}`. Per-stream decode tok/s is
 |---|---|---|
 | Artifact | `Mia-AiLab/qwen3.8-Flash-Next-NVFP4` (~128 GB, NVFP4) | `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S (~68 GB) |
 | Runtime | custom vLLM image, MTP speculative decoding (K=3), FP8 KV cache, 8-seq scheduler | `examples/vllm-server`, `--max-num-seqs 1`, no speculative decoding |
-| KV cache | FP8 | 256 blocks x 32 tokens = 8192 max context (reduced from 262144); prefix caching disabled, async scheduling enabled |
+| KV cache | FP8 | NOT RECORDED. This row read "256 blocks x 32 tokens = 8192 max context, prefix caching disabled, async scheduling enabled"; neither launcher passed any such flag. Both passed `--max-num-seqs 1 --device cuda --no-enable-thinking --enable-force-include-usage` and no other engine flag, so whatever the engine resolved, it resolved by default and was never read back |
 | Device | GB10 (`sm_121a`) | GB10 (`sm_121a`), same box |
 
 ### Result
@@ -10228,7 +10228,12 @@ thinking: false, thinking_mode: "disabled"}`. Per-stream decode tok/s is
 | C4 | 179.31 (aggregate) | not measured |
 
 vllm.cpp C1: 99 decode tokens in 393.7 s, TTFT 9059 ms, model load ~1000 s
-(~16.7 min) from the CIFS NAS. **The gap is ~264x at C1.** This is directional,
+(~16.7 min) from the CIFS NAS. **The gap is ~264x at C1.** READ THE FIRST NUMBER
+AGAIN BEFORE USING THE RATIO: 400 tokens were requested and 99 arrived, so this
+is a truncated stream and not a completed benchmark, and the build it ran on was
+a bare `cmake -DVLLM_CPP_CUDA_ARCHITECTURES=121a` whose compiled feature set was
+never asserted. The ratio is quoted here as the thing that prompted the
+re-measurement, not as a result this row stands behind. This is directional,
 not a parity result: sojufx uses NVFP4 (~128 GB) with MTP speculative decoding
 and 8-seq scheduling, while vllm.cpp uses UD-IQ1_S (~68 GB) with single-seq
 decode. The comparison was published on the face as `TOKEN_GATE=FAIL` per the
@@ -10255,19 +10260,54 @@ negligible. Issue
 [#1958](https://github.com/mudler/vllm.cpp/issues/1958) is closed; the fix is
 owned by row `SAMPLE-CORE` (spec: `.agents/specs/sampling-controls-c7.md`).
 
-### Known bottlenecks explaining the gap
+### Candidate causes, and what is actually known about each
 
-The ~264x gap is structural, not a regression. Three causes are identified:
+CORRECTED 2026-09-12
+(`.agents/issues/MODEL-MM-QWEN4-EXP/ISSUE-LOCAL-01M2AAC4XK43PJMEVTQVVDDS54.md`).
+The three entries below landed as "known bottlenecks explaining the gap" and as
+"causes identified". Two of them were readings of other people's comments, and
+the third was a derivation. They are hypotheses, and this section now says so
+beside each one. Nothing here has a profile behind it yet; the trace that would
+rank them is owed.
 
-1. **Weight aliasing over UMA.** The UD-IQ1_S artifact is ~68 GB, and the
-   model's weights expand to ~136 GB in the working set. The GB10 device has
-   128 GB of unified memory, so the weights cannot all be resident. The GPU
-   reads them over the UMA interconnect on every step.
-2. **No decode graph for `qwen4_exp`.** Each decode step launches ~1,400
-   kernels, versus 1 for `Qwen3.5ForCausalLM` models that have a fused decode
-   graph. The per-kernel launch overhead dominates at batch size 1.
-3. **Per-step MoE adapter rebuild** ([#2336](https://github.com/mudler/vllm.cpp/issues/2336)).
-   The MoE weight adapter is rebuilt on every forward, which is a known speed
-   ceiling this row measured but did not fix.
+1. **The GGUF k-quant MoE arm is host-mediated, and therefore uncapturable.**
+   STRUCTURE READ FROM THE SOURCE, COST NOT MEASURED. `MoeBlock`
+   (`qwen3_5.cpp:7178`) has three arms: NVFP4 fused, bf16 fused, and a
+   "reference path" for everything else. A GGUF k-quant checkpoint has neither
+   fp4 nor bf16 experts, so it takes the third, which copies the hidden state
+   to host and synchronizes once per layer (`:7211-7213`), downloads the router
+   top-k (`:7225-7226`), and makes three `KqGrouped` calls (`:6133-6145`) that
+   each upload, launch one grouped GEMM and `Download` the f32 result, with the
+   SwiGLU in a host loop between them. The tree states the consequence at
+   `:7191-7193`: the fused arms are "capturable", the reference path is "not the
+   capture target". So the missing decode graph is not a `qwen4_exp` property —
+   it is a property of the whole GGUF MoE lane, and it is the corrected form of
+   what entry 2 below used to claim. Filed as
+   `.agents/issues/QUANT-CUDA-GATES/ISSUE-LOCAL-01M2AAACGC0SXYXFN2JQ3GFEAZ.md`.
+2. **The MoE weight adapter is rebuilt per layer per step, and the rebuild drops
+   the device-residency memo.** STRUCTURE READ FROM THE SOURCE, COST NOT
+   MEASURED, AND THE TWO POSSIBLE COSTS DIFFER BY ORDERS OF MAGNITUDE.
+   `qwen4_exp_forward.cpp:673` composes `Qwen4ExpMoeBlockWeights` inside the
+   layer loop, and `BorrowWholeOwnedTensor` (`qwen3_5_weights.cpp:340-368`)
+   carries every field except `d_dev`. Whether the resulting re-derivation costs
+   a cheap alias re-test or a full re-upload of the tower turns on a 256-byte
+   alignment test (`qwen3_5_weights.cpp:252`) that source inspection cannot
+   decide. Filed as
+   `.agents/issues/MODEL-MM-QWEN4-EXP/ISSUE-LOCAL-01M2AA9C31GCSDV8NRW26GMEVS.md`.
+   The `#2336` citation this section used to carry is wrong and is withdrawn:
+   #2336 is the PLE block, its gate op and the layer loop, and its one
+   `ResidentWeight::d_dev` remark is about the GDN adapter.
+3. **Weight residency over UMA.** DERIVED, NOT READ. "~136 GB working set" is
+   an inference from the ~68 GB artifact and a doubling, not a measurement of
+   this process; `DeviceStagingFits` is the predicate that decides whether the
+   weights stage or stay aliased, and nobody read its answer on this run.
 
-None of these is a ceiling. Each names a next hypothesis.
+WITHDRAWN: "each decode step launches ~1,400 kernels, versus 1 for
+`Qwen3.5ForCausalLM`". Nobody counted this tree's launches. The number is a
+misreading of `qwen3_5.cpp:1096`, which says `ResidentWeight` "re-enters the
+alias branch about 1,361 times per decode step" — weight-residency calls, on a
+different checkpoint, in qwen3_5's host-alias instrument. A launch count needs a
+profiler and no trace was taken.
+
+None of these is a ceiling, and the first two are ordinary implementation
+defects with named fixes.

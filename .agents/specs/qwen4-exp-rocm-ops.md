@@ -619,6 +619,13 @@ row's branch with `git rev-parse HEAD` asserted equal to the commit under test:
 |---|---|---|---|
 | RED | `8f95f95c8` (test only) | `58 cases / 56 passed / 2 failed / 0 skipped`, `84471 assertions / 2 failed` | `6a84c6af220c9d4f` |
 | GREEN | `c40d88ee0` (the arms) | `58 cases / 58 passed / 0 failed / 0 skipped`, `84558 assertions / 0 failed`, `Status: SUCCESS!` | `dc16c76a31a11e99` |
+| GREEN, final head | `07b45621a` (the fixture repair) | `58 cases / 58 passed / 0 failed / 0 skipped`, `84562 assertions / 0 failed`, `Status: SUCCESS!` | `e14715b33ccaa715` |
+
+The third row is the head that ships, `rc` job
+`7b111bc7-eda2-48f0-97bf-ee632ebcb0ca` on the same worker, and the assertion
+count rises by 4 over `c40d88ee0` because the fixture repair below added a
+fourth query token and two bars. The second row is kept because it is the
+measurement the red/green pair was taken against.
 
 **The red is the evidence, not a mishap**, and it is the same ROUTE-gap
 signature W2 and W3 recorded: two failed cases against two failed assertions,
@@ -641,7 +648,7 @@ to assert it.
 |---|---|---|---|
 | `qsa_compress` | f32, `round=0` / `round=1` | **0** / **0** | 0 of 3072 |
 | `qsa_compress` | bf16, `round=0` / `round=1` | **0** / **0** | 0 of 1536 |
-| `qsa_gather` | f32, contiguous / paged | **1.54469e-14** | — |
+| `qsa_gather` | f32, contiguous / paged | **1.77439e-15** | — |
 | `qsa_gather` | bf16, contiguous / paged | **0** | — |
 
 The gather's f32 arm is the only number in the table that is not zero, and the
@@ -654,7 +661,7 @@ absorbs that difference, which is what a bf16 model path does.
 case runs at kv_len 3002 with a 512-block budget out of 750 complete blocks,
 plus one sub-budget control token at 2051:
 
-- **`keys_visited` = 49208 of a dense 64440 (76.4%)**, on the CPU oracle and on
+- **`keys_visited` = 49264 of a dense 64496 (76.4%)**, on the CPU oracle and on
   both device address modes, asserted with `CHECK(visited == honest_reads)` and
   not merely printed. Below the budget that assertion is trivially true, which is
   the `.agents/specs/qwen4-exp-flash-next.md:1790` finding this fixture is built
@@ -663,7 +670,7 @@ plus one sub-budget control token at 2051:
   rather than arguing it.** The case computes the same softmax over the same
   selection with each selected block replaced by the MEAN of its four K and V
   rows — the DeepSeek-V4-shaped consumer the flash-next spec names as the trap —
-  and measures it at NMSE **0.657387** against the gather, **1314.77x** the
+  and measures it at NMSE **0.211277** against the gather, **422.554x** the
   `5e-4` bar. A port that attended pooled keys cannot pass this fixture, and the
   margin is a measurement in the gate's own output.
 - **THE NaN PROBE, which is what convicts a MASK.** No value comparison can:
@@ -673,6 +680,69 @@ plus one sub-budget control token at 2051:
   V and requires the output finite AND bit-identical to the clean run. Both
   dtype arms pass. 944 is not a fixture choice, it is what the budget leaves: at
   a sub-budget context it would be ZERO and the probe would be vacuous.
+
+**THIRTEEN MUTATIONS, EVERY ONE RED, every one sha256-proven to have changed
+the test binary** (baseline and restored both `e14715b33ccaa715`; each mutant
+differs, and `git status --porcelain` was empty after every restore). `rc` job
+`7b111bc7-eda2-48f0-97bf-ee632ebcb0ca`, head `07b45621a`, focused suite
+(`-tc=*QSA*`), 103 assertions when green:
+
+| Mutation | What it breaks | measured | Ratio to the `5e-4` bar |
+|---|---|---|---|
+| `r1` | `kQwen4ExpQsaCompress` registered on an absent device instead of `kROCM` | registration `REQUIRE` false, 1 failed assertion | route gap, not a number |
+| `r2` | the same for `kQwen4ExpQsaGatherAttention` | registration `REQUIRE` false, 1 failed assertion | route gap, not a number |
+| `c1` | the rope is applied at the block's LAST position, not its first | **0.249913** / 0.249712 / 0.249776 / 0.250021 | **500x** |
+| `c2` | eps moves OUTSIDE the reciprocal, `1/sqrt(ms) + eps` | **0.124019** and three more within 0.3% | **248x** |
+| `c3` | the norm's `(1.0 + w)` polarity becomes `(0.0 + w)` | **0.940907** and three more within 0.01% | **1882x** |
+| `c4` | the pool runs over an OVERLAPPING window, stride `CR - 1` | **1.44362** and three more within 0.05% | **2887x** |
+| `c5` | the rope's final add drops its intermediate bf16 rounding | NMSE **1.16317e-06**, but **399 of 3072 BYTES** | **0.0023x on NMSE**, red on the byte bar |
+| `g1` | a selected block expands to its FIRST row `CR` times — the POOLED shape | **0.513503** / 0.513918 | **1027x** |
+| `g2` | the block id is used as a ROW, the `* CR` expansion dropped | **0.0732903** / 0.0731525 | **147x** |
+| `g3` | the ragged tail is dropped from the selection | **0.985995** / 0.986135, and `keys_visited` 49184 against 49264 | **1972x** |
+| `g4` | the GQA map becomes `h % groups` instead of `h / groups` | **0.801421** / 0.80186 | **1603x** |
+| `g5` | pass 1's `++reads` deleted — the INSTRUMENT, not the answer | values UNCHANGED, `keys_visited` **24632** against 49264 | red on the count, correctly not on the value |
+| `g6` | the paged page index is `^ 1` | paged **2.19943** / 2.19786, contiguous UNCHANGED | **4399x**, and only on the paged arm |
+
+**TWO OF THOSE THIRTEEN SURVIVED THE FIRST ROUND AND THE FIXTURE WAS REPAIRED,
+not the tolerance.** The round before `07b45621a` ran the same thirteen against
+`c9c7504f6` and returned twelve reds, one survivor and one margin too thin to
+call a gate. Both were fixture defects and both are recorded here because a
+fixture that cannot fail is indistinguishable from one that passes:
+
+- **`c5` PASSED at NMSE 1.16317e-06**, 0.0023x the band, while changing 399 of
+  3072 bytes. Three of its four arms cannot see the axis at all — at `round=0`
+  the helper is the identity, and on a bf16 tensor `StoreAt` has already
+  rounded — so only the f32 `round=1` arm carries it, and it carries it as
+  BYTES. Widening the fixture is NOT available, because the difference IS one
+  bf16 rounding. The bar became the one the op actually guarantees: the
+  compressor has no transcendental, `sqrtf` and `__frcp_rn` are correctly
+  rounded by IEEE-754 on both sides, every reduction runs in the host's order,
+  and the unmutated arm measured 0 differing bytes in all four arms across two
+  rounds and 27 builds. The CUDA sibling already gates the same op with a
+  `memcmp`. The differing-byte count stopped being a MESSAGE and became a CHECK.
+- **`g3` RED at 0.000919392, only 1.84x the bar** — a real red, and not a gate.
+  The cause was geometric rather than numerical: the ragged tail is at most
+  `compress_ratio - 1` = 3 rows BY CONSTRUCTION, and 2 rows out of 2050 cannot
+  move a softmax far. The tail cannot be made wider, so a fourth query token was
+  added at kv_len 7, where the tail is 3 of 7 attended rows. The same mutation
+  now measures **0.985995**, a **1972x** margin. The long tokens keep the
+  sparsity and pooled-key axes; the new one keeps the tail axis.
+
+**`g2` AT 147x IS THE NARROWEST NUMERICAL MARGIN AND IT IS REPORTED AS SUCH.**
+Using the block id as a row attends rows `[b, b + CR)` instead of
+`[CR*b, CR*b + CR)`, which for the low-numbered blocks of an ASCENDING selection
+overlaps the correct rows heavily — at `b = 0` the two sets are identical — so
+the mutation is partially self-cancelling by construction. Two orders is still
+two orders, and nothing was widened to reach it.
+
+**THE TWO REGISTRATION MUTATIONS RED BY ABSENCE, AND D2 IS WHAT MAKES THAT A
+REFUSAL.** Each case `REQUIRE`s its ROCm registration before it calls anything,
+so `r1` and `r2` stop there rather than reaching a `GetOp` throw. That the
+throw is what follows on this board is not assumed: W1 MEASURED it, with
+`vt::RmsNormGroup`'s registration neutralised and the kernel left in place, and
+D2 quotes the message the device produced. A guarded case cannot measure the
+refusal twice, and a case that dropped the guard to reach it would be the
+`if (!OpAvailable) continue` shape this file forbids twice in its own comments.
 
 **W3's OWN RECORD IS NOT DELETED, it is superseded here and kept below**, the
 same way W3 kept W2's and W2 kept W1's. Its counts are read against its own

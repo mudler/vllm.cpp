@@ -660,13 +660,17 @@ enum class OpId : uint8_t {
   // flash attention, so a mask-shaped port passes every value comparison and
   // forfeits the long-context lever this row exists for.
   //
-  // Registered on kCPU (src/vt/cpu/cpu_qwen4_exp_qsa.cpp:354,357) and on kCUDA
-  // (src/vt/cuda/cuda_qwen4_exp_qsa.cu:641,644 — unconditional, at preprocessor
-  // depth 0). This paragraph read "kCPU only. The CUDA arm is OWED, not
-  // written" until 2026-09-12, by which date the CUDA arm had landed. The kROCM
-  // arms ARE owed and MODEL-MM-QWEN4-EXP W4 owns them; until they land, a ROCm
-  // queue refuses this pair BY NAME through the ordinary GetOp message.
-  // Appended before kCount so no existing op's id shifts.
+  // Registered on kCPU (src/vt/cpu/cpu_qwen4_exp_qsa.cpp:354,357), on kCUDA
+  // (src/vt/cuda/cuda_qwen4_exp_qsa.cu:641,644) and on kROCM
+  // (src/vt/rocm/rocm_qwen4_exp_qsa.hip — MODEL-MM-QWEN4-EXP W4), every one of
+  // the three unconditional and at preprocessor depth 0. This paragraph read
+  // "kCPU only. The CUDA arm is OWED, not written" until 2026-09-12, by which
+  // date the CUDA arm had landed, and said the kROCM arms were owed until W4
+  // landed them. THE ROCm FORWARD STILL REFUSES, and not at this pair: the QSA
+  // block composes its indexer from kDsaIndexerLogits and kDsaTopkSelect
+  // (qwen4_exp_qsa_block.cpp:391,403) and NEITHER has a ROCm arm, which
+  // rocm_ops.hip:374 records from the GLM-5.3 side. The spec's `## Owed` owns
+  // that gap. Appended before kCount so no existing op's id shifts.
   kQwen4ExpQsaCompress,
   kQwen4ExpQsaGatherAttention,
   // MODEL-MM-QWEN4-EXP W5d-1 (#2249 item 1) — the UNGATED per-group RMS norm.

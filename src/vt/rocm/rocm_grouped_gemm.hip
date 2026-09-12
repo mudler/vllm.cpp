@@ -48,6 +48,13 @@
 
 // Block layouts — the single source of truth (ggml-common.h mirrors).
 #include "vt/cpu/cpu_quant_blocks.h"
+// DotIQ4_NL below reads d_kvalues_iq4nl from this header, generated from the
+// same source the CPU/CUDA tables read (see the header). The device-codebook
+// seal that used to live here moved to rocm_quant_dot.hip, which snapshots
+// the vt::cuda tables its own dots actually index (KERNEL-QUANT-CIQ-GEMM-
+// ROCM-IQUANT, #1940); this file's copy of the IQ2/IQ3 tables has no
+// remaining reader and no seal of its own.
+#include "vt/rocm/rocm_quant_iq_tables.h"
 
 namespace vt::rocm {
 namespace {
@@ -1602,23 +1609,6 @@ void NormQuantResetForTesting() {
 
 const void* NormQuantLastScratchForTesting() {
   return g_norm_quant_last_scratch.load(std::memory_order_acquire);
-}
-
-// Mirror the CUDA seal in cuda_quant_dot.cu. Copy in the translation unit
-// that owns these symbols so the test sees device bytes, not host literals.
-void SnapshotIqTablesFromDevice(IqTableSnapshot* out) {
-  static_assert(sizeof(out->kmask_iq2xs) == sizeof(d_kmask_iq2xs), "kmask extent");
-  static_assert(sizeof(out->ksigns_iq2xs) == sizeof(d_ksigns_iq2xs), "ksigns extent");
-  static_assert(sizeof(out->iq3xxs_grid) == sizeof(d_iq3xxs_grid), "iq3xxs grid extent");
-  static_assert(sizeof(out->kvalues_iq4nl) == sizeof(d_kvalues_iq4nl), "iq4nl values extent");
-  Check(hipMemcpyFromSymbol(out->kmask_iq2xs, HIP_SYMBOL(d_kmask_iq2xs), sizeof(d_kmask_iq2xs)),
-        "snapshot d_kmask_iq2xs");
-  Check(hipMemcpyFromSymbol(out->ksigns_iq2xs, HIP_SYMBOL(d_ksigns_iq2xs), sizeof(d_ksigns_iq2xs)),
-        "snapshot d_ksigns_iq2xs");
-  Check(hipMemcpyFromSymbol(out->iq3xxs_grid, HIP_SYMBOL(d_iq3xxs_grid), sizeof(d_iq3xxs_grid)),
-        "snapshot d_iq3xxs_grid");
-  Check(hipMemcpyFromSymbol(out->kvalues_iq4nl, HIP_SYMBOL(d_kvalues_iq4nl), sizeof(d_kvalues_iq4nl)),
-        "snapshot d_kvalues_iq4nl");
 }
 
 // Warps that cooperate on one output row of the dense K-quant GEMM. 1 selects

@@ -46,9 +46,14 @@
 - **2026-08** **EXL3 checkpoints now generate on CPU and CUDA.** A stock
   Llama-3.2-1B-Instruct EXL3 checkpoint loads through the shared dense model path and emits text.
   The current CUDA path supports its 3-bit body and 6-bit output head. No speed claim is available.
-- **2026-08** **GGUF gains IQ2_XS and IQ4_XS.** Both formats decode and run directly on their
-  compressed blocks on CPU. This lets the 101.25 GiB GLM-5.3-Flash GGUF weight tower load without
-  expanding to 426.72 GiB. Its model forward is still incomplete.
+- **2026-08** **GLM-5.3-Flash now generates on CPU from a 101.25 GiB GGUF.** The shipped
+  `UD-Q2_K_XL` artifact emits coherent text while keeping IQ2_XS and IQ4_XS blocks compressed.
+  Both formats also have CUDA keep-quant kernels, but this model's CUDA forward and every speed
+  gate remain pending.
+- **2026-08** **GLM-5.3 joins the model registry.** Its GGUF loader and first-token forward run
+  through the shared expert-streaming path. The real 201.83 GiB artifact has not completed a load,
+  and resumed sparse decoding still needs the indexer side cache, so no real-checkpoint token or
+  speed claim is available.
 - **2026-08** **Hybrid CPU/GPU expert placement reaches five architecture families.** Qwen3-MoE,
   Qwen3.5/3.6, Nemotron-H, DeepSeek-V2, and Kimi-Linear can run routed experts on the CPU while the
   rest of the model stays on the selected accelerator. The end-to-end token and speed gates are
@@ -304,6 +309,7 @@ and Voxtral (audio).
 | DeepSeek-V4-Flash (MLA + MHC + DSA) | DeepSeek-V4-Flash-GGUF (80.7 GB, single GB10) | keep-quant | Coherent (near-tie-robust) | Decode beats ds4 1.144x by default (byte-exact) |
 | GLM-4 dense | GLM-4-9B-0414 | - | Token-exact | Speed-pending |
 | GLM-4.7-Flash (MLA MoE) | zai-org/GLM-4.7-Flash | - | Token-exact (near-tie-robust) | Speed-pending |
+| GLM-5.3 / GLM-5.3-Flash | unsloth GLM-5.3 GGUFs | keep-quant | Flash emits coherent text; GLM-5.3 synthetic first token only | Speed-pending |
 | Laguna-S / Laguna-XS 2.1 (MoE) | poolside/Laguna-S-2.1-NVFP4 | NVFP4 + Q4_K | Near-tie (byte-exact) | vLLM parity+ 1.03x by default |
 | Kimi-Linear-48B-A3B (KDA + MLA + MoE) | Kimi-Linear-48B-A3B | - | Near-tie (106/128) | 1.59 tok/s, default off |
 | Nemotron-H hybrid (Mamba2 + GQA + MoE) | Nemotron-3.5-Lightning-30B-A3B-NVFP4 | NVFP4 | Host gate strict 96/96; GB10 rerun pending | Speed-pending |

@@ -11,6 +11,14 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# PowerShell 7.4+ defaults $PSNativeCommandUseErrorActionPreference to $true,
+# which applies $ErrorActionPreference to native commands. With "Stop", any
+# native command that writes to stderr (dumpbin's banner, cl's informational
+# messages) throws a terminating error that breaks output capture in
+# Invoke-CrtAudit's $DumpbinRunner. The script already checks $LASTEXITCODE
+# for every native command it runs, so applying $ErrorActionPreference to
+# them adds no safety and breaks the dumpbin capture (#3171).
+$PSNativeCommandUseErrorActionPreference = $false
 Set-StrictMode -Version Latest
 
 if (-not $ArtifactId) { $ArtifactId = "windows-x86_64-msvc-$Backend" }
@@ -29,6 +37,46 @@ function Invoke-Checked {
     }
     if ($exitCode -ne 0) {
         throw "$Program exited with status $exitCode"
+    }
+}
+
+# The CMake configure uses the Visual Studio generator (`-G "Visual Studio 17
+# 2022"`, line ~770), which finds the compiler through the registry without
+# needing the MSVC environment. But the post-build steps call `dumpbin`
+# (Invoke-CrtAudit line ~850, PE audit line ~940), `cl` (line ~960), and read
+# `VCToolsVersion`/`UCRTVersion` (line ~960) directly from PowerShell. These
+# tools and variables are not available unless the MSVC developer environment
+# is set up. This function runs `vcvars64.bat` via `cmd`, captures every
+# environment variable it sets, and imports them into the current PowerShell
+# session (#3171).
+function Initialize-MsvcEnvironment {
+    param([string]$VswherePath = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe")
+
+    if (-not (Test-Path $VswherePath)) {
+        throw "vswhere.exe not found at $VswherePath. Visual Studio 2022 is required."
+    }
+    $vsInstall = & $VswherePath -latest -products * `
+        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+        -property installationPath
+    if (-not $vsInstall) {
+        throw "No Visual Studio installation with VC tools found via vswhere."
+    }
+    $vcvars = Join-Path $vsInstall "VC\Auxiliary\Build\vcvars64.bat"
+    if (-not (Test-Path $vcvars)) {
+        throw "vcvars64.bat not found at $vcvars"
+    }
+    $envOutput = cmd /c "`"$vcvars`" >nul 2>&1 && set" 2>&1
+    foreach ($line in $envOutput) {
+        $idx = $line.IndexOf('=')
+        if ($idx -gt 0) {
+            [Environment]::SetEnvironmentVariable(
+                $line.Substring(0, $idx),
+                $line.Substring($idx + 1),
+                'Process')
+        }
+    }
+    if (-not (Get-Command dumpbin -ErrorAction SilentlyContinue)) {
+        throw "dumpbin not found on PATH after MSVC environment setup"
     }
 }
 
@@ -627,6 +675,9 @@ function Invoke-CrtAudit {
               if ($LASTEXITCODE -ne 0) {
                   throw "dumpbin $Mode failed for $Path with status $LASTEXITCODE"
               }
+              if (@($output).Count -eq 0) {
+                  throw "dumpbin $Mode produced no output for $Path (exit 0)"
+              }
               return @($output)
           })
     $directiveOutput = @()
@@ -732,6 +783,39 @@ function Invoke-UnsupportedTierContractTests {
     }
 }
 
+function Invoke-NativeCommandPreferenceContractTests {
+    if ($PSNativeCommandUseErrorActionPreference -ne $false) {
+        throw "PSNativeCommandUseErrorActionPreference must be false (dumpbin stderr + ErrorActionPreference=Stop, #3171)"
+    }
+}
+
+function Invoke-MsvcEnvironmentContractTests {
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+        $PSCommandPath, [ref]$null, [ref]$null)
+    $calls = @($ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.CommandAst] -and
+        $node.CommandElements.Count -ge 1 -and
+        $node.CommandElements[0].Extent.Text -eq 'Initialize-MsvcEnvironment'
+    }, $true))
+    $realCalls = @($calls | Where-Object {
+        $_.Parent -isnot [System.Management.Automation.Language.FunctionDefinitionAst]
+    })
+    if ($realCalls.Count -lt 1) {
+        throw "Initialize-MsvcEnvironment is not called in the script body"
+    }
+
+    $rejected = $false
+    try {
+        Initialize-MsvcEnvironment -VswherePath "C:\nonexistent\vswhere.exe"
+    } catch {
+        $rejected = $true
+    }
+    if (-not $rejected) {
+        throw "Initialize-MsvcEnvironment did not reject a missing vswhere.exe"
+    }
+}
+
 if ($ContractTest) {
     Invoke-CheckedContractTests
     Invoke-CrtContractTests
@@ -739,6 +823,8 @@ if ($ContractTest) {
     Invoke-DoctestLocaliserContractTests
     Invoke-DoctestProcessContractTests
     Invoke-FocusedTestLocalisationContractTests
+    Invoke-MsvcEnvironmentContractTests
+    Invoke-NativeCommandPreferenceContractTests
     Write-Host "Windows PowerShell/CRT contract tests OK"
     exit 0
 }
@@ -748,6 +834,8 @@ foreach ($name in @("SOURCE_SHA", "VERSION", "EVIDENCE_URL", "SOURCE_DATE_EPOCH"
         throw "$name is required"
     }
 }
+
+Initialize-MsvcEnvironment
 
 if (-not (Test-Path (Join-Path $SmokeModel "config.json"))) {
     throw "Windows runtime smoke model is incomplete: $SmokeModel"

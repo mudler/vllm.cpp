@@ -152,7 +152,7 @@ std::tuple<ttnn::Tensor, std::optional<ttnn::Tensor>> chunk_gated_delta_rule(
 #include <tt-metalium/circular_buffer_config.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
 #include <filesystem>
-#include <tt-metalium/experimental/tensor/spec/memory_config/memory_config.hpp>
+#include <tt-metalium/tensor/spec/memory_config/memory_config.hpp>
 // Exact row gather/scatter for the GDN caches (BACKEND-TENSTORRENT-GDN W2):
 // ttnn::gather (data_movement/gather/gather.hpp) and ttnn::indexed_fill
 // (indexed_fill/indexed_fill.hpp) are not in the installed include set at our
@@ -180,10 +180,9 @@ Tensor transpose(const Tensor& input_tensor, int64_t dim1, int64_t dim2,
 #undef VT_RESTORE_TRACY_ENABLE
 #endif
 
-#include <tt-metalium/experimental/tensor/spec/tensor_spec.hpp>
-#include <tt-metalium/experimental/tensor/spec/layout/tensor_layout.hpp>
-#include <tt-metalium/experimental/tensor/spec/layout/page_config.hpp>
-#include <tt-metalium/experimental/tensor/spec/memory_config/memory_config.hpp>
+#include <tt-metalium/tensor/spec/tensor_spec.hpp>
+#include <tt-metalium/tensor/spec/layout/tensor_layout.hpp>
+#include <tt-metalium/tensor/spec/layout/page_config.hpp>
 
 namespace vt::tenstorrent {
 namespace {

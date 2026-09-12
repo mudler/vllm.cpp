@@ -750,6 +750,25 @@ class WindowsPortabilityCheckerTest(unittest.TestCase):
             "unguarded POSIX",
         )
 
+    def test_rejects_glibc_fopen_e_mode(self) -> None:
+        self.assert_rejected(
+            "src/vllm/v1/core/kv_cache_utils.cpp",
+            'std::FILE* f = std::fopen("/proc/meminfo", "re");\n',
+            "glibc-only fopen",
+        )
+        self.assert_rejected(
+            "src/vllm/v1/core/kv_cache_utils.cpp",
+            'freopen("/proc/meminfo", "we", stream);\n',
+            "glibc-only fopen",
+        )
+
+    def test_accepts_standard_fopen_mode(self) -> None:
+        result = self.run_checker(self.make_tree({
+            "src/vllm/v1/core/kv_cache_utils.cpp":
+                'std::FILE* f = std::fopen("/proc/meminfo", "r");\n',
+        }))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_rejects_global_avx2_and_missing_static_runtime(self) -> None:
         self.assert_rejected(
             "CMakeLists.txt",

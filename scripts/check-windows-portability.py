@@ -2159,6 +2159,11 @@ def check(root: Path, build_dir: Path | None = None,
                     line,
                 ) or (platform_boundary and re.search(r"\.string\s*\(\)", line))):
                 errors.append(f"{relative}:{number}: lossy Windows path conversion/API is forbidden")
+            if re.search(r'\bf(?:open|reopen)\s*\([^)]*,\s*"[rwab+]*e"\s*[,)]', line):
+                errors.append(
+                    f"{relative}:{number}: glibc-only fopen 'e' "
+                    f"(O_CLOEXEC) mode is invalid on MSVC and triggers __fastfail"
+                )
 
     all_source = "\n".join(texts.values())
     if has_shell_process_launch(all_source):

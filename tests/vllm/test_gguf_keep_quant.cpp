@@ -656,11 +656,19 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
             type == kIQ2_S || type == kIQ4_XS ||
             type == kMXFP4 || type == kIQ1_XXXS;
         const bool rocm = kRouteDev == vt::DeviceType::kROCM;
+        // QUANT-GGUF-IQ4_NL adds kIQ4_NL to the ROCm set. It is the one entry
+        // here whose activation encoding is Q8_0 rather than Q8_K, and it is
+        // served on BOTH device arms by `DotIQ4_NL` through `IQ4NLGemmK`
+        // (single matrix) and `GroupedIQ4NLK` (expert towers). The grouped arm
+        // is the load-bearing one: the shipped Qwen3.8-Flash-Next checkpoints
+        // store all 48 `ffn_down_exps` in IQ4_NL, and an expert tower reaches
+        // the GROUPED provider, so this row is what stops those experts from
+        // expanding to bf16 on a ROCm box.
         const bool device_capable =
             !rocm || type == kQ8_0 || type == kQ2_K || type == kQ3_K ||
             type == kQ4_K || type == kQ5_K || type == kQ6_K ||
             type == kIQ2_XXS || type == kIQ3_XXS || type == kIQ2_S ||
-            type == kIQ1_S || type == kIQ1_XXXS;
+            type == kIQ1_S || type == kIQ1_XXXS || type == kIQ4_NL;
         const bool block_capable = cpu_capable && device_capable;
         const int64_t blk = (type == kQ4_0 || type == kQ5_0 || type == kQ8_0 ||
                              type == kMXFP4 || type == kIQ4_NL)
@@ -749,7 +757,7 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   // Both outcomes are actually exercised (a table that never keeps anything
   // would pass every assertion above vacuously). The kept count is
   // device-dependent (review #523): 17 block-capable encodings x 2 keep-capable
-  // GEMM roles where the device covers the CPU list; 11 x 2 on ROCm. The
+  // GEMM roles where the device covers the CPU list; 12 x 2 on ROCm. The
   // GATHER role adds 19 more (the 17, plus Q8_K and IQ3_S) on a device that
   // REGISTERS the block
   // gather, and nothing on a device that does not. Written as named terms
@@ -776,7 +784,12 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   // was, the same decode-only shape #2240 had. That asymmetry IS the row's
   // per-tier result: IQ3_S stays compressed in a gather table and expands to
   // bf16 in a GEMM, on every device.
-  const int gemm_kept = kRouteDev == vt::DeviceType::kROCM ? 22 : 34;
+  //
+  // QUANT-GGUF-IQ4_NL moves the ROCm GEMM term 22 -> 24 and leaves the CPU/CUDA
+  // term at 34, because IQ4_NL was already in the CPU list and only the DEVICE
+  // set was narrower. That is the shape of a device-arm port: one encoding, two
+  // keep-capable GEMM roles, and no change to either gather term.
+  const int gemm_kept = kRouteDev == vt::DeviceType::kROCM ? 24 : 34;
   const int gather_kept =
       vt::OpRegistered(vt::OpId::kEmbeddingQuant, kRouteDev) ? 19 : 0;
   CHECK(kept == gemm_kept + gather_kept);

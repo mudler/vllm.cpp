@@ -136,12 +136,22 @@ bool KeepNvfp4DType(uint32_t ggml_type) { return ggml_type == 40; }
 bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
   switch (dev) {
     case vt::DeviceType::kROCM:
-      // rocm_grouped_gemm.hip implements Q8_0/Q4_K/Q5_K/Q6_K, while
+      // rocm_grouped_gemm.hip implements Q8_0/IQ4_NL/Q4_K/Q5_K/Q6_K, while
       // rocm_quant_dot.hip adds the seven Q8_K-activation formats below on
       // both grouped and non-grouped arms. IQ4_XS remains with #3029 and is
-      // not admitted by this row; Q4_0/Q5_0/IQ2_XS/IQ4_NL/IQ3_S/IQ4_XS/
-      // MXFP4 stay on the named expand-or-refuse path.
-      return dt == vt::DType::kQ8_0 || dt == vt::DType::kQ4_K ||
+      // not admitted by this row; Q4_0/Q5_0/IQ2_XS/IQ3_S/IQ4_XS/MXFP4 stay
+      // on the named expand-or-refuse path.
+      //
+      // IQ4_NL is admitted on BOTH arms or neither. It is the only entry here
+      // whose activation encoding is Q8_0 rather than Q8_K, and it is served by
+      // DotIQ4_NL through IQ4NLGemmK (single) and GroupedIQ4NLK (expert
+      // towers). The grouped arm is the one that matters for the shipped
+      // Qwen3.8-Flash-Next checkpoints, whose 48 ffn_down_exps are IQ4_NL;
+      // admitting the encoding with only the single-matrix arm would throw at
+      // the first expert forward with the model already resident, which is the
+      // exact failure this predicate exists to prevent.
+      return dt == vt::DType::kQ8_0 || dt == vt::DType::kIQ4_NL ||
+             dt == vt::DType::kQ4_K ||
              dt == vt::DType::kQ5_K || dt == vt::DType::kQ6_K ||
              dt == vt::DType::kIQ2_XXS || dt == vt::DType::kIQ3_XXS ||
              dt == vt::DType::kQ2_K || dt == vt::DType::kQ3_K ||

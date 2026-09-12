@@ -333,10 +333,12 @@ from a prompt: both refuse, naming what is missing.
 
 ## Backends and hardware
 
-ROCm GGUF keep-quant supports Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K,
+ROCm GGUF keep-quant supports Q8_0, IQ4_NL, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K,
 IQ2_XXS, IQ3_XXS, IQ2_S, IQ1_S, and IQ1_XXXS on matrix and grouped expert
-weights. IQ4_XS remains separate work in #3029; unsupported formats expand at
-load instead of reaching a device provider that cannot execute them.
+weights. IQ4_NL is the one entry served against a Q8_0 activation rather than a
+Q8_K one, and it is what the published Qwen3.8-Flash-Next quants store their
+`ffn_down_exps` in. IQ4_XS remains separate work in #3029; unsupported formats
+expand at load instead of reaching a device provider that cannot execute them.
 
 | Backend | vllm.cpp | vLLM | SGLang | llama.cpp |
 |---|---|---|---|---|

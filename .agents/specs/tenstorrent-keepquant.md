@@ -392,6 +392,29 @@ to make a failure pass.
   `neartie_gap_mnats_tenstorrent_capture.npy`): 51/256 near-tie divergences,
   max gap 0.1875 nats — all inside the 500 mnats band (kNearTieMnats,
   test_qwen35_paged_engine.cpp:83).
+- Re-capture 2026-09-12, after the tt-metal rebase: the fresh capture
+  differs from the committed anchor at 83/256 cells (gross re-roll at ULP
+  level; net anchor-vs-oracle divergence grows 44→84; p15t0 and p9t2 are
+  exact bf16 ties in our logits, and the engine picks the first occurrence
+  while the committed capture held the oracle's token). Pinned-recipe
+  verification: 84/256 cells off oracle greedy, max gap 250 mnats (worst
+  p2t2, also p9t2), 0 cells above the 500-mnat band — every re-rolled cell
+  is a near-tie and the fresh capture is no farther from the oracle than
+  the committed one (375). The band is unchanged; no tt-metal numerics
+  regression.
+- Off-recipe incident (2026-09-12), recorded so the class is recognizable: an
+  ad-hoc gap re-derivation wrote f32-grain values (62/313/562/625/875/1000
+  mnats — impossible under the pinned bf16 recipe, whose gaps sit on the
+  62.5-mnat bf16 logit grid) that manufactured four fake band violations and
+  nearly drove a band widening. Provenance proof that closed it: the pinned
+  script rerun on the COMMITTED anchor reproduces the committed gap golden
+  bit-for-bit, and on the fresh ids yields max gap 250. The canonical
+  re-derivation path is now `scripts/qwen35-q4km-neartie-gap.sh`, which
+  asserts the pinned oracle env (python 3.12, torch 2.7.1+cpu,
+  transformers 5.8.1), refuses any other, warns on off-grid values, and
+  prints the dequant artifact hash (this capture:
+  `946f72d34d8ac6e68429c50d88b61c55499c5c6c7fcd3197e842618f9c0f50a5`;
+  input GGUF pin below).
 - READY adjudication: 147/147 assertions; 16/16 prompts PASS — 11/16 STRICT
   token-exact vs oracle per-prompt greedy, 5/16 near-tie-band only, max gap
   0.188 nats, 0 forward-divergent; backend proof 16/16 ops selections>0 with
@@ -833,6 +856,114 @@ bundled.
   split into a follow-up PR if the attribution reveals multiple
   contributors, but the spec, tool, and attribution are the first
   deliverable.
+- **W1 outcome — the trace attribution (2026-09-11, local Blackhole,
+  601 `AllocTraceSnapshot`s, OOM reproduced; log
+  `~/.local/logs/maki/.../monitor-1789119678-ca01/stdout.log`).** The
+  W1 candidates (a)-(e) above resolve as follows. The overshoot is NOT
+  transient `ttnn::where` amplification and NOT an oversized single
+  request. It is **7.61 GB of decode planes that are never returned to
+  the allocator**, and the OOM itself is fragmentation: the fatal
+  `ttnn::where` requested 1,073,725,440 B while `largest_free` was
+  893 MB — with 7.23 GB total free across 8 banks.
+  Ranked attribution (net `total_free` decline per snapshot label):
+  embed table 2.543 GB (1 alloc, permanent — by design); packed word
+  shadows 8.735 GB (150 allocs, permanent — by design, the weights);
+  committed output slots ~8.07 GB (the model's activation residency);
+  **chunk-loop decode planes 7.613 GB — LEAKED**. The leak is
+  concentrated: 4 wide-weight first decodes consumed 2855 + 1429 +
+  2015 + 1008 MB = 7.31 GB; the other 145 chunk-loop calls leaked
+  < 1 MB each. Two invariants prove no reclamation: `alloc_per_bank`
+  decreases in none of 600 transitions (max drop 0.2 MB), and
+  `largest_free` never recovers (4272 → 893 MB, monotone).
+- **The leak mechanism (W1 conclusion).** `ttnn::Tensor::~Tensor()`
+  calls `deallocate_impl(/*force=*/false)`
+  (`ttnn/core/tensor/tensor.cpp:120,124`), which skips
+  `DeviceStorage::deallocate()` unless `tensor_attributes.use_count()
+  == 1` and the storage is the sole owner of its device memory. The
+  eager dispatch path holds `shared_ptr<TensorAttributes>` copies for
+  tensors it enqueued operations on, so every f32 decode plane's
+  refcount is > 1 when its C++ object dies at scope exit; nobody ever
+  calls deallocate afterwards, and the buffer is orphaned for the
+  process lifetime. Each wide-weight decode orphans ~a dozen ~636 MB
+  planes (the `ceil(N/8)` floor makes the head-weight planes 606+ MB,
+  so the leak scales with plane size). This also explains why the
+  32 MiB cap run got 85% through prefill: smaller planes, smaller
+  orphaned blocks, later fragmentation death — mitigation, not fix.
+  The surveyed ~22-23 GB design residency was correct about the
+  permanent surfaces; the ~11 GB gap is (leaked decode planes
+  7.6 GB) + (committed activation slots 8.1 GB, of which the survey
+  counted only part as "activations").
+- **W2 direction (from the W1 mechanism, superseding candidates
+  (a)/(b) as the primary fix).** Reclaim the decode planes: at the
+  E=1 chunk-loop boundary, `mesh_command_queue().finish()` under the
+  `!tt_capture_active()` guard (the int8-dot staging precedent,
+  `:3368`) so every enqueued op completes and the dispatch refs
+  release while the chunk's locals are still reclaimable, plus
+  explicit `ttnn::deallocate(force=true)` on the chunk's dead planes
+  where the natural destructor path stays refcount-blocked. Candidate
+  (b) (a custom below-ttnn decode kernel) remains the W4b int8-dot
+  lever's job, which already replaces this whole path with one launch
+  once e2e-enabled; candidate (c) (output-twin elimination) is real
+  but secondary (~2.4 GiB) and not this wave. The red-first focused
+  test: two `MatmulBTQuantKernel` calls on a wide weight must return
+  `GetMemoryView` free bytes to baseline; today the second call finds
+  the first call's planes still allocated.
+- **W2 outcome — the residency fix (2026-09-11, local Blackhole; the
+  focused red-first test, the bit-exact sweeps, the full backend
+  suite).** Three findings, all fixed in this change.
+  (1) The decode planes were never returned to the allocator — the W1
+  mechanism (eager dispatch holds `TensorAttributes` refs past
+  `~Tensor()`'s `use_count()==1` gate, `tensor.cpp:120,124`) means a
+  dead plane must be deallocated by force. `TTReclaimPlanes` (a
+  capture-guarded `finish()` plus `ttnn::deallocate(force=true)` per
+  plane) runs at every decode web's last use; the helper webs
+  (`f16_bits_to_f32`, `sign_bit_f32`, `zero_mask_f32`,
+  `signed_byte_f32`, `repair`) reclaim internally. The drain-only
+  draft (finish alone) was FALSIFIED first: the red test books the
+  same 4.3 GB with and without it — finish releases nothing on its
+  own.
+  (2) The −0.0f repair-constant cache (`Neg0CacheGet`) held the
+  constant per shape as f32 TILE, and TILE pads rows 8→32: the
+  {B,8,32} prod plane and the {B,8,1} m1 plane each resolve to a
+  2 GiB resident entry at the focused-test shape — a 4.29 GB pair
+  cached BY DESIGN per distinct decode shape, which is the OOM's
+  second half at 27B (per-layer widths → per-shape entries; much of
+  W1's "7.6 GB leaked decode planes" bookkeeping was these permanent
+  cache entries). The block-table ledger pinned it: two
+  256 MiB/bank blocks appear at the two `repair()` calls and persist
+  at identical addresses across chunks — a cache, not a leak. The fix
+  is one cached {1,1,1} scalar (`neg0_scalar`) that `ttnn::where`
+  broadcasts; bit-exactness is preserved.
+  (3) The alias rule the forced reclaims had to learn: `ttnn::slice`
+  returns its INPUT for a full-extent step-1 window (tt-metal
+  `slice.cpp:182`), so force-freeing such a slice kills its source.
+  Four identities: the chunk loop's `sl` (single-chunk window —
+  killed the resident word shadow and, through the zombied
+  `EnsureKeepQuantWords` hit path that never checks `is_allocated()`
+  plus a mid-capture throw stuck at
+  `fd_mesh_command_queue.cpp:760`, cascaded into 7 full-suite
+  failures from one real defect), `slice_decode`'s `sl` (E=1), and
+  inside `KeepQuantByteRange` the tail `out` (word-aligned ranges:
+  Q4_K `sb`, Q5_K `qh`, Q6_K `ql`/`qh`/`sc`) and `sw` (Q8_0's `qb`
+  covers the whole 9-word row). Aliases stay with their owners: the
+  aligned tail returns `stream` (the permute's own buffer, freed by
+  the caller's existing reclaim list), `sw`/`sl` skip their reclaim.
+  Bisected: all 7 suite failures are W2-caused (the W0 baseline runs
+  the same 7 cases green).
+  EVIDENCE: focused test green — two calls on the Q4_K focused shape
+  return `GetMemoryView` free bytes to baseline, 256 MiB slack, 3/3
+  assertions; bit-exact sweeps 4/4 cases, 515/515 assertions (Q4_K,
+  Q5_K/Q6_K/Q8_0, chunked slice-decode, `MatmulBT` bf16 oracle);
+  7-case rerun 7/7 (282 assertions); full backend suite 71/71,
+  524,439 assertions, EXIT=0; 0.8B vehicle gate 16/16 (10 strict /
+  6 near-tie, max gap 0.375 nats @ prompt[9] tok=4, 0
+  forward-divergent, 147 assertions — near-tie membership moves run
+  to run, the band and the zero-divergence are the invariant).
+  DEFAULTS: the reclaims are unconditional, not env-gated — the W1
+  falsification makes residency correctness, not tuning; the neg0
+  scalar trades nothing (bit-exact; a 2 GiB per-shape pair becomes
+  one cached scalar); the alias guards free nothing the pre-W2 tree
+  freed.
 
 ## Now
 
@@ -962,4 +1093,16 @@ term), `ttnn::where` memory amplification, the missing device-side
 allocation trace tool, and the work breakdown (W0: trace tool, W1:
 attribute the overshoot, W2: fix the top contributor, W3: re-run the
 27B e2e gate). The 27B e2e gate moves from `## Owed` into W4d scope.
+AMENDED 2026-09-11 (fourteenth): W2 is implementation-complete on the
+row branch — the OOM's two top contributors are fixed (forced per-plane
+reclaims at every decode web's last use, after the drain-only draft was
+falsified, and the neg0 repair-constant cache collapsed from per-shape
+f32 TILE planes — 2 GiB pairs at the 27B shapes — to one broadcast
+scalar) plus the slice-identity alias guards the forced reclaims
+exposed (`slice` returns its input on a full-extent window; the word
+shadow, the permute buffer, and the single-chunk windows stay with
+their owners). Evidence in `## W4d`: focused test green, bit-exact
+sweeps 4/4 (515/515), backend suite 71/71 (524,439 assertions), 0.8B
+vehicle gate 16/16 with 0 forward-divergent. W3 — the 27B e2e gate
+rerun — is the remaining W4d wave. The row stays `ACTIVE`.
 The row stays `ACTIVE`: W4d is the open scope.

@@ -7686,3 +7686,151 @@ TEST_CASE("kTENSTORRENT alloc-trace: zero without env, positive with it (#3042)"
   vt::tenstorrent::ResetAllocTraceForTest();
 }
 
+// W4d W2 (#3042) red-first: the chunked keep-quant decode's f32 planes must
+// return to the allocator once the call ends. The W1 trace (2026-09-11, 601
+// snapshots) proved they do not — the eager dispatch holds TensorAttributes
+// refs past every plane's scope exit, ttnn::Tensor::~Tensor()'s
+// use_count()==1 gate skips the free, and 4 wide-weight first decodes
+// orphaned 7.31 GB with alloc_per_bank never decreasing in 600 transitions.
+// This test books the same shape on a small scale: a 2-chunk Q4_K weight
+// whose decode planes sum to several GB, one call, then every host-side
+// surface dropped. The reclaim bar is 256 MiB; the pre-fix orphan set is
+// gigabytes — the gap between the two is the leak this wave closes.
+TEST_CASE("kTENSTORRENT keep-quant decode planes return to the allocator (#3042)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBTQuant, vt::DeviceType::kTENSTORRENT));
+
+  // The reclaim path this wave adds runs in EAGER mode only; the int8-dot
+  // env would route the f32-out dense arm away from the chunk decode, and
+  // the alloc trace would spam stderr behind the numbers under test.
+  const char* const trace_prev = std::getenv("VT_TT_ALLOC_TRACE");
+  const bool trace_had = trace_prev != nullptr;
+  const std::string trace_saved = trace_had ? std::string(trace_prev) : std::string();
+  const char* const int8dot_prev = std::getenv("VT_TT_KEEPQUANT_INT8DOT");
+  const bool int8dot_had = int8dot_prev != nullptr;
+  const std::string int8dot_saved = int8dot_had ? std::string(int8dot_prev) : std::string();
+  ::unsetenv("VT_TT_KEEPQUANT_INT8DOT");
+  ::unsetenv("VT_TT_ALLOC_TRACE");
+
+  Backend& backend = *vt::TryGetBackend(DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+
+  // Shape: plane budget 256 MiB / (K*4) = 8192 rows per chunk against
+  // N=16384 -> 2 chunk iterations, each decoding ~256 MiB f32 planes through
+  // the Q4_K chain (the W1 leak shape, scaled to fit the box with room to
+  // fail red without OOM-aborting the binary).
+  constexpr int64_t M = 1, N = 16384;
+  const int64_t kBlockBytes = vt::BlockBytes(vt::DType::kQ4_K);
+  const int64_t kBlockElems = vt::BlockElems(vt::DType::kQ4_K);
+  const int64_t K = 256 * kBlockElems;  // 8192; 256 blocks per row
+
+  std::mt19937 rng(20260911u);
+  std::vector<uint8_t> packed(static_cast<size_t>(N * (K / kBlockElems) * kBlockBytes));
+  for (int64_t b = 0; b < N * (K / kBlockElems); ++b) {
+    uint8_t* blk = packed.data() + b * kBlockBytes;
+    const uint16_t d =
+        vt::F32ToF16(0.05f + 0.35f * static_cast<float>(rng() % 64) / 64.0f);
+    std::memcpy(blk + 0, &d, sizeof(d));
+    const uint16_t ls =
+        vt::F32ToF16(0.005f + 0.02f * static_cast<float>(rng() % 32) / 32.0f);
+    std::memcpy(blk + 2, &ls, sizeof(ls));
+    for (int i = 0; i < 12; ++i) blk[4 + i] = static_cast<uint8_t>(rng() & 0xFF);
+    for (int i = 0; i < 128; ++i) blk[16 + i] = static_cast<uint8_t>(rng() & 0xFF);
+  }
+  std::vector<uint16_t> a_bf(static_cast<size_t>(M * K));
+  for (auto& v : a_bf)
+    v = vt::F32ToBF16((static_cast<float>(rng() % 401) - 200.0f) / 100.0f);
+
+  auto run_once = [&]() {
+    void* mem_a = backend.Alloc(M * K * sizeof(uint16_t));
+    void* mem_b = backend.Alloc(packed.size());
+    void* mem_o = backend.Alloc(M * N * sizeof(float));
+    backend.Copy(q, mem_a, a_bf.data(), a_bf.size() * sizeof(uint16_t));
+    backend.Copy(q, mem_b, packed.data(), packed.size());
+    Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {M, K});
+    Tensor b_t = Tensor::Contiguous(mem_b, vt::DType::kQ4_K,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {N, K});
+    Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {M, N});
+    vt::MatmulBT(q, o_t, a_t, b_t);
+    std::vector<float> out(static_cast<size_t>(M * N), 0.0f);
+    backend.Copy(q, out.data(), mem_o, out.size() * sizeof(float));
+    // UnregisterHostBuffer drops the word shadow, the output slot twin and
+    // the activation slot with the host buffers — everything the row owns
+    // BY DESIGN. Whatever free bytes are still missing afterwards are the
+    // decode planes, which no Free path can reach.
+    backend.Free(mem_a);
+    backend.Free(mem_b);
+    backend.Free(mem_o);
+  };
+
+  // Warm-up: a small matmul settles the device/JIT init allocations so the
+  // baseline below measures residency, not first-touch.
+  {
+    constexpr int64_t sM = 4, sN = 8;
+    const int64_t sK = 2 * kBlockElems;
+    std::vector<uint8_t> s_packed(static_cast<size_t>(sN * 2 * kBlockBytes));
+    for (int64_t b = 0; b < sN * 2; ++b) {
+      uint8_t* blk = s_packed.data() + b * kBlockBytes;
+      const uint16_t d = vt::F32ToF16(0.2f);
+      std::memcpy(blk + 0, &d, sizeof(d));
+      const uint16_t ls = vt::F32ToF16(0.01f);
+      std::memcpy(blk + 2, &ls, sizeof(ls));
+    }
+    std::vector<uint16_t> s_a(static_cast<size_t>(sM * sK),
+                              vt::F32ToBF16(0.5f));
+    void* mem_a = backend.Alloc(sM * sK * sizeof(uint16_t));
+    void* mem_b = backend.Alloc(s_packed.size());
+    void* mem_o = backend.Alloc(sM * sN * sizeof(float));
+    backend.Copy(q, mem_a, s_a.data(), s_a.size() * sizeof(uint16_t));
+    backend.Copy(q, mem_b, s_packed.data(), s_packed.size());
+    Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {sM, sK});
+    Tensor b_t = Tensor::Contiguous(mem_b, vt::DType::kQ4_K,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {sN, sK});
+    Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {sM, sN});
+    vt::MatmulBT(q, o_t, a_t, b_t);
+    backend.Free(mem_a);
+    backend.Free(mem_b);
+    backend.Free(mem_o);
+  }
+
+  const int64_t free0 = vt::tenstorrent::FreeDeviceDramBytesForTest();
+  run_once();
+  const int64_t free1 = vt::tenstorrent::FreeDeviceDramBytesForTest();
+  run_once();
+  const int64_t free2 = vt::tenstorrent::FreeDeviceDramBytesForTest();
+
+  // Every owned surface (word shadow, slots) rode UnregisterHostBuffer away;
+  // both calls' decode planes are the only thing that can hold free1/free2
+  // below free0. 256 MiB slack covers allocator alignment and kernel-cache
+  // residue; the W1-measured orphan set for this shape is gigabytes.
+  constexpr int64_t kSlack = 256ll << 20;
+  const std::string leak1_msg =
+      "first wide keep-quant call leaked its decode planes: free fell from " +
+      std::to_string(free0) + " to " + std::to_string(free1) + " bytes (drop " +
+      std::to_string(free0 - free1) + ")";
+  const std::string leak2_msg =
+      "second wide keep-quant call leaked its decode planes: free fell from " +
+      std::to_string(free0) + " to " + std::to_string(free2) + " bytes (drop " +
+      std::to_string(free0 - free2) + ")";
+  CHECK_MESSAGE(free1 >= free0 - kSlack, leak1_msg);
+  CHECK_MESSAGE(free2 >= free0 - kSlack, leak2_msg);
+
+  if (trace_had) {
+    ::setenv("VT_TT_ALLOC_TRACE", trace_saved.c_str(), 1);
+  } else {
+    ::unsetenv("VT_TT_ALLOC_TRACE");
+  }
+  if (int8dot_had) {
+    ::setenv("VT_TT_KEEPQUANT_INT8DOT", int8dot_saved.c_str(), 1);
+  } else {
+    ::unsetenv("VT_TT_KEEPQUANT_INT8DOT");
+  }
+}
+

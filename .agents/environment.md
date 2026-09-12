@@ -68,6 +68,54 @@ The fleet, read from `rc devices` and `rc describe` on 2026-08-17:
 | `dgx:gpu0` | `gpu_model=GB10`, `class=train`, `k8s=true`, driver 580.173.02, `cpus=20`, 128 GB | the house NAS |
 | `thor:gpu0` | `gpu_model=NVIDIA-Thor`, `class=train`, `k8s=true`, driver 595.78, `cpus=14`, 132 GB | the house NAS, the SAME folder as `dgx` |
 | `orin:gpu0` | `gpu_model=AGX-Orin`, `class=train`, `k8s=true`, `cpus=12`, 32 GB, L4T R36.4.7 (JetPack 6), and NO detected GPU labels because Jetson carries no `nvidia-smi` | the house NAS, the SAME folder as `dgx` and `thor` |
+| `strix:gpu0` | `gpu_model=Radeon-8060S`, `vendor=amd`, `class=train`, `k8s=true`, `cpus=32`, `gfx1151` (RDNA 3.5, AMD RYZEN AI MAX+ 395), ROCm 7.2.4 / HIP 7.2.53211, `mem_total_bytes=33270497280` | the house NAS, the SAME folder as `dgx`, `thor` and `orin` |
+
+### `strix:gpu0` was missing from the table above until 2026-09-11
+
+**It is the only AMD device on this fleet, and the table predates it.** The
+table's own header says it was read on 2026-08-17; `strix:gpu0` is leasable,
+every `BACKEND-ROCM` row leases it, and a reader who trusted the table would
+conclude this fleet has no AMD hardware. Claim it with `rc run` or `rc hold`
+like any other fleet device, and never by `ssh`.
+
+**Its memory split is configurable in firmware and it was CHANGED on
+2026-09-11**, so every figure recorded against this box before that date
+describes a different machine. Measured inside a lease on 2026-09-11, `rc`
+jobs `a8111ff8-3ce8-42f6-9034-36bdd2cacfe4` and
+`c30dc437-bf12-4a23-ab8b-89b88fe767dd`:
+
+| Probe | Value |
+|---|---|
+| `mem_info_vram_total` | 103,079,215,104 B = **96.00 GiB** |
+| `hipMemGetInfo` total / free | 96.000 GiB / 95.848 GiB idle |
+| `mem_info_gtt_total` | 16,635,248,640 B = 15.49 GiB |
+| host RAM total / available | 33,270,497,280 B / 29,304,037,376 B |
+| device properties | `integrated=1 managedMemory=1 pageableMemoryAccess=0 gcn=gfx1151` |
+
+**`hipMallocManaged` on this board is bounded by HOST memory, not by the
+carve.** A bounded probe that stops at its first failure reached **76 GiB with
+plain `hipMalloc`** (its target, so the real ceiling is at least that and is
+NOT measured above it) and **27 GiB with `hipMallocManaged`, which returned
+`out of memory`**. 27 GiB against 29.3 GiB host-available is the match that
+identifies which bound was hit.
+
+This **resolves an ambiguity [#2518](https://github.com/mudler/vllm.cpp/issues/2518)
+could not**. Its 58.000 GiB managed ceiling was measured when the carve was
+64.00 GiB and host RAM was 62 GiB; 58 sits below both, so that number never
+said which one it was. The current split separates them, and the answer is
+host.
+
+Three consequences for anyone sizing work here:
+
+1. **Raising the carve LOWERED the managed ceiling**, 58 GiB to 27 GiB, because
+   host RAM fell from 62 GiB to 31 GiB. More VRAM is not more of everything.
+2. **`VT_ROCM_MANAGED_ALLOC=1` is actively harmful on this board.** The default
+   is already correct: `ResolveMemoryPolicy` (`include/vt/rocm/rocm_arch.h`)
+   sets `managed_alloc = pageable_memory_access` under `kUnset`, and this board
+   reports that 0, so the #2511 narrowing selects plain `hipMalloc`.
+3. **A large CPU arm no longer fits this box.** The `qwen4_exp` CPU arm peaked
+   at 73.9 GiB `VmHWM`; the host side is now 31 GiB total. Run a CPU comparison
+   on `thor` or `dgx`, or on-box against an oracle instead.
 
 ### `orin:gpu0` needs L4T CUDA 12.6, and the DGX recipe breaks it
 

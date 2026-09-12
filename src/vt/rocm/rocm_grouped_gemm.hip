@@ -43,6 +43,7 @@
 #include "vt/rocm/rocm_f16_codec.h"
 #include "vt/rocm/rocm_mmvq_policy.h"
 #include "vt/rocm/rocm_norm_quant_bridge.h"
+#include "vt/rocm/rocm_quant_iq_tables.h"
 #include "vt/rocm/rocm_runtime.h"
 
 // Block layouts — the single source of truth (ggml-common.h mirrors).
@@ -51,11 +52,13 @@
 namespace vt::rocm {
 namespace {
 
+using vt::cpu::BlockIQ4_NL;
 using vt::cpu::BlockQ8_0;
 using vt::cpu::BlockQ8_K;
 using vt::cpu::BlockQ4_K;
 using vt::cpu::BlockQ5_K;
 using vt::cpu::BlockQ6_K;
+using vt::cpu::kQK4_NL;
 using vt::cpu::kQK8_0;
 using vt::cpu::kQK_K;
 
@@ -189,6 +192,34 @@ __device__ inline float DotQ8_0(const BlockQ8_0* wb, const BlockQ8_0* ab) {
   for (int k = 0; k < kQK8_0 / 4; ++k)
     sumi = Dp4a(GetIntB2(wb->qs, k), GetIntB2(ab->qs, k), sumi);
   return sumi * (DF16ToF32(wb->d) * DF16ToF32(ab->d));
+}
+
+// IQ4_NL x Q8_0: cpu_quant_dot.cpp VecDotIQ4_NLQ8_0, itself a 1:1 port of
+// llama.cpp b10451 ggml/src/ggml-cpu/quants.c:1254
+// ggml_vec_dot_iq4_nl_q8_0_generic. IQ4_NL is Q4_0's geometry with the 16-entry
+// NON-LINEAR codebook (d_kvalues_iq4nl, stock ggml-common.h:1120) in place of
+// the affine step, and it pairs with a Q8_0 activation rather than the Q8_K
+// every neighbouring i-quant here uses (ggml-cpu.c:379-384).
+//
+// KEEP THE ASSOCIATION. The scale product is formed BEFORE the integer sum is
+// folded in, `d * (sumi1 + sumi2)`, which is the OPPOSITE order from DotQ8_0
+// directly above. That is upstream's order and it is what makes this GEMM
+// bit-reproducible against the oracle; a kernel that reassociates is a
+// different kernel and a small golden will not tell you so.
+//
+// Deliberately NOT Dp4a-vectorized. The codebook lookup is per nibble, so the
+// four-way byte dot has nothing to multiply until the values are gathered, and
+// gfx1100 has no hardware dp4a anyway (see the note above Dp4a).
+__device__ inline float DotIQ4_NL(const BlockIQ4_NL* wb, const BlockQ8_0* ab) {
+  const float d = DF16ToF32(ab->d) * DF16ToF32(wb->d);
+  int sumi1 = 0;
+  int sumi2 = 0;
+#pragma unroll
+  for (int j = 0; j < kQK4_NL / 2; ++j) {
+    sumi1 += ab->qs[j] * d_kvalues_iq4nl[wb->qs[j] & 0x0F];
+    sumi2 += ab->qs[j + kQK4_NL / 2] * d_kvalues_iq4nl[wb->qs[j] >> 4];
+  }
+  return d * static_cast<float>(sumi1 + sumi2);
 }
 
 // Q4_K x Q8_K: cuda_quant_dot.cu DotQ4K. dp4a-vectorized, one scale per 32.
@@ -787,6 +818,38 @@ __global__ void GroupedQ8_0K(OutT* __restrict__ out, const uint8_t* __restrict__
   }
 }
 
+// IQ4_NL grouped expert GEMM against a Q8_0 activation. This is the arm the
+// shipped Qwen3.8-Flash-Next checkpoints actually need: all 48 ffn_down_exps
+// are IQ4_NL, and an expert tower reaches the grouped provider rather than the
+// single-matrix one. Lane ownership, stride, expert indexing and reduction
+// order are copied verbatim from GroupedQ8_0K above.
+template <typename OutT>
+__global__ void GroupedIQ4NLK(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
+                              const BlockQ8_0* __restrict__ act,
+                              const int32_t* __restrict__ expert_ids, int64_t P, int64_t n,
+                              int64_t nb, size_t w_row_bytes, bool bcast) {
+  const int64_t warp = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  if (warp >= P * n) return;
+  const int64_t p = warp / n;
+  const int64_t j = warp % n;
+  const int lane = threadIdx.x;
+  const int64_t e = expert_ids[p];
+  const uint8_t* w_row = weight + static_cast<size_t>(e * n + j) * w_row_bytes;
+  const BlockQ8_0* a_row = act + (bcast ? 0 : p) * nb;
+  float partial = 0.0f;
+  for (int64_t b = lane; b < nb; b += 32) {
+    const BlockIQ4_NL* wb = reinterpret_cast<const BlockIQ4_NL*>(
+        w_row + static_cast<size_t>(b) * sizeof(BlockIQ4_NL));
+    partial += DotIQ4_NL(wb, a_row + b);
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) partial += __shfl_down_sync(0xffffffffULL, partial, off);
+  if (lane == 0) {
+    if constexpr (sizeof(OutT) == 4) out[p * n + j] = partial;
+    else out[p * n + j] = DF32ToBF16(partial);
+  }
+}
+
 // K-quant grouped kernel body (shared by Q4_K/Q5_K/Q6_K instantiations).
 // Fmt: 0=Q4_K, 1=Q5_K, 2=Q6_K.
 template <typename OutT, int Fmt>
@@ -1012,6 +1075,36 @@ __global__ void Q8_0GemmK(OutT* __restrict__ out, const uint8_t* __restrict__ we
     const BlockQ8_0* wb = reinterpret_cast<const BlockQ8_0*>(w_row + static_cast<size_t>(bb) *
                                                                           sizeof(BlockQ8_0));
     partial += DotQ8_0(wb, a_row + bb);
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) partial += __shfl_down_sync(0xffffffffULL, partial, off);
+  if (lane == 0) {
+    if constexpr (sizeof(OutT) == 4) out[i * n + j] = partial;
+    else out[i * n + j] = DF32ToBF16(partial);
+  }
+}
+
+// IQ4_NL weights against a Q8_0 activation. A SEPARATE kernel rather than a
+// weight-templated Q8_0GemmK on purpose: Q8_0GemmK is on the GDN decode path,
+// and templating it would re-codegen a kernel this row has no evidence about.
+// The lane ownership, the stride and the reduction order are copied from it
+// verbatim so the two stay comparable.
+template <typename OutT>
+__global__ void IQ4NLGemmK(OutT* __restrict__ out, const uint8_t* __restrict__ weight,
+                           const BlockQ8_0* __restrict__ act, int64_t m, int64_t n,
+                           int64_t nb) {
+  const int64_t warp = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  if (warp >= m * n) return;
+  const int64_t i = warp / n;
+  const int64_t j = warp % n;
+  const int lane = threadIdx.x;
+  const uint8_t* w_row = weight + static_cast<size_t>(j * nb) * sizeof(BlockIQ4_NL);
+  const BlockQ8_0* a_row = act + i * nb;
+  float partial = 0.0f;
+  for (int64_t bb = lane; bb < nb; bb += 32) {
+    const BlockIQ4_NL* wb = reinterpret_cast<const BlockIQ4_NL*>(
+        w_row + static_cast<size_t>(bb) * sizeof(BlockIQ4_NL));
+    partial += DotIQ4_NL(wb, a_row + bb);
   }
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) partial += __shfl_down_sync(0xffffffffULL, partial, off);
@@ -1608,6 +1701,27 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
     Check(hipGetLastError(), "q8_0 gemm");
     return;
   }
+  if (b.dtype == DType::kIQ4_NL) {
+    NormQuantInvalidate(q);
+    if (k % kQK4_NL != 0) throw std::runtime_error("vt rocm: matmul_bt_quant IQ4_NL: K%32!=0");
+    const int64_t nb = k / kQK4_NL;
+    // The activation encoding is Q8_0, NOT Q8_K: IQ4_NL is a 32-element block
+    // and the quantizer below is the one the Q8_0 arm already uses.
+    BlockQ8_0* qact = static_cast<BlockQ8_0*>(EnsureQuantScratch(
+        static_cast<size_t>(m) * nb * sizeof(BlockQ8_0), s));
+    QuantizeQ8_0K<<<static_cast<unsigned>((m * nb + 127) / 128), 128, 0, s>>>(
+        qact, a.data, ActDtOf(a.dtype), a.stride[0], m, nb);
+    Check(hipGetLastError(), "iq4_nl activation quant");
+    const int64_t grid = (m * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
+    if (out.dtype == DType::kF32)
+      IQ4NLGemmK<float><<<static_cast<unsigned>(grid), block, 0, s>>>(
+          static_cast<float*>(out.data), w, qact, m, n, nb);
+    else
+      IQ4NLGemmK<uint16_t><<<static_cast<unsigned>(grid), block, 0, s>>>(
+          static_cast<uint16_t*>(out.data), w, qact, m, n, nb);
+    Check(hipGetLastError(), "iq4_nl gemm");
+    return;
+  }
   if (b.dtype == DType::kQ4_K || b.dtype == DType::kQ5_K || b.dtype == DType::kQ6_K) {
     if (k % kQK_K != 0) throw std::runtime_error("vt rocm: matmul_bt_quant K-quant: K%256!=0");
     const int64_t nsb = k / kQK_K;
@@ -1779,8 +1893,8 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
   }
   throw std::runtime_error(
       "vt rocm: internal GDN matmul_bt_quant provider received an unsupported weight dtype "
-      "(GDN-owned: Q8_0/Q4_K/Q5_K/Q6_K; wrapper-owned: Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ2_S/IQ1_S/IQ1_XXXS; "
-      "unimplemented: Q4_0/Q5_0/IQ2_XS/IQ4_NL/IQ3_S/IQ4_XS/MXFP4 -- the ROCm wrapper must delegate only the GDN-owned set)");
+      "(GDN-owned: Q8_0/IQ4_NL/Q4_K/Q5_K/Q6_K; wrapper-owned: Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ2_S/IQ1_S/IQ1_XXXS; "
+      "unimplemented: Q4_0/Q5_0/IQ2_XS/IQ3_S/IQ4_XS/MXFP4 -- the ROCm wrapper must delegate only the GDN-owned set)");
 }
 
 
@@ -1822,6 +1936,28 @@ void MatmulBTQuantGroupedKernelRocmGdn(Queue& q, Tensor& out, const Tensor& act,
     Check(hipGetLastError(), "q8_0 grouped");
     return;
   }
+  if (weight.dtype == DType::kIQ4_NL) {
+    if (k % kQK4_NL != 0)
+      throw std::runtime_error("vt rocm: matmul_bt_quant_grouped IQ4_NL: K must be a multiple of 32");
+    const int64_t nb = k / kQK4_NL;
+    const size_t w_row_bytes = static_cast<size_t>(nb) * sizeof(BlockIQ4_NL);
+    // Q8_0 activation, not Q8_K — see DotIQ4_NL.
+    BlockQ8_0* qact = static_cast<BlockQ8_0*>(EnsureQuantScratch(
+        static_cast<size_t>(Pa) * nb * sizeof(BlockQ8_0), s));
+    constexpr int kQBlock = 128;
+    QuantizeQ8_0K<<<static_cast<unsigned>((Pa * nb + kQBlock - 1) / kQBlock), kQBlock, 0, s>>>(
+        qact, act.data, ActDtOf(act.dtype), act.stride[0], Pa, nb);
+    Check(hipGetLastError(), "iq4_nl activation quant (grouped)");
+    const int64_t grid = (P * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
+    if (out.dtype == DType::kF32)
+      GroupedIQ4NLK<float><<<static_cast<unsigned>(grid), block, 0, s>>>(
+          static_cast<float*>(out.data), w, qact, eids, P, n, nb, w_row_bytes, bcast);
+    else
+      GroupedIQ4NLK<uint16_t><<<static_cast<unsigned>(grid), block, 0, s>>>(
+          static_cast<uint16_t*>(out.data), w, qact, eids, P, n, nb, w_row_bytes, bcast);
+    Check(hipGetLastError(), "iq4_nl grouped");
+    return;
+  }
 
   if (weight.dtype == DType::kQ4_K || weight.dtype == DType::kQ5_K || weight.dtype == DType::kQ6_K) {
     if (k % kQK_K != 0)
@@ -1851,8 +1987,8 @@ void MatmulBTQuantGroupedKernelRocmGdn(Queue& q, Tensor& out, const Tensor& act,
 
   throw std::runtime_error(
       "vt rocm: internal GDN matmul_bt_quant_grouped provider received an unsupported weight dtype "
-      "(GDN-owned: Q8_0/Q4_K/Q5_K/Q6_K; wrapper-owned: Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ2_S/IQ1_S/IQ1_XXXS; "
-      "unimplemented: Q4_0/Q5_0/IQ2_XS/IQ4_NL/IQ3_S/IQ4_XS/MXFP4 -- the ROCm wrapper must delegate only the GDN-owned set)");
+      "(GDN-owned: Q8_0/IQ4_NL/Q4_K/Q5_K/Q6_K; wrapper-owned: Q2_K/Q3_K/IQ2_XXS/IQ3_XXS/IQ2_S/IQ1_S/IQ1_XXXS; "
+      "unimplemented: Q4_0/Q5_0/IQ2_XS/IQ3_S/IQ4_XS/MXFP4 -- the ROCm wrapper must delegate only the GDN-owned set)");
 }
 
 }  // namespace vt::rocm

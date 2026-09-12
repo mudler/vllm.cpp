@@ -2555,6 +2555,11 @@ TEST_CASE("non-grouped keep-quant GEMM (Q8_0/Q4_K/Q5_K/Q6_K) matches the CPU ora
     {vt::DType::kQ4_K, 144, 0, 2, "q4_K"},
     {vt::DType::kQ6_K, 210, 208, -1, "q6_K"},
     {vt::DType::kQ5_K, 176, 0, 2, "q5_K"},
+    // IQ4_NL: 18-byte, 32-element block, and the ONLY entry here whose
+    // activation encoding is Q8_0 rather than Q8_K. It is what every published
+    // Qwen3.8-Flash-Next quant stores its ffn_down_exps and its n-gram table
+    // in, so a ROCm arm that lacks it cannot multiply those experts at all.
+    {vt::DType::kIQ4_NL, 18, 0, -1, "iq4_nl"},
   };
   const bool rocm_present = OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM);
   const bool any_rocm = [&] {
@@ -2569,7 +2574,8 @@ TEST_CASE("non-grouped keep-quant GEMM (Q8_0/Q4_K/Q5_K/Q6_K) matches the CPU ora
   }
   for (const Fmt& f : fmts) {
     CAPTURE(f.name);
-    const int64_t elems_per_block = (f.dt == vt::DType::kQ8_0) ? 32 : 256;
+    const int64_t elems_per_block =
+        (f.dt == vt::DType::kQ8_0 || f.dt == vt::DType::kIQ4_NL) ? 32 : 256;
     const int64_t blocks_per_row = K / elems_per_block;
     const size_t row_bytes = static_cast<size_t>(blocks_per_row) * f.block_bytes;
     const size_t wn = static_cast<size_t>(N) * row_bytes;
@@ -2617,6 +2623,113 @@ TEST_CASE("non-grouped keep-quant GEMM (Q8_0/Q4_K/Q5_K/Q6_K) matches the CPU ora
       CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
       dev.DestroyQueue(q);
     }
+  }
+}
+
+// QUANT-GGUF-IQ4_NL D1/R2: the IQ4_NL association order, pinned BIT-EXACTLY.
+//
+// `VecDotIQ4_NLQ8_0` and its two device ports form the scale product BEFORE the
+// integer sum is folded in -- `d * (sumi1 + sumi2)` -- which is the OPPOSITE
+// association from the neighbouring q4_0/Q8_0 kernels. The spec calls that
+// load-bearing. The NMSE gates above cannot see it: reassociating moves the
+// result by about 1e-7 relative, which is about 3.7 orders of magnitude inside
+// their 5e-4 band, and a fresh review duly mutated `DotIQ4_NL` to
+// `(d*sumi1) + (d*sumi2)` and watched 47 of 47 cases stay green.
+//
+// This case is built so the two orders DIFFER and so the correct one is
+// reproducible to the last bit:
+//
+//   * ONE block (K = 32), M = N = 1. With a single block the warp reduction
+//     adds only zeros to lane 0's value, so the device result is the dot itself
+//     rather than a reassociated sum of dots.
+//   * The activation is k/64 with max |k| = 127, so the Q8_0 quantizer is
+//     EXACT: amax/127 = 1/64 is representable in f16 and every `roundf` lands
+//     on the integer it started from. `qs` is therefore known here, not guessed.
+//   * The weight scale carries a FULL f16 mantissa (0x2123), written as raw
+//     bits. A scale with a short mantissa (a power of two, say) makes `d*sumi1`
+//     exact and the two orders agree -- which is exactly how a toy fixture
+//     silently stops discriminating.
+//
+// The REQUIRE below is the anti-degeneracy guard: if the two orders ever agree
+// on these operands the case FAILS rather than passing vacuously.
+TEST_CASE("IQ4_NL keeps upstream's association order d*(s1+s2), bit for bit") {
+  constexpr int64_t M = 1, N = 1, K = 32;
+  // kvalues_iq4nl, llama.cpp b10451 ggml/src/ggml-common.h:1120. Transcribed
+  // here rather than included, so the test holds the codebook INDEPENDENTLY of
+  // whatever the CPU and device kernels read.
+  static const int kValues[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
+                                  1,    13,   25,  38,  53,  69,  89,  113};
+  static const uint8_t kWeightQs[16] = {0xa8, 0x0f, 0xed, 0x48, 0x16, 0x2b,
+                                        0xd2, 0x4b, 0x68, 0x07, 0xa2, 0xb1,
+                                        0x5f, 0x4b, 0xd5, 0x2f};
+  // max |k| == 127 on lane 16, which pins amax and therefore the Q8_0 scale.
+  static const int kActQ[32] = {-18, -50, -71, -52,  63, -115, 126, 124,
+                                -81, -67,  93,  77, -58,  126, 118,   4,
+                                127,  64,  14,  -2,  82,   29, -29, -32,
+                                -19, 105, -84, -95, -56,  -81, -81, -95};
+  constexpr uint16_t kWeightDBits = 0x2123;  // f16, full mantissa
+  constexpr uint16_t kActDBits = 0x2400;     // f16 1/64, what the quantizer must emit
+
+  std::vector<uint8_t> wt(18);
+  std::memcpy(wt.data(), &kWeightDBits, 2);
+  std::memcpy(wt.data() + 2, kWeightQs, 16);
+
+  std::vector<float> act(K);
+  for (int64_t j = 0; j < K; ++j) act[j] = static_cast<float>(kActQ[j]) / 64.0f;
+
+  int32_t s1 = 0, s2 = 0;
+  for (int j = 0; j < 16; ++j) {
+    s1 += kActQ[j] * kValues[kWeightQs[j] & 0x0F];
+    s2 += kActQ[j + 16] * kValues[kWeightQs[j] >> 4];
+  }
+  // `act_d * weight_d`, in that order, because that is the order both kernels
+  // write and float multiplication is not associative across a rounding.
+  const float d = vt::F16ToF32(kActDBits) * vt::F16ToF32(kWeightDBits);
+  const float upstream_order = d * static_cast<float>(s1 + s2);
+  const float reassociated = d * static_cast<float>(s1) + d * static_cast<float>(s2);
+  auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+  CAPTURE(s1);
+  CAPTURE(s2);
+  REQUIRE_MESSAGE(bits(upstream_order) != bits(reassociated),
+                  "the fixture must be able to SEE a reassociation: these "
+                  "operands make the two orders differ by one ulp, and a "
+                  "fixture where they agree gates nothing");
+
+  // REQUIRE-proven registration on ROCm (never a silent skip -- review sweep
+  // on #523: an OpAvailable-guarded case passes green with the registration
+  // deleted). ROCm is the arm this row added, so a build that carries the
+  // backend and has lost the IQ4_NL admission must FAIL here rather than fall
+  // through to a pass that measured only the CPU.
+  const bool rocm_built = [&] {
+    for (DeviceType dt : RegisteredDevices()) if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (rocm_built) {
+    REQUIRE_MESSAGE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM),
+                    "kMatmulBTQuant must be registered on ROCm -- a missing "
+                    "registration is a failure, never a skip");
+  }
+
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!OpAvailable(vt::OpId::kMatmulBTQuant, dt)) continue;
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d_id{dt, 0};
+    DevBuf da(dev, q, static_cast<size_t>(K));
+    DevBufBytes dwt(dev, q, wt.size());
+    DevBuf dout(dev, q, static_cast<size_t>(M) * N);
+    da.Upload(act);
+    dwt.Upload(wt.data());
+    Tensor tact = T2(da.ptr(), d_id, M, K);
+    Tensor twt = Tensor::Contiguous(dwt.ptr(), vt::DType::kIQ4_NL, d_id, {N, K});
+    Tensor tout = T2(dout.ptr(), d_id, M, N);
+    vt::MatmulBTQuant(q, tout, tact, twt);
+    const std::vector<float> got = dout.Download();
+    REQUIRE(got.size() == 1u);
+    CHECK(bits(got[0]) == bits(upstream_order));
+    CHECK(bits(got[0]) != bits(reassociated));
+    dev.DestroyQueue(q);
   }
 }
 
@@ -3816,6 +3929,12 @@ TEST_CASE("grouped quant expert GEMM (Q8_0/Q4_K/Q6_K) matches the CPU oracle") {
     {vt::DType::kQ4_K, 144, 0, 2, "q4_K"},   // {d,dmin,sc,qs}     superblocks of 256
     {vt::DType::kQ6_K, 210, 208, -1, "q6_K"},// {ql,qh,scales,d}   superblocks of 256
     {vt::DType::kQ5_K, 176, 0, 2, "q5_K"},   // {d,dmin,sc,qh,qs}  superblocks of 256
+    // IQ4_NL {d; qs[16]} — 32-element block on a Q8_0 activation. THIS is the
+    // arm the shipped Qwen3.8-Flash-Next checkpoints need: all 48
+    // ffn_down_exps are IQ4_NL and an expert tower reaches the GROUPED
+    // provider, so the single-matrix arm alone would still throw at the first
+    // expert forward with the model already resident.
+    {vt::DType::kIQ4_NL, 18, 0, -1, "iq4_nl"},
   };
 
   // REQUIRE-proven registration on ROCm (never a silent skip — review sweep
@@ -3832,7 +3951,8 @@ TEST_CASE("grouped quant expert GEMM (Q8_0/Q4_K/Q6_K) matches the CPU oracle") {
   }
   for (const Fmt& f : fmts) {
     CAPTURE(f.name);
-    const int64_t elems_per_block = (f.dt == vt::DType::kQ8_0) ? 32 : 256;
+    const int64_t elems_per_block =
+        (f.dt == vt::DType::kQ8_0 || f.dt == vt::DType::kIQ4_NL) ? 32 : 256;
     const int64_t blocks_per_row = K / elems_per_block;
     const size_t row_bytes = static_cast<size_t>(blocks_per_row) * f.block_bytes;
     const size_t wn = static_cast<size_t>(E) * N * row_bytes;
@@ -3928,6 +4048,13 @@ TEST_CASE("fused MoE gate+up+SwiGLU grouped GEMM matches the CPU oracle and is N
     {vt::DType::kQ4_K, 144, 0, 2, "q4_K"},
     {vt::DType::kQ6_K, 210, 208, -1, "q6_K"},
     {vt::DType::kQ5_K, 176, 0, 2, "q5_K"},
+    // IQ4_NL {d; qs[16]} — 32-element block on a Q8_0 activation. The fused
+    // seam DOES serve it: `rocm_moe_gate_up_swiglu.hip` composes the epilogue
+    // over two `MatmulBTQuantGroupedKernelRocm` calls, which delegate IQ4_NL to
+    // `GroupedIQ4NLK`. Listing it here is what makes the `elems_per_block`
+    // branch below reachable — without the row the branch is dead code that
+    // reads like coverage.
+    {vt::DType::kIQ4_NL, 18, 0, -1, "iq4_nl"},
   };
 
   const bool rocm_built = [&] {
@@ -3955,7 +4082,8 @@ TEST_CASE("fused MoE gate+up+SwiGLU grouped GEMM matches the CPU oracle and is N
     // As std::string: doctest stringifies a bare `const char*` as `1`, so the
     // capture in the case above cannot name the format that failed.
     CAPTURE(std::string(f.name));
-    const int64_t elems_per_block = (f.dt == vt::DType::kQ8_0) ? 32 : 256;
+    const int64_t elems_per_block =
+        (f.dt == vt::DType::kQ8_0 || f.dt == vt::DType::kIQ4_NL) ? 32 : 256;
     const int64_t blocks_per_row = K / elems_per_block;
     const size_t row_bytes = static_cast<size_t>(blocks_per_row) * f.block_bytes;
     const size_t wn = static_cast<size_t>(E) * N * row_bytes;

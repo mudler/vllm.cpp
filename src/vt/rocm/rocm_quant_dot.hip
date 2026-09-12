@@ -779,7 +779,10 @@ bool IsRocmKeepQuantSupported(DType dt, WType* out) {
     case DType::kIQ2_S: *out = WType::kIQ2_S; return true;
     case DType::kIQ1_S: *out = WType::kIQ1_S; return true;
     case DType::kIQ1_XXXS: *out = WType::kIQ1_XXXS; return true;
-    // Q4_0 / Q8_0 / MXFP4 dot a Q8_0 activation and have no native arm here.
+    // Q4_0 / Q8_0 / IQ4_NL / MXFP4 dot a Q8_0 activation and have no native arm
+    // here. IQ4_NL is in that class since QUANT-GGUF-IQ4_NL, and it is why the
+    // delegation lists above name it: this predicate can never admit it, so the
+    // wrapper must hand it to the GDN kernels instead of falling through.
     default: return false;
   }
 }
@@ -847,12 +850,18 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a,
   const int64_t m = a.shape[0];
   const int64_t k = a.shape[1];
   const int64_t n = b.shape[0];
-  // Delegate Q8_0/Q4_K/Q5_K/Q6_K to the optimized kernels in
+  // Delegate Q8_0/IQ4_NL/Q4_K/Q5_K/Q6_K to the optimized kernels in
   // rocm_grouped_gemm.hip (renamed *Gdn). These have cooperative-warp dispatch
   // and format-specific templates tuned for gfx1100; the new CUDA-ported
   // kernels in this file are slower for these types. The new kernels handle
   // IQ types and Q2_K/Q3_K.
-  if (b.dtype == DType::kQ8_0 || b.dtype == DType::kQ4_K ||
+  // IQ4_NL is in the SAME CLASS as Q8_0 here and must be delegated for the same
+  // reason: it dots a 32-element block against a Q8_0 activation, so it has no
+  // Q8_K-superblock arm in this file and IsRocmKeepQuantSupported will never
+  // admit it. Leaving it out of this list turns a format the *Gdn kernel serves
+  // into a throw — which is exactly what the grouped cross-device case caught.
+  if (b.dtype == DType::kQ8_0 || b.dtype == DType::kIQ4_NL ||
+      b.dtype == DType::kQ4_K ||
       b.dtype == DType::kQ5_K ||
       b.dtype == DType::kQ6_K) {
     MatmulBTQuantKernelRocmGdn(q, out, a, b);
@@ -913,10 +922,13 @@ void MatmulBTQuantGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
   const int64_t k = act.shape[1];
   if (P == 0 || n == 0) return;
 
-  // Delegate Q8_0/Q4_K/Q5_K/Q6_K to the optimized grouped kernels. Q8_0 has no
-  // Q8_K-superblock arm in this file (it dots a Q8_0 activation), so leaving it
-  // out of this list turns a format the *Gdn kernel serves today into a throw.
-  if (weight.dtype == DType::kQ8_0 || weight.dtype == DType::kQ4_K ||
+  // Delegate Q8_0/IQ4_NL/Q4_K/Q5_K/Q6_K to the optimized grouped kernels. Q8_0
+  // and IQ4_NL have no
+  // Q8_K-superblock arm in this file (both dot a Q8_0 activation), so leaving
+  // either out of this list turns a format the *Gdn kernel serves today into a
+  // throw.
+  if (weight.dtype == DType::kQ8_0 || weight.dtype == DType::kIQ4_NL ||
+      weight.dtype == DType::kQ4_K ||
       weight.dtype == DType::kQ5_K || weight.dtype == DType::kQ6_K) {
     MatmulBTQuantGroupedKernelRocmGdn(q, out, act, weight, expert_ids);
     return;

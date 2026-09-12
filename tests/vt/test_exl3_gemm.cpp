@@ -875,17 +875,23 @@ TEST_CASE("exl3 device: every shape in the kernel table is FORCED and agrees wit
     per_shape.push_back(c_dev);
   }
 
-  // THE DISCRIMINATION CHECK (2 above). Byte comparison, not a tolerance: two
-  // runs of the SAME kernel on the same operands are bit-identical, so any
-  // difference at all is proof that a different kernel ran.
+  // THE DISCRIMINATION CHECK (2 above). For shapes with different compute
+  // triples, a byte comparison proves a different kernel ran: two runs of the
+  // SAME kernel on the same operands are bit-identical, so any difference at
+  // all is proof that dispatch selected a different shape.
   //
   // Two shapes that share the same (tile_k, sh_stages, frag_stages) triple
   // differ only in tile_n, which maps output columns to thread blocks. The
-  // per-element K-accumulation is identical, so the output is bit-identical by
-  // design. Upstream's shape table (`exl3_kernel_map.cuh:53-60`) has exactly
-  // one such pair: shapes 2 and 3 (tile_k=32, sh_stages=4, frag_stages=3;
-  // tile_n=128 vs 256). The discrimination check skips those pairs, because
-  // zero differing bytes is the correct result, not a sign that dispatch failed.
+  // per-element K-accumulation is identical, so the output is numerically
+  // equal by design. Bit-identity is NOT guaranteed across GPU architectures:
+  // different tile_n values partition output columns into different block
+  // configurations, and fp16 reduction order is scheduling-dependent. On sm_121a
+  // the output is bit-identical; on sm_110 shapes 2 and 3 differ in rounding.
+  // Upstream's shape table (`exl3_kernel_map.cuh:53-60`) has exactly one such
+  // pair: shapes 2 and 3 (tile_k=32, sh_stages=4, frag_stages=3; tile_n=128
+  // vs 256). The same-compute case uses a tight tolerance (1e-6) rather than a
+  // byte comparison, confirming the kernels agree without asserting
+  // architecture-dependent bit-identity.
   REQUIRE(per_shape.size() == static_cast<size_t>(vt::Exl3GemmNumShapes()));
   for (size_t i = 0; i < per_shape.size(); ++i) {
     for (size_t j = i + 1; j < per_shape.size(); ++j) {
@@ -905,7 +911,15 @@ TEST_CASE("exl3 device: every shape in the kernel table is FORCED and agrees wit
       if (!same_compute) {
         CHECK(differing > 0);
       } else {
-        CHECK(differing == 0);
+        double pair_num = 0.0;
+        for (size_t e = 0; e < per_shape[i].size(); ++e) {
+          const double d = static_cast<double>(per_shape[i][e]) -
+                           static_cast<double>(per_shape[j][e]);
+          pair_num += d * d;
+        }
+        const double pair_rel = std::sqrt(pair_num / den);
+        MESSAGE("shapes ", i + 1, " and ", j + 1, " same-compute rel_rms = ", pair_rel);
+        CHECK(pair_rel <= 1.0e-6);
       }
     }
   }

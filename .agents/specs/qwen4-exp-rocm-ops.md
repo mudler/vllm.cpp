@@ -580,6 +580,19 @@ here, green, at 84383 assertions. A full `ctest` at this head is therefore
 UNRUN and is recorded as such rather than implied. No throughput, latency or
 memory number was taken, and none is admissible from this row.
 
+**ONE LOCAL GATE FAILS AND IT IS NOT THIS ROW'S.** `scripts/agent-preflight.sh
+--staged` at `baffa7b8d` runs to completion and exits 1 on `tools suites`, with
+the five argument-starved SKIPs the banner expects. All 50 failures are in
+`tests/tools/test_strix_vllm_oracle.py` and 75 of them carry the same message,
+`ValueError: disk headroom exhausted` from that tool's OWN guard at
+`tools/bench/strix_vllm_oracle/worker.py:252-257`, which refuses to build when
+`shutil.disk_usage(...).free` is below its floor. The dev box was at 98% of
+447 GB with 12 GB free. `git diff origin/main..HEAD -- tools/ tests/tools/
+scripts/` is EMPTY, so every file that suite exercises is byte-identical to
+`main`, and no file this branch touches is named anywhere in it. The guard is
+working; the host is full. Recorded rather than left for a reviewer to
+rediscover, and NOT filed as a bug, because nothing is defective.
+
 **W2's OWN RECORD IS NOT DELETED, it is superseded here and kept below**, the
 same way W2 kept W1's. Its counts are read against its own head and not against
 this one: "five landed and four owed" was true at `52cecd733`.

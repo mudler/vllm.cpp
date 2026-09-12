@@ -20,6 +20,15 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKER = ROOT / "tools/bench/strix_vllm_oracle/worker.py"
 RUNTIME = WORKER.with_name("runtime.py")
 
+_TUNING = ("VT_", "GGML_", "HSA_", "HIP_", "ROCR_", "PYTORCH_", "VLLM_", "TORCH_", "TRITON_", "CUDA_", "CMAKE_")
+_INJECTION = {"PYTHONPATH", "PYTHONHOME", "LD_PRELOAD", "LD_LIBRARY_PATH", "CC", "CXX", "CFLAGS", "CXXFLAGS", "LDFLAGS"}
+
+
+def _clean_env():
+    return {k: v for k, v in os.environ.items()
+            if not (k.startswith(_TUNING) or k in _INJECTION)
+            and not (k == "CUDA_VISIBLE_DEVICES" and v == "0")}
+
 
 class OracleCliTests(unittest.TestCase):
     def setUp(self):
@@ -172,7 +181,7 @@ class OracleCliTests(unittest.TestCase):
                 "--output", str(self.tmp / output)]
         if state:
             args += ["--state", str(state)]
-        child_env = {**os.environ, "RC_DEVICE": "strix:gpu0", "RC_JOB_ID": "cpu-fixture",
+        child_env = {**_clean_env(), "RC_DEVICE": "strix:gpu0", "RC_JOB_ID": "cpu-fixture",
                      "STRIX_TEST_LOG": str(self.tmp / "commands.jsonl"),
                      "STRIX_TEST_SELECTED_TRITON": str(int("selected_triton" in self.manifest["dependencies"])), **env}
         if as_process:

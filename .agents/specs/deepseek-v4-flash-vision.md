@@ -729,6 +729,13 @@ above as its red-before input.
   DeepSeek-V4 publishes a multi-cache topology, so the image path is served on
   the non-paged branch only until the per-position mask lands. Issue #2411 and
   row `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm` own it.
+- **The two DEVICE routers' media refusal was NEVER DRIVEN, and stays
+  unmeasured.** W7-CUDA built and ran this architecture's suites on a CUDA queue
+  on `thor:gpu0`, and no case reaches `DispRoute` with image rows on the
+  `be.device` or glue arm, so the `VT_CHECK` below has still never executed. The
+  device run happened; this particular refusal was not exercised by it, which is
+  a different thing and is recorded rather than glossed. A case that drives an
+  image step onto a device router is owed by issue #2411 and W7-CUDA.
 - **The two DEVICE routers take one bias pointer per call.** `DispRoute` refuses
   a step carrying image rows on the `be.device` and glue arms rather than routing
   them on the text bias, and the two resident single-token decode arms refuse an
@@ -745,11 +752,16 @@ above as its red-before input.
   it -- `dev_attn` is independent of `be.device` and of `GlueDev`, so
   `DispRoute`'s media refusal does not reach it, and `paged_attn` is false in
   that branch -- so both conditions are now REFUSED BY NAME there.
-  **THE REFUSAL IS UNMEASURED, and this entry is the record of that.** `dev_attn`
-  needs a non-CPU queue, `VT_V4_DEVICE_ATTN` and the V4 device kernels together,
-  so no CPU build can execute either check and the W4 repair claims no gate for
-  them. The windowed and span-aware device kernel, and the device run that would
-  gate the refusal, are owed by issue #2411 and W7-CUDA.
+  **THE WINDOWED HALF IS NOW MEASURED, W7-CUDA.** On `thor:gpu0` with
+  `VT_V4_DEVICE_ATTN=1`, a CUDA queue and the V4 device kernels all live,
+  `deepseek_v4.cpp:1319` threw by name at `sliding_window 128` — rc job
+  `665b2427-4b85-4e75-916b-d3ad3345ea24`, and see `### W7-CUDA evidence`. The
+  refusal is necessary and it is kept.
+  **THE IMAGE-SPAN HALF IS STILL UNMEASURED**, and this sentence is the record
+  of that: nothing in the suite drives an image span through `dev_attn`, so the
+  second `VT_CHECK` has never executed. The windowed and span-aware device
+  kernel, and a case that drives an image span onto this arm, are owed by issue
+  #2411 and W7-CUDA.
 - `ResidentWeight`'s device-staging arm in
   `include/vllm/model_executor/models/dense_attn_block.h` drops `q8_0_aligned`
   and `repacked` while guarding `elem_kn_repacked`, so the shared seam cannot
@@ -890,9 +902,93 @@ above as its red-before input.
   is the committed fixture and the measurement above is the red-before input.
   The checker change is not made here because it is a semantic checker change
   and needs its own red-before evidence. Issue #2411 and W3 own it.
-- CUDA, ROCm and Vulkan device-path evidence are owed by #2411 W7-CUDA,
-  W7-ROCM and W7-VULKAN. Every run uses `rc`; a CPU fallback is not evidence for
-  any of the three.
+- **CUDA: the VISION half is CLOSED by W7-CUDA; ROCm and Vulkan are still
+  owed** by #2411 W7-ROCM and W7-VULKAN. Every run uses `rc`; a CPU fallback is
+  not evidence for any of them. The vision tower now runs on a CUDA queue on
+  `thor:gpu0` (sm_110) against the real projector and matches llama.cpp
+  `b10766` inside W6's declared bound; see `### W7-CUDA evidence`. What CUDA
+  still cannot do is listed in the four entries below.
+
+- **`vt: MatVec weight size mismatch` IS NOW THE FIRST BLOCKER FOR A SERVED
+  IMAGE ON CUDA. It SUPERSEDES vision residency, which W7-CUDA fixed.**
+
+  **THE BLOCKER ORDER ON THIS ROW HAS MOVED THREE TIMES UNDER MEASUREMENT, and
+  each move was only visible because the previous blocker was genuinely
+  repaired.** A reader needs to know which are closed and which is live:
+
+  | # | Blocker | State |
+  |---|---|---|
+  | 1 | `fp8_ds_mla` KV cache at engine start | **NOT what stops a CUDA build.** W6 measured it on a CPU build; `KV-DSV4-MULTICACHE` W5 (#2455) owns it and it is untouched here |
+  | 2 | `DeepSeek-V4 vision queue and weights must share one device` | **CLOSED by W7-CUDA.** See `### W7-CUDA evidence` |
+  | 3 | `vt: MatVec weight size mismatch at deepseek_v4.cpp:504` | **LIVE. This entry.** |
+
+  **THE EXACT FAILING INVOCATION.** `test_deepseek_v4_mm_chat`'s served image
+  request dies with
+  `engine-fatal: EngineCore busy loop threw: vt: MatVec weight size mismatch at
+  deepseek_v4.cpp:504`. `MatVec` has exactly ONE call site in that file, `:567`,
+  inside `Gemm`'s HOST-FLOAT FALLBACK:
+  `const std::vector<float> y = MatVec(wf32, &x[t * K], N, K);` — so `out = N`,
+  `in = K`, and the guard that fires is
+  `VT_CHECK(static_cast<int64_t>(w.size()) == out * in, ...)` at `:504`.
+
+  **IT IS NOT THE DEVICE GEMM PATH**, and calling it one would be wrong. `Gemm`
+  takes its keep-quant arm only when
+  `be.gguf != nullptr && wq != nullptr && !wq->Empty()`, and otherwise falls
+  through to that host loop REGARDLESS of device. The failing code is host code.
+  What is device-specific is its REACHABILITY: on a CPU build the request never
+  arrives, because `ForwardDevice` refuses first at
+  `VT_CHECK(deepseek_v4::V4DeviceKernelsAvailable(), kDevicePending)`, so only a
+  build with the V4 device kernels can get this far.
+
+  **THE ASYMMETRY IS THE FINDING.** The keep-quant arm carries a NAMED shape
+  refusal (`keep-quant GEMM: weight shape mismatch: want [N=..,K=..] got [..]`)
+  while this fallback arm's guard is ANONYMOUS. The same wrong shape is
+  diagnosable on one arm and nameless on the other. The tree already says what
+  that costs: `deepseek_v4_weights.cpp:346` records that the assertion is
+  "unconditional (a plain `VT_CHECK` and not an `assert`, so it survives
+  `NDEBUG`)" and that the throw "names neither the tensor, nor the layer, nor
+  the geometry, nor what is missing".
+
+  **WHAT IS UNMEASURED, and is not guessed here:** the `N` and `K` values, which
+  tensor, and which layer. This throw names none of them by construction, so
+  recovering them needs an instrumented device run. It is NOT the aarch64 repack
+  path — the failure is byte-identical with `VT_CPU_QUANT_REPACK=0`.
+
+  **A STALE CROSS-REFERENCE a reader will otherwise chase:**
+  `deepseek_v4.cpp:734`, `deepseek_v4.cpp:831`, `deepseek_v4_weights.cpp:346`
+  and `deepseek_v4_weights.cpp:1068` all cite this throw as
+  `deepseek_v4.cpp:413`. The guard now sits at `:504`, which is what the
+  measured failure reports; the line moved and those comments did not follow.
+
+  Root-causing it, and giving the fallback arm a named refusal, are owed by
+  issue #2411 and W7-CUDA.
+
+- **`test_deepseek_v4_mm_chat`'s image branch encodes a CPU-ONLY PREMISE and
+  fails on any CUDA build.** Its else-branch asserts the served error names
+  `W7-device`, which is `kDevicePending` — and `ForwardDevice` guards that with
+  `VT_CHECK(V4DeviceKernelsAvailable(), kDevicePending)`, a predicate that is
+  FALSE exactly when the device kernels are absent. On a CUDA build the refusal
+  therefore cannot fire, and the assertion can never hold. One assertion of 650
+  fails for this reason (the sibling `deepseek_v4.cpp` check now passes, because
+  the new message names that file). The case needs a device-aware expectation
+  rather than a CPU-shaped one; owed by issue #2411 and W7-CUDA.
+
+- **8 of 20 `test_deepseek_v4_mm_reach` cases FAIL ON AARCH64, and the cause is
+  the i8mm quant repack rather than the device.** Every one throws
+  `deepseek-v4 keep-quant expert/group slice requires non-repacked blocks
+  (disable VT_CPU_QUANT_REPACK for the stacked-expert weights)` at
+  `deepseek_v4.cpp:583`. **PROVEN by an A/B on the same binary and the same
+  box**, not inferred from the message: with the repack ON the suite reads
+  `20 | 12 passed | 8 failed`; with `VT_CPU_QUANT_REPACK=0` it reads
+  `20 | 20 passed | 0 failed`. `vt::cpu::QuantRepackActive()` is true only on an
+  aarch64 i8mm host, which is why these cases are green on the x86-64 devbox and
+  red on `thor`. The row's gate therefore cannot run clean on an aarch64 host
+  without that flag. Owed by issue #2411.
+
+- **`test_serve_deepseek_v4_mm` TIMES OUT at 1800 s on a CUDA build, and why is
+  UNKNOWN.** It produced no output before CTest killed it, on both the red and
+  the green run, so nothing here attributes it. It is not asserted to be related
+  to the vision path. Owed by issue #2411 and W7-CUDA.
 - **CLOSED BY W4.** The W2 vision tower and aligner were unreachable from a
   production entry point, and are not any more. `DeepseekV4LoadedModel::
   vision_tower` builds `DeepSeekV4Vision` and `EncodeMmDeepseekV4ForCausalLM`
@@ -1067,6 +1163,136 @@ above as its red-before input.
   the gate does not cover. Widening the fixture is owed by issue #2411 and W3;
   it needs a change to the shared `tests/vllm/gguf_builder.h`, which every GGUF
   test uses, so it is not made inside a W3A repair.
+
+### W7-CUDA evidence — the vision tower on the device, and what the device still cannot do
+
+Every job ran on `thor:gpu0` through `rc`, and every artifact was written to
+`/workspace/dsv4-vision/w7-out/` as well as to stdout, because `rc` logs age out
+within a day. Thor is **sm_110**, outside the vendored FlashAttention-2 arch set,
+and the configure log says so on every run:
+`CUDA feature fa2: DISABLED (no requested arch in [110] provides it)`. Two jobs
+carry the result:
+
+| Job | Head | What it established |
+|---|---|---|
+| `14908980-7670-4283-a798-4247481f0bf2` | `4abe547d2` | THE RED. The tower could not run on CUDA at all |
+| `665b2427-4b85-4e75-916b-d3ad3345ea24` | `4abe547d2` + the staging fix | THE GREEN, and the aarch64 attribution |
+| `c472faab-347f-451d-865d-e844aff15e77` | (artifacts only) | the device block against the llama.cpp oracle directly |
+
+**THE BUILD IS A CUDA sm_110 BUILD, and that is proven rather than assumed.**
+CUDA **13.0.88**, installed by the job: the worker image carries no toolkit, and
+the box's leftover system `nvcc` is **12.0**, which cannot target sm_110 at all.
+41 `.cu.o` objects, and `cuobjdump --list-elf` over all 41 reports **41 sm_110**
+with `objects scanned: 41`. `ldd` on `tests/test_cuda_deepseek_v4` resolves
+`libcudart.so.13` and `libcublasLt.so.13`. The first run's `ldd` line asked for
+`libvllm.so` and got "No such file or directory"; that was a defective proof
+line, not a finding — `CMakeLists.txt:732` is `add_library(vllm STATIC ...)`, so
+this tree has no shared object. It is repaired to target an executable.
+
+**1. THE RED: the vision tower could not take a CUDA queue.** The `deepseek4v`
+mmproj reader hands the tower HOST views — `clip_mmproj_gguf.cpp`'s `HostView`
+says so in its own comment, "W4 owns the upload, so this wave keeps every weight
+on the default device" — and W4 did the routing rather than the upload, so
+nothing ever uploaded them. `DeepSeekV4Vision::ValidateQueue` then refused every
+CUDA queue. Measured on the real 934,462,656-byte `mmproj-BF16.gguf`, all four
+`lead_pad` rungs aborted:
+
+```text
+terminate called after throwing an instance of 'std::invalid_argument'
+  what():  DeepSeek-V4 vision queue and weights must share one device
+```
+
+**The same sentence killed a SERVED image request**, which is what makes this a
+capability gap and not a probe artifact: `test_deepseek_v4_mm_chat` died with
+`engine-fatal: EngineCore busy loop threw: DeepSeek-V4 vision queue and weights
+must share one device`. So vision residency, and NOT the `fp8_ds_mla` KV cache
+(#2455), is the FIRST blocker a served image meets on a CUDA build.
+
+**THE CONTROL THAT MAKES IT A DEVICE RESULT.** The same binary's CPU arm
+reproduced W6's block BYTE FOR BYTE (`cmp`, reported as
+`CPU_CONTROL_IDENTICAL`). The refusal is therefore a property of the device
+path, not of this build.
+
+**2. THE FIX, and it is the smallest one that reaches the capability.**
+`DeepSeekV4Vision::Impl::EnsureResident(queue)` stages the tower to the queue's
+device on first use and rebuilds the `MlpGateUpMethodBase` borrows against the
+staged tensors, because `BorrowResidentWeight` aliases whatever device its
+argument declares and leaving them alone would hand the shared seam a host
+pointer labelled with a device. **ONLY HOST -> DEVICE IS ADDED.** A queue on one
+device with weights already on a different one still hits the original refusal:
+the refusal is NARROWED, never deleted, and a device case asserts that it still
+fires.
+
+**3. THE GREEN, against W6's own CPU block** (job `665b2427`, all four rungs
+`RC=0`, `provider: cuda`):
+
+| Check | Result |
+|---|---|
+| token count | 114, 115, 116, 117 for `lead_pad` 0-3 — the same as W6 |
+| START, END, every NEWLINE, every PAD | **EXACT**, `f32_exact: true`, `max_abs 0.0`, every rung |
+| row placement | the identity is the best cosine match for **100 of 100** rows, every rung |
+| patch rows consumed | **IDENTICAL** (`max_abs 0.0`, `mean_cos 1.0`) — both arms read the same input |
+| aligner cells | mean relative L2 **2.32%**, mean cosine **0.99970**, min cosine 0.99363 |
+| vit, 784 rows | mean relative L2 **1.51%**, mean cosine 0.99979 |
+
+**4. THE GREEN, against the llama.cpp `b10766` ORACLE DIRECTLY** (job
+`c472faab`). Item 3 compares the device against OUR OWN CPU arm, which would
+leave the oracle claim resting on two chained measurements. These are the
+oracle's own dumps, captured by W6 from `llama.cpp` itself, and the numbers are
+identical on all four rungs:
+
+| Check, 100 image rows | CUDA vs oracle | CPU vs oracle (W6) |
+|---|---|---|
+| four sentinel kinds | **EXACT**, `max_abs 0.0` | EXACT |
+| permutation | **identity best 100 of 100** | identity best 100 of 100 |
+| cells mean relative L2 | **2.884%** | 3.83% |
+| cells mean cosine | **0.99939** | 0.99899 |
+| cells min cosine | 0.98653 | 0.96709 |
+| vit mean relative L2 | **1.872%** | 2.45% |
+
+**VERDICT AGAINST W6'S DECLARED BOUND, not against a number chosen here.** W6
+set three conditions. (1) the four sentinel kinds are exact and every image row
+is in its place — **met**, exactly, on every rung. (3) the shipped bf16 path is
+no farther from the oracle than it is from its own f32 arm plus the oracle's own
+floor, `<= 3.34% + 1.57% = 4.9%` cells mean relative L2 with mean cosine
+`>= 0.998` — measured **2.884%** and **0.99939**, so **met**. Condition (2) is
+about the f32 arm and no f32 device arm was run; it is untouched by this wave.
+The device arm is CLOSER to the oracle than our own CPU arm is, and the residual
+has W6's structure rather than a defect's: relative error tracks row norm
+(`corr = -0.351`) while absolute error does not (`corr = +0.073`), and no
+aligner row or column is loaded.
+
+**5. THE DEVICE SUITES, and every skip named.** `test_cuda_deepseek_v4` ran
+**29 cases, 0 skipped, 90082 assertions, all passed**, including the two cases
+this wave adds. A grep for skip messages across the whole run returns NOTHING:
+no case silently skipped. The suite exits 77 on a host with no CUDA, and that
+was verified on the devbox, so its green here is a device green.
+
+`ctest -R 'deepseek_v4|clip_mmproj_gguf'` reported **24 of 27 passed**. The
+three failures are characterised below, and NONE of them is caused by this
+wave's change, which before the fix touched only `tools/parity/`.
+
+**6. THE THREE REFUSALS.**
+
+- **The DEVICE decode attention refusal FIRES, and W4's "unmeasured" record is
+  now measured.** With `VT_V4_DEVICE_ATTN=1` on a CUDA build at sm_110,
+  `deepseek_v4.cpp:1319` threw by name: *"layer 0 runs the DEVICE decode kernel
+  at sliding_window 128 ... Refused by name; the windowed device kernel is owed
+  by issue #2411 ... Unset VT_V4_DEVICE_ATTN to take the host arm"*. It is
+  NECESSARY and it is kept. **Its IMAGE-SPAN half did not fire**, because
+  nothing in the suite drives an image span through `dev_attn`; that half stays
+  UNMEASURED and `## Owed` says so.
+- **The two DEVICE routers' media refusal was NOT driven.** No case reaches
+  `DispRoute` with image rows on a device arm, so it stays unmeasured.
+- **The paged image-span refusal** is gated on the host by
+  `test_deepseek_v4_mm_reach`, and it is unchanged by the device: the predicate
+  is `vt::AttentionWindow`'s one-window-per-call shape, which no device build
+  alters.
+
+**7. WHAT THIS DOES NOT SHOW.** One image at one size. No served image answer
+exists yet (see `## Owed`). No speed was measured, and no speed claim is made.
+No f32 device arm was run, so W6's condition (2) has no device counterpart. ROCm
+and Vulkan are untouched.
 
 ### W6 evidence — the first real-weight run, and vision parity against llama.cpp `b10766`
 
@@ -1631,8 +1857,34 @@ the row that owns the wiring and issue #2411.
 
 ## Now
 
-`ACTIVE`. W1, W2, W3, W4 and W5 have landed on the row branch, and W6 has run
-its first real-weight gates.
+`ACTIVE`. W1, W2, W3, W4 and W5 have landed on the row branch, W6 ran the first
+real-weight gates, and W7-CUDA has run the first DEVICE ones.
+
+W7-CUDA IS THE WAVE THAT PUT THE VISION TOWER ON A GPU. Before it, the tower
+could not take a CUDA queue at all: the `deepseek4v` mmproj reader left every
+weight a host view — its own comment said "W4 owns the upload" and W4 did the
+routing instead — so `ValidateQueue` refused every device queue, and a SERVED
+image request died with that same sentence rather than with the `fp8_ds_mla` KV
+blocker everyone expected. `EnsureResident` stages the tower on first use and
+rebuilds the MLP gate-up borrows against the staged tensors; the host-to-device
+case is added and the device-to-device case is still refused by name, so the
+refusal is narrowed rather than deleted. On `thor:gpu0` (sm_110) the tower then
+ran on the real 934,462,656-byte projector at every `lead_pad` rung and matched
+llama.cpp `b10766` DIRECTLY: the four sentinel kinds byte-exact, the identity
+permutation best for 100 of 100 rows, cells at 2.884% mean relative L2 and
+0.99939 mean cosine — inside W6's declared bound of 4.9% and 0.998, and closer
+to the oracle than our own CPU arm. W4's windowed `dev_attn` refusal, which no
+CPU build could execute, FIRED and is now measured. The numbers, the job ids and
+what stays unmeasured are in `### W7-CUDA evidence`.
+
+WHAT W7-CUDA DID NOT DO. No image has been ANSWERED yet: the served request now
+gets past the tower and dies at `vt: MatVec weight size mismatch`, which is a
+different, unexplained defect. The `dev_attn` image-span refusal and the two
+device routers' media refusal were never driven, so both stay unmeasured. Eight
+`mm_reach` cases fail on aarch64 for a host-side quant-repack reason proven by
+an A/B, not a device one. `test_serve_deepseek_v4_mm` times out with no output
+and nothing here explains it. No speed was measured. ROCm and Vulkan are
+untouched. Every one of these is under `## Owed`.
 
 W6 IS THE FIRST TIME THE REAL WEIGHTS RAN, and the vision half is right. On
 `thor:gpu0`, the pinned `UD-IQ1_S` language model loads and generates text, and

@@ -610,8 +610,13 @@ TEST_CASE("oversubscribed dispatch does not cost a scheduler timeslice") {
   MESSAGE("empty-op dispatch: " << fits << " threads " << fits_us << " us, "
                                 << over << " threads " << over_us
                                 << " us, ratio " << ratio);
-  CHECK_MESSAGE(ratio < 100.0,
-                "oversubscribed dispatch is " << ratio
-                    << "x the fitted cost: the waiter is spinning through a "
+  // Floor the threshold so a 4-vCPU runner whose fits arm measures
+  // sub-microsecond dispatch does not trip the ratio on scheduler jitter
+  // alone. The defect this test guards produces a full scheduler timeslice
+  // (3-6 ms on 20 cores), so a 100 us floor sits ~30x below the defect floor.
+  constexpr double kOverUsFloor = 100.0;
+  CHECK_MESSAGE(over_us < std::max(100.0 * fits_us, kOverUsFloor),
+                "oversubscribed dispatch costs " << over_us
+                    << " us: the waiter is spinning through a "
                        "scheduler timeslice instead of yielding its core");
 }

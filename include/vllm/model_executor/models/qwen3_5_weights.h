@@ -225,6 +225,73 @@ struct OwnedTensor {
 // behavior (house convention for a default-on residency change).
 void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w);
 
+// Drop the resident host pages a just-STAGED weight's borrowed source span still
+// holds, on a device whose kernels cannot read host memory.
+//
+// WHAT IT IS FOR. `ResidentWeight`'s staging arm copies the weight to the device
+// and leaves every source page mapped for the process lifetime. For a GGUF
+// keep-quant load that is the WHOLE MODEL: 65.488 GiB on the 67.56 GiB
+// `Qwen3.8-Flash-Next UD-IQ1_S`, faulted in by the load-time prefault and read
+// exactly once. `ReleaseHost()`'s borrowed branch declines to `madvise` those
+// pages, arguing that clean file-backed pages are reclaimable without our help.
+// That argument holds against the page reclaimer and FAILS against the KFD,
+// which walks what this process has resident: on gfx1151 the load then wedges
+// forever in `svm_range_set_attr` with a 31 GiB host
+// (.agents/specs/rocm-host-residency-after-upload.md).
+//
+// This is llama.cpp's `unmap_fragment` (`src/llama-mmap.cpp:492-507`, called at
+// `src/llama-model-loader.cpp:1683-1694` after the offloaded tensors are set)
+// expressed as `MADV_DONTNEED` rather than `munmap`, which is the spelling this
+// tree already uses for the same job in `GgufFile::DropSpanResidency`,
+// `ReleaseHost` and `AdoptDeviceBytesAsHost`. The borrow itself is untouched and
+// stays a valid, re-faultable `PROT_READ MAP_PRIVATE` view, so a later read
+// re-faults the identical bytes from the file. The cost of being wrong is a page
+// fault, never a wrong token.
+//
+// THREE PRECONDITIONS, ALL CHECKED HERE.
+//
+//  1. The device cannot dereference host storage
+//     (`vt::Backend::DeviceMemoryIsHostAddressable()` false). Where it can, the
+//     bytes ARE the weight and `AdoptDeviceBytesAsHost` handles it instead.
+//  2. `bytes` is BORROWED. An owned buffer is `ReleaseHost`'s business.
+//  3. `mmap_fd >= 0`. This is the discriminator that makes the call SAFE, and it
+//     is not a convenience. `MADV_DONTNEED` on a file-backed private mapping
+//     drops re-faultable pages; on ANONYMOUS memory it ZEROES them. The other
+//     borrow producer in this tree is a tied pair's shared bf16 expansion, which
+//     is anonymous and whose keep-alive both tensors share. Only the mmap-borrow
+//     path sets `mmap_fd` (`SourceOfSpan`, qwen3_5_gguf_weights.cpp), so asking
+//     for it is asking "are these pages backed by a file I can re-read".
+//
+// IT MUST BE CALLED FROM BEHIND THE `d_dev` MEMO, and #1299 is why: the caller
+// reaches `ResidentWeight` about 1,361 times per forward step on that
+// checkpoint, so a release that re-tested its condition on every call would
+// `MADV_DONTNEED` the pages the GPU is about to read on every step and the
+// kernel would fault them straight back in. Correctness survives that;
+// throughput does not. The one production call site is inside
+// `if (!w.d_dev)` and `BorrowReleaseSnapshot().calls` is what makes that
+// checkable rather than asserted.
+//
+// It SYNCHRONIZES `queue` before releasing anything, because the staging copy is
+// `hipMemcpyAsync` on a stream and dropping the source pages under a live DMA is
+// a correctness bug rather than a residency one. The synchronize is skipped
+// entirely when the preconditions do not hold, so a backend this does not apply
+// to pays nothing.
+//
+// Returns true when pages were released.
+bool MaybeReleaseStagedBorrowSource(vt::Backend& backend, vt::Queue& queue,
+                                    const OwnedTensor& w);
+
+// What `MaybeReleaseStagedBorrowSource` has done in this process. `calls` counts
+// the releases that HAPPENED, not the invocations that declined, for the same
+// reason `NoteGgufPrefaultedSpan` counts after the fact: an `madvise` changes no
+// byte, so a count of the ones that ran is the only thing that separates a
+// release from a skip. Read it at a stated point; it is cumulative.
+struct BorrowReleaseStats {
+  uint64_t calls = 0;
+  uint64_t bytes = 0;
+};
+BorrowReleaseStats BorrowReleaseSnapshot();
+
 // The whole of `src` as a ZERO-COPY view: same bytes, shape, dtype, `nk` and
 // layout markers, with a keep-alive on `src`'s buffer.
 //

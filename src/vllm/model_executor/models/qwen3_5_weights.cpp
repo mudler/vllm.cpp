@@ -368,6 +368,51 @@ OwnedTensor BorrowWholeOwnedTensor(OwnedTensor& src) {
   return v;
 }
 
+namespace {
+
+struct AtomicBorrowReleaseStats {
+  std::atomic<uint64_t> calls{0};
+  std::atomic<uint64_t> bytes{0};
+};
+
+AtomicBorrowReleaseStats& BorrowReleaseStatsRef() {
+  static AtomicBorrowReleaseStats s;
+  return s;
+}
+
+}  // namespace
+
+BorrowReleaseStats BorrowReleaseSnapshot() {
+  const AtomicBorrowReleaseStats& s = BorrowReleaseStatsRef();
+  BorrowReleaseStats out;
+  out.calls = s.calls.load(std::memory_order_relaxed);
+  out.bytes = s.bytes.load(std::memory_order_relaxed);
+  return out;
+}
+
+bool MaybeReleaseStagedBorrowSource(vt::Backend& backend, vt::Queue& queue,
+                                    const OwnedTensor& w) {
+  // See the header for each of the three. The ORDER matters only in that the
+  // cheap, allocation-free tests come before the synchronize: a backend this
+  // does not apply to must not pay a stream sync per weight to find that out.
+  if (backend.DeviceMemoryIsHostAddressable()) return false;
+  if (w.bytes.empty() || !w.bytes.borrowed()) return false;
+  if (w.mmap_fd < 0) return false;
+  // THE STAGING COPY IS ASYNCHRONOUS. `RocmBackend::Copy` is `hipMemcpyAsync` on
+  // `queue`'s stream, and the CUDA backend's is the same shape. Releasing the
+  // source under a live DMA would be a correctness bug, not a residency one, so
+  // the copy is waited for here. This runs once per weight (see the `d_dev`
+  // memo note in the header), so it is a first-forward cost and not a per-step
+  // one.
+  backend.Synchronize(queue);
+  const size_t nb = w.bytes.size();
+  DropResidentInteriorPages(w.bytes.data(), nb);
+  AtomicBorrowReleaseStats& st = BorrowReleaseStatsRef();
+  st.calls.fetch_add(1, std::memory_order_relaxed);
+  st.bytes.fetch_add(static_cast<uint64_t>(nb), std::memory_order_relaxed);
+  return true;
+}
+
 void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w) {
   if (w.d_dev == nullptr) return;
   // ENG-LOAD-DIRECT-UPLOAD: a direct-upload borrow is the ONE borrow that may be

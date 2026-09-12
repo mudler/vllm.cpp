@@ -218,6 +218,34 @@ bool GgufNvfp4ComputeAvailable(vt::DeviceType dev);
 bool QuantRepackForDevice(bool keep_quant, bool cpu_ref,
                           bool host_repack_active, vt::DeviceType dev);
 
+// Whether a BORROWED span should be PREFAULTED at load, for a load the engine
+// resolved onto `dev`.
+//
+// The prefault (`PrefaultBorrowedSpan`, qwen3_5_gguf_weights.cpp) faults a
+// borrowed span in at load with `madvise(MADV_WILLNEED)` plus a synchronous
+// one-byte-per-page read, so the page traps land off the timed prefill instead
+// of inside it. That is worth paying for exactly when the borrowed pages are
+// what the FORWARD reads -- the CPU tier, and a device whose kernels can
+// dereference host storage.
+//
+// On a device that STAGES, they are not. `ResidentWeight` copies the weight to
+// the device once and the host pages are never read again, so the prefault
+// reads the whole model off disk into pages one `memcpy` then consumes. On
+// gfx1151 that is 65.488 GiB of resident file pages on a 31 GiB host, and the
+// load wedges in `svm_range_set_attr`
+// (.agents/specs/rocm-host-residency-after-upload.md).
+//
+// THIS DECIDES THE DEFAULT ONLY. `VT_GGUF_PREFAULT` and
+// `vllm_cpp.mmap.prefault` still win, because the A/B they exist for has to
+// stay available in the same binary on the very device this narrows.
+// `ResolveGgufPrefault` remains the sole reader of that variable; this asks
+// `GgufPrefaultIsExplicit()` whether it was set at all.
+//
+// `dev` is a PARAMETER for the same reason `QuantRepackForDevice`'s is: a
+// decision that takes its inputs can be checked from a host that is not the one
+// it decides for.
+bool GgufPrefaultForDevice(vt::DeviceType dev);
+
 // Loader-wide residency policy.
 struct GgufLoadPolicy {
   // Master switch for keep-quant residency. The STRUCT default stays false so
@@ -343,6 +371,15 @@ struct GgufLoadPolicy {
   // until then a wrong default would be a silent correctness bug, not a slow
   // path.
   bool elem_kn_repack = false;
+  // Whether a BORROWED span is PREFAULTED at load. `FromEnv` resolves it through
+  // `GgufPrefaultForDevice(dev)` above, exactly as `quant_repack` is resolved
+  // through `QuantRepackForDevice(..., dev)`, so the decision carries the
+  // ENGINE's device rather than being a literal at each call site.
+  //
+  // The STRUCT default is `true`, which is what every call site passed before
+  // this field existed, so a hand-built policy and a caller that still passes
+  // the argument itself are both unchanged.
+  bool prefault = true;
   // Optional observer; null in production.
   GgufRoutingAudit audit;
 

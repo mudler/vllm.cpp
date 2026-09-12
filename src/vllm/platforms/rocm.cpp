@@ -125,12 +125,33 @@ class RocmPlatform final : public Platform {
   // probe) — the ONE field the device-fit check reads. The other two fields
   // stay DEFAULT/false, unlike CUDA's: `release_host_weights_after_upload`
   // and `uses_device_memory_pool` are separate policy questions (a discrete
-  // card's host-copy release and DevicePool reuse) this row does not touch,
-  // because on a unified part (780M, Strix Halo) freeing the host copy after
-  // "upload" would free the ONLY copy — the same answer CPU, Metal and Vulkan
-  // give for the same reason, and per-DEVICE (not per-DEVICE-TYPE) besides.
-  // Flip those when a discrete board's release/pool behavior is actually
-  // measured, not as a side effect of making the budget check reachable.
+  // card's host-copy release and DevicePool reuse) this row does not touch.
+  //
+  // THE REASON THIS COMMENT USED TO GIVE IS FALSE, AND SAYING SO IS THE POINT.
+  // It read: "on a unified part (780M, Strix Halo) freeing the host copy after
+  // 'upload' would free the ONLY copy — the same answer CPU, Metal and Vulkan
+  // give for the same reason". #2511 falsified that premise. gfx1151 reports
+  // `pageableMemoryAccess = 0`, so `HostMemoryIsDeviceAddressable` answers
+  // false (`vt/rocm/rocm_backend.hip`, and `host_memory_is_device_addressable`
+  // above), `ResidentWeight`'s host-alias arm is not taken, and its staging
+  // branch always makes a real second copy on the device. The host copy has not
+  // been the only copy on this part since that change landed. Left uncorrected,
+  // that sentence is what kept 65.488 GiB of spent GGUF source pages resident
+  // on a 31 GiB host until the load wedged in `svm_range_set_attr`
+  // (.agents/specs/rocm-host-residency-after-upload.md).
+  //
+  // THE FLAG NONETHELESS STAYS FALSE, for a different and checkable reason.
+  // Nothing reads it except `ShouldReleaseHostWeights` and
+  // `ShouldInterleaveLoadStream` (`platforms/interface.h`), and BOTH also
+  // require `marlin_committed`, which no ROCm path sets. Flipping it here would
+  // therefore change no behaviour while asserting a release/pool measurement
+  // nobody has taken on this board. The host-residency release that defect
+  // needed is gated instead on the property that is load-bearing and checkable
+  // at the call site — the device cannot dereference host memory and the source
+  // is a re-faultable read-only file mapping — in
+  // `MaybeReleaseStagedBorrowSource` (qwen3_5_weights.h). Flip these two when a
+  // board's release/pool behavior is actually measured, not as a side effect of
+  // making the budget check reachable.
   ResidencyPolicy residency_policy() const override {
     ResidencyPolicy p;
     p.device_memory_total_bytes = device_memory_total_bytes_;

@@ -42,15 +42,26 @@
 // staging flag — is what selects it.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <new>
 #include <stdexcept>
 #include <vector>
 
 #include "vllm/model_executor/models/owned_bytes.h"
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
+#include "vllm/config/weight_residency.h"
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
+#include "vllm/model_executor/models/qwen3_5.h"
 #include "vllm/model_executor/models/qwen3_5_dense.h"
 #include "vllm/model_executor/models/qwen3_5_internal.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
@@ -738,4 +749,340 @@ TEST_CASE("stage-vs-retag: a model larger than the whole box REFUSES without wra
   // wrap when 2*model overflows the comparison.
   CHECK_FALSE(vllm::StagingFitsModel(200ull << 30, 119ull << 30, 12ull << 30));
   CHECK_FALSE(vllm::StagingFitsModel(1ull << 30, 8ull << 30, 12ull << 30));
+}
+
+
+// ---------------------------------------------------------------------------
+// THE SPENT SOURCE PAGES OF A STAGED BORROW (.agents/specs/
+// rocm-host-residency-after-upload.md).
+//
+// `ResidentWeight`'s staging arm copies a weight to the device and then leaves
+// every source page of it mapped for the process lifetime. For a GGUF keep-quant
+// load those source pages ARE the whole model: 65.488 GiB on the 67.56 GiB
+// `Qwen3.8-Flash-Next UD-IQ1_S`, faulted in by the load-time prefault and read
+// exactly once by the copy. `ReleaseHost()`'s borrowed branch declines to touch
+// them on the argument that clean file-backed pages are the kernel's problem,
+// which holds against the page reclaimer and fails against the KFD: on gfx1151
+// the load wedges forever inside `svm_range_set_attr` with a 31 GiB host.
+//
+// WHY THIS IS MEASURED AS RESIDENT PAGES AND NOT AS A COUNTER ALONE. An
+// `madvise(MADV_DONTNEED)` changes no byte, moves no pointer and allocates
+// nothing, so every observable a staging case already has stays identical
+// whether it ran or not. A counter says the call happened; only the kernel's own
+// accounting says the pages went. Both are asserted below, because a counter
+// that is the ONLY instrument is the shape that has produced false greens here
+// before.
+#if defined(__linux__)
+namespace {
+
+// `VmRSS` in KiB, the figure the KFD's resident-system-memory accounting is
+// about. Returns 0 when it cannot be read, which a case treats as "cannot
+// measure" rather than as a pass.
+size_t VmRssKib() {
+  std::FILE* f = std::fopen("/proc/self/status", "r");
+  if (f == nullptr) return 0;
+  char line[256];
+  size_t kib = 0;
+  while (std::fgets(line, sizeof(line), f) != nullptr) {
+    if (std::strncmp(line, "VmRSS:", 6) == 0) {
+      kib = static_cast<size_t>(std::strtoull(line + 6, nullptr, 10));
+      break;
+    }
+  }
+  std::fclose(f);
+  return kib;
+}
+
+// A real file, mapped PROT_READ MAP_PRIVATE, standing in for the GGUF mapping.
+// It has to be a REAL file: the whole safety argument for the release is that
+// the borrow stays a re-faultable view, and a mapping with nothing behind it
+// cannot prove that.
+class MappedFile {
+ public:
+  explicit MappedFile(size_t bytes) : bytes_(bytes) {
+    std::snprintf(path_, sizeof(path_), "/tmp/vt_borrow_release_XXXXXX");
+    fd_ = ::mkstemp(path_);
+    if (fd_ < 0) return;
+    ::unlink(path_);  // the descriptor keeps it alive; nothing is left behind
+    std::vector<uint8_t> chunk(1u << 20);
+    for (size_t i = 0; i < chunk.size(); ++i)
+      chunk[i] = static_cast<uint8_t>((i * 31 + 7) & 0xFF);
+    for (size_t off = 0; off < bytes_; off += chunk.size()) {
+      const size_t n = std::min(chunk.size(), bytes_ - off);
+      if (::write(fd_, chunk.data(), n) != static_cast<ssize_t>(n)) return;
+    }
+    void* p = ::mmap(nullptr, bytes_, PROT_READ, MAP_PRIVATE, fd_, 0);
+    if (p == MAP_FAILED) return;
+    addr_ = static_cast<uint8_t*>(p);
+  }
+  ~MappedFile() {
+    if (addr_ != nullptr) ::munmap(addr_, bytes_);
+    if (fd_ >= 0) ::close(fd_);
+  }
+  MappedFile(const MappedFile&) = delete;
+  MappedFile& operator=(const MappedFile&) = delete;
+
+  // Make every page RESIDENT, which is what the load-time prefault does and what
+  // gives this case something to watch go away.
+  void Prefault() const {
+    volatile uint8_t sink = 0;
+    const size_t ps = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+    for (size_t off = 0; off < bytes_; off += ps) sink = sink ^ addr_[off];
+    (void)sink;
+  }
+
+  bool ok() const { return addr_ != nullptr; }
+  const uint8_t* data() const { return addr_; }
+  size_t size() const { return bytes_; }
+  int fd() const { return fd_; }
+
+ private:
+  char path_[64] = {};
+  int fd_ = -1;
+  uint8_t* addr_ = nullptr;
+  size_t bytes_ = 0;
+};
+
+// A weight that BORROWS `f`, shaped exactly as the GGUF keep-quant borrow the
+// loader builds: a keep-alive on the mapping, and `mmap_fd` set, which is the
+// discriminator that says these pages are backed by a file and may be dropped.
+OwnedTensor BorrowWeight(const MappedFile& f, int64_t vocab, int64_t hidden) {
+  OwnedTensor w;
+  w.dtype = DType::kBF16;
+  w.rank = 2;
+  w.shape[0] = vocab;
+  w.shape[1] = hidden;
+  w.nk = false;  // a gather table, which is what the bridge below binds
+  std::shared_ptr<const void> keep(static_cast<const void*>(f.data()),
+                                   [](const void*) {});  // owned by MappedFile
+  w.bytes = vllm::OwnedBytes::Borrow(f.data(), f.size(), std::move(keep));
+  w.mmap_fd = f.fd();
+  w.mmap_file_offset = 0;
+  return w;
+}
+
+constexpr int64_t kBigVocab = 4096;
+constexpr int64_t kBigHidden = 8192;  // 4096 * 8192 * 2 = 64 MiB
+
+}  // namespace
+
+TEST_CASE("a STAGED borrow's source pages are released, and the RSS says so") {
+  const PlatformArm arm(false);  // a device that cannot read host memory
+  MappedFile f(static_cast<size_t>(kBigVocab * kBigHidden) * 2);
+  REQUIRE(f.ok());
+  f.Prefault();
+
+  const size_t rss_resident = VmRssKib();
+  REQUIRE(rss_resident > 0);  // unreadable /proc is "cannot measure", not a pass
+
+  const OwnedTensor w = BorrowWeight(f, kBigVocab, kBigHidden);
+  const vllm::BorrowReleaseStats before = vllm::BorrowReleaseSnapshot();
+
+  // THROUGH THE PRODUCTION BRIDGE, not through the test seam. `Qwen3_5EmbeddingTable`
+  // is the call the forward makes; a case that hand-built the operand one step
+  // later would prove the helper works and not that anything reaches it.
+  Queue q = XpuQueue();
+  const Tensor t = vllm::Qwen3_5EmbeddingTable(Fake(), q, w, kBigVocab, kBigHidden);
+
+  REQUIRE(w.d_dev != nullptr);           // it really staged
+  REQUIRE(t.data == w.d_dev.get());
+
+  const vllm::BorrowReleaseStats after = vllm::BorrowReleaseSnapshot();
+  CHECK(after.calls == before.calls + 1);
+  CHECK(after.bytes == before.bytes + f.size());
+
+  // THE ASSERTION THE COUNTER CANNOT MAKE. The 64 MiB of file pages this case
+  // faulted in are gone from this process's resident set. The bar is HALF the
+  // span rather than all of it, because the staging copy itself allocated 64 MiB
+  // of device (here: malloc'd) memory that is also resident and is supposed to
+  // stay: what is asserted is that the SOURCE went, against that background.
+  const size_t rss_after = VmRssKib();
+  CHECK(rss_resident > rss_after);
+  CHECK(rss_resident - rss_after >= (f.size() / 2) / 1024);
+
+  // ...AND THE BORROW IS STILL A VALID VIEW, which is the entire safety
+  // argument: MADV_DONTNEED on a private file mapping drops re-faultable pages,
+  // so reading them back re-faults the identical bytes from the file. If this
+  // ever reads differently, the release is touching something anonymous.
+  CHECK(w.bytes.data() == f.data());
+  CHECK(std::memcmp(w.bytes.data(), t.data, f.size()) == 0);
+}
+
+TEST_CASE("the source release happens ONCE, not on every step (#1299's shape)") {
+  // #1299 IS THE HAZARD, AND IT IS NOT HYPOTHETICAL HERE. `ResidentWeight` runs
+  // about 1,361 times per forward step on the target checkpoint. An unmemoized
+  // release would `MADV_DONTNEED` the pages the GPU is about to read on every
+  // one of them, and the kernel would fault them straight back in: correct
+  // tokens, destroyed throughput, and nothing in a token gate to see it. The
+  // release is inside `if (!w.d_dev)` for exactly this reason, and this case is
+  // what makes that placement checkable. Move it outside the memo and the count
+  // below becomes 8.
+  const PlatformArm arm(false);
+  MappedFile f(1u << 20);
+  REQUIRE(f.ok());
+  f.Prefault();
+  const int64_t vocab = 64;
+  const int64_t hidden = (1 << 20) / (64 * 2);
+  const OwnedTensor w = BorrowWeight(f, vocab, hidden);
+
+  const vllm::BorrowReleaseStats before = vllm::BorrowReleaseSnapshot();
+  Queue q = XpuQueue();
+  for (int i = 0; i < 8; ++i)
+    (void)vllm::Qwen3_5EmbeddingTable(Fake(), q, w, vocab, hidden);
+  const vllm::BorrowReleaseStats after = vllm::BorrowReleaseSnapshot();
+
+  CHECK(after.calls == before.calls + 1);
+  CHECK(after.bytes == before.bytes + f.size());
+}
+
+TEST_CASE("a HOST-ADDRESSABLE device releases nothing: those bytes are the weight") {
+  // The other side of the predicate. Where the kernels can follow a host
+  // pointer the source pages are not spent at all -- they are what the weight
+  // IS -- so dropping them would cost a fault on the very next read.
+  // `AdoptDeviceBytesAsHost` owns that case and declines it for a borrow.
+  const PlatformArm arm(true);
+  MappedFile f(1u << 20);
+  REQUIRE(f.ok());
+  f.Prefault();
+  const int64_t vocab = 64;
+  const int64_t hidden = (1 << 20) / (64 * 2);
+  const OwnedTensor w = BorrowWeight(f, vocab, hidden);
+
+  const vllm::BorrowReleaseStats before = vllm::BorrowReleaseSnapshot();
+  Queue q = XpuQueue();
+  (void)vllm::Qwen3_5EmbeddingTable(Fake(), q, w, vocab, hidden);
+  CHECK(vllm::BorrowReleaseSnapshot().calls == before.calls);
+}
+
+TEST_CASE("an ANONYMOUS borrow is never released: MADV_DONTNEED would ZERO it") {
+  // THE DISCRIMINATOR, AND WHY IT IS NOT A CONVENIENCE. `MADV_DONTNEED` on a
+  // private FILE mapping drops re-faultable pages; on ANONYMOUS memory it
+  // zeroes them. The tree's other borrow producer is a tied pair's shared bf16
+  // expansion, which is anonymous and which both tensors read. `mmap_fd` is set
+  // only on the mmap-borrow path, so requiring it is what keeps the release off
+  // those pages. Clear the field and this case is what goes red -- with the
+  // wrong bytes, not with a count.
+  const PlatformArm arm(false);
+  const size_t nb = static_cast<size_t>(kN * kK) * 2;
+  auto* block = new uint8_t[nb];
+  for (size_t i = 0; i < nb; ++i) block[i] = static_cast<uint8_t>(i & 0xFF);
+  const std::vector<uint8_t> expect(block, block + nb);
+  std::shared_ptr<const void> keep(static_cast<const void*>(block),
+                                   [](const void* p) {
+                                     delete[] static_cast<const uint8_t*>(p);
+                                   });
+  OwnedTensor w;
+  w.dtype = DType::kBF16;
+  w.rank = 2;
+  w.shape[0] = kN;
+  w.shape[1] = kK;
+  w.nk = false;
+  w.bytes = vllm::OwnedBytes::Borrow(block, nb, std::move(keep));
+  // mmap_fd deliberately LEFT AT -1: this is anonymous memory.
+  REQUIRE(w.mmap_fd == -1);
+
+  const vllm::BorrowReleaseStats before = vllm::BorrowReleaseSnapshot();
+  Queue q = XpuQueue();
+  (void)vllm::Qwen3_5EmbeddingTable(Fake(), q, w, kN, kK);
+  CHECK(vllm::BorrowReleaseSnapshot().calls == before.calls);
+  CHECK(std::memcmp(w.bytes.data(), expect.data(), nb) == 0);
+}
+#endif  // __linux__
+
+
+// ---------------------------------------------------------------------------
+// FIX 2: THE LOAD-TIME PREFAULT'S DEVICE TERM (`GgufPrefaultForDevice`).
+//
+// The prefault faults a borrowed span in at load so its page traps land off the
+// timed prefill. That is worth paying for where the FORWARD reads the borrowed
+// pages: the CPU tier, and a device whose kernels can dereference host storage.
+// On a device that stages, the copy is the only read there will ever be, so the
+// prefault reads the whole model off disk to populate pages one `memcpy` then
+// consumes -- 65.488 GiB on gfx1151, against a 31 GiB host.
+//
+// This fake platform is the only way to check that from a host with no such
+// device: the decision takes `dev`, so it can be asked about a device this
+// machine is not.
+namespace {
+
+// setenv/unsetenv around one case, restored on every exit path including a
+// REQUIRE that aborts the body -- the same discipline `PlatformArm` above
+// exists for, and for the same reason.
+struct EnvArm {
+  EnvArm(const char* name, const char* value) : name_(name) {
+    const char* prev = std::getenv(name);
+    had_ = prev != nullptr;
+    if (had_) prev_ = prev;
+    if (value == nullptr) ::unsetenv(name);
+    else ::setenv(name, value, 1);
+  }
+  ~EnvArm() {
+    if (had_) ::setenv(name_, prev_.c_str(), 1);
+    else ::unsetenv(name_);
+  }
+  const char* name_;
+  bool had_ = false;
+  std::string prev_;
+};
+
+}  // namespace
+
+TEST_CASE("the prefault DEFAULT follows the device, and the knob still wins") {
+  // With no knob set, the answer is the platform's own
+  // `host_memory_is_device_addressable()`.
+  {
+    const EnvArm knob("VT_GGUF_PREFAULT", nullptr);
+    {
+      const PlatformArm arm(true);  // kernels can read host memory
+      CHECK(vllm::GgufPrefaultForDevice(DeviceType::kXPU));
+    }
+    {
+      const PlatformArm arm(false);  // a device that stages
+      CHECK_FALSE(vllm::GgufPrefaultForDevice(DeviceType::kXPU));
+    }
+    // The CPU tier is where the prefault was measured and where it stays ON:
+    // there the borrowed pages ARE what the forward reads.
+    CHECK(vllm::GgufPrefaultForDevice(DeviceType::kCPU));
+  }
+
+  // AN EXPLICIT KNOB IS ANSWERED BEFORE THE DEVICE IS CONSULTED. The A/B this
+  // variable exists for has to stay reachable in the same binary on the very
+  // device the default narrows; a device term that could not be overridden
+  // would have removed the instrument along with the cost.
+  {
+    const PlatformArm arm(false);
+    const EnvArm on("VT_GGUF_PREFAULT", "1");
+    CHECK(vllm::GgufPrefaultForDevice(DeviceType::kXPU));
+    CHECK(vllm::GgufPrefaultIsExplicit());
+  }
+  // ...and =0 still turns it off everywhere, including where the default is ON.
+  {
+    const PlatformArm arm(true);
+    const EnvArm off("VT_GGUF_PREFAULT", "0");
+    CHECK_FALSE(vllm::GgufPrefaultForDevice(DeviceType::kXPU));
+    CHECK_FALSE(vllm::GgufPrefaultForDevice(DeviceType::kCPU));
+  }
+}
+
+TEST_CASE("FromEnv carries the prefault decision into the policy the loader reads") {
+  // THE ROUTING HALF. The decision above is only worth anything if the loader
+  // asks it: before this change every call site passed a literal `true`. This
+  // is the case that would stay green if `FromEnv` stopped setting the field,
+  // so it asserts the FIELD, on a policy built the way a load builds one.
+  const EnvArm knob("VT_GGUF_PREFAULT", nullptr);
+  {
+    const PlatformArm arm(false);
+    const vllm::GgufLoadPolicy p = vllm::GgufLoadPolicy::FromEnv(DeviceType::kXPU);
+    CHECK_FALSE(p.prefault);
+  }
+  {
+    const PlatformArm arm(true);
+    const vllm::GgufLoadPolicy p = vllm::GgufLoadPolicy::FromEnv(DeviceType::kXPU);
+    CHECK(p.prefault);
+  }
+  const vllm::GgufLoadPolicy cpu = vllm::GgufLoadPolicy::FromEnv(DeviceType::kCPU);
+  CHECK(cpu.prefault);
+  // A hand-built policy is unchanged: the struct default is what every call site
+  // passed before the field existed.
+  CHECK(vllm::GgufLoadPolicy{}.prefault);
 }

@@ -487,6 +487,18 @@ void NoteExpertStreamGeometry(int64_t slots, int64_t slot_bytes);
 // `setenv` could not affect anything, so both of its arms ran the same way.
 bool ResolveGgufPrefault();
 
+// Whether the prefault answer above was DECIDED by an operator -- the
+// `VT_GGUF_PREFAULT` knob or a `vllm_cpp.mmap.prefault` key -- rather than
+// falling through to the built-in default.
+//
+// It exists so that a caller may give the DEFAULT a device term without taking
+// the decision away from whoever set the knob (`GgufPrefaultForDevice`,
+// gguf_keep_quant.h). It lives HERE, beside the resolver, so that
+// `VT_GGUF_PREFAULT` still has exactly one reader in the tree: a second
+// `getenv` of that name in the model layer is how the two would come to
+// disagree about one load.
+bool GgufPrefaultIsExplicit();
+
 // Called by the prefault site after it has actually faulted a span in. Feeds
 // GgufPrefaultedSpanCount above; nothing else reads it.
 void NoteGgufPrefaultedSpan();

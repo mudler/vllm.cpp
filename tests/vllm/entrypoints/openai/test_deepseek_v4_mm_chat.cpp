@@ -912,14 +912,26 @@ TEST_CASE("dsv4 mm chat: two images reach the server through the production inst
     // on the text bias -- fluently and wrong. That device arm is owed by #2411
     // W7-CUDA.
     //
-    // ASSERTING THE VISION-BIAS REFUSAL, not merely "not W7-device", is the
-    // point. A bare inequality would accept ANY failure, including a regression
-    // that stopped the request earlier -- which is exactly what this row has
-    // already lived through twice (the vision-residency refusal, then the host
-    // GEMM's `wq_a` layer 0). When W7-CUDA lands the per-row bias the request
-    // stops failing and takes the `served` branch above instead.
-    CHECK(image_run.error.find("deepseek_v4.cpp") != std::string::npos);
-    CHECK(image_run.error.find("W7-device") == std::string::npos);
-    CHECK(image_run.error.find("exp_probs_b_vl") != std::string::npos);
+    // THAT REFUSAL IS NOW ANSWERED, and this branch is the W7-CUDA gate
+    // (ISSUE-LOCAL-01M2C26CSZWB7WVRS5H7YPW4S8). The device routers carry the
+    // per-row bias selector, so a build with the V4 device kernels must SERVE the
+    // request and take the `served` branch above. Reaching here at all means it
+    // did not.
+    //
+    // IT IS ASSERTED AS AN EMPTY ERROR, not as "not the old refusal". A bare
+    // inequality would accept ANY failure, including a regression that stopped the
+    // request EARLIER -- which is exactly what this row has already lived through
+    // twice (the vision-residency refusal, then the host GEMM's `wq_a` layer 0).
+    // The INFO carries whatever wall replaced it, so a failure names the next
+    // blocker instead of leaving a reader to guess at one.
+    INFO("served-image error: ", image_run.error);
+    CHECK(image_run.error.empty());
+    // THE REFUSAL THAT REMAINS is a DIFFERENT predicate, and it is deliberately
+    // still live: a step carrying image rows whose LAYER has no `exp_probs_b_vl`
+    // is refused by name in `MoeBlock`, because that is a TEXT checkpoint being
+    // asked to route an image. It is host-side and arm-independent, so it fires on
+    // a CUDA build too. This fixture's vision checkpoint carries the tensor on
+    // every layer, so it must NOT be what stops this request.
+    CHECK(image_run.error.find("carries no `exp_probs_b_vl`") == std::string::npos);
   }
 }

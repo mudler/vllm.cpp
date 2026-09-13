@@ -876,17 +876,23 @@ guessed, and the blocker table in `## Owed` gains a row rather than a claim.
   DeepSeek-V4 publishes a multi-cache topology, so the image path is served on
   the non-paged branch only until the per-position mask lands. Issue #2411 and
   row `MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm` own it.
-- **The two DEVICE routers' media refusal was NEVER DRIVEN, and stays
-  unmeasured.** W7-CUDA built and ran this architecture's suites on a CUDA queue
-  on `thor:gpu0`, and no case reaches `DispRoute` with image rows on the
-  `be.device` or glue arm, so the `VT_CHECK` below has still never executed. The
-  device run happened; this particular refusal was not exercised by it, which is
-  a different thing and is recorded rather than glossed. A case that drives an
-  image step onto a device router is owed by issue #2411 and W7-CUDA.
-- **The two DEVICE routers take one bias pointer per call.** `DispRoute` refuses
-  a step carrying image rows on the `be.device` and glue arms rather than routing
-  them on the text bias, and the two resident single-token decode arms refuse an
-  out-of-vocabulary identifier. Owed by issue #2411 and W7-CUDA.
+- **The two DEVICE routers' media refusal is ANSWERED, and what remains owed is
+  the REACHABILITY MUTATION.** W7-CUDA gave `MoeDeviceKernels::route` and
+  `route_ip` a per-row bias selector, so a step carrying image rows is SERVED on
+  the `be.device` and glue arms instead of refused by name: an image row routes
+  on `exp_probs_b_vl`, a text row in the same step keeps the text bias, and on a
+  hash layer the image row leaves `tid2eid` while the text row still hashes.
+  Both CUDA kernels carry it, so the shipped warp top-k and its single-thread A/B
+  baseline agree on a media step as well as a text one. Measured on `thor:gpu0`,
+  rc job `bc9c74ce-e9f6-47e1-bde0-bb0939ad0ed8`; see `### W7-CUDA evidence`.
+  **THE MUTATION WAS NOT RUN.** Deleting the `DispRoute` pass-through in a
+  scratch copy and confirming the focused gate reds is what would prove the green
+  rests on the production call site rather than on a class that merely works, and
+  no run has done it. Issue #2411 and W7-CUDA own it.
+- **The two resident single-token decode arms still refuse an out-of-vocabulary
+  identifier**, and they pass the no-media values to `route_ip` because no image
+  row can legitimately reach them. Widening that refusal to carry image rows is
+  not done and is owed by issue #2411 and W7-CUDA.
 - **The DEVICE decode attention kernel takes no per-key index list, and W4 made
   that a divergence.** `deepseek_v4.cpp`'s `dev_attn` arm calls
   `DsaDevice()->decode_attn`, which derives its own key range from `kv_base + t`
@@ -1027,12 +1033,15 @@ guessed, and the blocker table in `## Owed` gains a row rather than a claim.
   an image block, so `MoeBlock` needs no new forward channel and a text step,
   whose identifiers are all below the vocabulary, is byte-identical.
 
-  The two DEVICE routers take one bias pointer per call and have no per-row
-  selector, so `DispRoute` REFUSES a step carrying image rows on those arms by
-  name rather than routing them on the text bias. The kernel change is owed by
-  issue #2411 and W7-CUDA. The two resident single-token decode arms refuse an
-  out-of-vocabulary identifier for the same reason, and they also read `embed`
-  with no bound, which that refusal now closes.
+  The two DEVICE routers NOW CARRY the per-row selector (W7-CUDA): `route` and
+  `route_ip` take `vision_bias` and `is_media_token`, and both CUDA kernels apply
+  the host rule per row, so `DispRoute` SERVES a step carrying image rows on
+  those arms rather than refusing it. The refusal that remains is a DIFFERENT
+  predicate and it lives in `MoeBlock`: a step carrying image rows whose LAYER
+  has no `exp_probs_b_vl` is refused by name there, with the width check beside
+  it, and that one is host-side and fires on every arm. The two resident
+  single-token decode arms still refuse an out-of-vocabulary identifier, and they
+  also read `embed` with no bound, which that refusal closes.
 
   **The refusal ORDER, CLOSED BY W4.** `RefuseDeepSeekV4ClipMmprojArm` holds it
   in one function and `model_loader.cpp` calls that function rather than its
@@ -1056,9 +1065,11 @@ guessed, and the blocker table in `## Owed` gains a row rather than a claim.
   `b10766` inside W6's declared bound; see `### W7-CUDA evidence`. What CUDA
   still cannot do is listed in the four entries below.
 
-- **THE HOST GEMM's WEIGHT SIZE MISMATCH IS CLOSED. The first blocker for a
-  served image on CUDA is now the MoE VISION-BIAS DEVICE ROUTER**, which is
-  W4-era code carrying its own named refusal and is owed by #2411 W7-CUDA.
+- **THE HOST GEMM's WEIGHT SIZE MISMATCH IS CLOSED, AND SO IS THE MoE
+  VISION-BIAS DEVICE ROUTER THAT REPLACED IT AS THE BLOCKER.** W7-CUDA gave the
+  two device routers a per-row bias selector, and a served image now comes back
+  ANSWERED on the synthetic fixture. See the table below and
+  `### W7-CUDA evidence`.
 
   **THE BLOCKER ORDER ON THIS ROW HAS MOVED FOUR TIMES UNDER MEASUREMENT, and
   each move was only visible because the previous blocker was genuinely
@@ -1069,7 +1080,8 @@ guessed, and the blocker table in `## Owed` gains a row rather than a claim.
   | 1 | `fp8_ds_mla` KV cache at engine start | **NOT what stops a CUDA build.** W6 measured it on a CPU build; `KV-DSV4-MULTICACHE` W5 (#2455) owns it and it is untouched here |
   | 2 | `DeepSeek-V4 vision queue and weights must share one device` | **CLOSED by W7-CUDA.** See `### W7-CUDA evidence` |
   | 3 | the host GEMM's weight size mismatch, thrown as the anonymous `vt: MatVec weight size mismatch` until it was named | **CLOSED.** Named, then root-caused to `ForwardDevice` never binding the keep-quant tower, then repaired. Measured gone on `thor:gpu0`, rc job `1b46515d-8caf-4c49-823e-efc7a1f3e3f4`. This entry |
-  | 4 | `deepseek-v4 MoE: this step carries image rows, which route on the vision bias `exp_probs_b_vl`, and the device router takes one bias for the whole call with no per-row selector` | **LIVE.** W4-era code refusing BY NAME rather than routing image rows on the text bias. The device arm is owed by #2411 W7-CUDA; it is not a regression from blocker 3's repair |
+  | 4 | `deepseek-v4 MoE: this step carries image rows, which route on the vision bias `exp_probs_b_vl`, and the device router takes one bias for the whole call with no per-row selector` | **CLOSED by W7-CUDA.** `route` and `route_ip` take `vision_bias` + `is_media_token` and both CUDA kernels select per row, so the step is SERVED rather than refused. `thor:gpu0`, rc job `bc9c74ce-e9f6-47e1-bde0-bb0939ad0ed8`: `image: served`, aarch64 repack ON and OFF alike |
+  | 5 | — | **NO FURTHER BLOCKER IS KNOWN ON THE SYNTHETIC FIXTURE.** With blocker 4 closed `test_deepseek_v4_mm_chat` returns an answer. This says nothing about the RELEASED checkpoint, which this row has still never served, and the blocker order has moved five times already — so this row is "none known", never "none exists" |
 
   **THE EXACT FAILING INVOCATION.** `test_deepseek_v4_mm_chat`'s served image
   request died with
@@ -1648,8 +1660,27 @@ wave's change, which before the fix touched only `tools/parity/`.
   NECESSARY and it is kept. **Its IMAGE-SPAN half did not fire**, because
   nothing in the suite drives an image span through `dev_attn`; that half stays
   UNMEASURED and `## Owed` says so.
-- **The two DEVICE routers' media refusal was NOT driven.** No case reaches
-  `DispRoute` with image rows on a device arm, so it stays unmeasured.
+- **The two DEVICE routers now SERVE a media step, and this is the measurement.**
+  rc job `bc9c74ce-e9f6-47e1-bde0-bb0939ad0ed8` on `thor:gpu0` (NVIDIA Thor,
+  compute_cap 11.0, driver 595.78, CUDA 13.0.88, aarch64), built from the tree at
+  spec commit `04fe5f4dc` plus the selector, 41 `.cu.o` and the V4 objects
+  `sm_110`, linked against `libcudart.so.13` and `libcublasLt.so.13`. Binaries
+  built by that run: `test_cuda_deepseek_v4` md5 `12b23adb4b6b4741bad7c19626f70211`,
+  `test_deepseek_v4_mm_chat` md5 `625faa37ecdfa3716c38a3ba8ddec628`.
+  - The focused case `W7-CUDA per-row vision bias` ran and passed: `test cases: 1
+    | 1 passed`, **102 assertions**. The matched-case count is read explicitly,
+    because a non-matching `-tc` filter prints `test cases: 0` AND
+    `Status: SUCCESS!`.
+  - The whole CUDA V4 suite: `test cases: 31 | 31 passed | 0 failed | 0 skipped`,
+    **90193 assertions**. Zero skipped, so no case silently sat out.
+  - `test_deepseek_v4_mm_chat`: `8 | 8 passed`, 650 assertions, and the served
+    image line reads **`image: served`** — with `VT_CPU_QUANT_REPACK` ON and OFF
+    alike, so the answer is not an artefact of the aarch64 i8mm repack path.
+  - **WHAT THIS IS NOT.** The fixture is the SYNTHETIC lang GGUF + `deepseek4v`
+    mmproj built by the suite, driven through the production entry point
+    (`LoadedEngine::FromModelDir` -> the installed seam -> `AsyncLLM` ->
+    `ModelRegistry::Forward`). It is NOT the released checkpoint, and no
+    real-weight image answer exists. The reachability mutation was not run.
 - **The paged image-span refusal** is gated on the host by
   `test_deepseek_v4_mm_reach`, and it is unchanged by the device: the predicate
   is `vt::AttentionWindow`'s one-window-per-call shape, which no device build
@@ -2270,10 +2301,20 @@ sentinels and the 100-of-100 identity permutation are what carry this result. W4
 CPU build could execute, FIRED and is now measured. The numbers, the job ids and
 what stays unmeasured are in `### W7-CUDA evidence`.
 
-WHAT W7-CUDA DID NOT DO. No image has been ANSWERED yet: the served request now
-gets past the tower and dies at `vt: MatVec weight size mismatch`, which is a
-different, unexplained defect. The `dev_attn` image-span refusal and the two
-device routers' media refusal were never driven, so both stay unmeasured. Eight
+AN IMAGE NOW SERVES ON CUDA, AND THAT IS THIS WAVE'S RESULT. The `wq_a`
+host-GEMM defect was root-caused to `ForwardDevice` never binding the keep-quant
+tower and repaired; the MoE vision-bias device router, the blocker that replaced
+it, now carries a PER-ROW selector, so `test_deepseek_v4_mm_chat`'s two-image
+request returns `image: served` on `thor:gpu0` — rc job
+`bc9c74ce-e9f6-47e1-bde0-bb0939ad0ed8`, aarch64 repack ON and OFF alike, the
+CUDA V4 suite 31/31 with 90193 assertions and the focused selector case 1/1 with
+102. THAT IS THE SYNTHETIC FIXTURE through the production entry point, NOT the
+released checkpoint: no real-weight image answer exists, and none is claimed.
+
+WHAT W7-CUDA STILL HAS NOT DONE. The REACHABILITY MUTATION for the new selector
+was not run, so nothing has yet proved the green rests on the production call
+site rather than on a class that merely works. The `dev_attn` image-span refusal
+was never driven, so it stays unmeasured. Eight
 `mm_reach` cases fail on aarch64 for a host-side quant-repack reason proven by
 an A/B, not a device one. `test_serve_deepseek_v4_mm` times out with no output
 and nothing here explains it. No speed was measured. ROCm and Vulkan are

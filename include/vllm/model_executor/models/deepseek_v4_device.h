@@ -199,7 +199,18 @@ struct MoeDeviceKernels {
                           const std::vector<float>& e_score_correction_bias, bool renormalize,
                           float routed_scaling_factor,
                           const std::vector<int64_t>& input_tokens,
-                          const std::vector<int32_t>& hash_indices_table, int64_t vocab_size);
+                          const std::vector<int32_t>& hash_indices_table, int64_t vocab_size,
+                          // MODEL-MM-deepseek-v4 W7-CUDA (#2411): the PER-ROW bias
+                          // selector, meaning exactly what it means in the host arm
+                          // `SqrtSoftplusRouteTopk`. An IMAGE row routes on
+                          // `exp_probs_b_vl` and takes the learned top-k; on a HASH
+                          // layer that REPLACES the tid2eid route for that row alone,
+                          // while a text row in the same step still hashes. Either
+                          // vector empty means no row is media, which is the host
+                          // arm's own `any_media` rule and leaves a text step
+                          // byte-identical.
+                          const std::vector<float>& vision_bias,
+                          const std::vector<char>& is_media_token);
   std::vector<float> (*clamped_swiglu)(vt::Queue&, const std::vector<float>& gate_up,
                                        int64_t d, float limit, float alpha, float beta);
   // Brick B — IN-PLACE clamped-SwiGLU: reads gate_up[2*d], writes out[d] on the
@@ -213,7 +224,14 @@ struct MoeDeviceKernels {
   void (*route_ip)(vt::Queue&, int32_t* topk_ids, float* topk_weights, const float* gating,
                    int64_t T, int64_t E, int64_t topk, const float* bias, bool has_bias,
                    const int64_t* in_tokens, bool is_hash, const int32_t* hashtab,
-                   int64_t vocab, bool renorm, float scale);
+                   int64_t vocab, bool renorm, float scale,
+                   // W7-CUDA (#2411): the same per-row selector as `route`, in this
+                   // seam's pointer vocabulary. A null `is_media_token`, or
+                   // `has_vision_bias == false`, means no row is media.
+                   // `is_media_token` is one `char` per row, matching the host
+                   // `std::vector<char>` rather than assuming `bool` width.
+                   const float* vision_bias, bool has_vision_bias,
+                   const char* is_media_token);
   // Brick C — MoE combine: out[h] = Σ_a weights[a]*eo[a*H+h] (per-h sequential over
   // the A experts; near-tie vs host — device FMA contraction). In place on the queue.
   void (*moe_combine)(vt::Queue&, float* out, const float* eo, const float* weights, int64_t A,

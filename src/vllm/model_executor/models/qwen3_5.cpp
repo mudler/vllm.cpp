@@ -1316,7 +1316,10 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
     // re-tested its condition each time would madvise away the pages the GPU is
     // about to read, every step. The helper states its other two preconditions
     // and synchronizes the queue before it touches anything.
-    vllm::MaybeReleaseStagedBorrowSource(d.b, d.q, w);
+    vllm::MaybeReleaseStagedBorrowSource(
+        d.b, d.q, w,
+        vllm::platforms::GetPlatform(d.q.device.type)
+            .host_memory_is_device_addressable());
     // Same adoption as the dense block's ResidentWeight: on a host-addressable
     // device the uploaded buffer IS the host buffer, so keeping the mirror
     // costs a second full copy of the model out of the same unified RAM.

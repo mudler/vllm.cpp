@@ -391,11 +391,15 @@ BorrowReleaseStats BorrowReleaseSnapshot() {
 }
 
 bool MaybeReleaseStagedBorrowSource(vt::Backend& backend, vt::Queue& queue,
-                                    const OwnedTensor& w) {
+                                    const OwnedTensor& w, bool host_addressable) {
   // See the header for each of the three. The ORDER matters only in that the
   // cheap, allocation-free tests come before the synchronize: a backend this
   // does not apply to must not pay a stream sync per weight to find that out.
-  if (backend.DeviceMemoryIsHostAddressable()) return false;
+  //
+  // BOTH host-addressability predicates, because they answer different
+  // questions and a weight can reach this arm with them disagreeing. The
+  // header says which is which.
+  if (host_addressable || backend.DeviceMemoryIsHostAddressable()) return false;
   if (w.bytes.empty() || !w.bytes.borrowed()) return false;
   if (w.mmap_fd < 0) return false;
   // THE STAGING COPY IS ASYNCHRONOUS. `RocmBackend::Copy` is `hipMemcpyAsync` on

@@ -250,9 +250,21 @@ void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w);
 //
 // THREE PRECONDITIONS, ALL CHECKED HERE.
 //
-//  1. The device cannot dereference host storage
-//     (`vt::Backend::DeviceMemoryIsHostAddressable()` false). Where it can, the
-//     bytes ARE the weight and `AdoptDeviceBytesAsHost` handles it instead.
+//  1. The device cannot dereference host storage. TWO predicates answer that,
+//     they are not the same question, and asking only one is a defect this
+//     file's own gate caught. `vllm::platforms::Platform::
+//     host_memory_is_device_addressable()` is what `ResidentWeight` selects the
+//     ALIAS arm on (issues #125, #1299): may a kernel follow a host pointer.
+//     `vt::Backend::DeviceMemoryIsHostAddressable()` is the converse: is a
+//     DEVICE allocation host-dereferenceable (GB10 answers false while being
+//     physically unified). A weight can reach the staging arm on a platform
+//     whose answer is YES -- a misaligned borrow declines the alias and falls
+//     through -- and releasing its pages there would drop memory the kernels
+//     may still read directly. So the CALLER passes its already-computed
+//     platform answer in as `host_addressable` and the helper refuses on
+//     either. One predicate, computed once, exactly as #2406 made
+//     `QuantRepackForDevice` take its `dev`: a second spelling is how a
+//     refusal and its route predicate come to disagree about one weight.
 //  2. `bytes` is BORROWED. An owned buffer is `ReleaseHost`'s business.
 //  3. `mmap_fd >= 0`. This is the discriminator that makes the call SAFE, and it
 //     is not a convenience. `MADV_DONTNEED` on a file-backed private mapping
@@ -277,9 +289,10 @@ void AdoptDeviceBytesAsHost(vt::Backend& backend, const OwnedTensor& w);
 // entirely when the preconditions do not hold, so a backend this does not apply
 // to pays nothing.
 //
-// Returns true when pages were released.
+// `host_addressable` is the caller's `host_memory_is_device_addressable()`
+// answer for the queue's device. Returns true when pages were released.
 bool MaybeReleaseStagedBorrowSource(vt::Backend& backend, vt::Queue& queue,
-                                    const OwnedTensor& w);
+                                    const OwnedTensor& w, bool host_addressable);
 
 // What `MaybeReleaseStagedBorrowSource` has done in this process. `calls` counts
 // the releases that HAPPENED, not the invocations that declined, for the same

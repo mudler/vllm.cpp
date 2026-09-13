@@ -4780,9 +4780,12 @@ needs to claim bit-identity should compare bytes, not an aggregate.
   tree reduction** (`7d0d74c2c`): pass 2's tile now goes ONE WHOLE DOT PER
   THREAD, which reassociates nothing, because a dot's value does not depend on
   which thread evaluates it. The red-first measurement this entry asked for is
-  the attribution in `ISSUE-LOCAL-01M2DJ8Y4DFQMDG9GMWEK93142` — that lane
-  measured 86.4% and 88.8% of the kernel's wall time in two `thor:gpu0` runs —
-  and the change measured 6.52x at the released decode shape.
+  the attribution the row's kernel-time issue carries — that lane measured 86.4%
+  and 88.8% of the kernel's wall time in two `thor:gpu0` runs — and the change
+  measured 6.52x at the released decode shape. (The issue is deliberately NOT
+  cited by ID here: `scripts/issue_records.py:518` refuses a row-owned issue that
+  a spec's `## Owed` names, because that is the shape reserved for a rowless
+  `_owed` record.)
   **What remains owed is the lever itself, still declined:** a deterministic tree
   reduction over `d` would preserve the gather-vs-dense bit-identity — the order
   would depend on `head_dim` alone — while breaking the CPU-vs-CUDA relation the
@@ -4795,8 +4798,8 @@ needs to claim bit-identity should compare bytes, not an aggregate.
   against the warp-shuffle tree. (2) The mixer takes ONE `cudaMalloc` per call
   for its four intermediates. A static cache would not be re-entrant; the fix is
   a caller-supplied workspace, which changes the op signature and owes its own
-  spec. **LIVE**, and now tracked by
-  `ISSUE-LOCAL-01M2DQHP2FWXHH7GTHB17QX53Q`.
+  spec. **LIVE**, and tracked by its own row-owned issue under
+  `.agents/issues/MODEL-MM-QWEN4-EXP/`, unnamed here for the same reason.
 
 - **W8CONFIRM ISOLATED THE CAUSE TO W5r's TWO LINES, WHICH W5s ASSERTED BUT ITS
   EVIDENCE COULD NOT SEPARATE FROM W5p. ISSUE OWED.** W5s compares W7DIAG on

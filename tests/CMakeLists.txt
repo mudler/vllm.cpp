@@ -790,6 +790,19 @@ vllm_cpp_add_test(test_deepseek_v4_fp8_ds_mla_bridge
   vllm/models/test_deepseek_v4_fp8_ds_mla_bridge.cpp)
 target_include_directories(test_deepseek_v4_fp8_ds_mla_bridge
                            PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# DeepSeek-V4.1-Flash (DeepseekV41ForCausalLM) W1 scaffolding gate: the arch
+# RESOLVES through the registry, the REAL published config.json descends and
+# validates through ParseDeepseekV41Params (nested text_config/vision_config ->
+# flat, the vision_* lift and the expert_dtype lift out of quantization_config),
+# and every unimplemented arm -- load, forward, KV-cache spec and the GGUF
+# `deepseek41` container -- refuses BY NAME. No checkpoint / GPU: W1 claims no
+# load and no forward (.agents/specs/deepseek-v4-1-flash.md `## Work breakdown`).
+vllm_cpp_add_test(test_deepseek_v4_1_scaffold vllm/models/test_deepseek_v4_1_scaffold.cpp)
+target_compile_definitions(test_deepseek_v4_1_scaffold PRIVATE
+  DEEPSEEK_V4_1_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/deepseek_v4_1")
+target_include_directories(test_deepseek_v4_1_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# `gguf_builder.h` is the shared in-memory GGUF fixture builder under tests/vllm.
+target_include_directories(test_deepseek_v4_1_scaffold PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm)
 
 # DeepSeek-V4-Pro shape-generality gate (#504): the Pro config descends through
 # the SAME ParseDeepseekV4Params with zero new keys, and compress_ratios alone
@@ -2754,6 +2767,13 @@ set_tests_properties(test_backend_cross_device_vt_attn_decode_d128 PROPERTIES
 # of that skeleton carrying a DECISION is gated on a CPU-only CI runner with no
 # AMD GPU. The rest of the ROCm skeleton is under VLLM_CPP_HIP below.
 vllm_cpp_add_test(test_rocm_arch vt/test_rocm_arch.cpp)
+# The pure half of the ROCm pinned H2D bounce ring (chunk plan, cross-call slot
+# reuse, the five-term predicate). UNCONDITIONAL for exactly the reason
+# test_rocm_arch is: include/vt/rocm/rocm_pinned_h2d.h carries no HIP header, and
+# a ring that silently never engages produces identical bytes -- only the host
+# residency differs -- so the decision has to be gated on a runner with no AMD
+# GPU. The reachability half is in test_backend_cross_device.
+vllm_cpp_add_test(test_rocm_pinned_h2d vt/test_rocm_pinned_h2d.cpp)
 vllm_cpp_add_test(test_rocm_f16_contract vt/test_rocm_f16_contract.cpp)
 # The grow-only per-stream device scratch pool (#2712). UNCONDITIONAL for the
 # same reason test_rocm_arch is: src/vt/grow_only_stream_scratch.h is free of
@@ -4111,6 +4131,54 @@ target_include_directories(test_qwen4_exp_moe PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_test(NAME test_qwen4_exp_moe_sel_fp COMMAND test_qwen4_exp_moe)
 set_tests_properties(test_qwen4_exp_moe_sel_fp PROPERTIES
   ENVIRONMENT "VT_MOE_SEL_FP=4096")
+
+# QUANT-CUDA-GATES W8: the device-resident keep-quant MoE arm. NOT CUDA-only --
+# the arm asks the op table rather than naming a device, so it is default-ON on
+# every backend the three ops are registered on, and the suite has a CPU, a CUDA
+# and a ROCm case. The CPU cases run unconditionally and gate arm SELECTION on a
+# box with no GPU at all; each device case prints a LOUD [SKIP] where its backend
+# is absent, because a device arm that silently vanishes from the gate is the
+# failure this suite exists to stop. It reaches only the public seam header
+# (qwen3_5_moe_block.h) plus the one probe symbol `vllm::MoeKqDeviceCalls()`, so
+# it needs no src/ grant.
+vllm_cpp_add_test(test_qwen35_moe_kq_device vllm/models/test_qwen35_moe_kq_device.cpp)
+# The same binary on the REFERENCE arm, so the fallback the row promises is a
+# gated route and not a claim. The suite forces the variable per case, so this
+# registration proves the process-level default does not change the verdict.
+add_test(NAME test_qwen35_moe_kq_device_ref COMMAND test_qwen35_moe_kq_device)
+set_tests_properties(test_qwen35_moe_kq_device_ref PROPERTIES
+  ENVIRONMENT "VT_MOE_KQ_FAST=0")
+# The same binary with the VT_MOE_SEL_FP TAP ARMED, which is the only way to gate
+# the `MoeSelFpCalls() == 0` term of the arm's predicate. That term is
+# load-bearing: `MoeSelFp` is called only inside the reference path, so without
+# it an operator who arms the tap gets the fast arm and a silently empty tap.
+# It cannot be a case in the suite -- `MoeSelFpCalls()` caches its read in a
+# process-static on first use, so arming it from inside the binary either comes
+# first and disarms every other case or comes later and is ignored. With the tap
+# armed every arm-selection expectation in the suite flips to "must not run", so
+# deleting the term reddens THIS registration while the two above stay green.
+# DELIBERATELY UNFILTERED, for the reason test_qwen4_exp_moe_sel_fp gives above.
+add_test(NAME test_qwen35_moe_kq_device_sel_fp COMMAND test_qwen35_moe_kq_device)
+set_tests_properties(test_qwen35_moe_kq_device_sel_fp PROPERTIES
+  ENVIRONMENT "VT_MOE_SEL_FP=4096")
+# THE ROCm LANE, BECAUSE THE DOCUMENTED ROCm GATE IS A NAME FILTER. `docs/ROCM.md:24`
+# runs `ctest --test-dir build-hip -R 'rocm|cross_device'`, and none of the three
+# registrations above carries either token -- so this suite's ROCm cases never ran in
+# the lane a ROCm operator is told to run, on an arm that is DEFAULT-ON on ROCm with
+# `strix:gpu0` (gfx1151) a live fleet device. Registering the same binary under a name
+# that carries `rocm`, filtered to its ROCm cases, puts them in that lane.
+#
+# A doctest filter that matches NOTHING exits 0, so a renamed case would turn this
+# registration into a green that measured nothing -- the trap
+# `scripts/run-doctest-selected.sh` exists for. ctest cannot run that wrapper on every
+# platform this file is configured on, so the zero-selection case is made RED by the
+# summary line instead: doctest prints `test cases: 0 | ...` when the filter selects
+# none. It is a FAIL_REGULAR_EXPRESSION and NOT a PASS_REGULAR_EXPRESSION, because
+# CMake ignores the exit status of a test that has the latter, which would swap one
+# silent green for another.
+add_test(NAME test_rocm_qwen35_moe_kq_device COMMAND test_qwen35_moe_kq_device "-tc=*(ROCm)*")
+set_tests_properties(test_rocm_qwen35_moe_kq_device PROPERTIES
+  FAIL_REGULAR_EXPRESSION "test cases: +0 [|]")
 
 # The five suites that reach src/vllm/support/platform_compat.h, granted per
 # target rather than globally: the file already carries 123 explicit

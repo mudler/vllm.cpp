@@ -25,8 +25,26 @@
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vt/dtype.h"
 #include "vt/quant.h"
+#if defined(VLLM_CPP_TENSTORRENT)
+#include "vt/tenstorrent/tenstorrent_device.h"
+#endif
 
 namespace vllm {
+// W4d W0 (#3042) attribution: DRAM bank snapshots in the host load path.
+#if defined(VLLM_CPP_TENSTORRENT)
+static void TtAllocTrace(const char* label) {
+  vt::tenstorrent::AllocTraceSnapshot(vt::tenstorrent::SharedMeshDevice(), label);
+}
+static void TtAllocTraceLayer(const char* what, int64_t il) {
+  char lbl[64];
+  std::snprintf(lbl, sizeof(lbl), "load/%s/%lld", what, (long long)il);
+  TtAllocTrace(lbl);
+}
+#else
+static inline void TtAllocTrace(const char*) {}
+static inline void TtAllocTraceLayer(const char*, int64_t) {}
+#endif
+
 
 // Load-time PREFAULT of a mmap-borrowed weight span (VT_GGUF_PREFAULT or
 // `--offload-config`'s `vllm_cpp.mmap.prefault`, default ON with mmap residency). A weight left BORROWED in the read-only mapping is not
@@ -298,13 +316,14 @@ OwnedTensor OwnGgufKeptSlice(const GgufFile& g, const GgufLoadPolicy& pol,
                              int64_t k, int64_t row_offset) {
   if (r == GgufResidency::kKeepQuant) {
     return OwnGgufQuantBlocks(t, n, k, row_offset, MmapSrc(g, pol),
-                              pol.quant_repack);
+                              pol.quant_repack, /*cuda_align=*/false,
+                              pol.prefault);
   }
   VT_CHECK(r == GgufResidency::kKeepF16,
            "qwen3_5 gguf: OwnGgufKeptSlice called for a non-keep residency on " +
                t.name);
   return OwnGgufF16(t, n, k, row_offset, MmapSrc(g, pol), /*nk=*/true,
-                    pol.elem_kn_repack, /*prefault=*/true, pol.weight_value_dtype);
+                    pol.elem_kn_repack, pol.prefault, pol.weight_value_dtype);
 }
 
 bool HasTensor(const GgufFile& g, const std::string& name) {
@@ -389,6 +408,8 @@ void ReorderVRows(std::vector<T>& buf, int64_t cols, int64_t row_off,
   }
   std::memcpy(base, seg.data(), seg.size() * sizeof(T));
 }
+
+
 
 // Reorder the full column range [0, cols) of a [rows, cols] row-major buffer
 // (cols = num_v * head_cols) from GGUF tiled to HF grouped order (out_proj).
@@ -816,14 +837,14 @@ void LoadEmbedAndHead(const GgufFile& g, const GgufLoadPolicy& pol,
     // it does on the f16 arm — this tensor is a table, not a [N,K] GEMM weight.
     *embed = OwnGgufQuantBlocks(et, et.shape[0], et.shape[1], /*row_offset=*/0,
                                 MmapSrc(g, pol), /*repack=*/false,
-                                /*cuda_align=*/false, /*prefault=*/true,
+                                /*cuda_align=*/false, pol.prefault,
                                 GgufTensorRole::kEmbeddingTable);
     embed->nk = false;
   } else if (embed_r == GgufResidency::kKeepF16) {
     VT_CHECK(et.shape.size() == 2, "qwen3_5 gguf: token_embd must be 2-D");
     // Embedding gather table: never repacked (EmbeddingKernel reads it row-wise).
     *embed = OwnGgufF16(et, et.shape[0], et.shape[1], 0, MmapSrc(g, pol),
-                        /*nk=*/false, /*elem_kn_repack=*/false, /*prefault=*/true,
+                        /*nk=*/false, /*elem_kn_repack=*/false, pol.prefault,
                         pol.weight_value_dtype);
   } else {
     VT_CHECK(embed_r == GgufResidency::kExpandBf16,
@@ -1104,11 +1125,36 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
   // in_proj_qkv <- attn_qkv [conv_dim, H]; only the trailing V rows reorder.
   {
     const std::string nm = Blk(il, "attn_qkv.weight");
-    const GgufResidency r = pol.Route(g.Get(nm), proj_role);
+    // W4d W4 (tenstorrent-27b-gdn-keepquant.md): with the V-head reorder
+    // active the permutation acts on whole weight rows, so the PACKED
+    // blocks survive a byte-level row reorder and the projection stays
+    // keep-quant (kMatmulWeight) instead of expanding to bf16 — which
+    // cost the P150 ~9.7 GiB of attn_qkv staging at 27B
+    // (ISSUE-LOCAL-01M2AA4ZVD9EWJG5NNQD5DWZXS).
+    vt::DType kq_dt = vt::DType::kF32;
+    const bool packed_reorder =
+        reorder && pol.keep_quant &&
+        KeepQuantDType(g.Get(nm).ggml_type, &kq_dt) &&
+        g.Get(nm).shape[1] % vt::BlockElems(kq_dt) == 0 &&
+        DeviceKeepQuantSupported(kq_dt, pol.device);
+    const GgufResidency r = pol.Route(
+        g.Get(nm),
+        packed_reorder ? GgufTensorRole::kMatmulWeight : proj_role);
     if (r != GgufResidency::kExpandBf16) {
       const GgufTensorInfo& ti = g.Get(nm);
       gdn.in_proj_qkv =
           OwnGgufKeptSlice(g, pol, ti, r, ti.shape[0], ti.shape[1], 0);
+      if (packed_reorder) {
+        // The kept bytes may be a BORROWED mmap view — the reorder
+        // materializes them into an owned buffer before permuting.
+        std::vector<uint8_t> tmp(gdn.in_proj_qkv.bytes.data(),
+                                 gdn.in_proj_qkv.bytes.data() +
+                                     gdn.in_proj_qkv.bytes.size());
+        ReorderVRows<uint8_t>(tmp,
+                              tmp.size() / ti.shape[0],
+                              /*row_off=*/2 * key_dim, num_k, rpk, dv);
+        gdn.in_proj_qkv.bytes = OwnedBytes(std::move(tmp));
+      }
     } else {
       const GgufTensorInfo* t = nullptr;
       std::vector<uint16_t> dq = DqBf16(g, nm, &t);
@@ -1121,11 +1167,28 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
   // in_proj_z <- attn_gate [value_dim, H]; all rows are V.
   {
     const std::string nm = Blk(il, "attn_gate.weight");
-    const GgufResidency r = pol.Route(g.Get(nm), proj_role);
+    vt::DType z_dt = vt::DType::kF32;
+    const bool packed_reorder_z =
+        reorder && pol.keep_quant &&
+        KeepQuantDType(g.Get(nm).ggml_type, &z_dt) &&
+        g.Get(nm).shape[1] % vt::BlockElems(z_dt) == 0 &&
+        DeviceKeepQuantSupported(z_dt, pol.device);
+    const GgufResidency r = pol.Route(
+        g.Get(nm),
+        packed_reorder_z ? GgufTensorRole::kMatmulWeight : proj_role);
     if (r != GgufResidency::kExpandBf16) {
       const GgufTensorInfo& ti = g.Get(nm);
       gdn.in_proj_z =
           OwnGgufKeptSlice(g, pol, ti, r, ti.shape[0], ti.shape[1], 0);
+      if (packed_reorder_z) {
+        std::vector<uint8_t> tmp(gdn.in_proj_z.bytes.data(),
+                                 gdn.in_proj_z.bytes.data() +
+                                     gdn.in_proj_z.bytes.size());
+        ReorderVRows<uint8_t>(tmp,
+                              tmp.size() / ti.shape[0],
+                              /*row_off=*/0, num_k, rpk, dv);
+        gdn.in_proj_z.bytes = OwnedBytes(std::move(tmp));
+      }
     } else {
       const GgufTensorInfo* t = nullptr;
       std::vector<uint16_t> dq = DqBf16(g, nm, &t);
@@ -1402,6 +1465,7 @@ Qwen3_5MoeWeights LoadQwen3_5MoeFromGguf(const GgufFile& gguf,
 
   w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
   for (int64_t il = 0; il < config.num_hidden_layers; ++il) {
+    TtAllocTraceLayer("layer-moe", il);
     Qwen3_5MoeLayerWeights layer;
     RequireExpand(pol, gguf, Blk(il, "attn_norm.weight"),
                   GgufTensorRole::kTransformedWeight);
@@ -1556,6 +1620,7 @@ Qwen3_5DenseWeights LoadQwen3_5DenseFromGguf(const GgufFile& gguf,
            "qwen3_5 gguf: num_experts must be 0 for the dense model");
 
   Qwen3_5DenseWeights w;
+  TtAllocTrace("load/embed-and-head/pre");
   // Tied-embedding GGUFs (the 2B bench file) omit output.weight; the head is
   // then token_embd itself, as llama.cpp has it (TENSOR_DUPLICATED), and L5
   // lets the two SHARE one expansion. See LoadEmbedAndHead.
@@ -1563,9 +1628,11 @@ Qwen3_5DenseWeights LoadQwen3_5DenseFromGguf(const GgufFile& gguf,
   RequireExpand(pol, gguf, "output_norm.weight",
                 GgufTensorRole::kTransformedWeight);
   w.final_norm = OwnNormMinus1(gguf, "output_norm.weight");
+  TtAllocTrace("load/embed-and-head/post");
 
   w.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
   for (int64_t il = 0; il < config.num_hidden_layers; ++il) {
+    TtAllocTraceLayer("layer-dense", il);
     Qwen3_5DenseLayerWeights layer;
     RequireExpand(pol, gguf, Blk(il, "attn_norm.weight"),
                   GgufTensorRole::kTransformedWeight);
@@ -1836,6 +1903,14 @@ void LogQwen3_5GgufMtpHeadSkip(const GgufFile& gguf, const HfConfig& config) {
                ".agents/oracles/llama-cpp.md), so a gate against it is "
                "matched work only with this skip loud."
             << std::endl;
+}
+
+
+void ReorderVPackedForTest(std::vector<uint8_t>& packed, int64_t row_bytes,
+                           int64_t row_off, int64_t num_k,
+                           int64_t num_v_per_k, int64_t head_rows) {
+  ReorderVRows<uint8_t>(packed, row_bytes, row_off, num_k, num_v_per_k,
+                        head_rows);
 }
 
 }  // namespace vllm

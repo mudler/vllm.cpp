@@ -1328,6 +1328,50 @@ struct Qwen4ExpQsaAttnArgs {
   // owes a device-side counter and its copy-back.
   int64_t* keys_visited = nullptr;
 
+  // ─── THE SOFTMAX-FOLD PROBE, W9's REPAIR ────────────────────────────────────
+  //
+  // OPTIONAL host-side instrument, on the `keys_visited` precedent and for the
+  // same reason: the property it exposes cannot be asserted from the outputs.
+  // The gather's denominator `sum_s w(s)` is accumulated SERIALLY ASCENDING over
+  // the gathered rows, and THAT ORDER is what makes a sub-budget gather reduce
+  // over exactly the dense sequence and so be BIT-identical to dense attention.
+  // It is the property W9's spec calls the whole argument for choosing its
+  // lever, and NOTHING MEASURED IT: a fresh review reassociated it two ways on
+  // `thor:gpu0` -- a descending fold, and the warp-shuffle tree the CUDA
+  // kernel's header explicitly declines -- and all three committed suites passed
+  // unmodified, while the outputs demonstrably moved.
+  //
+  // A TIGHTER TOLERANCE CANNOT REPLACE THIS AND THAT IS MEASURED, not feared. At
+  // the multi-tile shapes the reassociated denominator lands at 0.01-0.02% of
+  // the derived arm-vs-arm bound, and the WORST ratio on a CORRECT kernel
+  // (0.2041) is HIGHER than on a reassociated one (0.1136), so no threshold
+  // separates them. `test_qwen4_exp_cuda_reductions.cpp` already records a
+  // fitted `kUlpTol` that failed correct kernels by 112-290%; this is the
+  // instrument chosen instead of a third attempt at a constant.
+  //
+  // WHAT IT HANDS BACK. `softmax_probe_weights` receives the per-row softmax
+  // weights the arm ACTUALLY COMPUTED, at `pair * softmax_probe_stride + s` for
+  // pair `t * num_q_heads + h` and gathered position `s` in visit order;
+  // `softmax_probe_denom` receives that pair's finished denominator. A caller
+  // sets all three or none. Entries at `s >= softmax_probe_stride` are dropped,
+  // so a stride below `|sel|` measures a prefix and the caller owns the sizing.
+  //
+  // WHY BOTH, AND WHY THAT MAKES THE GATE ROBUST. The test refolds the weights
+  // ASCENDING **on the host, from these exact device-produced floats**, and
+  // requires BIT equality with the denominator. Both sides then consume the same
+  // `expf` outputs, so a toolkit that moves `exp` cannot make it red -- the
+  // fragility a stored device golden would have -- while a descending fold or a
+  // tree reduction is red immediately, because those are the only things the
+  // comparison can see.
+  //
+  // A ROW WHOSE SELECTION IS MALFORMED (the CUDA arm's NaN poison) writes no
+  // denominator: its weights are not the weights of any well-formed softmax.
+  // Honoured by the CPU and CUDA arms. The ROCm arm REFUSES the probe BY NAME
+  // rather than returning an unwritten buffer.
+  float* softmax_probe_weights = nullptr;
+  float* softmax_probe_denom = nullptr;
+  int64_t softmax_probe_stride = 0;
+
   // ─── THE PAGED ADDRESS MODE (row MODEL-MM-QWEN4-EXP W5d-3, #2249 item 2) ───
   //
   // WHY IT IS HERE AND NOT A SECOND OP. The engine allocates this model's QSA

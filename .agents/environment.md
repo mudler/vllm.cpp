@@ -756,6 +756,129 @@ and was inside a readiness poll, and it blocked its own owner's restart for abou
 50 minutes as well as the queued gate. Read the whole process chain and
 `/proc/<pid>/fd` before you call a lock stale, and never kill an unowned PID.
 
+### Two ways a `strix:gpu0` job dies before it measures anything, 13 September 2026
+
+Both cost a lease on that date and neither names itself in the failure.
+
+**Ubuntu noble's own ROCm packages outrank `repo.radeon.com`, and
+`rocm-hip-sdk` is unsatisfiable until you pin.** The `strix` worker is a bare
+Ubuntu 24.04 container: no `/opt/rocm`, no `rocprofv3`, no `podman`, `apt-get`
+and `/dev/kfd` present, and `repo.radeon.com` reachable. Adding the ROCm
+repository is not enough, because noble ships `rocminfo` 5.7.1, `rocm-cmake`
+6.0.0 and `hipcc` 5.7.1 in universe and apt prefers them:
+
+```text
+rocm-hip-runtime : Depends: rocminfo (= 1.0.0.70204-93~24.04)
+                   but 5.7.1-3build1 is to be installed
+```
+
+The install then fails with "you have held broken packages", which names
+neither ROCm nor Ubuntu. Pin the vendor repository above the distribution:
+
+```sh
+printf 'Package: *\nPin: origin repo.radeon.com\nPin-Priority: 1000\n' \
+  > /etc/apt/preferences.d/rocm-radeon-first
+```
+
+With the pin, `rocm-hip-sdk rocprofiler-sdk hsa-amd-aqlprofile libdw1t64`
+installs in **431 s** and `rocprofv3` runs. `rocprofiler-sdk` alone was already
+satisfiable without the pin, so a job that only profiles will not see this and a
+job that also builds will.
+
+**`exec >"$LOG" 2>&1` in a job script gets the job REAPED by `rc`.** Redirecting
+the script's own stdout to a file closes the job's stdout, and `rc` treats that
+as the end of the process:
+
+```text
+rc: log stream ended: unexpected EOF
+rc: job b4e2330a-...: stragglers reaped after exit
+```
+
+Lease `b4e2330a` died that way about one second in, before it installed
+anything, and `rc ps` showed no job. This is worth stating because the idiom is
+in committed job scripts here, paired with a background loop that copies the log
+to `/workspace`, and it reads as the careful thing to do. Stream to `rc`'s own
+stdout instead and let `rc` keep the log; copy to `/workspace` at the end,
+because `rc` logs age out within a day. Process substitution is worse, not
+better: `exec > >(tee ...)` wedges the lease at exit.
+
+### `rocprofv3` writes NOTHING on `strix:gpu0` unless you move its temp directory, 13 September 2026
+
+**`rocprofv3` spills its trace records to `$CWD/.rocprofv3/<ppid>-<pid>-<domain>.dat`
+and an `rc` job starts with `cwd = /`. From `/` that spill never comes back, so
+the profiler aborts at output generation and writes a zero-row file.** Set
+`ROCPROF_TMPDIR` to a directory under `/tmp`, or `cd` into one, and the same
+command writes a complete trace.
+
+The failure names nothing that points at a directory:
+
+```text
+E output_stream.cpp:111] Opened result file: .../12328_kernel_trace.csv
+ring_buffer: munmap failed: Invalid argument
+F ring_buffer.cpp:106] mmap failed with errno 22 :: Invalid argument
+    ... abort
+W tool.cpp:3104] [rocprofv3_error_signal_handler] rocprofv3 caught signal 6...
+```
+
+`strace` gives the argument the message omits: the call is
+`mmap(NULL, 0, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)` and
+**the length is zero**. `ring_buffer::load` (`ring_buffer.cpp:229` at
+rocprofiler-sdk `97f5574fe`) reads the buffer size out of the spill file and
+calls `init(_size)` without checking the read; when the read delivers nothing,
+`_size` stays 0, `init` rounds 0 up to 0, and `mmap` of length 0 is `EINVAL`.
+`init` then calls `destroy()` on the failed mapping, which is the `munmap`
+warning printed one line earlier, and logs at FATAL, which aborts. The tool's
+own `rocprofv3_error_signal_handler` re-enters on signal 6 and does not return;
+on one lease it survived `SIGTERM` for 29 minutes and needed `SIGKILL`.
+
+The default is in `output_config.hpp:81`: `tmp_directory = output_path` and
+`output_path = "%cwd%"`. `--output-directory` moves the RESULT files only.
+`rocprofv3`'s CLI never sets `ROCPROF_TMPDIR` (`source/bin/rocprofv3.py`), so
+the spill follows the working directory whatever you pass.
+
+Measured on one lease, a 50-dispatch HIP program, four arms in this order:
+
+| Arm | `cwd` | `ROCPROF_TMPDIR` | kernel_trace.csv |
+|---|---|---|---:|
+| B1 | `/` | `/tmp/rpt` | 6602 B, **51 rows** |
+| A1 | `/` | unset | 0 B, **0 rows**, `mmap failed` |
+| C1 | `/tmp/cdtest` | unset | 6602 B, **51 rows** |
+
+B1 ran FIRST and passed, so this is not a cold-start or an ordering effect: the
+working directory is the whole variable. `/` is writable on the worker -- an
+8 MiB `dd` to `/.rocprofv3/` succeeds at 2.9 GB/s -- so "the root filesystem is
+read-only" is NOT the explanation, and the precise reason a spill under `/` is
+unreadable is UNVERIFIED. The remedy does not depend on it.
+
+Two corollaries. The recipe is:
+
+```sh
+mkdir -p /tmp/rpt
+cd /tmp && ROCPROF_TMPDIR=/tmp/rpt timeout -s KILL <n> \
+    rocprofv3 --kernel-trace --output-format csv --output-directory <dir> -- <cmd>
+```
+
+And **set `ulimit -c 0` around any `rocprofv3` invocation on this box.** The
+abort dumps core into `cwd`, and a HIP process maps the whole VRAM carve: one
+such core left **11.7 GB** in `/` on 13 September 2026.
+
+Three hypotheses were tested and are FALSIFIED, so nobody needs to repeat them.
+`ulimit -l` is 8192 on the worker but `ulimit -l unlimited` is permitted there
+and the failing `mmap` is anonymous and unlocked, so the locked-memory limit is
+not involved. `Seccomp: 0` and `CapEff: 000001ffffffffff`, so no filter and no
+dropped capability. `rocprofiler-sdk` 1.1.0, `rocprofiler-register`,
+`rocprofiler-sdk-rocpd`, `rocprofiler-sdk-roctx` and `hsa-amd-aqlprofile` are
+all installed, so no package is missing. The 2026-09-07 capture's `podman` image
+is not required; a bare worker writes the same trace once the spill has a
+usable directory.
+
+Two more ways to lose a lease to this tool, both measured the same day. **Never
+pipe `rocprofv3` into `head`**: `head` closes the pipe, the tool's signal
+handler catches the `SIGPIPE` and wedges, and the arm that should take 40 s
+holds the box until `--max-runtime`. Redirect to a file and grep the file.
+**Never run `find /` on this worker**: `/workspace` is a 7.3 TB CIFS mount and
+the traversal does not come back.
+
 ## Registering your own environment
 
 The profiles below are per-developer facts, not requirements: nothing here is

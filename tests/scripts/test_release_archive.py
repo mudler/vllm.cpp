@@ -593,6 +593,48 @@ class ReleaseArchiveContract(unittest.TestCase):
             [],
         )
 
+    def test_pe_audit_allows_declared_non_system_import(self) -> None:
+        manifest = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        manifest["host"].update({"os": "windows", "arch": "x86_64", "abi": "msvc"})
+        manifest["dependencies"] = [
+            {"name": name, "linkage": "dynamic"}
+            for name in ("KERNEL32.dll", "LIBCRYPTO-3-x64.dll", "LIBSSL-3-x64.dll")
+        ]
+        self.assertEqual(
+            self.tool.validate_pe_audit(
+                manifest,
+                "8664",
+                ["KERNEL32.dll", "LIBCRYPTO-3-x64.dll", "LIBSSL-3-x64.dll"],
+                [],
+                [],
+            ),
+            [],
+        )
+        undeclared = json.loads(json.dumps(manifest))
+        undeclared["dependencies"] = [
+            {"name": "KERNEL32.dll", "linkage": "dynamic"},
+        ]
+        errors = self.tool.validate_pe_audit(
+            undeclared,
+            "8664",
+            ["KERNEL32.dll", "LIBCRYPTO-3-x64.dll"],
+            [],
+            [],
+        )
+        self.assertTrue(any("non-system PE import" in e for e in errors), errors)
+        crt_declared = json.loads(json.dumps(manifest))
+        crt_declared["dependencies"].append(
+            {"name": "VCRUNTIME140.dll", "linkage": "dynamic"}
+        )
+        errors = self.tool.validate_pe_audit(
+            crt_declared,
+            "8664",
+            ["KERNEL32.dll", "VCRUNTIME140.dll"],
+            [],
+            [],
+        )
+        self.assertTrue(any("static-CRT" in e for e in errors), errors)
+
     def test_windows_layout_rejects_every_lib_payload(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

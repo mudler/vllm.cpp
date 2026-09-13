@@ -6861,6 +6861,160 @@ TEST_CASE("kTENSTORRENT E=1 int8-dot keep-quant capture survives the 50 MiB trac
   backend.Free(mem_o);
 }
 
+// W4d W6: the BF16-OUT dispatch joined the int8-dot lever. The W4b landing
+// decision refused bf16-out because committing the kernel's f32 dev_out into
+// a bf16 slot left the slot holding f32 bytes at an f32 page geometry — the
+// next bf16 reader got word-halved garbage (the ROW_MAJOR chained leg's NaN
+// signature). The fix is an explicit f32->bf16 cast before the commit; this
+// test is its red-first lock (RED on the pre-cast tree: the replay output
+// word-halves against the eager reference).
+TEST_CASE("kTENSTORRENT E=1 int8-dot keep-quant capture survives the 50 MiB trace region (BF16-out dispatch)") {
+  // Same lever gate as the F32-out sibling: on default the bf16-out
+  // dispatch serves the W4a grouped arm and this test would prove nothing.
+  if (const char* lever = std::getenv("VT_TT_KEEPQUANT_INT8DOT");
+      lever == nullptr || lever[0] == '\0' || std::strcmp(lever, "0") == 0) {
+    MESSAGE("SKIPPED: set VT_TT_KEEPQUANT_INT8DOT=1 — this capture asserts the "
+            "int8-dot lever through the BF16-out dispatch");
+    return;
+  }
+  ::setenv("VT_TT_KEEPQUANT_INT8DOT", "1", 1);
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  Backend& backend = vt::GetBackend(vt::DeviceType::kTENSTORRENT);
+  REQUIRE(backend.SupportsGraphCapture());
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBTQuant, vt::DeviceType::kTENSTORRENT));
+  Queue q = backend.CreateQueue();
+
+  // Two chained keep-quant matmuls: m1 (bf16 out) feeds m2 (f32 out) as its
+  // ACTIVATION. The W4b store-geometry bug lived in exactly that handoff:
+  // the f32 dev_out committed into the bf16 slot, and the next DEVICE
+  // reader (m2's activation load) word-halved it. A host download converts
+  // and hides the poison, so the probe is the device-side consumer.
+  constexpr int64_t kN1 = 4096, kK = 1024, kN2 = 1024, kM = 1;
+  const int64_t kElems = vt::BlockElems(vt::DType::kQ6_K);
+  const int64_t kBB = vt::BlockBytes(vt::DType::kQ6_K);
+  const int64_t kNb1 = kK / kElems, kNb2 = kN1 / kElems;
+
+  std::mt19937 rng(20260913u);
+  auto fill_q6k = [&](std::vector<uint8_t>& packed, uint32_t seed) {
+    std::mt19937 r(seed);
+    packed.resize(static_cast<size_t>(packed.size()));
+    for (size_t b = 0; b < packed.size() / static_cast<size_t>(kBB); ++b) {
+      uint8_t* blk = packed.data() + b * kBB;
+      for (int i = 0; i < 208; ++i) blk[i] = static_cast<uint8_t>(r() & 0xFF);
+      const uint16_t d_bits =
+          vt::F32ToF16(0.05f + 0.35f * static_cast<float>(r() % 64) / 64.0f);
+      std::memcpy(blk + 208, &d_bits, sizeof(d_bits));
+    }
+  };
+  std::vector<uint8_t> p1(static_cast<size_t>(kN1) * kNb1 * kBB);
+  std::vector<uint8_t> p2(static_cast<size_t>(kN2) * kNb2 * kBB);
+  fill_q6k(p1, 20260913u);
+  fill_q6k(p2, 20260914u);
+  std::vector<uint16_t> a_bf(static_cast<size_t>(kM * kK));
+  for (auto& v : a_bf) v = vt::F32ToBF16((static_cast<float>(rng() % 401) - 200.0f) / 100.0f);
+
+  void* mem_a = backend.Alloc(a_bf.size() * sizeof(uint16_t));
+  void* mem_w1 = backend.Alloc(p1.size());
+  void* mem_w2 = backend.Alloc(p2.size());
+  void* mem_o16 = backend.Alloc(static_cast<size_t>(kM * kN1) * sizeof(uint16_t));
+  void* mem_o32 = backend.Alloc(static_cast<size_t>(kM * kN1) * sizeof(float));
+  void* mem_o2 = backend.Alloc(static_cast<size_t>(kM * kN2) * sizeof(float));
+  backend.Copy(q, mem_a, a_bf.data(), a_bf.size() * sizeof(uint16_t));
+  backend.Copy(q, mem_w1, p1.data(), p1.size());
+  backend.Copy(q, mem_w2, p2.data(), p2.size());
+  Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                  Device{vt::DeviceType::kTENSTORRENT, 0},
+                                  {kM, kK});
+  Tensor w1_t = Tensor::Contiguous(mem_w1, vt::DType::kQ6_K,
+                                   Device{vt::DeviceType::kTENSTORRENT, 0},
+                                   {kN1, kK});
+  Tensor w2_t = Tensor::Contiguous(mem_w2, vt::DType::kQ6_K,
+                                   Device{vt::DeviceType::kTENSTORRENT, 0},
+                                   {kN2, kN1});
+  Tensor o16_t = Tensor::Contiguous(mem_o16, vt::DType::kBF16,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0},
+                                    {kM, kN1});
+  Tensor o32_t = Tensor::Contiguous(mem_o32, vt::DType::kF32,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0},
+                                    {kM, kN1});
+  Tensor o2_t = Tensor::Contiguous(mem_o2, vt::DType::kF32,
+                                   Device{vt::DeviceType::kTENSTORRENT, 0},
+                                   {kM, kN2});
+
+  // The reference chain, all f32-out (no bf16 slot handoff): m1 ref, cast
+  // to bf16, m2 ref, cast to bf16 — what the bf16-out arm MUST produce.
+  vt::MatmulBT(q, o32_t, a_t, w1_t);
+  std::vector<float> ref32(static_cast<size_t>(kM * kN1), 0.0f);
+  backend.Copy(q, ref32.data(), mem_o32, ref32.size() * sizeof(float));
+  std::vector<uint16_t> ref16(static_cast<size_t>(kM * kN1));
+  for (size_t i = 0; i < ref16.size(); ++i) ref16[i] = vt::F32ToBF16(ref32[i]);
+  Tensor ref16_t = Tensor::Contiguous(ref16.data(), vt::DType::kBF16,
+                                      Device{vt::DeviceType::kTENSTORRENT, 0},
+                                      {kM, kN1});
+  // Warm the bf16-out arm EAGERLY once: the int8-dot launch AND the W6
+  // f32->bf16 cast op must be in the program cache before the capture (a
+  // new binary during capture refuses: mesh_workload.cpp:196).
+  vt::MatmulBT(q, o16_t, a_t, w1_t);
+  vt::MatmulBT(q, o2_t, ref16_t, w2_t);
+  std::vector<float> ref2(static_cast<size_t>(kM * kN2), 0.0f);
+  backend.Copy(q, ref2.data(), mem_o2, ref2.size() * sizeof(float));
+
+  // The bf16-out m1 under capture x2 (the #2907 discipline), then the
+  // DEVICE consumer: m2 reads the committed bf16 slot as its activation.
+  std::vector<uint16_t> dumps[2];
+  int64_t demand[2] = {0, 0};
+  for (int pass = 0; pass < 2; ++pass) {
+    void* graph = nullptr;
+    std::string what;
+    bool threw = false;
+    try {
+      backend.BeginCapture(q);
+      vt::MatmulBT(q, o16_t, a_t, w1_t);  // bf16 out: the W6 cast fires
+      graph = backend.EndCaptureGraph(q);
+    } catch (const std::exception& ex) {
+      threw = true;
+      what = ex.what();
+    }
+    REQUIRE_MESSAGE(!threw, "capture pass " << pass << " threw: " << what);
+    REQUIRE(graph != nullptr);
+    demand[pass] = vt::tenstorrent::LastTraceBytesForTest();
+    backend.ReplayGraph(q, graph);
+    dumps[pass].resize(static_cast<size_t>(kM * kN1), 0);
+    backend.Copy(q, dumps[pass].data(), mem_o16,
+                 dumps[pass].size() * sizeof(uint16_t));
+    backend.DestroyGraph(graph);
+    // The device-side consumer probe: m2 over the committed slot.
+    vt::MatmulBT(q, o2_t, o16_t, w2_t);
+    std::vector<float> got2(static_cast<size_t>(kM * kN2), 0.0f);
+    backend.Copy(q, got2.data(), mem_o2, got2.size() * sizeof(float));
+    for (size_t i = 0; i < got2.size(); ++i)
+      CHECK(std::isfinite(got2[i]));  // the word-halved-garbage signature
+  }
+  for (int pass = 0; pass < 2; ++pass) {
+    REQUIRE_MESSAGE(demand[pass] <= 52428800,
+                    "capture pass " << pass << " demanded " << demand[pass]
+                                    << " B of trace region against 52428800 B");
+    CHECK_MESSAGE(std::memcmp(dumps[static_cast<size_t>(pass)].data(),
+                              ref16.data(),
+                              ref16.size() * sizeof(uint16_t)) == 0,
+                  "replay pass " << pass
+                                 << " diverged from the f32-out reference");
+  }
+  CHECK(std::memcmp(dumps[1].data(), dumps[0].data(),
+                    ref16.size() * sizeof(uint16_t)) == 0);
+  MESSAGE("bf16-out capture x2 byte-identity + device-consumer probe: PASS");
+  backend.Free(mem_a);
+  backend.Free(mem_w1);
+  backend.Free(mem_w2);
+  backend.Free(mem_o16);
+  backend.Free(mem_o32);
+  backend.Free(mem_o2);
+}
+
+// KEEPQUANT W4b (issue #3031) C4 profile, spec ## W4b "Profile first": the
 // KEEPQUANT W4b (issue #3031) C4 profile, spec ## W4b "Profile first": the
 // packed arm vs the int8-dot lever per call, on ONE build, both through the
 // public vt::MatmulBT dispatch — bf16-out for the W4a grouped packed arm, the
@@ -7833,4 +7987,182 @@ TEST_CASE("kTENSTORRENT keep-quant decode planes return to the allocator (#3042)
     ::unsetenv("VT_TT_KEEPQUANT_INT8DOT");
   }
 }
+
+// W4d W2 (#3042) red-first, the chunk-loop sl_alias guard: a SINGLE-chunk
+// weight runs the dense chunk loop exactly once with c0 == 0 && c1 == N, and
+// that full-extent window is the one case where ttnn::slice returns its INPUT
+// (tt-metal slice.cpp:182) — the staged slice IS the resident word shadow,
+// so the forced reclaim must skip it or the cache entry dies mid-call.
+// Mutation (red-first): sl_alias=false at
+// src/vt/tenstorrent/tenstorrent_ops.cpp:2901 force-frees the shadow, the
+// second call's cache hit returns the dead tensor and must throw "Tensor is
+// not allocated" (or lose residency, the free-memory bar below) — the
+// mutation evidence is captured in the queued device phase (the GPU is
+// occupied by the 27B gate run).
+TEST_CASE("kTENSTORRENT single-chunk keep-quant decode keeps the word shadow resident (#3042)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBTQuant, vt::DeviceType::kTENSTORRENT));
+
+  // The guard under test lives in the W4a chunk decode, which the f32-out
+  // dense arm reaches only with the int8-dot env unset; the alloc trace
+  // would spam stderr behind the numbers under test.
+  const char* const trace_prev = std::getenv("VT_TT_ALLOC_TRACE");
+  const bool trace_had = trace_prev != nullptr;
+  const std::string trace_saved = trace_had ? std::string(trace_prev) : std::string();
+  const char* const int8dot_prev = std::getenv("VT_TT_KEEPQUANT_INT8DOT");
+  const bool int8dot_had = int8dot_prev != nullptr;
+  const std::string int8dot_saved = int8dot_had ? std::string(int8dot_prev) : std::string();
+  ::unsetenv("VT_TT_KEEPQUANT_INT8DOT");
+  ::unsetenv("VT_TT_ALLOC_TRACE");
+
+  Backend& backend = *vt::TryGetBackend(DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+
+  // Pin the production chunk policy: chunk == N is the single-iteration
+  // shape under test, and a leaked non-zero override from another case
+  // would silently re-chunk it (and un-exercise the alias).
+  vt::tenstorrent::KeepQuantChunkRowsOverrideForTest(0);
+  struct ChunkReset {
+    ~ChunkReset() { vt::tenstorrent::KeepQuantChunkRowsOverrideForTest(0); }
+  } chunk_reset;
+
+  // Shape: plane budget 256 MiB / (K*4) = 32768 rows per chunk against
+  // N=8192 -> chunk = min(N, max(32768, ceil(N/8))) = N — ONE chunk
+  // iteration, c0 == 0 && c1 == N, the exact window where the slice is its
+  // own input.
+  constexpr int64_t M = 1, N = 8192;
+  const int64_t kBlockBytes = vt::BlockBytes(vt::DType::kQ4_K);
+  const int64_t kBlockElems = vt::BlockElems(vt::DType::kQ4_K);
+  const int64_t K = 8 * kBlockElems;  // 2048; 8 blocks per row
+
+  std::mt19937 rng(20260912u);
+  std::vector<uint8_t> packed(static_cast<size_t>(N * (K / kBlockElems) * kBlockBytes));
+  for (int64_t b = 0; b < N * (K / kBlockElems); ++b) {
+    uint8_t* blk = packed.data() + b * kBlockBytes;
+    const uint16_t d =
+        vt::F32ToF16(0.05f + 0.35f * static_cast<float>(rng() % 64) / 64.0f);
+    std::memcpy(blk + 0, &d, sizeof(d));
+    const uint16_t ls =
+        vt::F32ToF16(0.005f + 0.02f * static_cast<float>(rng() % 32) / 32.0f);
+    std::memcpy(blk + 2, &ls, sizeof(ls));
+    for (int i = 0; i < 12; ++i) blk[4 + i] = static_cast<uint8_t>(rng() & 0xFF);
+    for (int i = 0; i < 128; ++i) blk[16 + i] = static_cast<uint8_t>(rng() & 0xFF);
+  }
+  std::vector<uint16_t> a_bf(static_cast<size_t>(M * K));
+  for (auto& v : a_bf)
+    v = vt::F32ToBF16((static_cast<float>(rng() % 401) - 200.0f) / 100.0f);
+
+  // Warm-up: a small matmul settles the device/JIT init allocations so the
+  // baseline below measures residency, not first-touch.
+  {
+    constexpr int64_t sM = 4, sN = 8;
+    const int64_t sK = 2 * kBlockElems;
+    std::vector<uint8_t> s_packed(static_cast<size_t>(sN * 2 * kBlockBytes));
+    for (int64_t b = 0; b < sN * 2; ++b) {
+      uint8_t* blk = s_packed.data() + b * kBlockBytes;
+      const uint16_t d = vt::F32ToF16(0.2f);
+      std::memcpy(blk + 0, &d, sizeof(d));
+      const uint16_t ls = vt::F32ToF16(0.01f);
+      std::memcpy(blk + 2, &ls, sizeof(ls));
+    }
+    std::vector<uint16_t> s_a(static_cast<size_t>(sM * sK),
+                              vt::F32ToBF16(0.5f));
+    void* mem_a = backend.Alloc(sM * sK * sizeof(uint16_t));
+    void* mem_b = backend.Alloc(s_packed.size());
+    void* mem_o = backend.Alloc(sM * sN * sizeof(float));
+    backend.Copy(q, mem_a, s_a.data(), s_a.size() * sizeof(uint16_t));
+    backend.Copy(q, mem_b, s_packed.data(), s_packed.size());
+    Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {sM, sK});
+    Tensor b_t = Tensor::Contiguous(mem_b, vt::DType::kQ4_K,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {sN, sK});
+    Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                    Device{vt::DeviceType::kTENSTORRENT, 0}, {sM, sN});
+    vt::MatmulBT(q, o_t, a_t, b_t);
+    backend.Free(mem_a);
+    backend.Free(mem_b);
+    backend.Free(mem_o);
+  }
+
+  // ONE host weight buffer held across BOTH calls: the word shadow is keyed
+  // by the host pointer, so the second call must hit the cache and decode
+  // from the SAME resident words the first call staged — the exact state
+  // the sl_alias guard protects.
+  void* mem_a = backend.Alloc(M * K * sizeof(uint16_t));
+  void* mem_b = backend.Alloc(packed.size());
+  void* mem_o = backend.Alloc(M * N * sizeof(float));
+  backend.Copy(q, mem_a, a_bf.data(), a_bf.size() * sizeof(uint16_t));
+  backend.Copy(q, mem_b, packed.data(), packed.size());
+  Tensor a_t = Tensor::Contiguous(mem_a, vt::DType::kBF16,
+                                  Device{vt::DeviceType::kTENSTORRENT, 0}, {M, K});
+  Tensor b_t = Tensor::Contiguous(mem_b, vt::DType::kQ4_K,
+                                  Device{vt::DeviceType::kTENSTORRENT, 0}, {N, K});
+  Tensor o_t = Tensor::Contiguous(mem_o, vt::DType::kF32,
+                                  Device{vt::DeviceType::kTENSTORRENT, 0}, {M, N});
+
+  const int64_t free0 = vt::tenstorrent::FreeDeviceDramBytesForTest();
+  vt::MatmulBT(q, o_t, a_t, b_t);
+  const int64_t free1 = vt::tenstorrent::FreeDeviceDramBytesForTest();
+  vt::MatmulBT(q, o_t, a_t, b_t);
+  const int64_t free2 = vt::tenstorrent::FreeDeviceDramBytesForTest();
+  std::vector<float> out(static_cast<size_t>(M * N), 0.0f);
+  backend.Copy(q, out.data(), mem_o, out.size() * sizeof(float));
+
+  // The shadow is ~1 MiB of i32 words and both calls' decode planes are
+  // reclaimed in-call; 256 MiB slack covers allocator alignment and
+  // kernel-cache residue. Under the mutation the shadow is force-freed and
+  // the second call throws before this bar is even reached — the uncaught
+  // exception IS the red.
+  constexpr int64_t kSlack = 256ll << 20;
+  const std::string drop1_msg =
+      "first single-chunk keep-quant call lost residency: free fell from " +
+      std::to_string(free0) + " to " + std::to_string(free1) + " bytes (drop " +
+      std::to_string(free0 - free1) + ")";
+  const std::string drop2_msg =
+      "second single-chunk keep-quant call lost residency: free fell from " +
+      std::to_string(free0) + " to " + std::to_string(free2) + " bytes (drop " +
+      std::to_string(free0 - free2) + ")";
+  CHECK_MESSAGE(free1 >= free0 - kSlack, drop1_msg);
+  CHECK_MESSAGE(free2 >= free0 - kSlack, drop2_msg);
+
+  // UnregisterHostBuffer drops the word shadow with the host weight buffer —
+  // the designed teardown, run only after both calls survived on it.
+  backend.Free(mem_a);
+  backend.Free(mem_b);
+  backend.Free(mem_o);
+
+  if (trace_had) {
+    ::setenv("VT_TT_ALLOC_TRACE", trace_saved.c_str(), 1);
+  } else {
+    ::unsetenv("VT_TT_ALLOC_TRACE");
+  }
+  if (int8dot_had) {
+    ::setenv("VT_TT_KEEPQUANT_INT8DOT", int8dot_saved.c_str(), 1);
+  } else {
+    ::unsetenv("VT_TT_KEEPQUANT_INT8DOT");
+  }
+}
+
+// W4d W3 (#3042): the loader stages every weight's bf16 TILE form as the
+// slot's persistent buffer. For a k-quant weight that form is dead the
+// moment the keep-quant word shadow exists — the matmul reads only the
+// words — but it stayed resident forever, and at 27B the staged bf16 forms
+// filled the banks to 93 percent during the warm pass and fragmented them
+// into the init OOM (attn_qkv alone: 97 x [10240,5120] bf16 = 9.7 GiB
+// beside ~21 MiB q6_K each). EnsureKeepQuantWords now releases the slot's
+// bf16 forms when it stores the shadow. RED on the pre-fix tree: the same
+// assertion measured 268 MB of bf16 staging still held after the shadow
+// existed (the census ledger: /tmp/census-run2.log, pers 9.7 GiB at
+// block/54 with the words already resident).
+// The premise-broken bf16-staging test was removed (W4d W6): its premise —
+// that the loader stages a bf16 twin of packed weights — was falsified by
+// the slot census (the `pers` bf16 forms are the GDN projections' LEGITIMATE
+// expand-arm residency, not a double-hold), and its EnsureDevice2D-based
+// setup cannot stage a packed tensor ("unsupported float dtype"). The
+// equivalence it aimed at is proven TT-free by the W4d W4 standalone check
+// (q6_K + q4_K, bit-for-bit vs the element-level reorder through the real
+// dequantizer) and locked by the bf16-out capture test above.
 

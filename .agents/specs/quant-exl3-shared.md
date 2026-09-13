@@ -18,7 +18,9 @@ supplies only the trellis format and its kernels.
 
 ## Now
 
-`ACTIVE`. W1a, W1b, W3, and W6 landed. EXL3 runs a model on the GPU, the
+`ACTIVE`. W1a, W1b, W3, and W6 landed. W7, which stops W6's reconstruct scratch
+from being pinned once per captured decode graph, is specified in
+[`quant-exl3-recon-scratch.md`](quant-exl3-recon-scratch.md). EXL3 runs a model on the GPU, the
 device arm instantiates all seven `(bits, codebook)` pairs, and the
 reconstruct + cuBLAS GEMM path for M > 144 closes the prefill-rate gap.
 

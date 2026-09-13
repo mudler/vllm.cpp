@@ -1,0 +1,6 @@
+clock-leg1.jsonl samples=47 busy_samples=36 busy_median=9 sclk_all_median=2772 sclk_busy_min/med/max=632/2830.0/2892 spread_pct=79.859 boot=2ed44130
+clock-leg2.jsonl samples=51 busy_samples=39 busy_median=9 sclk_all_median=2741 sclk_busy_min/med/max=621/2811/2894 spread_pct=80.861 boot=2ed44130
+clock-leg3.jsonl samples=44 busy_samples=34 busy_median=9.5 sclk_all_median=2694.0 sclk_busy_min/med/max=619/2766.5/2896 spread_pct=82.306 boot=2ed44130
+clock-leg4.jsonl samples=49 busy_samples=38 busy_median=9 sclk_all_median=2775 sclk_busy_min/med/max=632/2829.0/2894 spread_pct=79.958 boot=2ed44130
+clock-leg5.jsonl samples=47 busy_samples=37 busy_median=9 sclk_all_median=2741 sclk_busy_min/med/max=618/2793/2893 spread_pct=81.454 boot=2ed44130
+clock-leg6.jsonl samples=51 busy_samples=37 busy_median=10 sclk_all_median=2756 sclk_busy_min/med/max=634/2837/2892 spread_pct=79.591 boot=2ed44130

@@ -8,6 +8,7 @@
 
 #include "vllm/config/weight_residency.h"
 #include "vllm/model_executor/device_placement.h"
+#include "vllm/platforms/interface.h"
 #include "vt/ops.h"
 #include "vt/quant.h"
 
@@ -96,6 +97,20 @@ bool QuantRepackForDevice(bool keep_quant, bool cpu_ref,
                           bool host_repack_active, vt::DeviceType dev) {
   return keep_quant && !cpu_ref && host_repack_active &&
          dev == vt::DeviceType::kCPU;
+}
+
+// See the header. The ORDER of the terms is the contract: an explicit knob is
+// answered before the device is consulted, so the same-binary A/B still reaches
+// a staging device.
+bool GgufPrefaultForDevice(vt::DeviceType dev) {
+  if (!ResolveGgufPrefault()) return false;
+  if (GgufPrefaultIsExplicit()) return true;
+  if (dev == vt::DeviceType::kCPU) return true;
+  // A device with no registered platform cannot be asked, and this function is
+  // not the place to refuse a load. Answering ON leaves such a caller with
+  // exactly the behaviour it had before this term existed.
+  if (!vllm::platforms::HasPlatform(dev)) return true;
+  return vllm::platforms::GetPlatform(dev).host_memory_is_device_addressable();
 }
 
 const char* Name(GgufTensorRole role) {
@@ -431,6 +446,11 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv(
   // rather than called there.
   p.quant_repack = QuantRepackForDevice(p.keep_quant, p.cpu_ref,
                                         vt::cpu::QuantRepackActive(), dev);
+  // The load-time prefault, with the SAME device term and for a reason of the
+  // same shape: the transform is worth paying for only where the forward reads
+  // the borrowed pages. See `GgufPrefaultForDevice`. `VT_GGUF_PREFAULT` and
+  // `vllm_cpp.mmap.prefault` still win over the device.
+  p.prefault = GgufPrefaultForDevice(dev);
   // KERNEL-GEMM-CPU-TILED lever 2, elementwise [N,K] -> [K,N] repack-at-load.
   // OPT-IN ONLY (default false) because the repacked bytes are transposed and
   // only the CPU MatmulBTKernel honours Tensor.elem_kn_repacked today; see the

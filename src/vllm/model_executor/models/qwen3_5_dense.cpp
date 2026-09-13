@@ -238,6 +238,15 @@ ForwardLogits ForwardQwen3_5Dense(LoadedModel& model,
        (input.logits_indices.empty() ||
         static_cast<int64_t>(input.logits_indices.size()) ==
             input.attn_meta.num_actual_tokens));
+  if (std::getenv("VT_TT_ALLOC_TRACE") != nullptr)
+    std::fprintf(stderr,
+                 "[TT-FWD] route T=%zu num_reqs=%d pure_decode=%d "
+                 "uniform_qlen=%lld gather=%d n_idx=%zu -> %s\n",
+                 input.token_ids.size(), input.attn_meta.num_reqs,
+                 input.pure_decode ? 1 : 0,
+                 static_cast<long long>(input.uniform_query_len),
+                 input.gather_logits ? 1 : 0, input.logits_indices.size(),
+                 uniform_decode ? "graph" : "eager");
   if (DenseDecodeGraphEnabled() && uniform_decode && graph_cuda &&
       input.num_reqs <= kMaxDecodeGraphBatch) {
     if (!qwen.decode_graph()) {

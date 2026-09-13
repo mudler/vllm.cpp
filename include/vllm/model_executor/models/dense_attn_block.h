@@ -203,7 +203,9 @@ inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> s
   // what serves it. Each arm therefore asserts the precondition IT needs, which
   // is also why the staging assert sits inside `if (!w.d_dev)` — a resident
   // weight re-read on the hot path pays nothing for this.
-  if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu()) {
+  const vllm::platforms::Platform& plat =
+      vllm::platforms::GetPlatform(d.q.device.type);
+  if (plat.is_cpu()) {
     VT_CHECK(!w.bytes.empty(),
              std::string("resident weight: EMPTY tensor has no host bytes to "
                          "alias (host-alias arm, dtype ") +
@@ -241,6 +243,36 @@ inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> s
     d.b.Copy(d.q, p, w.bytes.data(), nb);
     Backend* bk = &d.b;
     w.d_dev = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+    // THE SOURCE PAGES ARE SPENT, AND THIS IS THE ARM QWEN4-EXP ACTUALLY TAKES.
+    // The identical release landed first in `qwen3_5.cpp`'s own `ResidentWeight`
+    // (the TU-local one, which shadows this function inside that file), and that
+    // covered the Qwen3.5 dense weights and — through `KqResidentSlice` and
+    // `KqGrouped` — the shared MoE seam's keep-quant expert towers. It did NOT
+    // cover Qwen4-Exp's attention, norm, hyper-connection, PLE and lm_head
+    // weights, because every one of those stages HERE: 12 call sites in
+    // `qwen4_exp_forward.cpp`, 10 in `qwen4_exp_qsa_block.cpp`, 7 in
+    // `qwen4_exp_ple_block.cpp` and 1 in `qwen4_exp_registry.cpp`, and not one
+    // reference to the `qwen3_5.cpp` function anywhere in that model. Measured
+    // with the release in the other function only: host `RssFile` on
+    // `strix:gpu0` still climbed to 21.08 GB during the forward and stayed
+    // there (.agents/specs/rocm-host-residency-after-upload.md §4).
+    //
+    // INSIDE THE `d_dev` MEMO ON PURPOSE, which is #1299's lesson and the same
+    // placement the other arm was reviewed on: this function runs about 1,361
+    // times per forward step on the target checkpoint, so a release that
+    // re-tested its condition on every call would `MADV_DONTNEED` the pages the
+    // GPU is about to read, every step. The helper states its other two
+    // preconditions (a BORROWED span, and `mmap_fd >= 0` so the pages are
+    // re-faultable from a file rather than anonymous) and synchronizes the
+    // queue before it touches anything.
+    //
+    // The platform answer is the one COMPUTED ABOVE, passed in. It is
+    // `host_memory_is_device_addressable()` and NOT the backend's
+    // `DeviceMemoryIsHostAddressable()`: those answer different questions and
+    // GB10 answers them differently, which is what the guard repair on this
+    // branch existed for. The helper asks the backend's separately.
+    vllm::MaybeReleaseStagedBorrowSource(d.b, d.q, w,
+                                         plat.host_memory_is_device_addressable());
     // The host mirror is now redundant wherever device memory is host-
     // addressable (Vulkan). See AdoptDeviceBytesAsHost — this is what keeps a
     // unified-memory box from holding the whole model twice.

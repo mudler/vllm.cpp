@@ -176,6 +176,14 @@ void RunGate(const std::string& golden_subdir, const char* label,
     SkipGate(label, "model artifact not cached — resolve the snapshot or GGUF "
                     "path this gate is pinned to first");
   }
+  // W4d W3 (#3042): the 27B checkpoint's auto-fit (max_model_len 8192 -> a
+  // 256-block KV pool and a 13104-token capture shape) drove the 32 GiB card
+  // to 99 percent bank occupancy and OOM'd mid-generation; the battery needs
+  // ~40 tokens of context. Bound the engine to the workload the way vLLM's
+  // own smoke tests pass max_model_len. The 0.8B vehicle keeps the default.
+  vllm::entrypoints::EngineParams gate_params;
+  if (label == std::string_view("qwen38-gguf-q4km-27b"))
+    gate_params.max_model_len = 1024;
   const fs::path gdir = probe ? fs::path(probe_dir)
                               : fs::path(PARITY_GOLDENS_DIR) / golden_subdir;
   const bool dump = !probe && std::getenv("VT_DUMP_IDS") != nullptr;
@@ -195,8 +203,7 @@ void RunGate(const std::string& golden_subdir, const char* label,
   if (artifacts == GateArtifactState::kBootstrap) {
     MESSAGE(label << ": BOOTSTRAP dump (gap golden absent) via FromModelDir(" << snap << ")...");
     std::unique_ptr<vllm::entrypoints::LoadedEngine> le =
-        vllm::entrypoints::LoadedEngine::FromModelDir(
-            snap, vllm::entrypoints::EngineParams{});
+        vllm::entrypoints::LoadedEngine::FromModelDir(snap, gate_params);
     const parity::NpyArray gg = parity::LoadNpy((gdir / "greedy_ids.npy").string());
     const int64_t NN = gg.shape[0], TT = gg.shape[1];
     std::vector<int32_t> buf(static_cast<size_t>(NN * TT), -1);
@@ -241,8 +248,7 @@ void RunGate(const std::string& golden_subdir, const char* label,
 
   MESSAGE(label << ": loading via FromModelDir(" << snap << ")...");
   std::unique_ptr<vllm::entrypoints::LoadedEngine> loaded =
-      vllm::entrypoints::LoadedEngine::FromModelDir(
-          snap, vllm::entrypoints::EngineParams{});
+      vllm::entrypoints::LoadedEngine::FromModelDir(snap, gate_params);
 
   // The base golden pair is production-mode ROCm evidence after issue #2772.
   // The Tenstorrent device lane carries its OWN oracle-backed golden pair

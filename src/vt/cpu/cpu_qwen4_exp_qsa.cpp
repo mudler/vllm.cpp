@@ -325,8 +325,15 @@ inline float MaybeBf16(float x, bool round) {
         m = std::max(m, dot * args.scale);
       }
       // Pass 2: the softmax weights and the value reduction, ascending.
+      // THE PROBE (`Qwen4ExpQsaAttnArgs::softmax_probe_*`) publishes the weights
+      // this fold consumes and the value it folds them into. It changes no
+      // arithmetic: it stores `w` as it is produced and `denom` once it is
+      // finished, so the ascending order a caller checks is the order this loop
+      // runs and not a restatement of it.
+      const int64_t probe_pair = t * HQ + h;
       float denom = 0.0f;
       std::vector<float> acc(static_cast<size_t>(DH), 0.0f);
+      int64_t probe_s = 0;
       for (int64_t p : sel) {
         ++reads;
         float dot = 0.0f;
@@ -335,12 +342,17 @@ inline float MaybeBf16(float x, bool round) {
           dot += qrow[static_cast<size_t>(d)] * LoadF32At(key, kbase + d);
         }
         const float w = std::exp(dot * args.scale - m);
+        if (args.softmax_probe_weights != nullptr && probe_s < args.softmax_probe_stride) {
+          args.softmax_probe_weights[probe_pair * args.softmax_probe_stride + probe_s] = w;
+        }
+        ++probe_s;
         denom += w;
         const int64_t vbase = RowBase(value, p, kvh);
         for (int64_t d = 0; d < DH; ++d) {
           acc[static_cast<size_t>(d)] += w * LoadF32At(value, vbase + d);
         }
       }
+      if (args.softmax_probe_denom != nullptr) args.softmax_probe_denom[probe_pair] = denom;
       for (int64_t d = 0; d < DH; ++d) {
         StoreF32At(out, (t * HQ + h) * DH + d, acc[static_cast<size_t>(d)] / denom);
       }

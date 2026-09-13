@@ -334,6 +334,12 @@ fix is tracked as #3124 under Owed.
 
 ## Owed
 
+- **`ISSUE-LOCAL-01M2CZX87ZB0WHRW2YZYPW7VRZ` (closed 2026-09-13): the binary
+  cache never restored on the CIFS share.** Fixed with an existence guard, a
+  manifest written before an atomic rename, and an md5 check on restore. Still
+  owed from its review: the cache key is the source pin alone, so a build-flag
+  change under an unchanged pin restores the older build.
+
 - **[#2993](https://github.com/mudler/vllm.cpp/issues/2993): `gpu_memory_utilization`
   does not account for the DFlash2 draft speculative context.** Found by this
   run, which recorded 1282.5 MiB of it at `max_num_seqs 8`

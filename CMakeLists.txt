@@ -801,6 +801,13 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/deepseek_v2.cpp
   src/vllm/model_executor/models/deepseek_v4_registry.cpp
   src/vllm/model_executor/models/deepseek_v4_mm.cpp
+  # DeepSeek-V4.1 is a SIBLING of V4, not a widening of it: upstream forked
+  # `vllm/models/deepseek_v4_1/` from `vllm/models/deepseek_v4/`, and the two
+  # disagree on values the V4 parser hard-validates (compress_ratios {0,1,2}
+  # against {0,4,128}). Its own TUs keep V4's landed gates out of the blast
+  # radius. W1 only: config descent + registration, every other arm refuses.
+  src/vllm/model_executor/models/deepseek_v4_1_registry.cpp
+  src/vllm/model_executor/models/deepseek_v4_1.cpp
   src/vllm/model_executor/models/deepseek_v4_weights.cpp
   src/vllm/model_executor/models/deepseek_v4_vision_weights.cpp
   src/vllm/model_executor/models/deepseek_v4.cpp

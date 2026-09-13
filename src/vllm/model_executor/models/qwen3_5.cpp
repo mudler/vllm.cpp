@@ -1298,6 +1298,28 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
     d.b.Copy(d.q, p, w.bytes.data(), nb);
     Backend* bk = &d.b;
     w.d_dev = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+    // THE SOURCE PAGES ARE SPENT, AND ON A STAGING DEVICE NOTHING WAS DROPPING
+    // THEM (.agents/specs/rocm-host-residency-after-upload.md). The copy above
+    // is the only read of this weight's host bytes that will ever happen there,
+    // and for a GGUF keep-quant load those bytes are the whole model -- 65.488
+    // GiB on `Qwen3.8-Flash-Next UD-IQ1_S`, faulted in by the load-time prefault
+    // and then held resident for the process lifetime, which is what wedges a
+    // 31 GiB gfx1151 host inside `svm_range_set_attr`. llama.cpp
+    // `unmap_fragment`s the equivalent range after its offloaded tensors are set
+    // (llama-model-loader.cpp:1683-1694). `AdoptDeviceBytesAsHost` below cannot
+    // do this job: it returns immediately for a GGUF borrow, by design, because
+    // the borrow must NOT be re-pointed at a device allocation the kernels are
+    // the only readers of.
+    //
+    // INSIDE THE `d_dev` MEMO ON PURPOSE, which is the whole of #1299's lesson:
+    // this function runs about 1,361 times per forward step, and a release that
+    // re-tested its condition each time would madvise away the pages the GPU is
+    // about to read, every step. The helper states its other two preconditions
+    // and synchronizes the queue before it touches anything.
+    vllm::MaybeReleaseStagedBorrowSource(
+        d.b, d.q, w,
+        vllm::platforms::GetPlatform(d.q.device.type)
+            .host_memory_is_device_addressable());
     // Same adoption as the dense block's ResidentWeight: on a host-addressable
     // device the uploaded buffer IS the host buffer, so keeping the mirror
     // costs a second full copy of the model out of the same unified RAM.
@@ -4375,6 +4397,25 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
     out.z = out.z_owner->t();
     return out;
   }
+  // W4d W4 (tenstorrent-27b-gdn-keepquant.md): block-encoded GDN
+  // projections — the packed row-reorder keeps attn_qkv (q6_K) and
+  // attn_gate (q4_K) verbatim through the V-head reorder — decode through
+  // their keep-quant words via the same MatmulBTRawD the merged arm uses,
+  // per tensor (the merged arm needs ONE encoding; this checkpoint mixes
+  // q6_K qkv with a q4_K gate). bf16 output: the same dtype the default
+  // bf16 in_proj arm emits, which the conv/post-conv consumers expect.
+  if (!w.in_proj_qkv.Empty() && vt::IsBlockQuant(w.in_proj_qkv.dtype)) {
+    VT_CHECK(!w.in_proj_z.Empty() && vt::IsBlockQuant(w.in_proj_z.dtype),
+             "qwen3_5 GDN: a block-encoded in_proj_qkv must pair with a "
+             "block-encoded in_proj_z");
+    out.mixed_owner.emplace(MatmulBTRawD(
+        d, h, ResidentWeight(d, w.in_proj_qkv), DType::kBF16));
+    out.z_owner.emplace(
+        MatmulBTRawD(d, h, ResidentWeight(d, w.in_proj_z), DType::kBF16));
+    out.mixed = out.mixed_owner->t();
+    out.z = out.z_owner->t();
+    return out;
+  }
   out.mixed_owner.emplace(
       !w.in_proj_qkv_fp8.Empty()
           ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_qkv_fp8,
@@ -7175,6 +7216,155 @@ void MoeSelFp(int dev_type, int64_t T, int64_t E, int64_t top_k,
   ++MoeSelFpCall();
 }
 
+// ─── W8: the DEVICE-RESIDENT keep-quant grouped MoE arm (QUANT-CUDA-GATES) ───
+//
+// Owned by `.agents/issues/QUANT-CUDA-GATES/ISSUE-LOCAL-01M2AAACGC0SXYXFN2JQ3GFEAZ.md`;
+// scoped by `.agents/specs/qwen4-exp-flash-next.md` §"W8 scope".
+//
+// WHAT THIS REPLACES, and it is a STRUCTURE rather than a kernel. The reference
+// arm below is the only arm a GGUF k-quant checkpoint can take, because it has
+// neither fp4 nor bf16 experts. That arm copies the hidden to host and
+// synchronizes, downloads the router top-k, and then makes three `KqGrouped`
+// calls that each upload an activation, launch ONE grouped GEMM and `Download`
+// an f32 result — a blocking drain — with the SwiGLU in a host loop between
+// them and the routed output assembled in a host `std::vector`. Nothing in that
+// sequence needs the host: `vt::MatmulBTQuantGrouped`, `vt::MoeSiluMul`,
+// `vt::CastBf16`, `vt::MoeRouterTopK` and `vt::MoeCombine` are all registered
+// device ops. What was missing is an arm that keeps the intermediates on device
+// BETWEEN them, and this is that arm. NO new kernel is added.
+//
+// THE BAR IS PER-PAIR BIT IDENTITY WITH THE REFERENCE ARM, EXCEPT AT THE
+// SwiGLU, where it is one bf16 ULP. Not a tolerance anywhere else, and the
+// whole shape of this function is chosen to make that reachable rather than
+// hoped for. Each step below reaches the SAME op on the SAME bytes as the
+// reference step it replaces, and the one that does not is named as such:
+//
+//   * router GEMM — `vt::Matmul`/`vt::MatmulBT` over the SAME `ResidentWeight`,
+//     branched on `w.router_gate.nk` exactly as `MatmulBf16` branches. The
+//     reference downloads the bf16 logits and re-uploads them into `dlog`; that
+//     round trip moves no bits, so the tensor `MoeRouterTopK` reads is the same
+//     one.
+//   * top-k — the same `vt::MoeRouterTopK` on the same logits.
+//   * gate/up — the same `vt::MatmulBTQuantGrouped` over the same
+//     `ResidentWeight`-staged tower with the same `eids`. The reference
+//     materialises `act[P,H]` by copying `h[t]` into every routed pair's row;
+//     at `T == 1` every row is the same row, which is exactly the broadcast the
+//     grouped kernel already implements (`Pa == 1 && P > 1`,
+//     `cuda_quant_dot.cu`). The kernel SELECTION does not depend on `bcast` —
+//     it is passed as a row-index flag — and the activation quantizer produces
+//     the same Q8_K/Q8_0 block from the same bytes, so broadcasting is
+//     bit-identical to P copies rather than merely close.
+//   * SwiGLU — `vt::MoeSiluMul`, whose CUDA kernel computes
+//     `g/(1+expf(-g)) * u` in f32 and stores through `__float2bfloat16`
+//     (round-to-nearest-even, the same rounding as the host `vt::F32ToBF16`).
+//     THIS IS THE ONE STEP THAT IS NOT BIT-IDENTICAL BY CONSTRUCTION: the
+//     reference computes `Silu()` with `std::exp` and this computes it with
+//     `expf`, and the two are not required to agree to the last f32 ULP. The
+//     op's own comment (`cuda_moe.cu:823-827`) calls that an ACCEPTED
+//     deviation, so this arm cannot claim identity for it.
+//
+//     IT IS GATED AT THE OP RATHER THAN THROUGH THIS BLOCK, because the block
+//     comparison has almost no power over that class: a 1-f32-ULP move in
+//     `silu(g)` changes `bf16(silu(g)*u)` in 1.44e-5 of N(0,3) samples
+//     (288/20,000,000, measured), so a fixture's handful of SwiGLU elements
+//     would miss a kernel that disagreed everywhere. The
+//     `SwiGLU expf deviation, bounded` cases in
+//     `tests/vllm/models/test_qwen35_moe_kq_device.cpp` sweep 2^22 pairs
+//     against this arm's own host formula and hold the result to ONE bf16 ULP,
+//     printing the observed disagreement count on the green run. The CPU case
+//     of that sweep must be EXACTLY equal, because `cpu_ops.cpp:733` is the
+//     same `std::exp` formula the reference arm runs.
+//   * down GEMM — the same grouped op, `Pa == P` on both arms.
+//   * the bf16 narrowing of the routed output — `vt::CastBf16` is
+//     `__float2bfloat16`, which is `vt::F32ToBF16`.
+//   * shared expert + combine — the same calls the reference makes, on the same
+//     `dh` and the same `dtw`.
+//
+// T == 1 ONLY, and that is a scope statement rather than an oversight. The
+// broadcast is what removes the host gather, and it exists only for one hidden
+// row. Prefill (`T > 1`) needs a device row-gather that `MatmulBTQuantGrouped`
+// has no row-map argument for, so it keeps the reference loop; decode is the
+// capture target and decode is `T == 1`.
+//
+// This arm does NOT gate on the weight dtype. An encoding the CUDA grouped
+// kernel cannot read falls back to the CPU provider INSIDE `vt` (with its own
+// drain) on both arms identically, so refusing it here would change nothing
+// except which of two identical answers is computed.
+int64_t& MoeKqDeviceCallCount() {
+  static int64_t n = 0;
+  return n;
+}
+
+// The ship gate. DEFAULT ON, `VT_MOE_KQ_FAST=0` restores the reference loop in
+// the same binary — the polarity `MoeBf16FastEnabled()` set.
+//
+// IT IS READ ON EVERY CALL AND NOT CACHED IN A PROCESS-STATIC, which is where
+// this deliberately departs from `MoeBf16FastEnabled()`. The bar this arm has
+// to clear is BYTE EQUALITY WITH THE OTHER ARM, and a process-static makes that
+// unmeasurable: one process can then only ever run one arm, so the comparison
+// would have to cross two processes through a golden file and the assertion
+// would live in neither run. One `getenv` per MoE layer — 48 per decode token,
+// beside three grouped GEMMs — is not a cost worth trading that for.
+bool MoeKqFastEnabled() {
+  const char* e = std::getenv("VT_MOE_KQ_FAST");
+  return !(e != nullptr && e[0] == '0');  // default ON; =0 rolls back
+}
+
+DBuf MoeBlockKqDevice(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
+                    const Tensor& dh, int64_t T) {
+  const int64_t H = cfg.hidden_size;
+  const int64_t E = cfg.num_experts;
+  const int64_t top_k = cfg.num_experts_per_tok;
+  const int64_t I = cfg.moe_intermediate_size;
+  const int64_t P = T * top_k;
+  ++MoeKqDeviceCallCount();
+
+  // Router: logits = dh @ gate, then softmax/top-k/renormalize — both on device.
+  // The `nk` branch mirrors `MatmulBf16`, which is what the reference arm calls.
+  Tensor drg = ResidentWeight(d, w.router_gate);
+  DBuf dlog(d, DType::kBF16, {T, E});
+  if (w.router_gate.nk)
+    vt::MatmulBT(d.q, dlog.t(), dh, drg);
+  else
+    vt::Matmul(d.q, dlog.t(), dh, drg);
+  DBuf dtw(d, DType::kF32, {T, top_k});
+  DBuf dtid(d, DType::kI32, {T, top_k});
+  vt::MoeRouterTopK(d.q, dtw.t(), dtid.t(), dlog.t(),
+                    vt::MoeRouterTopKArgs{static_cast<int>(top_k), true});
+  Tensor eids = Reshape(dtid.t(), {P});  // [P] i32, pair p = t*top_k + j
+
+  // gate/up over the BROADCAST hidden. `dh` is already the [1,H] row the
+  // grouped kernel wants for `Pa == 1`; nothing is gathered and nothing is
+  // copied.
+  Tensor wg = ResidentWeight(d, w.expert_gate_kq);
+  Tensor wu = ResidentWeight(d, w.expert_up_kq);
+  Tensor wd = ResidentWeight(d, w.expert_down_kq);
+  DBuf dg(d, DType::kF32, {P, I});
+  DBuf du(d, DType::kF32, {P, I});
+  vt::MatmulBTQuantGrouped(d.q, dg.t(), dh, wg, eids);
+  vt::MatmulBTQuantGrouped(d.q, du.t(), dh, wu, eids);
+
+  // SwiGLU, on device: eact = bf16(silu(g) * u) — the host loop's exact shape.
+  DBuf dact(d, DType::kBF16, {P, I});
+  vt::MoeSiluMul(d.q, dact.t(), dg.t(), du.t());
+
+  // down, then the f32 -> bf16 narrowing the host loop did with F32ToBF16.
+  DBuf ddn(d, DType::kF32, {P, H});
+  vt::MatmulBTQuantGrouped(d.q, ddn.t(), dact.t(), wd, eids);
+  DBuf deo(d, DType::kBF16, {P, H});
+  vt::CastBf16(d.q, deo.t(), ddn.t());
+  Tensor expert_out = Reshape(deo.t(), {T, top_k, H});
+
+  // Shared expert + combine: the reference arm's own calls, unchanged.
+  const bool has_shared = cfg.shared_expert_intermediate_size > 0;
+  std::optional<DBuf> shared;
+  if (has_shared) shared.emplace(SharedExpert(d, w, cfg, dh, T, /*fp4=*/false));
+  DBuf dout(d, DType::kBF16, {T, H});
+  vt::MoeCombine(d.q, dout.t(), expert_out, dtw.t(),
+                 has_shared ? &shared->t() : nullptr);
+  return dout;
+}
+
 DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
               const Tensor& dh, int64_t T) {
   const int64_t H = cfg.hidden_size;
@@ -7207,6 +7397,42 @@ DBuf MoeBlock(Dev d, const MoeBlockWeights& w, const HfConfig& cfg,
       vt::OpRegistered(vt::OpId::kMoeGroupedGemmBf16GateUpSilu, d.q.device.type) && MoeBf16FastEnabled() &&
       !w.expert_gate.empty() && MoeBf16FastLayoutOk(w, cfg))
     return MoeBlockBf16Cuda(d, w, cfg, dh, T);
+
+  // W8 (QUANT-CUDA-GATES): device-resident keep-quant grouped MoE — the GGUF
+  // k-quant analog of the bf16 arm above, selected at the same site and under
+  // the same shape of condition. DEFAULT ON (VT_MOE_KQ_FAST); =0 falls through
+  // to the reference loop below, which stays intact as BOTH the fallback and
+  // the correctness oracle the arm is gated byte-for-byte against.
+  //
+  // Three of the five conditions are the arm's preconditions: a keep-quant tower
+  // set, every op it calls registered on THIS queue's device, and T == 1 for the
+  // broadcast. It asks the op table rather than naming CUDA — the same question
+  // the bf16 arm asks, and the one `check-device-leakage.py` requires of the
+  // device-agnostic layer. Every op it calls has a CPU provider too, and the CPU
+  // grouped kernel implements the same `act.shape[0] == 1` broadcast
+  // (`cpu_quant_gemm.cpp:244`), so the arm is correct wherever it is registered
+  // and the suite exercises it on CPU, CUDA and ROCm.
+  //
+  // THAT MAKES IT DEFAULT-ON ON TENSTORRENT TOO, which registers all three ops
+  // (`tenstorrent_ops.cpp:8298, 8307, 8309`) and which no suite here runs a MoE
+  // block on. The bf16 arm above does NOT reach that backend — Tenstorrent
+  // registers no `kMoeGroupedGemmBf16` — so this gap is this arm's alone and is
+  // tracked by
+  // `.agents/issues/QUANT-CUDA-GATES/ISSUE-LOCAL-01M2D7X94RTPJ453QGHYKQZPY8.md`. The other two conditions are
+  // refusals of an INVISIBLE FALLBACK rather than of a defect.
+  // `Qwen35GroupedMoeEnabled()` is the existing grouped-vs-per-expert route
+  // switch, and it is already false when expert streaming was asked for; taking
+  // this arm anyway would silently do neither. `MoeSelFpCalls()` is the
+  // VT_MOE_SEL_FP selection tap, which reads the host `h`/`logits`/`ids`/
+  // `expert_out` the reference arm downloads and this arm never materialises —
+  // so an operator who turned the tap on gets the reference arm and a real tap,
+  // not this arm and a silent nothing.
+  if (!fp4 && !w.expert_gate_kq.Empty() && T == 1 &&
+      vt::OpRegistered(vt::OpId::kMatmulBTQuantGrouped, d.q.device.type) &&
+      vt::OpRegistered(vt::OpId::kMoeSiluMul, d.q.device.type) &&
+      vt::OpRegistered(vt::OpId::kCastBf16, d.q.device.type) &&
+      Qwen35GroupedMoeEnabled() && MoeSelFpCalls() == 0 && MoeKqFastEnabled())
+    return MoeBlockKqDevice(d, w, cfg, dh, T);
 
   // Reference path: download the hidden once, then gather + per-expert MLP.
   std::vector<uint16_t> h(static_cast<size_t>(T) * H);
@@ -8127,6 +8353,15 @@ MoeBlockOutput RunMoeBlock(vt::Queue& queue, const MoeBlockWeights& weights,
   return r;
 }
 
+// How many times the W8 device-resident keep-quant arm (`MoeBlockKqDevice`) has
+// run in this process. The ARM-SELECTION probe, and the only thing that can see
+// the defect this row closes: the two arms agree on every byte they produce, so
+// an output comparison alone cannot say WHICH one ran, and a gate that cannot
+// say that would have stayed green through the whole history of this bug. The
+// `qwen3_5.cpp`-internal `MoeBlock` has internal linkage, so this is the same
+// cross-TU shape `RunMoeBlock` above already uses to expose it.
+int64_t MoeKqDeviceCalls() { return MoeKqDeviceCallCount(); }
+
 
 // Exposed wrapper over the anon-ns `GdnBlockPaged` (row MODEL-MM-QWEN4-EXP W5b,
 // issue #2110) so a hybrid architecture in another TU — Qwen4-Exp, whose
@@ -8253,7 +8488,10 @@ static void EmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& token_ids
                       const Qwen3_5MoeWeights& weights, const HfConfig& config) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
-  const int64_t vocab = config.vocab_size;
+    if (std::getenv("VT_TT_ALLOC_TRACE") != nullptr)
+    std::fprintf(stderr, "[TT-FWD] EmbedInto T=%lld H=%lld\n",
+                 static_cast<long long>(T), static_cast<long long>(H));
+const int64_t vocab = config.vocab_size;
   Tensor dtab =
       Qwen3_5EmbeddingTable(d.b, d.q, weights.embed_tokens, vocab, H);
   // ENG-ASYNC-SCHED W4: when the async runner has already placed this step's
@@ -8528,6 +8766,12 @@ static DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                         const Tensor* aux_out = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
+  if (std::getenv("VT_TT_ALLOC_TRACE") != nullptr)
+    std::fprintf(stderr, "[TT-FWD] ForwardBody T=%lld H=%lld num_reqs=%lld "
+                 "logits_indices=%zu\n",
+                 static_cast<long long>(T), static_cast<long long>(H),
+                 static_cast<long long>(attn_meta.num_reqs),
+                 logits_indices.size());
   DBuf hidden(d, ActDType(d), {T, H});
   EmbedInto(d, hidden, token_ids, weights, config);
   return ForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
@@ -8747,7 +8991,14 @@ void Qwen3_5DenseModel::PrepareBf16Resident(
            "PrepareBf16Resident: a weight-staging (device-resident) queue required");
   Dev d{vt::GetBackend(queue.device.type), queue};
   const auto raw = [&d](const OwnedTensor& tensor) {
-    if (!tensor.Empty()) (void)ResidentWeight(d, tensor);
+    if (!tensor.Empty()) {
+      Tensor t = ResidentWeight(d, tensor);
+      // W4d W6: stage the keep-quant word shadow HERE, at load, while the
+      // banks are unfragmented — a lazy first-matmul stage at 27B asked the
+      // head's 1 GiB words against a 100 MB largest free block and died.
+      // No-op for non-block dtypes; the warm's later call hits the cache.
+      vt::tenstorrent::StageKeepQuantWordsFor(t);
+    }
   };
   const auto f32 = [&d](const OwnedTensor& tensor) {
     if (!tensor.Empty()) {
@@ -9334,6 +9585,9 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
                                StepDevInputs* persistent_sdi = nullptr) {
   const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
+  if (std::getenv("VT_TT_ALLOC_TRACE") != nullptr)
+    std::fprintf(stderr, "[TT-FWD] DenseForwardLayers T=%lld n_idx=%zu\n",
+                 static_cast<long long>(T), logits_indices.size());
   const float eps = static_cast<float>(config.rms_norm_eps);
 
   // Working copy of the embedded hidden (device->device; captured). RunDenseLayer
@@ -9415,8 +9669,30 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
         layer.is_linear_attention ? nullptr : &attn_kv[static_cast<size_t>(fa_idx++)];
     const GdnStateCache* gs =
         layer.is_linear_attention ? &gdn_state[static_cast<size_t>(gdn_idx++)] : nullptr;
+#ifdef VLLM_CPP_TENSTORRENT
+    // W4d (#3042) attribution: the chunk-loop ledger brackets only the
+    // keep-quant webs; 13 GB of the 27B first pass lands in the spans this
+    // pair now brackets (attention, GDN, norms, rolls).
+    char tt_lbl[48];
+    if (vt::tenstorrent::DeviceAvailable()) {
+      std::snprintf(tt_lbl, sizeof tt_lbl, "block/%lld/pre",
+                    static_cast<long long>(l));
+      vt::tenstorrent::AllocTraceSnapshot(vt::tenstorrent::SharedMeshDevice(),
+                                          tt_lbl);
+    }
+#endif
     RunDenseLayerPaged(d, layer, config, hidden, res, sdi, attn_meta,
                        gdn_meta, kv, gs, T, l);
+#ifdef VLLM_CPP_TENSTORRENT
+    if (vt::tenstorrent::DeviceAvailable()) {
+      std::snprintf(tt_lbl, sizeof tt_lbl, "block/%lld/post",
+                    static_cast<long long>(l));
+      vt::tenstorrent::AllocTraceSnapshot(vt::tenstorrent::SharedMeshDevice(),
+                                          tt_lbl);
+      if (std::getenv("VT_TT_ALLOC_TRACE") != nullptr)  // W4d: census spam only on trace
+        vt::tenstorrent::DumpSlotCensus(tt_lbl);
+    }
+#endif
     // DFlash DF-AUX-TAPS: capture (hidden+res) at configured boundaries. Inert
     // (no-op) when aux_out is null — every non-DFlash caller.
     MaybeCaptureAuxTap(d, l, aux_layer_ids, aux_out, hidden.t(), res.t(), T, H);
@@ -9475,6 +9751,27 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
   return DenseLogitsF32D(d, dnorm.t(), weights);
 }
 
+// W4d (tenstorrent-27b-decode-shape-capture.md): per-sequence LAST-TOKEN
+// logits indices for a mixed prefill step, the vLLM logits_processor
+// semantics — generation samples only the last scheduled token per sequence
+// (prepare_inputs.cpp:210-221: `logits_indices[i] = query_start_loc[i+1]-1`).
+// Empty (identity, full [T,vocab] head) when the metadata cannot express the
+// gather or it would be a no-op: a pure-decode step has size == T, and the
+// graph-replay/capture contract passes {} by design. The driver's eager
+// fallback feeds these to the forward so the gather-before-lm_head fires and
+// the head allocates [num_seqs, vocab], never [T, vocab].
+static std::vector<int32_t> LastTokenLogitsIndices(
+    const v1::CommonAttentionMetadata& am, int64_t T) {
+  const int64_t n =
+      static_cast<int64_t>(am.query_start_loc.size()) - 1;
+  if (n <= 0 || n >= T) return {};
+  std::vector<int32_t> indices(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; ++i) {
+    indices[static_cast<size_t>(i)] = am.query_start_loc[static_cast<size_t>(i) + 1] - 1;
+  }
+  return indices;
+}
+
 // Full eager dense paged forward body: embed (host token_ids) then the capturable
 // dense layer region. Used by Qwen3_5DenseModel::Forward/ForwardDevice and the
 // dense-graph driver's eager fallback / cold-shape pre-warm step (one contiguous
@@ -9496,6 +9793,12 @@ static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                          gdn_state, weights, config);
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
+  if (std::getenv("VT_TT_ALLOC_TRACE") != nullptr)
+    std::fprintf(stderr, "[TT-FWD] DenseForwardBody T=%lld H=%lld num_reqs=%lld "
+                 "logits_indices=%zu\n",
+                 static_cast<long long>(T), static_cast<long long>(H),
+                 static_cast<long long>(attn_meta.num_reqs),
+                 logits_indices.size());
   DBuf hidden(d, ActDType(d), {T, H});
   DenseEmbedInto(d, hidden, token_ids, weights, config);
   return DenseForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
@@ -10852,8 +11155,14 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
           token_ids, positions, attn_meta, gdn_meta, attn_kv, gdn_state,
           impl_->weights, impl_->config, impl_->queue, aux_out, {});
     }
+    // W4d (tenstorrent-27b-decode-shape-capture.md): a MIXED step the graph
+    // declines (it captures only the decode shape, Q == 1) runs eagerly here --
+    // pass the per-sequence last-token indices so the head gathers
+    // [num_reqs, vocab] instead of asking for the [T, vocab] plane the 27B
+    // banks cannot hold.
     DBuf lg = ForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
-                          gdn_state, impl_->weights, impl_->config);
+                          gdn_state, impl_->weights, impl_->config,
+                          LastTokenLogitsIndices(attn_meta, B));
     // ForwardBody returns [B,vocab] (owned pool block; hand ownership out).
     return WrapDeviceLogits(d, std::move(lg), vocab);
   }
@@ -11448,6 +11757,10 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   // paths return a NON-owning view over the slot's persistent [S,vocab] logits
   // (first B rows are the real requests). Stream ordering guarantees the sampler
   // sees the replay's writes; the next same-size replay overwrites the buffer.
+    if (std::getenv("VT_TT_ALLOC_TRACE") != nullptr)
+      std::fprintf(stderr, "[TT-FWD] DenseGraph::Step B=%lld num_reqs=%lld\n",
+                   static_cast<long long>(token_ids.size()),
+                   static_cast<long long>(attn_meta.num_reqs));
   // SPEC-DSPARK W8 (#442): a uniform SPEC batch carries B = num_reqs * (1+k)
   // tokens, which exceeds max_num_reqs and would make PadToCaptureSize return -1
   // (eager). Capture its EXACT shape instead of padding: upstream pads only in
@@ -11485,8 +11798,9 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
           token_ids, positions, attn_meta, gdn_meta, attn_kv, gdn_state,
           impl_->weights, impl_->config, impl_->queue, aux_out, {});
     }
-    DBuf lg = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
-                               gdn_state, impl_->weights, impl_->config, {});
+    DBuf lg = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta,
+                               attn_kv, gdn_state, impl_->weights, impl_->config,
+                               LastTokenLogitsIndices(attn_meta, B));
     return WrapDeviceLogits(d, std::move(lg), vocab);
   }
 

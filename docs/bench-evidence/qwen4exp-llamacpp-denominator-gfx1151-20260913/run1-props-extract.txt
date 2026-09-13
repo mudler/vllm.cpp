@@ -1,0 +1,3 @@
+build_info b1-035e227
+model_ftype IQ1_S - 1.5625 bpw
+modalities {'vision': False, 'video': False, 'audio': False}

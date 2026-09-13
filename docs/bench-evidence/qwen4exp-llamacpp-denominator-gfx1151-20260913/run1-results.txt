@@ -1,0 +1,24 @@
+RESULT HOST rc-worker-lcjhd arch=x86_64 cpus=32 date=2026-09-13T10:37:14Z
+RESULT LOADAVG_BEFORE 0.39 3.63 6.56
+RESULT BOOT_ID 2ed44130-3e9a-487f-876c-5cbb57f38aab
+RESULT BINARY llama-bench sha256 MATCHES the build job: 03bc5011bdafaa82eaeca4f32ce0ecf35f145b2ab20c79d8f0e69502596a1597
+RESULT BINARY llama-cli sha256 MATCHES the build job: 8617aa73d9694e5d8f2fc782763f6be4ac7ed9a2bce10bb28bd919b0326650e9
+RESULT BINARY llama-server sha256 MATCHES the build job: 222e5c795a87343156979a450ea0c181dc1c65c4dccde745c153fb2f767384c2
+RESULT LDD libamdhip64.so.7 -> /opt/rocm/lib/libamdhip64.so.7
+RESULT QWEN4EXP_STRINGS_IN_LIBLLAMA 76
+RESULT GFX1151_CODE_OBJECTS_IN_LIBGGML_HIP 270
+RESULT SHARD1 sha256=88a1420825a9304063e882ada29d438263617f51ac8923d438d927496693bafd (expect 88a1420825a9304063e882ada29d438263617f51ac8923d438d927496693bafd)
+RESULT SHARD SIZES 10946624 49990818368 22544696352 
+RESULT FILESYSTEM overlay 1.9T 356G 1.4T 21% / -- LOCAL disk, not the CIFS share
+RESULT PILOT rc=0 wall=37s
+RESULT PILOT build_commit=035e227 1
+RESULT LEG 1 rc=0 wall=45s avg_ts/stddev_ts/samples: 26.041122 0.617733 26.345 26.4481 25.3303
+RESULT LEG 2 rc=0 wall=48s avg_ts/stddev_ts/samples: 25.681147 0.906239 26.0372 26.3553 24.651
+RESULT LEG 3 rc=0 wall=42s avg_ts/stddev_ts/samples: 24.466618 0.453652 24.5384 24.8801 23.9814
+RESULT LEG 4 rc=0 wall=46s avg_ts/stddev_ts/samples: 25.734857 0.583982 25.8539 26.2501 25.1005
+RESULT LEG 5 rc=0 wall=45s avg_ts/stddev_ts/samples: 25.579065 1.001905 25.9073 26.3757 24.4542
+RESULT LEG 6 rc=0 wall=48s avg_ts/stddev_ts/samples: 25.691706 0.736071 26.0525 26.1777 24.8448
+RESULT SERVER health after 40s (pid alive: yes)
+RESULT PROPS build_info b1-035e227 model_ftype IQ1_S - 1.5625 bpw modalities {'vision': False, 'video': False, 'audio': False} 
+RESULT COMPLETION ' Paris. Given a sequence of letters, generate the capital of the country.\n'
+RESULT LOADAVG_AFTER 3.18 3.37 5.43

@@ -3182,3 +3182,82 @@ TEST_CASE("ROCm F16 production registered forward reaches retained embedding and
   vllm_test::UnsetEnv("VT_GGUF_KEEP_F16");
 }
 #endif
+
+// W4d W4 (#3042, spec tenstorrent-27b-gdn-keepquant.md): the byte-level
+// packed V-row reorder must be EXACTLY the element-level reorder seen
+// through the row dequantizer — bit-for-bit, per row, for every encoding
+// the GDN family carries. RED until ReorderVPackedForTest existed: the
+// function did not, and the loader dequantized+reordered elements instead,
+// which is what forced the 9.7 GiB of bf16 GDN projections onto the P150.
+namespace {
+
+std::vector<float> ReorderVRowsRef(const std::vector<float>& in,
+                                   int64_t cols, int64_t row_off,
+                                   int64_t num_k, int64_t num_v_per_k,
+                                   int64_t head_rows) {
+  const int64_t cs = head_rows * cols;
+  std::vector<float> out = in;
+  for (int64_t k = 0; k < num_k; ++k) {
+    for (int64_t r = 0; r < num_v_per_k; ++r) {
+      const int64_t g = k * num_v_per_k + r;
+      const int64_t t = r * num_k + k;
+      std::memcpy(out.data() + (row_off + g) * cs,
+                  in.data() + (row_off + t) * cs,
+                  static_cast<size_t>(cs) * sizeof(float));
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("packed V-row reorder equals the element-level reorder (W4d W4)") {
+  // Geometry: K=512 (2 blocks/row, whole blocks per row), 15 weight rows =
+  // row_off(3, non-V) + 6 heads x head_rows(2). q6_K row 420 B, q4_K 288 B.
+  struct Enc {
+    const char* name;
+    uint32_t ggml_type;
+    int64_t block_bytes;
+  };
+  const Enc encs[] = {{"q6_K", 14, 210}, {"q4_K", 12, 144}};
+  const int64_t K = 512, row_off = 3, num_k = 2, rpk = 3, head_rows = 2;
+  const int64_t rows = row_off + num_k * rpk * head_rows;  // 15
+
+  std::mt19937 rng(20260912u);
+  for (const Enc& e : encs) {
+    const int64_t row_bytes = K / 256 * e.block_bytes;
+    std::vector<uint8_t> packed(static_cast<size_t>(rows * row_bytes));
+    for (size_t b = 0; b < packed.size(); b += e.block_bytes) {
+      // pin the block's scale/min bits to valid f16 payloads; randomize the
+      // quant elements (a random f16 scale can be inf/NaN and NaN != NaN).
+      const uint16_t d = vt::F32ToF16(0.05f + 0.01f * static_cast<float>(b % 97));
+      const uint16_t s = vt::F32ToF16(0.004f + 0.001f * static_cast<float>(b % 31));
+      std::memcpy(packed.data() + b, &d, 2);
+      if (e.block_bytes > 2) std::memcpy(packed.data() + b + 2, &s, 2);
+      for (int64_t i = 4; i < e.block_bytes; ++i)
+        packed[b + i] = static_cast<uint8_t>(rng() & 0xFF);
+    }
+
+    // candidate: reorder the packed bytes, then dequant per row
+    std::vector<uint8_t> pb = packed;
+    vllm::ReorderVPackedForTest(pb, row_bytes, row_off, num_k, rpk, head_rows);
+    std::vector<float> fb(static_cast<size_t>(rows * K));
+    for (int64_t r = 0; r < rows; ++r) {
+      auto row = vllm::DequantGgufRowToF32(
+          e.ggml_type, pb.data() + r * row_bytes, K);
+      REQUIRE(row.size() == static_cast<size_t>(K));
+      std::memcpy(fb.data() + r * K, row.data(), static_cast<size_t>(K) * 4);
+    }
+
+    // reference: dequant per row, then the independent element reorder
+    std::vector<float> fa(static_cast<size_t>(rows * K));
+    for (int64_t r = 0; r < rows; ++r) {
+      auto row = vllm::DequantGgufRowToF32(
+          e.ggml_type, packed.data() + r * row_bytes, K);
+      std::memcpy(fa.data() + r * K, row.data(), static_cast<size_t>(K) * 4);
+    }
+    fa = ReorderVRowsRef(fa, K, row_off, num_k, rpk, head_rows);
+
+    CHECK(fa == fb);
+  }
+}

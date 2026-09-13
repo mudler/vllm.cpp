@@ -177,15 +177,51 @@ fi
 say "D. BUILD OUR ENGINE"
 PIN=$(cat "$W/PINNED_SHA" 2>/dev/null | tr -d '[:space:]')
 res "OURS TREE PIN $PIN"
-CACHED_BIN=$W/bin/$PIN/vllm-server
+CACHE_DIR=$W/bin/$PIN
+CACHED_BIN=$CACHE_DIR/vllm-server
+CACHE_MANIFEST=$CACHE_DIR/MANIFEST.md5
 BIN=$SCRATCH/bin/vllm-server
 mkdir -p "$SCRATCH/bin"
-if [ -x "$CACHED_BIN" ]; then
+# -f, not -x: /workspace is CIFS mounted file_mode=0664,nounix, so no file on
+# it carries an execute bit and a -x guard never holds (the restored local
+# copy gets its chmod below). ISSUE-LOCAL-01M2CZX87ZB0WHRW2YZYPW7VRZ.
+#
+# Existence is not validity. dgx:gpu0 crashes about hourly, so a cache can be
+# cut short mid-write, and a binary that dies at startup reads to start_ours as
+# a pool that does not fit. So every file the manifest lists is copied to /tmp
+# and md5-checked THERE, on the bytes that will run. A cache with no manifest,
+# with a manifest that does not list the binary, or with bytes that do not
+# match, is deleted and rebuilt.
+CACHE_STATE=absent
+if [ -f "$CACHED_BIN" ]; then
+    if [ ! -f "$CACHE_MANIFEST" ]; then
+        CACHE_STATE="it has no manifest"
+    elif ! grep -qx '[0-9a-f]\{32\}  vllm-server' "$CACHE_MANIFEST"; then
+        CACHE_STATE="its manifest does not list vllm-server"
+    else
+        CACHE_STATE=ok
+        while read -r _sum name; do
+            if ! cp -L "$CACHE_DIR/$name" "$SCRATCH/bin/$name"; then
+                CACHE_STATE="copying $name failed"; break
+            fi
+        done < "$CACHE_MANIFEST"
+        if [ "$CACHE_STATE" = ok ] \
+           && ! (cd "$SCRATCH/bin" && md5sum -c --quiet --strict "$CACHE_MANIFEST"); then
+            CACHE_STATE="its bytes do not match its manifest"
+        fi
+    fi
+    if [ "$CACHE_STATE" != ok ]; then
+        res "OURS binary cache for $PIN REJECTED ($CACHE_STATE) -- deleting $CACHE_DIR and rebuilding"
+        rm -rf "$CACHE_DIR"
+        # Drop what a partial restore put in /tmp, so the rebuild below does
+        # not carry a stale .so into the new cache.
+        rm -f "$BIN" "$SCRATCH"/bin/*.so*
+    fi
+fi
+if [ "$CACHE_STATE" = ok ]; then
     # Restore to /tmp and run from there. A measured binary is never executed
     # off the share: /workspace is CIFS, and a network filesystem in the load
     # path is exactly the confound this campaign has been bitten by.
-    cp -L "$CACHED_BIN" "$BIN"
-    cp -L "$W"/bin/"$PIN"/*.so* "$SCRATCH/bin/" 2>/dev/null
     chmod +x "$BIN"
     res "OURS binary restored from the share md5=$(md5sum "$BIN" | cut -d' ' -f1)"
 else
@@ -219,12 +255,30 @@ else
     cp -L "$BUILT" "$BIN"
     find "$SCRATCH/build" -name '*.so*' -exec cp -L {} "$SCRATCH/bin/" \; 2>/dev/null
     res "OURS binary $BIN md5=$(md5sum "$BIN" | cut -d' ' -f1)"
-    mkdir -p "$W/bin/$PIN"
-    cp -L "$BIN" "$CACHED_BIN" 2>/dev/null
-    cp -L "$SCRATCH"/bin/*.so* "$W/bin/$PIN/" 2>/dev/null
+    # The binary is committed LAST, by rename, because the restore guard keys
+    # on its existence: a crash before the rename leaves no binary and the next
+    # resume rebuilds. The manifest the restore verifies against is computed
+    # here, on the /tmp bytes that were just built. A failed write deletes the
+    # cache dir so the next resume rebuilds; this run keeps its /tmp binary.
+    # An explicit && chain, not `set -e`: bash ignores -e inside a subshell
+    # whose status an `if` tests, so a failed copy would not stop the write.
+    if (
+        shopt -s nullglob
+        mkdir -p "$CACHE_DIR" && cd "$SCRATCH/bin" || exit 1
+        for so in *.so*; do cp -L "$so" "$CACHE_DIR/$so" || exit 1; done
+        md5sum vllm-server *.so* > "$CACHE_MANIFEST.partial" \
+            && mv -f "$CACHE_MANIFEST.partial" "$CACHE_MANIFEST" \
+            && cp -L vllm-server "$CACHED_BIN.partial" \
+            && mv -f "$CACHED_BIN.partial" "$CACHED_BIN"
+    ); then
+        res "OURS binary cached at $CACHE_DIR with manifest"
+    else
+        res "OURS binary cache write FAILED -- deleting $CACHE_DIR; the next resume rebuilds"
+        rm -rf "$CACHE_DIR"
+    fi
     # No marker here on purpose. The guard for this phase is the cached binary
-    # itself (`[ -x "$CACHED_BIN" ]` above), which is the thing a resume needs;
-    # a marker beside it would be a second source of truth that can disagree.
+    # itself (`[ -f "$CACHED_BIN" ]` above) verified against its manifest; a
+    # marker beside it would be a second source of truth that can disagree.
 fi
 
 say "E. INSTALL THEIR ENGINE (MiaAI-Lab/exllamav3 @ 63b32f00, OUR pin -- their card pins none)"

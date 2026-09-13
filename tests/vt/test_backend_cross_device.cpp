@@ -46,6 +46,7 @@
 #include "vt/quant.h"
 #include "vt/recipes.h"
 #include "vt/rocm/rocm_arch.h"
+#include "vt/rocm/rocm_pinned_h2d.h"
 #include "vt/rocm/rocm_runtime.h"
 
 namespace {
@@ -227,6 +228,135 @@ TEST_CASE("device Copy/Memset are BIT-EXACT against the host bytes") {
     dev.Free(p);
     dev.DestroyQueue(q);
   }
+}
+
+// --- The bounded pinned bounce ring (.agents/specs/rocm-chunked-pinned-h2d.md)
+//
+// THE REACHABILITY CONVICTION for that change, and the only one there can be.
+// The ring changes no byte: the model still loads, the tokens are still the
+// same, and only the HOST RESIDENCY of the transfer differs, which is a property
+// no byte-equality case in this file can see. So the instrument is asserted
+// beside the bytes, and the mutation that fails this case is deleting the staged
+// branch from RocmBackend::Copy in src/vt/rocm/rocm_backend.hip.
+//
+// It enters through `vt::Backend&`, the production seam every model loader
+// reaches — dense_attn::ResidentWeight, the qwen3_5.cpp twin, the MoE expert
+// towers, the EXL3 device loader — rather than through any test hook.
+//
+// TWO ARMS, and neither of them is a silent skip. On a board that takes the
+// plain hipMalloc branch the destination is device memory and the copy MUST take
+// the ring. On a board that takes the hipMallocManaged branch (gfx1103, or
+// VT_ROCM_MANAGED_ALLOC=1) the destination is already device-addressable and the
+// copy MUST NOT take it — the ring exists only to create a property managed
+// memory already has. Each arm asserts its own direction and says which it ran.
+TEST_CASE("a large pageable H2D takes the pinned bounce ring, and a small one does not") {
+  // One chunk short of three, so the last chunk is ragged and the count is not
+  // a number the loop could reach by accident.
+  const size_t kChunk = vt::rocm::kPinnedH2DChunkBytesDefault;
+  const size_t kBig = kChunk * 2 + (kChunk / 2);
+  const size_t kSmall = 4096;  // a norm weight: it must not pay a bounce
+
+  bool ran_on_a_board = false;
+  for (DeviceType dt : RegisteredDevices()) {
+    if (dt != DeviceType::kROCM) continue;
+    ran_on_a_board = true;
+    CAPTURE(DeviceTag(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+
+    // A PAGEABLE host source: an ordinary std::vector the HIP runtime knows
+    // nothing about. That is what a GGUF mmap view is, as far as this decision
+    // is concerned, and it is the only source kind the ring accepts.
+    std::vector<uint8_t> src(kBig);
+    {
+      uint32_t s = 20260913u;
+      for (size_t i = 0; i < kBig; ++i) {
+        s = s * 1664525u + 1013904223u;
+        src[i] = static_cast<uint8_t>(s >> 24);
+      }
+    }
+
+    const bool managed = vt::rocm::ManagedAllocActive(0);
+    const vt::rocm::PinnedH2DStats before = vt::rocm::PinnedH2DSnapshot();
+
+    void* p = dev.Alloc(kBig);
+    dev.Copy(q, p, src.data(), kBig);
+    dev.Synchronize(q);
+
+    const vt::rocm::PinnedH2DStats after_big = vt::rocm::PinnedH2DSnapshot();
+
+    // THE BYTES FIRST. The bar for a pure copy path in this file is
+    // bit-exactness, and a ring that reassembled the buffer wrongly would be a
+    // far worse defect than the residency it fixes.
+    std::vector<uint8_t> back(kBig, 0);
+    dev.Copy(q, back.data(), p, kBig);
+    dev.Synchronize(q);
+    CHECK(std::memcmp(src.data(), back.data(), kBig) == 0);
+
+    // A SMALL copy on the same backend, in the same case, so the threshold is
+    // gated beside the path it guards.
+    void* small = dev.Alloc(kSmall);
+    dev.Copy(q, small, src.data(), kSmall);
+    dev.Synchronize(q);
+    const vt::rocm::PinnedH2DStats after_small = vt::rocm::PinnedH2DSnapshot();
+
+    // ONE std::string, not a `const char*` chained with `<<`: doctest prints the
+    // literal as `1` (see the DeviceTag comment at the top of this file), which
+    // would turn the one line that says WHICH arm ran into noise.
+    const std::string note =
+        std::string("pinned H2D: managed_alloc=") + std::to_string(managed ? 1 : 0) +
+        " staged=" + std::to_string(after_small.staged_copies - before.staged_copies) +
+        " direct=" + std::to_string(after_small.direct_copies - before.direct_copies) +
+        " chunks=" + std::to_string(after_big.chunks - before.chunks) +
+        " max_chunk=" + std::to_string(after_big.max_chunk_bytes) +
+        " ring_bytes=" + std::to_string(after_big.ring_bytes);
+    MESSAGE(note);
+
+    if (managed) {
+      // The managed arm: device memory is host-addressable here, so the ring is
+      // deliberately not engaged and every copy is direct.
+      CHECK(after_small.staged_copies == before.staged_copies);
+      CHECK(after_small.direct_copies > before.direct_copies);
+      // AND NOT ONE PINNED BYTE IS ALLOCATED. A ring that is built and then
+      // never used is invisible to every other assertion here -- the bytes are
+      // right, the copies are direct, the case is green -- and it costs 256 MiB
+      // of PINNED HOST memory on exactly the boards that never stage. That is
+      // not free on this part: .agents/environment.md:95-100 measures gfx1151's
+      // managed ceiling as bounded by HOST RAM (27 GiB reached against 29.3 GiB
+      // available), so pinned host is the binding resource. The instrument
+      // printed ring_bytes=268435456 on this arm for a whole review cycle and
+      // nothing read it; this is the line that reads it.
+      CHECK(after_small.ring_bytes == before.ring_bytes);
+    } else {
+      // The staging arm. This is the assertion the whole change is for.
+      CHECK(after_big.staged_copies == before.staged_copies + 1);
+      CHECK(after_big.chunks == before.chunks + 3);
+      // BOUNDED HOST RESIDENCY, in the form this harness can actually make: no
+      // single pinned-to-device transfer ever exceeds one chunk, whatever the
+      // size of the copy. Mutating the chunk size to the whole buffer makes this
+      // one kBig-sized transfer and fails here.
+      CHECK(after_big.max_chunk_bytes <= kChunk);
+      // Read against the RESOLVED chunk, not the compile-time constant, so the
+      // case still measures something when VT_ROCM_PINNED_H2D_MIB is set for an
+      // A/B. A ring that was never allocated reports 0 and fails either way.
+      CHECK(after_big.ring_bytes ==
+            vt::rocm::kPinnedH2DBuffers * vt::rocm::PinnedH2DChunkBytes());
+      CHECK(after_big.ring_bytes > 0);
+      // The D2H readback and the 4 KiB upload both stayed on the single call.
+      CHECK(after_small.staged_copies == after_big.staged_copies);
+      CHECK(after_small.direct_copies >= after_big.direct_copies + 2);
+    }
+
+    dev.Free(small);
+    dev.Free(p);
+    dev.DestroyQueue(q);
+  }
+  // NOT an assertion: a CPU-only or CUDA-only build registers no ROCm backend
+  // and this case measures nothing, exactly like every other case in this file.
+  // It is printed so a green run says which of the two it was.
+  const std::string ran = std::string("pinned H2D case ran on a ROCm board: ") +
+                          std::to_string(ran_on_a_board ? 1 : 0);
+  MESSAGE(ran);
 }
 
 // The bf16<->f32 casts are a pure ELEMENTWISE CODEC: no reduction, no

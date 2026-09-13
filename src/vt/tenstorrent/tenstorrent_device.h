@@ -221,6 +221,19 @@ int64_t FreeDeviceDramBytesForTest();
 // Total DRAM across banks (capacity, not free) — the platform's probed
 // total for the placement fit (ISSUE-LOCAL-01M2ACXRJYFW7R7BP2ABQS3VY2).
 int64_t DeviceDramTotalBytes();
+// W4d W3 focused-test hook: stage `t`'s bf16 TILE form exactly as
+// EnsureDevice2D does (creating the slot's persistent buffer), reproducing
+// the loader's weight staging before a keep-quant matmul.
+void StageWeightBf16ForTest(const Tensor& t, MeshDevice& device);
+// W4d W6: stage the keep-quant word shadow for a block-quant weight at
+// LOAD time (the residency pre-pass; no-op for non-block dtypes).
+void StageKeepQuantWordsFor(const Tensor& packed);
+// Attribution (W4d W3): dump resident slot bytes by holder (device shadow /
+// persistent staged buffer / gemma) + top holders. Gated by the caller.
+void DumpSlotCensus(const char* label);
+// W4d W3: release consumer shadows whose rows match the warm forward's
+// shape (recipe-gated via VT_TT_RELEASE_WARM_ROWS; see the ops-side comment).
+void ReleaseWarmShapeSlots(uint32_t rows);
 #else
 inline int64_t KeepQuantCaptureStagingWrites() { return 0; }
 inline void ResetKeepQuantCaptureStagingWritesForTest() {}
@@ -235,6 +248,10 @@ inline int64_t AllocTraceMaxDeltaForTest() { return 0; }
 inline void ResetAllocTraceForTest() {}
 inline int64_t FreeDeviceDramBytesForTest() { return 0; }
 inline int64_t DeviceDramTotalBytes() { return 0; }
+inline void StageWeightBf16ForTest(const Tensor&, MeshDevice&) {}
+inline void StageKeepQuantWordsFor(const Tensor&) {}
+inline void DumpSlotCensus(const char*) {}
+inline void ReleaseWarmShapeSlots(uint32_t) {}
 #endif
 
 // ITEM 5 (rope): driver-side warm hook — populate the persistent device

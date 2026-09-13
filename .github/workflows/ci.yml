@@ -245,8 +245,15 @@ jobs:
           python3 scripts/check-env-doc.py
           python3 tests/scripts/test_check_env_doc.py
       - name: DeepSeek-V4 Vision manifests match the derived tensor map
+        # Registered in TWO places, like the bring-up suite below: here and in
+        # the `SUITES` array of `scripts/agent-preflight.sh`. The checker runs
+        # first on the committed fixtures, then its mutation suite performs the
+        # failures the checker claims to catch. Both are offline by
+        # construction: the network path is `--refresh`, which neither line
+        # takes.
         run: |
           python3 scripts/check-deepseek-v4-vision-manifests.py
+          python3 tests/scripts/test_check_deepseek_v4_vision_manifests.py
       - name: The gate bring-up script resolves its values or refuses
         run: |
           python3 tests/scripts/test_gate_bringup.py

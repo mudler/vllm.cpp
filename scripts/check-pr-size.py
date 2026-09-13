@@ -497,6 +497,21 @@ CREATION_MUTATIONS = {
     # checker raises AttributeError. Measured: 31 of 31 red under the stub, because
     # the suite has no case that passes without calling into the checker at all.
     "scripts/check-attention-rung-consistency.py": DISABLED_CREATION_CHECKER,
+    # MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm (#2411). Created in this
+    # range, so it has no BASE version to mutate, and without this entry the
+    # evidence run raised "absent at BASE and has no closed creation mutation"
+    # -- an absent checker reading as a broken one, which is the same shape the
+    # deletion exemption above answers from the other side. Measured against the
+    # stub, not asserted: "Ran 28 tests" then "FAILED (failures=19, errors=19)",
+    # with ZERO cases surviving. The suite loads the checker as a module and
+    # every case either calls into it (official_names, classify, vision_shape,
+    # summary, verify_offline -- none of which the stub defines) or runs a copy
+    # of it over mutated fixtures and reads an exit code of 1 and a counted
+    # number of disagreements, which silence cannot satisfy. The import itself
+    # still succeeds on the stub, deliberately: the suite touches no checker
+    # attribute at module level, so the cases run and fail individually rather
+    # than reporting "Ran 0 tests", which this contract reads as no evidence.
+    "scripts/check-deepseek-v4-vision-manifests.py": DISABLED_CREATION_CHECKER,
 }
 SELF_CHECKER = "scripts/check-pr-size.py"
 EVIDENCE_TIMEOUT_SECONDS = 120

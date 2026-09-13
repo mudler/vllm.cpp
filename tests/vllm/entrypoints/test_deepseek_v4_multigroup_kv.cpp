@@ -33,7 +33,22 @@
 // works and say nothing about whether a checkpoint can be served.
 #include <doctest/doctest.h>
 
+// The child-process machinery below needs these. `tests/` is outside the
+// Windows source contract (`scripts/check-windows-portability.py` sweeps only
+// the shipped-server sources plus `src/vllm/platform/`), and two suites in this
+// tree already re-exec themselves this way: `test_none_hash_determinism.cpp`
+// and `test_serve_hf_model.cpp:371`.
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -93,6 +108,79 @@ vllm::HfConfig FlashLikeConfig() {
       {"compress_ratios", ratios},
   };
   return cfg;
+}
+
+// IS THE COORDINATOR'S DEFERRAL ASSERT COMPILED INTO THIS BUILD? This is the
+// ONE place in the suite that reads `NDEBUG`, and it reads it into a value
+// rather than into a branch around an assertion. Every case below runs in both
+// configurations and asserts the same invariant; this flag only selects WHICH
+// observed outcome of the child process is the correct one, because the
+// production behaviour genuinely differs between the two builds and a test that
+// hid that difference would be describing neither.
+#ifdef NDEBUG
+constexpr bool kDeferralAssertLive = false;
+#else
+constexpr bool kDeferralAssertLive = true;
+#endif
+
+// What the parent learned about the child that tried to construct the engine.
+struct ChildOutcome {
+  bool exited = false;       // terminated normally rather than by a signal
+  int exit_code = -1;        // meaningful only when `exited`
+  bool aborted = false;      // killed by SIGABRT, which is what a live assert does
+  int signal_number = 0;     // the signal, when one killed it
+  std::string output;        // the child's stdout and stderr, interleaved
+};
+
+// Run THIS binary again, on the skip-decorated child case, and report how it
+// died. The child writes both streams into `capture` because glibc prints the
+// failed assertion to stderr immediately before it raises SIGABRT: that text is
+// the only evidence that says WHICH assert fired, and a run that reported a
+// bare "aborted" could not tell the deferral marker apart from any other abort.
+ChildOutcome RunConstructChild() {
+  char exe[4096];
+  const ssize_t n = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+  REQUIRE(n > 0);
+  exe[n] = '\0';
+
+  const std::filesystem::path capture =
+      std::filesystem::temp_directory_path() /
+      ("dsv4_multigroup_child." + std::to_string(::getpid()) + ".log");
+
+  const pid_t pid = ::fork();
+  REQUIRE(pid >= 0);
+  if (pid == 0) {
+    const int fd = ::open(capture.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) std::_Exit(126);
+    ::dup2(fd, 1);
+    ::dup2(fd, 2);
+    ::close(fd);
+    // `--no-skip` is required: the child case is skip-decorated, so a normal run
+    // of this suite never executes it and it costs one engine load only here.
+    const char* child_argv[] = {
+        exe, "--no-skip", "--test-case=dsv4_multigroup_construct_child",
+        nullptr};
+    ::execv(exe, const_cast<char* const*>(child_argv));
+    std::_Exit(127);
+  }
+
+  int status = 0;
+  REQUIRE(::waitpid(pid, &status, 0) == pid);
+
+  ChildOutcome out;
+  out.exited = WIFEXITED(status) != 0;
+  if (out.exited) out.exit_code = WEXITSTATUS(status);
+  if (WIFSIGNALED(status) != 0) {
+    out.signal_number = WTERMSIG(status);
+    out.aborted = out.signal_number == SIGABRT;
+  }
+  std::ifstream in(capture);
+  std::ostringstream buffer;
+  buffer << in.rdbuf();
+  out.output = buffer.str();
+  std::error_code ignored;
+  std::filesystem::remove(capture, ignored);
+  return out;
 }
 
 }  // namespace
@@ -186,18 +274,15 @@ TEST_CASE("a ratio-bearing DeepSeek-V4 publishes groups that no single block siz
 //     compiled out of Release and of CI, which builds Release throughout.
 //
 // A DEBUG BUILD OF THIS SUITE THEREFORE ABORTS, AND THAT WAS MEASURED RATHER
-// THAN REASONED. `-DCMAKE_BUILD_TYPE=Debug` (`CMAKE_CXX_FLAGS_DEBUG = -g`, no
-// NDEBUG) on 2026-09-13 gives SIGABRT in the case below, verbatim:
+// THAN REASONED. Any build without `-DNDEBUG` — which INCLUDES the repository's
+// DEFAULT configure, `cmake -S . -B build -G Ninja` with `CMAKE_BUILD_TYPE`
+// EMPTY, not only `-DCMAKE_BUILD_TYPE=Debug` — gives SIGABRT while the engine is
+// constructed, verbatim:
 //
 //   kv_cache_coordinator.cpp:386: vllm::v1::HybridKVCacheCoordinator::
 //   HybridKVCacheCoordinator(...): Assertion `g.kv_cache_spec->block_size ==
 //   hash_block_size && "differing group/hash block sizes are DEFERRED (M1.3
 //   Task 3)"' failed.
-//
-// An abort cannot be caught, so no assertion here can express it in-process and
-// none pretends to; it is recorded so that a reader who hits it knows it is the
-// owed hash-granularity port and not a new defect. The Release expectation
-// below is the production one, because Release is what ships and what CI runs.
 //
 // AND THAT IS THE TRAP THIS COMMENT EXISTS TO NAME: **AN ASSERT-BASED WALL IS
 // INVISIBLE UNDER NDEBUG, SO A TEST THAT RELIES ON THE SIGABRT SILENTLY PASSES
@@ -209,13 +294,53 @@ TEST_CASE("a ratio-bearing DeepSeek-V4 publishes groups that no single block siz
 // check was removed. Any load result on this topology must therefore state its
 // `CMAKE_BUILD_TYPE` and whether NDEBUG was defined, or it means nothing.
 //
-// The arithmetic says `:386` is the ONLY wall here: for
-// `{256,256,256,64,4,4,8}` at scheduler 256 / hash 4, the divisibility guards at
-// `:138` (256%4), `:140` (256 % each group) and `:382` (each group % 4) all
-// PASS, and only the strict equality at `:386` fails. Upstream asserts
-// divisibility ALONE (`kv_cache_coordinator.py:608-613`), so our extra equality
-// is a local deferral marker and an abort naming it is the CORRECT outcome
-// rather than a defect to route around.
+// SO THIS CASE RUNS THE LOAD IN A CHILD PROCESS, and that is the whole repair
+// (ISSUE-LOCAL-01M2EHJ5N35KCEC05R3VWHM0VH). Until 2026-09-13 the load ran
+// in-process and asserted construction, which made the SUITE'S VERDICT A
+// FUNCTION OF `-DNDEBUG`: green in Release, and a SIGABRT that killed the runner
+// on a default checkout. A gate whose answer is a build flag is not a gate. An
+// abort still cannot be caught in-process, so the observation moved OUT of the
+// process instead: the child (`dsv4_multigroup_construct_child`, skip-decorated,
+// re-exec'd by name exactly as `test_none_hash_determinism.cpp` does) performs
+// the load and its death is read as an exit status plus its captured stderr.
+// BOTH BUILDS THEN RUN THE SAME CASE AND ASSERT THE SAME INVARIANT — that
+// NOTHING REFUSES THIS TOPOLOGY BY NAME — and only the outcome that follows it
+// differs, because the product itself differs. `kDeferralAssertLive` is the one
+// place `NDEBUG` is read, and it selects which observed death is correct; it
+// does not delete, weaken or widen any assertion, and `:386` is untouched.
+//
+// The coordinator arithmetic still says `:386` is the only wall INSIDE the
+// coordinator: for `{256,256,256,64,4,4,8}` at scheduler 256 / hash 4, the
+// divisibility guards at `:138` (256%4), `:140` (256 % each group) and `:382`
+// (each group % 4) all PASS, and only the strict equality at `:386` fails.
+// Upstream asserts divisibility ALONE (`kv_cache_coordinator.py:608-613`), so
+// our extra equality is a local deferral marker and an abort naming it is the
+// CORRECT outcome rather than a defect to route around.
+//
+// **IT IS NO LONGER THE ONLY WALL A REAL CHECKPOINT MEETS, AND THAT WAS
+// MEASURED.** This comment claimed it was, and the claim is now false. On
+// 2026-09-13, rc job `b622dd45-d763-41d6-9fe3-c1822100163d` on `dgx:gpu0`, a
+// RELEASE build of base `7a62a7fca` served the real 82,438,622,112-byte
+// DeepSeek-V4-Flash-Vision-Exp UD-IQ1_S GGUF through `vllm-cli`. The engine
+// CONSTRUCTED (`:386` compiled out, as this comment predicts), auto-fit
+// `max_model_len` from 1048576 to 65536 for 256 blocks x 256 tokens, enabled
+// asynchronous scheduling, and then died in the FORWARD after 1026 s with zero
+// output bytes:
+//
+//   engine-fatal: EngineCore busy loop threw: vt: DeepseekV4 DEVICE forward
+//   (W7-device) not implemented — ... at
+//   src/vllm/model_executor/models/deepseek_v4.cpp:4658
+//
+// That is `VT_CHECK(deepseek_v4::V4DeviceKernelsAvailable(), kDevicePending)` in
+// `DeepseekV4Model::ForwardDevice`. So on the PRODUCTION path the current wall
+// is W7-device, not the coordinator, and this suite gates the door the engine
+// now walks through rather than the one it stops at. The run also passed
+// `--device cpu` and took the DEVICE forward anyway, because
+// `ForwardDeepseekV4ForCausalLM` selects that arm on `input.gather_logits` alone
+// (`deepseek_v4_registry.cpp:253`) and reads nothing about `input.queue.device`;
+// that is filed as ISSUE-LOCAL-01M2EHJFGT76K4DVBN31HAEY9E and is NOT repaired
+// here, because moving a forward route is a production change with its own spec
+// and review.
 //
 // A NAMED REFUSAL WOULD BE A BETTER GUARD THAN THIS ASSERT, for exactly the
 // reason above: a refusal is visible in the configuration that ships, and an
@@ -230,7 +355,15 @@ TEST_CASE("a ratio-bearing DeepSeek-V4 publishes groups that no single block siz
 // marker, and `{256,256,256,64,4,4,8}` against a granularity of 4 satisfies
 // upstream's rule while violating ours.
 // ---------------------------------------------------------------------------
-TEST_CASE("serve: a multi-group DeepSeek-V4 checkpoint now CONSTRUCTS on the default path") {
+
+// THE CHILD. Skip-decorated, so a normal run never executes it and the engine
+// load it performs costs nothing until the parent case asks for it by name. It
+// reports through a MARKER LINE rather than through an exit code alone, so a
+// named refusal (which is a message, not a death) stays distinguishable from a
+// construction and from an abort. `std::_Exit` keeps doctest's own teardown and
+// summary out of the captured stream, so what the parent reads after a marker
+// is the product's output and nothing else.
+TEST_CASE("dsv4_multigroup_construct_child" * doctest::skip()) {
   gguf_test::TempFile lang(dsv4_lang_test::BuildDeepseek4Gguf(
       /*vision=*/false, dsv4_lang_test::BiasWidths{}, /*vision_from=*/0,
       /*head_dim=*/512, /*with_tokenizer=*/true, /*vision_bias_scale=*/1.0f,
@@ -243,20 +376,57 @@ TEST_CASE("serve: a multi-group DeepSeek-V4 checkpoint now CONSTRUCTS on the def
   vllm::entrypoints::EngineParams params;
   REQUIRE(params.kv_cache_dtype == "auto");
 
-  std::string message;
   std::unique_ptr<vllm::entrypoints::LoadedEngine> engine;
   try {
     engine = vllm::entrypoints::LoadedEngine::FromModelDir(lang.path(), params);
   } catch (const std::exception& e) {
-    message = e.what();
+    std::printf("CONSTRUCT=refused:%s\n", e.what());
+    std::fflush(stdout);
+    std::_Exit(0);
   }
+  std::printf("CONSTRUCT=%s\n", engine != nullptr ? "ok" : "null");
+  std::fflush(stdout);
+  std::_Exit(0);
+}
 
-  // THE NEW TRUTH: it constructs. If this ever throws again, the message is
-  // printed rather than swallowed, so the next reader sees WHICH door closed
-  // instead of a bare boolean.
-  INFO("unexpected refusal: " << message);
-  CHECK(message.empty());
-  CHECK(engine != nullptr);
+TEST_CASE("serve: a multi-group DeepSeek-V4 checkpoint reaches the coordinator, and nothing refuses it BY NAME") {
+  const ChildOutcome child = RunConstructChild();
+  INFO("child output:\n" << child.output);
+
+  // (i) THE INVARIANT, asserted identically in both configurations, because it
+  // is true in both: every NAMED door — `RetypeAttentionSpec`'s `fp8_ds_mla`
+  // refusal above all, which case (3) still pins on an explicit override — is
+  // reached BEFORE the coordinator is built, so a refusal would appear here
+  // whether or not the deferral assert survives the compiler.
+  CHECK(child.output.find("CONSTRUCT=refused:") == std::string::npos);
+  // ...and the child really ran: 127 is a failed `execv` and 126 a capture file
+  // that could not be opened, both of which would otherwise read as "no refusal"
+  // from a process that never loaded anything.
+  CHECK(child.exit_code != 127);
+  CHECK(child.exit_code != 126);
+  CHECK_FALSE(child.output.empty());
+
+  // (ii) WHAT THEN HAPPENS, which the build genuinely decides. Each arm pins its
+  // own evidence, so neither can be satisfied by the other's outcome.
+  if (kDeferralAssertLive) {
+    // No NDEBUG: `:386` is compiled in, the seven groups violate it, and the
+    // load dies there. The text is asserted because "it aborted" alone would
+    // accept an abort from anywhere else in the loader.
+    CHECK(child.aborted);
+    CHECK(child.output.find(
+              "differing group/hash block sizes are DEFERRED") !=
+          std::string::npos);
+    CHECK(child.output.find("kv_cache_coordinator.cpp") != std::string::npos);
+    CHECK(child.output.find("CONSTRUCT=ok") == std::string::npos);
+  } else {
+    // NDEBUG: `:386` is gone, and the engine constructs — the production
+    // outcome, and the one the rc-job measurement above then carried into the
+    // forward.
+    CHECK_FALSE(child.aborted);
+    CHECK(child.exited);
+    CHECK(child.exit_code == 0);
+    CHECK(child.output.find("CONSTRUCT=ok") != std::string::npos);
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -422,37 +422,40 @@ deepseek_v4::MoeRouteResult DispRoute(const V4Backend& be, const std::vector<flo
                                       const std::vector<int32_t>& hashtab, int64_t vocab,
                                       const std::vector<float>& vision_bias,
                                       const std::vector<char>& is_media_token) {
-  // MODEL-MM-deepseek-v4 W4 (#2411): the two DEVICE routers below take ONE bias
-  // pointer for the whole call and have no per-row selector, so an image row
-  // reaching them would be routed on the TEXT bias -- fluently, and wrong. The
-  // kernel change is W7-CUDA's, so the arm is refused BY NAME here rather than
-  // served from the wrong bias. This is the same predicate the host arm routes
-  // on, not a second copy of it: both read `is_media_token`.
-  const bool any_media = [&] {
-    for (const char m : is_media_token) {
-      if (m != 0) return true;
-    }
-    return false;
-  }();
-  VT_CHECK(!any_media || !(be.device || GlueDev(be)),
-           "deepseek-v4 MoE: this step carries image rows, which route on the "
-           "vision bias `exp_probs_b_vl`, and the device router takes one bias "
-           "for the whole call with no per-row selector. Refused by name rather "
-           "than routed on the text bias. The device arm is owed by issue #2411 "
-           "(row MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm, W7-CUDA)");
+  // MODEL-MM-deepseek-v4 W7-CUDA (#2411,
+  // ISSUE-LOCAL-01M2C26CSZWB7WVRS5H7YPW4S8): the two DEVICE routers now carry the
+  // PER-ROW bias selector, so a step with image rows is SERVED here rather than
+  // refused. W4 refused it by name because the kernels took ONE bias pointer for
+  // the whole call, and routing an image row on the TEXT bias would have been
+  // fluent and wrong. The kernels express it now, so the refusal was ANSWERED
+  // rather than deleted or weakened.
+  //
+  // THE GENUINELY-UNAVAILABLE CASE IS A DIFFERENT PREDICATE, and it keeps its own
+  // refusal one level up in `MoeBlock`: a step carrying image rows whose LAYER has
+  // no `exp_probs_b_vl` is refused BY NAME there, with the width check beside it.
+  // That one is host-side and arm-independent, so it still fires on a device
+  // build -- a text checkpoint asked to route an image is refused on every arm.
+  //
+  // All three arms below read the SAME two arrays, so the device kernels apply
+  // the rule the host `SqrtSoftplusRouteTopk` applies, not a second copy of it.
   if (be.device)
     return deepseek_v4::MoeDevice()->route(*be.q, gating, T, E, topk, bias, renorm, scale,
-                                           in_tokens, hashtab, vocab);
+                                           in_tokens, hashtab, vocab, vision_bias,
+                                           is_media_token);
   if (GlueDev(be)) {  // Brick B: in-place device router (softmax + top-k → expert_ids)
     const bool has_bias = !bias.empty();
     const bool is_hash = !hashtab.empty() && !in_tokens.empty();
+    // The host arm's `any_media` rule: BOTH halves must be present.
+    const bool has_media = !is_media_token.empty() && !vision_bias.empty();
     deepseek_v4::MoeRouteResult out;
     out.topk_ids.assign(static_cast<size_t>(T * topk), 0);
     out.topk_weights.assign(static_cast<size_t>(T * topk), 0.0f);
     deepseek_v4::MoeDevice()->route_ip(
         *be.q, out.topk_ids.data(), out.topk_weights.data(), gating.data(), T, E, topk,
         has_bias ? bias.data() : nullptr, has_bias, is_hash ? in_tokens.data() : nullptr, is_hash,
-        is_hash ? hashtab.data() : nullptr, vocab, renorm, scale);
+        is_hash ? hashtab.data() : nullptr, vocab, renorm, scale,
+        has_media ? vision_bias.data() : nullptr, has_media,
+        has_media ? is_media_token.data() : nullptr);
     SyncDeviceGemm(be);
     return out;
   }
@@ -2782,7 +2785,14 @@ std::vector<float> ForwardResidentDecodeGguf(const DeepseekV4HostWeights& hw,
                   has_bias ? L.gate_bias.data() : nullptr, has_bias,
                   cfg_hash ? in_tokens.data() : nullptr, cfg_hash,
                   cfg_hash ? L.tid2eid.data() : nullptr, p.vocab_size, p.norm_topk_prob,
-                  static_cast<float>(p.routed_scaling_factor));
+                  static_cast<float>(p.routed_scaling_factor),
+                  // W7-CUDA (#2411): NO media selector on the resident single-token
+                  // decode arm. It refuses an out-of-vocabulary identifier before
+                  // reaching here, so an image row cannot arrive on this path; the
+                  // no-media values keep it byte-identical. Widening that refusal is
+                  // a separate piece of work and is NOT done here.
+                  /*vision_bias=*/nullptr, /*has_vision_bias=*/false,
+                  /*is_media_token=*/nullptr);
     weights[0] = 1.0f;  // shared-expert combine weight (host write; device reads later)
     // shared expert (index 0 of eo).
     // Brick 12: shared-expert gate+up share x → ONE paired launch.
@@ -3011,7 +3021,13 @@ struct V4Graph {
                     has_bias ? L.gate_bias.data() : nullptr, has_bias,
                     cfg_hash ? in_tokens.data() : nullptr, cfg_hash,
                     cfg_hash ? L.tid2eid.data() : nullptr, p->vocab_size, p->norm_topk_prob,
-                    static_cast<float>(p->routed_scaling_factor));
+                    static_cast<float>(p->routed_scaling_factor),
+                    // W7-CUDA (#2411): as the sibling resident arm above -- an
+                    // out-of-vocabulary identifier is refused before this point, so
+                    // no image row reaches here and the no-media values keep it
+                    // byte-identical.
+                    /*vision_bias=*/nullptr, /*has_vision_bias=*/false,
+                    /*is_media_token=*/nullptr);
       // Brick 12: shared-expert gate+up share x → ONE paired launch.
       GemmPairIntoKq(be, Lq.shared_gate, Lq.shared_up, x.data(), gate_up_s.data(),
                      gate_up_s.data() + mi, mi, mi, H);
@@ -3045,8 +3061,16 @@ struct V4Graph {
   std::vector<float> Step(const V4Backend& be, int32_t token, int32_t pos) {
     VT_CHECK(kv_base + 1 <= max_cap, "deepseek-v4 decode graph: KV capacity exceeded");
     // MODEL-MM-deepseek-v4 W4 (#2411): the same guard as the eager resident arm.
-    // A captured graph indexes `embed` with the identifier and no bound, and its
-    // device router takes one bias for the whole call.
+    // A captured graph indexes `embed` with the identifier and NO BOUND, so an
+    // out-of-vocabulary sentinel would read past it -- which is what this refuses.
+    //
+    // W7-CUDA (#2411, ISSUE-LOCAL-01M2C26CSZWB7WVRS5H7YPW4S8): this comment used
+    // to give a SECOND reason, "and its device router takes one bias for the whole
+    // call". That reason is now FALSE -- the device routers carry the per-row bias
+    // selector -- and it is removed rather than left to mislead. The guard itself
+    // is unchanged and still necessary: the unbounded `embed` index is reason
+    // enough on its own, and this arm passes the no-media values to `route_ip`
+    // precisely because no image row can legitimately reach it.
     VT_CHECK(token >= 0 && token < p->vocab_size,
              "deepseek-v4 decode graph: token id " + std::to_string(token) +
                  " is outside the vocabulary of " +

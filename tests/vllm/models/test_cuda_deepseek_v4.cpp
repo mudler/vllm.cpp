@@ -470,7 +470,8 @@ TEST_CASE("W7-device sqrtsoftplus/hash router: CUDA ids BIT-EXACT, weights near-
   // (a) learned top-k with the noaux_tc bias (selection biased, weights unbiased).
   {
     const auto ref = dv4::SqrtSoftplusRouteTopk(gating, T, E, topk, bias, true, 1.5f, {}, {}, vocab);
-    const auto got = dv4::MoeDevice()->route(g.q, gating, T, E, topk, bias, true, 1.5f, {}, {}, vocab);
+    const auto got = dv4::MoeDevice()->route(g.q, gating, T, E, topk, bias, true, 1.5f, {}, {},
+                                             vocab, {}, {});
     REQUIRE(got.topk_ids.size() == ref.topk_ids.size());
     for (size_t i = 0; i < ref.topk_ids.size(); ++i) CHECK(got.topk_ids[i] == ref.topk_ids[i]);
     CHECK(RelL2(got.topk_weights, ref.topk_weights) < kTol);
@@ -483,10 +484,118 @@ TEST_CASE("W7-device sqrtsoftplus/hash router: CUDA ids BIT-EXACT, weights near-
       for (int64_t j = 0; j < topk; ++j)
         tid2eid[static_cast<size_t>(tok * topk + j)] = static_cast<int32_t>((tok * 5 + j) % E);
     const auto ref = dv4::SqrtSoftplusRouteTopk(gating, T, E, topk, {}, true, 1.5f, in_tokens, tid2eid, vocab);
-    const auto got = dv4::MoeDevice()->route(g.q, gating, T, E, topk, {}, true, 1.5f, in_tokens, tid2eid, vocab);
+    const auto got = dv4::MoeDevice()->route(g.q, gating, T, E, topk, {}, true, 1.5f, in_tokens,
+                                             tid2eid, vocab, {}, {});
     for (size_t i = 0; i < ref.topk_ids.size(); ++i) CHECK(got.topk_ids[i] == ref.topk_ids[i]);
     CHECK(RelL2(got.topk_weights, ref.topk_weights) < kTol);
   }
+}
+
+// MODEL-MM-deepseek-v4 W7-CUDA (#2411, ISSUE-LOCAL-01M2C26CSZWB7WVRS5H7YPW4S8):
+// THE PER-ROW VISION BIAS on the device routers. The host arm
+// `SqrtSoftplusRouteTopk` is the oracle, because the kernel transcribes its rule.
+//
+// The two biases deliberately name DIFFERENT experts. A near-uniform pair would
+// leave a wrong-bias bug invisible in the ids and detectable only in generated
+// text, which is the "a token gate cannot see this" trap the row's spec records.
+// RED-first: before the selector existed the device arms could not take these
+// arguments at all, and routing an image row on the text bias changes the ids.
+TEST_CASE("W7-CUDA per-row vision bias: image rows take exp_probs_b_vl, text rows do not") {
+  if (!HasCuda()) { MESSAGE("no CUDA; skip"); return; }
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  Rng r;
+  const int64_t T = 4, E = 8, topk = 3, vocab = 12;
+  const auto gating = Rand(r, T * E, -3.0f, 3.0f);
+  std::vector<float> text_bias(static_cast<size_t>(E), 0.0f);
+  std::vector<float> vision_bias(static_cast<size_t>(E), 0.0f);
+  text_bias[0] = 9.0f;   text_bias[1] = 8.0f;   text_bias[2] = 7.0f;
+  vision_bias[E - 1] = 9.0f; vision_bias[E - 2] = 8.0f; vision_bias[E - 3] = 7.0f;
+  const std::vector<char> is_media = {0, 1, 0, 1};  // rows 1 and 3 are image rows
+
+  // BOTH kernels: the warp top-k is the shipped default and the single-thread one
+  // is its A/B baseline, and the selector must behave identically in each.
+  for (const char* warp : {"0", "1"}) {
+    setenv("VT_V4_ROUTE_WARP_TOPK", warp, 1);
+    CAPTURE(warp);
+    // (a) a noaux_tc layer, mixed text/image batch.
+    {
+      const auto ref = dv4::SqrtSoftplusRouteTopk(gating, T, E, topk, text_bias, true, 1.5f, {},
+                                                  {}, vocab, vision_bias, is_media);
+      const auto got = dv4::MoeDevice()->route(g.q, gating, T, E, topk, text_bias, true, 1.5f, {},
+                                               {}, vocab, vision_bias, is_media);
+      REQUIRE(got.topk_ids.size() == ref.topk_ids.size());
+      for (size_t i = 0; i < ref.topk_ids.size(); ++i) CHECK(got.topk_ids[i] == ref.topk_ids[i]);
+      CHECK(RelL2(got.topk_weights, ref.topk_weights) < kTol);
+      // THE SWAP IS OBSERVABLE, which is what makes this a gate and not a
+      // restatement: routing every row on the text bias moves the IMAGE row's ids
+      // and leaves the TEXT row's alone.
+      const auto all_text = dv4::MoeDevice()->route(g.q, gating, T, E, topk, text_bias, true,
+                                                    1.5f, {}, {}, vocab, {}, {});
+      bool image_row_differs = false;
+      for (int64_t j = 0; j < topk; ++j)
+        if (got.topk_ids[static_cast<size_t>(topk + j)] !=
+            all_text.topk_ids[static_cast<size_t>(topk + j)])
+          image_row_differs = true;
+      CHECK(image_row_differs);
+      for (int64_t j = 0; j < topk; ++j)
+        CHECK(got.topk_ids[static_cast<size_t>(j)] == all_text.topk_ids[static_cast<size_t>(j)]);
+    }
+    // (b) a HASH layer: the image row LEAVES the hash route, the text row keeps it.
+    {
+      std::vector<int64_t> in_tokens = {3, 7, 1, 9};
+      std::vector<int32_t> tid2eid(static_cast<size_t>(vocab * topk));
+      for (int64_t tok = 0; tok < vocab; ++tok)
+        for (int64_t j = 0; j < topk; ++j)
+          tid2eid[static_cast<size_t>(tok * topk + j)] = static_cast<int32_t>((tok * 5 + j) % E);
+      // A hash layer carries NO text bias -- the converter drops `ffn.gate.bias`
+      // there -- while `exp_probs_b_vl` is present on every layer.
+      const auto ref = dv4::SqrtSoftplusRouteTopk(gating, T, E, topk, {}, true, 1.5f, in_tokens,
+                                                  tid2eid, vocab, vision_bias, is_media);
+      const auto got = dv4::MoeDevice()->route(g.q, gating, T, E, topk, {}, true, 1.5f, in_tokens,
+                                               tid2eid, vocab, vision_bias, is_media);
+      for (size_t i = 0; i < ref.topk_ids.size(); ++i) CHECK(got.topk_ids[i] == ref.topk_ids[i]);
+      CHECK(RelL2(got.topk_weights, ref.topk_weights) < kTol);
+      const int64_t tok0 = in_tokens[0] % vocab;
+      for (int64_t j = 0; j < topk; ++j)
+        CHECK(got.topk_ids[static_cast<size_t>(j)] ==
+              tid2eid[static_cast<size_t>(tok0 * topk + j)]);
+      const int64_t tok1 = in_tokens[1] % vocab;
+      bool image_left_hash = false;
+      for (int64_t j = 0; j < topk; ++j)
+        if (got.topk_ids[static_cast<size_t>(topk + j)] !=
+            tid2eid[static_cast<size_t>(tok1 * topk + j)])
+          image_left_hash = true;
+      CHECK(image_left_hash);
+    }
+    // (c) AN EMPTY MASK IS EVERY TEXT STEP, and must be byte-identical to the call
+    //     that carries no vision bias at all.
+    {
+      const auto with_empty = dv4::MoeDevice()->route(g.q, gating, T, E, topk, text_bias, true,
+                                                      1.5f, {}, {}, vocab, vision_bias, {});
+      const auto without = dv4::MoeDevice()->route(g.q, gating, T, E, topk, text_bias, true, 1.5f,
+                                                   {}, {}, vocab, {}, {});
+      CHECK(with_empty.topk_ids == without.topk_ids);
+      REQUIRE(with_empty.topk_weights.size() == without.topk_weights.size());
+      CHECK(std::memcmp(with_empty.topk_weights.data(), without.topk_weights.data(),
+                        without.topk_weights.size() * sizeof(float)) == 0);
+    }
+    // (d) THE IN-PLACE ROUTER carries the same selector.
+    {
+      dv4::MoeRouteResult ip;
+      ip.topk_ids.assign(static_cast<size_t>(T * topk), 0);
+      ip.topk_weights.assign(static_cast<size_t>(T * topk), 0.0f);
+      dv4::MoeDevice()->route_ip(g.q, ip.topk_ids.data(), ip.topk_weights.data(), gating.data(), T,
+                                 E, topk, text_bias.data(), true, nullptr, false, nullptr, vocab,
+                                 true, 1.5f, vision_bias.data(), true, is_media.data());
+      gpu.Synchronize(g.q);
+      const auto ref = dv4::SqrtSoftplusRouteTopk(gating, T, E, topk, text_bias, true, 1.5f, {},
+                                                  {}, vocab, vision_bias, is_media);
+      for (size_t i = 0; i < ref.topk_ids.size(); ++i) CHECK(ip.topk_ids[i] == ref.topk_ids[i]);
+      CHECK(RelL2(ip.topk_weights, ref.topk_weights) < kTol);
+    }
+  }
+  unsetenv("VT_V4_ROUTE_WARP_TOPK");
 }
 
 // ds4-gap Lever 3 / Brick 10 — the warp-parallel router top-k (RouteWarpKernel,
@@ -517,10 +626,10 @@ TEST_CASE("Lever 3 warp-topk router == single-thread RouteKernel BYTE-IDENTICAL 
     {
       setenv("VT_V4_ROUTE_WARP_TOPK", "0", 1);
       const auto st = dv4::MoeDevice()->route(g.q, gating, c.T, c.E, c.topk, bias, true, 1.5f, {},
-                                              {}, c.vocab);
+                                              {}, c.vocab, {}, {});
       setenv("VT_V4_ROUTE_WARP_TOPK", "1", 1);
       const auto wp = dv4::MoeDevice()->route(g.q, gating, c.T, c.E, c.topk, bias, true, 1.5f, {},
-                                              {}, c.vocab);
+                                              {}, c.vocab, {}, {});
       REQUIRE(wp.topk_ids.size() == st.topk_ids.size());
       for (size_t i = 0; i < st.topk_ids.size(); ++i) CHECK(wp.topk_ids[i] == st.topk_ids[i]);
       CHECK(bytes_equal(wp.topk_weights, st.topk_weights));  // BIT-EXACT, not near-tie
@@ -536,10 +645,10 @@ TEST_CASE("Lever 3 warp-topk router == single-thread RouteKernel BYTE-IDENTICAL 
               static_cast<int32_t>((tok * 5 + j) % c.E);
       setenv("VT_V4_ROUTE_WARP_TOPK", "0", 1);
       const auto st = dv4::MoeDevice()->route(g.q, gating, c.T, c.E, c.topk, {}, true, 1.5f,
-                                              in_tokens, tid2eid, c.vocab);
+                                              in_tokens, tid2eid, c.vocab, {}, {});
       setenv("VT_V4_ROUTE_WARP_TOPK", "1", 1);
       const auto wp = dv4::MoeDevice()->route(g.q, gating, c.T, c.E, c.topk, {}, true, 1.5f,
-                                              in_tokens, tid2eid, c.vocab);
+                                              in_tokens, tid2eid, c.vocab, {}, {});
       for (size_t i = 0; i < st.topk_ids.size(); ++i) CHECK(wp.topk_ids[i] == st.topk_ids[i]);
       CHECK(bytes_equal(wp.topk_weights, st.topk_weights));
     }
@@ -874,12 +983,14 @@ TEST_CASE("DeepseekV4 device MHC + router in place == round-trip (Brick B)") {
     const int64_t T = 2, E = 8, topk = 3;
     const auto gating = Rand(r, T * E, -2.0f, 2.0f);
     const auto bias = Rand(r, E, -0.5f, 0.5f);
-    const auto rt = dv4::MoeDevice()->route(g.q, gating, T, E, topk, bias, true, 1.5f, {}, {}, 0);
+    const auto rt = dv4::MoeDevice()->route(g.q, gating, T, E, topk, bias, true, 1.5f, {}, {}, 0,
+                                            {}, {});
     dv4::MoeRouteResult ip;
     ip.topk_ids.assign(static_cast<size_t>(T * topk), 0);
     ip.topk_weights.assign(static_cast<size_t>(T * topk), 0.0f);
     dv4::MoeDevice()->route_ip(g.q, ip.topk_ids.data(), ip.topk_weights.data(), gating.data(), T,
-                              E, topk, bias.data(), true, nullptr, false, nullptr, 0, true, 1.5f);
+                              E, topk, bias.data(), true, nullptr, false, nullptr, 0, true, 1.5f,
+                              nullptr, false, nullptr);
     gpu.Synchronize(g.q);
     for (size_t i = 0; i < ip.topk_ids.size(); ++i) CHECK(ip.topk_ids[i] == rt.topk_ids[i]);
     for (size_t i = 0; i < ip.topk_weights.size(); ++i) CHECK(ip.topk_weights[i] == rt.topk_weights[i]);

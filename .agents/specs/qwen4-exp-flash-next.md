@@ -10277,6 +10277,79 @@ negligible. Issue
 [#1958](https://github.com/mudler/vllm.cpp/issues/1958) is closed; the fix is
 owned by row `SAMPLE-CORE` (spec: `.agents/specs/sampling-controls-c7.md`).
 
+### THE ALLOCATOR, MEASURED AT THE REFERENCE WORKLOAD: the count is right and the LEVER IS NOT (2026-09-13)
+
+`dgx:gpu0`, `rc` job `4e36bbae`, source `3eabd4dbd` (post-W9 `main`), released
+UD-IQ1_S, 600-token decode, `nsys` window opened and closed BY THE CLIENT around
+the measured request. **The window is self-validated**: it recorded **1,594,621**
+`cudaLaunchKernel` calls, and the job refuses to report numbers below 20,000
+because a load-shaped window reads exactly like a result. The capture is 113 MB
+against the 198 KB of the attempt that silently profiled model loading.
+
+#### The prediction held to 2.1%
+
+`ISSUE-LOCAL-01M2DQHP2FWXHH7GTHB17QX53Q` derived 97 `cudaFree` per step from
+three call sites -- `Qwen4ExpGatedResidual` twice per layer plus once after, at
+48 layers -- by reading the tree, and called it an arithmetic match needing a
+measurement.
+
+| | derived | measured |
+|---|---|---|
+| `cudaFree` per step | 97 | **99.0** (59,400 / 600) |
+| `cudaMalloc` per step | 97 | **99.0** (59,428), paired to **28 calls** across the window |
+| `cudaLaunchKernel` per step | ~2,560 | **2,658** |
+| QSA launches per step | 12 | **12.0** (7,200 / 600) -- exactly the 12 QSA layers |
+
+`cudaFree` is **80.0% of all CUDA API time**, mean **652.5 us**, i.e. **64.6 ms
+per step** against an **87.6 ms** step: **74% of the step, in host time.**
+
+#### AND IT IS WORTH ABOUT 14%, NOT 4x, BECAUSE THE GPU IS 88% BUSY
+
+This is the number the issue said would size the work, and it changes the answer.
+QSA is 23.6% of GPU kernel time at 10.895 s, so total kernel time in the window is
+46.16 s -- **76.9 ms of the 87.6 ms step. The GPU is BUSY 88% of the time and
+IDLE 10.6 ms per step.**
+
+So the 64.6 ms of `cudaFree` **overlaps GPU work almost entirely**. Removing it
+cannot remove work that was never on the critical path; it can only recover the
+idle:
+
+```
+  best case   87.6 ms -> 76.9 ms      11.4 -> 13.0 tok/s      +14%
+```
+
+**THE BOUND THIS ROW WROTE BEFORE MEASURING IS WHAT MAKES THAT LEGIBLE.** The
+issue said the recoverable time "is bounded above by how long the GPU is currently
+IDLE, and not by the host-side total", and that is exactly what happened. A
+reader given only "74% of the step is `cudaFree`" would have scoped a
+caller-supplied workspace redesign, with its signature change and its re-entrancy
+argument and its collision with `ISSUE-LOCAL-01M2DW8CXYEWWMJSZZ6GRH48SZ`'s
+retention finding, for a 14% return.
+
+**The fix is still worth doing and is still cheap** -- `cudaFreeAsync` sits in
+this very trace at **1,340 ns** against `cudaFree`'s **652,550 ns**, 487x -- but
+it is a 14% item competing with 20%+ items, not the top of the list.
+
+#### WHAT THE STEP IS ACTUALLY MADE OF, and it is GPU work
+
+| kernel | share of kernel time | per step |
+|---|---|---|
+| `QsaGatherAttentionKernel` | **23.6%** | **18.16 ms** |
+| cuBLAS `gemvx` (bf16) | **22.8%** | **17.53 ms** |
+
+**We are GPU-BOUND at 88%.** The path to the reference is LESS GPU WORK, not less
+host overhead, and that re-ranks this row for the third time today.
+
+**ONE NEW OBSERVATION, NOT YET A SCOPE.** QSA is still 20.7% of the step AFTER W9,
+at **1.513 ms per launch**. Against the pre-W9 profile's 2.545 ms at `|sel| ~
+1600`, a cost linear in `|sel|` would predict roughly 0.53 ms at this run's mean
+`|sel|` of about 335. It measures 1.513. **That implies a large per-launch cost
+that does not scale with context at all**, which every context-scaling argument in
+this row -- including the correction section above -- has been silently treating as
+zero. Twelve launches a step makes it the larger half of QSA's bill here. The
+owed instrument is a `|sel|` sweep at fixed shape on this box, which is the same
+head_dim-sweep method the W9 attribution already used and trusts.
+
 ### THE REFERENCE MEASUREMENT, taken at last: 13.02 tok/s at 400 tokens, a 5.08x gap (2026-09-13)
 
 **This row has never before compared itself to sojufx on sojufx's workload.** Every
@@ -10696,6 +10769,50 @@ time from different runs in the same sentence. Never quote a rate against a
 reference that generated a different number of tokens. For an attention kernel whose work
 is proportional to context, the workload is part of the measurement, and a profile
 taken at 1,600 tokens does not describe a benchmark run at 400.
+
+### W9 OUTCOME, as landed at `054a8910c` (operator, 2026-09-13)
+
+**What landed.** Pass 2's tile evaluates one whole dot product per thread; only
+the sum over `s` stays on thread 0, so no reduction was reassociated. Four
+commits: the kernel change, the fold gate the review demanded, and two records.
+
+**The operator's gate, rerun on the final head `af417e4ee` rather than on the
+implementer's report** (`rc` job on `thor:gpu0`, sm_110, fresh clone, selected
+case count asserted for every suite):
+
+| suite | cases | assertions |
+|---|---|---|
+| `test_qwen4_exp_cuda_reductions` | 20/20 | **19,678** |
+| `test_qwen4_exp_qsa` | 14/14 | 7,263 |
+| `test_qwen4_exp_qsa_device` | 12/12 | 4,697 |
+| `test_qwen4_exp_cuda` | 12/12 | 351 |
+| `test_qwen4_exp_qsa_block` | **12/13** | 7,438/7,439 |
+
+The assertion count on the first suite went 213 -> 19,678, and that IS the
+repair: the fold gate now exercises the property W9 rests on. The fifth suite's
+single failure predates W9 and is measured to (`ISSUE-LOCAL-01M2E18YDQ8M5Y5P5SPFXD1D99`).
+
+**Speed: at least 3.62x on the kernel, measured by the operator.** See the
+subsection above; the naive 4.40x mean ratio is invalid because the fix arm runs
+three more instances. The implementer's 6.52x at the released `DH = 256`,
+`|sel| = 2048` shape is not contradicted and is not gated.
+
+**THE ROCm ARM IS COMPILED BY NOTHING, AND THAT WAS FOUND HERE.** W9's repair
+needed the probe field in `include/vt/ops.h` and handling in all three arms, so it
+touched `src/vt/rocm/rocm_qwen4_exp_qsa.hip`. `check-tree-compiles` reports
+`src/vt/cuda/cuda_qwen4_exp_qsa.cu` as "in scope that no target in this
+configuration compiles" and does not see the `.hip` at all, and the operator's
+gate is CUDA. So a typo in that file would have reached `main` unbuilt.
+`hipcc -fsyntax-only --offload-arch=gfx1151` on `strix:gpu0`, both arms, `rc=0`
+each, with different `.hip` sha256 proving the file really differs. **This is a
+standing gap, not a W9 one**: any change touching a `.hip` has the same exposure.
+
+**What the review changed, and why the FAIL was right.** The code was correct
+throughout; what failed was that its central claim was enforced by nothing. Two
+reassociations -- a descending fold, and the warp-shuffle tree this kernel's own
+header declines -- passed all three committed suites while demonstrably moving the
+output. Merging on "the code is correct" would have left the declined lever free
+to be added later with every gate green.
 
 ### Out of scope for W9
 

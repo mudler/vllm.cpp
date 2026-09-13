@@ -33,6 +33,7 @@
 #ifndef VLLM_ENTRYPOINTS_CHAT_TEMPLATE_H_
 #define VLLM_ENTRYPOINTS_CHAT_TEMPLATE_H_
 
+#include <cstdint>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -116,6 +117,14 @@ std::string apply_chat_template(
     const std::vector<openai::ChatCompletionToolsParam>& tools = {},
     const nlohmann::ordered_json& chat_template_kwargs =
         nlohmann::ordered_json::object());
+
+// How many times this process has handed a chat template to minja's parser.
+// A TEST SEAM and nothing else: it is the one observable that tells "parsed
+// once when the prompt fn was built" apart from "parsed on every request"
+// without timing anything, and the parse itself has no other side effect a gate
+// can see (ISSUE-LOCAL-01M2EAQ6R63BSRF1GVZ3JAR4A4). One atomic increment per
+// parse, against a parse that costs tens of milliseconds.
+std::uint64_t ChatTemplateParseCountForTesting();
 
 // Adapt a chat template to Task 2's ChatPromptFn seam (serving_chat.h).
 // `default_chat_template_kwargs` is the SERVER-level default (our

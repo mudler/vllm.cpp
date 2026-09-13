@@ -13,14 +13,18 @@
 #include "vllm/model_executor/model_loader/gguf_reader.h"
 #include "vllm/v1/engine/validation_error.h"  // refused kwarg -> HTTP 400
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <ctime>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <memory>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -31,6 +35,20 @@
 
 namespace vllm::entrypoints {
 namespace {
+
+std::atomic<std::uint64_t> g_chat_template_parse_count{0};
+
+// The ONE place a chat template reaches minja's parser, with transformers'
+// whitespace policy (trim_blocks=True, lstrip_blocks=True,
+// keep_trailing_newline=False).
+std::shared_ptr<minja::TemplateNode> ParseChatTemplate(
+    const std::string& template_str) {
+  g_chat_template_parse_count.fetch_add(1, std::memory_order_relaxed);
+  return minja::Parser::parse(
+      template_str, minja::Options{/*trim_blocks=*/true,
+                                   /*lstrip_blocks=*/true,
+                                   /*keep_trailing_newline=*/false});
+}
 
 nlohmann::ordered_json DecodeHistoricalToolArguments(
     const std::string& encoded, size_t tool_call_index,
@@ -131,20 +149,53 @@ nlohmann::ordered_json BuildTools(
   return arr;
 }
 
-}  // namespace
+// A template parsed ONCE, or the reason it would not parse. The failure is
+// kept, not thrown, because transformers compiles inside apply_chat_template
+// and a broken template is therefore a per-request error upstream (api_server
+// answers it with 400); holding the message lets every render report exactly
+// what a fresh parse would have.
+//
+// Sharing `root` across the server's HTTP worker threads is safe because a
+// minja render never writes to the tree (third_party/minja/minja.hpp):
+// TemplateNode::do_render and Expression::do_evaluate are `const` (:865, :656),
+// no node or expression has a `mutable` member, and every name a render binds
+// goes into the per-call Context or into a Value that Context owns -- SetNode
+// :1149 (namespace write) and :1152, ForNode :1010-1013, MacroNode :1106,
+// SetTemplateNode :1166, CallNode :1736. LiteralExpr (:1190) holds only the
+// scalars parseConstant produces (:1891-1912) and returns them by value, so a
+// template cannot `.append()` into a node's own storage; list and dict literals
+// build a fresh Value per evaluation (ArrayExpr :1204, DictExpr :1219).
+// Context::builtins() builds a new globals object per call (:2818), and the
+// only statics are function-local const regexes, initialised once
+// thread-safely and only read.
+struct ParsedChatTemplate {
+  std::shared_ptr<const minja::TemplateNode> root;  // null when parse failed
+  std::string parse_error;                          // the parser's what()
+};
 
-// ─── Public API ──────────────────────────────────────────────────────────────
-std::string apply_chat_template(
-    const std::string& template_str,
+ParsedChatTemplate ParseChatTemplateKeepingError(
+    const std::string& template_str) {
+  ParsedChatTemplate parsed;
+  try {
+    parsed.root = ParseChatTemplate(template_str);
+  } catch (const std::exception& e) {
+    parsed.parse_error = e.what();
+  }
+  return parsed;
+}
+
+std::string RenderChatTemplate(
+    const ParsedChatTemplate& parsed,
     const std::vector<openai::ChatMessage>& messages, bool add_generation_prompt,
     const std::string& bos_token, const std::string& eos_token,
     const std::vector<openai::ChatCompletionToolsParam>& tools,
     const nlohmann::ordered_json& chat_template_kwargs) {
   try {
-    std::shared_ptr<minja::TemplateNode> root = minja::Parser::parse(
-        template_str, minja::Options{/*trim_blocks=*/true,
-                                     /*lstrip_blocks=*/true,
-                                     /*keep_trailing_newline=*/false});
+    // Raised inside the try, ahead of everything a render validates, so the
+    // arm below wraps it into the same ChatTemplateError, in the same order
+    // against a refused kwarg, that parsing here used to produce.
+    if (!parsed.root) throw std::runtime_error(parsed.parse_error);
+    const minja::TemplateNode& root = *parsed.root;
 
     nlohmann::ordered_json top = nlohmann::ordered_json::object();
     top["messages"] = BuildMessages(messages);
@@ -285,7 +336,7 @@ std::string apply_chat_template(
           return minja::Value(ss.str());
         }));
 
-    return root->render(context);
+    return root.render(context);
   } catch (const ChatTemplateError&) {
     throw;
   } catch (const vllm::v1::InputValidationError&) {
@@ -299,10 +350,37 @@ std::string apply_chat_template(
   }
 }
 
+}  // namespace
+
+// ─── Public API ──────────────────────────────────────────────────────────────
+std::string apply_chat_template(
+    const std::string& template_str,
+    const std::vector<openai::ChatMessage>& messages, bool add_generation_prompt,
+    const std::string& bos_token, const std::string& eos_token,
+    const std::vector<openai::ChatCompletionToolsParam>& tools,
+    const nlohmann::ordered_json& chat_template_kwargs) {
+  return RenderChatTemplate(ParseChatTemplateKeepingError(template_str),
+                            messages, add_generation_prompt, bos_token,
+                            eos_token, tools, chat_template_kwargs);
+}
+
+std::uint64_t ChatTemplateParseCountForTesting() {
+  return g_chat_template_parse_count.load(std::memory_order_relaxed);
+}
+
 openai::ChatPromptFn MakeChatTemplatePromptFn(
     std::string template_str, std::string bos_token, std::string eos_token,
     nlohmann::ordered_json default_chat_template_kwargs) {
-  return [tmpl = std::move(template_str), bos = std::move(bos_token),
+  // Parsed here, once per prompt fn, and shared by every request the fn
+  // renders -- including concurrent ones (see ParsedChatTemplate). Upstream
+  // compiles once as well: transformers' _compile_jinja_template is
+  // lru_cache'd, and vLLM resolves the template once per model
+  // (vllm/renderers/hf.py). Re-parsing per request cost 45 ms of an 8952-char
+  // Qwen3.8 template against 0.1 ms to render it
+  // (ISSUE-LOCAL-01M2EAQ6R63BSRF1GVZ3JAR4A4).
+  auto parsed = std::make_shared<const ParsedChatTemplate>(
+      ParseChatTemplateKeepingError(template_str));
+  return [parsed = std::move(parsed), bos = std::move(bos_token),
           eos = std::move(eos_token),
           defaults = std::move(default_chat_template_kwargs)](
              const std::vector<openai::ChatMessage>& messages,
@@ -331,8 +409,8 @@ openai::ChatPromptFn MakeChatTemplatePromptFn(
         merged[it.key()] = it.value();
       }
     }
-    return apply_chat_template(tmpl, messages, add_generation_prompt, bos, eos,
-                               tools, merged);
+    return RenderChatTemplate(*parsed, messages, add_generation_prompt, bos,
+                              eos, tools, merged);
   };
 }
 

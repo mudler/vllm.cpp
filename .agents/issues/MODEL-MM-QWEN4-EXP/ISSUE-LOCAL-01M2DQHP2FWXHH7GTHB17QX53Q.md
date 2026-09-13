@@ -1,14 +1,14 @@
 ID: ISSUE-LOCAL-01M2DQHP2FWXHH7GTHB17QX53Q
 Title: the decode step makes ~99 cudaFree calls at 634 us each, and DevicePool means it should be making almost none
 Row: MODEL-MM-QWEN4-EXP
-State: OPEN
+State: CLOSED
 Kind: bug
 GitHub: -
 Mirror: PENDING
 Availability: FULL
 Created: 2026-09-13
 Updated: 2026-09-13
-Closed: -
+Closed: 2026-09-13
 
 ## Problem
 
@@ -191,7 +191,43 @@ can carry the attribution, and the fleet-comparable numbers are owed on dgx.
 
 ## Resolution
 
--
+**MEASURED AND CLOSED 2026-09-13.** `dgx:gpu0`, `rc` job `4e36bbae`, post-W9
+`main` (`3eabd4dbd`), 600-token decode at the reference workload, `nsys` window
+opened and closed by the client and SELF-VALIDATED at 1,594,621
+`cudaLaunchKernel` calls.
+
+**The derivation was right.** 97 per step was read off three call sites in
+`Qwen4ExpGatedResidual`; the device says **99.0** (59,400 frees / 600 steps),
+paired with 99.0 `cudaMalloc` to within 28 calls across the whole window.
+`cudaFree` is **80.0% of CUDA API time** at **652.5 us**, i.e. **64.6 ms of an
+87.6 ms step**.
+
+**AND THE LEVER IS NOT WHAT THE COUNT SUGGESTS, which is why this issue insisted
+on the second owed item.** The GPU is **88% BUSY** -- 76.9 ms of kernel time in
+that 87.6 ms step -- leaving **10.6 ms idle**. The 64.6 ms of host time overlaps
+GPU work almost entirely, so removing it recovers at most the idle:
+**87.6 -> 76.9 ms, 11.4 -> 13.0 tok/s, about +14%.** Not the 4x that "74% of the
+step" invites.
+
+The issue's own words were "the recoverable time is bounded above by how long the
+GPU is currently IDLE, and not by the host-side total... that ratio has not been
+measured at the reference workload and it is the number that sizes this work."
+It is measured now, and it sizes the work DOWN.
+
+**What to do with it.** Still worth doing and still cheap -- `cudaFreeAsync` is in
+the same trace at **1,340 ns** against 652,550 ns -- but it is a 14% item, and the
+same trace shows `QsaGatherAttentionKernel` at 18.16 ms/step and cuBLAS `gemvx` at
+17.53 ms/step. **This row is GPU-bound at 88%**; the next work is less GPU work.
+Anyone scoping the async move must still answer the graph-capture interaction
+(`cuda_mla_attn.cu:454`) and the retention finding
+(`ISSUE-LOCAL-01M2DW8CXYEWWMJSZZ6GRH48SZ`), both unchanged.
+
+Closed because both owed items are answered: the population is attributed by call
+site to 2.1%, and the recoverable fraction is bounded by measurement. The full
+record, including the kernel table and a new observation about QSA's
+context-independent per-launch cost, is in
+`.agents/specs/qwen4-exp-flash-next.md`, "### THE ALLOCATOR, MEASURED AT THE
+REFERENCE WORKLOAD".
 
 **THE OTHER SIDE OF THIS POOL IS NOW MEASURED, AND IT CONSTRAINS THE FIX.**
 `ISSUE-LOCAL-01M2DW8CXYEWWMJSZZ6GRH48SZ` (row ENG-POOL-BEST-FIT, landed

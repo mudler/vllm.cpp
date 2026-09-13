@@ -276,7 +276,11 @@ TEST_CASE("a large pageable H2D takes the pinned bounce ring, and a small one do
       }
     }
 
+#if defined(VLLM_CPP_HIP)
     const bool managed = vt::rocm::ManagedAllocActive(0);
+#else
+    const bool managed = false;
+#endif
     const vt::rocm::PinnedH2DStats before = vt::rocm::PinnedH2DSnapshot();
 
     void* p = dev.Alloc(kBig);

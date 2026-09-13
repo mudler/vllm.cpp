@@ -135,10 +135,17 @@ else
   grep -E 'ERROR:' "$OUT/mm_chat.log" | head -10
   step mm_chat_suite_green 1
 fi
-echo "--- the image: line ---"
-grep -n 'image: ' "$OUT/mm_chat.log" | head -5
-echo "--- any host-GEMM refusal left ---"
-grep -nE 'host GEMM|tensor `|engine-fatal' "$OUT/mm_chat.log" | head -10
+# `MESSAGE: image: ` is the CASE'S OWN line -- mm_chat prints
+# `MESSAGE("image: " << (error.empty() ? "served" : error))`. A bare `image: `
+# ALSO matches the PNG and data-URI residual INFO lines, which read
+# `chat image: ...` and are NOT the engine's stop. Measured: on the run that
+# repaired this, the bare pattern printed three container-decode residuals while
+# the real stop sat 70 lines further down. Quoting one of those as "the blocker"
+# is how a job reports a cause that is not the cause.
+echo "--- the image: line (the case's OWN MESSAGE) ---"
+grep -nE 'MESSAGE: image: ' "$OUT/mm_chat.log" | head -5
+echo "--- the engine's own stop, if any ---"
+grep -nE 'host GEMM|engine-fatal' "$OUT/mm_chat.log" | head -10
 
 # THE GATE. The previous wave died naming `wq_a` layer 0. If that exact refusal
 # is still on the image line, binding the tower did not move the blocker.
@@ -156,7 +163,7 @@ if grep -qE 'image: served' "$OUT/mm_chat.log"; then
   step image_served 0
 else
   echo "NOT SERVED: the image stopped. THE NEXT BLOCKER, verbatim:"
-  grep -n 'image: ' "$OUT/mm_chat.log" | head -3
+  grep -nE 'MESSAGE: image: |engine-fatal' "$OUT/mm_chat.log" | head -3
   step image_served 1
 fi
 

@@ -10316,6 +10316,115 @@ copying that pointer into a second handle that can outlive it is how #2476's
 use-after-free was built. If a sweep of other per-step adapters is wanted it is
 its own row, with its own review.
 
+**Device residency changes, and that is the mechanism rather than a side
+effect.** The `d_dev` deleter that `ResidentWeight` installs
+(`include/vllm/model_executor/models/dense_attn_block.h:243`,
+`w.d_dev = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); })`) hangs off
+whichever handle was staged. Today that handle is the per-layer temporary, so
+the deleter runs at the end of each layer -- those are the 378 `cudaFree` calls
+per step the profile above measured. After the hoist the deleter hangs off a
+model-held handle, so every expert tower stays device-resident for the life of
+the model. Steady-state DEVICE footprint therefore moves from roughly one
+layer's towers to the whole set. That is exactly what makes the memo survive the
+step; it is not an incidental cost, and no correctness claim depends on it. The
+risk it creates is capacity, not tokens: on a unified-memory box a model whose
+host mapping and device allocations are both live could fail to fit, and such a
+failure would present as an allocation error rather than as a slow number. That
+risk was raised here before the fix was measured; the measurement below tested
+it and it did not materialise on this artifact.
+`AdoptDeviceBytesAsHost` is the lever that would collapse the host mirror onto
+the device block, and IT DOES NOT APPLY TO THIS ARTIFACT. Its first branch needs
+`w.mmap_src != nullptr && w.bytes.borrowed()`, and `OwnedTensor::mmap_src`
+(`include/vllm/model_executor/models/qwen3_5_weights.h:119`) has exactly one
+producer in the tree: `o.mmap_src = t.data;` at
+`src/vllm/model_executor/models/qwen3_5_weights.cpp:517`, inside
+`BorrowStTensorBytes` (`:491`), which takes an `StTensor` and is therefore the
+SAFETENSORS direct-upload path. `grep -rn '\.mmap_src\s*=' src/ include/`
+returns five hits and the other four are clears to `nullptr`. No GGUF path
+assigns it, which is what the tree comment at `:265-266` already states and what
+the header contract at `:112-118` turns on. The `MmapSrc(g, pol)` helper at
+`qwen4_exp_weights.cpp:123` is NOT that field: it returns a `const GgufFile*`
+whose only use inside `OwnGgufQuantBlocks` is `DropSpanResidency`, and the two
+share nothing but a name. So on a GGUF weight adoption returns early, the host
+mirror survives, and both copies are real.
+
+**The focused gate is NOT `test_qwen4_exp_layer_loop` alone.** It must include
+`test_qwen4_exp_moe` and `test_qwen4_exp_moe_sel_fp`. The reviewer's M5 mutation
+deep-copied all six expert-tower entries instead of borrowing them, and the new
+layer-loop file stayed fully green (470 of 470 assertions). The mutation was
+caught only by the pre-existing W5d-4 cases, whose assertion is the borrow
+identity itself -- `mw.expert_gate_kq.bytes.data() == s.w.gate_exps.bytes.data()`
+(`tests/vllm/models/test_qwen4_exp_moe.cpp:567`). The borrow guarantee with the
+largest blast radius, constraint (2) above and the whole of #2476, is pinned
+there and nowhere else.
+
+**The capacity risk was raised, measured, and did not materialise on this
+artifact.** The paragraph above predicted that the released UD-IQ1_S artifact
+would be held twice -- roughly 68 GiB of host mapping plus roughly 68 GiB of
+device allocations -- and that the failure would present as an allocation error
+rather than as a slow number. THAT PREDICTION IS FALSIFIED by the A/B below.
+Peak resident memory is unchanged within 0.006% on both boxes, steady-state
+resident memory is LOWER after the hoist, and no arm's server log contains
+`out of memory`, `bad_alloc` or `cudaErrorMemoryAllocation`. The mechanism is
+exactly as described -- the deleter moved from per-layer to model lifetime, and
+that is what makes the memo survive the step -- but the predicted consequence
+was wrong. What the measurement covers is ONE artifact (UD-IQ1_S, ~68 GiB) on
+TWO unified-memory boxes of 122-128 GB. It does not license a general claim
+that permanent device residency is free for every model and every checkpoint; a
+larger artifact, or a box with a discrete device memory pool rather than a
+unified one, is unmeasured and the axis stays open there.
+
+### W6 measured: 33.4x, on the nsys-predicted kernel floor (2026-09-13)
+
+Interleaved same-tree A/B. BASE is `3cafbcaf718816f8e60bde525d3c30bac1016a20`
+(the profile commit, no hoist); FIX is
+`72498897144afb4d7037e3c3f48a8c0f8b4f3223` (this change). Two rounds alternating
+BASE/FIX, one server boot per arm, released `unsloth/Qwen3.8-Flash-Next-GGUF`
+UD-IQ1_S staged to local disk, `--max-num-seqs 1 --device cuda` and no other
+engine flag, 16-token decode, median inter-token delta.
+
+| Box | Round | Arm | tok/s | s/token |
+|---|---|---|---|---|
+| `dgx:gpu0` (GB10, sm_121a) | 1 | BASE | 0.2570 | 3.88307 |
+| `dgx:gpu0` | 1 | FIX | 8.5655 | 0.11689 |
+| `dgx:gpu0` | 2 | BASE | 0.2570 | 3.88307 |
+| `dgx:gpu0` | 2 | FIX | 8.5816 | 0.11685 |
+| `thor:gpu0` (sm_110) | 1 | BASE | 0.2645 | - |
+| `thor:gpu0` | 2 | BASE | 0.3004 | - |
+| `thor:gpu0` | - | FIX | 4.9278 | - |
+
+**33.4x on `dgx:gpu0`, reproduced in both rounds.** TTFT falls from 9.0 s to
+1.23 s. The FIX arm's per-token spread across all 14 deltas is 0.1154-0.1180 s,
+so the two rounds are not averaging over a bimodal step. `thor:gpu0` confirms
+the direction on a second architecture; its BASE spreads 0.2645-0.3004 tok/s,
+which is why the ratio is quoted from `dgx:gpu0` only.
+
+**The measured step lands on the predicted floor, and THAT is what makes this a
+confirmed diagnosis rather than a lucky fix.** The nsys profile measured
+0.101 s of GPU kernel time per step against 3.69 s of allocator and copy time.
+If the allocator was the whole bill, removing it must leave a step at roughly
+0.10 s. The measured FIX step is 0.1169 s. The diagnosis, the fix and the trace
+agree, so the remaining 0.016 s is the host-side cost the allocator was hiding
+and is not an unexplained residue.
+
+**Memory, which is the axis the section above owed.** `VmHWM` is peak resident
+set size, read from `/proc/<pid>/status` of the server process.
+
+| Box | Arm | `VmHWM` (kB) | steady `VmRSS` (kB) |
+|---|---|---|---|
+| `dgx:gpu0` | BASE | 77,397,988 | 77,397,988 |
+| `dgx:gpu0` | FIX (round 1) | 77,402,288 | 43,977,844 |
+| `dgx:gpu0` | FIX (round 2) | 77,398,924 | 43,603,596 |
+| `thor:gpu0` | BASE | 77,304,396 | - |
+| `thor:gpu0` | FIX | 77,305,524 | - |
+
+Peak is identical within 0.006%, and steady-state resident set falls by roughly
+33.4 GB on `dgx:gpu0`. No arm logged `out of memory`, `bad_alloc` or
+`cudaErrorMemoryAllocation`. The predicted doubling is therefore not what this
+box does: the host mapping and the device block are not two independent 68 GiB
+charges against physical memory here, and the per-step staging BASE performed
+was itself resident cost that the hoist removes.
+
 ### The decode-step profile, measured (2026-09-12, `dgx:gpu0`, `51c248190`)
 
 Everything in the section below this one was a hypothesis. This section is the

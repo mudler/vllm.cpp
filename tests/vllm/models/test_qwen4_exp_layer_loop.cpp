@@ -2700,6 +2700,219 @@ TEST_CASE(
   CHECK(Addr(after.layers[0].gdn.in_proj_qkv) ==
         reinterpret_cast<uintptr_t>(base));
 }
+// ─────────────────────────────────────────────────────────────────────────────
+// MoE ADAPTER LIFETIME (`ISSUE-LOCAL-01M2AA9C31GCSDV8NRW26GMEVS`, spec
+// `.agents/specs/qwen4-exp-flash-next.md` §"W6 scope: hoist the MoE adapter onto
+// the model").
+//
+// WHAT FAILED, AND WHY TWELVE GREEN WAVES NEVER SAW IT. The layer loop composed
+// `Qwen4ExpMoeBlockWeights` INSIDE the loop, so every layer of every step got a
+// fresh set of handles. `BorrowWholeOwnedTensor` carries dtype, rank, shape,
+// `nk` and every layout marker and does NOT carry `d_dev`, which is
+// `ResidentWeight`'s residency memo, so every step's handles presented a null
+// memo and every expert tower took the `Alloc` + `Copy` staging arm again. On
+// `dgx:gpu0` that is 378 `cudaMalloc` calls per decode step — 48 layers x (3
+// expert towers + 3 shared-expert weights + router + shared gate) = 384 — and
+// 2.25 s of the step in the allocator against 0.101 s in all GPU kernels.
+//
+// THE TOKENS WERE ALWAYS CORRECT. Restaging a weight produces the same bytes on
+// the device that the last staging produced, so the golden above, every
+// per-block gate and every value comparison in this file pass in both arms. A
+// value gate cannot see a residency lifetime, which is the same sentence #2476
+// wrote next door about the Gated DeltaNet twin.
+//
+// WHY THIS CASE DOES NOT READ `load_stats::device_upload_bytes`. That counter is
+// the direct expression of the defect and it is the one the operator's
+// re-measurement reads — but `ResidentWeight` only reaches
+// `load_stats::AddDeviceUpload` on its DEVICE arm, and on a CPU queue it takes
+// the host-alias arm and counts nothing. On a CPU-only host the counter is
+// therefore 0 in BOTH arms, and an assertion on it would pass whether or not the
+// adapter is hoisted: an instrument that succeeds at the wrong question. So this
+// case asserts the PRECONDITION of the counter instead, which is exactly what
+// `d_dev` needs and what a CPU run can check: the handles the second step hands
+// `ResidentWeight` are THE SAME OBJECTS the first step handed it. A memo written
+// onto those handles survives; one written onto a temporary cannot.
+//
+// THE SENTINEL IS NOT DECORATION. Comparing addresses alone is not enough: a
+// rebuilt adapter frees its predecessor's buffers first, and the allocator
+// hands the same address straight back for a same-sized request, so two equal
+// addresses are consistent with a rebuild. Writing a byte into the adapter
+// between the two forwards and finding it afterwards is not — only an adapter
+// that was never recomposed still carries it.
+TEST_CASE(
+    "qwen4_exp: a second forward through ModelRegistry::Forward REUSES the MoE "
+    "adapter the first one built, so nothing is staged again") {
+  using namespace qwen4_exp_fixture;  // NOLINT(build/namespaces)
+
+  const gguf_test::TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig config = vllm::Qwen4ExpHfConfigFromGguf(g);
+  std::unique_ptr<vllm::LoadedModel> model;
+  REQUIRE_NOTHROW(model = LoadThroughRegistry(g));
+  REQUIRE(model != nullptr);
+
+  auto* loaded = dynamic_cast<vllm::Qwen4ExpLoadedModel*>(model.get());
+  REQUIRE(loaded != nullptr);
+
+  // The LOAD does not build it. Asserted, so a green cannot come from the
+  // loader having populated the adapter for some unrelated reason: what this
+  // case measures is what the FORWARD does with it.
+  REQUIRE(!loaded->weights().layers[0].moe_block.has_value());
+
+  const int64_t T = 4;
+  std::vector<int32_t> ids(static_cast<size_t>(T));
+  std::vector<int32_t> pos(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t) {
+    ids[static_cast<size_t>(t)] =
+        static_cast<int32_t>(t == T - 1 ? kEosTokenId : t + 1);
+    pos[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+  }
+
+  vllm::v1::CommonAttentionMetadata am;
+  am.num_reqs = 1;
+  am.num_actual_tokens = static_cast<int>(T);
+  am.block_table_num_cols = 1;
+  am.block_table_tensor.assign(1, 0);
+  am.seq_lens.assign(1, static_cast<int32_t>(T));
+  am.query_start_loc = {0, static_cast<int32_t>(T)};
+  am.slot_mapping.resize(static_cast<size_t>(T));
+  for (int64_t t = 0; t < T; ++t)
+    am.slot_mapping[static_cast<size_t>(t)] = static_cast<int32_t>(t);
+
+  vllm::v1::GDNAttentionMetadata gm;
+  gm.num_prefills = 1;
+  gm.num_prefill_tokens = static_cast<int>(T);
+  gm.num_actual_tokens = static_cast<int>(T);
+  gm.has_initial_state = std::vector<uint8_t>{0};
+  gm.non_spec_state_indices_tensor = std::vector<int32_t>{0};
+  gm.non_spec_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+  gm.prefill_query_start_loc = std::vector<int32_t>{0, static_cast<int32_t>(T)};
+  gm.prefill_state_indices = std::vector<int32_t>{0};
+  gm.prefill_has_initial_state = std::vector<uint8_t>{0};
+  {
+    const auto conv =
+        vllm::v1::ComputeCausalConv1dMetadata(*gm.non_spec_query_start_loc);
+    gm.batch_ptr = conv.batch_ptr;
+    gm.token_chunk_offset_ptr = conv.token_chunk_offset_ptr;
+  }
+
+  vt::Queue q = CpuQ();
+  vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+
+  const int64_t key_dim = kNumKHeads * kLinHeadDim;
+  const int64_t value_dim = kNumVHeads * kLinHeadDim;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t conv_len = kConvKernel - 1;
+  const int64_t ssm_row = kNumVHeads * kLinHeadDim * kLinHeadDim;
+
+  std::vector<std::vector<float>> ssm(3), conv(3);
+  std::vector<vllm::dense_attn::DBuf> ssm_b, conv_b;
+  std::vector<vllm::GdnStateCache> gdn(3);
+  ssm_b.reserve(3);
+  conv_b.reserve(3);
+  for (int i = 0; i < 3; ++i) {
+    ssm[i].assign(static_cast<size_t>(ssm_row), 0.0F);
+    conv[i].assign(static_cast<size_t>(conv_dim * conv_len), 0.0F);
+    ssm_b.emplace_back(
+        d, DType::kF32,
+        std::vector<int64_t>{1, kNumVHeads, kLinHeadDim, kLinHeadDim},
+        ssm[i].data());
+    conv_b.emplace_back(d, DType::kF32,
+                        std::vector<int64_t>{1, conv_dim, conv_len},
+                        conv[i].data());
+    gdn[static_cast<size_t>(i)].ssm_state = ssm_b.back().t();
+    gdn[static_cast<size_t>(i)].conv_state = conv_b.back().t();
+  }
+
+  std::vector<uint16_t> kv(static_cast<size_t>(2 * T * kKvHeads * kHeadDim), 0);
+  vllm::dense_attn::DBuf kv_b(d, DType::kBF16, {2, T, kKvHeads, kHeadDim},
+                              kv.data());
+  std::vector<vllm::PagedKvCache> attn_kv(1);
+  attn_kv[0].data = kv_b.t().data;
+  attn_kv[0].dtype = DType::kBF16;
+  attn_kv[0].num_blocks = 1;
+  attn_kv[0].block_size = T;
+  attn_kv[0].num_kv_heads = kKvHeads;
+  attn_kv[0].head_size = kHeadDim;
+
+  const std::vector<int32_t> logits_indices{static_cast<int32_t>(T - 1)};
+  vllm::ModelForwardInput in{ids, pos,     am, gm, attn_kv,
+                             gdn, config,  q,  logits_indices};
+  in.num_reqs = 1;
+  in.gdn_state_slots = 1;
+
+  // ── STEP ONE ───────────────────────────────────────────────────────────────
+  vllm::ForwardLogits fl;
+  REQUIRE_NOTHROW(fl = vllm::ModelRegistry::Forward(*model, in));
+  REQUIRE(fl.rows == 1);
+
+  // EVERY layer, because the MoE is on every layer of this architecture and a
+  // hoist that reaches only the first one is the same defect on 47 of them.
+  for (size_t il = 0; il < loaded->weights().layers.size(); ++il) {
+    CAPTURE(il);
+    REQUIRE(loaded->weights().layers[il].moe_block.has_value());
+  }
+
+  vllm::Qwen4ExpLayerWeights& lw = loaded->weights().layers[0];
+  const vllm::MoeBlockWeights* adapter = &lw.moe_block.value();
+
+  // THE BORROW, which is constraint (2) of the spec's three and the half that
+  // makes holding the adapter SAFE rather than merely stable. The shared
+  // expert's projections must be VIEWS of the model's own bytes: spelling them
+  // as assignment deep-copies `OwnedTensor`'s owned buffer, which is what
+  // #2476 was.
+  CHECK(Addr(adapter->shared_gate_proj) == Addr(lw.moe.shared_gate_proj));
+  CHECK(Addr(adapter->shared_up_proj) == Addr(lw.moe.shared_up_proj));
+  CHECK(Addr(adapter->shared_down_proj) == Addr(lw.moe.shared_down_proj));
+  CHECK(adapter->shared_gate_proj.bytes.borrowed());
+  CHECK(adapter->shared_down_proj.bytes.borrowed());
+
+  // The addresses the first step handed `ResidentWeight`, one per tensor the
+  // memo would be written onto. Listed rather than folded, so a red names the
+  // tensor that was rebuilt.
+  const uintptr_t a_router = Addr(adapter->router_gate);
+  const uintptr_t a_sgate = Addr(adapter->shared_gate);
+  const uintptr_t a_sgp = Addr(adapter->shared_gate_proj);
+  const uintptr_t a_sup = Addr(adapter->shared_up_proj);
+  const uintptr_t a_sdn = Addr(adapter->shared_down_proj);
+
+  // THE SENTINEL. `router_gate` is the adapter's OWN bf16 re-rounding of the
+  // model's f32 router, so writing here touches nothing the model owns and
+  // nothing a later load reads. A recomposed adapter overwrites this byte with
+  // the conversion's output; the adapter that survives the step still has it.
+  REQUIRE(!adapter->router_gate.bytes.empty());
+  auto* sentinel_at =
+      const_cast<uint8_t*>(adapter->router_gate.bytes.data());  // NOLINT
+  const uint8_t sentinel_was = sentinel_at[0];
+  const uint8_t kSentinel = static_cast<uint8_t>(sentinel_was ^ 0x5AU);
+  sentinel_at[0] = kSentinel;
+
+  // ── STEP TWO, the one the defect lives in ──────────────────────────────────
+  REQUIRE_NOTHROW(fl = vllm::ModelRegistry::Forward(*model, in));
+  REQUIRE(fl.rows == 1);
+
+  // (1) THE SAME OBJECT. Not a new `MoeBlockWeights` at the same address: the
+  // optional still holds the one the first step emplaced.
+  REQUIRE(loaded->weights().layers[0].moe_block.has_value());
+  CHECK(&loaded->weights().layers[0].moe_block.value() == adapter);
+
+  // (2) THE SAME BYTES, so the `d_dev` the first step's staging wrote is on the
+  // handle the second step reads.
+  CHECK(Addr(adapter->router_gate) == a_router);
+  CHECK(Addr(adapter->shared_gate) == a_sgate);
+  CHECK(Addr(adapter->shared_gate_proj) == a_sgp);
+  CHECK(Addr(adapter->shared_up_proj) == a_sup);
+  CHECK(Addr(adapter->shared_down_proj) == a_sdn);
+
+  // (3) AND IT WAS NEVER RECOMPOSED, which is the assertion an equal address
+  // cannot make on its own.
+  CHECK(static_cast<unsigned>(adapter->router_gate.bytes.data()[0]) ==
+        static_cast<unsigned>(kSentinel));
+
+  // Restored, because a poisoned router is not a state any later assertion in
+  // this binary should inherit.
+  sentinel_at[0] = sentinel_was;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DECODEDIV (#2496) — WHERE THE CUDA ARM LEAVES THE CPU ARM, BY STEP AND BY

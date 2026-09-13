@@ -1,14 +1,14 @@
 ID: ISSUE-LOCAL-01M2AA9C31GCSDV8NRW26GMEVS
 Title: The qwen4_exp layer loop rebuilds the MoE adapter per step, and BorrowWholeOwnedTensor drops d_dev, so every decode step re-derives device residency for all 48 layers of expert towers
 Row: MODEL-MM-QWEN4-EXP
-State: OPEN
+State: CLOSED
 Kind: bug
 GitHub: -
 Mirror: PENDING
 Availability: FULL
 Created: 2026-09-12
-Updated: 2026-09-12
-Closed: -
+Updated: 2026-09-13
+Closed: 2026-09-13
 
 ## Problem
 
@@ -22,9 +22,18 @@ The fix, if the measurement ranks it, is a hoist: build each layer's `MoeBlockWe
 
 ## Resolution
 
--
+FIXED 2026-09-13 by `72498897144afb4d7037e3c3f48a8c0f8b4f3223`, which hoists the MoE adapter onto `Qwen4ExpLayerWeights::moe_block` and emplaces it on first use, so the `d_dev` residency memo `ResidentWeight` writes survives the decode step instead of dying with the per-layer temporary.
 
-### MEASURED 2026-09-12 on `dgx:gpu0`: this is 97% of the decode step
+MEASURED: interleaved same-tree A/B, BASE `3cafbcaf718816f8e60bde525d3c30bac1016a20` vs FIX `72498897144afb4d7037e3c3f48a8c0f8b4f3223`, two rounds alternating BASE/FIX, one boot per arm, released `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S staged to local disk, `--max-num-seqs 1 --device cuda`, 16-token decode, median inter-token delta. On `dgx:gpu0` (GB10, sm_121a): round 1 BASE 0.2570 tok/s (3.88307 s/token) -> FIX 8.5655 tok/s (0.11689 s/token); round 2 BASE 0.2570 -> FIX 8.5816 tok/s (0.11685 s/token). 33.4x, reproduced in both rounds. TTFT 9.0 s -> 1.23 s. FIX per-token spread across all 14 deltas is 0.1154-0.1180 s. `thor:gpu0` (sm_110) confirms the direction on the same harness: BASE 0.2645 / 0.3004 tok/s -> FIX 4.9278 tok/s.
+
+The measured step lands on the floor this issue's own nsys profile predicted: 0.101 s of GPU kernel time per step against 3.69 s of allocator and copy time, so removing the allocator had to leave roughly 0.10 s, and it left 0.1169 s. That agreement is what makes this a confirmed diagnosis rather than a lucky fix.
+
+MEMORY: the capacity risk the spec raised -- roughly 68 GiB of host mapping plus roughly 68 GiB of device allocations held at once -- did NOT materialise on this artifact. `dgx:gpu0` `VmHWM` 77,397,988 kB BASE against 77,402,288 kB and 77,398,924 kB FIX, identical within 0.006%; `thor:gpu0` 77,304,396 kB BASE against 77,305,524 kB FIX. Steady-state `VmRSS` is LOWER on FIX, 43,977,844 kB and 43,603,596 kB against 77,397,988 kB on BASE. No arm's server log contains `out of memory`, `bad_alloc` or `cudaErrorMemoryAllocation`. This is one artifact (~68 GiB) on two unified-memory boxes of 122-128 GB and does not generalise to a larger checkpoint or a discrete device memory pool.
+
+### The diagnosis this closes on: MEASURED 2026-09-12 on `dgx:gpu0`, 97% of the decode step
+
+Retained because it is the evidence the fix was chosen from, and the denominator
+the 2026-09-13 A/B above is read against.
 
 `nsys`, 60 s window over ~15.2 steady-state decode steps, `51c248190`, GB10,
 released UD-IQ1_S staged locally. Per step: `cudaMalloc` 378 calls / 2.25 s
@@ -49,5 +58,7 @@ and its precedent is twelve lines away in the same function: GDN carried this
 exact defect and #2476 repaired it by building `lw.gdn_block` once and holding
 it on the model.
 
-DO NOT record an expected speedup here. Removing the allocator can expose
-host-side cost it currently hides; the number comes from the re-measurement.
+This section closed with "DO NOT record an expected speedup here", because
+removing the allocator can expose host-side cost it hides. The re-measurement
+has now been taken and is recorded above: the exposed host-side cost is
+0.016 s per step, against the 0.101 s kernel floor this profile measured.

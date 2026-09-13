@@ -2398,11 +2398,13 @@ LoadedEngine::LoadedEngine(HfConfig config,
   // slots that the captured decode never reads. Recipe-gated release —
   // here, at the end of BOTH LoadedEngine ctors, because the GGUF dense
   // load reaches the engine through more than one loader branch.
+#if defined(VLLM_CPP_TENSTORRENT)
   if (const char* wr = std::getenv("VT_TT_RELEASE_WARM_ROWS");
       wr != nullptr && wr[0] != '\0') {
     vt::tenstorrent::ReleaseWarmShapeSlots(
         static_cast<uint32_t>(std::strtoul(wr, nullptr, 10)));
   }
+#endif
 }
 
 void LoadedEngine::WarmupKernels() {
@@ -3182,11 +3184,13 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     TtAllocTraceStage("load/stage/post-engine-ctor");
     // W4d W3: the ctor's cold pre-warm committed full-batch-shape activation
     // slots that the captured decode never reads. Recipe-gated release.
+#if defined(VLLM_CPP_TENSTORRENT)
     if (const char* wr = std::getenv("VT_TT_RELEASE_WARM_ROWS");
         wr != nullptr && wr[0] != '\0') {
       vt::tenstorrent::ReleaseWarmShapeSlots(
           static_cast<uint32_t>(std::strtoul(wr, nullptr, 10)));
     }
+#endif
     return engine;
   }
 

@@ -297,4 +297,15 @@ Qwen3_5GgufMtpHeadSkip Qwen3_5GgufMtpHeadSkipTensors(const GgufFile& gguf,
 // (prints nothing) when `Qwen3_5GgufMtpHeadSkip` reports nothing skipped.
 void LogQwen3_5GgufMtpHeadSkip(const GgufFile& gguf, const HfConfig& config);
 
+
+// W4d W4 focused-test hook: the byte-level twin of the element-level
+// ReorderVRows — permute whole row BYTE-ranges of a PACKED block buffer
+// with the same grouped->tiled V-head permutation. `row_bytes` is the
+// packed byte size of one weight row (whole blocks: the caller checks
+// K % block_elems == 0). Exists so the packed reorder's equivalence to the
+// element reorder is testable across TU boundaries.
+void ReorderVPackedForTest(std::vector<uint8_t>& packed, int64_t row_bytes,
+                           int64_t row_off, int64_t num_k,
+                           int64_t num_v_per_k, int64_t head_rows);
+
 }  // namespace vllm

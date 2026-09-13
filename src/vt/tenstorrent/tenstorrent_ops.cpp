@@ -929,6 +929,10 @@ ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device) {
   return dev;
 }
 
+// (StageWeightBf16ForTest is defined at vt::tenstorrent scope below — it
+// needs external linkage for the focused test and calls EnsureDevice2D,
+// which stays TU-internal here.)
+
 // DEBUG (BACKEND-TENSTORRENT-QWEN35 W2c): ensure the tensor is staged on
 // device exactly as a consuming kernel would, then read the DEVICE copy back.
 // Comparing this against the host master exposes staging corruption that a
@@ -1862,6 +1866,7 @@ void DropKeepQuantWordShadow(void* host) {
 // immutable post-load, so a serve can never go stale while the master lives
 // (same assumption as the BufferSlot/WeightViewShadow resident shadows); the
 // UnregisterHostBuffer drop above covers the recycle case.
+void TTReclaimPlanes(MeshDevice& device, std::vector<ttnn::Tensor>& planes);
 ttnn::Tensor EnsureKeepQuantWords(const Tensor& packed, DType enc, int64_t rows,
                                   int64_t nb, MeshDevice& device) {
   VT_CHECK(packed.rank == 2 && packed.IsContiguous(),
@@ -1916,10 +1921,38 @@ ttnn::Tensor EnsureKeepQuantWords(const Tensor& packed, DType enc, int64_t rows,
                                   static_cast<uint32_t>(wpb)}),
              ttnn::DataType::INT32, ttnn::Layout::ROW_MAJOR),
       &device);
-  std::lock_guard<std::mutex> g(KeepQuantWordMutex());
-  KeepQuantWordShadows()[packed.data] =
-      KeepQuantWordShadow{staged, rows, nb, wpb};
+  {
+    std::lock_guard<std::mutex> g(KeepQuantWordMutex());
+    KeepQuantWordShadows()[packed.data] =
+        KeepQuantWordShadow{staged, rows, nb, wpb};
+  }
   AllocTraceSnapshot(device, "EnsureKeepQuantWords/post");
+  // W4d W3 (#3042): the weight's bf16 TILE staging is dead weight the moment
+  // its word shadow exists — the keep-quant matmul reads only the words, and
+  // a bf16-arm decline re-stages on demand from the slot's live host bytes.
+  // At 27B the staged bf16 form of every k-quant weight sat beside the words
+  // (attn_qkv alone: 97 x [10240,5120] bf16 = 9.7 GiB beside ~21 MiB q6_K
+  // each), filled the banks to 93 percent during the warm pass, and
+  // fragmented them into the init OOM. Release the slot's bf16 forms here;
+  // the word shadows, embed twin and persistent non-quant stagings stay.
+  // Scoped AFTER the KeepQuantWordMutex guard so the SlotMutex nesting order
+  // (Slot -> KeepQuant elsewhere, sequential here) is never inverted.
+  if (!tt_capture_active()) {
+    std::vector<ttnn::Tensor> dead;
+    {
+      std::lock_guard<std::mutex> g_slot(SlotMutex());
+      if (BufferSlot* s = FindSlot(packed.data);
+          s != nullptr && packed.data == s->host &&
+          (s->device.has_value() || s->persistent.has_value())) {
+        if (s->device) dead.push_back(*s->device);
+        if (s->persistent) dead.push_back(*s->persistent);
+        s->device.reset();
+        s->persistent.reset();
+        s->device_current = false;
+      }
+    }
+    if (!dead.empty()) TTReclaimPlanes(device, dead);
+  }
   return staged;
 }
 
@@ -1956,6 +1989,7 @@ void TTReclaimPlanes(MeshDevice& device, std::vector<ttnn::Tensor>& planes) {
   for (ttnn::Tensor& plane : planes)
     ttnn::deallocate(plane, /*force=*/true);
 }
+
 
 // Stream bytes [first, last) of the word-staged block as u8 {B, last-first}
 // (little-endian lanes). concat stacks the four lane tensors, so the
@@ -2071,6 +2105,12 @@ ttnn::Tensor DecodeKeepQuantWordsF32(const ttnn::Tensor& w, DType enc,
                                      int64_t slice_rows, int64_t nb,
                                      MeshDevice& device) {
   const uint32_t B = static_cast<uint32_t>(slice_rows * nb);
+  {  // W4d W0 (#3042) attribution: label carries the slice size.
+    char lbl[64];
+    std::snprintf(lbl, sizeof(lbl), "kq-decode/rows=%lld/nb=%lld",
+                  (long long)slice_rows, (long long)nb);
+    AllocTraceSnapshot(device, lbl);
+  }
 
   // W4d W2 (#3042): every plane this decode builds is reclaimed by force at
   // its last use — TTReclaimPlanes above (the W1 trace booked 7.6 GB of
@@ -2181,6 +2221,7 @@ ttnn::Tensor DecodeKeepQuantWordsF32(const ttnn::Tensor& w, DType enc,
   // cached -0 constant — never reclaimed.
   auto repair = [&](ttnn::Tensor value, ttnn::Tensor mask_f32,
                     const ttnn::Tensor& neg0) {
+    AllocTraceSnapshot(device, "kq-decode/repair");
     ttnn::Tensor pred = ttnn::to_layout(ttnn::gt(mask_f32, 0.0f),
                                         ttnn::Layout::TILE);
     ttnn::Tensor value_t = ttnn::to_layout(value, ttnn::Layout::TILE);
@@ -2620,6 +2661,12 @@ void MatmulBTQuantKernel(Queue& q, Tensor& out, const Tensor& a, const Tensor& b
            std::string("tenstorrent kMatmulBTQuant: K must be a whole number "
                        "of ") +
                Name(enc) + " blocks (" + std::to_string(elems) + " elems)");
+  {  // W4d W0 (#3042) attribution: which matmul weight is being staged.
+    char lbl[64];
+    std::snprintf(lbl, sizeof(lbl), "matmulbtq/N=%lld/K=%lld",
+                  (long long)b.shape[0], (long long)b.shape[1]);
+    AllocTraceSnapshot(SharedMeshDevice(), lbl);
+  }
   VT_CHECK(IsFloatDType(a.dtype) &&
                (out.dtype == DType::kF32 || out.dtype == DType::kBF16),
            "tenstorrent kMatmulBTQuant: float activation, f32/bf16 out");
@@ -2655,13 +2702,16 @@ void MatmulBTQuantKernel(Queue& q, Tensor& out, const Tensor& a, const Tensor& b
   // ROW_MAJOR chained leg's NaN signature: the vehicle's mid-layer bf16
   // keep-quant matmul fed a down-projection whose activation read the
   // poisoned slot).
-  if (out.dtype == DType::kF32) {
-    if (const char* int8dot_env = std::getenv("VT_TT_KEEPQUANT_INT8DOT");
-        int8dot_env != nullptr && int8dot_env[0] != '\0' &&
-        std::strcmp(int8dot_env, "0") != 0) {
-      MatmulBTQuantInt8DotKernel(q, out, a, b);
-      return;
-    }
+  // W4d W6: int8-dot serves BOTH out dtypes when opted in — one captured
+  // launch per matmul replaces the per-chunk E=1 chain, whose capture-time
+  // transients pinned 3.8 GiB into the trace region at 27B
+  // (tenstorrent-27b-int8dot-capture.md). bf16-out carries an explicit
+  // f32->bf16 cast before the commit (the W4b store-geometry bug, fixed).
+  if (const char* int8dot_env = std::getenv("VT_TT_KEEPQUANT_INT8DOT");
+      int8dot_env != nullptr && int8dot_env[0] != '\0' &&
+      std::strcmp(int8dot_env, "0") != 0) {
+    MatmulBTQuantInt8DotKernel(q, out, a, b);
+    return;
   }
   // W4a wave-3b-1 (#3030): the bf16-out dispatch. P = M output rows against
   // expert 0; the ids are statically all zero and the E=1 arm never reads
@@ -2788,6 +2838,12 @@ void MatmulBTQuantGroupedKernel(Queue&, Tensor& out, const Tensor& act,
   if (P == 0 || N == 0) return;
 
   MeshDevice& device = SharedMeshDevice();
+  {  // W4d W0 (#3042) attribution: grouped arm shape.
+    char lbl[80];
+    std::snprintf(lbl, sizeof(lbl), "matmulbtq-grouped/E=%lld/N=%lld/K=%lld",
+                  (long long)E, (long long)N, (long long)K);
+    AllocTraceSnapshot(device, lbl);
+  }
 
   // Stage the PACKED tower once — the resident i32 word shadow keyed by the
   // host weight pointer, served forever after (the dense arm's pattern). The
@@ -3284,6 +3340,7 @@ std::map<std::string, Int8DotWorkloadEntry>& Int8DotWorkloadCache() {
 }
 
 }  // namespace
+
 // kMatmulBTQuant's W4b body: out[M,N] = a[M,K] @ b[N,K]^T with b PACKED
 // keep-quant blocks, computed entirely by the device kernel above. M, N, K,
 // nb, wpb and the per-core row split are launch arguments; the activation is
@@ -3584,6 +3641,15 @@ void MatmulBTQuantInt8DotKernel(Queue& q, Tensor& out, const Tensor& a,
   // slot the next consumer's tile view can overflow, the wave-3b lesson).
   ttnn::Tensor committed =
       ttnn::to_layout(std::move(dev_out), ttnn::Layout::TILE);
+  // W4d W6: a BF16-OUT call takes an explicit f32->bf16 cast BEFORE the
+  // commit. Committing the f32 dev_out into a bf16 slot left the slot
+  // holding f32 bytes at an f32 page geometry — the next bf16 reader got
+  // word-halved garbage (the ROW_MAJOR chained leg's NaN signature, the
+  // W4b landing decision). One recorded typecast launch: capture-safe.
+  if (out.dtype == DType::kBF16)
+    committed = ttnn::typecast(std::move(committed),
+                               ttnn::DataType::BFLOAT16);
+
   CommitDeviceLogical2D(out, std::move(committed), static_cast<uint32_t>(M),
                         static_cast<uint32_t>(N));
 }
@@ -8725,6 +8791,58 @@ int64_t AllocTraceMaxDeltaForTest() {
   std::lock_guard<std::mutex> g(AllocTraceSt().mtx);
   return AllocTraceSt().max_alloc_delta;
 }
+void StageWeightBf16ForTest(const Tensor& t, MeshDevice& device) {
+  (void)EnsureDevice2D(t, device);
+}
+
+// W4d W3 (ISSUE-LOCAL-01M2AA4ZVD9EWJG5NNQD5DWZXS): after the ctor's cold
+// pre-warm (which runs at the full batched shape) and the capture, every
+// warm activation it committed via CommitDeviceLogical2D is garbage — the
+// captured decode only reads step-shaped buffers — yet the slots hold it
+// forever (~14 GiB at 27B: banks at 93 percent before the first decode, and
+// the repair chain's contiguity ask fragments against it). Release slots
+// whose consumer shadow has EXACTLY the warm forward's row count; word
+// shadows, persistent weight stagings and the embed twin live in other
+// holders and are untouched. Recipe-gated via VT_TT_RELEASE_WARM_ROWS.
+void ReleaseWarmShapeSlots(uint32_t rows) {
+  std::vector<ttnn::Tensor> dead;
+  {
+    std::lock_guard<std::mutex> g(SlotMutex());
+    for (auto& kv : Slots()) {
+      BufferSlot& s = kv.second;
+      if (!s.device) continue;
+      const auto ls = s.device->logical_shape();
+      if (ls.rank() >= 1 && ls[0] == rows) {
+        dead.push_back(*s.device);
+        s.device.reset();
+      }
+    }
+  }
+  if (!dead.empty()) {
+    std::fprintf(stderr,
+                 "[TT-WARM-RELEASE] rows=%u: released %zu warm slot(s)\n",
+                 rows, dead.size());
+    TTReclaimPlanes(SharedMeshDevice(), dead);
+  }
+}
+
+// W4d W6: stage the keep-quant word shadow for ONE block-quant weight at
+// LOAD time (the residency pre-pass). A lazy first-matmul stage at 27B
+// asked the head's 1 GiB words against a fragmented, 95-percent-full bank
+// set and died; staged here — immediately after the weight's own resident
+// upload, while the banks are unfragmented — the words land contiguously
+// and the warm's EnsureKeepQuantWords hits the cache (same key: the
+// ResidentWeight device view's pointer). No-op for non-block dtypes.
+void StageKeepQuantWordsFor(const Tensor& packed) {
+  if (!vt::IsBlockQuant(packed.dtype)) return;
+  const int64_t nb =
+      static_cast<int64_t>(packed.shape[1]) /
+      static_cast<int64_t>(BlockElems(packed.dtype));
+  (void)EnsureKeepQuantWords(packed, packed.dtype,
+                             static_cast<int64_t>(packed.shape[0]), nb,
+                             SharedMeshDevice());
+}
+
 int64_t FreeDeviceDramBytesForTest() {
   MeshDevice& device = SharedMeshDevice();
   const auto view = tt::tt_metal::detail::GetMemoryView(
@@ -8743,6 +8861,62 @@ int64_t DeviceDramTotalBytes() {
       &device, tt::tt_metal::BufferType::DRAM);
   return static_cast<int64_t>(view.num_banks) *
          static_cast<int64_t>(view.total_bytes_per_bank);
+}
+
+// Attribution (W4d W3, ISSUE-LOCAL-01M2AA4ZVD9EWJG5NNQD5DWZXS): walk the
+// slot table and dump resident device bytes by holder — the consumer shadow
+// (`device`), the persistent staged buffer (`persistent`), the gemma affine
+// form — plus the top holders by volume. The 27B warm pass leaves ~14 GiB
+// of slot residency; this census names which slots hold it.
+void DumpSlotCensus(const char* label) {
+  std::lock_guard<std::mutex> g(SlotMutex());
+  auto bytes_of = [](const ttnn::Tensor& t) -> size_t {
+    size_t esz = 4;
+    switch (t.dtype()) {
+      case ttnn::DataType::BFLOAT16: esz = 2; break;
+      case ttnn::DataType::UINT8: esz = 1; break;
+      default: esz = 4; break;
+    }
+    size_t n = 1;
+    for (uint32_t d : t.logical_shape()) n *= d;
+    return n * esz;
+  };
+  size_t dev_bytes = 0, pers_bytes = 0, gemma_bytes = 0;
+  size_t n_dev = 0, n_pers = 0;
+  std::map<std::string, std::pair<size_t, size_t>> dev_hist;  // shape -> bytes, slots
+  std::map<std::string, std::pair<size_t, size_t>> pers_hist;
+  for (auto& kv : Slots()) {
+    BufferSlot& s = kv.second;
+    if (s.device) {
+      const size_t b = bytes_of(*s.device);
+      dev_bytes += b;
+      ++n_dev;
+      auto& e = dev_hist[std::to_string(s.dev_rows) + "x" +
+                         std::to_string(s.dev_cols)];
+      e.first += b;
+      e.second += 1;
+    }
+    if (s.persistent) {
+      const size_t b = bytes_of(*s.persistent);
+      pers_bytes += b;
+      ++n_pers;
+      auto& e = pers_hist[std::to_string(s.persist_rows) + "x" +
+                          std::to_string(s.persist_cols)];
+      e.first += b;
+      e.second += 1;
+    }
+    if (s.gemma_device) gemma_bytes += bytes_of(*s.gemma_device);
+  }
+  std::fprintf(stderr,
+               "[TT-SLOT-CENSUS] %s: dev=%zu B in %zu slots, "
+               "pers=%zu B in %zu slots, gemma=%zu B\n",
+               label, dev_bytes, n_dev, pers_bytes, n_pers, gemma_bytes);
+  for (auto& [shape, e] : dev_hist)
+    std::fprintf(stderr, "[TT-SLOT-CENSUS]   dev %s: %zu B in %zu slots\n",
+                 shape.c_str(), e.first, e.second);
+  for (auto& [shape, e] : pers_hist)
+    std::fprintf(stderr, "[TT-SLOT-CENSUS]   pers %s: %zu B in %zu slots\n",
+                 shape.c_str(), e.first, e.second);
 }
 void ResetAllocTraceForTest() {
   std::lock_guard<std::mutex> g(AllocTraceSt().mtx);

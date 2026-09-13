@@ -52,6 +52,9 @@
 #include "vllm/v1/core/hybrid_kv_budget.h"
 #include "vllm/v1/core/kv_cache_utils.h"  // check_enough_kv_cache_memory (M4)
 #include "vllm/v1/kv_cache_interface.h"  // FIX-KV-GROUP-LAYER-COUNT resolver
+#if defined(VLLM_CPP_TENSTORRENT)
+#include "vt/tenstorrent/tenstorrent_device.h"  // W4d W0 (#3042) alloc trace
+#endif
 #include "vllm/v1/structured_output/backend_native.h"  // MakeNativeBackendFactory
 #include "vllm/v1/structured_output/jump_forward.h"     // JumpForwardEnabled (SW3)
 #include "vt/dtype.h"
@@ -63,6 +66,16 @@
 namespace vllm::entrypoints {
 
 namespace fs = std::filesystem;
+
+// W4d W0 (#3042) attribution: DRAM bank snapshots around the load stages.
+#if defined(VLLM_CPP_TENSTORRENT)
+static void TtAllocTraceStage(const char* stage) {
+  vt::tenstorrent::AllocTraceSnapshot(vt::tenstorrent::SharedMeshDevice(),
+                                      stage);
+}
+#else
+static inline void TtAllocTraceStage(const char*) {}
+#endif
 
 // `architecture` is the model's registered architecture string. It is what lets
 // a PARTIAL backend decline a model whose kernels it has not registered, instead
@@ -2381,6 +2394,15 @@ LoadedEngine::LoadedEngine(HfConfig config,
   // Before any step runs (WarmupKernels below is the first).
   runner_.set_async_scheduling(async_scheduling_enabled_);
   WarmupKernels();
+  // W4d W3: the ctor's cold pre-warm committed full-batch-shape activation
+  // slots that the captured decode never reads. Recipe-gated release —
+  // here, at the end of BOTH LoadedEngine ctors, because the GGUF dense
+  // load reaches the engine through more than one loader branch.
+  if (const char* wr = std::getenv("VT_TT_RELEASE_WARM_ROWS");
+      wr != nullptr && wr[0] != '\0') {
+    vt::tenstorrent::ReleaseWarmShapeSlots(
+        static_cast<uint32_t>(std::strtoul(wr, nullptr, 10)));
+  }
 }
 
 void LoadedEngine::WarmupKernels() {
@@ -3106,7 +3128,9 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     ModelSource gguf_source = ModelSource::FromGguf(gguf, gguf_device);
     gguf_source.multimodal = &params.multimodal;
     const auto t_gguf_weights = std::chrono::steady_clock::now();
+    TtAllocTraceStage("load/stage/pre-registry-load");
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, gguf_source);
+    TtAllocTraceStage("load/stage/post-registry-load");
     ReportLoadPhase("weights", SecondsSince(t_gguf_weights));
     ReportGgufLoadIo();
     // SPEC-MTP-GGUF: attach the head from the SAME file, mirroring the
@@ -3150,10 +3174,20 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       resolved.draft_model_path = params.speculative_config->draft_model_path;
       dflash = LoadDflashDraft(resolved, SharedHeadSource(&gguf));
     }
-    return std::unique_ptr<LoadedEngine>(new LoadedEngine(
+    TtAllocTraceStage("load/stage/pre-engine-ctor");
+    std::unique_ptr<LoadedEngine> engine(new LoadedEngine(
         std::move(config), std::move(model), std::move(tokenizer), params,
         /*preselected_queue=*/nullptr, std::move(dflash),
         std::move(vision_tower), vision_config, mmproj_tower_skipped));
+    TtAllocTraceStage("load/stage/post-engine-ctor");
+    // W4d W3: the ctor's cold pre-warm committed full-batch-shape activation
+    // slots that the captured decode never reads. Recipe-gated release.
+    if (const char* wr = std::getenv("VT_TT_RELEASE_WARM_ROWS");
+        wr != nullptr && wr[0] != '\0') {
+      vt::tenstorrent::ReleaseWarmShapeSlots(
+          static_cast<uint32_t>(std::strtoul(wr, nullptr, 10)));
+    }
+    return engine;
   }
 
   // SPEC-DSPARK-BLOCK-SIZE-GUARD (#1225): resolve the DSpark speculative config

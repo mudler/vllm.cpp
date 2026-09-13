@@ -65,3 +65,20 @@ keep/revert, goldens quarantine).
 - If decode-shaped capture changes ANY captured-region operand (the graph
   must re-warm), the re-warm cost is measured and recorded before
   proceeding — never silently absorbed.
+
+
+## AMENDMENT (2026-09-13, post-implementation): the premise was falsified
+
+The alloc-trace ledger (VT_TT_ALLOC_TRACE=1, /tmp/w5-run3.log:27946-27948)
+falsified this spec's root cause: the 606 MiB ask is NOT a [B, 248320]
+logits plane — it is the lm_head keep-quant WEIGHT-DEQUANT chunk
+[31040, 5120] f32 (N=248320 / 8 chunks; 31040x5120x4 == 640x248320x4, the
+byte counts coincided), emitted by DecodeKeepQuantWordsF32 inside the
+captured decode. The logits-gather half of this spec is nonetheless
+vLLM-correct and landed (LastTokenLogitsIndices, both driver Step
+fallbacks). The trace-region framing is superseded by
+[tenstorrent-27b-int8dot-capture.md](tenstorrent-27b-int8dot-capture.md)
+(W6): the int8-dot captured decode eliminated the chunk-chain transients
+entirely, and the 27B gate went GREEN knob-free (16/16 prompts, 0
+forward-divergent, max gap 0.062 nats — /tmp/w6-run2.log). The
+decode-shaped-capture idea remains recorded for the performance wave.

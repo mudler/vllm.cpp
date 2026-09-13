@@ -4397,6 +4397,25 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
     out.z = out.z_owner->t();
     return out;
   }
+  // W4d W4 (tenstorrent-27b-gdn-keepquant.md): block-encoded GDN
+  // projections — the packed row-reorder keeps attn_qkv (q6_K) and
+  // attn_gate (q4_K) verbatim through the V-head reorder — decode through
+  // their keep-quant words via the same MatmulBTRawD the merged arm uses,
+  // per tensor (the merged arm needs ONE encoding; this checkpoint mixes
+  // q6_K qkv with a q4_K gate). bf16 output: the same dtype the default
+  // bf16 in_proj arm emits, which the conv/post-conv consumers expect.
+  if (!w.in_proj_qkv.Empty() && vt::IsBlockQuant(w.in_proj_qkv.dtype)) {
+    VT_CHECK(!w.in_proj_z.Empty() && vt::IsBlockQuant(w.in_proj_z.dtype),
+             "qwen3_5 GDN: a block-encoded in_proj_qkv must pair with a "
+             "block-encoded in_proj_z");
+    out.mixed_owner.emplace(MatmulBTRawD(
+        d, h, ResidentWeight(d, w.in_proj_qkv), DType::kBF16));
+    out.z_owner.emplace(
+        MatmulBTRawD(d, h, ResidentWeight(d, w.in_proj_z), DType::kBF16));
+    out.mixed = out.mixed_owner->t();
+    out.z = out.z_owner->t();
+    return out;
+  }
   out.mixed_owner.emplace(
       !w.in_proj_qkv_fp8.Empty()
           ? (h_fp8 ? MatmulFp8CutlassPreQuantD(d, *h_fp8, w.in_proj_qkv_fp8,
@@ -8469,7 +8488,10 @@ static void EmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& token_ids
                       const Qwen3_5MoeWeights& weights, const HfConfig& config) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
-  const int64_t vocab = config.vocab_size;
+    if (std::getenv("VT_TT_ALLOC_TRACE") != nullptr)
+    std::fprintf(stderr, "[TT-FWD] EmbedInto T=%lld H=%lld\n",
+                 static_cast<long long>(T), static_cast<long long>(H));
+const int64_t vocab = config.vocab_size;
   Tensor dtab =
       Qwen3_5EmbeddingTable(d.b, d.q, weights.embed_tokens, vocab, H);
   // ENG-ASYNC-SCHED W4: when the async runner has already placed this step's
@@ -8744,6 +8766,12 @@ static DBuf ForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                         const Tensor* aux_out = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
+  if (std::getenv("VT_TT_ALLOC_TRACE") != nullptr)
+    std::fprintf(stderr, "[TT-FWD] ForwardBody T=%lld H=%lld num_reqs=%lld "
+                 "logits_indices=%zu\n",
+                 static_cast<long long>(T), static_cast<long long>(H),
+                 static_cast<long long>(attn_meta.num_reqs),
+                 logits_indices.size());
   DBuf hidden(d, ActDType(d), {T, H});
   EmbedInto(d, hidden, token_ids, weights, config);
   return ForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
@@ -8963,7 +8991,14 @@ void Qwen3_5DenseModel::PrepareBf16Resident(
            "PrepareBf16Resident: a weight-staging (device-resident) queue required");
   Dev d{vt::GetBackend(queue.device.type), queue};
   const auto raw = [&d](const OwnedTensor& tensor) {
-    if (!tensor.Empty()) (void)ResidentWeight(d, tensor);
+    if (!tensor.Empty()) {
+      Tensor t = ResidentWeight(d, tensor);
+      // W4d W6: stage the keep-quant word shadow HERE, at load, while the
+      // banks are unfragmented — a lazy first-matmul stage at 27B asked the
+      // head's 1 GiB words against a 100 MB largest free block and died.
+      // No-op for non-block dtypes; the warm's later call hits the cache.
+      vt::tenstorrent::StageKeepQuantWordsFor(t);
+    }
   };
   const auto f32 = [&d](const OwnedTensor& tensor) {
     if (!tensor.Empty()) {
@@ -9550,6 +9585,9 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
                                StepDevInputs* persistent_sdi = nullptr) {
   const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
+  if (std::getenv("VT_TT_ALLOC_TRACE") != nullptr)
+    std::fprintf(stderr, "[TT-FWD] DenseForwardLayers T=%lld n_idx=%zu\n",
+                 static_cast<long long>(T), logits_indices.size());
   const float eps = static_cast<float>(config.rms_norm_eps);
 
   // Working copy of the embedded hidden (device->device; captured). RunDenseLayer
@@ -9651,6 +9689,8 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
                     static_cast<long long>(l));
       vt::tenstorrent::AllocTraceSnapshot(vt::tenstorrent::SharedMeshDevice(),
                                           tt_lbl);
+      if (std::getenv("VT_TT_ALLOC_TRACE") != nullptr)  // W4d: census spam only on trace
+        vt::tenstorrent::DumpSlotCensus(tt_lbl);
     }
 #endif
     // DFlash DF-AUX-TAPS: capture (hidden+res) at configured boundaries. Inert
@@ -9711,6 +9751,27 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
   return DenseLogitsF32D(d, dnorm.t(), weights);
 }
 
+// W4d (tenstorrent-27b-decode-shape-capture.md): per-sequence LAST-TOKEN
+// logits indices for a mixed prefill step, the vLLM logits_processor
+// semantics — generation samples only the last scheduled token per sequence
+// (prepare_inputs.cpp:210-221: `logits_indices[i] = query_start_loc[i+1]-1`).
+// Empty (identity, full [T,vocab] head) when the metadata cannot express the
+// gather or it would be a no-op: a pure-decode step has size == T, and the
+// graph-replay/capture contract passes {} by design. The driver's eager
+// fallback feeds these to the forward so the gather-before-lm_head fires and
+// the head allocates [num_seqs, vocab], never [T, vocab].
+static std::vector<int32_t> LastTokenLogitsIndices(
+    const v1::CommonAttentionMetadata& am, int64_t T) {
+  const int64_t n =
+      static_cast<int64_t>(am.query_start_loc.size()) - 1;
+  if (n <= 0 || n >= T) return {};
+  std::vector<int32_t> indices(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; ++i) {
+    indices[static_cast<size_t>(i)] = am.query_start_loc[static_cast<size_t>(i) + 1] - 1;
+  }
+  return indices;
+}
+
 // Full eager dense paged forward body: embed (host token_ids) then the capturable
 // dense layer region. Used by Qwen3_5DenseModel::Forward/ForwardDevice and the
 // dense-graph driver's eager fallback / cold-shape pre-warm step (one contiguous
@@ -9732,6 +9793,12 @@ static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                          gdn_state, weights, config);
   const int64_t T = static_cast<int64_t>(token_ids.size());
   const int64_t H = config.hidden_size;
+  if (std::getenv("VT_TT_ALLOC_TRACE") != nullptr)
+    std::fprintf(stderr, "[TT-FWD] DenseForwardBody T=%lld H=%lld num_reqs=%lld "
+                 "logits_indices=%zu\n",
+                 static_cast<long long>(T), static_cast<long long>(H),
+                 static_cast<long long>(attn_meta.num_reqs),
+                 logits_indices.size());
   DBuf hidden(d, ActDType(d), {T, H});
   DenseEmbedInto(d, hidden, token_ids, weights, config);
   return DenseForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
@@ -11088,8 +11155,14 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
           token_ids, positions, attn_meta, gdn_meta, attn_kv, gdn_state,
           impl_->weights, impl_->config, impl_->queue, aux_out, {});
     }
+    // W4d (tenstorrent-27b-decode-shape-capture.md): a MIXED step the graph
+    // declines (it captures only the decode shape, Q == 1) runs eagerly here --
+    // pass the per-sequence last-token indices so the head gathers
+    // [num_reqs, vocab] instead of asking for the [T, vocab] plane the 27B
+    // banks cannot hold.
     DBuf lg = ForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
-                          gdn_state, impl_->weights, impl_->config);
+                          gdn_state, impl_->weights, impl_->config,
+                          LastTokenLogitsIndices(attn_meta, B));
     // ForwardBody returns [B,vocab] (owned pool block; hand ownership out).
     return WrapDeviceLogits(d, std::move(lg), vocab);
   }
@@ -11684,6 +11757,10 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   // paths return a NON-owning view over the slot's persistent [S,vocab] logits
   // (first B rows are the real requests). Stream ordering guarantees the sampler
   // sees the replay's writes; the next same-size replay overwrites the buffer.
+    if (std::getenv("VT_TT_ALLOC_TRACE") != nullptr)
+      std::fprintf(stderr, "[TT-FWD] DenseGraph::Step B=%lld num_reqs=%lld\n",
+                   static_cast<long long>(token_ids.size()),
+                   static_cast<long long>(attn_meta.num_reqs));
   // SPEC-DSPARK W8 (#442): a uniform SPEC batch carries B = num_reqs * (1+k)
   // tokens, which exceeds max_num_reqs and would make PadToCaptureSize return -1
   // (eager). Capture its EXACT shape instead of padding: upstream pads only in
@@ -11721,8 +11798,9 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
           token_ids, positions, attn_meta, gdn_meta, attn_kv, gdn_state,
           impl_->weights, impl_->config, impl_->queue, aux_out, {});
     }
-    DBuf lg = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta, attn_kv,
-                               gdn_state, impl_->weights, impl_->config, {});
+    DBuf lg = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta,
+                               attn_kv, gdn_state, impl_->weights, impl_->config,
+                               LastTokenLogitsIndices(attn_meta, B));
     return WrapDeviceLogits(d, std::move(lg), vocab);
   }
 

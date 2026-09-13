@@ -43,6 +43,11 @@ constexpr int64_t kQLora = 32, kOLora = 32, kOGroups = 2;
 constexpr int64_t kExperts = 4, kUsed = 2, kInter = 32;
 constexpr int64_t kHc = 2, kSinkhorn = 3;
 constexpr int64_t kLayers = 3, kHashLayers = 1;
+// The Lightning-Indexer geometry, read only when a layer declares
+// `compress_ratio == 4` (`attention.py:274`). `kIndexHeadDim` must stay a
+// multiple of 32 because every indexer projection below is stored Q8_0, whose
+// block is 32 elements wide.
+constexpr int64_t kIndexHeads = 2, kIndexHeadDim = 32, kIndexTopK = 3;
 
 inline int64_t Prod(const std::vector<int64_t>& s) {
   int64_t n = 1;
@@ -166,7 +171,27 @@ inline std::string BuildDeepseek4Gguf(bool vision, BiasWidths bw = BiasWidths{},
                                // capability-level assertion cannot see it. With
                                // every layer hashed, dropping `!media` means the
                                // vision bias is never read at all.
-                               int64_t hash_layers = kHashLayers) {
+                               int64_t hash_layers = kHashLayers,
+                               // `deepseek4.attention.compress_ratios`, ONE
+                               // entry per layer. Empty (the default) writes the
+                               // all-zero array every suite before this argument
+                               // built, which keeps them byte-identical: a zero
+                               // clamps to ratio 1, no layer carries a
+                               // compressor or an indexer, and
+                               // `MakeDeepseekV4KVCache` publishes the SWA cache
+                               // as the ONLY group.
+                               //
+                               // A case that passes real ratios gets the
+                               // topology a REAL Flash checkpoint has: upstream
+                               // accepts 1, 4 and 128 only
+                               // (`sparse_swa.py:44-55`), a ratio-4 layer adds
+                               // the compressed latent, the indexer key cache
+                               // and two compressor states, and a ratio-128
+                               // layer adds the latent and one compressor state.
+                               // That is what makes the published groups
+                               // disagree about their block size, which is the
+                               // whole point of asking for them.
+                               const std::vector<int32_t>& compress_ratios = {}) {
   GgufModelBuilder b;
   b.AddKv(StrKv("general.architecture", "deepseek4"));
   const std::string p = "deepseek4.";
@@ -195,8 +220,26 @@ inline std::string BuildDeepseek4Gguf(bool vision, BiasWidths bw = BiasWidths{},
   b.AddKv(U32Kv(p + "hyper_connection.count", kHc));
   b.AddKv(U32Kv(p + "hyper_connection.sinkhorn_iterations", kSinkhorn));
   b.AddKv(F32Kv(p + "hyper_connection.epsilon", 1e-6f));
-  b.AddKv(I32ArrayKv(p + "attention.compress_ratios",
-                     std::vector<int32_t>(static_cast<size_t>(kLayers), 0)));
+  const std::vector<int32_t> ratios =
+      compress_ratios.empty()
+          ? std::vector<int32_t>(static_cast<size_t>(kLayers), 0)
+          : compress_ratios;
+  if (static_cast<int64_t>(ratios.size()) != kLayers) {
+    throw std::runtime_error(
+        "deepseek-v4 fixture: compress_ratios must carry exactly one entry per "
+        "layer, because the topology helpers index it over [0, block_count)");
+  }
+  b.AddKv(I32ArrayKv(p + "attention.compress_ratios", ratios));
+  // The indexer keys are written only when some layer actually has an indexer.
+  // `MakeDeepseekV4KVCache` sizes the indexer key cache from
+  // `index_head_dim`, so publishing the group without these would page it at
+  // width ZERO; and a file with no ratio-4 layer must stay byte-identical to
+  // what every earlier suite built, which means writing no key at all.
+  if (std::find(ratios.begin(), ratios.end(), 4) != ratios.end()) {
+    b.AddKv(U32Kv(p + "attention.indexer.head_count", kIndexHeads));
+    b.AddKv(U32Kv(p + "attention.indexer.key_length", kIndexHeadDim));
+    b.AddKv(U32Kv(p + "attention.indexer.top_k", kIndexTopK));
+  }
   // `LoadedEngine::FromModelDir` opens the tokenizer between the projector
   // block and `ModelRegistry::Load`, so a fixture without these keys stops
   // there. A caller that needs the loader to get PAST the tokenizer asks for
@@ -295,6 +338,29 @@ inline std::string BuildDeepseek4Gguf(bool vision, BiasWidths bw = BiasWidths{},
     } else {
       b.AddTensor(Blk(l, "exp_probs_b.bias"), GgmlDims({bw.text}), /*F32=*/0,
                   F32Data(bw.text, [l](int64_t i) { return TextBiasFill(l, i); }));
+    }
+    // The DSA population: a compressor on every `compress_ratio != 0` layer and
+    // a Lightning-Indexer on the `== 4` ones, under the GGUF names the loader
+    // reads (`deepseek_v4_weights.cpp`, the `has_compressor` / `has_indexer`
+    // arms). The compressor projects to `coff * head_dim` with
+    // `coff = 1 + (compress_ratio == 4)` (`compressor.py:247-248`), while its
+    // norm is over `head_dim` alone.
+    const int64_t cr = ratios[static_cast<size_t>(l)];
+    if (cr != 0) {
+      const int64_t coff = cr == 4 ? 2 : 1;
+      const int64_t cw = coff * head_dim;
+      f32(Blk(l, "attn_compressor_ape.weight"), {cr, cw});
+      q8(Blk(l, "attn_compressor_gate.weight"), {cw, kH});
+      q8(Blk(l, "attn_compressor_kv.weight"), {cw, kH});
+      f32(Blk(l, "attn_compressor_norm.weight"), {head_dim});
+    }
+    if (cr == 4) {
+      q8(Blk(l, "indexer.attn_q_b.weight"), {kIndexHeads * kIndexHeadDim, kH});
+      f32(Blk(l, "indexer.proj.weight"), {kIndexHeads, kH});
+      f32(Blk(l, "indexer_compressor_ape.weight"), {cr, kIndexHeadDim});
+      q8(Blk(l, "indexer_compressor_gate.weight"), {kIndexHeadDim, kH});
+      q8(Blk(l, "indexer_compressor_kv.weight"), {kIndexHeadDim, kH});
+      f32(Blk(l, "indexer_compressor_norm.weight"), {kIndexHeadDim});
     }
     if (vision && l >= vision_from) {
       b.AddTensor(Blk(l, "exp_probs_b_vl.bias"), GgmlDims({bw.vision}), /*F32=*/0,

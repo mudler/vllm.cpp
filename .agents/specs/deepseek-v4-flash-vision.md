@@ -684,28 +684,65 @@ manifest is a semantic checker change and is owed below, with the measurement
 above as its red-before input.
 
 ## Owed
-- **A MULTI-GROUP DeepSeek-V4 STILL CANNOT PREFIX-CACHE, AND THE REFUSAL IS AN
-  ABORT RATHER THAN A MESSAGE.** The engine now derives the scheduler's block
-  size from the built groups and hashes at the resolved granularity, mirroring
-  `vllm/v1/engine/core.py:335-338` and `:158-170` @ `e126687a9a`, which is what
-  lets `vllm serve` reach a DeepSeek-V4 checkpoint at all. That fix is complete
-  for the ONE-group shape, which is what the GGUF fixture publishes: its
-  `compress_ratios` are all zero, so only the SWA group (block size 64) exists.
-  A REAL Flash checkpoint sets those ratios and publishes up to seven groups at
-  block sizes 256, 64, 4 and 8 (`MakeDeepseekV4KVCache`). No single hash
-  granularity divides that set into equal group block sizes, so
-  `HybridKVCacheCoordinator` hits its `block_size == hash_block_size` assertion
-  — the DEFERRED `BlockHashListWithBlockSize` path named in
-  `include/vllm/v1/core/kv_cache_coordinator.h:64-66` and guarded again in
-  `block_pool.cpp:90-96`. THIS IS NOT A REGRESSION: before the block-size
-  derivation landed the same configuration aborted in the same place, with 256
-  against 64 instead of the GCD. What is owed is the port of
-  `_get_block_hashes` / `BlockHashListWithBlockSize`
-  (`vllm/v1/core/kv_cache_utils.py:2226-2330` @ the pin) so a group whose block
-  size is a multiple of the hash size reads its hashes through a converting
-  view. Until that lands, the coordinator must REFUSE by name instead of
-  asserting, because an assert in a server is an abort and a message is a
-  message.
+- **A MULTI-GROUP DeepSeek-V4 STILL CANNOT PREFIX-CACHE, AND THE COORDINATOR
+  ASSERT THAT WOULD STOP IT IS LATENT BEHIND THE fp8_ds_mla REFUSAL.** This
+  entry previously said a real Flash checkpoint ABORTS in
+  `HybridKVCacheCoordinator`. **That was a prediction and it is false**, measured
+  2026-09-13 through `LoadedEngine::FromModelDir` on a fixture carrying real
+  `compress_ratios` (`tests/vllm/entrypoints/test_deepseek_v4_multigroup_kv.cpp`).
+  What is recorded here now is what that probe measured.
+
+  **The topology is real.** With ratios set, `MakeDeepseekV4KVCache` publishes
+  seven groups at block sizes `{256, 256, 256, 64, 4, 4, 8}`, and
+  `resolve_kv_cache_block_sizes` resolves `scheduler_block_size = 256` (the LCM)
+  and `hash_block_size = 4` (the GCD). The engine derives that pair since
+  `c9129fb7b`.
+
+  **The engine never reaches the coordinator.** `ApplyCacheDType` runs while
+  `kv_cfg_` is being initialized, which precedes `scheduler_block_size_` and
+  `scheduler_` in the `LoadedEngine` constructor's initializer list, and
+  `RetypeAttentionSpec` refuses any `MLAAttentionSpec` BY NAME at
+  `src/vllm/v1/kv_cache_interface.cpp:398` — the fp8_ds_mla page formula landed
+  with no store and no read ([#2455](https://github.com/mudler/vllm.cpp/issues/2455),
+  owed to KV-DSV4-MULTICACHE W8). The compressed-latent groups are exactly the
+  groups a non-zero `compress_ratio` adds, so the ratios that create the
+  multi-group topology are also what trips that guard. The all-zero fixture in
+  `test_serve_deepseek_v4_mm` never meets it because `SlidingWindowMLASpec`
+  derives from `SlidingWindowSpec`, not from `MLAAttentionSpec`. **A named
+  refusal is a message, not an abort**, so the serve-time outcome today is
+  already the acceptable one.
+
+  **The assert is unreachable, not merely untriggered.** DeepSeek-V4 is the only
+  architecture in this tree publishing groups with DIFFERING block sizes; every
+  other multi-group registry (`glm5_next`, `kimi_linear`, `nemotron_h`,
+  `qwen4_exp`, `qwen3_5_common`) hands the same `block_size` variable to every
+  group. So nothing production can reach
+  `kv_cache_coordinator.cpp:386` or `block_pool.cpp:93,220` today.
+
+  **WHAT IS OWED, AND FOR WHOM.** #2455 / W8 is what makes this path reachable;
+  the hash-granularity port is owed BEHIND it and is deliberately NOT landed
+  unreached, because a converting view no entry point can reach is dead code with
+  paperwork attached. The upstream shape is recorded here so W8 does not have to
+  rediscover it, all @ `e126687a9a`:
+  - `vllm/v1/core/kv_cache_utils.py:678-770` — `resolve_kv_cache_block_sizes`:
+    scheduler = LCM of group block sizes, hash = GCD. **Already ported and
+    wired** (`kv_cache_utils.cpp:640`, called from
+    `LoadedEngine::ResolveSchedulerBlockSizes`), so only the view below is
+    missing.
+  - `kv_cache_utils.py:2358-2464` — `BlockHashListWithBlockSize` and
+    `resolve_block_hashes`. A coarse block's hash IS the last fine hash inside
+    it, because each hash already chains over its whole prefix; the conversion is
+    `block_hashes[(idx + 1) * scale_factor - 1]`. NOT PORTED.
+  - `kv_cache_coordinator.py:608-613` — upstream asserts **divisibility only**
+    (`block_size % hash_block_size == 0`). Our extra equality at
+    `kv_cache_coordinator.cpp:386` is a LOCAL deferral marker, not upstream's.
+  - Call sites to mirror: `single_type_kv_cache_manager.py:714-730`
+    (FullAttention, which serves MLA groups here), `:931-934` (SlidingWindow,
+    which serves the SWA and compressor-state groups), and `block_pool.py:263-267`
+    and `:395-396`, where our two `std::runtime_error` throws sit.
+  - The fine-grained PARTIAL-hit path stays out of scope: it is gated on
+    `enable_partial_hash_hits`, which upstream sets only for a partial Mamba
+    `align` group, and DeepSeek-V4 publishes none.
 - **THE W7-CUDA NUMBERS WERE PRODUCED BY A DRIVER THAT COULD NOT DETECT A FAILED
   STEP, AND THEY HAVE NOT BEEN RE-RUN SINCE IT WAS REPAIRED.** The 2.884% cells
   mean relative L2, the 0.99939 cells mean cosine and the 1.872% vit mean

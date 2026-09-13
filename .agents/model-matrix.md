@@ -564,7 +564,25 @@ Transformers compatibility is capability-driven and excluded from finite counts.
 
 Rows here are audio TOWERS that vLLM ships as a component of some registry
 architecture rather than as one themselves, so they have no `registry.py` entry
-of their own and are NOT part of the 366 architecture rows counted above.
+of their own and are NOT part of the architecture rows counted above. **This
+sentence stored `366` until 2026-09-12 and the count had moved twice under it.**
+The architecture-row count and the composition of the gap between it and the
+rollup are stated once in this file, in §"Architecture-support checklist" above
+— `377` architecture rows against `381` rollup rows, the difference being the
+four rows that are not architectures at all and say so in their own sections,
+namely `MODEL-FACTORY-registry`, these two `MODEL-AUDIO` rows, and the one
+`MODEL-HFDYNAMIC` row. **The numbers repeated in the next sentence are a dated
+derivation and not a second store**: re-derived on 2026-09-12,
+[`scripts/check-agent-record.py`](../scripts/check-agent-record.py)'s parser
+over this file prints `MODEL=381` (full line:
+`agent record OK: ENGINE=179 MODEL=381 QUANT=87 KERNEL=60 BACKEND=90
+ANCHOR-ROT=33`), so the architecture rows are 381 − 4 = 377 — which agrees with
+§"Architecture-support checklist" and is how to check that it has not drifted.
+Expect the pair to move the next time a row is added; re-run the parser rather
+than trusting either copy.
+[`scripts/check-model-checklist.py`](../scripts/check-model-checklist.py) is a
+different gate and prints no count: it holds the checklist marks against each
+row's `State` cell.
 
 | ID | Item / architecture aliases | Upstream | Task / modality | Dependencies | Spike/spec | State | Our code + tests/evidence | Owner |
 |---|---|---|---|---|---|---|---|---|

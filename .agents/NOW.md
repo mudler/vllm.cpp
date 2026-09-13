@@ -31,8 +31,14 @@ captured at the target is byte-identical to the committed bar --
 FLASH_ATTN backend produced the tokens, so the FA-on-GB10 risk did not fire. Our
 arm's 96/96 carries over unchanged because the candidate's bytes are identical to
 the bar it already passed. The BENCHMARK baselines are still measured at
-`555967922` and still owe step 6 (#2818), and the other strict goldens are still
-owed at the target (#2794).
+`555967922` and still owe step 6 (#2818, `OPEN` at a 2026-09-12 read), **and the
+other four strict goldens -- 27B W4A4, 32B-NVFP4A16, 35B, Coder -- are still
+owed at the target.** The gate that passed is the OPT-125m one; it discharges
+nothing about those four. They were anchored on #2794, which closed `COMPLETED`
+on 2026-09-06, so the anchor is gone and not the obligation: it lives under
+`## Owed` in [the tokengate spec](specs/upstream-sync-headpin-tokengate.md#L569),
+unanchored by design, and whoever takes it files the issue then. Also at
+[oracles/vllm.md](oracles/vllm.md#L93).
 
 
 ## Next actions

@@ -191,7 +191,7 @@ DecoderLayerResult DecoderLayerForward(
       const std::vector<float> out = glm5_next_kda::Glm5NextKdaLayerForward(
           w.kda, row, kd, seq_len,
           cache != nullptr ? &cache->kda[static_cast<size_t>(b)] : nullptr,
-          queue);
+          queue, dev);
       RequireSize("KDA layer output", out.size(), seq_len * H);
       std::copy_n(out.data(), static_cast<size_t>(seq_len * H),
                   attn_out.data() + b * seq_len * H);

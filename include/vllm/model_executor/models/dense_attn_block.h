@@ -296,6 +296,19 @@ inline DBuf Exl3MatmulD(Dev d, const vt::Tensor& x, const Exl3Weight& w,
   }
   DBuf a_had(d, vt::DType::kF16, {M, K});
 
+  // exl3.py:10,135. Upstream dispatches to `reconstruct_hgemm` (dequantize +
+  // cuBLAS fp16 GEMM) when M > AUTO_RECONSTRUCT_THRESHOLD (144), and to the
+  // fused cooperative kernel (`exl3_gemm`) otherwise. The cooperative kernel
+  // is faster for small M because it avoids materializing the full weight;
+  // cuBLAS wins for large M because the persistent kernel's occupancy drops.
+  constexpr int64_t kReconstructThreshold = 144;
+  const bool use_reconstruct = M > kReconstructThreshold;
+  const int64_t w_cols = N <= 32768 ? N : 32768;
+  DBuf w_scratch;
+  if (use_reconstruct) {
+    w_scratch = DBuf(d, vt::DType::kF16, {K, w_cols});
+  }
+
   vt::Tensor trellis = ResidentWeight(d, w.trellis);
   vt::Tensor suh = ResidentWeight(d, w.suh);
   vt::Tensor svh = ResidentWeight(d, w.svh);
@@ -304,13 +317,22 @@ inline DBuf Exl3MatmulD(Dev d, const vt::Tensor& x, const Exl3Weight& w,
   args.bits = w.Bits();
   args.codebook = w.codebook;
 
+  auto run_gemm = [&](vt::Tensor& out) {
+    if (use_reconstruct) {
+      vt::Exl3ReconstructGemm(d.q, out, a, trellis, suh, svh, a_had.t(),
+                               w_scratch.t(), args);
+    } else {
+      vt::Exl3Gemm(d.q, out, a, trellis, suh, svh, a_had.t(), args);
+    }
+  };
+
   if (out_dtype == vt::DType::kF16) {
     DBuf c(d, vt::DType::kF16, {M, N});
-    vt::Exl3Gemm(d.q, c.t(), a, trellis, suh, svh, a_had.t(), args);
+    run_gemm(c.t());
     return c;
   }
   DBuf c32(d, vt::DType::kF32, {M, N});
-  vt::Exl3Gemm(d.q, c32.t(), a, trellis, suh, svh, a_had.t(), args);
+  run_gemm(c32.t());
   if (out_dtype == vt::DType::kF32) return c32;
   DBuf cbf(d, vt::DType::kBF16, {M, N});
   vt::CastBf16(d.q, cbf.t(), c32.t());

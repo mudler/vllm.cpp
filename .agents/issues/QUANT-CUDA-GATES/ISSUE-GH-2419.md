@@ -1,14 +1,14 @@
 ID: ISSUE-GH-2419
 Title: IQ4_NL / Q5_0 / Q4_0 have no CUDA keep-quant GEMM, so the shipped qwen4_exp experts drain to the host or throw
 Row: QUANT-CUDA-GATES
-State: OPEN
+State: CLOSED
 Kind: UNKNOWN
 GitHub: 2419
-Mirror: DIVERGED
+Mirror: SYNCED
 Availability: FULL
 Created: 2026-08-31
-Updated: 2026-08-31
-Closed: -
+Updated: 2026-09-12
+Closed: 2026-09-12
 
 ## Problem
 
@@ -67,4 +67,8 @@ The quoted text below is historical evidence only. It does not define issue auth
 
 ## Resolution
 
--
+FALSIFIED BY THE TREE, 2026-09-12. `593b888b5` ("feat(QUANT-CUDA-KEEPQUANT-32B): give IQ4_NL, Q5_0 and Q4_0 a device GEMM instead of a host drain") added `IsCuda32BlockKeepQuantSupported` (`src/vt/cuda/cuda_quant_dot.cu`), which admits exactly the three encodings this issue names, and both the dense `MatmulBTQuantKernelCuda` and the grouped `MatmulBTQuantGroupedKernelCuda` take that lane before reaching the `IsCudaKeepQuantSupported` test whose `default:` arm drains to the host. The comment on the 32-block predicate names this issue's own artifact: "the two encodings the released unsloth/Qwen3.8-Flash-Next-GGUF UD-IQ1_S stores its routed-expert towers in".
+
+So the shipped qwen4_exp experts no longer drain to the host and no longer throw, and the title's condition no longer holds. Found while reading the same dispatch for the qwen4_exp decode profile; closed here with that evidence rather than re-specced, per AGENTS.md "An issue the tree falsifies closes with that evidence".
+
+What this does NOT close: the grouped GEMM runs on device, but the MoE block AROUND it still round-trips the intermediates through host memory on the k-quant arm, which is a different defect and is filed separately as `.agents/issues/QUANT-CUDA-GATES/ISSUE-LOCAL-01M2AAACGC0SXYXFN2JQ3GFEAZ.md`. The CPU fallback at `cuda_quant_dot.cu:2551-2556` also still exists for MXFP4, which no shipped artifact on this row uses.

@@ -227,12 +227,35 @@ were removed while their specs and same-tool traces remain. Lifecycle stays
 
 ## Count invariants
 
-- This table has exactly 38 practical kernel-family rows.
-- Baseline lifecycle counts are 8 `ANCHOR-BACKFILL`, 0 `READY`, 4 `PARTIAL`,
-  12 `ACTIVE`, 0 `GATING`, 1 `DONE`, and 13 `INVENTORIED`.
+- **These two bullets used to STORE a measurement of this file, and both had
+  drifted.** They read "This table has exactly 38 practical kernel-family rows"
+  and "Baseline lifecycle counts are 8 `ANCHOR-BACKFILL`, 0 `READY`, 4
+  `PARTIAL`, 12 `ACTIVE`, 0 `GATING`, 1 `DONE`, and 13 `INVENTORIED`" — a
+  baseline whose seven numbers sum to the same stale 38. Derived over this file
+  on 2026-09-12 the table carries **60 `KERNEL-*` rows** (plus 7 rows whose ID
+  prefix is not `KERNEL-` — 4 `MODEL-*`, 2 `GDN-*`, 1 `FIX-*` — for 67 leading
+  IDs in total; only the 60 are what `check-agent-record.py` reports), and the
+  `KERNEL-*` lifecycle spread is 14 `ACTIVE`, 12 `INVENTORIED`, 11
+  `ANCHOR-BACKFILL`, 10 `SPIKE`, 5 `PARTIAL`, 4 `DONE`, 3 `READY`, 1 `GATING`.
+  **Every number in this bullet is a DATED DERIVATION, recorded as the evidence
+  that the two retired bullets had drifted. None of them is an invariant, none
+  is stored as one, and no checker enforces any of them** — which is the
+  difference from what stood here, because `AGENTS.md` §Records admits only one
+  file per row or a value derived at read time, and a stored count of one file
+  inside that same file is what drifted twice. Expect these numbers to go stale
+  the next time a row is added; that is the point. The live cardinality comes
+  from [`scripts/check-agent-record.py`](../scripts/check-agent-record.py),
+  which printed `KERNEL=60` on 2026-09-12 — read it there rather than here. The
+  lifecycle spread is derived the same way, by grouping the `State` cell of
+  every `` `KERNEL-*` `` row of this table (one of the 60, `KERNEL-QUANT-CIQ-GEMM-ROCM`,
+  carries an escaped `` \| `` in an earlier cell, so a naive column split
+  misplaces its `ACTIVE`).
 - `KERNEL-DFLASH2-GROUPED-CONV` was added on 2026-08-19 (SPEC-DFLASH2 W2,
-  [#1314](https://github.com/mudler/vllm.cpp/issues/1314)) and is the tenth
-  `ACTIVE` row. It is a separate family from `KERNEL-DEPTHWISE-CONV1D` rather
+  [#1314](https://github.com/mudler/vllm.cpp/issues/1314)) and was the tenth
+  `ACTIVE` row IN ADDITION ORDER AT THAT DATE. That ordinal is history and not a
+  position in the table today: it counts against the 12-`ACTIVE` baseline the
+  first bullet retires, and the derivation there reads 14 `ACTIVE` on
+  2026-09-12. It is a separate family from `KERNEL-DEPTHWISE-CONV1D` rather
   than a variant of it: that kernel's weights are static per channel and its mask
   is causal over the SEQUENCE, while this one's are projected per position from
   the sublayer input, grouped, and masked over the QUERY BLOCK. It was recorded
@@ -246,8 +269,9 @@ were removed while their specs and same-tool traces remain. Lifecycle stays
   [#1469](https://github.com/mudler/vllm.cpp/issues/1469)'s open question.
 - `KERNEL-DFLASH2-SELECTOR-EDGES` and `KERNEL-TOPK-PAIRS` were added on
   2026-08-20 (SPEC-DFLASH2 W3,
-  [#1314](https://github.com/mudler/vllm.cpp/issues/1314)) and are the eleventh
-  and twelfth `ACTIVE` rows. They are TWO rows and not one because they are two
+  [#1314](https://github.com/mudler/vllm.cpp/issues/1314)) and were the eleventh
+  and twelfth `ACTIVE` rows IN ADDITION ORDER AT THAT DATE, against the same
+  retired 12-`ACTIVE` baseline. They are TWO rows and not one because they are two
   kernels with different shapes and different gates: one is a small dense
   contraction over two codebooks whose difficulty is the predecessor indexing and
   the bf16 rounding placement, the other is a sort-free selection over a 248320

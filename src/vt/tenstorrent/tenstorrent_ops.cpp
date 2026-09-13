@@ -8723,6 +8723,18 @@ int64_t FreeDeviceDramBytesForTest() {
   return static_cast<int64_t>(view.num_banks) *
          static_cast<int64_t>(view.total_bytes_free_per_bank);
 }
+
+// Total DRAM across banks — the number the placement fit needs as the
+// platform's probed total (ISSUE-LOCAL-01M2ACXRJYFW7R7BP2ABQS3VY2: without
+// it the budget is UNKNOWN and the MoE fit refuses, landing the model on
+// CPU). Same view the free-bytes helper reads; capacity, not free.
+int64_t DeviceDramTotalBytes() {
+  MeshDevice& device = SharedMeshDevice();
+  const auto view = tt::tt_metal::detail::GetMemoryView(
+      &device, tt::tt_metal::BufferType::DRAM);
+  return static_cast<int64_t>(view.num_banks) *
+         static_cast<int64_t>(view.total_bytes_per_bank);
+}
 void ResetAllocTraceForTest() {
   std::lock_guard<std::mutex> g(AllocTraceSt().mtx);
   AllocTraceSt().snapshot_count = 0;

@@ -951,7 +951,7 @@ int64_t host_available_memory_bytes() {
   //
   // Returns 0 when unreadable; callers treat 0 as "unknown" and do not refuse,
   // because an unknown budget must not become a false refusal.
-  std::FILE* f = std::fopen("/proc/meminfo", "re");
+  std::FILE* f = std::fopen("/proc/meminfo", "r");
   if (f == nullptr) return 0;
   char line[256];
   int64_t kb = 0;

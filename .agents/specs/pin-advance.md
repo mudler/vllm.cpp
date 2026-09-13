@@ -489,13 +489,32 @@ token-exact and its header says "no near-tie band is used here at all", and the 
 `kNearTieMnats`. `git log --follow` over `tests/parity/goldens/opt_greedy/greedy_ids.npy`
 returns one commit, `b8358a5b9`, an ancestor of the `bc415a3e4` pin flip, so nothing has
 touched the golden since it was captured against vLLM 0.25.0 / `e24d1b24`. The premise is false
-for this member, so the discharge does not reach it; the re-capture is owed and is tracked by
+for this member, so the discharge does not reach it; the re-capture was owed and was tracked by
 [#2794](https://github.com/mudler/vllm.cpp/issues/2794) together with the same capture at
 `e126687a9a`. The other members of that row are not re-examined here, and this correction makes
 no claim about them. Nothing else in W3b is affected: 27B W4A4, 32B-NVFP4A16, 35B and Coder
 were each really re-captured or re-measured at `55596792`, so the pin does have declared
 token-exact gates. What is false is the wider claim that every strict golden crossed the
 advance.
+
+**UPDATE 2026-09-12: #2794 is closed, and it discharged HALF of what this
+paragraph owes.** `gh issue view 2794 --repo mudler/vllm.cpp --json
+state,closedAt,stateReason` reads `CLOSED`, `COMPLETED`, `2026-09-06T07:00:58Z`.
+DISCHARGED: the OPT-125m re-capture at `e126687a9a`, by job
+`7386f034-246a-4af5-9a04-f98aafffce54` on `dgx:gpu0` on 2026-09-04 --
+`IDS mismatched_positions 0 of 96`, `TOKENGATE_VERDICT PASS`, the candidate
+byte-identical to the committed bar, so `tests/parity/goldens/opt_greedy` now
+holds across vLLM 0.25.0 / `e24d1b24`, `5559679229` and `e126687a9a`
+([`../../docs/bench-evidence/opt125m-token-gate-e126687-dgx-20260904.md`](../../docs/bench-evidence/opt125m-token-gate-e126687-dgx-20260904.md),
+[`../sync/2026-09-05-e126687-pingate.md`](../sync/2026-09-05-e126687-pingate.md)).
+SURVIVING: the other four strict goldens -- 27B W4A4, 32B-NVFP4A16, 35B, Coder
+-- at `e126687a9a`. This paragraph asserts they crossed the advance to
+`55596792` and that remains true; none has been re-captured at the ACTIVE pin.
+That survivor is NOT re-anchored on an issue, because #2794 is closed and an
+obligation citing a closed issue stops being read. It lives under `## Owed` in
+[upstream-sync-headpin-tokengate.md](upstream-sync-headpin-tokengate.md#L569),
+which is the surface that carries it, and whoever takes it files the issue then;
+[`../oracles/vllm.md`](../oracles/vllm.md#L93) states the same split.
 
 **No committed golden drifts under apples-to-apples capture.** The W0-W2 §6(d) "27B DRIFTS"
 row is superseded: it measured a near-tie config artifact, not oracle drift.

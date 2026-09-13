@@ -246,9 +246,18 @@ reviewer re-runs the mutations.
 ### W1 — the prefill op set (recorded 2026-08-22, P150)
 
 **Substrate.** Built and gated against the pinned tt-metal checkout
-`a3d330289752192754277638fe5c09eb2fb49763` (2026-05-20, "dispatch: prefetch
+`a3d330289752192754277638fe5c09eb2fb49763` (2026-08-09, "dispatch: prefetch
 src 2KB ahead in memcpy_to_device non-temporal path"), which exposes
-`ttnn::transformer::chunk_gated_delta_rule`.
+`ttnn::transformer::chunk_gated_delta_rule`. **That date read `2026-05-20` until
+2026-09-12 and is now the COMMITTER date**, so it agrees with
+[tt-metal-trace-replay-write-desync.md](tt-metal-trace-replay-write-desync.md),
+which always said `2026-08-09`. Resolved against the forge
+(`gh api repos/tenstorrent/tt-metal/commits/a3d3302897…`): author
+`2026-05-19T22:41:16Z`, committer `2026-08-09T08:12:00Z`. Neither record was
+inventing a number — one took the author stamp, rendered in a zone at or east of
+`+01:19`, and the other the committer stamp. Dates for a sha in this tree are
+the committer date in UTC; `scripts/check-record-claim-agreement.py` gates that
+two records never write the strict `` `sha` (DATE `` form with different dates.
 
 **Tolerance table** (deterministic LCG inputs, CPU f32 oracle, log
 `/tmp/w1_baseline.log`: 4 new cases, 102 assertions, all green). The gate is

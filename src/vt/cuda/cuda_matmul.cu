@@ -46,6 +46,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "vt/cuda/cublas_lt_hgemm.h"
 #include "vt/cuda/fp8_plan_cache.h"
 #include "vt/cuda/gemm_algo_log.h"
 #include "vt/cuda/gemm_plan_cache.h"
@@ -185,14 +186,23 @@ struct PrefGuard {
   }
 };
 
-void MakeRowMajor(LayoutGuard& l, cudaDataType_t t, int64_t rows, int64_t cols) {
+// Overload with an EXPLICIT leading dimension, for strided views whose row
+// stride exceeds `cols` (e.g. a column slice of a wider output tensor).
+// Mirrors MakeRowMajorBatched's ld parameter (line 202). For a contiguous
+// tensor, ld == cols and this is identical to the 4-arg overload below.
+void MakeRowMajor(LayoutGuard& l, cudaDataType_t t, int64_t rows, int64_t cols,
+                 int64_t ld) {
   CheckLt(cublasLtMatrixLayoutCreate(&l.v, t, static_cast<uint64_t>(rows),
-                                     static_cast<uint64_t>(cols), cols),
+                                     static_cast<uint64_t>(cols), ld),
           "cublasLtMatrixLayoutCreate");
   const cublasLtOrder_t order = CUBLASLT_ORDER_ROW;
   CheckLt(cublasLtMatrixLayoutSetAttribute(l.v, CUBLASLT_MATRIX_LAYOUT_ORDER, &order,
                                            sizeof(order)),
           "set CUBLASLT_MATRIX_LAYOUT_ORDER");
+}
+
+void MakeRowMajor(LayoutGuard& l, cudaDataType_t t, int64_t rows, int64_t cols) {
+  MakeRowMajor(l, t, rows, cols, cols);
 }
 
 // Row-major layout with an EXPLICIT leading dimension (the tensor's row stride,
@@ -1314,4 +1324,88 @@ struct Registrar {
 } registrar;
 
 }  // namespace
+
+// QUANT-EXL3 W6. fp16 @ fp16 -> fp16|f32 row-major GEMM for the EXL3
+// reconstruct+cuBLAS prefill path. The reference (exllamavav3_ext/hgemm.cu)
+// uses cublasGemmEx; this tree links cublasLt only, so the GEMM goes through
+// cublasLtMatmul with the same heuristic cache as the bf16/f32 lanes.
+//
+// a is fp16 [M, K] row-major, b is fp16 [K, N] row-major, c is [M, N]
+// row-major (fp16 or f32). Compute type CUBLAS_COMPUTE_32F with f32 alpha/beta,
+// matching the reference's CUBLAS_COMPUTE_32F / CUBLAS_GEMM_DEFAULT_TENSOR_OP.
+void CublasLtHgemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& b) {
+  if (a.dtype != DType::kF16 || b.dtype != DType::kF16 ||
+      (c.dtype != DType::kF16 && c.dtype != DType::kF32)) {
+    throw std::runtime_error(std::string("vt cuda: CublasLtHgemm: unsupported dtype combo (") +
+                             Name(a.dtype) + "," + Name(b.dtype) + ")->" + Name(c.dtype) +
+                             "; expected (f16,f16)->f16|f32");
+  }
+  const int64_t m = a.shape[0], k = a.shape[1], n = b.shape[1];
+  if (m == 0 || n == 0) return;
+  cudaStream_t s = static_cast<cudaStream_t>(q.handle);
+
+  const LtContext ctx = GetContext(q.device.index);
+  const cudaDataType_t ab_type = CUDA_R_16F;
+  const cudaDataType_t out_type = c.dtype == DType::kF32 ? CUDA_R_32F : CUDA_R_16F;
+
+  // ldc = c.stride[0]: the output's actual row stride. For a column slice of a
+  // wider output (EXL3 N>32768 slicing), c.stride[0] > n, and using ldc = n
+  // packs rows too tightly so they overwrite each other. The reference
+  // (exllamav3 hgemm.cu:49,72) does the same: ldc = c.stride(-2).
+  // ldb = n (= b.shape[1]): the reconstruct kernel writes B contiguously with
+  // row stride n_slice even when the scratch buffer is wider, so cuBLAS must
+  // read at that same stride, not at b.stride[0].
+  const int64_t lda = a.stride[0];
+  const int64_t ldb = n;
+  const int64_t ldc = c.stride[0];
+
+  DescGuard desc;
+  CheckLt(cublasLtMatmulDescCreate(&desc.v, CUBLAS_COMPUTE_32F, CUDA_R_32F),
+          "cublasLtMatmulDescCreate (hgemm)");
+  LayoutGuard la, lb, lc;
+  MakeRowMajor(la, ab_type, m, k, lda);
+  MakeRowMajor(lb, ab_type, k, n, ldb);
+  MakeRowMajor(lc, out_type, m, n, ldc);
+
+  PrefGuard pref;
+  CheckLt(cublasLtMatmulPreferenceCreate(&pref.v), "cublasLtMatmulPreferenceCreate (hgemm)");
+  CheckLt(cublasLtMatmulPreferenceSetAttribute(pref.v, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                               &kWorkspaceBytes, sizeof(kWorkspaceBytes)),
+          "set CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES (hgemm)");
+
+  GemmPlanKey key;
+  key.device = q.device.index;
+  key.op = kFp16Nn;
+  key.m = m;
+  key.n = n;
+  key.k = k;
+  key.lda = lda;
+  key.ldb = ldb;
+  key.ldc = ldc;
+  key.ab_type = static_cast<int>(ab_type);
+  key.out_type = static_cast<int>(out_type);
+
+  cublasLtMatmulHeuristicResult_t heur{};
+  bool fresh = false;
+  if (!GetOrQueryGemmHeuristic(ctx, key, desc.v, la.v, lb.v, lc.v, pref.v,
+                               "hgemm cublasLtMatmulAlgoGetHeuristic", &heur, &fresh)) {
+    throw std::runtime_error("vt cuda: CublasLtHgemm: no cublasLt heuristic for [" +
+                             std::to_string(m) + "," + std::to_string(k) + "]x[" +
+                             std::to_string(k) + "," + std::to_string(n) + "] (f16,f16)->" +
+                             Name(c.dtype));
+  }
+  if (fresh) MaybeLogGemmAlgo(heur, m, n, k, ab_type, ab_type, out_type, "hgemm-fp16-NN");
+
+  if (k == 0) {
+    CheckCuda(cudaMemsetAsync(c.data, 0, c.Bytes(), s), "hgemm k=0 memset");
+    return;
+  }
+
+  const float alpha = 1.0f, beta = 0.0f;
+  CheckLt(cublasLtMatmul(ctx.handle, desc.v, &alpha, a.data, la.v, b.data, lb.v, &beta,
+                         c.data, lc.v, c.data, lc.v, &heur.algo, ctx.workspace,
+                         kWorkspaceBytes, s),
+          "cublasLtMatmul (hgemm)");
+}
+
 }  // namespace vt::cuda

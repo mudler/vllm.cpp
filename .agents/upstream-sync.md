@@ -16,8 +16,27 @@ and [`sync/2026-09-03-e126687-advance.md`](sync/2026-09-03-e126687-advance.md)
 one.** The 2026-07-26 advance re-captured goldens on the new oracle on GB10 and
 recorded zero real drift. This one ran no build, no lease, no GPU and no golden
 re-capture. Every committed golden in this tree was captured against `555967922`
-or earlier, and the declared token-exact gate at this pin is owed by
-[#2794](https://github.com/mudler/vllm.cpp/issues/2794). Step 5 did not run
+or earlier. **This sentence used to end "and the declared token-exact gate at
+this pin is owed by [#2794](https://github.com/mudler/vllm.cpp/issues/2794)",
+and that is no longer true.** Read live 2026-09-12,
+`gh issue view 2794 --repo mudler/vllm.cpp --json state,closedAt,stateReason`
+gives `CLOSED`, `COMPLETED`, `2026-09-06T07:00:58Z`; the gate ran at this pin on
+2026-09-04 and PASSED, as [`NOW.md`](NOW.md) records. The declared token-exact
+gate — the OPT-125m oracle gate at six prompts and sixteen tokens — is therefore
+DISCHARGED, not owed. **Two obligations remain owed at this pin, and this
+sentence must not be read as naming only one.** (1) The BENCHMARK step-6
+re-baseline, [#2818](https://github.com/mudler/vllm.cpp/issues/2818), still
+`OPEN` at the same read. (2) **The other four strict goldens** — 27B W4A4,
+32B-NVFP4A16, 35B, Coder — which the pin advance re-captured at `5559679229` and
+none of which has been re-captured at `e126687a9a`. That second obligation is
+deliberately NOT anchored on an issue, because #2794 is closed and an `## Owed`
+bullet pointing at a closed issue is how an obligation stops being read: it
+lives under `## Owed` in
+[`specs/upstream-sync-headpin-tokengate.md`](specs/upstream-sync-headpin-tokengate.md)
+(the bullet at `:569`), and whoever takes it files the issue then. The same
+split is recorded at [`oracles/vllm.md`](oracles/vllm.md) `:77` and `:93` and in
+[`sync/2026-09-05-e126687-pingate.md`](sync/2026-09-05-e126687-pingate.md)
+`:45`. Step 5 did not run
 either, so **at least 177** files whose `Ported from:` header names `55596792`
 are now BEHIND the pin, counted over `include/`, `src/` and `tests/`. **It is a
 FLOOR, not a count**, and the reason is in

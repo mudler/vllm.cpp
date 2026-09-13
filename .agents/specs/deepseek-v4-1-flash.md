@@ -444,8 +444,16 @@ before any speed axis is quoted.
   to name a second debt, "the token-exact gate at `e126687a9a` owed by #2794".
   That is no longer true: the same command on 2794 gives `"state":"CLOSED"`,
   `"closedAt":"2026-09-06T07:00:58Z"`, so #2794 is discharged and does not size
-  a pin advance. `.agents/upstream-sync.md` still carries the stale sentence and
-  is out of scope for this change.
+  a pin advance. `.agents/upstream-sync.md` carried the stale sentence when this
+  was written and was out of scope for this change; it was reconciled on
+  2026-09-12 under row `ENG-RECORD-CLAIM-AGREEMENT` and no longer does.
+  **That reconciliation also corrected this bullet's own framing:** #2818 is not
+  the only debt the pin carries. The other four strict goldens at
+  `e126687a9a` — 27B W4A4, 32B-NVFP4A16, 35B, Coder — are still owed too. They
+  carry no issue by design, living under `## Owed` in
+  `.agents/specs/upstream-sync-headpin-tokengate.md:569`, which is why an
+  issue-state read alone cannot see them and why this bullet found only one
+  debt.
 - For the GGUF arm: an upstream or first-party `deepseek41` runtime, AND a rung
   that both fits 119 GiB and keeps `token_embd`/`output` out of the 1-bit
   format. Neither exists today, and the second one is a requantization we would

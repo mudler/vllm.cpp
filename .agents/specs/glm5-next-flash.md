@@ -166,7 +166,34 @@ That is the same four-family split this spec independently derives from the
 transformers reference, which raises confidence in the decomposition without
 being usable as its source.
 
-### transformers — the ONLY admissible reference, and it needs a lane pin
+### transformers — the algorithm reference until 2026-09-03, and it needs a lane pin
+
+**This heading read "the ONLY admissible reference" until 2026-09-12, and vLLM
+falsified that on 2026-09-03.** The file's head-level banner at `:3-6` already
+records the supersession — it names the 3 September registration and points at
+[the upstream reconciliation](glm5-next-upstream-reconciliation.md), row
+`MODEL-MM-GLM53-FLASH`, issue
+[#3045](https://github.com/mudler/vllm.cpp/issues/3045) — so what this note does
+is carry that banner DOWN to the one section that still asserted the
+pre-registration reading in its own heading. The banner is the authority; this
+paragraph is its local application, and it adds no new verdict.
+`Glm5NextForConditionalGeneration` is registered
+on vLLM `main` at `model_executor/models/registry.py:429` (also `:123` and
+`:693`), landed by `98ed0856f3` = `[Model] add GLM-5.3-Flash support (#53906)`,
+which lands on **2026-09-03**. Its two stamps are the SAME INSTANT,
+`2026-09-03T16:40:35Z` for both author and committer
+(`gh api repos/vllm-project/vllm/commits/98ed0856f3…` → `.commit.author.date`
+and `.commit.committer.date`, both `2026-09-03T16:40:35Z`); locally they render
+as `2026-09-04T00:40:35+08:00` and `2026-09-03T09:40:35-07:00`
+(`git log -1 --format='%aI %cI' 98ed0856f3`), so the `+0800` rendering crosses
+midnight and reads 2026-09-04 while nothing about the commit moved. The date
+recorded here is the UTC one. [`../oracles/transformers.md`](../oracles/transformers.md)
+records the lane as `expired_on = 2026-09-03`, `expired_by = 98ed0856f3`, on its
+own stated condition `expires = when vLLM registers glm5_next` — registration
+fires it, our pin advancing does not. vLLM now defines the algorithm, and
+transformers is retained at its lane pin for component evidence, preprocessing
+and checkpoint interpretation only. The paragraph below is the 2026-08-26
+reading, kept because a lane that vanishes cannot be audited.
 
 `glm5_next` exists in `huggingface/transformers`. The implementing commit is
 `eb4d9e2a64` (2026-08-26T14:26:40Z, PR

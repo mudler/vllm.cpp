@@ -683,6 +683,131 @@ manifest, so it cannot see this artifact at all today. Extending it to the visio
 manifest is a semantic checker change and is owed below, with the measurement
 above as its red-before input.
 
+## W7-CUDA: the per-row bias selector for the device MoE router
+
+Scope: issue #2411, wave W7-CUDA, and the row-owned local issue
+`ISSUE-LOCAL-01M2C26CSZWB7WVRS5H7YPW4S8`. This section scopes ONE capability:
+the two device MoE routers gain the per-row bias selector the host arm already
+has, so a step carrying image rows is SERVED on a device build rather than
+refused by name. It is written before the implementation, and it claims nothing
+about the outcome.
+
+**WHY THIS IS THE LAST KNOWN BLOCKER.** `DeepseekV4Model::ForwardDevice` builds
+`V4Backend dev_be{/*device=*/true, ...}`, and the registry sends the runner's
+default gather-logits path there for EVERY request on this architecture. So
+every served request takes the `be.device` arm, and `DispRoute`'s media
+`VT_CHECK` is what a served image reaches once the vision-residency and
+keep-quant-binding repairs above it are in. Blocker 4 in `## Owed` is this one.
+
+### The predicate, and there is only one of it
+
+A refusal whose predicate differs from its routing condition is how a silent
+wrong answer happens, and this row has already met that class of defect. So the
+array the refusal reads is the array the kernel reads, unchanged:
+
+```text
+media(t)     = has_vision_bias && is_media_token != null && is_media_token[t] != 0
+row_is_hash  = is_hash && !media(t)
+row_bias     = media(t) ? vision_bias : e_score_correction_bias
+row_has_bias = media(t) ? true        : has_bias
+weights      = ALWAYS gathered from the UNBIASED scores
+```
+
+That is `SqrtSoftplusRouteTopk`'s rule transcribed, not a second policy:
+`deepseek_v4_moe.cpp` computes `any_media = !is_media_token.empty() &&
+!vision_bias.empty()` and then `media = any_media && is_media_token[t] != 0`,
+takes the hash branch only on `is_hash && !media`, and selects `row_bias`
+exactly as above. The device arm must mirror it and must not invent another.
+
+### Upstream anchors
+
+- **vLLM, primary.**
+  `vllm/model_executor/layers/fused_moe/router/fused_topk_bias_router.py:75-118`
+  (`_topk_softplus_sqrt_torch`) defines the arithmetic of each arm: the
+  `sqrt(softplus(gating))` score, the bias used for SELECTION ONLY, the weight
+  gathered from the UNBIASED scores, the hash branch at :100-106, the renorm at
+  :114-115 and the scale at :117. That arithmetic is unchanged by this work.
+  vLLM takes ONE `e_score_correction_bias` and implements no vision bias at all,
+  so the per-row SELECTION between two biases is precisely where vLLM stops.
+- **`deepseek-v4-vision`, secondary, pin `86f746b36186f0e567729a5c06a8c918caba82a9`.**
+  The model author's `exp_probs_b_vl` is the bias an image row takes.
+- **`llama-cpp-dsv4vision`, secondary, release `b10766`.**
+  `src/models/deepseek4.cpp` selects PER UBATCH (`const bool is_media =
+  ubatch.embd != nullptr;`) and skips the hash branch wholesale. Our per-token
+  rule and its argument are W4's and are already recorded in `## Owed`. The
+  device arm INHERITS that decision unchanged; it does not reopen it.
+
+### Design
+
+1. `MoeDeviceKernels::route` takes `vision_bias` and `is_media_token`.
+2. `MoeDeviceKernels::route_ip` takes `vision_bias`, `has_vision_bias` and
+   `is_media_token`, in the pointer vocabulary its siblings already use.
+3. `RouteKernel` AND `RouteWarpKernel` both take the two new inputs and select
+   per row. Both, because `RouteWarpKernel` is the default and the two must stay
+   bit-identical.
+4. `RouteDispatch`, `RouteLaunch` and `RouteInPlaceLaunch` thread them.
+   `RouteLaunch` pads an absent buffer exactly as it already pads `bias`,
+   `in_tokens` and `hashtab`.
+5. `DispRoute` drops its media `VT_CHECK` and passes the two arrays to both
+   device arms.
+
+**DROPPING THAT CHECK IS NOT WEAKENING A GUARANTEE, and this is the argument.**
+The guarantee moves from "refuse, because the kernel cannot express this" to
+"the kernel expresses it". The case where the selector is GENUINELY unavailable
+is a different predicate and it keeps its own refusal one level up, in
+`MoeBlock`: a step carrying image rows whose LAYER has no `exp_probs_b_vl` is
+refused by name, with the width check beside it. That refusal is host-side and
+arm-independent, so it still fires on a CUDA build, and a case must keep proving
+it does.
+
+### Risks
+
+1. **A text step must stay byte-identical.** An empty vision bias or a null mask
+   means no row is media, which is the host arm's own `any_media` rule, and the
+   `has_bias`/`is_hash` branches are untouched.
+2. **`RouteWarpKernel` must stay bit-identical to `RouteKernel`.** The selector
+   is per row in both, so the existing A/B case extends to cover a media row.
+3. **A token gate cannot see a wrong bias when the two biases nearly agree.**
+   The focused cases therefore use biases that name DIFFERENT experts, as the
+   host cases in `test_deepseek_v4_moe.cpp` already do, so a swap is visible in
+   the expert ids and not only in generated text.
+4. **`is_media_token` is `std::vector<char>`.** The device arm must carry that
+   width and must not assume `bool`.
+
+### Tests
+
+- `test_cuda_deepseek_v4`: device `route` equals `SqrtSoftplusRouteTopk` for a
+  mixed text/image batch on a noaux_tc layer; for a mixed batch on a HASH layer,
+  where the image row leaves the hash route and the text row keeps it; and for
+  an empty mask, which must be byte-identical to the call carrying no vision
+  bias. RED-first: swapping the two biases changes the ids.
+- The same three through `route_ip`, and under both `VT_V4_ROUTE_WARP_TOPK=0`
+  and `=1`, because both kernels now carry the selector.
+- `test_deepseek_v4_mm_chat`: the served-image expectation flips from the
+  `exp_probs_b_vl` refusal to a served answer, and the case KEEPS a branch that
+  proves the refusal still fires where the selector is genuinely unavailable.
+- Reachability: deleting `DispRoute`'s pass-through in a scratch copy must red
+  the focused gate.
+
+### Gate, and what cannot gate it
+
+**A CPU BUILD CANNOT GATE THIS, and a CPU green is not device coverage.**
+`ForwardDevice` refuses first at
+`VT_CHECK(V4DeviceKernelsAvailable(), kDevicePending)`, so a CPU build never
+reaches the code this section changes. This is stated rather than left for a
+reader to infer from a green that measured nothing.
+
+The gate is a leased `thor:gpu0` run through `rc run -d thor:gpu0` on a CUDA
+sm_110 build: the CUDA router cases green, and `test_deepseek_v4_mm_chat`'s
+served image reaching its served branch with the answer recorded. `thor` is
+sm_110 and FA-2 is DISABLED there, which is a property of the box.
+
+### Stop conditions
+
+If the served image stops at a NEW wall once the selector lands, that wall is
+recorded with its verbatim message and the work stops there. No cause is
+guessed, and the blocker table in `## Owed` gains a row rather than a claim.
+
 ## Owed
 - **THE W7-CUDA NUMBERS WERE PRODUCED BY A DRIVER THAT COULD NOT DETECT A FAILED
   STEP, AND THEY HAVE NOT BEEN RE-RUN SINCE IT WAS REPAIRED.** The 2.884% cells

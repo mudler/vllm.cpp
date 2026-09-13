@@ -141,46 +141,139 @@ TEST_CASE("a ratio-bearing DeepSeek-V4 publishes groups that no single block siz
 }
 
 // ---------------------------------------------------------------------------
-// (2) WHAT ACTUALLY HAPPENS TO SUCH A CHECKPOINT TODAY, which is NOT what the
-// group set above would lead a reader to predict.
+// (2) WHAT ACTUALLY HAPPENS TO SUCH A CHECKPOINT TODAY. THIS CASE HAS BEEN
+// INVERTED ONCE ALREADY, AND THE HISTORY IS THE POINT.
 //
-// The obvious prediction is that seven groups at four different block sizes
-// reach `HybridKVCacheCoordinator` and die on its LOCAL deferral assert that
-// every group's block size EQUALS the hash granularity
-// (`kv_cache_coordinator.cpp:386`) — an assert inside a server being an abort.
-// MEASURED 2026-09-13, THAT IS NOT WHAT HAPPENS, and the difference is the whole
-// reason this case exists.
+// HISTORY, so a reader can tell which behaviour is current and which is merely
+// guarded:
 //
-// The engine never gets that far. `ApplyCacheDType` runs while `kv_cfg_` is
-// being initialized, which PRECEDES `scheduler_block_size_` and `scheduler_` in
-// the `LoadedEngine` constructor's initializer list, and `RetypeAttentionSpec`
-// refuses any `MLAAttentionSpec` BY NAME
-// (`src/vllm/v1/kv_cache_interface.cpp:398`): the fp8_ds_mla page formula landed
-// with no store and no read (#2455, owed to KV-DSV4-MULTICACHE W8). The
-// compressed-latent groups are exactly the groups a non-zero `compress_ratio`
-// adds, so the ratios that create the multi-group topology are also what trips
-// that guard.
+//   PREDICTION (never true): seven groups at four different block sizes reach
+//   `HybridKVCacheCoordinator` and die on its LOCAL deferral assert that every
+//   group's block size EQUALS the hash granularity
+//   (`kv_cache_coordinator.cpp:386`).
 //
-// That is why the all-zero-ratio fixture in `test_serve_deepseek_v4_mm` serves
-// happily: `SlidingWindowMLASpec` derives from `SlidingWindowSpec`, NOT from
-// `MLAAttentionSpec`, so a SWA-only publication never meets this guard at all.
+//   MEASURED 2026-09-13, BEFORE #2455/W8: the engine never reached the
+//   coordinator. `ApplyCacheDType` runs while `kv_cfg_` is initialized, which
+//   PRECEDES `scheduler_block_size_` and `scheduler_` in the `LoadedEngine`
+//   initializer list, and `RetypeAttentionSpec` refused any `MLAAttentionSpec`
+//   BY NAME (`src/vllm/v1/kv_cache_interface.cpp:398`). This case asserted that
+//   refusal, and it was written to go RED the moment W8 landed.
 //
-// SO THE COORDINATOR ASSERT IS LATENT, NOT LIVE. DeepSeek-V4 is the only
-// architecture in this tree that publishes groups with differing block sizes —
-// every other multi-group registry (glm5_next, kimi_linear, nemotron_h,
-// qwen4_exp, qwen3_5_common) hands the same `block_size` variable to every group
-// — so no production entry point can reach that assert today. WHOEVER LANDS W8
-// MAKES IT REACHABLE, and this case is the tripwire: when the refusal below
-// stops firing, the port recorded under `## Owed` in
-// `.agents/specs/deepseek-v4-flash-vision.md` has to be in place, or this
-// becomes the abort the prediction expected.
+//   MEASURED 2026-09-13, AFTER #2455/W8 (this case): THE REFUSAL NO LONGER
+//   FIRES ON THE DEFAULT PATH, AND THE ENGINE CONSTRUCTS. The tripwire did its
+//   job and is inverted here rather than deleted.
 //
-// This case asserts TODAY'S behaviour deliberately. A refusal that names its
-// reason is a message rather than a crash, and that is a supported outcome;
-// asserting a future pass here would be a test that stays red for a year and
-// teaches nobody why.
+// WHAT ACTUALLY REMOVED THE REFUSAL IS RESOLUTION, NOT A WIDER GUARD, and that
+// distinction is the whole reason case (3) below still exists. `ApplyCacheDType`
+// now returns immediately when the resolved cache dtype is `auto`
+// (`kv_cache_interface.cpp`, the `if (resolved.is_auto) return;` short-circuit
+// added by W8 slice 6): `auto` MEANS "use the dtype the model resolved", so
+// there is nothing to apply, and DeepSeek-V4's own factory publishing
+// `fp8_ds_mla` specs is that model's resolution rather than an operator
+// override. `RetypeAttentionSpec` is UNTOUCHED and still refuses every EXPLICIT
+// override, which case (3) pins.
+//
+// SO THE COORDINATOR ASSERT IS NOW REACHED, AND IT DOES NOT FIRE. Three
+// measured facts, none of them assumed:
+//   - DeepSeek-V4 registers `is_hybrid = false` and `has_inner_state = false`
+//     (`deepseek_v4_registry.cpp:54-55`), so `ResolveEnablePrefixCaching`
+//     returns TRUE and `get_kv_cache_coordinator` does NOT take the
+//     `KVCacheCoordinatorNoPrefixCache` arm;
+//   - seven groups is `num_groups != 1`, so it takes `HybridKVCacheCoordinator`,
+//     whose constructor DOES evaluate the equality at `:386`;
+//   - that line is a plain `assert`, and every shipping configuration compiles
+//     with `-DNDEBUG` (`CMAKE_CXX_FLAGS_RELEASE = -O3 -DNDEBUG`), so it is
+//     compiled out of Release and of CI, which builds Release throughout.
+//
+// A DEBUG BUILD OF THIS SUITE THEREFORE ABORTS, AND THAT WAS MEASURED RATHER
+// THAN REASONED. `-DCMAKE_BUILD_TYPE=Debug` (`CMAKE_CXX_FLAGS_DEBUG = -g`, no
+// NDEBUG) on 2026-09-13 gives SIGABRT in the case below, verbatim:
+//
+//   kv_cache_coordinator.cpp:386: vllm::v1::HybridKVCacheCoordinator::
+//   HybridKVCacheCoordinator(...): Assertion `g.kv_cache_spec->block_size ==
+//   hash_block_size && "differing group/hash block sizes are DEFERRED (M1.3
+//   Task 3)"' failed.
+//
+// An abort cannot be caught, so no assertion here can express it in-process and
+// none pretends to; it is recorded so that a reader who hits it knows it is the
+// owed hash-granularity port and not a new defect. The Release expectation
+// below is the production one, because Release is what ships and what CI runs.
+//
+// AND THAT IS THE TRAP THIS COMMENT EXISTS TO NAME: **AN ASSERT-BASED WALL IS
+// INVISIBLE UNDER NDEBUG, SO A TEST THAT RELIES ON THE SIGABRT SILENTLY PASSES
+// IN RELEASE.** `:386` is a bare `assert` and nothing in that file guards it, so
+// under NDEBUG it — and `:382`, `:390`, `:391` — are deleted outright and the
+// load proceeds INTO the `BlockHashListWithBlockSize` path that the comment
+// directly above `:386` calls DEFERRED, with the invariant violated. A run that
+// then emits plausible text has not shown the path is correct; it has shown the
+// check was removed. Any load result on this topology must therefore state its
+// `CMAKE_BUILD_TYPE` and whether NDEBUG was defined, or it means nothing.
+//
+// The arithmetic says `:386` is the ONLY wall here: for
+// `{256,256,256,64,4,4,8}` at scheduler 256 / hash 4, the divisibility guards at
+// `:138` (256%4), `:140` (256 % each group) and `:382` (each group % 4) all
+// PASS, and only the strict equality at `:386` fails. Upstream asserts
+// divisibility ALONE (`kv_cache_coordinator.py:608-613`), so our extra equality
+// is a local deferral marker and an abort naming it is the CORRECT outcome
+// rather than a defect to route around.
+//
+// A NAMED REFUSAL WOULD BE A BETTER GUARD THAN THIS ASSERT, for exactly the
+// reason above: a refusal is visible in the configuration that ships, and an
+// assert is not. That change is NOT made here — it would move a production
+// refusal and belongs to the wave that owns the hash-granularity port, not to a
+// test repair.
+// The hash-granularity port (`BlockHashListWithBlockSize`) recorded under
+// `## Owed` in `.agents/specs/deepseek-v4-flash-vision.md` is therefore STILL
+// owed: what changed is that nothing refuses first any more, not that the
+// converting view arrived. Upstream asserts DIVISIBILITY only
+// (`kv_cache_coordinator.py:608-613`); our extra equality is a local deferral
+// marker, and `{256,256,256,64,4,4,8}` against a granularity of 4 satisfies
+// upstream's rule while violating ours.
 // ---------------------------------------------------------------------------
-TEST_CASE("serve: a multi-group DeepSeek-V4 checkpoint is refused BY NAME, not aborted") {
+TEST_CASE("serve: a multi-group DeepSeek-V4 checkpoint now CONSTRUCTS on the default path") {
+  gguf_test::TempFile lang(dsv4_lang_test::BuildDeepseek4Gguf(
+      /*vision=*/false, dsv4_lang_test::BiasWidths{}, /*vision_from=*/0,
+      /*head_dim=*/512, /*with_tokenizer=*/true, /*vision_bias_scale=*/1.0f,
+      /*sliding_window=*/128, /*hash_layers=*/dsv4_lang_test::kHashLayers,
+      /*compress_ratios=*/kFlashRatios));
+
+  // DEFAULT params: `kv_cache_dtype == "auto"`, which is what `vllm-cli` and
+  // `vllm-server` pass when no `--kv-cache-dtype` is given. This is the
+  // production configuration, not a contrived one.
+  vllm::entrypoints::EngineParams params;
+  REQUIRE(params.kv_cache_dtype == "auto");
+
+  std::string message;
+  std::unique_ptr<vllm::entrypoints::LoadedEngine> engine;
+  try {
+    engine = vllm::entrypoints::LoadedEngine::FromModelDir(lang.path(), params);
+  } catch (const std::exception& e) {
+    message = e.what();
+  }
+
+  // THE NEW TRUTH: it constructs. If this ever throws again, the message is
+  // printed rather than swallowed, so the next reader sees WHICH door closed
+  // instead of a bare boolean.
+  INFO("unexpected refusal: " << message);
+  CHECK(message.empty());
+  CHECK(engine != nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// (3) THE GUARD IS STILL THERE, AND THIS IS THE CASE THAT PROVES IT.
+//
+// Case (2) records that the DEFAULT path no longer refuses. That must not be
+// read as "the fp8_ds_mla store/read gap stopped mattering". An EXPLICIT
+// `--kv-cache-dtype` is the operator asking for a different page format instead
+// of delegating the choice to the model, `resolved.is_auto` is then false, the
+// short-circuit does not apply, and `RetypeAttentionSpec` refuses the
+// `MLAAttentionSpec` groups BY NAME exactly as before.
+//
+// WITHOUT THIS CASE the suite could not tell "W8 landed" apart from "somebody
+// deleted the guard", because both look identical from case (2) alone. That is
+// the regression this case exists to make loud.
+// ---------------------------------------------------------------------------
+TEST_CASE("serve: an EXPLICIT --kv-cache-dtype on the same topology is still refused BY NAME") {
   gguf_test::TempFile lang(dsv4_lang_test::BuildDeepseek4Gguf(
       /*vision=*/false, dsv4_lang_test::BiasWidths{}, /*vision_from=*/0,
       /*head_dim=*/512, /*with_tokenizer=*/true, /*vision_bias_scale=*/1.0f,
@@ -188,25 +281,26 @@ TEST_CASE("serve: a multi-group DeepSeek-V4 checkpoint is refused BY NAME, not a
       /*compress_ratios=*/kFlashRatios));
 
   vllm::entrypoints::EngineParams params;
+  // An operator naming a page format the MLA store cannot write. Not "auto", so
+  // the W8 short-circuit is bypassed and the guard is the next thing reached.
+  params.kv_cache_dtype = "fp8";
+
   std::string message;
   try {
     std::unique_ptr<vllm::entrypoints::LoadedEngine> engine =
         vllm::entrypoints::LoadedEngine::FromModelDir(lang.path(), params);
-    // Reaching here means the fp8_ds_mla guard stopped firing — see above. That
-    // is W8 landing, and it is the moment the hash-granularity port stops being
-    // hypothetical.
     FAIL_CHECK(
-        "the fp8_ds_mla refusal did not fire: #2455 / KV-DSV4-MULTICACHE W8 has "
-        "landed, so re-read this suite's comment -- the coordinator's "
-        "block_size == hash_block_size assert is now REACHABLE");
+        "an explicit --kv-cache-dtype was ACCEPTED on an MLA topology: the "
+        "fp8_ds_mla guard in RetypeAttentionSpec has been removed or widened, "
+        "which lets a 584-byte packed page be written as though it were float "
+        "(#2455, KV-DSV4-MULTICACHE)");
   } catch (const std::exception& e) {
     message = e.what();
   }
 
   // It is a refusal that names the layout it cannot serve...
   CHECK(message.find("fp8_ds_mla") != std::string::npos);
-  // ...and the issue that owes the store and the read, so a reader is not sent
-  // hunting for a `--kv-cache-dtype` flag they never passed.
+  // ...and the issue that owes the store and the read.
   CHECK(message.find("2455") != std::string::npos);
   // ...and it is the CACHE DTYPE door, not the coordinator's. If this ever reads
   // as a hash-block-size complaint instead, the refusal order moved and every

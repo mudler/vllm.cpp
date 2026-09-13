@@ -823,26 +823,50 @@ guessed, and the blocker table in `## Owed` gains a row rather than a claim.
   and `hash_block_size = 4` (the GCD). The engine derives that pair since
   `c9129fb7b`.
 
-  **The engine never reaches the coordinator.** `ApplyCacheDType` runs while
-  `kv_cfg_` is being initialized, which precedes `scheduler_block_size_` and
-  `scheduler_` in the `LoadedEngine` constructor's initializer list, and
-  `RetypeAttentionSpec` refuses any `MLAAttentionSpec` BY NAME at
-  `src/vllm/v1/kv_cache_interface.cpp:398` — the fp8_ds_mla page formula landed
-  with no store and no read ([#2455](https://github.com/mudler/vllm.cpp/issues/2455),
-  owed to KV-DSV4-MULTICACHE W8). The compressed-latent groups are exactly the
-  groups a non-zero `compress_ratio` adds, so the ratios that create the
-  multi-group topology are also what trips that guard. The all-zero fixture in
-  `test_serve_deepseek_v4_mm` never meets it because `SlidingWindowMLASpec`
-  derives from `SlidingWindowSpec`, not from `MLAAttentionSpec`. **A named
-  refusal is a message, not an abort**, so the serve-time outcome today is
-  already the acceptable one.
+  **SUPERSEDED 2026-09-13 BY THE W8 MERGE. The two paragraphs this entry used to
+  carry said "the engine never reaches the coordinator" and "the assert is
+  unreachable, not merely untriggered". BOTH ARE NOW FALSE, and what falsified
+  them is recorded here rather than deleted.** Until `d8c780ec7` (#2455 / W8),
+  `ApplyCacheDType` ran while `kv_cfg_` was initialized — which precedes
+  `scheduler_block_size_` and `scheduler_` in the `LoadedEngine` initializer
+  list — and `RetypeAttentionSpec` refused any `MLAAttentionSpec` BY NAME at
+  `src/vllm/v1/kv_cache_interface.cpp:398`, so the refusal always won the race to
+  the coordinator.
 
-  **The assert is unreachable, not merely untriggered.** DeepSeek-V4 is the only
-  architecture in this tree publishing groups with DIFFERING block sizes; every
-  other multi-group registry (`glm5_next`, `kimi_linear`, `nemotron_h`,
-  `qwen4_exp`, `qwen3_5_common`) hands the same `block_size` variable to every
-  group. So nothing production can reach
-  `kv_cache_coordinator.cpp:386` or `block_pool.cpp:93,220` today.
+  **WHAT REMOVED THE REFUSAL IS RESOLUTION, NOT A WIDENED GUARD.**
+  `ApplyCacheDType` now returns immediately when the resolved cache dtype is
+  `auto` (the `if (resolved.is_auto) return;` short-circuit, W8 slice 6): `auto`
+  means "use the dtype the model resolved", and DeepSeek-V4's own factory
+  publishing `fp8_ds_mla` specs is that model's resolution rather than an
+  operator override. `RetypeAttentionSpec` is UNTOUCHED and still refuses every
+  EXPLICIT `--kv-cache-dtype` on this topology.
+
+  **THE COORDINATOR ASSERT IS NOW REACHED, AND IT IS COMPILED OUT.** Measured
+  2026-09-13 on `7a62a7fca` through `LoadedEngine::FromModelDir` with the
+  ratio-bearing fixture: DeepSeek-V4 registers `is_hybrid = false` and
+  `has_inner_state = false` (`deepseek_v4_registry.cpp:54-55`), so
+  `ResolveEnablePrefixCaching` returns TRUE and the
+  `KVCacheCoordinatorNoPrefixCache` arm is not taken; seven groups is
+  `num_groups != 1`, so `HybridKVCacheCoordinator` is constructed and DOES
+  evaluate `kv_cache_coordinator.cpp:386`. That line is a plain `assert`, and
+  every shipping configuration compiles with `-DNDEBUG`
+  (`CMAKE_CXX_FLAGS_RELEASE = -O3 -DNDEBUG`), so in Release — which is what CI
+  runs and what ships — **the engine constructs and no refusal fires**. A
+  `-DCMAKE_BUILD_TYPE=Debug` build of the same fixture ABORTS, verbatim:
+  `` kv_cache_coordinator.cpp:386: ... Assertion `g.kv_cache_spec->block_size ==
+  hash_block_size && "differing group/hash block sizes are DEFERRED (M1.3 Task
+  3)"' failed. `` So the deferral is now load-bearing on a silent path: Release
+  proceeds past an invariant Debug says is violated, and the hash-granularity
+  port below is what makes the two agree. The tripwire that measured it is
+  `tests/vllm/entrypoints/test_deepseek_v4_multigroup_kv.cpp`, whose case (3)
+  still pins the explicit-override refusal so the guard cannot be deleted
+  unnoticed.
+
+  DeepSeek-V4 remains the only architecture in this tree publishing groups with
+  DIFFERING block sizes; every other multi-group registry (`glm5_next`,
+  `kimi_linear`, `nemotron_h`, `qwen4_exp`, `qwen3_5_common`) hands the same
+  `block_size` variable to every group. `block_pool.cpp:93,220` has NOT been
+  re-measured since the merge and is not claimed either way here.
 
   **WHAT IS OWED, AND FOR WHOM.** #2455 / W8 is what makes this path reachable;
   the hash-granularity port is owed BEHIND it and is deliberately NOT landed

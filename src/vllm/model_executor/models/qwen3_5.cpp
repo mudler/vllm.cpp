@@ -1298,6 +1298,28 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
     d.b.Copy(d.q, p, w.bytes.data(), nb);
     Backend* bk = &d.b;
     w.d_dev = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+    // THE SOURCE PAGES ARE SPENT, AND ON A STAGING DEVICE NOTHING WAS DROPPING
+    // THEM (.agents/specs/rocm-host-residency-after-upload.md). The copy above
+    // is the only read of this weight's host bytes that will ever happen there,
+    // and for a GGUF keep-quant load those bytes are the whole model -- 65.488
+    // GiB on `Qwen3.8-Flash-Next UD-IQ1_S`, faulted in by the load-time prefault
+    // and then held resident for the process lifetime, which is what wedges a
+    // 31 GiB gfx1151 host inside `svm_range_set_attr`. llama.cpp
+    // `unmap_fragment`s the equivalent range after its offloaded tensors are set
+    // (llama-model-loader.cpp:1683-1694). `AdoptDeviceBytesAsHost` below cannot
+    // do this job: it returns immediately for a GGUF borrow, by design, because
+    // the borrow must NOT be re-pointed at a device allocation the kernels are
+    // the only readers of.
+    //
+    // INSIDE THE `d_dev` MEMO ON PURPOSE, which is the whole of #1299's lesson:
+    // this function runs about 1,361 times per forward step, and a release that
+    // re-tested its condition each time would madvise away the pages the GPU is
+    // about to read, every step. The helper states its other two preconditions
+    // and synchronizes the queue before it touches anything.
+    vllm::MaybeReleaseStagedBorrowSource(
+        d.b, d.q, w,
+        vllm::platforms::GetPlatform(d.q.device.type)
+            .host_memory_is_device_addressable());
     // Same adoption as the dense block's ResidentWeight: on a host-addressable
     // device the uploaded buffer IS the host buffer, so keeping the mirror
     // costs a second full copy of the model out of the same unified RAM.

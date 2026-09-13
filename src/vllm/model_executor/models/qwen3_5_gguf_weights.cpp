@@ -298,13 +298,14 @@ OwnedTensor OwnGgufKeptSlice(const GgufFile& g, const GgufLoadPolicy& pol,
                              int64_t k, int64_t row_offset) {
   if (r == GgufResidency::kKeepQuant) {
     return OwnGgufQuantBlocks(t, n, k, row_offset, MmapSrc(g, pol),
-                              pol.quant_repack);
+                              pol.quant_repack, /*cuda_align=*/false,
+                              pol.prefault);
   }
   VT_CHECK(r == GgufResidency::kKeepF16,
            "qwen3_5 gguf: OwnGgufKeptSlice called for a non-keep residency on " +
                t.name);
   return OwnGgufF16(t, n, k, row_offset, MmapSrc(g, pol), /*nk=*/true,
-                    pol.elem_kn_repack, /*prefault=*/true, pol.weight_value_dtype);
+                    pol.elem_kn_repack, pol.prefault, pol.weight_value_dtype);
 }
 
 bool HasTensor(const GgufFile& g, const std::string& name) {
@@ -816,14 +817,14 @@ void LoadEmbedAndHead(const GgufFile& g, const GgufLoadPolicy& pol,
     // it does on the f16 arm — this tensor is a table, not a [N,K] GEMM weight.
     *embed = OwnGgufQuantBlocks(et, et.shape[0], et.shape[1], /*row_offset=*/0,
                                 MmapSrc(g, pol), /*repack=*/false,
-                                /*cuda_align=*/false, /*prefault=*/true,
+                                /*cuda_align=*/false, pol.prefault,
                                 GgufTensorRole::kEmbeddingTable);
     embed->nk = false;
   } else if (embed_r == GgufResidency::kKeepF16) {
     VT_CHECK(et.shape.size() == 2, "qwen3_5 gguf: token_embd must be 2-D");
     // Embedding gather table: never repacked (EmbeddingKernel reads it row-wise).
     *embed = OwnGgufF16(et, et.shape[0], et.shape[1], 0, MmapSrc(g, pol),
-                        /*nk=*/false, /*elem_kn_repack=*/false, /*prefault=*/true,
+                        /*nk=*/false, /*elem_kn_repack=*/false, pol.prefault,
                         pol.weight_value_dtype);
   } else {
     VT_CHECK(embed_r == GgufResidency::kExpandBf16,

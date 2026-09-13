@@ -1033,6 +1033,16 @@ bool ResolveGgufPrefault() {
                               /*builtin_default=*/true);
 }
 
+// The header states why this is not a second `getenv` in the model layer. The
+// PRESENCE of the variable is what makes the answer explicit, empty string
+// included: `ResolveResidencyBool` reads an empty value as an explicit OFF, so
+// treating "" as unset here would let the device default overrule an operator
+// who deliberately emptied the knob.
+bool GgufPrefaultIsExplicit() {
+  return std::getenv("VT_GGUF_PREFAULT") != nullptr ||
+         ActiveWeightResidencyConfig().prefault.has_value();
+}
+
 bool ExpertStreamRequestedFrom(const char* env_value,
                                std::optional<bool> configured) {
   // THE FIRST-CHARACTER RULE, transcribed rather than normalised. The site this

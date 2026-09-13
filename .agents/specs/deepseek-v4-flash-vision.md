@@ -931,10 +931,11 @@ above as its red-before input.
   `b10766` inside W6's declared bound; see `### W7-CUDA evidence`. What CUDA
   still cannot do is listed in the four entries below.
 
-- **`vt: MatVec weight size mismatch` IS NOW THE FIRST BLOCKER FOR A SERVED
-  IMAGE ON CUDA. It SUPERSEDES vision residency, which W7-CUDA fixed.**
+- **THE HOST GEMM's WEIGHT SIZE MISMATCH IS CLOSED. The first blocker for a
+  served image on CUDA is now the MoE VISION-BIAS DEVICE ROUTER**, which is
+  W4-era code carrying its own named refusal and is owed by #2411 W7-CUDA.
 
-  **THE BLOCKER ORDER ON THIS ROW HAS MOVED THREE TIMES UNDER MEASUREMENT, and
+  **THE BLOCKER ORDER ON THIS ROW HAS MOVED FOUR TIMES UNDER MEASUREMENT, and
   each move was only visible because the previous blocker was genuinely
   repaired.** A reader needs to know which are closed and which is live:
 
@@ -942,16 +943,28 @@ above as its red-before input.
   |---|---|---|
   | 1 | `fp8_ds_mla` KV cache at engine start | **NOT what stops a CUDA build.** W6 measured it on a CPU build; `KV-DSV4-MULTICACHE` W5 (#2455) owns it and it is untouched here |
   | 2 | `DeepSeek-V4 vision queue and weights must share one device` | **CLOSED by W7-CUDA.** See `### W7-CUDA evidence` |
-  | 3 | `vt: MatVec weight size mismatch at deepseek_v4.cpp:504` | **LIVE. This entry.** |
+  | 3 | the host GEMM's weight size mismatch, thrown as the anonymous `vt: MatVec weight size mismatch` until it was named | **CLOSED.** Named, then root-caused to `ForwardDevice` never binding the keep-quant tower, then repaired. Measured gone on `thor:gpu0`, rc job `1b46515d-8caf-4c49-823e-efc7a1f3e3f4`. This entry |
+  | 4 | `deepseek-v4 MoE: this step carries image rows, which route on the vision bias `exp_probs_b_vl`, and the device router takes one bias for the whole call with no per-row selector` | **LIVE.** W4-era code refusing BY NAME rather than routing image rows on the text bias. The device arm is owed by #2411 W7-CUDA; it is not a regression from blocker 3's repair |
 
   **THE EXACT FAILING INVOCATION.** `test_deepseek_v4_mm_chat`'s served image
-  request dies with
+  request died with
   `engine-fatal: EngineCore busy loop threw: vt: MatVec weight size mismatch at
-  deepseek_v4.cpp:504`. `MatVec` has exactly ONE call site in that file, `:567`,
-  inside `Gemm`'s HOST-FLOAT FALLBACK:
-  `const std::vector<float> y = MatVec(wf32, &x[t * K], N, K);` — so `out = N`,
-  `in = K`, and the guard that fires is
-  `VT_CHECK(static_cast<int64_t>(w.size()) == out * in, ...)` at `:504`.
+  deepseek_v4.cpp:504`. `MatVec` has exactly ONE call site in that file, inside
+  `Gemm`'s HOST-FLOAT FALLBACK:
+  `const std::vector<float> y = MatVec(wf32, &x[t * K], N, K, tensor, layer);`
+  — so `out = N`, `in = K`, and the guard that fires is
+  `VT_CHECK(static_cast<int64_t>(w.size()) == out * in, ...)`.
+
+  **THE MESSAGE IS NO LONGER THAT ONE, and no line number is quoted here on
+  purpose.** Since the named-refusal commit on this row's branch the guard reads
+
+  ```text
+  vt: deepseek-v4 host GEMM: weight size mismatch: tensor `<name>` layer <n>
+  want [N=..,K=..] = .. elements, got .. elements
+  ```
+
+  A citation by LINE NUMBER is what went stale three times on this entry
+  already, so the guard is named by its message and its function instead.
 
   **IT IS NOT THE DEVICE GEMM PATH**, and calling it one would be wrong. `Gemm`
   takes its keep-quant arm only when
@@ -962,46 +975,117 @@ above as its red-before input.
   `VT_CHECK(deepseek_v4::V4DeviceKernelsAvailable(), kDevicePending)`, so only a
   build with the V4 device kernels can get this far.
 
-  **THE ASYMMETRY IS THE FINDING.** The keep-quant arm carries a NAMED shape
-  refusal (`keep-quant GEMM: weight shape mismatch: want [N=..,K=..] got [..]`)
-  while this fallback arm's guard is ANONYMOUS. The same wrong shape is
-  diagnosable on one arm and nameless on the other. The tree already says what
-  that costs: `deepseek_v4_weights.cpp:346` records that the assertion is
-  "unconditional (a plain `VT_CHECK` and not an `assert`, so it survives
-  `NDEBUG`)" and that the throw "names neither the tensor, nor the layer, nor
-  the geometry, nor what is missing".
+  **THE ASYMMETRY WAS THE FINDING, AND IT IS NOW CLOSED.** The keep-quant arm
+  carried a NAMED shape refusal
+  (`keep-quant GEMM: weight shape mismatch: want [N=..,K=..] got [..]`) while
+  this fallback arm's guard was ANONYMOUS, so the same wrong shape was
+  diagnosable on one arm and nameless on the other. Both arms now take the
+  tensor name and the layer index and refuse in the same vocabulary. The labels
+  are REQUIRED rather than defaulted, because a defaulted label leaves a call
+  site anonymous — which is the defect itself — and requiring them makes a
+  forgotten site a `-Werror` build failure rather than a silent gap;
+  `check-tree-compiles` compiled 685 of 685 translation units in scope, which is
+  what proves no site was missed.
 
-  **WHAT IS UNMEASURED, and is not guessed here:** the `N` and `K` values, which
-  tensor, and which layer. This throw names none of them by construction, so
-  recovering them needs an instrumented device run. It is NOT the aarch64 repack
-  path — the failure is byte-identical with `VT_CPU_QUANT_REPACK=0`.
+  **CLOSING THE ASYMMETRY IS A DIAGNOSTIC, NOT THE REPAIR.** The wrong shape is
+  still thrown and a served image still does not complete. What changed is that
+  the throw now says which tensor and which layer, which is the instrument this
+  entry needed and never had.
 
-  **A STALE CROSS-REFERENCE a reader will otherwise chase, and it is THREE
-  places rather than four.** `deepseek_v4.cpp:728` and `:734`,
-  `deepseek_v4.cpp:832` and `deepseek_v4_weights.cpp:344` and `:347` cited this
-  throw as `deepseek_v4.cpp:413`. `deepseek_v4_weights.cpp:1068` names the same
-  anonymous message and carries NO line number, so it was never stale; this
-  record said four and the tree says three. The guard sits at `:504`, which is
-  what the measured failure reports, and the three stale citations are corrected
-  to `:504` here. A fourth `:413` citation lives in
+  **IT IS NOW MEASURED, and the naming commit was the instrument.** On
+  `thor:gpu0` (sm_110, CUDA 13.0.88, aarch64), rc job
+  `04f39bcb-5636-4043-9cfc-8bdebd4862ec`, `test_deepseek_v4_mm_chat`'s served
+  image reported:
+
+  ```text
+  engine-fatal: EngineCore busy loop threw: vt: deepseek-v4 host GEMM: weight
+  size mismatch: tensor `wq_a` layer 0 want [N=32,K=32] = 1024 elements,
+  got 0 elements
+  ```
+
+  The tensor is `wq_a`, the layer is `0`, and `N=K=32` is the fixture's
+  `q_lora_rank` by `hidden_size`. It is NOT the aarch64 repack path — the failure
+  is byte-identical with `VT_CPU_QUANT_REPACK=0`.
+
+  **`got 0` IS THE FINDING, and it rules the shape hypothesis out.** A wrong
+  shape produces a wrong COUNT; zero means the weight reached NEITHER arm.
+  `DeepseekV4Model::ForwardDevice` built its backend with `gguf=nullptr` and
+  bound only the EXL3 tower, so `ForwardComposeImpl` read
+  `kq_src = be.gguf != nullptr` as false and handed every layer `Lq = nullptr`.
+  Every `Gemm` then fell to the host-float arm — and on a GGUF load the host MLA
+  tower is empty BY DESIGN, which `deepseek_v4_weights.cpp` asserts in as many
+  words (`hl.wq_a.empty() && ...`), because the weight is meant to be consumed
+  keep-quant. Layer 0's `wq_a` is simply the first GEMM the composition performs,
+  which is why the blocker surfaced there rather than somewhere more diagnostic.
+
+  **WHY NO GATE HELD THIS.** The sibling `DeepseekV4Model::Forward` has always
+  dispatched on `has_gguf_weights`; this entry never did, and
+  `git log -S'dev_be.gguf'` finds nothing since `dev_be` arrived in `d7d1ee914`.
+  The registry sends the runner's default `gather_logits` path to
+  `ForwardDevice` unconditionally (`deepseek_v4_registry.cpp:246`), yet no test
+  has ever driven that entry with a GGUF tower: every `ForwardDevice` case under
+  `tests/` belongs to another architecture, and `test_cuda_deepseek_v4.cpp`'s own
+  `ForwardDevice ASSEMBLES` case sets `has_host_weights` with no GGUF tower at
+  all. A CPU build cannot reach it either, because `kDevicePending` refuses
+  first. The unexecuted combination was "device entry + GGUF checkpoint", which
+  is precisely what serving a real checkpoint does.
+
+  **THE CROSS-REFERENCES THAT WENT STALE TWICE ARE NOW LINE-FREE.** The comments
+  in `deepseek_v4.cpp` and `deepseek_v4_weights.cpp` that quoted this throw cited
+  it first as `deepseek_v4.cpp:413` and then as `:504`; each correction went
+  stale the next time the file moved. The naming commit rewrites those comments
+  to quote the MESSAGE and to say what the by-name loader refusals still buy over
+  it — they name WHAT IS MISSING and every mismatched tensor at once, which a
+  per-GEMM throw reports one at a time and only for the tensor whose GEMM runs
+  first — and it removes the line numbers rather than correcting them a third
+  time. A `:413` citation still lives in
   `tests/vllm/models/test_deepseek_v4_exl3_forward.cpp:443,446`, which belongs to
   `MODEL-DSV4-EXL3` and is left to that row.
 
-  Root-causing it, and giving the fallback arm a named refusal, are owed by
-  issue #2411 and W7-CUDA, and by the row-owned local issue this repair filed
-  for it under `.agents/issues/MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm/`.
+  **Giving the fallback arm a named refusal is DONE** (this row's branch, with a
+  red-first case in `test_deepseek_v4_forward` that enters through the production
+  `DeepseekV4ForwardHost` and asserts the tensor, the layer, both geometries and
+  the actual element count). **Root-causing it is DONE too, and the repair is
+  committed on this row's branch**: `ForwardDevice` now binds the keep-quant
+  tower when the load took that arm, in the same order `Forward` binds it.
+  **THE OUTCOME IS MEASURED TOO, and it is NOT a working image.** Under the
+  lease (`thor:gpu0`, output dirs `bind-20260912-232118` and
+  `bind-20260912-235206`) the `wq_a` refusal is GONE — step `image_past_wq_a`
+  RC=0 — and the request travels the whole registered forward. It then STOPS at
+  blocker 4 in the table above, the MoE vision-bias device router, which is
+  W4-era code refusing by name. No suite regressed either side of the repair:
+  `test_deepseek_v4_forward` 7 of 7 and `test_deepseek_v4_mm_reach` 20 of 20
+  under `VT_CPU_QUANT_REPACK=0`.
 
-- **`test_deepseek_v4_mm_chat`'s image branch encodes a CPU-ONLY PREMISE and
-  fails on any CUDA build.** Its else-branch asserts the served error names
+  **SO THIS ENTRY CLAIMS A ROOT CAUSE, A REPAIR AND A MOVED BLOCKER — never a
+  served image.** What remains owed for a served image is the device MoE arm,
+  which belongs to issue #2411 and W7-CUDA rather than to this entry. The
+  row-owned local issue for the anonymous refusal is CLOSED; the issues still
+  open under `.agents/issues/MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm/`
+  are the remaining ones. That issue is
+  named by DIRECTORY rather than by ID on purpose: a row-owned issue whose stable
+  ID appears in a spec's `## Owed` is exactly what
+  `scripts/check-agent-record.py` refuses, because an ID listed as owed is how a
+  ROWLESS issue is tracked and a row-owned one is tracked by its directory.
+
+- **`test_deepseek_v4_mm_chat`'s image branch encoded a CPU-ONLY PREMISE. FIXED,
+  and green on CUDA.** Its else-branch asserted the served error names
   `W7-device`, which is `kDevicePending` — and `ForwardDevice` guards that with
   `VT_CHECK(V4DeviceKernelsAvailable(), kDevicePending)`, a predicate that is
-  FALSE exactly when the device kernels are absent. On a CUDA build the refusal
-  therefore cannot fire, and the assertion can never hold. One assertion of 650
-  fails for this reason (the sibling `deepseek_v4.cpp` check now passes, because
-  the new message names that file). The case needs a device-aware expectation
-  rather than a CPU-shaped one; owed by issue #2411 and W7-CUDA, and by its own
-  row-owned local issue under
-  `.agents/issues/MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm/`.
+  FALSE exactly when the device kernels are absent. On a CUDA build that refusal
+  cannot fire, so the assertion was not merely unmet but UNSATISFIABLE.
+
+  The branch now selects on `V4DeviceKernelsAvailable()` — the same symbol
+  `test_cuda_deepseek_v4.cpp` uses — keeping the old expectation where the
+  kernels are absent and asserting the MoE vision-bias refusal where they are
+  present. It asserts that refusal rather than merely "not `W7-device`", because
+  a bare inequality would accept ANY failure, including a regression that stopped
+  the request earlier: this row has already lived through exactly that twice.
+
+  **MEASURED both ways on `thor:gpu0`**, same box and same suite: before the
+  change `8 | 7 passed | 1 failed` (the one failure being this assertion), after
+  it `8 | 8 passed | 0 failed` (`bind-20260912-235206`). Its row-owned local
+  issue is CLOSED with that evidence.
 
 - **8 of 20 `test_deepseek_v4_mm_reach` cases FAIL ON AARCH64, and the cause is
   the i8mm quant repack rather than the device.** Every one throws

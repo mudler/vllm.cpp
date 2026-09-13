@@ -342,12 +342,14 @@ Exl3RankSlice ReadRankSlice(const StIndex& index, const std::string& base, int b
 // refuses a mismatch BY NAME. That is not defensive decoration, and the reason is
 // DIAGNOSTIC rather than numeric. A tensor materialized at the wrong shape does
 // not produce a wrong number: `Gemm`'s host arm is a `MatVec` whose size
-// assertion is unconditional (`deepseek_v4.cpp:504`, a plain `VT_CHECK` and not
-// an `assert`, so it survives `NDEBUG`), and its keep-quant arm checks too. What
-// it produces is an ANONYMOUS throw — `vt: MatVec weight size mismatch at
-// deepseek_v4.cpp:504` — that names neither the tensor, nor the layer, nor the
-// geometry, nor what is missing. Refusing HERE replaces that with a message the
-// reader can act on.
+// assertion is unconditional (a plain `VT_CHECK` and not an `assert`, so it
+// survives `NDEBUG`), and its keep-quant arm checks too. What it produces is a
+// throw — `vt: deepseek-v4 host GEMM: weight size mismatch: tensor `<name>`
+// layer <n> want [N=..,K=..] = .. elements, got .. elements` — which since
+// W7-CUDA (#2411, ISSUE-LOCAL-01M29KEXRT2GCS6C53DT2S3SPX) names the tensor, the
+// layer and both geometries, but still not WHAT IS MISSING, and only for the
+// first tensor whose GEMM happens to run. Refusing HERE says what is missing,
+// and says it for every tensor at once.
 
 // The carried half's own quantization recipe. The artifact records it twice —
 // `quantization_config.base_quantization_config` and the top-level
@@ -1065,9 +1067,10 @@ DeepseekV4Weights LoadDeepseekV4Exl3(const std::vector<SafetensorsFile>& shards,
   //    routed-expert block EXL3 replaced — MATERIALIZED into the host-float
   //    tower `ForwardComposeImpl` composes with (W1c). W1b only counted these.
   //    Every destination shape comes from the resolved config, so the refusal
-  //    that fires on the real artifact's DSA geometry NAMES the tensor instead
-  //    of the ANONYMOUS `vt: MatVec weight size mismatch` a wrong shape throws
-  //    anyway. That is a DIAGNOSTIC and the whole of it, not the difference
+  //    that fires on the real artifact's DSA geometry names WHAT IS MISSING,
+  //    which the per-GEMM `vt: deepseek-v4 host GEMM: weight size mismatch` a
+  //    wrong shape throws anyway still does not. That is a DIAGNOSTIC and the
+  //    whole of it, not the difference
   //    between wrong tokens and a refusal — the reader-shape block above says
   //    why (see `## W1c design` W1c-4). ─────────────────────────────────────
   std::unordered_set<std::string> routed;

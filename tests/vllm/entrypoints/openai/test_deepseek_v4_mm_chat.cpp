@@ -38,6 +38,10 @@
 #include "deepseek_v4_mmproj_fixture.h"
 #include "vllm/config/multimodal.h"
 #include "vllm/entrypoints/model_loader.h"
+// The device-kernel predicate the image expectation below selects on. Same
+// symbol the CUDA suite uses (test_cuda_deepseek_v4.cpp), so the two agree on
+// what "this build carries the V4 device kernels" means.
+#include "vllm/model_executor/models/deepseek_v4_device.h"
 #include "vllm/entrypoints/openai/chat_mm.h"
 #include "vllm/entrypoints/openai/mm_chat_registry.h"
 #include "vllm/entrypoints/openai/protocol.h"
@@ -886,8 +890,36 @@ TEST_CASE("dsv4 mm chat: two images reach the server through the production inst
     // four content parts a seam-less path would have rendered.
     CHECK(image_run.role == "assistant");
     CHECK(image_run.prompt_tokens > 200);
-  } else {
+  } else if (!vllm::deepseek_v4::V4DeviceKernelsAvailable()) {
+    // NO V4 DEVICE KERNELS. `ForwardDevice` refuses at its FIRST guard,
+    // `VT_CHECK(V4DeviceKernelsAvailable(), kDevicePending)`, whose message
+    // names `W7-device`. That predicate is false exactly when the kernels are
+    // absent, so this expectation belongs to this build and only to this build.
     CHECK(image_run.error.find("deepseek_v4.cpp") != std::string::npos);
     CHECK(image_run.error.find("W7-device") != std::string::npos);
+  } else {
+    // WITH the V4 device kernels the `kDevicePending` refusal CANNOT fire, so
+    // asserting `W7-device` here is not merely unmet, it is UNSATISFIABLE -- it
+    // encoded the absent-kernel build as a premise
+    // (ISSUE-LOCAL-01M29KF3SNQCR8163840XSBK5S).
+    //
+    // WHAT A CUDA BUILD ANSWERS IS MEASURED, not assumed. On `thor:gpu0`
+    // (sm_110, CUDA 13.0.88), rc job `1b46515d-8caf-4c49-823e-efc7a1f3e3f4`, the
+    // request travels the whole registered forward and stops at the MoE router's
+    // own named refusal: an image step routes on the vision bias
+    // `exp_probs_b_vl`, and the device router takes ONE bias for the call with
+    // no per-row selector, so it refuses BY NAME rather than routing image rows
+    // on the text bias -- fluently and wrong. That device arm is owed by #2411
+    // W7-CUDA.
+    //
+    // ASSERTING THE VISION-BIAS REFUSAL, not merely "not W7-device", is the
+    // point. A bare inequality would accept ANY failure, including a regression
+    // that stopped the request earlier -- which is exactly what this row has
+    // already lived through twice (the vision-residency refusal, then the host
+    // GEMM's `wq_a` layer 0). When W7-CUDA lands the per-row bias the request
+    // stops failing and takes the `served` branch above instead.
+    CHECK(image_run.error.find("deepseek_v4.cpp") != std::string::npos);
+    CHECK(image_run.error.find("W7-device") == std::string::npos);
+    CHECK(image_run.error.find("exp_probs_b_vl") != std::string::npos);
   }
 }

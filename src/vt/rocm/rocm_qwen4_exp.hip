@@ -45,21 +45,95 @@
 // changes answer when somebody adds a flag. `__fmul_rn`/`__fadd_rn` say what is
 // meant in the source instead.
 //
-// ─── THE REDUCTION WIDTHS ARE INHERITED, NOT CHOSEN ─────────────────────────
-// `HcGroupedNormKernel` below accumulates the grouped sum of squares in
-// **double**, because `cpu_qwen4_exp.cpp` does and its header measures why
-// ("on magnitude-separated data, a float accumulator and this one differ by
-// 742x"). `vt::RmsNormGroup`'s arm in `rocm_rms_norm_group.hip` reduces the
-// same SHAPE in **f32**, deliberately, and the two must NOT be unified: each
-// keeps the width its own oracle was dumped in. A ROCm arm that picked its own
-// width would have unified them by accident.
+// ─── THE ORACLE DEFINES BOTH THE SHAPE AND THE WIDTH, AND IT WAS READ ───────
+// AGENTS.md makes vLLM the primary reference wherever it implements the
+// behaviour, and it implements THIS one. `vllm/models/qwen4_exp/amd/ops/hc.py`
+// at the pin `e126687a9a` is vLLM's own first-party ROCm arm of this exact
+// norm, and `_grouped_gemma_rmsnorm_kernel` (`:13-51`) settles both questions
+// this file used to answer from its own CPU sibling:
 //
-// ─── NO MFMA, NO DP4A, NO WAVEFRONT ASSUMPTION ──────────────────────────────
-// Nothing below uses a cross-lane primitive, a matrix intrinsic or a warp
-// width. Every kernel is a grid-stride loop over independent output elements,
-// so the file is wavefront-size agnostic and carries no gfx-family dependency.
-// That is why W1 picked these ops: they prove the file and registration shape
-// without also having to answer an RDNA capability question.
+//   `_grouped_gemma_rmsnorm_kernel[(N * num_groups,)](...)`            `:66`
+//   `x = tl.load(x_ptr + row * stride_x + offsets, ...).to(tl.float32)` `:42`
+//   `rrms = tl.rsqrt(tl.sum(x * x) / GROUP_DIM + EPS)`                  `:45`
+//
+// The GRID IS `N * num_groups` PROGRAMS -- one BLOCK per (token, hc stream)
+// group, never one thread -- with `BLOCK_SIZE = next_power_of_2(GROUP_DIM)`, so
+// the whole group is one vector inside one program and `tl.sum` folds it as a
+// TREE. The accumulation is `tl.float32`. eps is inside the rsqrt, added to the
+// mean square. vLLM's own PyTorch reference for the same norm agrees on the
+// width at `common/hyperconnection.py:75`, `hidden_states.float()`.
+//
+// `amd/ops/hc.py` AND `nvidia/ops/hc.py` ARE THE SAME FILE -- diffed at the pin,
+// byte-identical but for one docstring line, 487 lines each -- so this is not an
+// AMD-specific shape a ROCm arm inherits by accident. It is what vLLM computes
+// on both backends, and what our own CUDA arm has computed since `ee0644eab`.
+//
+// So the kernel below is a MIRROR and not an invention: one block per group and
+// an f32 tree is what the oracle computes, and the one-thread-per-group `double`
+// walk this file shipped until now diverged from it on BOTH axes. The remaining
+// difference is below the behaviour line -- vLLM lets Triton pick the program
+// shape for a 4096-wide vector where this kernel takes a fixed `kBlock` and
+// strides, so the two trees have different DEPTHS while having the same width
+// and the same order-independence. That is what the gate's derived bound is
+// sized from.
+//
+// ONE vLLM SPELLING IS DELIBERATELY NOT ADOPTED, and it is the one D3a of
+// `.agents/specs/qwen4-exp-rocm-ops.md` already argued: `hc.py:47-48` writes the
+// Gemma affine as `y = x * rrms; y += y * w` and says in its own comment that
+// the form exists "to lower to an FMA". This file keeps `(x*rrms) * (1 + w)`,
+// which is what vLLM's OWN reference defines at
+// `common/hyperconnection.py:87` (`normalized * (1.0 + self.weight.float())`).
+// A lowering hint is not a behaviour. Nothing in this change touches it.
+//
+// ─── THE REDUCTION WIDTH IS THE ORACLE'S, AND THIS PARAGRAPH REPLACES THE ONE
+//     THAT SAID IT WAS INHERITED ────────────────────────────────────────────
+// `HcGroupedNormKernel` below accumulates the grouped sum of squares in
+// **float**. This paragraph used to say the opposite -- that the `double` was
+// "inherited, not chosen" from `cpu_qwen4_exp.cpp` and that unifying it with
+// `vt::RmsNormGroup`'s f32 would be an accident -- and that reading was wrong
+// about which arm the convention belongs to. The CPU reference's own header
+// settles it at `src/vllm/model_executor/models/qwen4_exp_hc.h:99-104`: the
+// double is "the `deepseek_v4_mhc.cpp` house convention for a HOST REFERENCE",
+// upstream runs the norm in fp32 (`self._norm(x.float())`) and vLLM likewise,
+// and "the device arm is the thing that must be fp32-accumulate and gated
+// against these numbers". A device arm carrying the reference's width was the
+// outlier; this moves it onto the oracle. The CUDA twin made the same move in
+// `ee0644eab` and this file mirrors it rather than diverging from it.
+//
+// THE COST IS REAL AND IS NAMED RATHER THAN HIDDEN. On MAGNITUDE-SEPARATED data
+// -- the shape `test_qwen4_exp_hc_device.cpp:504` was built for -- an f32
+// accumulator is a worse approximation of the reference than a double one. That
+// case measures a serial f32 walk at 6.702e-04 against a double walk's
+// 1.173e-06, and it runs the CPU arm ONLY, so it cannot red this kernel. The
+// number this kernel actually pays is not that one, because the reduction below
+// is a TREE about ten deep at H = 2560 rather than a 2560-deep serial chain,
+// and `test_qwen4_exp_rocm_reductions.cpp`'s magnitude-separated case measures
+// and prints it against that same 1e-5 bar.
+//
+// The `1 +` gamma fold stays f32, which is upstream's width, and it is NOT
+// covered by any of this: the accumulator width question is about the REDUCTION
+// and must not be allowed to move the multiplier.
+//
+// ─── NO MFMA, NO DP4A, AND NO WAVEFRONT *SIZE* ASSUMPTION ───────────────────
+// This paragraph used to say "no cross-lane primitive" as well, and that clause
+// is now false: `HcGroupedNormKernel` folds its per-group partials with
+// `__shfl_down`, because the alternative to a cross-lane reduction was the
+// four-active-threads launch this file shipped until now.
+//
+// WHAT STILL HOLDS, AND IT IS THE PART THAT MATTERED. No matrix intrinsic and
+// no MFMA -- those are CDNA-only and would have made this file refuse to build
+// for RDNA. And no wavefront SIZE is assumed anywhere: every lane constant in
+// the reduction is derived from `warpSize`, which HIP defines as
+// `__builtin_amdgcn_wavefrontsize()` and constant-folds per target, so the tree
+// is 5 levels on a wave32 RDNA part and 6 on a wave64 CDNA one from the same
+// source. The shared partial array is sized for the MAXIMUM wave count a
+// `kBlock` block can have (wave32); a wave64 target uses the first HALF of it
+// -- `kBlock / 32` is 8 slots and a wave64 block of 256 threads has `nwave` 4 --
+// and the `lane < nwave` guard keeps the fold off the slots no wave wrote.
+//
+// ONLY WAVE32 IS MEASURED. `strix:gpu0` (gfx1151, RDNA 3.5) is the only AMD part
+// in this fleet, so the wave64 path is REASONED and not run. The spec's
+// `## Owed` says so rather than letting the silence read as coverage.
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -87,6 +161,13 @@ hipStream_t AsStream(const Queue& q) { return static_cast<hipStream_t>(q.handle)
 unsigned GridFor(int64_t n) {
   const int64_t blocks = (n + kBlock - 1) / kBlock;
   return static_cast<unsigned>(blocks < 4096 ? blocks : 4096);
+}
+
+// ONE BLOCK PER ITEM, where `GridFor` gives one THREAD per item. Same 4096-block
+// cap, which is why every kernel launched through this one keeps a grid-stride
+// loop over its items.
+unsigned GridForGroups(int64_t n) {
+  return static_cast<unsigned>(n < 4096 ? (n > 0 ? n : 1) : 4096);
 }
 
 // The donor's runtime dtype tag. Local to this TU for the reason its own header
@@ -214,43 +295,112 @@ __device__ inline float SigmoidF(float x) {
   return __frcp_rn(__fadd_rn(1.0f, expf(-x)));
 }
 
-// STAGE 1 — the grouped RMS norm, ONE THREAD PER (token, hc stream). Each group
-// is `hidden` CONSECUTIVE elements, so no thread can see another's group, and
-// the walk is the host's ascending one.
+// STAGE 1 — the grouped RMS norm, ONE BLOCK PER (token, hc stream) group. Each
+// group is `hidden` CONSECUTIVE elements, so no block can see another's group.
+//
+// THE PER-GROUP WALK IS NO LONGER THE HOST'S ASCENDING SERIAL ONE. It is a
+// strided partial per thread folded in a `__shfl_down` tree and then across the
+// waves, in f32. Both header sections above say why the width and the shape each
+// changed; the short version is that the shape was costing 35.10% of the decode
+// kernel budget on `strix:gpu0` at `hc_count = 4` and `T = 1`, where the old
+// launch gave this kernel FOUR ACTIVE THREADS and each of them walked H = 2560
+// twice.
 __global__ void HcGroupedNormKernel(float* normed, const void* hyper, DTag hyper_tag,
                                     const void* hc_norm_w, DTag w_tag, int64_t T, int64_t hc,
                                     int64_t H, float eps) {
+  // One slot per WAVE of the block, sized for the largest wave count a `kBlock`
+  // block can have -- that is wave32's `kBlock / 32`, 8 slots. A wave64 target
+  // has `nwave = 256 / 64 = 4` and so fills the first HALF, and the
+  // `lane < nwave` guard below keeps the fold off the rest. This kernel is in an anonymous namespace and has exactly ONE launch
+  // site, which passes `kBlock`, so the array is sized from that constant while
+  // every index is still computed from `blockDim.x`; a second launch site with a
+  // different block size would have to resize it, and that is why there is not
+  // one.
+  __shared__ float s_part[kBlock / 32];
+  __shared__ float s_r;
   const int64_t flat = hc * H;
   const int64_t total = T * hc;
-  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
-  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < total;
-       idx += step) {
-    const int64_t t = idx / hc;
-    const int64_t j = idx - t * hc;
+  // `warpSize` is `__builtin_amdgcn_wavefrontsize()` and is a per-target
+  // constant, so these three are folded at compile time on both wave widths.
+  const unsigned lane = static_cast<unsigned>(threadIdx.x) % static_cast<unsigned>(warpSize);
+  const unsigned wave = static_cast<unsigned>(threadIdx.x) / static_cast<unsigned>(warpSize);
+  const unsigned nwave = static_cast<unsigned>(blockDim.x) / static_cast<unsigned>(warpSize);
+  for (int64_t g = static_cast<int64_t>(blockIdx.x); g < total;
+       g += static_cast<int64_t>(gridDim.x)) {
+    const int64_t t = g / hc;
+    const int64_t j = g - t * hc;
     const int64_t base = t * flat + j * H;
-    // `x.reshape(...).pow(2).mean(-1)` over the GROUP. DOUBLE, inherited from
-    // the CPU arm rather than chosen — see the header.
-    double ss = 0.0;
-    for (int64_t h = 0; h < H; ++h) {
-      const double v = static_cast<double>(LoadAt(hyper, hyper_tag, base + h));
-      ss = __dadd_rn(ss, __dmul_rn(v, v));
+    // `x.reshape(...).pow(2).mean(-1)` over the GROUP, in f32 — upstream's and
+    // vLLM's width. Every thread of the block takes a strided slice; a thread
+    // whose slice is empty (H < blockDim.x) contributes an exact 0.
+    float part = 0.0f;
+    for (int64_t h = static_cast<int64_t>(threadIdx.x); h < H;
+         h += static_cast<int64_t>(blockDim.x)) {
+      const float v = LoadAt(hyper, hyper_tag, base + h);
+      part = __fadd_rn(part, __fmul_rn(v, v));
     }
-    // eps is INSIDE the rsqrt, added to the MEAN SQUARE, never to the norm. The
-    // narrowing point is the host's: the quotient becomes float BEFORE eps is
-    // added.
-    const float r = __frcp_rn(sqrtf(
-        __fadd_rn(static_cast<float>(__ddiv_rn(ss, static_cast<double>(H))), eps)));
-    for (int64_t h = 0; h < H; ++h) {
+    // `_rn` throughout, for the same reason the rest of this TU spells it out:
+    // this build pins `-ffp-contract=off` for HIP, but an arm whose numerics
+    // depend on a compile option staying set is an arm that changes answer when
+    // somebody adds a flag.
+    for (int off = warpSize / 2; off > 0; off >>= 1) {
+      part = __fadd_rn(part, __shfl_down(part, static_cast<unsigned>(off)));
+    }
+    if (lane == 0) s_part[wave] = part;
+    __syncthreads();
+    if (wave == 0) {
+      float v = (lane < nwave) ? s_part[lane] : 0.0f;
+      for (int off = warpSize / 2; off > 0; off >>= 1) {
+        v = __fadd_rn(v, __shfl_down(v, static_cast<unsigned>(off)));
+      }
+      if (lane == 0) {
+        // eps is INSIDE the rsqrt, added to the MEAN SQUARE, never to the norm.
+        // The narrowing point is GONE rather than moved: the quotient was
+        // already float at this line, and eps is still added to it and nowhere
+        // else.
+        s_r = __frcp_rn(sqrtf(__fadd_rn(__fdiv_rn(v, static_cast<float>(H)), eps)));
+      }
+    }
+    __syncthreads();
+    const float r = s_r;
+    // ORDER-INDEPENDENT, so it simply strides across the block: every output
+    // element reads operands no other thread writes.
+    for (int64_t h = static_cast<int64_t>(threadIdx.x); h < H;
+         h += static_cast<int64_t>(blockDim.x)) {
       // THE `1 +` IS THE OP'S. `hc_norm_w` is the RAW HuggingFace gamma, centred
       // on zero (#2218); dropping the fold scales the stream by ~0 and reads as
       // a corrupt checkpoint rather than as a wiring bug. THE FOLD IS f32, which
-      // is upstream's width (`1.0 + self.weight.float()`) and not a convenience
-      // — the double above isolates the REDUCTION and must not also move the
-      // multiplier.
+      // is upstream's width (`1.0 + self.weight.float()`) and not a convenience.
       const float w = LoadAt(hc_norm_w, w_tag, j * H + h);
       normed[base + h] = __fmul_rn(__fmul_rn(LoadAt(hyper, hyper_tag, base + h), r),
                                    __fadd_rn(1.0f, w));
     }
+    // NO TRAILING `__syncthreads()` BELONGS HERE, and the argument is the
+    // donor's. `s_part` and `s_r` are the only shared state, so the group grid
+    // stride has exactly TWO cross-iteration hazards and each already has one of
+    // the barriers above between its ends:
+    //
+    //   `s_part` WAR -- wave 0 READS `s_part[lane]` in the cross-wave fold of
+    //   trip g; lane 0 of every wave WRITES `s_part[wave]` at trip g+1. The
+    //   SECOND barrier of trip g stands between them.
+    //
+    //   `s_r` WAR -- every thread READS `s_r` into `r` at trip g; thread 0
+    //   WRITES `s_r` at trip g+1 inside the `wave == 0` fold. The FIRST barrier
+    //   of trip g+1 stands between them.
+    //
+    // The two RAW pairs are inside one trip and the same two barriers order
+    // them. Every step of this rests on the trip count being BLOCK-UNIFORM, and
+    // it is: `g` is seeded from `blockIdx.x` and stepped by `gridDim.x`, neither
+    // of which varies within a block. `r` is a REGISTER copy, and
+    // `__syncthreads()` is a compiler barrier as well as a hardware one, so the
+    // load of `s_r` cannot be sunk past the next trip's first barrier.
+    //
+    // THE DONOR'S RACECHECK MEASUREMENT IS NOT INHERITED AS EVIDENCE. CUDA's
+    // `compute-sanitizer --tool racecheck` reported `0 hazards displayed` on the
+    // equivalent bytes; no ROCm equivalent was run for this file, and the spec's
+    // `## Owed` records that rather than borrowing the CUDA result. What is
+    // gated here is the VALUE, by the grid-cap case -- the only committed case
+    // that takes a second trip.
   }
 }
 
@@ -358,7 +508,10 @@ void Qwen4ExpGatedResidualKernelRocm(Queue& q, Tensor& mixed, Tensor* injection,
     ~FreeGuard() { if (p != nullptr) (void)hipFree(p); }
   } guard{scratch};
 
-  HcGroupedNormKernel<<<GridFor(T * hc), kBlock, 0, AsStream(q)>>>(
+  // ONE BLOCK PER GROUP, not one thread per group. `GridForGroups` keeps the
+  // same 4096-block cap `GridFor` applies, which is why the kernel's group loop
+  // is a grid stride.
+  HcGroupedNormKernel<<<GridForGroups(T * hc), kBlock, 0, AsStream(q)>>>(
       d_normed, hyper.data, hyper_tag, hc_norm_w.data, w_tag, T, hc, H, args.eps);
   Check(hipGetLastError(), "qwen4_exp_gated_residual norm launch");
 

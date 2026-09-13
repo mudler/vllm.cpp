@@ -87,6 +87,7 @@
 #include <string>
 #include <vector>
 
+#include "qwen4_exp_hc_synth.h"
 #include "support/max_abs_diff.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -110,7 +111,14 @@ namespace {
 
 namespace g = qwen4_exp_qsa_goldens;
 
-constexpr double kAbsFloor = 1e-30;
+// `kAbsFloor`, `Agreement`, `Compare`, `CheckBitwise` and `CheckWithin` now live
+// in `qwen4_exp_hc_synth.h`, beside the fixture and the bound they report, so the
+// ROCm gate holds this kernel to the SAME derivation instead of a second copy.
+using q4hc::Agreement;
+using q4hc::CheckBitwise;
+using q4hc::CheckWithin;
+using q4hc::Compare;
+using q4hc::kAbsFloor;
 
 // ─── THE GATHER'S ARM-VS-ARM BOUND IS DERIVED, NOT FITTED ────────────────────
 //
@@ -291,56 +299,7 @@ double RelL2(const std::vector<float>& a, const float* b, int64_t n) {
   return std::sqrt(num) / std::max(std::sqrt(den), 1e-30);
 }
 
-// max|a-b| with `std::max`'s NaN blindness removed, plus the count of elements
-// that are not BITWISE equal. Both are reported, because "within one ulp" and
-// "identical" are different findings and this file claims the second wherever it
-// can get it.
-struct Agreement {
-  double worst = 0.0;
-  size_t not_bitwise_equal = 0;
-};
 
-Agreement Compare(const std::vector<float>& got, const std::vector<float>& want) {
-  REQUIRE(got.size() == want.size());
-  Agreement a;
-  // MaxAbsDiff returns +infinity on ANY non-finite operand and raises its own
-  // doctest failure, so an all-NaN device output cannot read as a perfect match
-  // here. That defect is issue #449 and this file must not re-introduce it by
-  // hand-rolling a reduction.
-  a.worst = MaxAbsDiff(got, want);
-  for (size_t i = 0; i < got.size(); ++i) {
-    if (std::memcmp(&got[i], &want[i], sizeof(float)) != 0) ++a.not_bitwise_equal;
-  }
-  return a;
-}
-
-// BOTH REPORTERS PRINT ON SUCCESS, not only on failure. doctest's INFO/CAPTURE
-// are emitted only when an assertion fails, so a passing run of a numeric gate
-// says nothing about HOW closely it passed. These numbers are the wave's
-// evidence and have to survive a green run.
-void CheckBitwise(const std::vector<float>& got, const std::vector<float>& want,
-                  const char* what) {
-  const Agreement a = Compare(got, want);
-  std::printf("[MEASURED] %-48s BYTE gate: %zu/%zu differ, max|diff| = %.9g\n", what,
-              a.not_bitwise_equal, want.size(), a.worst);
-  INFO(what << ": " << a.not_bitwise_equal << " of " << want.size()
-            << " elements differ; max|diff| = " << a.worst);
-  CHECK(a.not_bitwise_equal == 0);
-}
-
-void CheckWithin(const std::vector<float>& got, const std::vector<float>& want, double rel,
-                 const char* what) {
-  const Agreement a = Compare(got, want);
-  double scale = 0.0;
-  for (float v : want) scale = std::max(scale, static_cast<double>(std::fabs(v)));
-  const double bound = kAbsFloor + rel * scale;
-  std::printf("[MEASURED] %-48s max|diff| = %.9g  bound = %.9g  not-bitwise-equal = %zu/%zu\n",
-              what, a.worst, bound, a.not_bitwise_equal, want.size());
-  INFO(what << ": max|diff| = " << a.worst << " vs bound " << bound << "; "
-            << a.not_bitwise_equal << " of " << want.size()
-            << " elements not bitwise equal (0 means byte-identical)");
-  CHECK(a.worst <= bound);
-}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // vt::Qwen4ExpGatedResidual — the mixer
@@ -368,11 +327,7 @@ const HcCase kHcC{"C", 6, 4, 5, 2, 1e-6f, kC_norm_w_hf, kC_down, kC_up,
 const HcCase kHcD{"D", 6, 4, 5, 2, 1e-6f, kD_norm_w_hf, kD_down, kD_up,
                   kD_inject, kD_hyper, kD_mixed, kD_inj_w};
 
-struct MixerResult {
-  std::vector<float> mixed;
-  std::vector<float> injection;
-  std::vector<float> hyper_after;  // the stream must come back UNCHANGED
-};
+using q4hc::MixerResult;
 
 MixerResult RunMixer(DeviceType dev, const HcCase& c) {
   const int64_t flat = c.hc * c.hidden;
@@ -736,159 +691,19 @@ Synth MakeSynth(int64_t T, int64_t HQ, int64_t HKV, int64_t DH, int64_t kv_len, 
 }
 
 
-// ═════════════════════════════════════════════════════════════════════════════
-// W7 — THE GROUPED NORM'S PARALLEL SHAPE, ISOLATED
-// Issue ISSUE-LOCAL-01M2C8HBDD9VG6AJMPM9PTN80S, spec section "W7 scope".
-// ═════════════════════════════════════════════════════════════════════════════
+// ─── THE W7 SYNTHETIC FIXTURE MOVED TO A HEADER ──────────────────────────────
+// `W7NormRel`, `SynthHc`, `MakeSynthHc` and `RunSynthMixer` are now
+// `qwen4_exp_hc_synth.h`, so the ROCm arm of this same kernel is held to the
+// same generator and the same DERIVED bound rather than to a copy of them. The
+// derivation is in that header beside `W7NormRel`; read it there.
 //
-// WHY THE FOUR GOLDEN CASES ABOVE CANNOT SEE THIS, WHICH IS THE WHOLE REASON
-// THIS FIXTURE EXISTS. Their widths are `hidden` 5 and 6 with `hc` 3 and 4, so
-// `flat` is 15 and 24 and the largest group is SIX elements. Against a kernel
-// that puts one block of 256 threads on each group, six elements means:
-//
-//   * the per-thread strided walk runs at most ONCE, so a wrong stride in it is
-//     unobservable;
-//   * only warp 0 is ever non-zero, so the cross-warp stage is dead code;
-//   * `T * hc` is at most 12 against a 4096-block grid, so the group grid-stride
-//     loop takes exactly one trip and the TWO `__syncthreads()` inside the loop
-//     body -- neither of them trailing -- never have to order a cross-iteration
-//     access to the reused shared slots, because there is no second iteration.
-//
-// That is the same gap `MakeSynth` closes for the gather further down, and it is
-// stated here rather than assumed: a fresh reviewer's mutation of any of those
-// three would be INVISIBLE to every committed case.
-//
-// ─── THE PROJECTIONS ARE ZEROED, AND THAT ISOLATES RATHER THAN DEGENERATES ───
-// `mix_down` is all zeros, so the low-rank intermediate is exactly 0, `silu(0)`
-// is exactly 0, `gate_pre` is exactly 0 and `sigmoid(0)` is exactly 0.5 in both
-// arms. `HcMixKernel` then reduces to
-//
-//     mixed[t, h] = (1/hc) * SUM_j normed[t, j, h] * 0.5
-//
-// which is a GEMM-FREE function of the normed stream. The ONLY thing that can
-// differ between the CUDA and CPU arms here is the grouped norm's reciprocal
-// `r`, which is exactly the thing under test — the CPU arm walks the group
-// ascending in DOUBLE, the CUDA arm now walks it strided in f32 and reduces it
-// in a warp-shuffle tree. `block_inject` is null (the `use_combine=False` arm,
-// golden case C's shape) for the same reason.
-//
-// This is isolation and not a reduced fixture: the mixer's three projections are
-// gated at their own widths by the four golden cases above, and nothing here
-// claims to cover them. What it buys is a bound that is a pure REDUCTION-WIDTH
-// bound, derived below, rather than one dominated by `vt::MatmulBT`'s
-// re-association.
-//
-// ─── THE BOUND IS DERIVED FROM H, NOT FITTED ─────────────────────────────────
-// The CPU arm's double accumulation is exact to f32 for every width here, so the
-// whole disagreement is the CUDA arm's f32 tree. Its longest dependent chain is
-// `ceil(H / 256)` serial adds inside one thread, then 5 warp-shuffle levels,
-// then 5 more across the eight warp partials — call the tree depth 16, which is
-// more than three times the 10 it actually is. The standard `n u` bound with
-// `u = 2^-24` gives a relative error on the sum of squares, `r = 1/sqrt(.)`
-// halves it, and a factor of 4 is carried on top as stated margin:
-//
-//   rel(H) = 4 * 0.5 * (ceil(H/256) + 16) * u
-//
-// At H = 2560 that is 3.1e-6. The defects it has to separate — a broadcast `r`,
-// a dropped grid stride, a missing cross-warp stage — are all O(1) RELATIVE, so
-// the discrimination band is six orders of magnitude wide and is MEASURED on
-// every run by the printed ratio. Never widen it to make a case pass.
-constexpr double kW7UnitRoundoff = 1.0 / 16777216.0;  // u = 2^-24
-double W7NormRel(int64_t H) {
-  const double depth = static_cast<double>((H + 255) / 256) + 16.0;
-  return 4.0 * 0.5 * depth * kW7UnitRoundoff;
-}
-
-struct SynthHc {
-  std::string name;
-  int64_t hidden = 0, hc = 0, lowrank = 0, T = 0;
-  float eps = 1e-6f;
-  std::vector<float> hyper, w_hf, down, up;
-};
-
-// A fixed 64-bit LCG, the one `test_qwen4_exp_hc_device.cpp`'s model-width case
-// uses, so the case is reproducible without depending on any standard-library
-// distribution's implementation.
-SynthHc MakeSynthHc(const char* name, int64_t H, int64_t hc, int64_t R, int64_t T,
-                    uint64_t seed) {
-  SynthHc y;
-  y.name = name;
-  y.hidden = H;
-  y.hc = hc;
-  y.lowrank = R;
-  y.T = T;
-  const int64_t flat = hc * H;
-  uint64_t state = seed;
-  const auto next = [&state]() {
-    state = state * 6364136223846793005ULL + 1442695040888963407ULL;
-    return static_cast<float>(static_cast<int32_t>(state >> 33)) / 2147483648.0f;
-  };
-  // PER-GROUP SCALES, period 7. Seven is coprime with `hc` (3 and 4 here) and
-  // with the 4096-block grid cap, so the pattern does not align with either —
-  // a kernel that computed group `(t, 0)` and broadcast it, that walked the
-  // group stride as `j` instead of `j * H`, or that lost a token to a dropped
-  // grid stride, lands on a DIFFERENT scale and cannot hide inside any
-  // reduction-width bound. The spread is 8x at most, which keeps every
-  // intermediate far from an f32 edge.
-  y.hyper.resize(static_cast<size_t>(T * flat));
-  for (int64_t t = 0; t < T; ++t) {
-    for (int64_t j = 0; j < hc; ++j) {
-      const int k = static_cast<int>((t * hc + j) % 7) - 3;
-      const float scale = std::ldexp(1.0f, k);
-      for (int64_t h = 0; h < H; ++h) {
-        y.hyper[static_cast<size_t>((t * hc + j) * H + h)] = scale * next();
-      }
-    }
-  }
-  // The RAW HuggingFace gamma (#2218): centred on ZERO, because the op adds the
-  // 1 itself. Drawn per element so no two groups share a gamma row.
-  y.w_hf.resize(static_cast<size_t>(flat));
-  for (float& v : y.w_hf) v = 0.1f * next();
-  // ZERO. See the isolation note above — this is the whole reason the bound is a
-  // reduction-width bound.
-  y.down.assign(static_cast<size_t>(R * flat), 0.0f);
-  y.up.assign(static_cast<size_t>(flat * R), 0.0f);
-  return y;
-}
-
-MixerResult RunSynthMixer(DeviceType dev, const SynthHc& c) {
-  const int64_t flat = c.hc * c.hidden;
-  MixerResult r;
-  r.mixed.assign(static_cast<size_t>(c.T * c.hidden), 0.0f);
-  r.injection.clear();
-  r.hyper_after = c.hyper;
-  std::vector<float> w = c.w_hf, down = c.down, up = c.up;
-
-  Qwen4ExpGatedResidualArgs args;
-  args.hc_count = c.hc;
-  args.hidden_size = c.hidden;
-  args.lowrank = c.lowrank;
-  args.eps = c.eps;
-
-  if (dev == DeviceType::kCPU) {
-    Queue q = CpuQ();
-    Tensor t_h = MakeTensor(r.hyper_after.data(), DType::kF32, Cpu(), {c.T, flat});
-    Tensor t_w = MakeTensor(w.data(), DType::kF32, Cpu(), {flat});
-    Tensor t_d = MakeTensor(down.data(), DType::kF32, Cpu(), {c.lowrank, flat});
-    Tensor t_u = MakeTensor(up.data(), DType::kF32, Cpu(), {flat, c.lowrank});
-    Tensor t_m = MakeTensor(r.mixed.data(), DType::kF32, Cpu(), {c.T, c.hidden});
-    vt::Qwen4ExpGatedResidual(q, t_m, nullptr, t_h, t_w, t_d, t_u, nullptr, args);
-    return r;
-  }
-  Backend& b = vt::GetBackend(DeviceType::kCUDA);
-  QueueGuard qg(b);
-  DeviceTensor d_h(b, qg.q, DType::kF32, {c.T, flat}, c.hyper.data());
-  DeviceTensor d_w(b, qg.q, DType::kF32, {flat}, w.data());
-  DeviceTensor d_d(b, qg.q, DType::kF32, {c.lowrank, flat}, down.data());
-  DeviceTensor d_u(b, qg.q, DType::kF32, {flat, c.lowrank}, up.data());
-  DeviceTensor d_m(b, qg.q, DType::kF32, {c.T, c.hidden});
-  vt::Qwen4ExpGatedResidual(qg.q, d_m.tensor(), nullptr, d_h.tensor(), d_w.tensor(),
-                            d_d.tensor(), d_u.tensor(), nullptr, args);
-  b.Synchronize(qg.q);
-  d_m.Download(qg.q, r.mixed.data());
-  d_h.Download(qg.q, r.hyper_after.data());
-  return r;
-}
+// `RunSynthMixer` gained exactly one behaviour in the move: its device branch
+// takes the `DeviceType` from its argument instead of hard-coding `kCUDA`. The
+// cases below pass `DeviceType::kCUDA` and are otherwise unchanged.
+using q4hc::MakeSynthHc;
+using q4hc::RunSynthMixer;
+using q4hc::SynthHc;
+using q4hc::W7NormRel;
 
 }  // namespace
 

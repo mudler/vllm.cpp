@@ -4626,9 +4626,18 @@ needs to claim bit-identity should compare bytes, not an aggregate.
     projections are unquantized bf16 by explicit construction. Owned by #2406.
   - **The merged HC down-plus-inject GEMM (verdict (b)).** Upstream stacks them
     into one padded `MergedColumnParallelLinear`; this tree runs three GEMMs. It
-    is a `vt::MergedGemmGroup` seam question and has NO issue yet.
+    is a `vt::MergedGemmGroup` seam question and IS NOW FILED, row-owned under
+    `.agents/issues/MODEL-MM-QWEN4-EXP/`. Its stable local ID is named in
+    [the ROCm grouped-norm spec](qwen4-exp-rocm-hc-norm.md) under
+    `## Adjacent work, filed and not built`, and NOT here: this heading is the
+    ROWLESS registry, and `scripts/check-agent-record.py` reads a row-owned
+    stable ID beneath it as an owed reference it cannot resolve.
   - **The deferred, norm-fused HC combine (verdict (b)).** Upstream reads the
-    residual once; this tree reads it twice. NO issue yet.
+    residual once; this tree reads it twice. ALSO FILED, row-owned, with its
+    stable ID in the same place and for the same reason. It is the LARGER of the
+    two hyper-connection levers, and the ROCm grouped-norm launch-shape fix does
+    NOT reach it: that one changes how the norm reads the stream, not how many
+    times the stream is read.
   - **The f32 QSA output gate (verdict (b)).** Upstream sigmoids a bf16 gate. It
     rides with #2477 because it is the same buffer.
   - **The single indexer side cache and the every-step re-pool (verdict (b)).**
@@ -10413,6 +10422,36 @@ Quote the measurement, not the rescaling.
 
 **Cumulative, all on `dgx:gpu0`: 0.257 -> 13.02 tok/s at the reference workload,
 and the gap has gone 264x -> 5.08x.**
+
+**AND THE REFERENCE'S MAIN LEVER IS NOT AVAILABLE TO US ON THIS ARTIFACT.** sojufx
+runs MTP speculative decoding at K=3; the released UD-IQ1_S GGUF **carries no MTP
+head**. Measured from this repository's own committed manifest of the artifact's
+headers (`tests/vllm/models/qwen4_exp_gguf_manifest.inc`): 1,225 tensors, none
+named `mtp`/`nextn`/`draft`/`eh_proj`/`enorm`/`hnorm`, and blocks `blk.0` through
+`blk.47` with nothing higher -- exactly the 48 trunk layers and no folded 49th,
+which is how llama.cpp's converter would carry one (see
+`qwen3_5_gguf_weights.cpp:965-974`). The architecture defines the head and the
+engine implements the method; the BYTES ARE ABSENT.
+
+**AND NO GGUF WE COULD PRODUCE WOULD CARRY IT EITHER.** The pinned
+`llama-cpp-qwen4exp` converter (PR #27742, head `6c5afc86`) is the only llama.cpp
+that converts this architecture, and `conversion/qwen4exp.py:29-31` sets
+`supports_mtp_export = False` / `no_mtp = True` above the comment "the MTP block
+is a separate draft head; vLLM drops it too". The head's absence is the
+converter's design, not a conversion oversight, so "convert one ourselves" is not
+an available route without patching a second unmerged PR -- and that converter's
+own `:151` records the PLE table peaking "near 300 GB of RSS", above this fleet's
+largest box.
+
+The arithmetic any plan must clear: 66.17 tok/s is a **15.1 ms** step against our
+**87.6 ms** at 88% GPU-busy, i.e. **5.8x less step time**, while the two largest
+kernels are 18.16 ms and 17.53 ms -- deleting both entirely leaves ~52 ms, about
+19 tok/s. **No combination of the identified kernel leads reaches 66 on this
+artifact without speculation.** That is not a ceiling claim, and this row's rule
+that an apparent limit is an untraced implementation difference still stands; it
+is the statement of what the remaining leads do and do not contain. See
+`ISSUE-LOCAL-01M2EG6R3MRCB9ENZB9840KAXX`, which lists the three routes and says
+which question to answer first.
 
 #### THE STEP GROWS 34% WITHIN ONE 400-TOKEN RUN, AND QSA EXPLAINS A THIRD OF IT
 

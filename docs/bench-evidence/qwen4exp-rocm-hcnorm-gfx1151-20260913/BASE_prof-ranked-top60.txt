@@ -1,0 +1,61 @@
+trace                 : /tmp/rank4-27378/BASE_prof-win.csv
+sampler marks         : 60 ('ArgmaxK')
+decode steps ranked   : 59 (dropped 0 leading; 0 load+prefill rows excluded)
+dispatches per step   : [3005]   <- one value validates the window
+step wall ms          : median 185.20  min 175.81  max 230.90
+kernel busy per step  : 172.22 ms (93.0% of step wall; the remainder is HOST time)
+#3040 swap warnings   : 615 of 177296 rows (0.3469%); worst-case share of the kernel budget 242.55% (every adjusted row assumed to cost the trace maximum, 40.076 ms)
+note                  : rocprofiler-sdk adjusts inverted timestamps silently (#3040); worst-case aggregate error is reported as swap_bound_fraction
+
+kernel                                    share%   total ms  n/step   mean us   min us    max us
+------------------------------------------------------------------------------------------------
+HcGroupedNormKernel                       35.68%     3625.8    97.0     633.5    622.8   40076.2
+Cijk_Alik_Bljk_SB_MT32x32x8_SN_1LDSB0_AP  17.12%     1739.2    96.0     307.1    297.7   15621.5
+wvSplitKSml                               11.75%     1194.4   180.0     112.5      2.7     246.9
+QsaGatherAttentionKernel                   6.36%      646.7    12.0     913.3    180.0    1644.4
+GdnScanK                                   5.04%      512.4    36.0     241.2    229.5     736.1
+QuantizeQ8KK                               3.41%      346.2   145.0      40.5     37.0     192.1
+QuantDotGemmGroupedKernel                  2.96%      301.1    96.0      53.2     39.7     504.2
+Cijk_Alik_Bljk_BSS_BH_MT128x32x16_SE_1LD   2.91%      296.1    72.0      69.7     63.8     317.1
+Q8_0GemmK                                  2.57%      261.3   244.0      18.1      2.4     161.5
+KQuantGemmK                                2.53%      257.1   143.0      30.5      1.0    1524.1
+MoeRouterTopKUngroupedKernel               1.93%      196.3    48.0      69.3     65.8      75.6
+GroupedIQ4NLK                              1.52%      154.8    48.0      54.7     51.7     178.5
+Cijk_Ailk_Bljk_BSS_BH_MT128x32x16_SE_1LD   1.43%      145.5    49.0      50.3     48.0     226.2
+RmsNormGroupRocmKernel                     1.13%      114.9     3.0     649.3    643.6     998.0
+QuantizeQ8_0K                              1.03%      105.0   292.0       6.1      1.6      30.8
+GdnPostConvChunkedK                        0.61%       62.1    36.0      29.2     22.1     146.5
+RmsNormGatedK                              0.36%       36.8    36.0      17.3     12.3      19.8
+__amd_rocclr_copyBuffer                    0.19%       19.6   228.0       1.5      0.0      40.7
+ArgmaxK                                    0.16%       16.6     1.0     281.7    270.2     295.2
+Convert                                    0.14%       14.0    96.0       2.5      0.1       9.3
+DsaIndexerLogitsKernel                     0.13%       13.4    12.0      18.9     14.9      29.8
+QuantizeQ8KKernel                          0.12%       11.9    96.0       2.1      0.1       8.9
+GatedResidualWriteBackKernel               0.10%       10.2    96.0       1.8      0.0      18.4
+HcMixKernel                                0.10%        9.9    97.0       1.7      0.0      17.6
+Cijk_S_PostGSU3                            0.09%        9.1   121.0       1.3      0.0      16.2
+MoeCombineK                                0.08%        7.8    48.0       2.8      0.1      13.8
+HcInjectKernel                             0.07%        6.8    96.0       1.2      0.0      15.4
+MoeSiluMulK                                0.07%        6.7    96.0       1.2      0.0      10.4
+CausalConv1dUpdateK                        0.06%        6.3    36.0       3.0      0.4      11.3
+HcSiluScaleKernel                          0.06%        5.7    97.0       1.0      0.0       5.3
+CastBf16K                                  0.04%        4.1    48.0       1.4      0.2      19.4
+SharedExpertGateK                          0.04%        4.1    48.0       1.4      0.2      16.2
+RmsNormRowKernel                           0.04%        4.0    36.0       1.9      0.1       9.0
+RopeFromCacheK                             0.02%        2.3    24.0       1.6      0.2       3.7
+QsaCompressKernel                          0.02%        2.3    12.0       3.2      0.8       5.7
+KQuantGemmKCoopQ6K                         0.02%        1.9     2.0      16.1     15.2      17.5
+ReshapeAndCacheK                           0.02%        1.5    12.0       2.2      1.4       5.1
+IndexSelectRowK                            0.01%        1.3    14.0       1.6      0.3      16.5
+AttnGateSplitK                             0.01%        1.2    12.0       1.7      0.1       8.6
+IndexCopyRowK                              0.01%        1.1    12.0       1.5      0.1       3.7
+SigmoidGateK                               0.01%        0.9    12.0       1.3      0.3       5.5
+DsaTopkSelectKernel                        0.01%        0.9    12.0       1.3      0.2      12.8
+PleConvKernel                              0.01%        0.5     1.0       9.0      8.6       9.5
+EmbeddingQuantGatherKernel                 0.00%        0.5     1.0       8.5      7.5      25.6
+PleGateKernel                              0.00%        0.3     1.0       4.6      3.7       5.1
+__amd_rocclr_fillBufferAligned             0.00%        0.2     2.0       2.0      1.1       5.2
+EmbeddingKernel                            0.00%        0.1     1.0       2.3      1.4       2.8
+AddMixK                                    0.00%        0.1     2.0       1.1      0.6       3.4
+------------------------------------------------------------------------------------------------
+TOTAL                                    100.00%    10161.1  3005.0

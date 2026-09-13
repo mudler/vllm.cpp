@@ -1,0 +1,9 @@
+selected=1
+[doctest] doctest version is "2.5.2"
+[doctest] run with "--help" for options
+[MEASURED] ROCM W7 magnitude-separated: max|diff| = 0  scale = 6.33523417  bound = 1e-05  (serial-f32 reference point: 6.702e-04)
+[MEASURED] ROCM W7 magnitude stream unchanged               BYTE gate: 0/10240 differ, max|diff| = 0
+===============================================================================
+[doctest] test cases: 1 | 1 passed | 0 failed | 4 skipped
+[doctest] assertions: 7 | 7 passed | 0 failed |
+[doctest] Status: SUCCESS!

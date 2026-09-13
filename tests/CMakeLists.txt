@@ -4257,6 +4257,20 @@ vllm_cpp_add_test(test_qwen4_exp_cuda vllm/models/test_qwen4_exp_cuda.cpp)
 vllm_cpp_add_test(test_qwen4_exp_cuda_reductions
                   vllm/models/test_qwen4_exp_cuda_reductions.cpp)
 
+# MODEL-MM-QWEN4-EXP, issue ISSUE-LOCAL-01M2CJXQMV9R9JGRSKZMW4W21F, spec
+# `.agents/specs/qwen4-exp-rocm-hc-norm.md` -- the ROCm twin of the `CUDA W7:`
+# battery above, for the grouped hyper-connection norm inside
+# `vt::Qwen4ExpGatedResidual`. It exists because until it did, the ONLY committed
+# test reaching that ROCm arm was `test_backend_cross_device.cpp:5580` at
+# `hidden_size = 7`, a width at which one thread does the whole group and no
+# reduction SHAPE is expressible. The two files share one fixture and one derived
+# bound through `vllm/models/qwen4_exp_hc_synth.h` rather than carrying a copy
+# each. Skips LOUDLY on a box with no ROCm backend, and names the OP as well as
+# the backend, because a built-but-unregistered arm and an absent backend are
+# different failures. No src/ grant: it reaches only the public vt:: surface.
+vllm_cpp_add_test(test_qwen4_exp_rocm_reductions
+                  vllm/models/test_qwen4_exp_rocm_reductions.cpp)
+
 # MODEL-MM-QWEN4-EXP W5e-2 (#2336) — `RunQwen4ExpPleBlock`, the PLE layer as ONE
 # production composition and the LAST of the three block seams. Gated end to end
 # against the SAME lane-pinned goldens the W2 host reference is held to

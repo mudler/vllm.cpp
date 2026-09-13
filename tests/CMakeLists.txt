@@ -1657,6 +1657,15 @@ vllm_cpp_add_test(test_deepseek_v4_mm_reach
 target_include_directories(test_deepseek_v4_mm_reach PRIVATE
                            ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models
                            ${CMAKE_CURRENT_SOURCE_DIR}/vllm)
+# MODEL-MM-deepseek-v4 (#2411): can a checkpoint whose published KV cache groups
+# DISAGREE about their block size be served at all? It enters at
+# `LoadedEngine::FromModelDir` on the DEFAULT configuration, so it needs the
+# language GGUF fixture beside the model gates, exactly as the suite above does.
+vllm_cpp_add_test(test_deepseek_v4_multigroup_kv
+                  vllm/entrypoints/test_deepseek_v4_multigroup_kv.cpp)
+target_include_directories(test_deepseek_v4_multigroup_kv PRIVATE
+                           ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models
+                           ${CMAKE_CURRENT_SOURCE_DIR}/vllm)
 # Multimodal M1 processor-parity gate: C++ Qwen3-VL image pipeline
 # (pixel_values/grid/mm-hash/placeholder-expansion) BIT-identical to the vLLM
 # 0.25.0 oracle fixture (tests/vllm/multimodal/fixtures/qwen3vl).

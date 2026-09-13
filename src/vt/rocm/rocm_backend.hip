@@ -38,6 +38,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -344,6 +345,8 @@ class RocmBackend final : public Backend {
   // an illegal op during capture a loud failure on THIS thread rather than a
   // process-wide mode change.
   bool SupportsGraphCapture() const override { return true; }
+  int64_t GraphsCaptured() const override { return graphs_captured_.load(std::memory_order_relaxed); }
+  int64_t GraphReplays() const override { return graph_replays_.load(std::memory_order_relaxed); }
   void BeginCapture(Queue& q) override {
     ResetF16ScratchCapture(q);
     Check(hipStreamBeginCapture(AsStream(q), hipStreamCaptureModeThreadLocal),
@@ -374,6 +377,7 @@ class RocmBackend final : public Backend {
     CaptureScratch cleanup{q};
     hipGraph_t graph = nullptr;
     Check(hipStreamEndCapture(AsStream(q), &graph), "hipStreamEndCapture");
+    graphs_captured_.fetch_add(1, std::memory_order_relaxed);
     // ENG-CUDAGRAPH-DEDUP (#1162), the same wiring as the CUDA leg against the same
     // shared registry and the same shared ops table: with VT_CUDA_GRAPH_DEDUP set, the
     // RAW graph is retained and keyed by topology so compatible captures share one
@@ -397,6 +401,7 @@ class RocmBackend final : public Backend {
   // cudaProfilerStart/Stop around a chosen replay. A rocprofiler equivalent is
   // later work and deliberately out of W1's scope (spec §2).
   void ReplayGraph(Queue& q, void* graph) override {
+    graph_replays_.fetch_add(1, std::memory_order_relaxed);
     if (dedup_ != nullptr && dedup_->Owns(graph)) {
       dedup_->Replay(graph, reinterpret_cast<void*>(AsStream(q)));
       return;
@@ -524,6 +529,10 @@ class RocmBackend final : public Backend {
   // ENG-CUDAGRAPH-DEDUP (#1162): built on the first capture, and only when
   // VT_CUDA_GRAPH_DEDUP asked for it, so an unset environment allocates nothing.
   std::unique_ptr<vt::GraphDedupRegistry> dedup_;
+  // T2b instrumentation: completed captures and launched replays (see
+  // Backend::GraphsCaptured).
+  std::atomic<int64_t> graphs_captured_{0};
+  std::atomic<int64_t> graph_replays_{0};
 };
 
 // Registers every visible AMD GPU at its own Device{kROCM, i} slot, mirroring

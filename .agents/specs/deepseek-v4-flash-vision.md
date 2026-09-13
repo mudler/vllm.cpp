@@ -684,6 +684,28 @@ manifest is a semantic checker change and is owed below, with the measurement
 above as its red-before input.
 
 ## Owed
+- **A MULTI-GROUP DeepSeek-V4 STILL CANNOT PREFIX-CACHE, AND THE REFUSAL IS AN
+  ABORT RATHER THAN A MESSAGE.** The engine now derives the scheduler's block
+  size from the built groups and hashes at the resolved granularity, mirroring
+  `vllm/v1/engine/core.py:335-338` and `:158-170` @ `e126687a9a`, which is what
+  lets `vllm serve` reach a DeepSeek-V4 checkpoint at all. That fix is complete
+  for the ONE-group shape, which is what the GGUF fixture publishes: its
+  `compress_ratios` are all zero, so only the SWA group (block size 64) exists.
+  A REAL Flash checkpoint sets those ratios and publishes up to seven groups at
+  block sizes 256, 64, 4 and 8 (`MakeDeepseekV4KVCache`). No single hash
+  granularity divides that set into equal group block sizes, so
+  `HybridKVCacheCoordinator` hits its `block_size == hash_block_size` assertion
+  — the DEFERRED `BlockHashListWithBlockSize` path named in
+  `include/vllm/v1/core/kv_cache_coordinator.h:64-66` and guarded again in
+  `block_pool.cpp:90-96`. THIS IS NOT A REGRESSION: before the block-size
+  derivation landed the same configuration aborted in the same place, with 256
+  against 64 instead of the GCD. What is owed is the port of
+  `_get_block_hashes` / `BlockHashListWithBlockSize`
+  (`vllm/v1/core/kv_cache_utils.py:2226-2330` @ the pin) so a group whose block
+  size is a multiple of the hash size reads its hashes through a converting
+  view. Until that lands, the coordinator must REFUSE by name instead of
+  asserting, because an assert in a server is an abort and a message is a
+  message.
 - **THE W7-CUDA NUMBERS WERE PRODUCED BY A DRIVER THAT COULD NOT DETECT A FAILED
   STEP, AND THEY HAVE NOT BEEN RE-RUN SINCE IT WAS REPAIRED.** The 2.884% cells
   mean relative L2, the 0.99939 cells mean cosine and the 1.872% vit mean

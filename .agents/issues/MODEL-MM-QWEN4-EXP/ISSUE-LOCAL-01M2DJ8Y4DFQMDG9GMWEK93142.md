@@ -24,7 +24,26 @@ OWED BEFORE A FIX IS SCOPED: an `nsys`/Nsight-Compute attribution of where the 2
 
 ## Resolution
 
--
+**STAYS OPEN, and this is what for.** W9 discharged the ATTRIBUTION this issue
+owed and removed the term it found, and the W9 repair gates the fold order that
+change rests on. Two things this issue asked for are NOT done, and they are the
+only reasons it is still open:
+
+1. **The RE-RANK this issue's own problem statement demands.** "Re-rank before
+   scoping, and re-rank again after this lands." The 34.5% figure is a
+   `dgx:gpu0` profile taken BEFORE W9; after a 6.52x on the kernel it cannot
+   still be the ranking, and the next row must not be scoped from it. Nothing
+   has re-profiled since `7d0d74c2c`.
+2. **The step-level number, which this issue is careful NOT to derive.** The
+   6.52x is a kernel result at `|sel| = 2048`. What QSA costs per decode step
+   depends on the context length, and the 16-token A/B harness runs the kernel
+   at `|sel|` of about 36, so no end-to-end figure follows. A long-context
+   end-to-end measurement is owed before any step-budget claim.
+
+Also unresolved and recorded above rather than fixed: `ncu` returns
+`ERR_NVGPUCTRPERM` on this worker, so the arithmetic-latency and load-latency
+halves of the remaining cost are unseparated, and the 86-89% fraction is an
+sm_110 reading that GB10 has never reproduced.
 
 ### ATTRIBUTED 2026-09-13 on `thor:gpu0` (sm_110): 86-89% is a dot product on ONE THREAD
 
@@ -168,12 +187,21 @@ thousands (19,200 at one site). The clean run therefore measures the barrier
 rather than the tool being silent.
 
 **Four mutations, each rebuilt and each DETECTED** (per-arm binary md5 beside the
-fix's `5e4ab5a98147`, all nine gather cases selected and counted in every arm):
+fix's `5e4ab5a98147`, EIGHT gather cases selected and counted in every arm):
 bounding the tile map by `head_dim` instead of `blockDim.x` (`bac53105fc8a`,
 1 case red), dropping the last entry of every tile (`a63dcb30cb32`, abort),
 deleting the denominator fold (`d51ffb73ee3e`, 7 cases red), and not counting the
-pass-2 read (`dcbc383fd18d`, 2 cases red). Restoring the source returns 9/9 green
+pass-2 read (`dcbc383fd18d`, 2 cases red). Restoring the source returns 8/8 green
 at source sha256 `55d34c66a72a495db5db79045f72b616e2171f723c1557e3ddbbdb48fd657507`.
+
+**The count in the two lines above read `nine` and `9/9` and it is WRONG. The
+file carries EIGHT** `TEST_CASE("vt::Qwen4ExpQsaGatherAttention...` at
+`7d0d74c2c`, counted in the tree. The corrected figure changes no verdict: every
+arm was red where it is recorded red and green where it is recorded green. It is
+corrected because a denominator nobody counted is how a selector that matches
+nothing reads as a pass. The W9 REPAIR adds a ninth, the softmax-fold gate below,
+so `nine` becomes true after the repair lands and was not true when it was
+written.
 
 Artifacts: `/workspace/qsa-w9/20260913T160154Z/` on the shared NAS; `rc` jobs
 `5a24eeef` (base+fix+racecheck+mutations) and `c3666e8f` (an earlier run of the

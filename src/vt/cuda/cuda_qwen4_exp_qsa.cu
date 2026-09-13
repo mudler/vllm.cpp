@@ -89,8 +89,24 @@
 // 86.4% and 88.8%, in two independent `thor:gpu0` runs, of this kernel's wall
 // time (`ISSUE-LOCAL-01M2DJ8Y4DFQMDG9GMWEK93142`). Pass 2 now spreads its tile
 // ONE WHOLE DOT PER THREAD, exactly as pass 1 already did, and only the SUM over
-// `s` stays on thread 0. Order 3 is what the CPU-vs-CUDA bit relation needs;
-// WHICH THREAD evaluates a given dot was never part of it.
+// `s` stays on thread 0. WHICH THREAD evaluates a given dot was never part of any
+// of the four orders; WHAT EACH THREAD DOES INSIDE ITS OWN DOT still is, so
+// orders 1, 3 and 4 are each as load-bearing after this change as before it, and
+// the list above is the statement of record. An earlier revision of this
+// paragraph named only order 3, which understates: order 1 is the ascending walk
+// over `d` that the moved dot itself performs, and order 4 is the ascending walk
+// over `p` in the value accumulation the tile feeds.
+//
+// AND ORDER 3 IS THE ONE THE SUITE NOW MEASURES. It was argued here and gated by
+// nothing: a fresh review reassociated this fold two ways on `thor:gpu0` -- a
+// descending fold, and the warp-shuffle tree the paragraph below declines -- and
+// all three committed suites passed unmodified. The repair is the softmax-fold
+// probe (`Qwen4ExpQsaAttnArgs::softmax_probe_weights`), which hands the test the
+// weights this kernel computed so the ascending fold can be recomputed on the
+// host FROM THE DEVICE'S OWN FLOATS and compared BIT for BIT. A tolerance cannot
+// do this job and that is measured, not assumed: the reassociated denominator
+// sits at 0.01-0.02% of the derived arm-vs-arm bound, and the worst ratio on a
+// CORRECT kernel is HIGHER than on a reassociated one.
 //
 // The tree reduction over `d` remains named and NOT taken: it would PRESERVE the
 // gather-vs-dense property, because the dot's order would then depend on
@@ -389,7 +405,8 @@ __global__ void QsaGatherAttentionKernel(
     int64_t HQ, int64_t DH, int64_t HKV, int64_t groups, int64_t topk, int64_t CR, float scale,
     bool paged, const int32_t* pages, int64_t page_size, int64_t num_phys_pages,
     int64_t max_kv, int64_t k_s0, int64_t k_s1, int64_t k_s2, int64_t v_s0, int64_t v_s1,
-    int64_t v_s2, unsigned long long* visited) {
+    int64_t v_s2, unsigned long long* visited, float* wprobe, float* dprobe,
+    int64_t wstride) {
   extern __shared__ float s_attn[];
   float* s_q = s_attn;                       // [DH] the query row
   float* s_red = s_attn + DH;                // [blockDim/32] warp partials
@@ -562,7 +579,12 @@ __global__ void QsaGatherAttentionKernel(
           for (int64_t d = 0; d < DH; ++d) {
             dot = __fadd_rn(dot, __fmul_rn(s_q[d], LoadAt(key, k_tag, base + d)));
           }
-          s_wtile[u] = expf(__fsub_rn(__fmul_rn(dot, scale), m));
+          const float w = expf(__fsub_rn(__fmul_rn(dot, scale), m));
+          // THE PROBE, and it publishes the value the fold below will read --
+          // `s_wtile[u]` itself, not a recomputation of it. See
+          // `Qwen4ExpQsaAttnArgs::softmax_probe_weights`.
+          if (wprobe != nullptr && s < wstride) wprobe[pair * wstride + s] = w;
+          s_wtile[u] = w;
           s_ptile[u] = p;
         }
       }
@@ -597,6 +619,9 @@ __global__ void QsaGatherAttentionKernel(
       continue;
     }
     const float denom = s_denom;
+    // Published AFTER the poison check on purpose: a malformed row's weights are
+    // not the weights of any well-formed softmax, so it publishes no denominator.
+    if (dprobe != nullptr && threadIdx.x == 0) dprobe[pair] = denom;
     if (threadIdx.x < DH) {
       StoreAt(out, out_tag, (t * HQ + h) * DH + threadIdx.x, __fdiv_rn(acc, denom));
     }
@@ -642,6 +667,31 @@ void Qwen4ExpQsaGatherAttentionKernelCuda(Queue& q, Tensor& out, const Tensor& q
   // The device counter and its copy-back, allocated ONLY when the caller passed
   // the instrument. `keys_visited == nullptr` is the production path and takes
   // neither the allocation nor the synchronise.
+  // The softmax-fold probe, on the same terms: allocated ONLY when the caller
+  // passed it, and `nullptr` on the production path. A caller sets the weights
+  // buffer, the denominator buffer and the stride together or sets none.
+  VT_CHECK((args.softmax_probe_weights != nullptr) == (args.softmax_probe_denom != nullptr) &&
+               (args.softmax_probe_weights == nullptr) == (args.softmax_probe_stride == 0),
+           std::string("cuda ") + kOp +
+               ": softmax_probe_weights, softmax_probe_denom and softmax_probe_stride are "
+               "one instrument and must be set together or all left unset");
+  const bool probing = args.softmax_probe_denom != nullptr;
+  const size_t wprobe_bytes =
+      static_cast<size_t>(pairs) * static_cast<size_t>(args.softmax_probe_stride) *
+      sizeof(float);
+  const size_t dprobe_bytes = static_cast<size_t>(pairs) * sizeof(float);
+  float* d_wprobe = nullptr;
+  float* d_dprobe = nullptr;
+  if (probing) {
+    Check(cudaMalloc(&d_wprobe, wprobe_bytes), "qwen4_exp_qsa_gather_attention probe alloc");
+    Check(cudaMalloc(&d_dprobe, dprobe_bytes),
+          "qwen4_exp_qsa_gather_attention probe denom alloc");
+    Check(cudaMemsetAsync(d_wprobe, 0, wprobe_bytes, AsStream(q)),
+          "qwen4_exp_qsa_gather_attention probe zero");
+    Check(cudaMemsetAsync(d_dprobe, 0, dprobe_bytes, AsStream(q)),
+          "qwen4_exp_qsa_gather_attention probe denom zero");
+  }
+
   unsigned long long* d_visited = nullptr;
   if (args.keys_visited != nullptr) {
     Check(cudaMalloc(&d_visited, sizeof(unsigned long long)),
@@ -660,7 +710,8 @@ void Qwen4ExpQsaGatherAttentionKernelCuda(Queue& q, Tensor& out, const Tensor& q
       block_ids.shape[1], args.compress_ratio, args.scale, paged,
       paged ? args.kv_block_table->Ptr<int32_t>() : nullptr, page_size,
       paged ? key.shape[0] : 0, max_kv, key.stride[0], key.stride[1], key.stride[2],
-      value.stride[0], value.stride[1], value.stride[2], d_visited);
+      value.stride[0], value.stride[1], value.stride[2], d_visited, d_wprobe, d_dprobe,
+      args.softmax_probe_stride);
   Check(cudaGetLastError(), "qwen4_exp_qsa_gather_attention launch");
 
   if (args.keys_visited != nullptr) {
@@ -672,6 +723,18 @@ void Qwen4ExpQsaGatherAttentionKernelCuda(Queue& q, Tensor& out, const Tensor& q
           "qwen4_exp_qsa_gather_attention keys_visited sync");
     Check(cudaFree(d_visited), "qwen4_exp_qsa_gather_attention keys_visited free");
     *args.keys_visited = static_cast<int64_t>(host);
+  }
+
+  if (probing) {
+    Check(cudaMemcpyAsync(args.softmax_probe_weights, d_wprobe, wprobe_bytes,
+                          cudaMemcpyDeviceToHost, AsStream(q)),
+          "qwen4_exp_qsa_gather_attention probe copy-back");
+    Check(cudaMemcpyAsync(args.softmax_probe_denom, d_dprobe, dprobe_bytes,
+                          cudaMemcpyDeviceToHost, AsStream(q)),
+          "qwen4_exp_qsa_gather_attention probe denom copy-back");
+    Check(cudaStreamSynchronize(AsStream(q)), "qwen4_exp_qsa_gather_attention probe sync");
+    Check(cudaFree(d_wprobe), "qwen4_exp_qsa_gather_attention probe free");
+    Check(cudaFree(d_dprobe), "qwen4_exp_qsa_gather_attention probe denom free");
   }
 }
 

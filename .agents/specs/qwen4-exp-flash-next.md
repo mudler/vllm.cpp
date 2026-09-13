@@ -4773,16 +4773,30 @@ needs to claim bit-identity should compare bytes, not an aggregate.
   route through `vt::MatmulBT` refuses or drains to the host on a CUDA queue —
   also another wave's, also owed. See `### W6-CUDA-B` below.
 
-- **TWO SPEED ITEMS THIS WAVE DECLINED, EACH WITH ITS CONDITION.** (1) The
-  gather's pass-2 dot is SEQUENTIAL on one lane, `|sel| * head_dim` dependent f32
-  operations, ~525k per (token, head) at the released config. A deterministic
-  tree reduction over `d` would preserve the gather-vs-dense bit-identity — the
-  order would depend on `head_dim` alone — while breaking the CPU-vs-CUDA
-  relation the sequential dot keeps. Take it after a red-first measurement that
-  shows this is the bottleneck, not before. (2) The mixer takes ONE `cudaMalloc`
-  per call for its four intermediates. A static cache would not be re-entrant;
-  the fix is a caller-supplied workspace, which changes the op signature and owes
-  its own spec.
+- **TWO SPEED ITEMS THIS WAVE DECLINED, EACH WITH ITS CONDITION. ITEM (1) IS
+  HALF DISCHARGED BY W9 AND ITEM (2) IS LIVE.** (1) The gather's pass-2 dot WAS
+  SEQUENTIAL ON ONE LANE, `|sel| * head_dim` dependent f32 operations, ~525k per
+  (token, head) at the released config. **W9 removed that cost WITHOUT taking the
+  tree reduction** (`7d0d74c2c`): pass 2's tile now goes ONE WHOLE DOT PER
+  THREAD, which reassociates nothing, because a dot's value does not depend on
+  which thread evaluates it. The red-first measurement this entry asked for is
+  the attribution in `ISSUE-LOCAL-01M2DJ8Y4DFQMDG9GMWEK93142` — that lane
+  measured 86.4% and 88.8% of the kernel's wall time in two `thor:gpu0` runs —
+  and the change measured 6.52x at the released decode shape.
+  **What remains owed is the lever itself, still declined:** a deterministic tree
+  reduction over `d` would preserve the gather-vs-dense bit-identity — the order
+  would depend on `head_dim` alone — while breaking the CPU-vs-CUDA relation the
+  sequential dot keeps. It is now a SECOND-ORDER item rather than the
+  bottleneck, and the condition is unchanged: take it only after a red-first
+  measurement that shows the per-thread dot is the bottleneck. The fold over `s`
+  that W9 preserved is no longer only argued: `test_qwen4_exp_cuda_reductions.cpp`
+  refolds the arm's own softmax weights ascending on the host and requires BIT
+  equality with the arm's denominator, which is red against a descending fold and
+  against the warp-shuffle tree. (2) The mixer takes ONE `cudaMalloc` per call
+  for its four intermediates. A static cache would not be re-entrant; the fix is
+  a caller-supplied workspace, which changes the op signature and owes its own
+  spec. **LIVE**, and now tracked by
+  `ISSUE-LOCAL-01M2DQHP2FWXHH7GTHB17QX53Q`.
 
 - **W8CONFIRM ISOLATED THE CAUSE TO W5r's TWO LINES, WHICH W5s ASSERTED BUT ITS
   EVIDENCE COULD NOT SEPARATE FROM W5p. ISSUE OWED.** W5s compares W7DIAG on

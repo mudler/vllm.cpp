@@ -568,6 +568,16 @@ void Qwen4ExpQsaGatherAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& q
            std::string("rocm ") + kOp + ": head_dim " + std::to_string(DH) + " exceeds the " +
                std::to_string(kMaxHeadDim) +
                " this arm can give one thread each; the CPU arm has no such limit");
+  // THE SOFTMAX-FOLD PROBE IS REFUSED BY NAME, not ignored. This arm does not
+  // implement `Qwen4ExpQsaAttnArgs::softmax_probe_*`; returning the caller's
+  // buffer unwritten would read as a denominator of zero and make a gate that
+  // exists to catch a reassociated fold report a pass. Owed: the CUDA arm has
+  // it, this one does not.
+  VT_CHECK(args.softmax_probe_denom == nullptr && args.softmax_probe_weights == nullptr,
+           std::string("rocm ") + kOp +
+               ": the softmax-fold probe (softmax_probe_weights / softmax_probe_denom) is "
+               "implemented by the CPU and CUDA arms only; this arm would return the buffer "
+               "unwritten");
   const int64_t page_size = args.kv_block_size;
   const int64_t num_pages_named = paged ? args.kv_block_table->shape[1] : 0;
   // How many logical token rows the cache can address. Contiguous: its row count.

@@ -545,19 +545,33 @@ Selection RunIndexerCpu(const QsaCase& c) {
 struct GatherResult {
   std::vector<float> out;
   int64_t keys_visited = -1;
+  // The softmax-fold probe, filled only when `probe_stride > 0` was asked for.
+  std::vector<float> probe_w;      // [T*HQ, probe_stride], visit order
+  std::vector<float> probe_denom;  // [T*HQ]
 };
 
 // The gather, on either device, over a CONTIGUOUS [max_kv, Hkv, Dh] cache.
+// `probe_stride > 0` asks for the softmax-fold probe; 0 is the production path.
 GatherResult RunGather(DeviceType dev, const std::vector<float>& qa,
                        const std::vector<float>& ka, const std::vector<float>& va,
                        const Selection& sel, int64_t T, int64_t HQ, int64_t HKV, int64_t DH,
-                       int64_t max_kv, bool want_counter) {
+                       int64_t max_kv, bool want_counter, int64_t probe_stride = 0) {
   GatherResult r;
   r.out.assign(static_cast<size_t>(T * HQ * DH), 0.0f);
   Qwen4ExpQsaAttnArgs args;
   args.scale = 1.0f / std::sqrt(static_cast<float>(DH));
   args.compress_ratio = sel.CR;
   if (want_counter) args.keys_visited = &r.keys_visited;
+  if (probe_stride > 0) {
+    // A SENTINEL, not a zero. An arm that returns the buffer UNWRITTEN must be
+    // distinguishable from one that folded to zero, and the case below requires
+    // the sentinel to be gone.
+    r.probe_w.assign(static_cast<size_t>(T * HQ * probe_stride), -1.0f);
+    r.probe_denom.assign(static_cast<size_t>(T * HQ), -1.0f);
+    args.softmax_probe_weights = r.probe_w.data();
+    args.softmax_probe_denom = r.probe_denom.data();
+    args.softmax_probe_stride = probe_stride;
+  }
   std::vector<float> qc = qa, kc = ka, vc = va;
   std::vector<int32_t> ids = sel.block_ids, lens = sel.kv_lens;
   const int64_t topk = sel.topk;
@@ -1405,6 +1419,136 @@ TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA W9: head_dim BELOW the tile width
     // that separates a `blockDim.x` bound from a `head_dim` one.
     CHECK(gpu.keys_visited == want_reads);
     CheckGatherDerived(gpu.out, cpu.out, y.v, y.sel, sh.T, sh.HQ, sh.HKV, sh.DH, nm);
+  }
+}
+
+TEST_CASE("vt::Qwen4ExpQsaGatherAttention W9: the DENOMINATOR is the ASCENDING fold, BITWISE") {
+  if (SkipNoCuda("vt::Qwen4ExpQsaGatherAttention softmax-fold order")) return;
+  // **THE PROPERTY W9 RESTS ITS WHOLE ARGUMENT ON, WHICH NOTHING MEASURED.**
+  // W9 moved pass 2's dot product off one lane and kept the SUM OVER `s` serial
+  // and ascending, because that order is what makes a sub-budget gather
+  // BIT-identical to dense attention. A fresh review reassociated that fold two
+  // ways on `thor:gpu0` -- a DESCENDING fold, and the WARP-SHUFFLE TREE the
+  // kernel's header explicitly declines -- and ALL THREE committed suites passed
+  // unmodified (19/19, 12/12, 14/14) while the outputs demonstrably moved.
+  //
+  // **A TIGHTER BOUND CANNOT BE THE REPAIR AND THAT IS MEASURED.** The
+  // reassociated denominator lands at 0.01-0.02% of the derived arm-vs-arm bound
+  // at these shapes (|diff| 5.2e-08 against 9.8e-04 at |sel| = 2050), and the
+  // WORST ratio on a CORRECT kernel (0.2041) is HIGHER than on a reassociated
+  // one (0.1136): no threshold separates them. The `kUlpTol` obituary at the top
+  // of this file is the same mistake one revision earlier.
+  //
+  // SO THE INVARIANT IS ASSERTED DIRECTLY, FROM THE ARM'S OWN WEIGHTS. The probe
+  // hands back the softmax weights the arm actually computed and the denominator
+  // it folded them into. This case refolds those exact floats ASCENDING on the
+  // host and requires BIT equality. Both sides consume the SAME `expf` outputs,
+  // so a toolkit that moves `exp` cannot make this red -- the fragility a stored
+  // device golden would have -- while any reassociation of the fold is red at
+  // once, because reassociation is the only thing the comparison can see.
+  //
+  // AND THE CASE VALIDATES ITS OWN INSTRUMENT. A fixture whose weights sum
+  // exactly under every order would pass while measuring nothing, so the two
+  // reassociations are ALSO computed on the host and the case REQUIRES them to
+  // differ from the ascending fold. That is the red the mutation would produce,
+  // proven on the fixture itself rather than assumed.
+  struct Shape { const char* name; int64_t T, HQ, HKV, DH, kv, CR, topk; };
+  const Shape kShapes[] = {
+      // 300 complete blocks -> |sel| = 1200 -> 38 tiles, so the carry across
+      // tiles is live and a tree over the tile has 32 leaves to disagree on.
+      {"1200 rows / 38 tiles", 2, 2, 1, 32, 1200, 4, 300},
+      // The RELEASED geometry's selection size at head_dim 64: 65 tiles.
+      {"2050 rows / 65 tiles", 1, 2, 1, 64, 2050, 4, 512},
+      // Two full tiles and a 2-row ragged tail: the partial tile folds too.
+      {"2 full tiles + a 2-row tail", 3, 4, 2, 32, 66, 4, 16},
+  };
+  auto bits = [](float f) {
+    uint32_t u = 0;
+    std::memcpy(&u, &f, sizeof u);
+    return u;
+  };
+  for (const Shape& sh : kShapes) {
+    CAPTURE(std::string(sh.name));
+    const Synth y = MakeSynth(sh.T, sh.HQ, sh.HKV, sh.DH, sh.kv, sh.CR, sh.topk, 909u);
+    int64_t stride = 0;
+    for (int64_t t = 0; t < sh.T; ++t) {
+      stride = std::max<int64_t>(stride,
+                                 static_cast<int64_t>(ExpandHost(y.sel, t, sh.kv).size()));
+    }
+    REQUIRE(stride > 32);  // one tile cannot show a cross-tile carry
+
+    const GatherResult gpu = RunGather(DeviceType::kCUDA, y.q, y.k, y.v, y.sel, sh.T, sh.HQ,
+                                       sh.HKV, sh.DH, y.max_kv, false, stride);
+    const GatherResult cpu = RunGather(DeviceType::kCPU, y.q, y.k, y.v, y.sel, sh.T, sh.HQ,
+                                       sh.HKV, sh.DH, y.max_kv, false, stride);
+    // THE INSTRUMENT MUST NOT PERTURB THE THING IT MEASURES. The same call with
+    // the probe unset must produce the SAME OUTPUT BYTES; W9's bar is bit
+    // identity and an instrument that moved a float would falsify it.
+    const GatherResult plain = RunGather(DeviceType::kCUDA, y.q, y.k, y.v, y.sel, sh.T,
+                                         sh.HQ, sh.HKV, sh.DH, y.max_kv, false, 0);
+    REQUIRE(gpu.out.size() == plain.out.size());
+    const bool probe_is_inert =
+        std::memcmp(gpu.out.data(), plain.out.data(), gpu.out.size() * sizeof(float)) == 0;
+    INFO("the probe changed the kernel's output bytes");
+    CHECK(probe_is_inert);
+
+    struct Arm { const char* name; const GatherResult* r; };
+    for (const Arm& arm : {Arm{"CUDA", &gpu}, Arm{"CPU", &cpu}}) {
+      CAPTURE(std::string(arm.name));
+      int64_t pairs_checked = 0, desc_differs = 0, tree_differs = 0, exact_mismatch = 0;
+      double worst_rel = 0.0;
+      for (int64_t t = 0; t < sh.T; ++t) {
+        const int64_t n = static_cast<int64_t>(ExpandHost(y.sel, t, sh.kv).size());
+        REQUIRE(n <= stride);
+        for (int64_t h = 0; h < sh.HQ; ++h) {
+          const int64_t pair = t * sh.HQ + h;
+          const float* w = arm.r->probe_w.data() + pair * stride;
+          // The sentinel must be GONE, or the arm returned the buffer unwritten
+          // and every fold below would agree on garbage.
+          for (int64_t s = 0; s < n; ++s) {
+            REQUIRE(w[s] >= 0.0f);  // -1.0f is the sentinel; `exp` is never negative
+          }
+          // THE ASCENDING FOLD, in the arm's own visit order, over the arm's own
+          // weights. A plain `float` accumulator in a plain loop: the host
+          // provider is pinned `-ffp-contract=off` and no compiler may
+          // reassociate IEEE float addition, so this IS the order written.
+          float asc = 0.0f;
+          for (int64_t s = 0; s < n; ++s) asc = asc + w[s];
+          // The two reassociations the review actually ran, on the host.
+          float desc = 0.0f;
+          for (int64_t s = n - 1; s >= 0; --s) desc = desc + w[s];
+          std::vector<float> tree(w, w + n);
+          for (size_t span = tree.size(); span > 1; span = (span + 1) / 2) {
+            for (size_t i = 0; i + 1 < span; i += 2) tree[i / 2] = tree[i] + tree[i + 1];
+            if (span % 2 == 1) tree[span / 2] = tree[span - 1];
+          }
+          const float got = arm.r->probe_denom[static_cast<size_t>(pair)];
+          REQUIRE(got > 0.0f);  // the sentinel again, and a fold of positives
+          if (bits(asc) != bits(got)) {
+            ++exact_mismatch;
+            worst_rel = std::max(worst_rel, std::fabs(static_cast<double>(asc - got)) /
+                                                std::fabs(static_cast<double>(asc)));
+          }
+          if (bits(desc) != bits(asc)) ++desc_differs;
+          if (bits(tree[0]) != bits(asc)) ++tree_differs;
+          ++pairs_checked;
+        }
+      }
+      std::printf("[MEASURED] qsa_gather %-28s %-4s fold: %lld pairs, %lld bit-mismatches "
+                  "(worst rel %.3g); a DESCENDING fold would move %lld, a TREE %lld\n",
+                  sh.name, arm.name, static_cast<long long>(pairs_checked),
+                  static_cast<long long>(exact_mismatch), worst_rel,
+                  static_cast<long long>(desc_differs),
+                  static_cast<long long>(tree_differs));
+      INFO("denominator is not the ascending fold of the arm's own weights");
+      CHECK(exact_mismatch == 0);
+      // THE INSTRUMENT'S OWN VALIDATION: this fixture can SEE a reassociation.
+      // Without these two, a fold that agreed under every order would pass while
+      // measuring nothing.
+      CHECK(pairs_checked == sh.T * sh.HQ);
+      CHECK(desc_differs > 0);
+      CHECK(tree_differs > 0);
+    }
   }
 }
 

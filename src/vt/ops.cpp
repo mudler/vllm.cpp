@@ -5847,6 +5847,14 @@ void Exl3ReconstructGemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& tre
   const int64_t w_cols = n <= 32768 ? n : 32768;
   VT_CHECK(w_scratch.shape[0] == k && w_scratch.shape[1] == w_cols,
            "exl3_reconstruct_gemm: w_scratch must be [k, min(n, 32768)]");
+  // Upstream requires this on EVERY reconstruct path, not only the fused one.
+  // The unfused path calls `reconstruct` -> `reconstruct_slice`, which checks
+  // N % 128 (exllamav3_ext/quant/reconstruct.cu:121), and `had_r_128` on the
+  // input (K) and on the output (N), which checks cols % 128
+  // (exllamav3_ext/quant/hadamard.cu:102). The fused `reconstruct_had_slice`
+  // checks both (reconstruct.cu:348-349). exl3.py:170-174 gates only the fused
+  // choice on it because EXL3 tensors always satisfy it. `Exl3Gemm` above
+  // enforces the same rule, so no shape it serves is refused here.
   VT_CHECK(k % 128 == 0 && n % 128 == 0,
            "exl3_reconstruct_gemm: k and n must be multiples of 128");
   VT_CHECK(trellis.shape[0] == k / 16 && trellis.shape[1] == n / 16 &&

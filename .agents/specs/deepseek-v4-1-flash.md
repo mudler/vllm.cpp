@@ -48,6 +48,18 @@ ordering, and on the published artifacts themselves. `## Scope`, `## Gates` and
 `## Dependencies` carry the evidence for each; this section only says which row
 takes which.
 
+**`BLOCKED` bounds the GATE, not the work, and `## Work breakdown` says which
+waves proceed anyway.** An earlier revision of that section put W1 "after a pin
+advance", and the tree falsifies that: `Qwen3_5ForCausalLM` and
+`Qwen3_5MoeForCausalLM` sit at `PARTIAL` today as an explicit **"Ahead-of-pin
+forward port … REGISTERED, NOT RUN-GATED"**
+([model-matrix.md](../model-matrix.md), issue
+[#490](https://github.com/mudler/vllm.cpp/issues/490)), and `glm5_next` was
+registered while vLLM implemented it at no revision at all. Registration, config
+validation, the host op references and their device ports are all reachable
+without the pin, because none of them claims a gate against the oracle. What the
+pin gates is the DENOMINATOR, and nothing below produces one.
+
 The pin blocker, taken by the first three rows, is this. `DeepseekV41ForCausalLM`
 does not exist at our parity pin `e126687a9a` and cannot be made to exist there:
 the architecture landed on vLLM `main` on 10-11 September 2026, and the commit
@@ -500,18 +512,59 @@ before any speed axis is quoted.
 
 ## Work breakdown
 
-- **W0 (this change).** The records: two registry rows, two campaign rows, the
-  `QUANT-GGUF-Q1_0` evidence correction, the checklist and rollup, and one
-  local issue per row. No product code.
-- **W1 (blocked, not started).** After a pin advance: resolve and register
-  `deepseek_v41`, parse and validate the nested config, and refuse everything
-  else by name. The GLM-5.3-Flash W1 shape, which landed registration without
-  claiming a load.
-- **W2+ (blocked, unscoped).** All six subsystems with no counterpart here:
-  engram, MXFP8 32x32, the indexer arm, DSpark, the vision tower, and the CED
-  encoder-decoder KV split with its SWA Bounded Replay.
-  Each needs its own row and spec; none is scoped here,
-  because scoping an unreachable port produces a document nothing can check.
+**Developer goal, given 2026-09-12 in session:** land DeepSeek-V4.1-Flash
+support, complete with the GPU op families, on Metal and on Vulkan as well as
+CUDA. The waves below are that goal decomposed. Each is a row-sized brick with
+its own fresh implementer and fresh reviewer, and each states what gates it.
+
+**Two constraints bound every wave, and neither is removed by a pin advance.**
+
+1. **No published artifact fits any device this project reaches**, so no
+   end-to-end token gate against vLLM is reachable here. The release is 475.27
+   GiB against `dgx:gpu0`'s 119 GiB; the EXL3 arm is 428.488 GiB and wants four
+   matched devices; the only rung that fits, `Q1_0` at 98.591 GiB, is degenerate
+   by construction. Every wave below is therefore gated the way V4's W3-W7 were
+   gated: a portable host reference per op family, unit-gated at small shapes
+   against hand-derived and double-precision references, and device ports gated
+   against those host refs. That is a real gate and it is not an e2e gate, and
+   this spec says so in both directions.
+2. **DeepSeek-V4 itself has device ops on CUDA only** (`src/vt/cuda/cuda_deepseek_v4.cu`).
+   `src/vt/metal/` and `src/vt/vulkan/` carry no DeepSeek family at all. So the
+   Metal and Vulkan waves are not ports of an existing V4 arm; they are first
+   implementations for this architecture on those backends.
+
+| Wave | Scope | Needs the pin? | Needs a device? |
+|---|---|---|---|
+| W1 | Resolve and register `deepseek_v41`; parse and VALIDATE the nested config; refuse every unimplemented arm BY NAME | no | no |
+| W2 | Advance the vLLM parity pin to `e77daef89e` or later, reconciling every affected row and gate | it IS the pin | yes, for revalidation |
+| W3a | **Engram** host reference: the n-gram hash state, the compressed token map, the two ~384M-row tables, and the gate into the hyper-connection stream | no | no |
+| W3b | **MXFP8 32x32 UE8M0** host reference: block dequant and the linear arm, against V4's 128x128 fp8 | no | no |
+| W3c | **Indexer arm** host reference: the second block size (64/128 against V4's 256) and the `indexer_k_store` / `query_quant` ops | no | no |
+| W3d | **CED** host reference: the 20-layer causal encoder and 20-layer decoder split, the decoder's global KV projected from the final encoder hidden states, and SWA Bounded Replay | no | no |
+| W3e | **DSpark** host reference: block drafting at `dspark_block_size` 5 over target layers [37,38,39], its own 128-expert MoE at top-3, and the Markov rank-256 state | no | no |
+| W3f | **Vision** host reference: the 32-layer DeepSeek-ViT, 2D RoPE, the 3x3 pixel-unshuffle and the 2-layer MLP projector | no | no |
+| W4 | Host FORWARD assembly at a tiny synthetic config, composing W3a-W3f, finite and deterministic end to end | no | no |
+| W5 | CUDA device ports of every W3 family, each gated against its host reference | no | yes (CUDA) |
+| W6 | **Metal** ports of the same families, gated against the same host references | no | yes (the M4 host, which is NOT an `rc` fleet device and takes the file mutex) |
+| W7 | **Vulkan** ports of the same families, gated against the same host references through `llvmpipe`, which is how the EXL3 Vulkan arm was proven byte-exact | no | no (llvmpipe is CPU) |
+| W8 | Loader: the safetensors arm for the nested config, and the `deepseek41` GGUF architecture arm beside the existing `deepseek4` one | no | no |
+| W9 | **A rung that both fits and speaks.** Requantize so `token_embd` and `output` stay out of the 1-bit format, the way the published file already keeps `output.weight` at Q6_K and the router at BF16. This is the ONLY identified path to running this model on this hardware at all | no | yes, to produce and verify |
+| W10 | End-to-end run and whatever gate is then reachable | yes | yes |
+
+**Sequencing.** W1 starts immediately and blocks nothing else. W3a-W3f are
+mutually independent and are the parallel bulk of the campaign. W4 needs all of
+W3. W5, W6 and W7 each need W4 for the composition gate but their per-family
+ports need only the matching W3 family, so a family can go host-then-CUDA-then-
+Metal-then-Vulkan without waiting for its siblings. W9 is independent of all of
+it and is on the critical path for anything end to end. W10 needs W2 and W9.
+
+**What "supported" will mean when these land.** The architecture resolves,
+validates, loads, and forwards; every op family has a host reference and a CUDA,
+Metal and Vulkan arm gated against it; every unimplemented path refuses by name.
+It will NOT mean a token-exact e2e result against vLLM, unless W9 produces a
+fitting non-degenerate artifact and a device is free to run it. Recording that
+now is the difference between a campaign that ends in a measured result and one
+that ends in a claim.
 
 ## Risks/decisions
 

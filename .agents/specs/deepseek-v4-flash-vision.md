@@ -1048,28 +1048,44 @@ above as its red-before input.
   the actual element count). **Root-causing it is DONE too, and the repair is
   committed on this row's branch**: `ForwardDevice` now binds the keep-quant
   tower when the load took that arm, in the same order `Forward` binds it.
-  **WHAT REMAINS OWED IS THE OUTCOME**, and it is deliberately not asserted from
-  the diagnosis: whether a served image COMPLETES with the tower bound, or stops
-  at a further blocker, is a measurement under a lease. Until that run is
-  recorded here, this entry claims a root cause and a repair, never a working
-  image. Owed by issue #2411 and W7-CUDA, and by the row-owned local issue under
-  `.agents/issues/MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm/`. That issue is
+  **THE OUTCOME IS MEASURED TOO, and it is NOT a working image.** Under the
+  lease (`thor:gpu0`, output dirs `bind-20260912-232118` and
+  `bind-20260912-235206`) the `wq_a` refusal is GONE — step `image_past_wq_a`
+  RC=0 — and the request travels the whole registered forward. It then STOPS at
+  blocker 4 in the table above, the MoE vision-bias device router, which is
+  W4-era code refusing by name. No suite regressed either side of the repair:
+  `test_deepseek_v4_forward` 7 of 7 and `test_deepseek_v4_mm_reach` 20 of 20
+  under `VT_CPU_QUANT_REPACK=0`.
+
+  **SO THIS ENTRY CLAIMS A ROOT CAUSE, A REPAIR AND A MOVED BLOCKER — never a
+  served image.** What remains owed for a served image is the device MoE arm,
+  which belongs to issue #2411 and W7-CUDA rather than to this entry. The
+  row-owned local issue for the anonymous refusal is CLOSED; the issues still
+  open under `.agents/issues/MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm/`
+  are the remaining ones. That issue is
   named by DIRECTORY rather than by ID on purpose: a row-owned issue whose stable
   ID appears in a spec's `## Owed` is exactly what
   `scripts/check-agent-record.py` refuses, because an ID listed as owed is how a
   ROWLESS issue is tracked and a row-owned one is tracked by its directory.
 
-- **`test_deepseek_v4_mm_chat`'s image branch encodes a CPU-ONLY PREMISE and
-  fails on any CUDA build.** Its else-branch asserts the served error names
+- **`test_deepseek_v4_mm_chat`'s image branch encoded a CPU-ONLY PREMISE. FIXED,
+  and green on CUDA.** Its else-branch asserted the served error names
   `W7-device`, which is `kDevicePending` — and `ForwardDevice` guards that with
   `VT_CHECK(V4DeviceKernelsAvailable(), kDevicePending)`, a predicate that is
-  FALSE exactly when the device kernels are absent. On a CUDA build the refusal
-  therefore cannot fire, and the assertion can never hold. One assertion of 650
-  fails for this reason (the sibling `deepseek_v4.cpp` check now passes, because
-  the new message names that file). The case needs a device-aware expectation
-  rather than a CPU-shaped one; owed by issue #2411 and W7-CUDA, and by its own
-  row-owned local issue under
-  `.agents/issues/MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm/`.
+  FALSE exactly when the device kernels are absent. On a CUDA build that refusal
+  cannot fire, so the assertion was not merely unmet but UNSATISFIABLE.
+
+  The branch now selects on `V4DeviceKernelsAvailable()` — the same symbol
+  `test_cuda_deepseek_v4.cpp` uses — keeping the old expectation where the
+  kernels are absent and asserting the MoE vision-bias refusal where they are
+  present. It asserts that refusal rather than merely "not `W7-device`", because
+  a bare inequality would accept ANY failure, including a regression that stopped
+  the request earlier: this row has already lived through exactly that twice.
+
+  **MEASURED both ways on `thor:gpu0`**, same box and same suite: before the
+  change `8 | 7 passed | 1 failed` (the one failure being this assertion), after
+  it `8 | 8 passed | 0 failed` (`bind-20260912-235206`). Its row-owned local
+  issue is CLOSED with that evidence.
 
 - **8 of 20 `test_deepseek_v4_mm_reach` cases FAIL ON AARCH64, and the cause is
   the i8mm quant repack rather than the device.** Every one throws

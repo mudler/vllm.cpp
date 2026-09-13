@@ -27,3 +27,9 @@ Owed: a full A/B that is rc job resubmitted after `ba8079ae` failed its corpus c
 ## Resolution
 
 -
+
+## Progress 2026-09-12 (branch row/QUANT-EXL3-3150-DISPATCH, fresh review PASS)
+
+Item 1 fixed: `Exl3MatmulD` takes the reconstruct path only when `vt::OpRegistered(kExl3ReconstructGemm, device)` holds, so CPU, ROCm and Vulkan keep `Exl3Gemm` at every M. `tests/vt/test_exl3_matmul_dispatch.cpp` enters through `Exl3MatmulD` on a CPU queue at M = 145: red before the fix ("no kernel for op Exl3ReconstructGemm ... op_provider.cpp:625"), green after, and red again with the guard mutated to `true`.
+
+Item 3 falsified by upstream at exllamav3 `63b32f001d7b`: 128-divisibility is required on every reconstruct path, not only the fused one. The unfused path runs `reconstruct_slice` (`exllamav3_ext/quant/reconstruct.cu:121`, N % 128) and `had_r_128` on both sides (`exllamav3_ext/quant/hadamard.cu:102`, cols % 128); the fused path checks both at `reconstruct.cu:348-349`. `vt::Exl3Gemm` already refuses the same shapes, so the dispatch cannot refuse a shape it served before #3150. The check stays, now with those anchors. Item 2 (batched decode crossing 144) remains open and unmeasured.

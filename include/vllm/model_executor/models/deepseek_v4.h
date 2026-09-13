@@ -746,7 +746,25 @@ std::string ResolveDeepseekV4SwaPages(const DeepseekV4Params& params,
                                       // needs T == 1 or H == 1), so a prefill
                                       // refuses by name here rather than inside
                                       // the composition.
-                                      int64_t num_tokens);
+                                      int64_t num_tokens,
+                                      // KV-DSV4-MULTICACHE W8 slice 4 (#2455):
+                                      // STORAGE ROWS PER BLOCK when the resolved
+                                      // pages are PACKED fp8_ds_mla bytes, and 0
+                                      // when they are float. A rank-2 byte page
+                                      // cannot carry this in its shape, and it is
+                                      // taken from the published spec rather than
+                                      // recovered from `block_bytes`, because
+                                      // inverting `RoundUp(rows * 584, 576)` is
+                                      // not a function.
+                                      //
+                                      // DEFAULTED so the resolver's existing
+                                      // callers, which bind float pages and have
+                                      // no use for it, stay byte-identical. A
+                                      // caller that passes nullptr and is then
+                                      // handed a packed page is REFUSED by name
+                                      // rather than left to write 2048 f32 bytes
+                                      // into a 584-byte token slot.
+                                      int64_t* out_rows_per_block = nullptr);
 
 // MODEL-DSV4-PAGED-ENTRY (#2447). THE ONE derivation of "the paged arm composes
 // this layer's compressor rather than treating it as dense".
@@ -792,6 +810,23 @@ std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
                                               // arm. Null keeps the refusal.
                                               DeepseekV4CompressorState* compressor =
                                                   nullptr,
+                                              // KV-DSV4-MULTICACHE W8 slice 4
+                                              // (#2455): STORAGE ROWS PER BLOCK
+                                              // when `paged_kv` holds PACKED
+                                              // fp8_ds_mla byte pages, 0 when it
+                                              // holds float pages. Comes from
+                                              // `ResolveDeepseekV4SwaPages`, which
+                                              // reads it off the published spec.
+                                              // A rank-2 byte page cannot carry it
+                                              // in its shape.
+                                              //
+                                              // BEFORE `inputs_embeds` because the
+                                              // packed-page gates pass it
+                                              // POSITIONALLY in this slot
+                                              // (test_deepseek_v4_gguf_load.cpp
+                                              // ARM A/ARM B), while no caller
+                                              // passes `inputs_embeds` positionally.
+                                              int64_t rows_per_block = 0,
                                               // MODEL-MM-deepseek-v4 W4 (#2411):
                                               // the already-merged [T, H] f32
                                               // token stream, replacing the
@@ -811,6 +846,9 @@ std::vector<float> DeepseekV4ForwardExl3Paged(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const std::vector<int32_t>& logits_indices = {},
     DeepseekV4CompressorState* compressor = nullptr,
+    // KV-DSV4-MULTICACHE W8 slice 4 (#2455): storage rows per block for a
+    // PACKED fp8_ds_mla page, 0 for a float page. See the GGUF twin above.
+    int64_t rows_per_block = 0,
     const std::vector<float>* inputs_embeds = nullptr);
 
 // MODEL-DSV4-PAGED-ENTRY (#2447): the same composition, returning the runner's
@@ -829,6 +867,9 @@ ForwardLogits DeepseekV4ForwardExl3PagedLogits(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const std::vector<int32_t>& logits_indices,
     DeepseekV4CompressorState* compressor,
+    // KV-DSV4-MULTICACHE W8 slice 4 (#2455): storage rows per block for a
+    // PACKED fp8_ds_mla page, 0 for a float page.
+    int64_t rows_per_block = 0,
     // MODEL-MM-deepseek-v4 W4 (#2411): the ALREADY-MERGED `[num_tokens, hidden]`
     // row-major f32 token stream, or null on a text step. When present it
     // REPLACES the embedding lookup: `ModelRegistry::EmbedMm` has already

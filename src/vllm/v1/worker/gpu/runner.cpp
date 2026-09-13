@@ -1303,6 +1303,12 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     vt::Fp8KVCacheDataType fp8_kind;
     float k_scale;
     float v_scale;
+    // KV-DSV4-MULTICACHE W8 slice 4 (#2455): the entry's OWN page in bytes, the
+    // same `page_size_bytes()` this loop already spends on the allocation. It
+    // travels beside the view geometry because the two disagree for any spec
+    // whose page is not `block_size * head_size * sizeof(dtype)` — see the
+    // field's comment on `PagedKvCache`.
+    int64_t page_size_bytes;
   };
   std::vector<FaDims> fa_dims;
   // Parallel to fa_dims: 1 when the layer's spec kind is kMlaAttention (the
@@ -1413,7 +1419,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
             kv_cache_backend_resident_));
         fa_dims.push_back(FaDims{spec->num_kv_heads, spec->head_size,
                                  spec->dtype, spec->block_size, spec->fp8_kind,
-                                 spec->k_scale, spec->v_scale});
+                                 spec->k_scale, spec->v_scale, page});
         mla_layer_mask.push_back(static_cast<char>(fused));
       }
     }
@@ -1574,7 +1580,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
             static_cast<size_t>(num_blocks_) * static_cast<size_t>(l_page),
             kv_cache_backend_resident_));
         fa_dims.push_back(FaDims{l_Hkv, l_Dh, l_dtype, fa_block_size, l_fp8_kind,
-                                 l_k_scale, l_v_scale});
+                                 l_k_scale, l_v_scale, l_page});
         // Per-layer MLA flag, parallel to fa_dims: the view loop picks the right
         // backend name (TRITON_MLA for an MLA group) and the right expected KV
         // shape (fused 3-dim, not the NHD 5-dim) per group.
@@ -1620,6 +1626,10 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     kv.fp8_kind = fa_dims[i].fp8_kind;
     kv.k_scale = fa_dims[i].k_scale;
     kv.v_scale = fa_dims[i].v_scale;
+    // KV-DSV4-MULTICACHE W8 slice 4 (#2455): the allocated page, so a consumer
+    // of a packed or compressed page can build a view over the bytes that were
+    // actually reserved instead of the bytes the rank-3 geometry implies.
+    kv.page_size_bytes = fa_dims[i].page_size_bytes;
     // M3: the backend selection resolved for THIS group must describe the view
     // geometry the engine allocates + KvSlice reads — the NHD 5-dim
     // (num_blocks, 2, block_size, num_kv_heads, head_size) for a dense group,
@@ -1807,6 +1817,11 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       dkv.fp8_kind = kv_fp8_kind;
       dkv.k_scale = kv_k_scale;
       dkv.v_scale = kv_v_scale;
+      // The draft buffer is allocated at `fa_page_bytes` three lines above, so
+      // that is its page. Carrying the target's value here is the same choice
+      // the dtype and fp8 fields already make, and for the same reason: both
+      // sides index one shared block table.
+      dkv.page_size_bytes = fa_page_bytes;
       draft_attn_kv_.push_back(dkv);
       break;  // exactly one fa_draft group at k=1.
     }

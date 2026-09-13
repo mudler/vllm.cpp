@@ -783,6 +783,14 @@ target_include_directories(test_deepseek_v2_forward PRIVATE ${CMAKE_SOURCE_DIR}/
 vllm_cpp_add_test(test_deepseek_v4_scaffold vllm/models/test_deepseek_v4_scaffold.cpp)
 target_include_directories(test_deepseek_v4_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# KV-DSV4-MULTICACHE W8 slice 4 + slice 6 (#2455): the fp8_ds_mla BRIDGE — the
+# published byte page is actually written and read, and `--kv-cache-dtype auto`
+# stops refusing the layout the model's own factory declared.
+vllm_cpp_add_test(test_deepseek_v4_fp8_ds_mla_bridge
+  vllm/models/test_deepseek_v4_fp8_ds_mla_bridge.cpp)
+target_include_directories(test_deepseek_v4_fp8_ds_mla_bridge
+                           PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # DeepSeek-V4-Pro shape-generality gate (#504): the Pro config descends through
 # the SAME ParseDeepseekV4Params with zero new keys, and compress_ratios alone
 # reproduces the compressor/indexer layer counts of BOTH real checkpoints

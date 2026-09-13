@@ -73,7 +73,8 @@
 // This arm keeps all four:
 //
 //   1. the DOT `sum_d q[d]*k[d]` is sequential ascending f32 on ONE thread,
-//      never tree-reduced;
+//      never tree-reduced — one WHOLE dot per thread in both passes, which says
+//      nothing about WHICH thread, because the value does not depend on that;
 //   2. the MAX over the gathered rows is split across threads and block-reduced,
 //      which is exact and order-free — `max` is associative and commutative in
 //      IEEE arithmetic and it is the one reduction here that may be parallelised;
@@ -81,16 +82,22 @@
 //   4. the VALUE accumulation `acc[d] += w * v[d]` runs ascending over `p` and is
 //      parallel across `d` only, which each thread owns alone.
 //
-// THE COST IS STATED RATHER THAN LEFT TO BE FOUND. Pass 2's dot is sequential on
-// thread 0, so a block spends `|sel| * head_dim` dependent f32 operations on one
-// lane — ~525k per (token, head) at the released config. The lever that removes
-// it is named and NOT taken here: a deterministic tree reduction over `d` would
-// PRESERVE the gather-vs-dense property, because the dot's order would then
-// depend on `head_dim` alone and be identical in the sub-budget and the dense
-// run, while breaking the CPU-vs-CUDA relation the sequential dot keeps. That
-// trade is declined on the run that first puts this kernel on a device, because
-// it would replace a measured `max|diff|` with an argued one. The spec's
-// `## Owed` records it as a SPEED item with its condition.
+// THE COST THIS HEADER USED TO STATE HAS BEEN REMOVED, and the removal did not
+// need the lever it declined. Pass 2's dot WAS sequential on thread 0, so a
+// block spent `|sel| * head_dim` dependent f32 operations on one lane — ~525k
+// per (token, head) at the released config — and that single lane MEASURED
+// 86.4% and 88.8%, in two independent `thor:gpu0` runs, of this kernel's wall
+// time (`ISSUE-LOCAL-01M2DJ8Y4DFQMDG9GMWEK93142`). Pass 2 now spreads its tile
+// ONE WHOLE DOT PER THREAD, exactly as pass 1 already did, and only the SUM over
+// `s` stays on thread 0. Order 3 is what the CPU-vs-CUDA bit relation needs;
+// WHICH THREAD evaluates a given dot was never part of it.
+//
+// The tree reduction over `d` remains named and NOT taken: it would PRESERVE the
+// gather-vs-dense property, because the dot's order would then depend on
+// `head_dim` alone and be identical in the sub-budget and the dense run, while
+// breaking the CPU-vs-CUDA relation the sequential dot keeps. That trade would
+// replace a measured `max|diff|` with an argued one, and the change above is
+// bit-identity-preserving and did not require it.
 //
 // ─── TWO REFUSALS THIS ARM IMPOSES THAT THE CPU ARM DOES NOT ─────────────────
 // `head_dim > 1024` IS REFUSED BY NAME. One thread block serves one
@@ -344,11 +351,17 @@ void Qwen4ExpQsaCompressKernelCuda(Queue& q, Tensor& block_keys, const Tensor& r
 // the parallel path AGENTS.md "Shared seams" forbids AND would have to be kept
 // bit-identical to this one by hand.
 //
-// How many rows the tile below carries between thread 0 and the block. It exists
-// to amortise `__syncthreads`, NOT to change any order: thread 0 still walks `s`
-// ASCENDING and still accumulates `denom` ascending, and the block still applies
-// the tile's weights to `acc[d]` in ascending `s`. With `|sel|` up to 2051 at the
-// released config this turns ~4100 barrier pairs into ~130.
+// How many rows the tile below carries between the block and thread 0. It exists
+// to amortise `__syncthreads`, NOT to change any order: thread 0 still folds
+// `denom` over the tile ASCENDING, and the block still applies the tile's
+// weights to `acc[d]` in ascending `s`. With `|sel|` up to 2051 at the released
+// config this turns ~4100 barrier pairs into ~130.
+//
+// IT IS ALSO THE WIDTH OF THE TILE'S THREAD MAPPING, and 32 is the value that
+// makes that mapping need no bound: `BlockWidthFor` floors `blockDim.x` at 32,
+// so every entry `u < n <= 32` has a thread for every `DH` this op admits.
+// Raising it above 32 requires a real bound against `blockDim.x`, a case that
+// exercises `DH < kSelTile`, and `s_ptile`/`s_wtile` moving with it.
 constexpr int kSelTile = 32;
 
 // The one address that differs between the two arms, mirroring vLLM's paged read
@@ -497,41 +510,73 @@ __global__ void QsaGatherAttentionKernel(
     }
     const float m = s_m;
 
-    // Pass 2: the softmax weights and the value reduction, ASCENDING. Thread 0
-    // walks `s` in order and accumulates `denom` in order; the block applies each
-    // tile's weights to `acc[d]` in the same order. `kSelTile` amortises the
+    // Pass 2: the softmax weights and the value reduction, ASCENDING. The ORDER
+    // that is load-bearing is the SUM OVER `s`: `denom` is still accumulated by
+    // thread 0 alone, walking `u` from 0 to `n` ascending, so nothing here
+    // reassociates and the bit relation to the CPU arm is untouched. What is NOT
+    // order-bearing is the dot product over `d` INSIDE one `s` — it is a
+    // self-contained ascending f32 accumulation whose value does not depend on
+    // which thread runs it — so the tile's dots go ONE WHOLE DOT PER THREAD, the
+    // same arrangement pass 1 above already uses. Thread 0 used to recompute
+    // every selected key's dot by itself while the block waited, and that single
+    // lane MEASURED 86-89% of this kernel's wall time on `thor:gpu0`
+    // (`ISSUE-LOCAL-01M2DJ8Y4DFQMDG9GMWEK93142`). `kSelTile` amortises the
     // barriers and changes no order at all.
+    //
+    // THE TILE-TO-THREAD MAPPING IS SAFE WITHOUT A BOUND CHECK, and that is a
+    // property of the constants and not an assumption: `BlockWidthFor` floors
+    // `blockDim.x` at 32 and `kSelTile` is 32, so `n <= kSelTile <= blockDim.x`
+    // for every `DH` this op admits. Raising `kSelTile` gives that up and would
+    // need a real bound against `blockDim.x`.
+    //
+    // THE BARRIER COUNT DOES NOT CHANGE. Threads `u < n` write the tile,
+    // `__syncthreads`, then thread 0 folds `denom` (a READ of `s_wtile`) while
+    // the block applies the tile to `acc[d]` (also a read). Concurrent reads are
+    // not a hazard, and the trailing barrier that already keeps the next tile's
+    // writes off them is still there.
     float acc = 0.0f;  // this thread's acc[d], d == threadIdx.x
     if (threadIdx.x == 0) s_denom = 0.0f;
     __syncthreads();
     for (int64_t s0 = 0; s0 < selcount; s0 += kSelTile) {
       const int64_t n = (selcount - s0) < kSelTile ? (selcount - s0) : kSelTile;
-      if (threadIdx.x == 0) {
-        float denom = s_denom;
-        for (int64_t u = 0; u < n; ++u) {
-          const int64_t s = s0 + u;
-          int64_t p;
-          if (s < nsel_blocks * CR) {
-            p = static_cast<int64_t>(ids[t * topk + s / CR]) * CR + (s % CR);
-          } else {
-            p = complete * CR + (s - nsel_blocks * CR);
-          }
-          const int64_t base = RowBase(paged, pages, page_size, num_phys_pages, k_str, HKV, DH,
-                                       p, kvh);
-          if (base < 0) { s_bad = 1; s_wtile[u] = 0.0f; s_ptile[u] = -1; continue; }
-          ++reads;
+      if (threadIdx.x < n) {
+        const int64_t u = threadIdx.x;
+        const int64_t s = s0 + u;
+        int64_t p;
+        if (s < nsel_blocks * CR) {
+          p = static_cast<int64_t>(ids[t * topk + s / CR]) * CR + (s % CR);
+        } else {
+          p = complete * CR + (s - nsel_blocks * CR);
+        }
+        const int64_t base = RowBase(paged, pages, page_size, num_phys_pages, k_str, HKV, DH,
+                                     p, kvh);
+        if (base < 0) {
+          // The poison path, unchanged in value: `s_bad` is already written
+          // racily from many threads with this same value by pass 1.
+          s_bad = 1;
+          s_wtile[u] = 0.0f;
+          s_ptile[u] = -1;
+        } else {
+          ++reads;  // COUNTED AT THE READ, now by the thread that performs it
           float dot = 0.0f;
           for (int64_t d = 0; d < DH; ++d) {
             dot = __fadd_rn(dot, __fmul_rn(s_q[d], LoadAt(key, k_tag, base + d)));
           }
-          const float w = expf(__fsub_rn(__fmul_rn(dot, scale), m));
-          denom = __fadd_rn(denom, w);
-          s_wtile[u] = w;
+          s_wtile[u] = expf(__fsub_rn(__fmul_rn(dot, scale), m));
           s_ptile[u] = p;
         }
-        s_denom = denom;
       }
       __syncthreads();
+      if (threadIdx.x == 0) {
+        // The SUM OVER `s`, still serial and still ascending. A poisoned entry
+        // folds its `0.0f`, which is this accumulator's identity — `s_denom`
+        // starts at `+0.0f` and every `w` is non-negative, so it never holds
+        // `-0.0f`, the one value `+0.0f` would change — and the row it poisons
+        // is overwritten with NaN below regardless.
+        float denom = s_denom;
+        for (int64_t u = 0; u < n; ++u) denom = __fadd_rn(denom, s_wtile[u]);
+        s_denom = denom;
+      }
       if (threadIdx.x < DH) {
         const int64_t d = threadIdx.x;
         for (int64_t u = 0; u < n; ++u) {

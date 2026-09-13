@@ -1347,6 +1347,67 @@ TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA: |sel| CROSSES the tile boundary"
   }
 }
 
+TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA W9: head_dim BELOW the tile width") {
+  if (SkipNoCuda("vt::Qwen4ExpQsaGatherAttention CUDA narrow head_dim")) return;
+  // THE CASE W9's MAPPING NEEDS AND THE COMMITTED SUITE DID NOT HAVE. Pass 2's
+  // tile is now evaluated ONE WHOLE DOT PER THREAD -- thread `u` owns tile entry
+  // `u` -- and that mapping is bounded by `blockDim.x`, NOT by `head_dim`.
+  // `BlockWidthFor` floors the block at 32 and `kSelTile` is 32, so every entry
+  // `u < n <= 32` has a thread even when `DH` is far below 32. Every gather
+  // fixture in this file before this one ran `DH >= 32`, where the two bounds
+  // coincide and a mapping wrongly written `threadIdx.x < n && threadIdx.x < DH`
+  // is indistinguishable from the correct one.
+  //
+  // The shapes below put `DH` under the tile width, so entries `u` in
+  // `[DH, n)` exist and are owned by threads that own no output dim. The COUNT
+  // is the sharp instrument: a mapping that loses those entries reads fewer
+  // keys, and `keys_visited` is derived here from the HOST expansion, not from
+  // the kernel.
+  constexpr int64_t kTileWidth = 32;   // `kSelTile`, and the `BlockWidthFor` floor
+  constexpr int64_t kReadsPerRowPerHead = 2;  // two softmax passes
+  struct Shape { const char* name; int64_t T, HQ, HKV, DH, kv, CR, topk; };
+  const Shape kShapes[] = {
+      // head_dim 8: a 32-wide block, 24 of whose threads own no output dim.
+      {"DH 8 / 200 rows / 7 tiles", 2, 4, 2, 8, 200, 4, 50},
+      // head_dim 16 with a 2-row ragged tail, so the last tile is partial too.
+      {"DH 16 / 66 rows / 3 tiles", 3, 4, 2, 16, 66, 4, 16},
+      // head_dim 1: the narrowest the op admits, one output dim for 32 threads.
+      {"DH 1 / 132 rows / 5 tiles", 1, 2, 1, 1, 132, 4, 33},
+  };
+  for (const Shape& sh : kShapes) {
+    CAPTURE(std::string(sh.name));
+    // The fixture must actually be narrower than the tile, or it is the old case.
+    REQUIRE(sh.DH < kTileWidth);
+    const Synth y = MakeSynth(sh.T, sh.HQ, sh.HKV, sh.DH, sh.kv, sh.CR, sh.topk, 5309u);
+    int64_t rows = 0;
+    for (int64_t t = 0; t < sh.T; ++t) {
+      rows += static_cast<int64_t>(ExpandHost(y.sel, t, sh.kv).size());
+    }
+    const int64_t tiles = (static_cast<int64_t>(ExpandHost(y.sel, 0, sh.kv).size()) +
+                           kTileWidth - 1) / kTileWidth;
+    CHECK(tiles > 1);  // one tile cannot show a carry, and cannot show a tail
+    // The tile beyond `DH` must be NON-EMPTY, or the mapping under test is not
+    // exercised: with `n` capped at `kSelTile`, that needs `|sel| > DH`.
+    REQUIRE(static_cast<int64_t>(ExpandHost(y.sel, 0, sh.kv).size()) > sh.DH);
+    const int64_t want_reads = rows * sh.HQ * kReadsPerRowPerHead;
+    const GatherResult gpu = RunGather(DeviceType::kCUDA, y.q, y.k, y.v, y.sel, sh.T, sh.HQ,
+                                       sh.HKV, sh.DH, y.max_kv, true);
+    const GatherResult cpu = RunGather(DeviceType::kCPU, y.q, y.k, y.v, y.sel, sh.T, sh.HQ,
+                                       sh.HKV, sh.DH, y.max_kv, false);
+    char nm[96];
+    std::snprintf(nm, sizeof nm, "qsa_gather %s", sh.name);
+    std::printf("[MEASURED] %-44s tiles = %lld  keys_visited = %lld  host-derived = %lld\n",
+                nm, static_cast<long long>(tiles),
+                static_cast<long long>(gpu.keys_visited),
+                static_cast<long long>(want_reads));
+    INFO("keys_visited ", gpu.keys_visited, " want ", want_reads);
+    // A tile entry with no thread is a key never read. This is the assertion
+    // that separates a `blockDim.x` bound from a `head_dim` one.
+    CHECK(gpu.keys_visited == want_reads);
+    CheckGatherDerived(gpu.out, cpu.out, y.v, y.sel, sh.T, sh.HQ, sh.HKV, sh.DH, nm);
+  }
+}
+
 TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA: the GRID STRIDE takes more than one trip") {
   if (SkipNoCuda("vt::Qwen4ExpQsaGatherAttention CUDA grid stride")) return;
   // The launcher caps the grid at 4096 blocks and the kernel walks

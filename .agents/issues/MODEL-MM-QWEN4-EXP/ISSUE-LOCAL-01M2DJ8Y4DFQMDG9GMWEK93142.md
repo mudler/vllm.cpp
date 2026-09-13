@@ -121,3 +121,61 @@ counts or the step budget, and no correctness comparison against goldens was run
 
 Artifacts: `/workspace/qsa-attrib/20260913T145638Z/`, `...T145839Z/`,
 `...T150040Z/` on the shared NAS; `rc` jobs `3ea9b1c5`, `3ef2fe85`, `130642f7`.
+
+### W9 LANDED 2026-09-13 on `thor:gpu0` (sm_110): 17.69 ms -> 2.71 ms, **6.52x**
+
+The pass-2 dot now runs one whole dot per thread. Measured through the
+production op `vt::Qwen4ExpQsaGatherAttention` against the real `libvllm.a`,
+CUDA 13.0.88, sm_110, at the SAME released shape the attribution used --
+`T=1, HQ=24, HKV=2, DH=256, CR=4, block_topk=512`, `|sel| = 2048` -- 15 timed
+reps after 3 warm-ups, median, both arms in ONE job off ONE base tree:
+
+| arm | median | min | max |
+|---|---|---|---|
+| base `6a47d4370` | **17.6921 ms** | 17.6123 | 17.8523 |
+| fix | **2.7118 ms** | 2.5574 | 4.9118 |
+
+**6.52x against the spec's `~6.4x` prediction, which is NOT adjusted.** An
+earlier, aborted run of the same job measured the base arm at 17.8571 ms, 0.9%
+from the number above, so the denominator is reproduced rather than taken once.
+
+**THE STEP-LEVEL NUMBER IS NOT DERIVED HERE, and the reason is the operator's
+correction to the spec.** The 2.545 ms per launch and the 77.8 ms step come from
+two different context lengths, so they must not be divided into each other: QSA
+cost tracks `|sel| = min(kv_len, ~2048)`, which is ~1600 in the profile window
+and ~36 in the 16-token A/B harness. The 6.52x above is a KERNEL result at
+`|sel| = 2048`. What it is worth per step depends on the context the step runs
+at, and no end-to-end number is claimed from a harness whose `|sel|` is 36.
+
+**Bit identity is DEMONSTRATED, not argued.** The suite's arm-vs-arm gate holds
+the gather to a DERIVED BOUND, not to equality
+(`test_qwen4_exp_cuda_reductions.cpp:37-46`), so a green suite is not evidence of
+bit identity. The gather's raw output bytes were therefore captured on the device
+at base and at fix over 11 fixtures -- the two transformers goldens, seven
+synthetics spanning `DH` 1 to 256 with multi-tile and ragged-tail selections, the
+released decode shape, and a malformed selection whose row is poisoned -- 11,836
+floats, 47,344 bytes. Both streams are
+`b5bdad52c1a692626fdfc06cf6c87796d462cedc78f3437054aaadeaf3960f61` and `cmp`
+exits 0. The paged arm rides on this: the suite gates it BITWISE against the
+contiguous arm, which the dump covers.
+
+**`racecheck` is clean WITH a positive control.** `compute-sanitizer --tool
+racecheck` over the two multi-tile QSA cases reports `0 hazards displayed
+(0 errors, 0 warnings)`. Deleting the `__syncthreads()` between the tile write
+and the denominator fold, rebuilt (md5 `7a31c372e515` vs the fix's
+`5e4ab5a98147`), reports hazards in `QsaGatherAttentionKernel` in the tens of
+thousands (19,200 at one site). The clean run therefore measures the barrier
+rather than the tool being silent.
+
+**Four mutations, each rebuilt and each DETECTED** (per-arm binary md5 beside the
+fix's `5e4ab5a98147`, all nine gather cases selected and counted in every arm):
+bounding the tile map by `head_dim` instead of `blockDim.x` (`bac53105fc8a`,
+1 case red), dropping the last entry of every tile (`a63dcb30cb32`, abort),
+deleting the denominator fold (`d51ffb73ee3e`, 7 cases red), and not counting the
+pass-2 read (`dcbc383fd18d`, 2 cases red). Restoring the source returns 9/9 green
+at source sha256 `55d34c66a72a495db5db79045f72b616e2171f723c1557e3ddbbdb48fd657507`.
+
+Artifacts: `/workspace/qsa-w9/20260913T160154Z/` on the shared NAS; `rc` jobs
+`5a24eeef` (base+fix+racecheck+mutations) and `c3666e8f` (an earlier run of the
+same job, aborted by a defect in the job script's own binary comparison, whose
+base timing is quoted above).

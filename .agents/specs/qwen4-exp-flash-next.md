@@ -10350,6 +10350,30 @@ zero. Twelve launches a step makes it the larger half of QSA's bill here. The
 owed instrument is a `|sel|` sweep at fixed shape on this box, which is the same
 head_dim-sweep method the W9 attribution already used and trusts.
 
+**THE SWEEP WAS ATTEMPTED TWICE AND BOTH RUNS DIED THE SAME WAY. Read this before
+taking a lease for it.** `rc` jobs `8ea56726` and `0cfb7294` extended the working
+single-window harness to two legs -- 120 tokens then 1200, one boot, one binary,
+`nsys start`/`stop` around each. In both runs the server came up, answered
+`/v1/models`, and SERVED THE WARMUP CORRECTLY (ttft 111.2 s and 73.1 s
+respectively, decode 12.01 tok/s), and then **both legs got
+`URLError: [Errno 111] Connection refused`** -- including the FIRST leg, before
+any second `nsys start`, so it is not the two-window structure. The server died
+between the warmup completing and the first capture. `nsys stop` still produced
+`.nsys-rep` files, and the self-validation correctly REFUSED both as not
+decode-shaped rather than reporting the empty windows as a result.
+
+The cause is not established and is not guessed here. It is in `$OUT/srv.log` on
+the worker, which needs a lease to read, and the two candidates worth separating
+are an OOM under tracing (the box holds a ~68 GiB model in 128 GiB unified memory,
+and this dev host OOM-killed an unrelated `agent-preflight` the same evening) and
+`dgx:gpu0` itself, which went unhealthy EIGHT times on 2026-09-13. **The next
+attempt should read that log FIRST**, and should print the server's tail on client
+failure the way the leg function now prints the client's.
+
+WHAT IS NOT OWED, because it is already measured: the single-window capture works
+(`4e36bbae`, 1,594,621 launches, 113 MB) and produced everything in this section.
+Only the second context point is missing.
+
 ### THE REFERENCE MEASUREMENT, taken at last: 13.02 tok/s at 400 tokens, a 5.08x gap (2026-09-13)
 
 **This row has never before compared itself to sojufx on sojufx's workload.** Every

@@ -10260,6 +10260,65 @@ negligible. Issue
 [#1958](https://github.com/mudler/vllm.cpp/issues/1958) is closed; the fix is
 owned by row `SAMPLE-CORE` (spec: `.agents/specs/sampling-controls-c7.md`).
 
+### W7 scope: make the hyper-connection grouped norm fp32 and parallel
+
+Owned by `.agents/issues/MODEL-MM-QWEN4-EXP/ISSUE-LOCAL-01M2C8HBDD9VG6AJMPM9PTN80S.md`.
+Scoped AFTER W6 landed, against the 116.9 ms step W6 produced, never against the
+3.95 s one it retired.
+
+**Why this one next.** `nsys` ranks it: `HcGroupedNormKernel` is 40.7% of all GPU
+kernel time, 96 instances per decode step at ~435 us each, ~42 ms of a 101 ms
+kernel budget. With W6 landed the step is 116.9 ms, so this kernel is ~36% of a
+decode token.
+
+**The two defects.** `cuda_qwen4_exp.cu:258` launches ONE THREAD PER (token, hc
+stream), `GridFor(T * hc)` at `:402`. At `hc_count = 4` and decode `T = 1` that
+is FOUR threads on 48 SMs, each walking `H = 2560` twice, and the sum of squares
+accumulates in `double` (`:271-275`). Precision and parallelism are separable and
+both are in scope.
+
+**This is not a parity decision, and the spec says so rather than leaving it to
+the implementer.** `qwen4_exp_hc.h:99-104` already states the rule: the double is
+a HOST REFERENCE convention, "upstream runs the norm in fp32 and vLLM likewise",
+and "THE DEVICE ARM IS THE THING THAT MUST BE FP32-ACCUMULATE". The device arm is
+therefore the outlier, and moving it to fp32 moves it TOWARD the oracle.
+
+**The existing gates already admit the change, which is what makes it cheap.**
+The device arm is not held bit-exact against the CPU arm.
+`test_qwen4_exp_hc_device.cpp:76` gates the golden widths at `kTol = 1e-5`
+absolute; its model-width case at `:379` gates a RELATIVE `4e-5`, documented
+there as "6.6x the sqrt(K)*u random-walk bound for K = 10240" -- a bound derived
+for FP32 unit roundoff, beside the sentence "because torch runs this in fp32
+too". A serial fp32 walk is ~sqrt(K)*u ~= 6e-6 relative; a block tree reduction
+is BETTER at ~sqrt(log K)*u. Both sit inside a bound this tree derived before W7
+existed. Do NOT widen either tolerance. If the change cannot meet them, that is a
+finding about the change, not about the bound.
+
+**Design.** One block per (token, hc) group; a block-wide reduction for the sum
+of squares in fp32; the normalize-and-write loop that follows is
+order-independent and parallelises across the block with no numerical question.
+The `1 +` gamma fold stays f32 and stays where it is (`:288-290`) -- it is
+upstream's `1.0 + self.weight.float()` and #2218 records what dropping it looks
+like. `eps` stays INSIDE the rsqrt, added to the mean square, with the narrowing
+point unchanged.
+
+**Tests.** Red-first, and the red must come from the SHAPE rather than from the
+width: a case that fails because the kernel computed one group and broadcast it,
+or walked the wrong stride, is the one that discriminates a bad parallelisation.
+The existing `test_qwen4_exp_hc_device.cpp` cases (golden widths + the model-width
+agreement case) must stay green unmodified -- they are the numerical gate and
+they were written before this change.
+
+**Owed evidence.** An `nsys` re-measurement on `dgx:gpu0`, same harness as the W6
+A/B (interleaved arms, one boot per arm, released UD-IQ1_S staged locally), giving
+the new per-step kernel share for this kernel and the new tok/s. The prediction to
+test, stated so it can be wrong: ~42 ms per step removed, a step near 77 ms, and
+~13 tok/s. Record what is measured, not this number.
+
+**Out of scope.** The CPU reference's double (it is the oracle these gates use),
+`vt::RmsNormGroup`, the PLE block's norms, and the cuBLAS `gemvx` path -- the
+latter is the NEXT item at 15.9% and gets its own row.
+
 ### W6 scope: hoist the MoE adapter onto the model
 
 Owned by `.agents/issues/MODEL-MM-QWEN4-EXP/ISSUE-LOCAL-01M2AA9C31GCSDV8NRW26GMEVS.md`.

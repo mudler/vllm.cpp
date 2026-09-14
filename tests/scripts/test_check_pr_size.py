@@ -1198,133 +1198,19 @@ class BudgetEnforcement(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(checker.requires_reviewed_pr(path))
 
-    def test_production_role_check_requires_pr_for_product_paths(self) -> None:
-        """Feature code still needs a reviewed row/* PR."""
-        role = checker.load_role_discipline()
-        for path in (
-            "src/vt/cuda/cuda_backend.cu",
-            "include/vllm.h",
-            "examples/cli/main.cpp",
-            "tests/vt/test_backend.cpp",
-            "CMakeLists.txt",
-            ".env.example",
-        ):
-            with self.subTest(path=path):
-                self.assertTrue(
-                    role.policy_commit_violations(
-                        "abc123", ["parent"], "direct", "", [path]
-                    )
-                )
+    def test_role_discipline_loader_is_removed(self) -> None:
+        """check-role-discipline.py was deleted; its loader is gone too."""
+        self.assertFalse(
+            hasattr(checker, "load_role_discipline"),
+            "load_role_discipline should be removed with check-role-discipline.py",
+        )
 
-    def test_integration_trees_may_reach_main_directly(self) -> None:
-        """The documented operator escape hatch, now actually implemented.
-
-        check-role-discipline.py's docstring has always said scripts/, .agents/,
-        docs/ and .github/ may be pushed straight to main so a gate or a record
-        can be repaired without a round trip -- but only an explicit FILE list
-        implemented it, so policy_commit_violations governed every path. A spec
-        commit under docs/ could not reach main at all. This pins the documented
-        behaviour so the code and its docstring cannot diverge again.
-        """
-        role = checker.load_role_discipline()
-        for path in (
-            "docs/STATUS.md",
-            "docs/superpowers/specs/2026-08-09-policy-simplification-design.md",
-            ".github/workflows/ci.yml",
-            "scripts/agent-role.py",
-            ".agents/NOW.md",
-            "AGENTS.md",
-        ):
-            with self.subTest(path=path):
-                self.assertEqual(
-                    role.policy_commit_violations(
-                        "abc123", ["parent"], "direct", "", [path]
-                    ),
-                    [],
-                )
-
-    def test_role_checker_classifies_archived_state_as_integration(self) -> None:
-        role = checker.load_role_discipline()
-        for path in (
-            ".agents/completed/state-events/2026-08/STATE-20260808T120000-001.md",
-            ".agents/completed/state-migration-manifest.csv",
-        ):
-            with self.subTest(path=path):
-                self.assertTrue(role.is_integration_path(path))
-
-    def test_pending_pr_range_requires_the_exact_event_head(self) -> None:
-        role = checker.load_role_discipline()
-        head = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
-        ).strip()
-        base = subprocess.check_output(
-            ["git", "rev-parse", "HEAD^"], cwd=ROOT, text=True
-        ).strip()
-        self.assertIn(head, role.pending_pr_commits(base, head, head))
-        for pending in ("", head[:-1], head.upper(), "0" * 40):
-            with self.subTest(pending=pending):
-                with self.assertRaises(ValueError):
-                    role.pending_pr_commits(base, head, pending)
-
-    def test_a_merge_landed_pr_carries_the_commits_it_brings_in(self) -> None:
-        """Arrival is judged ONCE, on the commit that lands the change.
-
-        A PR landed with a real merge commit pushes the merge AND its branch
-        commits in one range. The merge names the PR; the branch commits under it
-        never had to, so judging each on its own message called every merge-
-        landed PR a direct push -- main went red for `6603356a` (#178),
-        `e73cbbae` (#204) and `1a02ab4f` (#196), in a gate about arriving through
-        exactly the PR that had just been merged.
-
-        The exhaustive cases live in tests/scripts/test_agent_role.py; this is the
-        evidence CHECKER_EVIDENCE_OVERRIDES names for the role-discipline checker,
-        so it pins the rule and the hole it must not open: only the SIDE parents
-        count, and a merge naming no row and no PR exempts nothing.
-        """
-        role = checker.load_role_discipline()
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp)
-
-            def git(*args: str) -> str:
-                return subprocess.check_output(
-                    ["git", *args], cwd=repo, text=True, stderr=subprocess.DEVNULL
-                ).strip()
-
-            def commit(message: str, path: str) -> str:
-                target = repo / path
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(f"{message}\n")
-                git("add", path)
-                git("commit", "-q", "-m", message)
-                return git("rev-parse", "HEAD")
-
-            git("init", "-q", "-b", "main")
-            git("config", "user.email", "t@example.com")
-            git("config", "user.name", "T")
-            commit("docs: seed", "docs/STATUS.md")
-            pushed = commit("perf: hand-edit a kernel", "src/vt/cuda/x.cu")
-            git("checkout", "-q", "-b", "row/ENG-FOO")
-            reviewed = commit("perf: faster kernel", "src/vllm/a.cpp")
-            git("checkout", "-q", "main")
-            git("merge", "-q", "--no-ff", "-m",
-                "Merge pull request #12 from mudler/row/ENG-FOO", "row/ENG-FOO")
-            merge = git("rev-parse", "HEAD")
-
-            with mock.patch.object(role, "ROOT", repo):
-                content = role.merged_pr_content([pushed, merge])
-                self.assertIn(reviewed, content)
-                # Merging a PR on top must not launder a direct push below it.
-                self.assertNotIn(pushed, content)
-
-                git("checkout", "-q", "-b", "wip", merge)
-                commit("perf: hand-edit again", "src/vllm/b.cpp")
-                git("checkout", "-q", "main")
-                git("merge", "-q", "--no-ff", "-m", "Merge branch 'wip'", "wip")
-                self.assertEqual(
-                    role.merged_pr_content([git("rev-parse", "HEAD")]), frozenset()
-                )
-
-
+    def test_role_discipline_evidence_override_is_removed(self) -> None:
+        """No evidence override for the deleted checker."""
+        self.assertNotIn(
+            "scripts/check-role-discipline.py",
+            checker.CHECKER_EVIDENCE_OVERRIDES,
+        )
 
 
 class PerClaimPathClass(unittest.TestCase):

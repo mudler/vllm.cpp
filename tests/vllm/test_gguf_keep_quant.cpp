@@ -3201,8 +3201,8 @@ std::vector<float> ReorderVRowsRef(const std::vector<float>& in,
     for (int64_t r = 0; r < num_v_per_k; ++r) {
       const int64_t g = k * num_v_per_k + r;
       const int64_t t = r * num_k + k;
-      std::memcpy(out.data() + (row_off + g) * cs,
-                  in.data() + (row_off + t) * cs,
+      std::memcpy(out.data() + (row_off + g * head_rows) * cols,
+                  in.data() + (row_off + t * head_rows) * cols,
                   static_cast<size_t>(cs) * sizeof(float));
     }
   }
@@ -3258,6 +3258,8 @@ TEST_CASE("packed V-row reorder equals the element-level reorder (W4d W4)") {
     }
     fa = ReorderVRowsRef(fa, K, row_off, num_k, rpk, head_rows);
 
-    CHECK(fa == fb);
+    // NaN != NaN under float operator==, so compare raw bytes.
+    CHECK(std::memcmp(fa.data(), fb.data(),
+                      fa.size() * sizeof(float)) == 0);
   }
 }

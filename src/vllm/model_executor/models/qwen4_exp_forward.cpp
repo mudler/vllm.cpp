@@ -268,6 +268,11 @@ GdnLayerWeights Qwen4ExpGdnBlockWeights(Qwen4ExpGdnWeights& g,
   w.dt_bias = BorrowWholeOwnedTensor(g.dt_bias);
   w.norm_weight = BorrowWholeOwnedTensor(g.norm_weight);
   w.out_proj = BorrowWholeOwnedTensor(g.out_proj);
+  // The loader kept the five projections in the converter's TILED V-head order
+  // so they could stay quantized; the GDN block undoes that on the projection
+  // vectors. Carried, never re-derived: the predicate that decided the layout
+  // and the predicate that undoes it must be the same one.
+  w.v_head_perm_key_heads = g.v_head_perm_key_heads;
   // `in_proj_ba` and `in_proj_qkvz` are left EMPTY — see the header. That is
   // what keeps the split fields above live and it is exactly what qwen3_5's own
   // GGUF loader does.

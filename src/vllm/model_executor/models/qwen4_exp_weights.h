@@ -125,7 +125,15 @@ struct Qwen4ExpGdnWeights {
   OwnedTensor dt_bias;      // f32 [num_v]                 un-reordered
   // `RMSNormGated` over `head_v_dim`. THE ONE NORM WITH NO `+1` TO INVERT.
   OwnedTensor norm_weight;  // [value_head_dim]
-  OwnedTensor out_proj;     // [H, value_dim]      V columns un-reordered
+  OwnedTensor out_proj;     // [H, value_dim]      V columns, VERBATIM
+  // The key-head count when the converter's TILED V-head order is still in
+  // place on `in_proj_qkv`'s trailing V rows, `in_proj_z`, `in_proj_b`,
+  // `in_proj_a` and `out_proj`'s columns; 0 when the file already wrote
+  // HuggingFace grouped order (`linear_num_value_heads == linear_num_key_heads`).
+  // Carried verbatim into `GdnLayerWeights::v_head_perm_key_heads`, which is
+  // where it is documented. Keeping the five projections verbatim is what keeps
+  // them QUANTIZED — see `LoadGdn`.
+  int64_t v_head_perm_key_heads = 0;
 };
 
 // `Qwen4ExpTextAttention` + its `Qwen4ExpTextQSAIndexer`

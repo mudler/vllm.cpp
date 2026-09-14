@@ -507,7 +507,7 @@ TEST_CASE("qwen4_exp GGUF: ssm_a is recovered as log(-x), and a bad sign refuses
         doctest::Approx(std::log(4.0F)).epsilon(1e-6));
 }
 
-TEST_CASE("qwen4_exp GGUF: the V-head reorder is inverted on every GDN tensor") {
+TEST_CASE("qwen4_exp GGUF: the five GDN projections load VERBATIM and DEFER their V-head order") {
   TempFile f(BuildFixture());
   const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
   const vllm::HfConfig cfg = vllm::Qwen4ExpHfConfigFromGguf(g);
@@ -518,45 +518,46 @@ TEST_CASE("qwen4_exp GGUF: the V-head reorder is inverted on every GDN tensor") 
   // Grouped head `g = k*R + r` reads tiled head `t = r*K + k`, with K = 2 key
   // heads and R = 3 value heads each: 0->0, 1->2, 2->4, 3->1, 4->3, 5->5. Four
   // of the six MOVE, and the map differs from its own inverse (which would send
-  // 1 to 3), so a loader that ran the permutation backwards lands somewhere
-  // wrong. At K = 1 the map is the identity and at K == R it is an involution;
-  // this fixture is neither.
+  // 1 to 3). At K = 1 the map is the identity and at K == R it is an
+  // involution; this fixture is neither, so "did not move" is a real claim.
   const int64_t tiled_for_grouped[6] = {0, 2, 4, 1, 3, 5};
 
-  // One element of a [rows, cols] buffer whose file value was `base + index`.
-  // `src_index` is where the value came from and `identity_index` is where a
-  // loader that skipped the un-reorder would have read it. Asserting the two
-  // ROUNDED values differ is what stops a bf16-collapsed pair from reading as a
-  // pass; the CHECK then has somewhere wrong to land.
-  auto CheckMoved = [&](const vllm::OwnedTensor& t, int64_t dst_index,
-                        int64_t src_index, int64_t identity_index) {
-    CAPTURE(dst_index);
-    CAPTURE(src_index);
-    CAPTURE(identity_index);
-    const float want = Rounded(base + static_cast<float>(src_index));
-    if (src_index != identity_index) {
-      REQUIRE(want != Rounded(base + static_cast<float>(identity_index)));
+  // THE CONTRACT CHANGED, AND THIS IS WHERE IT IS WRITTEN DOWN
+  // (ISSUE-LOCAL-01M2ENTH6YA5FWEDY6CFHF4NAM). These five tensors used to be
+  // un-reordered AT LOAD, which made every one of them `kTransformedWeight` and
+  // expanded 4.152 GB of k-quant to bf16 on the released artifact. They now
+  // load VERBATIM and the permutation happens on the projection VECTORS
+  // (`vt::VHeadPermute`, gated by `v_head_perm_key_heads`). So each subcase
+  // below asserts the value the FILE holds at that index and, separately, that
+  // the value the OLD loader would have put there is a different rounded number
+  // -- otherwise "unchanged" would be unfalsifiable.
+  CHECK(gdn.v_head_perm_key_heads == kNumKHeads);
+
+  auto CheckVerbatim = [&](const vllm::OwnedTensor& t, int64_t index,
+                           int64_t old_loader_index) {
+    CAPTURE(index);
+    CAPTURE(old_loader_index);
+    const float want = Rounded(base + static_cast<float>(index));
+    if (index != old_loader_index) {
+      REQUIRE(want != Rounded(base + static_cast<float>(old_loader_index)));
     }
-    CHECK(Bf16At(t, dst_index) == doctest::Approx(want));
+    CHECK(Bf16At(t, index) == doctest::Approx(want));
   };
 
-  SUBCASE("in_proj_z: every row moves with its head") {
+  SUBCASE("in_proj_z: no row moves") {
     REQUIRE(ShapeOf(gdn.in_proj_z) == std::vector<int64_t>{kValueDim, kH});
     for (int64_t gidx = 0; gidx < kNumVHeads; ++gidx) {
       for (int64_t r = 0; r < kLinHeadDim; r += 3) {
         CAPTURE(gidx);
-        const int64_t dst = (gidx * kLinHeadDim + r) * kH + 7;
-        const int64_t src = (tiled_for_grouped[gidx] * kLinHeadDim + r) * kH + 7;
-        CheckMoved(gdn.in_proj_z, dst, src, dst);
+        const int64_t at = (gidx * kLinHeadDim + r) * kH + 7;
+        const int64_t old = (tiled_for_grouped[gidx] * kLinHeadDim + r) * kH + 7;
+        CheckVerbatim(gdn.in_proj_z, at, old);
       }
     }
   }
 
-  SUBCASE("in_proj_qkv: ONLY the trailing V rows move") {
+  SUBCASE("in_proj_qkv: neither the q|k rows nor the V rows move") {
     REQUIRE(ShapeOf(gdn.in_proj_qkv) == std::vector<int64_t>{kConvDim, kH});
-    // The leading 2*key_dim q and k rows are untouched. A loader that reordered
-    // the whole tensor would scramble the query stream and the model would
-    // still run, which is why this half is asserted and not assumed.
     for (int64_t row : {int64_t{0}, int64_t{5}, 2 * kKeyDim - 1}) {
       CAPTURE(row);
       const int64_t idx = row * kH + 1;
@@ -565,32 +566,35 @@ TEST_CASE("qwen4_exp GGUF: the V-head reorder is inverted on every GDN tensor") 
     }
     for (int64_t gidx = 0; gidx < kNumVHeads; ++gidx) {
       CAPTURE(gidx);
-      const int64_t dst = (2 * kKeyDim + gidx * kLinHeadDim) * kH + 2;
-      const int64_t src =
+      const int64_t at = (2 * kKeyDim + gidx * kLinHeadDim) * kH + 2;
+      const int64_t old =
           (2 * kKeyDim + tiled_for_grouped[gidx] * kLinHeadDim) * kH + 2;
-      CheckMoved(gdn.in_proj_qkv, dst, src, dst);
+      CheckVerbatim(gdn.in_proj_qkv, at, old);
     }
   }
 
-  SUBCASE("in_proj_a / in_proj_b: one row per head") {
+  SUBCASE("in_proj_a / in_proj_b: one row per head, and it stays put") {
     // `ssm_beta` is `in_proj_b` and `ssm_alpha` is `in_proj_a` — the names
     // cross, and this subcase deliberately does NOT claim to see a swap: the
-    // fixture writes the same ramp into both, so their contents are identical
-    // and no assertion here could tell them apart. What it does see is the
-    // reorder, which is the thing with a wrong answer available. The crossing
-    // itself is gated by the name map against the shipped file, not here.
+    // fixture writes the same ramp into both, so no assertion here could tell
+    // them apart. The crossing is gated by the name map against the shipped
+    // file, not here.
     REQUIRE(ShapeOf(gdn.in_proj_a) == std::vector<int64_t>{kNumVHeads, kH});
     REQUIRE(ShapeOf(gdn.in_proj_b) == std::vector<int64_t>{kNumVHeads, kH});
     for (int64_t gidx = 0; gidx < kNumVHeads; ++gidx) {
       CAPTURE(gidx);
-      const int64_t dst = gidx * kH + 3;
-      const int64_t src = tiled_for_grouped[gidx] * kH + 3;
-      CheckMoved(gdn.in_proj_a, dst, src, dst);
-      CheckMoved(gdn.in_proj_b, dst, src, dst);
+      const int64_t at = gidx * kH + 3;
+      const int64_t old = tiled_for_grouped[gidx] * kH + 3;
+      CheckVerbatim(gdn.in_proj_a, at, old);
+      CheckVerbatim(gdn.in_proj_b, at, old);
     }
   }
 
-  SUBCASE("conv1d: only the V CHANNELS move, and the q|k channels do not") {
+  SUBCASE("conv1d: STILL un-reordered at load — only the V CHANNELS move") {
+    // The conv filter is f32 in the file and never a GEMM operand, so keeping
+    // it quantized saves nothing and deferring it would buy only a second
+    // permutation site. Leaving it GROUPED is what lets `mixed`'s V channels be
+    // permuted once, right after the projection, and have the conv agree.
     REQUIRE(ShapeOf(gdn.conv1d) == std::vector<int64_t>{kConvDim, kConvKernel});
     for (int64_t ch : {int64_t{0}, 2 * kKeyDim - 1}) {
       CAPTURE(ch);
@@ -603,24 +607,32 @@ TEST_CASE("qwen4_exp GGUF: the V-head reorder is inverted on every GDN tensor") 
       const int64_t dst = (2 * kKeyDim + gidx * kLinHeadDim) * kConvKernel + 1;
       const int64_t src =
           (2 * kKeyDim + tiled_for_grouped[gidx] * kLinHeadDim) * kConvKernel + 1;
-      CheckMoved(gdn.conv1d, dst, src, dst);
+      const float want = Rounded(base + static_cast<float>(src));
+      // FOUR of the six heads move; 0 and 5 are fixed points of this map, and
+      // for those there is no wrong answer to separate from, so demanding one
+      // would be asserting a property of the permutation's fixed points rather
+      // than of the loader. The four that move carry the discrimination.
+      if (src != dst) {
+        REQUIRE(want != Rounded(base + static_cast<float>(dst)));
+      }
+      CHECK(Bf16At(gdn.conv1d, dst) == doctest::Approx(want));
     }
   }
 
-  SUBCASE("out_proj: the reorder is on COLUMNS, not rows") {
-    // The one that can never ride a kept-quant block stream: a COLUMN
-    // permutation cuts across a superblock where a row permutation never does,
-    // which is why this tensor is `kTransformedWeight` whenever the reorder is
-    // active.
+  SUBCASE("out_proj: the COLUMN reorder is gone from the load too") {
+    // This is the one a kept-quant block stream could never carry: a COLUMN
+    // permutation cuts across a superblock where a ROW permutation never does.
+    // Deferring it to the out-projection's INPUT vector is what makes this
+    // tensor keep its blocks at all.
     REQUIRE(ShapeOf(gdn.out_proj) == std::vector<int64_t>{kH, kValueDim});
     for (int64_t row : {int64_t{0}, int64_t{9}}) {
       for (int64_t gidx = 0; gidx < kNumVHeads; ++gidx) {
         CAPTURE(row);
         CAPTURE(gidx);
-        const int64_t dst = row * kValueDim + gidx * kLinHeadDim + 2;
-        const int64_t src =
+        const int64_t at = row * kValueDim + gidx * kLinHeadDim + 2;
+        const int64_t old =
             row * kValueDim + tiled_for_grouped[gidx] * kLinHeadDim + 2;
-        CheckMoved(gdn.out_proj, dst, src, dst);
+        CheckVerbatim(gdn.out_proj, at, old);
       }
     }
   }

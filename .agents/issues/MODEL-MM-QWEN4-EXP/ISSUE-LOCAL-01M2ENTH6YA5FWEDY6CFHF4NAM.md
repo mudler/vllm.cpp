@@ -112,4 +112,94 @@ vector wrongly and showing the goldens catch it.
 
 ## Resolution
 
--
+IMPLEMENTED 2026-09-14, branch `row/MODEL-MM-QWEN4-EXP-gdn-impl` off
+`cef9f821632eb33156bb7d24a0a85eeab7f7484a`. The five projections load verbatim;
+`vt::VHeadPermute` (new op, CPU + CUDA + ROCm) re-indexes the vectors at four
+sites, all at the projection boundary. The consumer audit is in
+`.agents/specs/qwen4-exp-flash-next.md`, "THE CONSUMER AUDIT FOR THE DEFERRED
+V-HEAD PERMUTATION".
+
+### Two corrections to this issue's own gate, and both matter
+
+**1. "Both are exact re-indexings, so both are BIT-IDENTICAL" is true of the
+re-indexing and not of the reduction that consumes it.** A ROW permutation moves
+whole dot products, so `attn_qkv`, `attn_gate`, `ssm_beta` and `ssm_alpha` are
+bit-identical by construction. A COLUMN permutation permutes the summation order
+INSIDE every dot product, and floating-point addition is not associative, so
+`ssm_out` is bit-identical only under exact arithmetic. MEASURED on `thor:gpu0`
+(CPU arm, K = 2 against R = 3, T = 3 decode rows, all five deferred at once):
+the two arms agree BIT FOR BIT, `bad == 0` over the whole `[T, H]` output.
+So it holds here -- but it holds as a measurement, not as an identity, and it is
+measured at `value_dim` 96 rather than the released 6144.
+
+**2. "Bit identity against today's output on the released artifact" is not
+reachable by ANY implementation of this fix.** The fix's purpose is to stop
+dequantizing: today the five projections are bf16 values rounded from an f32
+dequant and consumed by cuBLAS `gemvx`; afterwards they are native Q5_K/Q6_K
+operands consumed by `QuantDotGemm*`. Different operand encodings through a
+different kernel cannot produce identical floats, and a gate demanding it would
+be demanding the defect back. What the committed tests gate at EQUALITY is the
+permutation mechanism held apart from the residency change -- same values, same
+dtype, permuted at load versus permuted on the vector.
+
+### The bytes, re-derived from the committed manifest
+
+`ssm_beta` and `ssm_alpha` are **F32 in the released file**, not quantized, so
+they contribute nothing; the saving is the three k-quant towers.
+
+| tensor | ggml type | bf16/layer | file/layer |
+|---|---|---|---|
+| `attn_qkv` | Q5_K | 52.429 MB | 18.022 MB |
+| `attn_gate` | Q5_K | 31.457 MB | 10.813 MB |
+| `ssm_out` | Q6_K | 31.457 MB | 12.902 MB |
+| x 36 layers | | **4.152 GB** | **1.503 GB** (2.763x) |
+
+Decode step **6.792 -> 4.142 GB, -39.0%**, which reproduces this issue's own
+arithmetic to three digits from an independent path.
+
+### THE MEASURED STEP CHANGE IS NOT YET TAKEN, and the byte figure must not be read as one
+
+This issue's risk 4 is the thing to measure and it is still owed. At the two
+rates this row has already measured -- cuBLAS bf16 GEMV at 162.3 GB/s against
+`QuantDotGemm*` at 93.4 GB/s -- the PREDICTION is 25.58 ms of kernel time
+becoming 16.09 ms, a **9.5 ms** saving against a 76.9 ms step. That is roughly a
+third of what the 2.763x byte ratio alone suggests, and it is a prediction from
+two previously measured rates, not a measurement of this change. Taking it needs
+a CUDA build on the released 67.564 GiB artifact, which this implementation
+session did not reach.
+
+### Gate evidence, `thor:gpu0`, CPU arm
+
+`rc` job `d83ff516-160e-4444-857b-60cd5d17ebce`, Release, `-j 8`:
+
+```
+test_gdn_v_head_permute        3/3   cases,  204/204 assertions   (md5 075694c39fd8ab6dcf9f95db83873e45)
+test_qwen3_5_gdn_spec_routing  7/7   cases,   82/82
+test_qwen4_exp_layer_loop     14/14  cases,  470/470
+test_qwen4_exp_qsa            14/14  cases, 7263/7263
+test_qwen4_exp_forward         2/2   cases,  429/429
+test_qwen4_exp_gguf_load_plan 10/10  cases, 7462/7462
+test_qwen4_exp_matmul_bt_dtype 3/3   cases,    2/2
+```
+
+### The device arms COMPILE, and that is all that is claimed of them
+
+`vt::VHeadPermute`'s CUDA and ROCm kernels are transcriptions of the CPU
+reference and were compiled inside leases, each as a single translation unit:
+
+| arm | box | toolchain | result |
+|---|---|---|---|
+| CUDA | `thor:gpu0`, `rc` job `e2cf10da-ce6f-4e5a-a10a-3f91b6d16ff6` | nvcc 13.0.88, `-arch=sm_110` | `NVCC_RC=0`, `cuda_gdn.o` 4,427,912 B |
+| ROCm | `strix:gpu0`, `rc` job `9fa1753e-09be-4c0b-8527-eb265823ad16` | HIP 7.2.53211 / ROCm 7.2.4, `--offload-arch=gfx1151` | `HIPCC_RC=0`, `rocm_gdn.o` 133,912 B |
+
+**NEITHER WAS EXECUTED.** A compile says the kernel is well-formed for that
+architecture and says nothing about its values. The equality and red-first cases
+above ran on the CPU arm only, so the device kernels are OWED a run -- which is
+the same shape as saying a CUDA forward for this model is owed, since no token
+has come out of a CUDA device for `qwen4_exp` at all.
+
+The red-first is inside `test_gdn_v_head_permute`: each of the four deferred
+tensor groups is flipped to the WRONG permutation direction in turn and the
+output must diverge. At K = 2 against R = 3 the backwards map is a genuinely
+different map -- at K = 1 it is the identity and at K == R its own inverse, and
+neither of those fixtures could tell a correct permutation from none.

@@ -10286,6 +10286,76 @@ negligible. Issue
 [#1958](https://github.com/mudler/vllm.cpp/issues/1958) is closed; the fix is
 owned by row `SAMPLE-CORE` (spec: `.agents/specs/sampling-controls-c7.md`).
 
+### THE CONSUMER AUDIT FOR THE DEFERRED V-HEAD PERMUTATION, and the one place the "bit-identical" claim is too strong (2026-09-14)
+
+Implementation of `ISSUE-LOCAL-01M2ENTH6YA5FWEDY6CFHF4NAM`. The scope named the
+correctness question as the actual work: the load-time reorder exists so every
+downstream consumer sees HuggingFace GROUPED V-head order, and permuting the
+vectors moves that obligation outward. This is that audit, read off
+`GdnBlockPaged`, `GdnBlock` and `GdnBlockPagedMixedSpec` rather than assumed.
+
+**THE BINDING CONSTRAINT IS THE RECURRENCE'S HEAD PAIRING.** `vt::GdnDecode`,
+`vt::GdnPrefill`, `vt::GdnSpecDecode` and `vt::GdnPackedDecode` take q/k at
+`[T, Hk, Dk]` and v/g/beta at `[T, Hv, *]`, and they pair value head `v` with
+key head `v / (Hv / Hk)`. That integer-divide rule IS the grouped order. In the
+converter's tiled order the same pairing would read `v % Hk`, so running the
+recurrence in tiled order is not an option, and the `attn_qkv` q and k rows the
+converter does NOT tile are what makes it unavailable — there is no permutation
+of 16 key heads that repairs a 48-head modulo grouping.
+
+**SO THE PERMUTATION IS APPLIED AT THE PROJECTION BOUNDARY AND NOWHERE ELSE.**
+Four sites, all before the first V-head-indexed consumer:
+
+| vector | shape | permuted | first consumer, and why it is satisfied |
+|---|---|---|---|
+| `mixed`'s trailing V channels | `[T, conv_dim]` | tiled -> grouped, prefix `2*key_dim` | `vt::CausalConv1d{Fwd,Update,SpecUpdate}` is DEPTHWISE — channel `c` pairs with row `c` of `conv1d_weight`, which the loader still permutes at load. Both sides grouped. |
+| `z` | `[T, value_dim]` | tiled -> grouped | `vt::RmsNormGated`'s gate, read as `[T, Hv, Dv]`. `norm_weight` is `[Dv]` and head-agnostic. |
+| `a`, `b` | `[T, Hv]` | tiled -> grouped | `vt::GdnGBeta` / `vt::GdnPostConv` / `vt::GdnPackedDecode`, which pair them ELEMENTWISE with `a_log` and `dt_bias` — both still permuted at load. |
+| the out-projection input | `[T, value_dim]` | grouped -> tiled | `out_proj`, whose permutation is on its COLUMNS, so the identity is `(W P) x = W (P x)` and the direction is the INVERSE one. |
+
+**WHAT IS NOT PERMUTED AT RUN TIME, AND WHY THAT IS THE POINT.**
+`ssm_conv1d`, `ssm_a` and `ssm_dt.bias` keep their load-time permutation. They
+are f32 and tiny — 0 of the 4.152 GB — so deferring them would buy nothing and
+cost a second permutation site. Leaving them grouped is exactly what confines
+the run-time work to the table above: the causal conv, the delta rule, the gated
+norm and BOTH PERSISTENT STATE CACHES (`conv_state` `[slots, conv_dim, K-1]`,
+`ssm_state` `[slots, Hv, Dv, Dk]`) see the grouped order they have always seen,
+so no cache written by an older build is re-indexed by a newer one.
+
+`vt::IndexSelect` in `GdnBlockPagedMixedSpec` splits by TOKEN, never by channel,
+and `vt::IndexCopy` merges the same way, so the mixed spec+prefill path inherits
+the permutation from the projections it is handed and needs no site of its own.
+Its out-projection tail needs the inverse, and has it.
+
+#### THE BIT-IDENTITY CLAIM IS TRUE FOR FOUR OF THE FIVE AND OVERSTATED FOR `ssm_out`
+
+The issue says "Both are exact re-indexings with no arithmetic, so both are
+BIT-IDENTICAL". **The re-indexing is exact in both directions; the REDUCTION
+that consumes it is not.**
+
+- A ROW permutation moves whole dot products. Output element `g` is the same sum
+  of the same products in the same order; only the index it is written to
+  changes. `attn_qkv`, `attn_gate`, `ssm_beta` and `ssm_alpha` are bit-identical
+  by construction.
+- A COLUMN permutation permutes the summation order INSIDE every dot product,
+  and floating-point addition is not associative. `ssm_out` is therefore
+  bit-identical only under exact arithmetic. Whether it moves a float in
+  practice is a measurement, and the `GDN deferred V-head permutation == the
+  load-time one` case in `tests/vllm/models/test_gdn_v_head_permute.cpp` is the
+  one that makes it.
+
+**AND A SECOND, LARGER CAVEAT ON THE GATE AS THE ISSUE WROTE IT.** "Bit identity
+against today's output on the released artifact" is not reachable by ANY
+implementation of this change, because the change's whole purpose is to stop
+dequantizing. Today the five projections are bf16 values rounded from an f32
+dequant, consumed by cuBLAS `gemvx`; afterwards they are native Q5_K/Q6_K
+operands consumed by `QuantDotGemm*`. Different operand encodings and a
+different kernel cannot produce identical floats, and a gate that demanded it
+would be demanding the defect back. What IS gateable at equality, and what the
+committed tests gate, is the PERMUTATION MECHANISM held apart from the residency
+change: the same weight values, in the same dtype, permuted at load versus
+permuted on the vector.
+
 ### THE NEXT ROW, NAMED: keep the GDN projections quantized by permuting a vector (2026-09-14)
 
 The attribution found that **61% of decode weight traffic is a load-time bf16

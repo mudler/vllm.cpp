@@ -222,6 +222,13 @@ enum class OpId : uint8_t {
   // scatter the per-group core outputs back to their original row positions.
   kIndexSelect,
   kIndexCopy,
+  // V-head re-indexing of a GDN projection vector. Additive op that lets the
+  // qwen4exp GGUF loader keep its Gated DeltaNet projections QUANTIZED: the
+  // converter's tiled V-head order is undone on the [T, N] activation instead
+  // of on the weight, which a k-quant block stream cannot represent. Pure
+  // re-indexing, no arithmetic, so it is bit-identical to the load-time
+  // permutation it replaces. See `VHeadPermuteArgs`.
+  kVHeadPermute,
   // BF16 grouped-MoE GEMM: the dtype-native analog of kMoeGroupedGemmNvfp4 (no
   // fp4 decode). Powers the Qwen3-Coder (Qwen3MoeForCausalLM) fast bf16 MoE path.
   kMoeGroupedGemmBf16,
@@ -1210,6 +1217,15 @@ struct Qwen4ExpPleGateArgs {
 
 struct L2NormArgs {
   float eps = 1e-6f;  // upstream default (gdn-semantics.md §4)
+};
+
+// Geometry of one Gated DeltaNet V-head re-indexing. See `vt::VHeadPermute`.
+struct VHeadPermuteArgs {
+  int64_t prefix_elems = 0;   // leading columns copied through unpermuted
+  int64_t num_key_heads = 0;  // K
+  int64_t heads_per_key = 0;  // R = num_value_heads / K
+  int64_t head_width = 1;     // elements per V head (value_head_dim, or 1)
+  bool inverse = false;       // false: tiled -> grouped; true: grouped -> tiled
 };
 
 struct RmsNormGatedArgs {
@@ -2579,6 +2595,8 @@ using GdnStateScatterFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using IndexSelectFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using IndexCopyFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
+using VHeadPermuteFn =
+    void (*)(Queue&, Tensor&, const Tensor&, const VHeadPermuteArgs&);
 using MoeRouterTopKFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&,
                                  const MoeRouterTopKArgs&, const Tensor*);
 // The trailing float is `routed_scale` — the routed_scaling_factor applied to
@@ -4492,6 +4510,34 @@ void GdnStateScatter(Queue& q, Tensor& cache, const Tensor& working,
 // dtype (any elementwise dtype). Powers the MIXED spec+non-spec GDN split
 // (qwen_gdn_linear_attn.py:1334-1335,1407-1408).
 void IndexSelect(Queue& q, Tensor& out, const Tensor& in, const Tensor& idx);
+
+// ── V-head re-indexing of a GDN projection vector ──────────────────────────
+//
+// WHY THIS EXISTS. The `qwen4exp` converter writes the Gated DeltaNet V heads
+// TILED (`t = r * num_key_heads + k`) while every downstream GDN kernel and
+// every HuggingFace reference indexes them GROUPED (`g = k * heads_per_key + r`,
+// so value head g belongs to key head `g / heads_per_key` — the rule the
+// recurrence hard-codes). The loader used to undo that on the WEIGHT, which
+// forces a k-quant superblock to be dequantized because the permutation moves
+// elements the superblock spans. For `out = W x` a ROW permutation satisfies
+// `(P W) x = P (W x)` and a COLUMN permutation satisfies `(W P) x = W (P x)`,
+// so the same re-indexing on the VECTOR leaves the weight verbatim. This op is
+// that re-indexing.
+//
+// `out` and `in` are [T, N] with N == prefix_elems + num_key_heads *
+// heads_per_key * head_width. Both are inner-contiguous and MAY carry an outer
+// row stride on dim 0; they must not alias. Elements [0, prefix_elems) are
+// copied straight through — that is `in_proj_qkv`'s leading q and k rows, which
+// the converter does NOT tile. Any elementwise dtype; in/out share it.
+//
+// `inverse == false` maps TILED -> GROUPED: `out[g] = in[r * K + k]` for
+// `g = k * R + r`. That is the four ROW-permuted projections (`attn_qkv`'s V
+// rows, `attn_gate`, `ssm_beta`, `ssm_alpha`), permuted on their OUTPUT.
+// `inverse == true` maps GROUPED -> TILED: `out[t] = in[k * R + r]` for
+// `t = r * K + k`. That is `ssm_out`, whose permutation is on its COLUMNS and
+// therefore on its INPUT.
+void VHeadPermute(Queue& q, Tensor& out, const Tensor& in,
+                  const VHeadPermuteArgs& args);
 
 // Row scatter over dim 0 (torch `index_copy_(0, idx, src)`): out[idx[i], ...] =
 // in[i, ...]. `idx` is i32 [M]; in is [M, D...] contiguous; out is [N, D...]

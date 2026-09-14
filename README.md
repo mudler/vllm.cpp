@@ -43,9 +43,10 @@
 - **2026-09** **EXL3 gains a native ROCm path.** Llama-3.2-1B-Instruct EXL3 generated on
   gfx1151 with zero CPU fallbacks. Discrete AMD validation and competitive performance remain
   unmeasured. See the [ROCm build guide](docs/BUILD.md#rocm-build-amd-gpus).
-- **2026-08** **EXL3 checkpoints now generate on CPU and CUDA.** A stock
-  Llama-3.2-1B-Instruct EXL3 checkpoint loads through the shared dense model path and emits text.
-  The current CUDA path supports its 3-bit body and 6-bit output head. No speed claim is available.
+- **2026-09** **CUDA EXL3 now supports Qwen3.8-27B and its DFlash2 draft.**
+  The CUDA path handles their `mul1` codebooks and uses reconstruction plus cuBLASLt for long
+  prefills. See [supported artifacts and limits](docs/USAGE.md#checkpoint-registry) and
+  [benchmark conditions](docs/benchmarks/qwen38-27b-exl3-gb10.md).
 - **2026-08** **GLM-5.3-Flash now generates on CPU from a 101.25 GiB GGUF.** The shipped
   `UD-Q2_K_XL` artifact emits coherent text while keeping IQ2_XS and IQ4_XS blocks compressed.
   Both formats also have CUDA keep-quant kernels, but this model's CUDA forward and every speed

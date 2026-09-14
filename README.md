@@ -37,6 +37,9 @@
 
 ## News
 
+- **2026-09** **Qwen3.8-Flash-Next generates text on CPU and ROCm.** The released UD-IQ1_S GGUF
+  runs one sequence at a time, with ROCm generation measured on gfx1151. Oracle token correctness
+  and competitive performance remain unverified. See the [model details](docs/FEATURES.md#registered-architectures).
 - **2026-09** **C ABI 26 exposes more engine controls.** Applications can select the KV cache
   dtype, read speculative acceptance counters, and disable the model-level sliding window.
   See the [C API reference](docs/reference/c-api.md#recent-abi-additions) for defaults and limits.

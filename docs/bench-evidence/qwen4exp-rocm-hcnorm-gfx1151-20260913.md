@@ -92,9 +92,23 @@ carries the table.
 ## NO CROSS-ENGINE RATIO IS CLAIMED
 
 `qwen4_exp` on ROCm has no token-exact gate
-(`ISSUE-LOCAL-01M2D6MV5RNSSM2GZVZKCZA4EG`): llama.cpp aborts on this architecture
-and the pinned vLLM has no ROCm build here. **Every number above is a
-within-engine A/B on one box, one boot, one artifact.**
+([`ISSUE-LOCAL-01M2D6MV5RNSSM2GZVZKCZA4EG`](../../.agents/issues/MODEL-MM-QWEN4-EXP/ISSUE-LOCAL-01M2D6MV5RNSSM2GZVZKCZA4EG.md)),
+and that ABSENT gate is the whole reason. **THE REASON THIS SECTION FIRST GAVE IS
+FALSE AND IS REPLACED** (corrected 2026-09-13; no number above is touched). It
+read: "llama.cpp aborts on this architecture and the pinned vLLM has no ROCm
+build here." Only the STOCK `llama-cpp` pin `b10451` aborts. The scoped
+[`llama-cpp-qwen4exp`](../../.agents/oracles/llama-cpp-qwen4exp.md) oracle
+(PR #27742 at `035e22731a`, `gateable = yes`) builds with HIP for `gfx1151` and
+decoded this same artifact on this same board at 25.877 tok/s
+([evidence](qwen4exp-llamacpp-denominator-gfx1151-20260913.md)), so a
+DENOMINATOR exists here. And the pinned vLLM at `e126687a9a` ships a complete
+`amd/` backend beside its `nvidia/` one and registers
+`Qwen4ExpForConditionalGeneration` at `registry.py:580`, so the primary oracle
+CAN define token-exact; what is missing is a RUN, for the three blockers that
+issue names. A denominator without a gate is still not divided:
+`AGENTS.md` §Gates, and the [#2497](https://github.com/mudler/vllm.cpp/issues/2497)
+retraction. **Every number above is a within-engine A/B on one box, one boot,
+one artifact.**
 
 ## Not measured
 

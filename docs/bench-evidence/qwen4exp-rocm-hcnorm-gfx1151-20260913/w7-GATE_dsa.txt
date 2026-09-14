@@ -1,0 +1,75 @@
+selected=2
+[doctest] doctest version is "2.5.2"
+[doctest] run with "--help" for options
+===============================================================================
+/tmp/vllmcpp-hcnorm-w7-48174/tests/vt/test_backend_cross_device.cpp:7236:
+TEST CASE:  DSA indexer logits match the CPU oracle and are NATIVE on ROCm
+
+/tmp/vllmcpp-hcnorm-w7-48174/tests/vt/test_backend_cross_device.cpp:7478: MESSAGE: dsa_indexer_logits NMSE ROCM heads=64 esz=4 qscale=0 = 0 differing bytes 0 of 820
+  logged: kH := 64
+          esz := 4
+          use_qs := 0
+          DeviceTag(dt) := ROCM
+
+/tmp/vllmcpp-hcnorm-w7-48174/tests/vt/test_backend_cross_device.cpp:7478: MESSAGE: dsa_indexer_logits NMSE ROCM heads=64 esz=4 qscale=1 = 0 differing bytes 0 of 820
+  logged: kH := 64
+          esz := 4
+          use_qs := 1
+          DeviceTag(dt) := ROCM
+
+/tmp/vllmcpp-hcnorm-w7-48174/tests/vt/test_backend_cross_device.cpp:7478: MESSAGE: dsa_indexer_logits NMSE ROCM heads=64 esz=2 qscale=0 = 0 differing bytes 0 of 820
+  logged: kH := 64
+          esz := 2
+          use_qs := 0
+          DeviceTag(dt) := ROCM
+
+/tmp/vllmcpp-hcnorm-w7-48174/tests/vt/test_backend_cross_device.cpp:7478: MESSAGE: dsa_indexer_logits NMSE ROCM heads=64 esz=2 qscale=1 = 0 differing bytes 0 of 820
+  logged: kH := 64
+          esz := 2
+          use_qs := 1
+          DeviceTag(dt) := ROCM
+
+/tmp/vllmcpp-hcnorm-w7-48174/tests/vt/test_backend_cross_device.cpp:7478: MESSAGE: dsa_indexer_logits NMSE ROCM heads=96 esz=4 qscale=0 = 2.83615e-14 differing bytes 84 of 820
+  logged: kH := 96
+          esz := 4
+          use_qs := 0
+          DeviceTag(dt) := ROCM
+
+/tmp/vllmcpp-hcnorm-w7-48174/tests/vt/test_backend_cross_device.cpp:7478: MESSAGE: dsa_indexer_logits NMSE ROCM heads=96 esz=4 qscale=1 = 2.53623e-14 differing bytes 85 of 820
+  logged: kH := 96
+          esz := 4
+          use_qs := 1
+          DeviceTag(dt) := ROCM
+
+/tmp/vllmcpp-hcnorm-w7-48174/tests/vt/test_backend_cross_device.cpp:7478: MESSAGE: dsa_indexer_logits NMSE ROCM heads=96 esz=2 qscale=0 = 1.9906e-14 differing bytes 78 of 820
+  logged: kH := 96
+          esz := 2
+          use_qs := 0
+          DeviceTag(dt) := ROCM
+
+/tmp/vllmcpp-hcnorm-w7-48174/tests/vt/test_backend_cross_device.cpp:7478: MESSAGE: dsa_indexer_logits NMSE ROCM heads=96 esz=2 qscale=1 = 2.06273e-14 differing bytes 73 of 820
+  logged: kH := 96
+          esz := 2
+          use_qs := 1
+          DeviceTag(dt) := ROCM
+
+===============================================================================
+/tmp/vllmcpp-hcnorm-w7-48174/tests/vt/test_backend_cross_device.cpp:7499:
+TEST CASE:  DSA top-k selection is INDEX-EXACT against the CPU oracle and NATIVE on ROCm
+
+/tmp/vllmcpp-hcnorm-w7-48174/tests/vt/test_backend_cross_device.cpp:7653: MESSAGE: dsa_topk_select ROCM topk=1: differing indices 0 of 6, differing counts 0
+  logged: topk := 1
+          DeviceTag(dt) := ROCM
+
+/tmp/vllmcpp-hcnorm-w7-48174/tests/vt/test_backend_cross_device.cpp:7653: MESSAGE: dsa_topk_select ROCM topk=5: differing indices 0 of 30, differing counts 0
+  logged: topk := 5
+          DeviceTag(dt) := ROCM
+
+/tmp/vllmcpp-hcnorm-w7-48174/tests/vt/test_backend_cross_device.cpp:7653: MESSAGE: dsa_topk_select ROCM topk=12: differing indices 0 of 72, differing counts 0
+  logged: topk := 12
+          DeviceTag(dt) := ROCM
+
+===============================================================================
+[doctest] test cases:   2 |   2 passed | 0 failed | 59 skipped
+[doctest] assertions: 273 | 273 passed | 0 failed |
+[doctest] Status: SUCCESS!

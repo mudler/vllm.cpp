@@ -20,10 +20,27 @@ fact, and it needs no second engine to be true.
 **It is not a comparison, and no ratio appears anywhere in this document.**
 `AGENTS.md` §Gates admits a performance result from an arm only after that arm's
 declared token-exact gate passes. The `qwen4_exp` ROCm arm has **no such gate —
-not a failing one, an absent one** — and it cannot simply be written, because
-`Qwen4ExpForConditionalGeneration` / `qwen4_exp` is an architecture no vLLM
-revision implements ([#1978](https://github.com/mudler/vllm.cpp/issues/1978)),
-so the primary oracle cannot define what token-exact means here. This run
+not a failing one, an absent one**. **THE REASON THIS FILE FIRST GAVE FOR THAT
+IS FALSE AND IS REPLACED RATHER THAN AMENDED** (corrected 2026-09-13, after the
+measurement and without touching it). It read: "it cannot simply be written,
+because `Qwen4ExpForConditionalGeneration` / `qwen4_exp` is an architecture no
+vLLM revision implements ([#1978](https://github.com/mudler/vllm.cpp/issues/1978)),
+so the primary oracle cannot define what token-exact means here." vLLM
+implements this architecture in full at the ACTIVE parity pin `e126687a9a`
+(`[Model] Support Qwen3.8-Flash-Next`, vllm#53896), with
+`Qwen4ExpForConditionalGeneration` registered at
+`vllm/model_executor/models/registry.py:580`, so the primary oracle CAN define
+token-exact here. [#1978](https://github.com/mudler/vllm.cpp/issues/1978) is not
+wrong, it is EXPIRED: it was read live against vLLM `origin/main` = `6a5e8f5979`
+on 2026-08-26, five days before that support landed. **What is missing is a
+primary-oracle RUN, and the blockers are specific**: `cooperative_topk` in the
+QSA indexer refuses to launch on this fleet at that revision
+([#2626](https://github.com/mudler/vllm.cpp/issues/2626), cause unestablished);
+every published safetensors arm exceeds the largest fleet box and vLLM cannot
+open the GGUF this file measured; and the decode GEMM plan is `sm_103`-gated.
+[`ISSUE-LOCAL-01M2D6MV5RNSSM2GZVZKCZA4EG`](../../.agents/issues/MODEL-MM-QWEN4-EXP/ISSUE-LOCAL-01M2D6MV5RNSSM2GZVZKCZA4EG.md)
+owns that gap. **Nothing above changes this document's refusal to divide**, which
+rested on the ABSENT gate and never on the absent oracle. This run
 therefore produced **no vllm.cpp figure at all**:
 `vllmcpp_binaries_built=0`, `vllmcpp_legs_run=0`, `ratios_computed=0`, recorded
 in `RESULT.json` by the job itself.

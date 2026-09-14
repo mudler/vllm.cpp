@@ -10286,6 +10286,130 @@ negligible. Issue
 [#1958](https://github.com/mudler/vllm.cpp/issues/1958) is closed; the fix is
 owned by row `SAMPLE-CORE` (spec: `.agents/specs/sampling-controls-c7.md`).
 
+### THE GAP IS A 13x MEMORY-EFFICIENCY DEFICIT, NOT A CEILING (2026-09-13)
+
+Derived from the model's config and this row's measured step, no GPU needed.
+**We sustain ~11.0 GB/s of GB10's ~273 GB/s: 4.0% of peak.** sojufx at 66.17
+tok/s sustains 140.1 GB/s (51.3%), and **this tree already sustains 220.8 GB/s
+(81%) on another model on this same box.**
+
+Active weights are 4.231 G params per token (48 layers x 88.15 M: MoE top-10 of
+512 at `moe_intermediate_size` 640 plus a shared expert, plus q/kv/o), which at
+IQ1_S is **~0.85 GB per step**. At 273 GB/s the floor is **3.1 ms per step,
+~320 tok/s**. The reference's 15.1 ms step is five times slower than the memory
+system permits, and at even 50% of peak we would be at ~161 tok/s -- 2.4x PAST
+the reference.
+
+**So the 5.08x gap is a defect, not a limit, and two of this row's own
+conclusions today are corrected by it.** The withdrawn "no combination of the
+identified kernel leads reaches 66" was wrong in a second and more basic way than
+its first retraction: it treated the distance as a shortfall to scrape together
+when there is ~20x of headroom. And the MTP finding
+(`ISSUE-LOCAL-01M2EG6R3MRCB9ENZB9840KAXX`), though true and unretracted, was
+OVER-WEIGHTED as "the blocker": speculation multiplies throughput at a given step
+cost and cannot explain running at 4% of bandwidth.
+
+Owed, and it is the next row: a per-kernel bandwidth attribution over the 68.9%
+that is GEMM, from shapes rather than from `ncu` (which refuses here). See
+`ISSUE-LOCAL-01M2EK69SESGH6ST1ESMFZC808`, which also records why the q/k/v merge
+is NOT the place to start.
+
+### THE FULL DECODE KERNEL TABLE, and a retraction: the lead is GEMM, not QSA (2026-09-13)
+
+Read from the SAME self-validated capture as the allocator measurement
+(`rc` job `4e36bbae`, 1,594,621 `cudaLaunchKernel` calls, 113 MB), by re-running
+`nsys stats` on it in a 2-minute lease with no build and no model load
+(`rc` job `fe5be663`). Per step over the window's 600 decode steps, against
+76.9 ms of GPU kernel time:
+
+| group | share | per step |
+|---|---|---|
+| **GEMM / GEMV, ALL OF IT** | **68.9%** | **52.98 ms** |
+| -- cuBLAS `gemvx` family (4 rows) + `gemv2T` + `splitKreduce` | 34.8% | 26.76 ms |
+| -- our `QuantDotGemm*` kernels (8 rows) | 34.1% | 26.22 ms |
+| `QsaGatherAttentionKernel` | 23.6% | 18.15 ms |
+| everything else (18 rows) | 7.5% | 5.77 ms |
+
+Notable individual rows: `gemvx` #1 at 43,128 instances (71.9 a step) and 244 us
+each; `QuantDotGemmQ8_0Kernel` at 145,200 instances (242 a step); and
+`QuantDotGemmKernel<WType 4, float>` at exactly **600 instances -- one per step --
+costing 2.49 ms each**, which is the shape of an `lm_head` over a large vocab.
+
+#### RETRACTION
+
+This row stated twice, in the MTP section and in the session prose that preceded
+it, that **"no combination of the identified kernel leads reaches 66 on this
+artifact without speculation."** That sentence was written while only TWO of the
+twenty-five kernel rows had ever been printed -- `QsaGatherAttentionKernel` and
+the first `gemvx` -- with the other 41.2 ms of the step unattributed. **It is
+withdrawn as reasoning**, independently of how the measurement below turns out.
+The arithmetic it quoted (deleting the top two kernels leaves ~52 ms) is correct
+and is not withdrawn; what is withdrawn is the inference that those two WERE the
+leads, and the closure that followed from it.
+
+It also corrects this row's aim. W9 optimised QSA because the post-W7 re-rank put
+it first. **At the reference workload QSA is second, at a third of the GEMM
+bill.**
+
+#### THE UNTRIED LEVER THIS EXPOSES, and it is already measured on this box
+
+`.agents/` and this project's own records carry the finding, measured on
+`dgx:gpu0` at tree `ecf580ce9`: **every decode GEMM runs a `cutlass_80_*` --
+AMPERE -- tactic on a Blackwell `sm_121` part, with no `nvjet`, `sm120`, `sm121`
+or `tcgen05` kernel anywhere in the decode trace**, alongside the sibling finding
+that cuBLASLt enumerates no Blackwell algorithm for these descriptors and that
+the DESCRIPTOR is the lever. That applies to the 26.76 ms/step of cuBLAS GEMV
+above. The other 26.22 ms/step is OUR OWN hand-written quant GEMM kernels, which
+no such finding covers and which nothing has profiled at this workload.
+
+**WHAT IS NOT ESTABLISHED, and must not be assumed from the paragraph above.**
+The recorded Ampere-tactic finding was measured on a DIFFERENT model and tree,
+and on GEMM shapes; the rows here are `gemvx`, cuBLAS's GEMV path, which at
+batch 1 is a different regime and may be bandwidth- rather than tactic-bound.
+Whether a Blackwell tactic is reachable for THESE descriptors and these shapes,
+and what it would be worth, is unmeasured. `ncu` refuses on this container
+(`ERR_NVGPUCTRPERM`), so the achieved-bandwidth reading that would settle the
+regime question is not available by the obvious route.
+
+#### AND THE FIRST LEVER IS A SHARED SEAM THIS MODEL NEVER JOINED
+
+`AGENTS.md` "Shared seams" requires: *"Route model fusion through
+`vt::FusedChain`. Route mergeable multilayer perceptron (MLP) projections through
+`layers::MlpGateUpMethodBase` and `vt::MergedGemmGroup`."*
+
+**`qwen4_exp` uses none of the three.** Grepping every `qwen4_exp*.cpp/h` for
+`MergedGemmGroup`, `MlpGateUpMethodBase` and `FusedChain` returns nothing; the
+only users in the tree are `dots3_note_vision.h` and `glm5_next_bridge.h`.
+
+The consequence is visible in the block code and then in the profile.
+`qwen4_exp_qsa_block.cpp` issues the projections as SEPARATE `vt::MatmulBT`
+calls against the same `hidden`: the indexer's q and k at `:593` and `:612`, then
+`:692` (q gate), `:756` (`k_proj`) and `:764` (`v_proj`). Each one re-reads the
+same activation and launches its own GEMV. The capture counts roughly **275 GEMV
+launches per decode step** across the `gemvx`, `gemv2T` and `QuantDotGemm*`
+families.
+
+Merging q/k/v into one GEMM is the standard form of this: three launches become
+one, the activation is read once instead of three times, and the single larger
+GEMM has more work to hide latency behind -- which matters precisely because
+these are BATCH-1 GEMV shapes, where per-launch overhead and activation re-reads
+are a large fraction of a small kernel. This is a protocol requirement this model
+does not meet AND the largest structurally-obvious lever aimed at the 68.9%.
+
+**IT IS NOT SIZED HERE.** How much of the 52.98 ms/step a merge recovers depends
+on how much of each GEMV is activation traffic against weight traffic, which this
+capture does not separate. That is what the owed work measures.
+
+**Owed, in order:** (1) confirm the tactic names actually chosen for these
+descriptors at this workload, which `nsys` can report without `ncu` -- note the
+rows here are `internal::gemvx::kernel`, cuBLAS's GEMV path, NOT the
+`cutlass_80_*` GEMM tactics the recorded Blackwell finding measured, so that
+finding may not transfer; (2) size the q/k/v and gate/up merge against the seam
+`AGENTS.md` already mandates, which needs no new kernel and no new oracle; (3)
+separately profile our own `QuantDotGemm*` family, the same size as the cuBLAS
+half and carrying no prior finding at all. Do not scope a fix before (1) and (2)
+are measured, and do not assume the Blackwell record applies to a GEMV.
+
 ### THE ALLOCATOR, MEASURED AT THE REFERENCE WORKLOAD: the count is right and the LEVER IS NOT (2026-09-13)
 
 `dgx:gpu0`, `rc` job `4e36bbae`, source `3eabd4dbd` (post-W9 `main`), released
@@ -10446,10 +10570,17 @@ largest box.
 The arithmetic any plan must clear: 66.17 tok/s is a **15.1 ms** step against our
 **87.6 ms** at 88% GPU-busy, i.e. **5.8x less step time**, while the two largest
 kernels are 18.16 ms and 17.53 ms -- deleting both entirely leaves ~52 ms, about
-19 tok/s. **No combination of the identified kernel leads reaches 66 on this
-artifact without speculation.** That is not a ceiling claim, and this row's rule
-that an apparent limit is an untraced implementation difference still stands; it
-is the statement of what the remaining leads do and do not contain. See
+19 tok/s. ~~**No combination of the identified kernel leads reaches 66 on this
+artifact without speculation.**~~ **WITHDRAWN the same day** -- that sentence was
+written knowing two of twenty-five kernel rows, with 41.2 ms of the step
+unattributed. The full table (see "### THE FULL DECODE KERNEL TABLE, and a
+retraction") puts **68.9% of kernel time in GEMM/GEMV**, splits it evenly between
+cuBLAS GEMV and our own `QuantDotGemm*` kernels, and puts QSA second. A recorded
+finding on this same box says every decode GEMM picks an AMPERE tactic on this
+Blackwell part. Whether that is worth anything at these GEMV shapes is
+unmeasured, but the closure was not earned and is retracted. This row's rule that
+an apparent limit is an untraced implementation difference stands, and here it
+bit the row that wrote it. See
 `ISSUE-LOCAL-01M2EG6R3MRCB9ENZB9840KAXX`, which lists the three routes and says
 which question to answer first.
 

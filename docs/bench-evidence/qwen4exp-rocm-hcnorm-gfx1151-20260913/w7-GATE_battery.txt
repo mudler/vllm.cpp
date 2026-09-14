@@ -1,0 +1,18 @@
+selected=5
+[doctest] doctest version is "2.5.2"
+[doctest] run with "--help" for options
+[MEASURED] ROCM W7 model width mixed vs CPU                 max|diff| = 5.96046448e-08  bound = 2.640087e-06  not-bitwise-equal = 967/7680
+[MEASURED] ROCM W7 model width stream unchanged             BYTE gate: 0/30720 differ, max|diff| = 0
+[MEASURED] ROCM W7 grid cap mixed vs CPU                    max|diff| = 1.78813934e-07  bound = 1.95702654e-06  not-bitwise-equal = 75436/614400
+[MEASURED] ROCM W7 grid cap stream unchanged                BYTE gate: 0/2457600 differ, max|diff| = 0
+[MEASURED] ROCM W7 ragged hidden=100 mixed vs CPU           max|diff| = 1.1920929e-07  bound = 1.69501057e-06  not-bitwise-equal = 30/400
+[MEASURED] ROCM W7 ragged hidden=100 stream unchanged       BYTE gate: 0/1200 differ, max|diff| = 0
+[MEASURED] ROCM W7 ragged hidden=777 mixed vs CPU           max|diff| = 1.1920929e-07  bound = 2.11831818e-06  not-bitwise-equal = 168/3108
+[MEASURED] ROCM W7 ragged hidden=777 stream unchanged       BYTE gate: 0/9324 differ, max|diff| = 0
+[MEASURED] ROCM W7 separation probe: broadcast signal = 0.666768516, case bound = 2.640087e-06, ratio = 252555.5x
+[MEASURED] ROCM W7 magnitude-separated: max|diff| = 9.53674316e-07  scale = 6.33523417  bound = 1e-05  (serial-f32 walk from hc_device.cpp:504, SCALE-NORMALISED to this fixture: 0.000129073535)
+[MEASURED] ROCM W7 magnitude stream unchanged               BYTE gate: 0/10240 differ, max|diff| = 0
+===============================================================================
+[doctest] test cases:  5 |  5 passed | 0 failed | 0 skipped
+[doctest] assertions: 55 | 55 passed | 0 failed |
+[doctest] Status: SUCCESS!

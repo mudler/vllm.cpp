@@ -627,8 +627,12 @@ CPU arms, 2.320338e-02 between CPU and CUDA.
 ## 6. What this does NOT establish
 
 - **It is not a token gate.** No oracle decoded this prompt. vLLM cannot run a
-  GGUF artifact, and the llama.cpp arm aborts in `build_delta_net_chunking`
-  before loading a byte — the blocker PREFILLDIV §8 recorded.
+  GGUF artifact, and the llama.cpp arm this wave had -- the STOCK `llama-cpp`
+  pin `b10451` -- aborts in `build_delta_net_chunking` before loading a byte,
+  the blocker PREFILLDIV §8 recorded. (Scoped 2026-09-13: the SCOPED
+  `llama-cpp-qwen4exp` oracle does NOT abort and has since decoded this
+  artifact on `gfx1151`, so this bullet is about the arm this wave ran and not
+  about every llama.cpp.)
 - **No speed number.** The wall times in §4 are liveness, on n=1 legs, on a box
   whose contention was not characterised.
 - **One prompt, one length.** `T = 5`, a single partial chunk at `BT = 64`. The

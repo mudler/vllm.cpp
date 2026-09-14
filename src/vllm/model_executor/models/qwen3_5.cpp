@@ -3861,17 +3861,59 @@ DBuf MatmulBTRawD(Dev d, const Tensor& x, const Tensor& weight,
   return out;
 }
 
+// ── DEFERRED V-HEAD PERMUTATION (MODEL-MM-QWEN4-EXP,
+//    ISSUE-LOCAL-01M2ENTH6YA5FWEDY6CFHF4NAM) ─────────────────────────────────
+//
+// INERT unless `w.v_head_perm_key_heads` is non-zero, which only the `qwen4exp`
+// GGUF loader sets. See `GdnLayerWeights::v_head_perm_key_heads` for why it
+// exists; in one line, undoing the converter's tiled V-head order on the WEIGHT
+// forces a k-quant superblock to be dequantized at load, and the identity
+// `(P W) x = P (W x)` lets the same re-indexing happen on the VECTOR instead.
+//
+// Returns an OWNING permuted copy, or nullopt when nothing is deferred (the
+// caller then keeps the tensor it had, byte for byte). The copy is out of
+// place because `vt::VHeadPermute` is a gather and the map is not an involution
+// at the released 16-vs-48 ratio.
+std::optional<DBuf> PermuteVHeadsIfDeferred(Dev d, const GdnLayerWeights& w,
+                                            const Tensor& src,
+                                            int64_t value_heads,
+                                            int64_t prefix_elems,
+                                            bool inverse) {
+  if (w.v_head_perm_key_heads == 0) return std::nullopt;
+  const int64_t kk = w.v_head_perm_key_heads;
+  VT_CHECK(value_heads > 0 && kk > 0 && value_heads % kk == 0,
+           "gdn deferred V-head permutation: value_heads is not a multiple of "
+           "the key-head count");
+  VT_CHECK(src.rank == 2, "gdn deferred V-head permutation: expected [T, N]");
+  const int64_t n = src.shape[1];
+  const int64_t body = n - prefix_elems;
+  VT_CHECK(prefix_elems >= 0 && body > 0 && body % value_heads == 0,
+           "gdn deferred V-head permutation: [T, N] does not split into a "
+           "prefix plus whole V heads");
+  DBuf out(d, src.dtype, {src.shape[0], n});
+  Tensor o = out.t();
+  vt::VHeadPermute(d.q, o, src,
+                   vt::VHeadPermuteArgs{prefix_elems, kk, value_heads / kk,
+                                        body / value_heads, inverse});
+  return out;
+}
+
 struct GdnBaOutput {
   std::optional<DBuf> packed_owner;
   std::optional<DBuf> b_owner;
   std::optional<DBuf> a_owner;
+  // Owners of the deferred V-head permutation's output (ProjectGdnBA). Empty on
+  // every checkpoint but the `qwen4exp` GGUF one. The owners above are kept
+  // alongside them, never replaced.
+  std::optional<DBuf> b_perm_owner;
+  std::optional<DBuf> a_perm_owner;
   Tensor b;
   Tensor a;
 };
 
-GdnBaOutput ProjectGdnBA(Dev d, const GdnLayerWeights& weights,
-                         const Tensor& hidden, int64_t value_heads,
-                         bool packed_decode = false) {
+GdnBaOutput ProjectGdnBARaw(Dev d, const GdnLayerWeights& weights,
+                            const Tensor& hidden, int64_t value_heads,
+                            bool packed_decode) {
   GdnBaOutput out;
   if (!weights.in_proj_ba.Empty()) {
     VT_CHECK(weights.in_proj_ba.nk && weights.in_proj_ba.rank == 2 &&
@@ -3937,6 +3979,37 @@ GdnBaOutput ProjectGdnBA(Dev d, const GdnLayerWeights& weights,
   }
   return out;
 }
+
+// The production entry point. `ProjectGdnBARaw` above is every existing arm,
+// unchanged; this wrapper adds the deferred V-head permutation and NOTHING else
+// — with `v_head_perm_key_heads == 0` (every loader but `qwen4exp`'s GGUF one)
+// `PermuteVHeadsIfDeferred` returns nullopt and the views below are the raw
+// ones, byte for byte.
+//
+// `b` and `a` are [T, Hv]: one element per V head, so the head width is 1 and
+// there is no prefix. Their consumers — `vt::GdnGBeta`, `vt::GdnPostConv` and
+// `vt::GdnPackedDecode` — pair them ELEMENTWISE with `a_log` and `dt_bias`,
+// which the loader still permutes at load, so both sides are grouped here.
+GdnBaOutput ProjectGdnBA(Dev d, const GdnLayerWeights& weights,
+                         const Tensor& hidden, int64_t value_heads,
+                         bool packed_decode = false) {
+  GdnBaOutput out =
+      ProjectGdnBARaw(d, weights, hidden, value_heads, packed_decode);
+  if (weights.v_head_perm_key_heads == 0) return out;
+  out.b_perm_owner = PermuteVHeadsIfDeferred(d, weights, out.b, value_heads,
+                                             /*prefix_elems=*/0,
+                                             /*inverse=*/false);
+  out.a_perm_owner = PermuteVHeadsIfDeferred(d, weights, out.a, value_heads,
+                                             /*prefix_elems=*/0,
+                                             /*inverse=*/false);
+  out.b = out.b_perm_owner->t();
+  out.a = out.a_perm_owner->t();
+  // The raw owners stay alive in `out` on purpose: the permutation above is
+  // queued, not complete, so returning their pool blocks here would hand a
+  // later allocation the memory this gather still reads.
+  return out;
+}
+
 
 // --- PERF-27B-GDN-FP8-QKVZ: the FP8 leaf of the merged GDN input projection.
 // The BF16 leaf below owns a merged `in_proj_qkvz` parameter; a ModelOpt FP8
@@ -4154,6 +4227,11 @@ struct GdnQkvzOutput {
   std::optional<DBuf> packed_owner;
   std::optional<DBuf> mixed_owner;
   std::optional<DBuf> z_owner;
+  // Owners of the deferred V-head permutation's output (ProjectGdnQkvz). Empty
+  // on every checkpoint but the `qwen4exp` GGUF one. The owners above are kept
+  // alongside them, never replaced.
+  std::optional<DBuf> mixed_perm_owner;
+  std::optional<DBuf> z_perm_owner;
   Tensor mixed;  // [T, conv_dim]; inner-contiguous, row stride may be padded
   Tensor z;      // [T, value_dim]; inner-contiguous, row stride may be padded
 };
@@ -4164,9 +4242,10 @@ struct GdnQkvzOutput {
 // fp8 (35B) when populated — qkv/z read the shared pre-quantized fp8
 // activation (h_fp8, quantize-once) when supplied — else bf16 (GGUF/synthetic;
 // mixed at GdnInDType, z at GdnOutDType).
-GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
-                             int64_t conv_dim, int64_t value_dim, DType indt,
-                             DType outdt, const Tensor* h_fp8) {
+GdnQkvzOutput ProjectGdnQkvzRaw(Dev d, const GdnLayerWeights& w,
+                                const Tensor& h, int64_t conv_dim,
+                                int64_t value_dim, DType indt,
+                                DType outdt, const Tensor* h_fp8) {
   GdnQkvzOutput out;
   // MODEL-QWEN35-GDN-EXL3 (#2495 item 4). FIRST and EXCLUSIVE, mirroring the
   // loader rung: an EXL3 load populates NO other in-projection field, so every
@@ -4434,6 +4513,39 @@ GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
   return out;
 }
 
+// The production entry point. `ProjectGdnQkvzRaw` above is every existing arm,
+// unchanged; this wrapper adds the deferred V-head permutation and NOTHING else
+// — with `v_head_perm_key_heads == 0` (every loader but `qwen4exp`'s GGUF one)
+// `PermuteVHeadsIfDeferred` returns nullopt and the views below are the raw
+// ones, byte for byte.
+//
+// `mixed` is [T, conv_dim] and ONLY its trailing V rows are tiled: the leading
+// `2 * key_dim` q and k rows are what the converter left alone, so they are the
+// permutation's PREFIX and are copied straight through. That keeps `mixed` in
+// exactly the channel order `conv1d_weight` (still permuted at load) and
+// `vt::GdnConvSplit` expect. `z` is [T, value_dim], all V heads, no prefix; its
+// consumer is the gated RMSNorm, which reads it as [T, Hv, Dv].
+GdnQkvzOutput ProjectGdnQkvz(Dev d, const GdnLayerWeights& w, const Tensor& h,
+                             int64_t conv_dim, int64_t value_dim, DType indt,
+                             DType outdt, const Tensor* h_fp8,
+                             int64_t value_heads) {
+  GdnQkvzOutput out =
+      ProjectGdnQkvzRaw(d, w, h, conv_dim, value_dim, indt, outdt, h_fp8);
+  if (w.v_head_perm_key_heads == 0) return out;
+  out.mixed_perm_owner =
+      PermuteVHeadsIfDeferred(d, w, out.mixed, value_heads,
+                              /*prefix_elems=*/conv_dim - value_dim,
+                              /*inverse=*/false);
+  out.z_perm_owner = PermuteVHeadsIfDeferred(d, w, out.z, value_heads,
+                                             /*prefix_elems=*/0,
+                                             /*inverse=*/false);
+  out.mixed = out.mixed_perm_owner->t();
+  out.z = out.z_perm_owner->t();
+  // The raw owners stay alive in `out`; see ProjectGdnBA.
+  return out;
+}
+
+
 // Rank-3 [T,Hv,Dv] gate view over a (possibly padded-row) [T, value_dim] z
 // slice for the gated RMSNorm — the inner [Hv,Dv] block is contiguous while
 // the token stride follows the packed parent (upstream z.reshape(T,-1,Dv) on
@@ -4488,7 +4600,7 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   const DType indt = GdnInDType();
   const DType outdt = GdnOutDType();
   GdnQkvzOutput qkvz =
-      ProjectGdnQkvz(d, w, h, conv_dim, value_dim, indt, outdt, h_fp8);
+      ProjectGdnQkvz(d, w, h, conv_dim, value_dim, indt, outdt, h_fp8, Hv);
   Tensor mixed = qkvz.mixed;  // [T,conv_dim], contiguous or row-strided view
   Tensor z = qkvz.z;          // [T,value_dim], contiguous or row-strided view
   GdnBaOutput ba = ProjectGdnBA(d, w, h, Hv);
@@ -4557,6 +4669,18 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   Tensor dnw = outdt == DType::kBF16 ? ResidentWeight(d, w.norm_weight, {Dv})
                                      : ResidentWeightF32(d, w.norm_weight, {Dv});
   const bool sigmoid_gate = GdnSigmoidGate(cfg);
+  // A deferred V-head permutation MUST reach the out-projection input, and the
+  // arms that quantize straight into the GEMM (`out_proj_fp8`'s fused store,
+  // fp4, block-fp8, EXL3) never materialize `gated_bf16` or never take a bf16
+  // activation. `qwen4exp` GGUF, the only loader that defers, populates none of
+  // them — so this refuses a combination that does not exist today rather than
+  // letting a future one produce a silently wrong V-head order.
+  VT_CHECK(w.v_head_perm_key_heads == 0 ||
+               (w.out_proj_fp8.Empty() && w.out_proj_fp4.Empty() &&
+                w.out_proj_fp8_block.Empty() && w.out_proj_exl3.Empty()),
+           "gdn: a deferred V-head permutation is implemented only for the "
+           "bf16/block-quant out_proj arm; this layer carries a quantized "
+           "out_proj owner that bypasses the permuted activation");
   const bool z_strided = z.stride[0] != value_dim;
   Tensor core2 = z_strided ? dcore.t() : Reshape(dcore.t(), {T * Hv, Dv});
   Tensor z2 = z_strided ? GdnGateView3(z, T, Hv, Dv) : Reshape(z, {T * Hv, Dv});
@@ -4608,6 +4732,15 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                      vt::RmsNormGatedArgs{eps, sigmoid_gate});
     vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
   }
+
+  // DEFERRED V-HEAD PERMUTATION on the OUT-PROJECTION INPUT (MODEL-MM-QWEN4-EXP).
+  // `out_proj`'s permutation is on its COLUMNS, so the identity that moves it is
+  // `(W P) x = W (P x)` — the INPUT is permuted, and in the INVERSE direction
+  // (grouped -> tiled) because everything from the conv to this point ran in
+  // grouped order. Inert when nothing is deferred.
+  std::optional<DBuf> gated_perm = PermuteVHeadsIfDeferred(
+      d, w, gated_bf16.t(), Hv, /*prefix_elems=*/0, /*inverse=*/true);
+  const Tensor gated_in = gated_perm ? gated_perm->t() : gated_bf16.t();
   // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
   // §3.6), else bf16 (default / GGUF).
   // MODEL-QWEN35-GDN-EXL3 (#2495 item 4): exclusive and FIRST, for the reason
@@ -4619,21 +4752,21 @@ DBuf GdnBlock(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // branch earlier in this function cannot have fired: it requires
   // `out_proj_fp8`, which an EXL3 load leaves empty.
   if (!w.out_proj_exl3.Empty()) {
-    return dense_exl3::Linear(d, gated_bf16.t(), w.out_proj, w.out_proj_exl3,
+    return dense_exl3::Linear(d, gated_in, w.out_proj, w.out_proj_exl3,
                               DType::kBF16);
   }
   // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
   // other arm of this out_proj returns.
   if (!w.out_proj_fp8_block.Empty()) {
-    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated_bf16.t(),
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated_in,
                                                         w.out_proj_fp8_block,
                                                         DType::kBF16);
   }
   return !w.out_proj_fp8.Empty()
-             ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
+             ? MatmulFp8CutlassD(d, gated_in, w.out_proj_fp8, DType::kBF16)
          : !w.out_proj_fp4.Empty()
-             ? MatmulNvfp4Bf16D(d, gated_bf16.t(), w.out_proj_fp4)
-             : MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
+             ? MatmulNvfp4Bf16D(d, gated_in, w.out_proj_fp4)
+             : MatmulBf16D(d, gated_in, w.out_proj);  // [T,H]
 }
 
 // PERSISTENT per-step input device buffers (decode host-tax #2): the flattened
@@ -5060,6 +5193,18 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
   Tensor dnw = outdt == DType::kBF16 ? ResidentWeight(d, w.norm_weight, {Dv})
                                      : ResidentWeightF32(d, w.norm_weight, {Dv});
   const bool sigmoid_gate = GdnSigmoidGate(cfg);
+  // A deferred V-head permutation MUST reach the out-projection input, and the
+  // arms that quantize straight into the GEMM (`out_proj_fp8`'s fused store,
+  // fp4, block-fp8, EXL3) never materialize `gated_bf16` or never take a bf16
+  // activation. `qwen4exp` GGUF, the only loader that defers, populates none of
+  // them — so this refuses a combination that does not exist today rather than
+  // letting a future one produce a silently wrong V-head order.
+  VT_CHECK(w.v_head_perm_key_heads == 0 ||
+               (w.out_proj_fp8.Empty() && w.out_proj_fp4.Empty() &&
+                w.out_proj_fp8_block.Empty() && w.out_proj_exl3.Empty()),
+           "gdn: a deferred V-head permutation is implemented only for the "
+           "bf16/block-quant out_proj arm; this layer carries a quantized "
+           "out_proj owner that bypasses the permuted activation");
   const bool z_strided = z.stride[0] != value_dim;
   Tensor core2 = z_strided ? dcore.t() : Reshape(dcore.t(), {T * Hv, Dv});
   Tensor z2 = z_strided ? GdnGateView3(z, T, Hv, Dv) : Reshape(z, {T * Hv, Dv});
@@ -5097,6 +5242,15 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
                      vt::RmsNormGatedArgs{eps, sigmoid_gate});
     vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
   }
+
+  // DEFERRED V-HEAD PERMUTATION on the OUT-PROJECTION INPUT (MODEL-MM-QWEN4-EXP).
+  // `out_proj`'s permutation is on its COLUMNS, so the identity that moves it is
+  // `(W P) x = W (P x)` — the INPUT is permuted, and in the INVERSE direction
+  // (grouped -> tiled) because everything from the conv to this point ran in
+  // grouped order. Inert when nothing is deferred.
+  std::optional<DBuf> gated_perm = PermuteVHeadsIfDeferred(
+      d, w, gated_bf16.t(), Hv, /*prefix_elems=*/0, /*inverse=*/true);
+  const Tensor gated_in = gated_perm ? gated_perm->t() : gated_bf16.t();
   // MODEL-QWEN35-GDN-EXL3 (#2495 item 4): exclusive and FIRST, for the reason
   // every other arm here is exclusive. An EXL3 load populates none of the
   // fields below, so each would fall through to an empty owner and refuse by
@@ -5106,21 +5260,21 @@ DBuf GdnBlockPagedMixedSpec(Dev d, const GdnLayerWeights& w, const HfConfig& cfg
   // branch earlier in this function cannot have fired: it requires
   // `out_proj_fp8`, which an EXL3 load leaves empty.
   if (!w.out_proj_exl3.Empty()) {
-    return dense_exl3::Linear(d, gated_bf16.t(), w.out_proj, w.out_proj_exl3,
+    return dense_exl3::Linear(d, gated_in, w.out_proj, w.out_proj_exl3,
                               DType::kBF16);
   }
   // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
   // other arm of this out_proj returns.
   if (!w.out_proj_fp8_block.Empty()) {
-    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated_bf16.t(),
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated_in,
                                                         w.out_proj_fp8_block,
                                                         DType::kBF16);
   }
   return !w.out_proj_fp8.Empty()
-             ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
+             ? MatmulFp8CutlassD(d, gated_in, w.out_proj_fp8, DType::kBF16)
          : !w.out_proj_fp4.Empty()
-             ? MatmulNvfp4Bf16D(d, gated_bf16.t(), w.out_proj_fp4)
-             : MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
+             ? MatmulNvfp4Bf16D(d, gated_in, w.out_proj_fp4)
+             : MatmulBf16D(d, gated_in, w.out_proj);  // [T,H]
 }
 
 // VT_DUMP_ACT stage probe (GDN): dump named intermediates so a layer-level
@@ -5246,7 +5400,7 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // f32 otherwise. The z gate follows the recurrence-output dtype
   // (VT_GDN_OUT_BF16): the gated-RMSNorm requires gate.dtype == core.dtype.
   GdnQkvzOutput qkvz =
-      ProjectGdnQkvz(d, w, h, conv_dim, value_dim, indt, outdt, h_fp8);
+      ProjectGdnQkvz(d, w, h, conv_dim, value_dim, indt, outdt, h_fp8, Hv);
   Tensor mixed = qkvz.mixed;  // [T,conv_dim], contiguous or row-strided view
   Tensor z = qkvz.z;          // [T,value_dim], contiguous or row-strided view
   GdnBaOutput ba = ProjectGdnBA(d, w, h, Hv, packed_decode);
@@ -5547,6 +5701,18 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   Tensor dnw = outdt == DType::kBF16 ? ResidentWeight(d, w.norm_weight, {Dv})
                                      : ResidentWeightF32(d, w.norm_weight, {Dv});
   const bool sigmoid_gate = GdnSigmoidGate(cfg);
+  // A deferred V-head permutation MUST reach the out-projection input, and the
+  // arms that quantize straight into the GEMM (`out_proj_fp8`'s fused store,
+  // fp4, block-fp8, EXL3) never materialize `gated_bf16` or never take a bf16
+  // activation. `qwen4exp` GGUF, the only loader that defers, populates none of
+  // them — so this refuses a combination that does not exist today rather than
+  // letting a future one produce a silently wrong V-head order.
+  VT_CHECK(w.v_head_perm_key_heads == 0 ||
+               (w.out_proj_fp8.Empty() && w.out_proj_fp4.Empty() &&
+                w.out_proj_fp8_block.Empty() && w.out_proj_exl3.Empty()),
+           "gdn: a deferred V-head permutation is implemented only for the "
+           "bf16/block-quant out_proj arm; this layer carries a quantized "
+           "out_proj owner that bypasses the permuted activation");
   const bool z_strided = z.stride[0] != value_dim;
   Tensor core2 = z_strided ? dcore.t() : Reshape(dcore.t(), {T * Hv, Dv});
   Tensor z2 = z_strided ? GdnGateView3(z, T, Hv, Dv) : Reshape(z, {T * Hv, Dv});
@@ -5600,6 +5766,15 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
                      vt::RmsNormGatedArgs{eps, sigmoid_gate});
     vt::CastBf16(d.q, gated_bf16.t(), dgated.t());
   }
+
+  // DEFERRED V-HEAD PERMUTATION on the OUT-PROJECTION INPUT (MODEL-MM-QWEN4-EXP).
+  // `out_proj`'s permutation is on its COLUMNS, so the identity that moves it is
+  // `(W P) x = W (P x)` — the INPUT is permuted, and in the INVERSE direction
+  // (grouped -> tiled) because everything from the conv to this point ran in
+  // grouped order. Inert when nothing is deferred.
+  std::optional<DBuf> gated_perm = PermuteVHeadsIfDeferred(
+      d, w, gated_bf16.t(), Hv, /*prefix_elems=*/0, /*inverse=*/true);
+  const Tensor gated_in = gated_perm ? gated_perm->t() : gated_bf16.t();
   // W8A8 cutlass fp8 (35B) when populated, else fp4-resident W4A4 (27B, notes
   // §3.6), else bf16 (default / GGUF).
   // MODEL-QWEN35-GDN-EXL3 (#2495 item 4): exclusive and FIRST, for the reason
@@ -5611,21 +5786,21 @@ DBuf GdnBlockPaged(Dev d, const GdnLayerWeights& w, const HfConfig& cfg,
   // branch earlier in this function cannot have fired: it requires
   // `out_proj_fp8`, which an EXL3 load leaves empty.
   if (!w.out_proj_exl3.Empty()) {
-    return dense_exl3::Linear(d, gated_bf16.t(), w.out_proj, w.out_proj_exl3,
+    return dense_exl3::Linear(d, gated_in, w.out_proj, w.out_proj_exl3,
                               DType::kBF16);
   }
   // MODEL-FP8-BLOCK-LINEAR (#1189 M4): exclusive and first; bf16 out, as every
   // other arm of this out_proj returns.
   if (!w.out_proj_fp8_block.Empty()) {
-    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated_bf16.t(),
+    return dense_fp8_block::MatmulFp8BlockScaledD<DBuf>(d, gated_in,
                                                         w.out_proj_fp8_block,
                                                         DType::kBF16);
   }
   return !w.out_proj_fp8.Empty()
-             ? MatmulFp8CutlassD(d, gated_bf16.t(), w.out_proj_fp8, DType::kBF16)
+             ? MatmulFp8CutlassD(d, gated_in, w.out_proj_fp8, DType::kBF16)
          : !w.out_proj_fp4.Empty()
-             ? MatmulNvfp4Bf16D(d, gated_bf16.t(), w.out_proj_fp4)
-             : MatmulBf16D(d, gated_bf16.t(), w.out_proj);  // [T,H]
+             ? MatmulNvfp4Bf16D(d, gated_in, w.out_proj_fp4)
+             : MatmulBf16D(d, gated_in, w.out_proj);  // [T,H]
 }
 
 // --- Dense full_attention block. qwen36-forward-notes.md §5; pinned

@@ -594,6 +594,12 @@ vllm_cpp_add_test(test_qwen3_5_gdn_spec_routing vllm/models/test_qwen3_5_gdn_spe
 vllm_cpp_add_test(test_qwen3_5_gguf_mtp vllm/models/test_qwen3_5_gguf_mtp.cpp)
 vllm_cpp_add_test(test_qwen3_dflash_gguf vllm/models/test_qwen3_dflash_gguf.cpp)
 target_include_directories(test_qwen3_5_gdn_spec_routing PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# MODEL-MM-QWEN4-EXP (ISSUE-LOCAL-01M2ENTH6YA5FWEDY6CFHF4NAM): the deferred GDN
+# V-head permutation. Same reason for the src/ include — it drives the block
+# through `GdnBlockPagedForTest`.
+vllm_cpp_add_test(test_gdn_v_head_permute vllm/models/test_gdn_v_head_permute.cpp)
+target_include_directories(test_gdn_v_head_permute PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen27_dense_forward vllm/models/test_qwen27_dense_forward.cpp)
 # MODEL-GDN-OUTPUT-GATE-TYPE (#489): `GlueFuseEnabled()` defaults ON and is read
 # ONCE per process into a function-local static, so one run of these two suites

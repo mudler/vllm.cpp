@@ -3348,6 +3348,40 @@ void IndexCopy(Queue& q, Tensor& out, const Tensor& in, const Tensor& idx) {
       q, out, in, idx);
 }
 
+void VHeadPermute(Queue& q, Tensor& out, const Tensor& in,
+                  const VHeadPermuteArgs& args) {
+  VT_CHECK(out.rank == 2 && in.rank == 2,
+           "v_head_permute: out/in must be rank-2 [T, N]");
+  VT_CHECK(out.dtype == in.dtype, "v_head_permute: dtype mismatch");
+  VT_CHECK(out.device == q.device && in.device == q.device,
+           "v_head_permute: device mismatch");
+  VT_CHECK(out.shape[0] == in.shape[0] && out.shape[1] == in.shape[1],
+           "v_head_permute: out/in shape mismatch");
+  VT_CHECK(args.num_key_heads > 0 && args.heads_per_key > 0 &&
+               args.head_width > 0 && args.prefix_elems >= 0,
+           "v_head_permute: non-positive geometry");
+  const int64_t body =
+      args.num_key_heads * args.heads_per_key * args.head_width;
+  VT_CHECK(args.prefix_elems + body == in.shape[1],
+           "v_head_permute: prefix_elems + K*R*head_width != N (" +
+               std::to_string(args.prefix_elems) + " + " +
+               std::to_string(body) + " != " + std::to_string(in.shape[1]) +
+               ")");
+  // Inner-contiguous, outer row stride may be padded. ALIASING IS REFUSED
+  // rather than tolerated: this is a gather, so an in-place call would read
+  // elements it has already overwritten and the permutation is not an
+  // involution at the released 16-vs-48 ratio (it IS one at K == R, which is
+  // exactly the fixture shape that could not detect the difference).
+  VT_CHECK(out.stride[1] == 1 && in.stride[1] == 1,
+           "v_head_permute: inner dim must be contiguous");
+  VT_CHECK(out.stride[0] >= out.shape[1] && in.stride[0] >= in.shape[1],
+           "v_head_permute: outer row stride too small");
+  VT_CHECK(out.data != in.data, "v_head_permute: out and in must not alias");
+  if (in.shape[0] == 0) return;
+  reinterpret_cast<VHeadPermuteFn>(GetOp(OpId::kVHeadPermute, q.device.type))(
+      q, out, in, args);
+}
+
 void MoeRouterTopK(Queue& q, Tensor& weights, Tensor& indices, const Tensor& logits,
                    const MoeRouterTopKArgs& args,
                    const Tensor* e_score_correction_bias) {

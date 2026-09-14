@@ -441,6 +441,47 @@ void RetypeAttentionSpec(AttentionSpec& spec, const ResolvedCacheDType& resolved
 void ApplyCacheDType(KVCacheConfig& config, const ResolvedCacheDType& resolved,
                      float k_scale, float v_scale) {
   const auto retype = [&](AttentionSpec& spec) {
+    // `auto` MEANS "USE THE DTYPE THE MODEL RESOLVED", SO THERE IS NOTHING TO
+    // APPLY TO ANY SPEC (KV-DSV4-MULTICACHE W8 slice 6, #2455).
+    //
+    // Upstream's `auto` is "if auto, use model data type" (`config/cache.py:76`),
+    // and for DeepSeek-V4 the model's own `_resolve_dsv4_kv_cache_dtype` WRITES
+    // `cache_config.cache_dtype = "fp8_ds_mla"` back onto the cache config and
+    // returns `torch.uint8` (`vllm/models/deepseek_v4/attention.py:89-119`,
+    // driven by `use_fp8_ds_mla_layout`, a `ClassVar[bool] = True` at `:140`).
+    // So on `auto` the resolved cache dtype IS whatever the factory chose, and
+    // rewriting it here is not resolution but an override the operator never
+    // asked for.
+    //
+    // THIS SUBSUMES THE EXISTING EARLY-OUT BELOW RATHER THAN COMPETING WITH IT.
+    // Every factory that builds its spec with `ResolveKvCacheDType()` already
+    // satisfies `spec.dtype == resolved.storage` on `auto` and returned there,
+    // so the ONLY specs that ever reached the retype on `auto` are the ones
+    // whose factory deliberately chose a different dtype. DeepSeek-V4 publishes
+    // THREE such shapes, and a narrower predicate keyed on `cache_dtype_str`
+    // caught only the first:
+    //   - the C4A/C128A latent and the 43-entry SWA group: `kI8` WITH
+    //     `cache_dtype_str == "fp8_ds_mla"`;
+    //   - the indexer key cache: `kI8` with NO `cache_dtype_str`, because
+    //     upstream passes none (`attention.py:669-684`) and it takes the
+    //     element formula at a byte-derived width of 132;
+    //   - the three compressor state caches: `kF32` with no `cache_dtype_str`
+    //     (`compressor.py:168-200`, where upstream ASSERTS f32).
+    // The last two are `SlidingWindowMLASpec`/`MLAAttentionSpec` shapes that the
+    // MLA refusal below either throws on or, worse, MISSES: a `kF32` compressor
+    // state satisfies `storage == kBF16` in the float branch and was silently
+    // retyped to bf16, halving a page whose allocation is already sized in f32.
+    //
+    // IT IS A CHANGE TO RESOLUTION, NOT A WIDER GUARD. `RetypeAttentionSpec` is
+    // untouched and still refuses every EXPLICIT override: `--kv-cache-dtype
+    // fp8` on this topology is refused exactly as before, because the operator
+    // is then asking for a different page format instead of delegating the
+    // choice. Widening that guard would instead let a packed 584-byte page be
+    // written as though it were float — the 3.5x overrun this wave exists to
+    // prevent.
+    if (resolved.is_auto) {
+      return;
+    }
     // NOTHING TO APPLY, and this is the whole default path. "auto" resolves to
     // the model dtype, which is exactly what every KV-cache factory already
     // built the spec with (`ResolveKvCacheDType()`), so the write would set the

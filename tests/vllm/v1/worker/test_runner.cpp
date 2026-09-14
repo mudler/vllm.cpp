@@ -2276,6 +2276,18 @@ TEST_CASE("runner: a multi-cache topology allocates EVERY published cache") {
     CHECK(runner.attn_kv()[i].dtype == want[i].dtype);
     CHECK(runner.attn_kv()[i].num_blocks == kNumBlocks);
     CHECK(runner.attn_kv()[i].data != nullptr);
+    // KV-DSV4-MULTICACHE W8 slice 4 (#2455, and the half of #2085 that is
+    // expressible today): the entry carries ITS OWN allocated page, per entry
+    // rather than only in the sum below.
+    //
+    // THE SUM CANNOT SEE A SWAP. `total_pages` stays 271872 if two entries
+    // exchange their pages, and it stays correct if every entry is handed the
+    // group's first page, so a carrier wired to the wrong spec passes it. This
+    // is also the assertion that separates the page from the VIEW: entry 0 is
+    // `block_size` 256 x `head_size` 512 = 131072 bytes of rank-3 geometry over
+    // a 37440-byte page, and a store that believed the view would run 3.5x past
+    // the block it was given.
+    CHECK(runner.attn_kv()[i].page_size_bytes == want[i].page);
     CHECK(runner.multi_kv_index().Find(want[i].name) ==
           static_cast<int64_t>(i));
     total_pages += want[i].page;

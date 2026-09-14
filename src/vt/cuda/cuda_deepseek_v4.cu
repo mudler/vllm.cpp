@@ -870,7 +870,8 @@ __global__ void SqrtSoftplusKernel(const float* x, float* out, int64_t n) {
 __global__ void RouteKernel(const float* gating, int T, int E, int topk, const float* bias,
                             int has_bias, int is_hash, const int64_t* in_tokens,
                             const int32_t* hashtab, int64_t vocab, int renorm, float scale,
-                            int32_t* ids_out, float* w_out) {
+                            int32_t* ids_out, float* w_out, const float* vbias, int has_vbias,
+                            const char* is_media) {
   const int t = blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= T) return;
   float scores[256];
@@ -878,7 +879,18 @@ __global__ void RouteKernel(const float* gating, int T, int E, int topk, const f
   for (int e = 0; e < E; ++e) scores[e] = SqrtSoftplusDev(g[e]);
   int32_t* ids = &ids_out[static_cast<int64_t>(t) * topk];
   float* w = &w_out[static_cast<int64_t>(t) * topk];
-  if (is_hash) {
+  // MODEL-MM-deepseek-v4 W7-CUDA (#2411): THE PER-ROW BIAS SELECTOR, transcribed
+  // from the host arm (`SqrtSoftplusRouteTopk`, deepseek_v4_moe.cpp) rather than
+  // re-derived. An IMAGE row takes the vision bias and the learned top-k route;
+  // on a HASH layer that REPLACES the tid2eid lookup for that row, because an
+  // image row has no identifier worth hashing, while a text row in the same step
+  // still hashes. A null mask or an absent vision bias means no row is media,
+  // which is the host arm's `any_media` rule and keeps a text step byte-identical.
+  const bool media = has_vbias != 0 && is_media != nullptr && is_media[t] != 0;
+  const float* row_bias = media ? vbias : bias;
+  const int row_has_bias = media ? 1 : has_bias;
+  const int row_is_hash = (is_hash != 0) && !media;
+  if (row_is_hash) {
     int64_t tok = in_tokens[t] % vocab;
     if (tok < 0) tok += vocab;
     const int32_t* row = &hashtab[tok * topk];
@@ -890,7 +902,7 @@ __global__ void RouteKernel(const float* gating, int T, int E, int topk, const f
     float sfc[256];
     bool used[256];
     for (int e = 0; e < E; ++e) {
-      sfc[e] = has_bias ? scores[e] + bias[e] : scores[e];
+      sfc[e] = row_has_bias ? scores[e] + row_bias[e] : scores[e];
       used[e] = false;
     }
     for (int j = 0; j < topk; ++j) {
@@ -941,7 +953,8 @@ __device__ __forceinline__ bool RouteScoreBetter(float av, unsigned ai, float bv
 __global__ void RouteWarpKernel(const float* gating, int T, int E, int topk, const float* bias,
                                 int has_bias, int is_hash, const int64_t* in_tokens,
                                 const int32_t* hashtab, int64_t vocab, int renorm, float scale,
-                                int32_t* ids_out, float* w_out) {
+                                int32_t* ids_out, float* w_out, const float* vbias, int has_vbias,
+                                const char* is_media) {
   extern __shared__ float sprob[];  // [blockDim.y * E]
   const unsigned lane = threadIdx.x;  // 0..31
   const unsigned row = threadIdx.y;   // token within block (one warp per row)
@@ -952,6 +965,13 @@ __global__ void RouteWarpKernel(const float* gating, int T, int E, int topk, con
   int32_t* ids = &ids_out[static_cast<int64_t>(t) * topk];
   float* w = &w_out[static_cast<int64_t>(t) * topk];
   float* srow = &sprob[static_cast<int64_t>(row) * E];
+  // W7-CUDA (#2411): the SAME per-row selector as RouteKernel, so the two stay
+  // bit-identical on a media step as well as a text one. All 32 lanes of this
+  // warp serve one row `t`, so they agree on `media` with no divergence.
+  const bool media = has_vbias != 0 && is_media != nullptr && is_media[t] != 0;
+  const float* row_bias = media ? vbias : bias;
+  const int row_has_bias = media ? 1 : has_bias;
+  const int row_is_hash = (is_hash != 0) && !media;
 
   // Per-lane experts (<=8 for E<=256): local_score is the BIASED selection key; local_prob
   // is the UNBIASED gathered weight. Invalid lanes (e>=E) hold -INF so they never win.
@@ -967,14 +987,14 @@ __global__ void RouteWarpKernel(const float* gating, int T, int E, int topk, con
       if (e < static_cast<unsigned>(E)) {
         const float p = SqrtSoftplusDev(g[e]);
         local_prob[j] = p;
-        local_score[j] = has_bias ? p + bias[e] : p;
+        local_score[j] = row_has_bias ? p + row_bias[e] : p;
         srow[e] = p;
       }
     }
   }
   __syncwarp();
 
-  if (is_hash) {
+  if (row_is_hash) {
     if (lane == 0) {
       int64_t tok = in_tokens[t] % vocab;
       if (tok < 0) tok += vocab;
@@ -1040,7 +1060,8 @@ unsigned Grid(int64_t n, int block);  // fwd-decl (defined below); used by Route
 inline void RouteDispatch(cudaStream_t s, const float* gating, int T, int E, int topk,
                           const float* bias, int has_bias, int is_hash,
                           const int64_t* in_tokens, const int32_t* hashtab, int64_t vocab,
-                          int renorm, float scale, int32_t* ids_out, float* w_out) {
+                          int renorm, float scale, int32_t* ids_out, float* w_out,
+                          const float* vbias, int has_vbias, const char* is_media) {
   if (T <= 0) return;
   const bool warp = RouteWarpTopkOn(std::getenv("VT_V4_ROUTE_WARP_TOPK")) && E <= 256 && topk <= 32;
   if (warp) {
@@ -1050,12 +1071,12 @@ inline void RouteDispatch(cudaStream_t s, const float* gating, int T, int E, int
     const unsigned shmem = rows * static_cast<unsigned>(E) * sizeof(float);
     RouteWarpKernel<<<grid, block, shmem, s>>>(gating, T, E, topk, bias, has_bias, is_hash,
                                                in_tokens, hashtab, vocab, renorm, scale, ids_out,
-                                               w_out);
+                                               w_out, vbias, has_vbias, is_media);
   } else {
     const int block = 64;
     RouteKernel<<<Grid(T, block), block, 0, s>>>(gating, T, E, topk, bias, has_bias, is_hash,
                                                  in_tokens, hashtab, vocab, renorm, scale, ids_out,
-                                                 w_out);
+                                                 w_out, vbias, has_vbias, is_media);
   }
 }
 
@@ -1355,15 +1376,25 @@ std::vector<float> SqrtSoftplusLaunch(Queue& q, const std::vector<float>& x) {
 MoeRouteResult RouteLaunch(Queue& q, const std::vector<float>& gating, int64_t T, int64_t E,
                            int64_t topk, const std::vector<float>& bias, bool renorm,
                            float scale, const std::vector<int64_t>& in_tokens,
-                           const std::vector<int32_t>& hashtab, int64_t vocab) {
+                           const std::vector<int32_t>& hashtab, int64_t vocab,
+                           const std::vector<float>& vision_bias,
+                           const std::vector<char>& is_media_token) {
   cudaStream_t s = AsStream(q);
   const bool has_bias = !bias.empty();
   const bool is_hash = !hashtab.empty() && !in_tokens.empty();
+  // W7-CUDA (#2411): the host arm's `any_media` rule, verbatim -- BOTH the mask
+  // and the vision bias must be present for any row to be treated as media.
+  const bool has_media = !is_media_token.empty() && !vision_bias.empty();
   Dev dg = Upload(gating, s);
   std::vector<float> bpad = has_bias ? bias : std::vector<float>(1, 0.0f);
   std::vector<int64_t> tpad = in_tokens.empty() ? std::vector<int64_t>(1, 0) : in_tokens;
   std::vector<int32_t> hpad = hashtab.empty() ? std::vector<int32_t>(1, 0) : hashtab;
+  // Padded exactly as `bias`/`in_tokens`/`hashtab` are: an absent buffer still
+  // uploads one element, so no kernel argument is ever a dangling pointer.
+  std::vector<float> vpad = has_media ? vision_bias : std::vector<float>(1, 0.0f);
+  std::vector<char> mpad = has_media ? is_media_token : std::vector<char>(1, 0);
   Dev dbias = Upload(bpad, s), dtok = Upload(tpad, s), dhash = Upload(hpad, s);
+  Dev dvbias = Upload(vpad, s), dmedia = Upload(mpad, s);
   MoeRouteResult out;
   out.topk_ids.assign(static_cast<size_t>(T * topk), 0);
   out.topk_weights.assign(static_cast<size_t>(T * topk), 0.0f);
@@ -1372,7 +1403,9 @@ MoeRouteResult RouteLaunch(Queue& q, const std::vector<float>& gating, int64_t T
                 static_cast<int>(topk), static_cast<const float*>(dbias.p), has_bias ? 1 : 0,
                 is_hash ? 1 : 0, static_cast<const int64_t*>(dtok.p),
                 static_cast<const int32_t*>(dhash.p), vocab, renorm ? 1 : 0, scale,
-                static_cast<int32_t*>(did.p), static_cast<float*>(dw.p));
+                static_cast<int32_t*>(did.p), static_cast<float*>(dw.p),
+                static_cast<const float*>(dvbias.p), has_media ? 1 : 0,
+                has_media ? static_cast<const char*>(dmedia.p) : nullptr);
   Download(out.topk_ids, did.p, s);
   Download(out.topk_weights, dw.p, s);
   Check(cudaStreamSynchronize(s), "sync route");
@@ -1540,12 +1573,16 @@ void MhcPreInPlaceLaunch(Queue& q, float* pre_mix, float* post_mix, float* comb_
 void RouteInPlaceLaunch(Queue& q, int32_t* topk_ids, float* topk_weights, const float* gating,
                         int64_t T, int64_t E, int64_t topk, const float* bias, bool has_bias,
                         const int64_t* in_tokens, bool is_hash, const int32_t* hashtab,
-                        int64_t vocab, bool renorm, float scale) {
+                        int64_t vocab, bool renorm, float scale, const float* vision_bias,
+                        bool has_vision_bias, const char* is_media_token) {
   if (T == 0) return;
   cudaStream_t s = AsStream(q);
+  // W7-CUDA (#2411): both halves must be present, matching the host `any_media`.
+  const bool has_media = has_vision_bias && vision_bias != nullptr && is_media_token != nullptr;
   RouteDispatch(s, gating, static_cast<int>(T), static_cast<int>(E), static_cast<int>(topk), bias,
                 has_bias ? 1 : 0, is_hash ? 1 : 0, in_tokens, hashtab, vocab, renorm ? 1 : 0,
-                scale, topk_ids, topk_weights);
+                scale, topk_ids, topk_weights, vision_bias, has_media ? 1 : 0,
+                has_media ? is_media_token : nullptr);
   Check(cudaGetLastError(), "route_ip launch");
 }
 

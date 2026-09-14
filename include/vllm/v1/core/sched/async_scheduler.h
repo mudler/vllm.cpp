@@ -57,14 +57,20 @@ class AsyncScheduler : public Scheduler {
   // loop spec budget, and num_spec_tokens_to_schedule for the placeholder
   // assignment below. std::nullopt (the default) is the production
   // no-speculator path, byte-identical to the pre-W7 ctor.
+  // hash_block_size rides through to the base exactly as it does upstream,
+  // where AsyncScheduler adds no constructor of its own and inherits the whole
+  // signature (async_scheduler.py:12-17). 0 is "same as block_size".
   AsyncScheduler(SchedulerConfig scheduler_config, KVCacheConfig kv_cache_config,
                  int block_size, bool enable_caching = false,
                  StructuredOutputManager* structured_output_manager = nullptr,
                  std::optional<SpeculativeConfig> speculative_config =
-                     std::nullopt)
+                     std::nullopt,
+                 int hash_block_size = 0)
       : Scheduler(std::move(scheduler_config), std::move(kv_cache_config),
                   block_size, enable_caching, structured_output_manager,
-                  std::move(speculative_config)) {}
+                  std::move(speculative_config),
+                  /*kv_events_config=*/nullptr, /*data_parallel_rank=*/0,
+                  hash_block_size) {}
 
   // The async-scheduling class answers true (read by EngineCore::post_step to
   // skip the out-of-band draft pull — core.py:617; see the base declaration).

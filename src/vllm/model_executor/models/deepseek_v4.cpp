@@ -38,6 +38,7 @@
 // quant_block == nope_head_dim (one block) at tiny width. Each reuses the SAME
 // landed primitive math the device kernels will call.
 #include "vllm/model_executor/models/deepseek_v4.h"
+#include "vllm/multimodal/deepseek_v4_processor.h"  // DeepSeekV4ImageTokenType
 #include "vllm/model_executor/models/deepseek_v4_dspark.h"
 #include "vllm/model_executor/models/deepseek_v4_rope.h"
 #include "vllm/model_executor/models/deepseek_v4_probe.h"
@@ -124,6 +125,24 @@ struct V4Backend {
   bool device = false;
   vt::Queue* q = nullptr;
   const DeepseekV4GgufWeights* gguf = nullptr;
+  // MODEL-MM-deepseek-v4 W4 (#2411): the ALREADY-MERGED `[T, H]` token stream,
+  // row-major f32, replacing the embedding lookup for this call.
+  //
+  // It is carried here rather than passed down the parameter list because this
+  // struct is already the per-call context every arm shares, and because the
+  // merge has to reach EVERY arm. An arm that silently ignored it would embed
+  // the expanded prompt's out-of-vocabulary sentinel identifiers, which is a
+  // refusal rather than a wrong answer -- but an arm that ignored it on a
+  // prompt whose sentinels happened to be in range would be fluent and wrong.
+  //
+  // NULL on every text step, which is every step of every other model, so those
+  // are byte-identical.
+  const std::vector<float>* inputs_embeds = nullptr;
+  // MODEL-MM-deepseek-v4 W4 (#2411): the image spans this step carries, in
+  // GLOBAL positions, derived once per forward from the step's identifiers.
+  // Null or empty on every text step, which is what keeps the visible-row rule
+  // byte-identical there.
+  const std::vector<DeepseekV4ImageSpan>* image_spans = nullptr;
   // Incremental-decode KV cache (Stage 1). Null = stateless full-recompute (the
   // default / --gpu path). When set, AttentionBlock appends each token's per-layer
   // `deck` latent to cache.deck[layer] and attends over the full cached KV; the
@@ -141,6 +160,22 @@ struct V4Backend {
   // same keys, and a step that wrote one and read the other would produce
   // plausible tokens from a stale context.
   std::vector<vt::Tensor>* paged_kv = nullptr;
+  // KV-DSV4-MULTICACHE W8 slice 4 (#2455): STORAGE ROWS PER BLOCK for a PACKED
+  // page, and 0 for the float page every other arm binds.
+  //
+  // A rank-2 `[num_blocks, block_bytes]` byte page cannot carry this in its
+  // shape, which is the whole reason it is a separate field. The fp8_ds_mla
+  // block is REGION-SPLIT — a token's 8 scale bytes live at
+  // `block_size * 576 + pos * 8`, after ALL of the block's token data
+  // (`cache_utils.py:59-66`) — so the row count is an argument to both ops
+  // (`vt::ConcatAndCacheDsMla`'s trailing `block_size`, and
+  // `DequantAndGatherDsMlaArgs::block_size`) exactly as it is upstream.
+  //
+  // Resolved ONCE by `ResolveDeepseekV4SwaPages`, from the published spec's own
+  // `block_size`, and never recomputed from `block_bytes`: inverting
+  // `RoundUp(rows * 584, 576)` is not a function, and a wrong row count writes
+  // every token's scales into another token's data region.
+  int64_t paged_rows_per_block = 0;
   // MODEL-DSV4-DSA-COMPOSE W1 (#2286): the compressor is a STATE MACHINE across
   // steps, so its state is carried by the caller, one entry per layer. Null =>
   // no compressor arm, which is every existing path.
@@ -400,24 +435,48 @@ deepseek_v4::MoeRouteResult DispRoute(const V4Backend& be, const std::vector<flo
                                       int64_t T, int64_t E, int64_t topk,
                                       const std::vector<float>& bias, bool renorm, float scale,
                                       const std::vector<int64_t>& in_tokens,
-                                      const std::vector<int32_t>& hashtab, int64_t vocab) {
+                                      const std::vector<int32_t>& hashtab, int64_t vocab,
+                                      const std::vector<float>& vision_bias,
+                                      const std::vector<char>& is_media_token) {
+  // MODEL-MM-deepseek-v4 W7-CUDA (#2411,
+  // ISSUE-LOCAL-01M2C26CSZWB7WVRS5H7YPW4S8): the two DEVICE routers now carry the
+  // PER-ROW bias selector, so a step with image rows is SERVED here rather than
+  // refused. W4 refused it by name because the kernels took ONE bias pointer for
+  // the whole call, and routing an image row on the TEXT bias would have been
+  // fluent and wrong. The kernels express it now, so the refusal was ANSWERED
+  // rather than deleted or weakened.
+  //
+  // THE GENUINELY-UNAVAILABLE CASE IS A DIFFERENT PREDICATE, and it keeps its own
+  // refusal one level up in `MoeBlock`: a step carrying image rows whose LAYER has
+  // no `exp_probs_b_vl` is refused BY NAME there, with the width check beside it.
+  // That one is host-side and arm-independent, so it still fires on a device
+  // build -- a text checkpoint asked to route an image is refused on every arm.
+  //
+  // All three arms below read the SAME two arrays, so the device kernels apply
+  // the rule the host `SqrtSoftplusRouteTopk` applies, not a second copy of it.
   if (be.device)
     return deepseek_v4::MoeDevice()->route(*be.q, gating, T, E, topk, bias, renorm, scale,
-                                           in_tokens, hashtab, vocab);
+                                           in_tokens, hashtab, vocab, vision_bias,
+                                           is_media_token);
   if (GlueDev(be)) {  // Brick B: in-place device router (softmax + top-k → expert_ids)
     const bool has_bias = !bias.empty();
     const bool is_hash = !hashtab.empty() && !in_tokens.empty();
+    // The host arm's `any_media` rule: BOTH halves must be present.
+    const bool has_media = !is_media_token.empty() && !vision_bias.empty();
     deepseek_v4::MoeRouteResult out;
     out.topk_ids.assign(static_cast<size_t>(T * topk), 0);
     out.topk_weights.assign(static_cast<size_t>(T * topk), 0.0f);
     deepseek_v4::MoeDevice()->route_ip(
         *be.q, out.topk_ids.data(), out.topk_weights.data(), gating.data(), T, E, topk,
         has_bias ? bias.data() : nullptr, has_bias, is_hash ? in_tokens.data() : nullptr, is_hash,
-        is_hash ? hashtab.data() : nullptr, vocab, renorm, scale);
+        is_hash ? hashtab.data() : nullptr, vocab, renorm, scale,
+        has_media ? vision_bias.data() : nullptr, has_media,
+        has_media ? is_media_token.data() : nullptr);
     SyncDeviceGemm(be);
     return out;
   }
-  return SqrtSoftplusRouteTopk(gating, T, E, topk, bias, renorm, scale, in_tokens, hashtab, vocab);
+  return SqrtSoftplusRouteTopk(gating, T, E, topk, bias, renorm, scale, in_tokens,
+                               hashtab, vocab, vision_bias, is_media_token);
 }
 std::vector<float> DispClampedSwiGLU(const V4Backend& be, const std::vector<float>& gate_up,
                                      int64_t d, float limit, float alpha, float beta) {
@@ -456,12 +515,39 @@ float Dot(const uint16_t* a, const float* b, int64_t n) {
   return acc;
 }
 
+// WHICH host GEMM a refusal is about, in the sibling keep-quant arm's vocabulary.
+// `layer` is the decoder layer index, or -1 when the call is not layer-scoped (the
+// final `lm_head`, the MTP head's own projections).
+//
+// W7-CUDA (#2411, ISSUE-LOCAL-01M29KEXRT2GCS6C53DT2S3SPX): a served image on a
+// CUDA build died in `vt: MatVec weight size mismatch at deepseek_v4.cpp:504`,
+// which named no tensor, no layer and no geometry -- while the keep-quant arm
+// refused the SAME wrong shape by name. Recovering the geometry needed an
+// instrumented device run precisely because this string carried none of it. The
+// two identifiers below are what close that asymmetry, and they are REQUIRED
+// rather than defaulted: a defaulted label leaves a call site anonymous, which is
+// the defect itself.
+std::string V4GemmSite(const char* tensor, int64_t layer) {
+  return std::string("tensor `") + tensor + "` " +
+         (layer >= 0 ? "layer " + std::to_string(layer)
+                     : std::string("(not layer-scoped)"));
+}
+
 // y[o] = Σ_i W[o*in + i] * x[i]  (W is [out, in] row-major).
 // `W` is `std::vector<float>` or `HostBf16`; `Dot` overloads on the element type,
 // so the bf16 carried tower and the f32 remainder share one body (W1d, #2186).
+//
+// `tensor` and `layer` are read ONLY by the refusal below. `VT_CHECK` evaluates
+// its message inside the failure branch, so naming the site costs nothing on the
+// path that succeeds.
 template <typename W>
-std::vector<float> MatVec(const W& w, const float* x, int64_t out, int64_t in) {
-  VT_CHECK(static_cast<int64_t>(w.size()) == out * in, "MatVec weight size mismatch");
+std::vector<float> MatVec(const W& w, const float* x, int64_t out, int64_t in,
+                          const char* tensor, int64_t layer) {
+  VT_CHECK(static_cast<int64_t>(w.size()) == out * in,
+           "deepseek-v4 host GEMM: weight size mismatch: " + V4GemmSite(tensor, layer) +
+               " want [N=" + std::to_string(out) + ",K=" + std::to_string(in) +
+               "] = " + std::to_string(out * in) + " elements, got " +
+               std::to_string(static_cast<int64_t>(w.size())) + " elements");
   std::vector<float> y(static_cast<size_t>(out));
   for (int64_t o = 0; o < out; ++o) y[static_cast<size_t>(o)] = Dot(&w[o * in], x, in);
   return y;
@@ -489,11 +575,13 @@ const std::vector<float> kNoHostWeights;
 template <typename W>
 std::vector<float> Gemm(const V4Backend& be, const OwnedTensor* wq,
                         const W& wf32, const std::vector<float>& x,
-                        int64_t T, int64_t N, int64_t K, bool defer_sync = false) {
+                        int64_t T, int64_t N, int64_t K, const char* tensor,
+                        int64_t layer, bool defer_sync = false) {
   if (be.gguf != nullptr && wq != nullptr && !wq->Empty()) {
     VT_CHECK(be.q != nullptr, "deepseek-v4 keep-quant GEMM needs a queue");
     VT_CHECK(wq->rank == 2 && wq->shape[0] == N && wq->shape[1] == K,
-             "deepseek-v4 keep-quant GEMM: weight shape mismatch: want [N=" +
+             "deepseek-v4 keep-quant GEMM: weight shape mismatch: " +
+                 V4GemmSite(tensor, layer) + " want [N=" +
                  std::to_string(N) + ",K=" + std::to_string(K) + "] got [" +
                  std::to_string(wq->shape[0]) + "," + std::to_string(wq->shape[1]) +
                  "] rank=" + std::to_string(wq->rank));
@@ -524,7 +612,7 @@ std::vector<float> Gemm(const V4Backend& be, const OwnedTensor* wq,
   }
   std::vector<float> out(static_cast<size_t>(T) * N);
   for (int64_t t = 0; t < T; ++t) {
-    const std::vector<float> y = MatVec(wf32, &x[t * K], N, K);
+    const std::vector<float> y = MatVec(wf32, &x[t * K], N, K, tensor, layer);
     for (int64_t n = 0; n < N; ++n) out[t * N + n] = y[static_cast<size_t>(n)];
   }
   return out;
@@ -581,7 +669,7 @@ std::vector<float> GroupedOutputLoraGguf(const V4Backend& be, const OwnedTensor&
                                          const OwnedTensor& wo_b,
                                          const std::vector<float>& o, int64_t T,
                                          int64_t nh, int64_t hd, int64_t ng,
-                                         int64_t olr, int64_t H) {
+                                         int64_t olr, int64_t H, int64_t layer) {
   VT_CHECK(ng > 0 && nh % ng == 0, "grouped o-LoRA: n_heads % n_groups != 0");
   const int64_t ipg = nh * hd / ng;  // in_per_group
   const int64_t z_dim = ng * olr;
@@ -603,7 +691,8 @@ std::vector<float> GroupedOutputLoraGguf(const V4Backend& be, const OwnedTensor&
     for (int64_t t = 0; t < T; ++t)
       for (int64_t d = 0; d < olr; ++d)
         z[t * z_dim + g * olr + d] = zg[static_cast<size_t>(g)][t * olr + d];
-  return Gemm(be, &wo_b, /*wf32=*/kNoHostWeights, z, T, H, z_dim);  // [T,H] (final; drains normally)
+  // [T,H] (final; drains normally)
+  return Gemm(be, &wo_b, /*wf32=*/kNoHostWeights, z, T, H, z_dim, "wo_b", layer);
 }
 
 // Grouped keep-quant expert GEMM (re-scoped Stage 2): out[P,N] where
@@ -683,18 +772,23 @@ std::vector<float> Slice(const std::vector<float>& v, int64_t off, int64_t len) 
 // `coff = 1 + (compress_ratio == 4)` (vllm/models/deepseek_v4/compressor.py:247-248)
 // — so the two can now disagree.
 //
-// AND A DISAGREEMENT HERE IS ANONYMOUS, NOT SILENT. Be exact about what this
+// AND A DISAGREEMENT HERE IS NAMED, NOT SILENT. Be exact about what this
 // buys, because overstating it is the defect #1964 was filed for. `Gemm`'s host
-// arm is a `MatVec` whose size assertion is UNCONDITIONAL — `deepseek_v4.cpp:413`
-// is a plain `VT_CHECK`, a throw rather than an `assert`, so `NDEBUG` does not
-// remove it — and its keep-quant arm checks the shape too. A [2*head_dim,
-// hidden_size] weight read at a [head_dim, hidden_size] stride therefore does NOT
-// produce a plausible wrong number. It throws
+// arm is a `MatVec` whose size assertion is UNCONDITIONAL — a plain `VT_CHECK`,
+// a throw rather than an `assert`, so `NDEBUG` does not remove it — and its
+// keep-quant arm checks the shape too. A [2*head_dim, hidden_size] weight read at
+// a [head_dim, hidden_size] stride therefore does NOT produce a plausible wrong
+// number. It throws
 //
-//     vt: MatVec weight size mismatch at deepseek_v4.cpp:413
+//     vt: deepseek-v4 host GEMM: weight size mismatch: tensor `comp_wgate`
+//     layer <n> want [N=<hd>,K=<H>] = <N*K> elements, got <2*N*K> elements
 //
-// which names no tensor, no layer, no geometry and no missing capability, from
-// the middle of a forward, on a checkpoint that loaded successfully.
+// W7-CUDA (#2411, ISSUE-LOCAL-01M29KEXRT2GCS6C53DT2S3SPX) gave that throw the
+// tensor, the layer and both geometries; before it, the message was the bare
+// `MatVec weight size mismatch` and named none of them. The refusal below still
+// earns its place: it names the MISSING CAPABILITY and every mismatched tensor at
+// once, which a per-GEMM throw reports one at a time and only for the tensor whose
+// GEMM happens to run first.
 //
 // So this is a DIAGNOSTICS improvement, and that is the whole of it: it replaces
 // an anonymous crash with a precise named refusal, listing EVERY mismatched
@@ -788,8 +882,9 @@ void RequireDsaGeometryOrRefuse(const DeepseekV4LayerHostWeights& L,
           std::to_string(layer) +
           " — the checkpoint carries this layer's DSA tensors at a geometry this "
           "forward does not implement. Reading the widened `comp_wgate` at the "
-          "width it DOES index throws an anonymous `MatVec weight size mismatch` "
-          "from inside the forward (deepseek_v4.cpp:413) that names none of this. "
+          "width it DOES index throws `deepseek-v4 host GEMM: weight size "
+          "mismatch` from inside the forward, which names that ONE tensor's "
+          "geometry but not the missing capability or the other mismatches. "
           "(That is the message the REAL geometry produces, because `comp_wgate`'s "
           "Gemm runs first. A `comp_ape`- or `comp_norm_weight`-only mismatch "
           "instead throws `ape size mismatch` / `rms_weight size mismatch` from "
@@ -864,7 +959,8 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   // 1. q [T,nh,hd] and raw kv latent [T,hd] (num_key_value_heads=1 MLA). The MLA
   //    linears (wq_a, wq_b, wkv) run the keep-quant GEMM (Gemm) — the whole batch
   //    at once — then the per-token RMSNorm(q_norm/kv_norm) + per-head RoPE.
-  std::vector<float> qa = Gemm(be, Lq != nullptr ? &Lq->wq_a : nullptr, L.wq_a, x, T, qlr, H);
+  std::vector<float> qa =
+      Gemm(be, Lq != nullptr ? &Lq->wq_a : nullptr, L.wq_a, x, T, qlr, H, "wq_a", layer);
   for (int64_t t = 0; t < T; ++t) {
     const std::vector<float> n = RmsNorm(Slice(qa, t * qlr, qlr), L.q_norm_weight, eps);
     for (int64_t i = 0; i < qlr; ++i) qa[t * qlr + i] = n[static_cast<size_t>(i)];
@@ -882,7 +978,8 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
                      p.rope_beta_fast, p.rope_beta_slow);
   };
   std::vector<float> q =
-      Gemm(be, Lq != nullptr ? &Lq->wq_b : nullptr, L.wq_b, qa, T, nh * hd, qlr);
+      Gemm(be, Lq != nullptr ? &Lq->wq_b : nullptr, L.wq_b, qa, T, nh * hd, qlr, "wq_b",
+           layer);
   // Per-head query RMS-norm (ds4 head_rms_norm_inplace, AFTER wq_b, BEFORE RoPE) — the
   // MLA query normalization our forward previously omitted (#188: q was rel-L2 ~0.96
   // vs ds4 at L00 with a bit-exact input; the KV latent already has its attn_kv_a_norm).
@@ -894,7 +991,8 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     char nm[64]; std::snprintf(nm, sizeof(nm), "ours_q_L%02lld", static_cast<long long>(layer));
     DumpAct(nm, Slice(q, 0, nh * hd));  // #188 q operand (post-proj+rope), t=0
   }
-  std::vector<float> kraw = Gemm(be, Lq != nullptr ? &Lq->wkv : nullptr, L.wkv, x, T, hd, H);
+  std::vector<float> kraw =
+      Gemm(be, Lq != nullptr ? &Lq->wkv : nullptr, L.wkv, x, T, hd, H, "wkv", layer);
   for (int64_t t = 0; t < T; ++t) {
     std::vector<float> kv = RmsNorm(Slice(kraw, t * hd, hd), L.kv_norm_weight, eps);
     rope_layer(&kv[nope], positions[static_cast<size_t>(t)]);
@@ -919,7 +1017,8 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     const int64_t win = 2;  // tiny pooling window (device gather addressing = W7 seam)
     // compressor pool-score projection (keep-quant comp_wgate) : [T,H] -> [T,hd].
     std::vector<float> score =
-        Gemm(be, Lq != nullptr ? &Lq->comp_wgate : nullptr, L.comp_wgate, x, T, hd, H);
+        Gemm(be, Lq != nullptr ? &Lq->comp_wgate : nullptr, L.comp_wgate, x, T, hd, H,
+             "comp_wgate", layer);
     std::vector<int64_t> pos64(positions.begin(), positions.end());
     score = DispSaveScoreApe(be, score, L.comp_ape, pos64, T, hd, cr);
     for (int64_t t = 0; t < T; ++t) {
@@ -1010,8 +1109,35 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     VT_CHECK(static_cast<int64_t>(be.paged_kv->size()) > layer,
              "deepseek-v4: paged MLA cache has no tensor for this layer");
     vt::Tensor& page = (*be.paged_kv)[static_cast<size_t>(layer)];
-    VT_CHECK(page.rank == 3 && page.shape[2] == hd,
-             "deepseek-v4: paged MLA cache must be [num_blocks, block_size, head_dim]");
+    // KV-DSV4-MULTICACHE W8 slice 4 (#2455): TWO page shapes, and the dtype is
+    // not what distinguishes them -- the RANK is. A float page is the rank-3
+    // `[num_blocks, block_size, head_dim]` row view every other arm binds. The
+    // fp8_ds_mla page is rank-2 `[num_blocks, block_bytes]` bytes, because the
+    // block is REGION-SPLIT: a token's 8 scale bytes sit after ALL of the
+    // block's token data (`cache_utils.py:59-66`), so no (block, row, column)
+    // indexing reaches both halves of one token.
+    //
+    // `paged_rows_per_block` is the resolver's answer and is 0 for a float page,
+    // so the two facts are asserted to AGREE here rather than trusted
+    // separately: a rank-2 page with no row count cannot be addressed, and a
+    // row count against a rank-3 page means the resolver and this block
+    // disagree about which format was bound.
+    const bool packed_page = page.rank == 2;
+    VT_CHECK(packed_page == (be.paged_rows_per_block > 0),
+             "deepseek-v4: the paged cache's SHAPE and its storage row count "
+             "disagree -- a rank-2 fp8_ds_mla byte page needs rows_per_block > 0 "
+             "and a rank-3 float page needs 0 (KV-DSV4-MULTICACHE W8, #2455)");
+    if (packed_page) {
+      VT_CHECK(page.dtype == vt::DType::kI8,
+               "deepseek-v4: a rank-2 paged MLA cache is the fp8_ds_mla BYTE "
+               "page and must be DType::kI8 (KV-DSV4-MULTICACHE W8, #2455)");
+      VT_CHECK(page.shape[1] >= be.paged_rows_per_block * vt::kFp8DsMlaTokenBytes,
+               "deepseek-v4: the fp8_ds_mla page row must hold "
+               "rows_per_block * 584 bytes (KV-DSV4-MULTICACHE W8, #2455)");
+    } else {
+      VT_CHECK(page.rank == 3 && page.shape[2] == hd,
+               "deepseek-v4: paged MLA cache must be [num_blocks, block_size, head_dim]");
+    }
     kv_base = be.kv_base;
     n_keys = kv_base + T;
 
@@ -1022,6 +1148,28 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     const int64_t rope_w = rope, nope_w = hd - rope;
     std::vector<int64_t> slots(static_cast<size_t>(T));
     for (int64_t t = 0; t < T; ++t) slots[static_cast<size_t>(t)] = kv_base + t;
+    // KV-DSV4-MULTICACHE W8 slice 4 (#2455): THE PACKED ARM, and the first
+    // caller either packed op has ever had. `deck` is already exactly the
+    // operand `vt::ConcatAndCacheDsMla` wants -- one contiguous [T, 512] row per
+    // token, NoPE in [0, 448) and the ALREADY-ROTATED RoPE in [448, 512) -- so
+    // the latent is handed over whole rather than split into two strided views.
+    if (packed_page) {
+      // The layout constants are upstream's literals, not parameters
+      // (`cache_utils.py:180-183`), so a geometry they cannot describe is
+      // refused instead of being packed into the wrong offsets.
+      VT_CHECK(hd == vt::kFp8DsMlaInputDim && rope == vt::kFp8DsMlaRopeDim,
+               "deepseek-v4: the fp8_ds_mla page is fixed at 448 NoPE + 64 RoPE "
+               "(cache_utils.py:180-183); this config's head_dim/rope do not "
+               "match, so its latent cannot be packed (KV-DSV4-MULTICACHE W8, "
+               "#2455)");
+      vt::Tensor t_k = vt::Tensor::Contiguous(const_cast<float*>(deck.data()),
+                                              vt::DType::kF32, be.q->device, {T, hd});
+      vt::Tensor t_slot_p = vt::Tensor::Contiguous(slots.data(), vt::DType::kI64,
+                                                   be.q->device, {T});
+      if (!be.paged_kv_prewritten)
+        vt::ConcatAndCacheDsMla(*be.q, t_k, page, t_slot_p, be.paged_rows_per_block);
+      paged_attn = true;
+    } else {
     // Built contiguous then RE-STRIDED: the row stride is the full `hd`, so each
     // view walks the same buffer and reads its own columns. `ConcatAndCacheMla`
     // indexes by stride, which is what makes the no-copy split legal.
@@ -1039,6 +1187,7 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     if (!be.paged_kv_prewritten)
       vt::ConcatAndCacheMla(*be.q, t_kvc, t_pe, page, t_slot);
     paged_attn = true;
+    }
   }
   if (be.kv != nullptr) {
     VT_CHECK(!is_indexer && !is_comp,
@@ -1085,12 +1234,14 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     const std::vector<float> iq =
         idx_q_from_qr
             ? Gemm(be, Lq != nullptr ? &Lq->idx_wq_b : nullptr, L.idx_wq, qa, T,
-                   inh * ihd, qlr)
+                   inh * ihd, qlr, "idx_wq", layer)
             : Gemm(be, Lq != nullptr ? &Lq->idx_wq_b : nullptr, L.idx_wq, x, T,
-                   inh * ihd, H);
+                   inh * ihd, H, "idx_wq", layer);
     const std::vector<float> ik =
-        Gemm(be, Lq != nullptr ? &Lq->idx_comp_wkv : nullptr, L.idx_wk, x, T, ihd, H);
-    const std::vector<float> wproj = Gemm(be, nullptr, L.idx_wproj, x, T, inh, H);
+        Gemm(be, Lq != nullptr ? &Lq->idx_comp_wkv : nullptr, L.idx_wk, x, T, ihd, H,
+             "idx_wk", layer);
+    const std::vector<float> wproj =
+        Gemm(be, nullptr, L.idx_wproj, x, T, inh, H, "idx_wproj", layer);
     const std::vector<float> folded = DispWeightFold(be, wproj, T, inh, ihd);
     std::vector<int64_t> ws(static_cast<size_t>(T)), we(static_cast<size_t>(T));
     for (int64_t t = 0; t < T; ++t) {
@@ -1111,9 +1262,20 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
           T > 0 ? static_cast<int>(sel[static_cast<size_t>(T - 1)].size()) : 0;
     }
   } else {
+    // MODEL-MM-deepseek-v4 W4 (#2411): the visible-row rule, in ONE place.
+    //
+    // The window value is the one the paged arm derives -- a layer WITH a
+    // compressor attends the full prefix here, because its window-plus-
+    // compressed-history composition belongs to MODEL-DSV4-DSA-COMPOSE (#2286)
+    // and refuses above. With no image span and no window this is the dense
+    // causal list this branch always built.
+    static const std::vector<DeepseekV4ImageSpan> kNoSpans;
+    const std::vector<DeepseekV4ImageSpan>& spans =
+        be.image_spans != nullptr ? *be.image_spans : kNoSpans;
+    const int64_t window = p.has_compressor(layer) ? 0 : p.sliding_window;
     for (int64_t t = 0; t < T; ++t) {
-      const int64_t g = kv_base + t;  // this query's GLOBAL position
-      for (int64_t s = 0; s <= g; ++s) sel[static_cast<size_t>(t)].push_back(s);
+      DeepseekV4VisibleRows(kv_base + t, kv_base + T, window, spans,
+                            &sel[static_cast<size_t>(t)]);
     }
   }
 
@@ -1134,6 +1296,33 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
     // tensor, one op call for the whole step. Proven equal to the loop below by
     // `test_deepseek_v4_paged_equiv`, at V4-Flash's real widths and across
     // several `kv_base` values, with both off-by-one directions mutation-proven.
+    // MODEL-MM-deepseek-v4 W4 (#2411): THE PAGED ARMS CANNOT EXPRESS THE
+    // IMAGE-SPAN EXEMPTION, and they say so rather than clipping it away.
+    //
+    // Both paged branches below hand `vt::AttentionWindow` ONE window for the
+    // whole call, so the mask is per-call and the exemption is per-position.
+    // With `sliding_window = 128` and a 384-token block, clipping it away leaves
+    // two thirds of the span invisible AND leaves the argmax plausible, which is
+    // precisely the failure a token gate cannot see. Refused by name; the
+    // per-position mask is owed by issue #2411 with the device path.
+    //
+    // The guard is the SAME predicate the host branch routes on -- a non-empty
+    // `be.image_spans` and a non-zero window -- rather than a second copy of it.
+    if (be.image_spans != nullptr && !be.image_spans->empty()) {
+      const int64_t win = p.has_compressor(layer) ? 0 : p.sliding_window;
+      VT_CHECK(win == 0,
+               "deepseek-v4 attention: this step carries " +
+                   std::to_string(be.image_spans->size()) +
+                   " image span(s) and layer " + std::to_string(layer) +
+                   " runs the PAGED arm at sliding_window " +
+                   std::to_string(win) +
+                   ". Inside an image span every position must see every other "
+                   "one, and the paged attention op takes one window for the "
+                   "whole call, so the span would be clipped to the window and "
+                   "the answer would stay plausible. Refused by name. The "
+                   "per-position mask is owed by issue #2411 (row "
+                   "MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm)");
+    }
     if (is_comp && be.compressor != nullptr &&
         (p.compress_ratio(layer) == 128 || p.compress_ratio(layer) == 4)) {
       // The compressor arm. `deck` is this step's latents, `x` the hidden state the
@@ -1165,10 +1354,11 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
         const std::vector<float> iq =
             static_cast<int64_t>(L.idx_wq.size()) == inh * ihd * qlr
                 ? Gemm(be, Lq != nullptr ? &Lq->idx_wq_b : nullptr, L.idx_wq, qa, T,
-                       inh * ihd, qlr)
+                       inh * ihd, qlr, "idx_wq", layer)
                 : Gemm(be, Lq != nullptr ? &Lq->idx_wq_b : nullptr, L.idx_wq, x, T,
-                       inh * ihd, H);
-        const std::vector<float> wproj = Gemm(be, nullptr, L.idx_wproj, x, T, inh, H);
+                       inh * ihd, H, "idx_wq", layer);
+        const std::vector<float> wproj =
+            Gemm(be, nullptr, L.idx_wproj, x, T, inh, H, "idx_wproj", layer);
         const std::vector<float> folded = DispWeightFold(be, wproj, T, inh, ihd);
         sel_rows = deepseek_v4::IndexerSelectCompressed(
             iq, irows, folded, pos64, T,
@@ -1186,7 +1376,7 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
       const std::vector<float> comp_kv =
           L.comp_wkv.empty()
               ? deck
-              : Gemm(be, /*kq=*/nullptr, L.comp_wkv, x, T, comp_w, H);
+              : Gemm(be, /*kq=*/nullptr, L.comp_wkv, x, T, comp_w, H, "comp_wkv", layer);
       o = deepseek_v4::CompressorLayerStep(
           *be.q, x, comp_kv, q, L.comp_wgate, L.comp_ape, L.comp_norm_weight, L.attn_sink,
           (*be.paged_kv)[static_cast<size_t>(layer)],
@@ -1199,6 +1389,48 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
           // The compressed row carries RoPE on its tail, at this layer's own
           // base -- compressed layers use `compress_rope_theta`.
           rope, rope_base, sel_ptr);
+    } else if (be.paged_rows_per_block > 0) {
+      // KV-DSV4-MULTICACHE W8 slice 4 (#2455): THE PACKED READ. Upstream splits
+      // exactly here too -- its prefill dequant-gathers (`nvidia/flashmla.py:296`)
+      // while its decode hands the packed page to a vendor kernel (`:219-226`)
+      // we do not have -- so the page is gathered into a float scratch and the
+      // EXISTING attention runs over that, unchanged.
+      //
+      // THE SCRATCH IS ONE BLOCK. `PagedCausalMlaAttention` builds its own block
+      // table from `num_blocks`, so handing it `num_blocks = 1` and
+      // `block_size = n_keys` makes every query read row `pos` of the scratch,
+      // which is exactly the global position the gather wrote there. The causal
+      // mask stays the helper's `seq_lens[t] = kv_base + t + 1`.
+      //
+      // Cost is `n_keys * 512 * 4` bytes per layer per step, which is why the
+      // native fp8 decode is a later wave and not this one (the row's `## Owed`).
+      vt::Tensor& packed = (*be.paged_kv)[static_cast<size_t>(layer)];
+      const int64_t num_blocks = packed.shape[0];
+      std::vector<float> gathered(static_cast<size_t>(n_keys) * static_cast<size_t>(hd), 0.0f);
+      std::vector<int32_t> g_seq{static_cast<int32_t>(n_keys)};
+      std::vector<int32_t> g_tab(static_cast<size_t>(num_blocks));
+      for (int64_t b = 0; b < num_blocks; ++b) g_tab[static_cast<size_t>(b)] = static_cast<int32_t>(b);
+      VT_CHECK(n_keys <= num_blocks * be.paged_rows_per_block,
+               "deepseek-v4: the fp8_ds_mla page cannot hold this step's context "
+               "(KV-DSV4-MULTICACHE W8, #2455)");
+      vt::Tensor t_g = vt::Tensor::Contiguous(gathered.data(), vt::DType::kF32,
+                                              be.q->device, {1, n_keys, hd});
+      vt::Tensor t_gs = vt::Tensor::Contiguous(g_seq.data(), vt::DType::kI32,
+                                               be.q->device, {1});
+      vt::Tensor t_gt = vt::Tensor::Contiguous(g_tab.data(), vt::DType::kI32,
+                                               be.q->device, {1, num_blocks});
+      vt::DequantAndGatherDsMlaArgs gargs;
+      gargs.block_size = be.paged_rows_per_block;
+      gargs.offset = 0;
+      vt::DequantAndGatherDsMla(*be.q, t_g, packed, t_gs, /*gather_lens=*/nullptr,
+                                t_gt, gargs);
+      vt::Tensor flat_page = vt::Tensor::Contiguous(
+          gathered.data(), vt::DType::kF32, be.q->device, {1, n_keys, hd});
+      o = deepseek_v4::PagedCausalMlaAttention(
+          *be.q, q, flat_page, /*num_blocks=*/1, /*block_size=*/n_keys, T, nh, hd,
+          kv_base, L.attn_sink, scale,
+          /*no_sink=*/miswire == V4Miswire::kNoAttnSink,
+          /*sliding_window=*/p.has_compressor(layer) ? 0 : p.sliding_window);
     } else
     o = deepseek_v4::PagedCausalMlaAttention(
         *be.q, q, (*be.paged_kv)[static_cast<size_t>(layer)],
@@ -1215,8 +1447,57 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
         // to MODEL-DSV4-DSA-COMPOSE (#2286) and they refuse above.
         /*sliding_window=*/p.has_compressor(layer) ? 0 : p.sliding_window);
   } else if (dev_attn) {
-    // kv_keys holds the cached deck [n_keys_total, hd]; sel is dense-causal, so the
-    // device kernel derives it from kv_base+t (no per-key index list needed).
+    // kv_keys holds the cached deck [n_keys_total, hd] and the device kernel
+    // derives its own key range from `kv_base + t`, taking no per-key index
+    // list. It therefore attends the DENSE CAUSAL prefix, and `sel` is
+    // discarded here.
+    //
+    // MODEL-MM-deepseek-v4 W4 repair (#2411): THAT IS NO LONGER ALWAYS THE SAME
+    // THING, and the comment this replaces asserted that it was. W4 made `sel`
+    // windowed and span-aware in the branch above, so on a layer with no
+    // compressor at the released `sliding_window = 128` the host arm attends
+    // 128 rows while this kernel attends the whole prefix, and inside an image
+    // span the host arm attends forward while this kernel does not. Both are
+    // silent numeric divergences that W4 introduced.
+    //
+    // Neither is covered by an existing refusal: `dev_attn` is independent of
+    // `be.device` and of `GlueDev`, so `DispRoute`'s media refusal does not
+    // reach it, and `paged_attn` is false in this branch so the paged refusal
+    // does not either. Refused by name instead, and the kernel is owed by issue
+    // #2411 W7-CUDA.
+    //
+    // NOT EXECUTABLE ON A CPU BUILD, and no gate here claims otherwise:
+    // `dev_attn` needs a non-CPU queue, `VT_V4_DEVICE_ATTN` and the V4 device
+    // kernels together. THE WINDOWED REFUSAL BELOW IS MEASURED: it threw by
+    // name on `thor:gpu0` (sm_110) at `sliding_window 128`, recorded with its
+    // rc job id in `.agents/specs/deepseek-v4-flash-vision.md` under
+    // `### W7-CUDA evidence`. That measurement came from a LEASE RUN and not
+    // from any committed test, so nothing in this tree re-checks it. The
+    // IMAGE-SPAN refusal that follows it has still never executed, and the
+    // spec's `## Owed` records that half as unmeasured.
+    const int64_t dev_window = p.has_compressor(layer) ? 0 : p.sliding_window;
+    VT_CHECK(dev_window == 0,
+             "deepseek-v4 attention: layer " + std::to_string(layer) +
+                 " runs the DEVICE decode kernel at sliding_window " +
+                 std::to_string(dev_window) +
+                 ". That kernel derives its own key range from kv_base+t and "
+                 "attends the whole causal prefix, so it would diverge from the "
+                 "host arm by exactly the rows the window excludes -- silently, "
+                 "with a plausible argmax. Refused by name; the windowed device "
+                 "kernel is owed by issue #2411 (row "
+                 "MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm, W7-CUDA). "
+                 "Unset VT_V4_DEVICE_ATTN to take the host arm");
+    VT_CHECK(be.image_spans == nullptr || be.image_spans->empty(),
+             "deepseek-v4 attention: layer " + std::to_string(layer) +
+                 " runs the DEVICE decode kernel on a step carrying " +
+                 std::to_string(be.image_spans == nullptr
+                                    ? size_t{0}
+                                    : be.image_spans->size()) +
+                 " image span(s). That kernel takes no per-key index list, so "
+                 "the non-causal image-span exemption cannot reach it and every "
+                 "row of the span would see only what precedes it. Refused by "
+                 "name; owed by issue #2411 (row "
+                 "MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm, W7-CUDA)");
     deepseek_v4::DsaDevice()->decode_attn(
         *be.q, o.data(), q.data(), kv_keys->data(), L.attn_sink.data(), nh, hd, kv_base, T,
         scale, /*no_sink=*/miswire == V4Miswire::kNoAttnSink);
@@ -1258,7 +1539,7 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   //    GGUF source; the host/device-synthetic path keeps the f32 primitive.
   if (be.gguf != nullptr && Lq != nullptr) {
     return GroupedOutputLoraGguf(be, Lq->wo_a, Lq->wo_b, o, T, nh, hd, p.o_groups,
-                                 p.o_lora_rank, H);
+                                 p.o_lora_rank, H, layer);
   }
   return DispGroupedOLora(be, o, L.wo_a, L.wo_b, T, nh, hd, p.o_groups, p.o_lora_rank, H);
 }
@@ -1727,7 +2008,8 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
 
   // router gating logits [T, ne] (keep-quant moe_gate).
   const std::vector<float> gating =
-      Gemm(be, kq ? &Lq->moe_gate : nullptr, L.gate_weight, x, T, ne, H);
+      Gemm(be, kq ? &Lq->moe_gate : nullptr, L.gate_weight, x, T, ne, H, "gate_weight",
+           layer);
   std::vector<int64_t> in_tokens;
   std::vector<int32_t> hashtab;
   std::vector<float> bias;
@@ -1737,6 +2019,47 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
   } else {
     bias = L.gate_bias;  // may be empty (then plain top-k on the unbiased scores)
   }
+  // MODEL-MM-deepseek-v4 W4 (#2411): WHICH ROWS ARE IMAGE ROWS.
+  //
+  // The processor writes `vocab_size + DeepSeekV4ImageTokenType` at every
+  // position of an image block, so the step's own identifiers say it and no new
+  // forward channel is needed. On a text step every identifier is below the
+  // vocabulary -- the embedding lookup refuses otherwise -- so the mask is
+  // empty and this layer is byte-identical.
+  std::vector<char> is_media_token;
+  std::vector<float> vision_bias;
+  int64_t media_rows = 0;
+  for (int64_t t = 0; t < T; ++t) {
+    if (token_ids[static_cast<size_t>(t)] >= p.vocab_size) ++media_rows;
+  }
+  if (media_rows > 0) {
+    // A text checkpoint carries no `exp_probs_b_vl`, and routing an image row on
+    // the TEXT bias would be fluent and wrong. Refuse by name; the same
+    // predicate that selects the bias is the one that refuses its absence.
+    VT_CHECK(!L.gate_bias_vl.empty(),
+             "deepseek-v4 MoE: layer " + std::to_string(layer) +
+                 " was handed " + std::to_string(media_rows) +
+                 " image row(s) and carries no `exp_probs_b_vl` "
+                 "(`layers.N.ffn.gate.bias_vl`). That tensor is present on every "
+                 "layer of a Flash-Vision checkpoint and on none of a text one, "
+                 "so this is a text checkpoint being asked to route an image");
+    VT_CHECK(static_cast<int64_t>(L.gate_bias_vl.size()) == ne,
+             "deepseek-v4 MoE: `exp_probs_b_vl` on layer " +
+                 std::to_string(layer) + " is " +
+                 std::to_string(L.gate_bias_vl.size()) + " wide and the router "
+                 "indexes it by expert, of which there are " +
+                 std::to_string(ne));
+    is_media_token.assign(static_cast<size_t>(T), 0);
+    for (int64_t t = 0; t < T; ++t) {
+      is_media_token[static_cast<size_t>(t)] =
+          token_ids[static_cast<size_t>(t)] >= p.vocab_size ? 1 : 0;
+    }
+    vision_bias = L.gate_bias_vl;
+    // A hash layer keeps its table on a media step, because the ROW decides and
+    // the layer no longer does: a text row in the same step still hashes. It is
+    // already set above whenever `hash_route` holds, which is the only state in
+    // which the router would read it, so nothing is added here.
+  }
   if (std::getenv("VT_DUMP_ACT") != nullptr && layer == 34) {  // #188 router logits/bias
     DumpAct("ours_gating_L34", std::vector<float>(gating.begin(), gating.begin() + ne));
     DumpAct("ours_gatebias_L34", bias.empty() ? std::vector<float>(ne, 0.0f) : bias);
@@ -1745,7 +2068,8 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
   }
   const MoeRouteResult route =
       DispRoute(be, gating, T, ne, topk, bias, p.norm_topk_prob,
-                static_cast<float>(p.routed_scaling_factor), in_tokens, hashtab, p.vocab_size);
+                static_cast<float>(p.routed_scaling_factor), in_tokens, hashtab,
+                p.vocab_size, vision_bias, is_media_token);
   if (trace != nullptr) {
     trace->layer_is_hash[static_cast<size_t>(layer)] = cfg_hash ? 1 : 0;
     trace->layer_hash_routed[static_cast<size_t>(layer)] = hash_route ? 1 : 0;
@@ -1839,8 +2163,10 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
       // phase 1: gate + up. Shared expert stays a per-expert Gemm; the topk routed
       // experts collapse into ONE grouped kMatmulBTQuantGrouped launch each when
       // grouped_moe (else the Stage-2 per-expert GemmRowSlice batch).
-      g[0] = Gemm(be, &Lq->shared_gate, kNoHostWeights, x1, 1, mi, H, /*defer_sync=*/true);
-      u[0] = Gemm(be, &Lq->shared_up, kNoHostWeights, x1, 1, mi, H, /*defer_sync=*/true);
+      g[0] = Gemm(be, &Lq->shared_gate, kNoHostWeights, x1, 1, mi, H, "shared_gate", layer,
+                  /*defer_sync=*/true);
+      u[0] = Gemm(be, &Lq->shared_up, kNoHostWeights, x1, 1, mi, H, "shared_up", layer,
+                  /*defer_sync=*/true);
       if (grouped) {
         std::vector<float> xrep(static_cast<size_t>(topk) * H);  // topk copies of x1
         for (int64_t j = 0; j < topk; ++j)
@@ -1864,7 +2190,8 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
       // phase 2: host clamped-SwiGLU
       for (int64_t a = 0; a < A; ++a) act[static_cast<size_t>(a)] = swiglu(g[a], u[a]);
       // phase 3: down. Shared per-expert; routed grouped when grouped_moe.
-      eo[0] = Gemm(be, &Lq->shared_down, kNoHostWeights, act[0], 1, H, mi, /*defer_sync=*/true);
+      eo[0] = Gemm(be, &Lq->shared_down, kNoHostWeights, act[0], 1, H, mi, "shared_down",
+                   layer, /*defer_sync=*/true);
       if (grouped) {
         std::vector<float> adown(static_cast<size_t>(topk) * mi);
         for (int64_t j = 0; j < topk; ++j)
@@ -2457,6 +2784,21 @@ std::vector<float> ForwardResidentDecodeGguf(const DeepseekV4HostWeights& hw,
   float* res_nxt = resB.data();
 
   // embed (host; the token hidden is the only host-written input, before any device op).
+  // MODEL-MM-deepseek-v4 W4 (#2411): this arm cannot serve an IMAGE row, and it
+  // must say so rather than read past the embedding table.
+  //
+  // The expanded prompt spells an image position `vocab_size + type`, and this
+  // decode path indexes `embed` with the identifier and no bound. It is also
+  // the arm whose device router takes ONE bias for the whole call, so an image
+  // row would route on the TEXT bias. Neither is reachable in practice --
+  // decode receives vocabulary identifiers only, because the image span is
+  // consumed whole during prefill -- and "not reachable" is why it needs a
+  // message rather than an out-of-bounds read.
+  VT_CHECK(tok >= 0 && tok < p.vocab_size,
+           "deepseek-v4 resident decode: token id " + std::to_string(tok) +
+               " is outside the vocabulary of " + std::to_string(p.vocab_size) +
+               ". An image sentinel reaches this arm only through a step the "
+               "prefill should have consumed whole (issue #2411)");
   for (int64_t h = 0; h < H; ++h) x[static_cast<size_t>(h)] = hw.embed[tok * H + h];
 
   // MHC-pre on a (hc*H) residual → writes layer_input(x), post_mix, res_mix; reads `residual`.
@@ -2551,7 +2893,14 @@ std::vector<float> ForwardResidentDecodeGguf(const DeepseekV4HostWeights& hw,
                   has_bias ? L.gate_bias.data() : nullptr, has_bias,
                   cfg_hash ? in_tokens.data() : nullptr, cfg_hash,
                   cfg_hash ? L.tid2eid.data() : nullptr, p.vocab_size, p.norm_topk_prob,
-                  static_cast<float>(p.routed_scaling_factor));
+                  static_cast<float>(p.routed_scaling_factor),
+                  // W7-CUDA (#2411): NO media selector on the resident single-token
+                  // decode arm. It refuses an out-of-vocabulary identifier before
+                  // reaching here, so an image row cannot arrive on this path; the
+                  // no-media values keep it byte-identical. Widening that refusal is
+                  // a separate piece of work and is NOT done here.
+                  /*vision_bias=*/nullptr, /*has_vision_bias=*/false,
+                  /*is_media_token=*/nullptr);
     weights[0] = 1.0f;  // shared-expert combine weight (host write; device reads later)
     // shared expert (index 0 of eo).
     // Brick 12: shared-expert gate+up share x → ONE paired launch.
@@ -2780,7 +3129,13 @@ struct V4Graph {
                     has_bias ? L.gate_bias.data() : nullptr, has_bias,
                     cfg_hash ? in_tokens.data() : nullptr, cfg_hash,
                     cfg_hash ? L.tid2eid.data() : nullptr, p->vocab_size, p->norm_topk_prob,
-                    static_cast<float>(p->routed_scaling_factor));
+                    static_cast<float>(p->routed_scaling_factor),
+                    // W7-CUDA (#2411): as the sibling resident arm above -- an
+                    // out-of-vocabulary identifier is refused before this point, so
+                    // no image row reaches here and the no-media values keep it
+                    // byte-identical.
+                    /*vision_bias=*/nullptr, /*has_vision_bias=*/false,
+                    /*is_media_token=*/nullptr);
       // Brick 12: shared-expert gate+up share x → ONE paired launch.
       GemmPairIntoKq(be, Lq.shared_gate, Lq.shared_up, x.data(), gate_up_s.data(),
                      gate_up_s.data() + mi, mi, mi, H);
@@ -2813,6 +3168,23 @@ struct V4Graph {
   // token's deck to the fixed-cap cache (on-stream, between replays), read logits.
   std::vector<float> Step(const V4Backend& be, int32_t token, int32_t pos) {
     VT_CHECK(kv_base + 1 <= max_cap, "deepseek-v4 decode graph: KV capacity exceeded");
+    // MODEL-MM-deepseek-v4 W4 (#2411): the same guard as the eager resident arm.
+    // A captured graph indexes `embed` with the identifier and NO BOUND, so an
+    // out-of-vocabulary sentinel would read past it -- which is what this refuses.
+    //
+    // W7-CUDA (#2411, ISSUE-LOCAL-01M2C26CSZWB7WVRS5H7YPW4S8): this comment used
+    // to give a SECOND reason, "and its device router takes one bias for the whole
+    // call". That reason is now FALSE -- the device routers carry the per-row bias
+    // selector -- and it is removed rather than left to mislead. The guard itself
+    // is unchanged and still necessary: the unbounded `embed` index is reason
+    // enough on its own, and this arm passes the no-media values to `route_ip`
+    // precisely because no image row can legitimately reach it.
+    VT_CHECK(token >= 0 && token < p->vocab_size,
+             "deepseek-v4 decode graph: token id " + std::to_string(token) +
+                 " is outside the vocabulary of " +
+                 std::to_string(p->vocab_size) +
+                 ". An image sentinel reaches this arm only through a step the "
+                 "prefill should have consumed whole (issue #2411)");
     for (int64_t h = 0; h < H; ++h) x[static_cast<size_t>(h)] = hw->embed[token * H + h];  // embed
     std::fill(pos_buf.begin(), pos_buf.end(), pos);
     in_tokens[0] = token;
@@ -2894,7 +3266,13 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
                                              const std::vector<int32_t>& positions,
                                              const std::vector<int32_t>& logits_indices,
                                              V4Miswire miswire, V4ForwardTrace* trace,
-                                             const V4Backend& be,
+                                             // MODEL-MM-deepseek-v4 W4 (#2411):
+                                             // BY VALUE, so this function can
+                                             // bind the image spans it derives
+                                             // without every caller having to
+                                             // derive them first. The struct is
+                                             // a handful of pointers.
+                                             V4Backend be,
                                              std::vector<float>* mtp_residual_out = nullptr,
                                              dspark::TapRequest* taps = nullptr) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
@@ -2924,13 +3302,40 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
   }
 
   // embed lookup -> the [T,H] token hidden stream.
+  //
+  // MODEL-MM-deepseek-v4 W4 (#2411): a multimodal step arrives ALREADY MERGED.
+  // `ModelRegistry::EmbedMm` embedded the ordinary identifiers and scattered the
+  // vision rows over the image span, so this call takes the result instead of
+  // running the lookup -- which it could not run anyway, because the expanded
+  // prompt's sentinel identifiers are `vocab_size + type` and out of range by
+  // construction.
   std::vector<float> x(static_cast<size_t>(T) * H);
-  for (int64_t t = 0; t < T; ++t) {
-    const int64_t tok = token_ids[static_cast<size_t>(t)];
-    VT_CHECK(tok >= 0 && tok < V, "token id out of range");
-    for (int64_t h = 0; h < H; ++h) x[t * H + h] = hw.embed[tok * H + h];
+  if (be.inputs_embeds != nullptr) {
+    VT_CHECK(static_cast<int64_t>(be.inputs_embeds->size()) == T * H,
+             "deepseek-v4 multimodal forward: inputs_embeds is " +
+                 std::to_string(be.inputs_embeds->size()) +
+                 " values, and this step needs num_tokens * hidden_size = " +
+                 std::to_string(T * H));
+    x = *be.inputs_embeds;
+  } else {
+    for (int64_t t = 0; t < T; ++t) {
+      const int64_t tok = token_ids[static_cast<size_t>(t)];
+      VT_CHECK(tok >= 0 && tok < V, "token id out of range");
+      for (int64_t h = 0; h < H; ++h) x[t * H + h] = hw.embed[tok * H + h];
+    }
   }
   DumpAct("ours_embed", Slice(x, 0, H));  // t=0 embed plain [H] (coherence-debug #188)
+
+  // MODEL-MM-deepseek-v4 W4 (#2411): the image spans, derived ONCE from the
+  // step's own identifiers and read by every layer's visible-row rule. Empty on
+  // a text step, so the rule reduces to the dense causal list it always built.
+  //
+  // `be` is taken by const reference, so the spans live here and the pointer is
+  // rebound on a copy -- which is also what keeps a caller that supplied its own
+  // spans from being overwritten.
+  const std::vector<DeepseekV4ImageSpan> image_spans =
+      DeepseekV4ImageSpans(token_ids, V, /*base=*/be.kv_base);
+  if (be.image_spans == nullptr) be.image_spans = &image_spans;
 
   // MHC residual manifold [T,hc,H] + the per-token post/comb mixes.
   std::vector<float> residual(static_cast<size_t>(T) * hc * H, 0.0f);
@@ -3121,7 +3526,7 @@ static std::vector<float> ForwardComposeImpl(const DeepseekV4HostWeights& hw,
         (*mtp_residual_out)[ri * hc * H + i] = all_res[r * hc * H + i];
   }
   const OwnedTensor* lmq = be.gguf != nullptr ? &be.gguf->lm_head : nullptr;
-  return Gemm(be, lmq, hw.lm_head, hsel, R, V, H);
+  return Gemm(be, lmq, hw.lm_head, hsel, R, V, H, "lm_head", /*layer=*/-1);
 }
 
 // Public host oracle: the composition on the portable host references.
@@ -3130,9 +3535,12 @@ std::vector<float> DeepseekV4ForwardHost(const DeepseekV4HostWeights& hw,
                                          const std::vector<int32_t>& token_ids,
                                          const std::vector<int32_t>& positions,
                                          const std::vector<int32_t>& logits_indices,
-                                         V4Miswire miswire, V4ForwardTrace* trace) {
+                                         V4Miswire miswire, V4ForwardTrace* trace,
+                                         const std::vector<float>* inputs_embeds) {
+  V4Backend be{/*device=*/false, /*q=*/nullptr, /*gguf=*/nullptr};
+  be.inputs_embeds = inputs_embeds;
   return ForwardComposeImpl(hw, p, token_ids, positions, logits_indices, miswire, trace,
-                            V4Backend{/*device=*/false, /*q=*/nullptr, /*gguf=*/nullptr});
+                            be);
 }
 
 // DSV4-DSPARK-DRAFTER W-3: one block's KV rows, derived from the projected taps.
@@ -3388,8 +3796,10 @@ std::vector<float> DeepseekV4MtpDraftLogitsHost(
   }
 
   // 3. hidden[T,hc,H] = h_proj(prev) + e_proj(emb).unsqueeze(-2) (:139-141).
-  const std::vector<float> e_out = Gemm(be, nullptr, mw.e_proj, emb, T, H, H);       // [T,H]
-  const std::vector<float> h_out = Gemm(be, nullptr, mw.h_proj, prev, T * hc, H, H);  // [T*hc,H]
+  const std::vector<float> e_out =
+      Gemm(be, nullptr, mw.e_proj, emb, T, H, H, "e_proj", mtp_layer);  // [T,H]
+  const std::vector<float> h_out =
+      Gemm(be, nullptr, mw.h_proj, prev, T * hc, H, H, "h_proj", mtp_layer);  // [T*hc,H]
   std::vector<float> hidden(static_cast<size_t>(T) * hc * H);
   for (int64_t t = 0; t < T; ++t)
     for (int64_t i = 0; i < hc; ++i)
@@ -3467,7 +3877,7 @@ std::vector<float> DeepseekV4MtpDraftLogitsHost(
     h = RmsNorm(h, mw.shared_norm_weight, eps);
     for (int64_t d = 0; d < H; ++d) hsel[ri * H + d] = h[static_cast<size_t>(d)];
   }
-  return Gemm(be, nullptr, mw.lm_head, hsel, R, V, H);
+  return Gemm(be, nullptr, mw.lm_head, hsel, R, V, H, "mtp.lm_head", /*layer=*/-1);
 }
 
 // W2C — the GGUF keep-quant forward. The SAME composition as the host oracle, but
@@ -3481,7 +3891,8 @@ std::vector<float> DeepseekV4ForwardGguf(const DeepseekV4Weights& weights,
                                          const std::vector<int32_t>& token_ids,
                                          const std::vector<int32_t>& positions,
                                          const std::vector<int32_t>& logits_indices,
-                                         V4Miswire miswire, V4ForwardTrace* trace) {
+                                         V4Miswire miswire, V4ForwardTrace* trace,
+                                         const std::vector<float>* inputs_embeds) {
   VT_CHECK(weights.has_gguf_weights,
            "DeepseekV4ForwardGguf: no keep-quant tower (call LoadDeepseekV4FromGguf)");
   VT_CHECK(weights.has_host_weights,
@@ -3489,6 +3900,7 @@ std::vector<float> DeepseekV4ForwardGguf(const DeepseekV4Weights& weights,
            "absent");
   V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/&weights.gguf};
   be.grouped_moe = GroupedMoeEnabled();
+  be.inputs_embeds = inputs_embeds;
   return ForwardComposeImpl(weights.host, weights.params, token_ids, positions, logits_indices,
                             miswire, trace, be);
 }
@@ -3574,7 +3986,9 @@ std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
                                               const std::vector<int32_t>& positions,
                                               const std::vector<int32_t>& logits_indices,
                                               bool kv_prewritten,
-                                              DeepseekV4CompressorState* compressor) {
+                                              DeepseekV4CompressorState* compressor,
+                                              int64_t rows_per_block,
+                                              const std::vector<float>* inputs_embeds) {
   VT_CHECK(weights.has_gguf_weights,
            "DeepseekV4ForwardGgufPaged: no keep-quant tower (call LoadDeepseekV4FromGguf)");
   VT_CHECK(weights.has_host_weights,
@@ -3584,10 +3998,12 @@ std::vector<float> DeepseekV4ForwardGgufPaged(const DeepseekV4Weights& weights,
            "DeepseekV4ForwardGgufPaged: one page tensor per layer is required");
   V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/&weights.gguf};
   be.paged_kv = &paged_kv;
+  be.paged_rows_per_block = rows_per_block;
   be.paged_kv_prewritten = kv_prewritten;
   be.compressor = compressor;
   be.kv_base = kv_base;
   be.grouped_moe = GroupedMoeEnabled();
+  be.inputs_embeds = inputs_embeds;
   return ForwardComposeImpl(weights.host, weights.params, token_ids, positions,
                             logits_indices, V4Miswire::kNone, /*trace=*/nullptr, be);
 }
@@ -3609,7 +4025,11 @@ std::string ResolveDeepseekV4SwaPages(const DeepseekV4Params& params,
                                       int num_reqs, vt::Device device,
                                       std::vector<vt::Tensor>* out_pages,
                                       bool dsa_dense, bool have_compressor_state,
-                                      int64_t num_tokens) {
+                                      int64_t num_tokens,
+                                      int64_t* out_rows_per_block) {
+  // KV-DSV4-MULTICACHE W8 slice 4 (#2455). 0 means "the pages are float", which
+  // is what every caller binding a float page reads back.
+  if (out_rows_per_block != nullptr) *out_rows_per_block = 0;
   // ONE REQUEST. The paged forward carries a single `kv_base` for the whole
   // step, so a batch at differing context lengths would silently attend the
   // wrong history for every request but one.
@@ -3669,23 +4089,77 @@ std::string ResolveDeepseekV4SwaPages(const DeepseekV4Params& params,
              "' has head_size " + std::to_string(c.head_size) + ", expected head_dim " +
              std::to_string(params.head_dim);
     }
-    // A PACKED PAGE. `vt::ConcatAndCacheMla` refuses a non-float cache dtype by
-    // name, and `MakeDeepseekV4KVCache` publishes the SWA pages as `kI8` with
-    // `cache_dtype_str == "fp8_ds_mla"` -- upstream's own default
-    // (`attention.py:140`). The write would abort either way; refusing here says
-    // WHICH row owns the gap instead of surfacing a kernel precondition.
+    // A PACKED PAGE — the DEFAULT for this architecture, and as of W8 slice 4 a
+    // route rather than a refusal. `MakeDeepseekV4KVCache` publishes the SWA
+    // pages as `kI8` with `cache_dtype_str == "fp8_ds_mla"`, mirroring
+    // upstream's own default (`attention.py:140`), so this is the arm a real
+    // artifact takes.
     //
-    // The fix is the packed 584-byte store (`KV-DSV4-MULTICACHE` W8), NOT a
-    // wider guard in `ApplyCacheDType`: widening that would let a packed page be
-    // written as though it were float, which is the wrong-tokens shape this
-    // whole path exists to remove. MODEL-DSV4-PAGED-ENTRY (#2447), `## Owed`.
+    // IT IS RANK-2 BYTES, NOT A RANK-3 ROW VIEW, and that is forced rather than
+    // chosen: the block keeps a token's 8 scale bytes at
+    // `block_size * 576 + pos * 8`, in a different REGION from its 576 data
+    // bytes (`cache_utils.py:59-66`), so no `(block, row, column)` indexing
+    // reaches both. The row width is the page the RUNNER ALLOCATED, never
+    // `block_size * head_size`: those disagree by design here (64 * 512 = 32768
+    // against a 37440-byte page), and believing the view is a 3.5x overrun
+    // (#2085).
     if (c.dtype != vt::DType::kF32 && c.dtype != vt::DType::kF16 &&
         c.dtype != vt::DType::kBF16) {
-      return "deepseek-v4 paged forward: the SWA cache for '" + name +
-             "' is a PACKED page (vt::ConcatAndCacheMla takes a float cache "
-             "only, and this topology publishes fp8_ds_mla). The packed store "
-             "is owed to KV-DSV4-MULTICACHE W8 "
-             "(MODEL-DSV4-PAGED-ENTRY, #2447)";
+      if (c.dtype != vt::DType::kI8) {
+        return "deepseek-v4 paged forward: the SWA cache for '" + name +
+               "' has storage dtype " + std::string(vt::Name(c.dtype)) +
+               ", which is neither a float page nor the fp8_ds_mla byte page "
+               "(KV-DSV4-MULTICACHE W8, #2455)";
+      }
+      // A caller that cannot receive the row count cannot drive either packed
+      // op, so it is refused instead of being handed a page it would write as
+      // though it were float.
+      if (out_rows_per_block == nullptr) {
+        return "deepseek-v4 paged forward: the SWA cache for '" + name +
+               "' is a PACKED fp8_ds_mla page, and this caller passed no "
+               "out_rows_per_block, so it cannot supply the storage row count "
+               "both packed ops take (KV-DSV4-MULTICACHE W8, #2455)";
+      }
+      // THE ROW COUNT COMES FROM THE PUBLISHED SPEC. `PagedKvCache::block_size`
+      // is the spec's own `block_size`, and the SWA group is `compress_ratio`
+      // 1 (`sparse_swa.py:86-101`), so storage rows == block_size for it.
+      if (c.page_size_bytes <= 0) {
+        return "deepseek-v4 paged forward: the SWA cache for '" + name +
+               "' carries no page_size_bytes, so its packed byte page cannot be "
+               "sized; only GPUModelRunner::initialize_kv_cache fills that field "
+               "(KV-DSV4-MULTICACHE W8, #2455)";
+      }
+      // A COMPRESSOR LAYER CANNOT READ THIS PAGE. `CompressorLayerStep` attends
+      // its window through `vt::MlaDecodeAttention`, which takes a rank-3 cache
+      // whose dtype equals the query's (`vt/ops.cpp`), and a region-split byte
+      // page is not expressible as that tensor. Dequantising the window inside
+      // the composition is the fix, and it belongs to the rows that own the
+      // composition rather than to the wave that lands the page format.
+      if (params.has_compressor(l)) {
+        return "deepseek-v4 paged forward: layer " + std::to_string(l) +
+               " has a compressor AND a PACKED fp8_ds_mla page. Its window pass "
+               "attends through vt::MlaDecodeAttention, which takes a rank-3 "
+               "float cache, so the composition cannot read a region-split byte "
+               "page. Dequantising the window inside CompressorLayerStep is "
+               "owed to MODEL-DSV4-DSA-COMPOSE (#2286) / "
+               "MODEL-DSV4-PAGED-ENTRY (#2447); the packed store and read "
+               "themselves are KV-DSV4-MULTICACHE W8 (#2455)";
+      }
+      // ONE row count for the whole step. The pages come from a single
+      // published group, so a second value means the topology disagrees with
+      // itself and a shared `block_size` argument would be wrong for some layer.
+      if (*out_rows_per_block != 0 && *out_rows_per_block != c.block_size) {
+        return "deepseek-v4 paged forward: the SWA caches disagree about "
+               "storage rows per block (" +
+               std::to_string(*out_rows_per_block) + " and " +
+               std::to_string(c.block_size) +
+               "); both packed ops take ONE row count per step "
+               "(KV-DSV4-MULTICACHE W8, #2455)";
+      }
+      *out_rows_per_block = c.block_size;
+      pages[static_cast<size_t>(l)] = vt::Tensor::Contiguous(
+          c.data, vt::DType::kI8, device, {c.num_blocks, c.page_size_bytes});
+      continue;
     }
     pages[static_cast<size_t>(l)] = vt::Tensor::Contiguous(
         c.data, c.dtype, device, {c.num_blocks, c.block_size, c.head_size});
@@ -3789,7 +4263,8 @@ void DeepseekV4ExpertProbe(const DeepseekV4Weights& weights, vt::Queue& queue,
       if (std::fread(din.data(), sizeof(float), static_cast<size_t>(H), fi) != static_cast<size_t>(H)) { std::fclose(fi); return; }
       std::fclose(fi);
       const int64_t ne = p.n_routed_experts;
-      const std::vector<float> myg = Gemm(be, &Lq.moe_gate, kNoHostWeights, din, 1, ne, H);
+      const std::vector<float> myg =
+          Gemm(be, &Lq.moe_gate, kNoHostWeights, din, 1, ne, H, "moe_gate", layer);
       double dr = 0; for (float v : din) dr += (double)v * v;
       std::fprintf(stderr, "[gate-xcheck] on ds4's router input (rms=%.4f): OUR logit[33]=%.4f logit[233]=%.4f\n",
                    std::sqrt(dr / H), myg[33], myg[233]);
@@ -3843,7 +4318,8 @@ static std::vector<float> DeepseekV4ForwardExl3(const DeepseekV4Weights& weights
                                                 vt::Queue& queue,
                                                 const std::vector<int32_t>& token_ids,
                                                 const std::vector<int32_t>& positions,
-                                                const std::vector<int32_t>& logits_indices) {
+                                                const std::vector<int32_t>& logits_indices,
+                                                const std::vector<float>* inputs_embeds) {
   VT_CHECK(weights.has_exl3_weights,
            "DeepseekV4ForwardExl3: no EXL3 tower (the load did not take that arm)");
   // W1b's EXL3-specific `has_host_weights` refusal stood HERE and is DELETED as
@@ -3862,6 +4338,7 @@ static std::vector<float> DeepseekV4ForwardExl3(const DeepseekV4Weights& weights
   (void)StageDeepseekV4Exl3TowerToDevice(queue, weights.exl3);
   V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/nullptr};
   be.exl3 = &weights.exl3;
+  be.inputs_embeds = inputs_embeds;
   return ForwardComposeImpl(weights.host, weights.params, token_ids, positions, logits_indices,
                             V4Miswire::kNone, /*trace=*/nullptr, be);
 }
@@ -3882,7 +4359,8 @@ std::vector<float> DeepseekV4ForwardExl3Paged(
     std::vector<vt::Tensor>& paged_kv, int64_t kv_base,
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const std::vector<int32_t>& logits_indices,
-    DeepseekV4CompressorState* compressor) {
+    DeepseekV4CompressorState* compressor, int64_t rows_per_block,
+    const std::vector<float>* inputs_embeds) {
   VT_CHECK(weights.has_exl3_weights,
            "DeepseekV4ForwardExl3Paged: no EXL3 tower (the load did not take that arm)");
   VT_CHECK(static_cast<int64_t>(paged_kv.size()) == weights.params.num_hidden_layers,
@@ -3896,34 +4374,210 @@ std::vector<float> DeepseekV4ForwardExl3Paged(
   V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/nullptr};
   be.exl3 = &weights.exl3;
   be.paged_kv = &paged_kv;
+  be.paged_rows_per_block = rows_per_block;
   be.kv_base = kv_base;
   be.compressor = compressor;
+  be.inputs_embeds = inputs_embeds;
   return ForwardComposeImpl(weights.host, weights.params, token_ids, positions,
                             logits_indices, V4Miswire::kNone, /*trace=*/nullptr, be);
+}
+
+std::vector<DeepseekV4ImageSpan> DeepseekV4ImageSpans(
+    const std::vector<int32_t>& token_ids, int64_t vocab_size, int64_t base) {
+  std::vector<DeepseekV4ImageSpan> spans;
+  const int64_t start_id =
+      vocab_size + static_cast<int64_t>(multimodal::kImageStart);
+  const int64_t end_id = vocab_size + static_cast<int64_t>(multimodal::kImageEnd);
+  const int64_t pad_id =
+      vocab_size + static_cast<int64_t>(multimodal::kImagePad);
+  int64_t open_at = -1;
+  // THE LEADING COMPRESSION PAD. `build_image_block` writes
+  // `3 - start_position % 4` pad rows BEFORE the start identifier, so a whole
+  // block's media rows are not all between START and END and an accounting
+  // that assumed they were would refuse every correct prompt. A run of pad
+  // rows outside a span is legal only while it is still on its way to a START
+  // in this same step, which is what `pad_run` tracks.
+  int64_t pad_run = 0;
+  for (int64_t t = 0; t < static_cast<int64_t>(token_ids.size()); ++t) {
+    const int64_t id = token_ids[static_cast<size_t>(t)];
+    if (open_at >= 0) {
+      // Inside an open block: every row of it is a sentinel and belongs to the
+      // span, so only the two structural identifiers are read here.
+      VT_CHECK(id != start_id,
+               "deepseek-v4 image span: a second image-start identifier at row " +
+                   std::to_string(t) + " while the span opened at row " +
+                   std::to_string(open_at) + " is still open");
+      if (id == end_id) {
+        spans.push_back({base + open_at, base + t + 1});
+        open_at = -1;
+      }
+      continue;
+    }
+    if (id == start_id) {
+      open_at = t;
+      pad_run = 0;  // the pads that led here are this block's own
+      continue;
+    }
+    VT_CHECK(id != end_id,
+             "deepseek-v4 image span: an image-end identifier at row " +
+                 std::to_string(t) + " with no open span");
+    if (id >= vocab_size) {
+      // A MEDIA ROW OUTSIDE ANY BLOCK. The only one that can legally be here is
+      // a leading compression pad; an image or newline row outside a block is
+      // the INTERIOR of a block whose start and end both fell in other chunks.
+      //
+      // W4 enforced atomicity for the two shapes that carry ONE of the two
+      // identifiers. A chunk cut from the middle carries NEITHER, so both of
+      // those checks stayed silent and this function returned zero spans on a
+      // step made entirely of image rows. Two things then went wrong at once
+      // and neither was observable: the visible-row rule fell back to the
+      // ordinary sliding window over image rows, which is half a visible span
+      // answering fluently; and the paged arm's refusal is keyed on a NON-EMPTY
+      // span list, so it did not fire either. The routing bias still applied,
+      // because it reads the identifiers rather than the spans, so every other
+      // signal looked right.
+      //
+      // WHY A REFUSAL AND NOT ATOMIC SCHEDULING. The scheduler can keep a span
+      // whole: `Scheduler::try_schedule_encoder_inputs` rolls a step back to
+      // before an item when `SchedulerConfig::disable_chunked_mm_input` is set.
+      // That flag defaults to false and NOTHING can turn it on -- no
+      // command-line flag, no `include/vllm.h` field, and no per-architecture
+      // channel through which a model could ask for it. Adding one is a shared
+      // scheduler-policy seam rather than a model change, so it is owed by
+      // issue #2411 and row
+      // MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm, and until it lands the
+      // step is refused by name rather than answered from a window that has
+      // seen a third of the picture.
+      VT_CHECK(id == pad_id,
+               "deepseek-v4 image span: the image row at row " +
+                   std::to_string(t) +
+                   " is outside every complete image block in this step. A "
+                   "prefill chunk cut from the middle of a block carries "
+                   "neither its start nor its end identifier, so the span is "
+                   "invisible to the visibility rule and to the paged-arm "
+                   "refusal, and the step would be answered from the ordinary "
+                   "sliding window over image rows. An image block must be "
+                   "scheduled whole "
+                   "(.agents/specs/deepseek-v4-flash-vision.md, issue #2411)");
+      ++pad_run;
+      continue;
+    }
+    // An ordinary text row. Any pad run before it never reached a start, so it
+    // is the tail of a block cut by a chunk boundary.
+    VT_CHECK(pad_run == 0,
+             "deepseek-v4 image span: " + std::to_string(pad_run) +
+                 " image-pad row(s) before row " + std::to_string(t) +
+                 " are followed by a text row rather than by an image-start "
+                 "identifier, so the block they lead is not in this step. An "
+                 "image block must be scheduled whole "
+                 "(.agents/specs/deepseek-v4-flash-vision.md, issue #2411)");
+  }
+  // The spec requires an image span to fall inside ONE prefill chunk. A span cut
+  // by a chunk boundary would be half-visible and would answer fluently, so it
+  // is refused rather than truncated.
+  VT_CHECK(open_at < 0,
+           "deepseek-v4 image span: the span opened at row " +
+               std::to_string(open_at) +
+               " is not closed inside this step. An image block must be "
+               "scheduled whole (.agents/specs/deepseek-v4-flash-vision.md, "
+               "issue #2411)");
+  // THE CHUNK THAT ENDS ON PADS, which is the third shape a boundary cuts and
+  // the only one the two checks above cannot see. `BuildDeepSeekV4ImageBlock`
+  // writes `compress_pad` PAD rows AHEAD of the START identifier, so a step can
+  // end on the leading pads of a block whose START is in the NEXT chunk: it
+  // carries neither identifier, every pad passes the in-loop rule that only
+  // asks a media row to BE a pad, and the loop finishes with nothing said.
+  //
+  // What that costs is not an exception, it is silence. The pads belong to a
+  // block this step will never see, so the span never opens; the visible-row
+  // rule then falls back to the ordinary sliding window and the paged arm's
+  // refusal keys on a NON-EMPTY span list, so neither fires, while
+  // `media_rows > 0` still applies the vision routing bias in `MoeBlock` and
+  // the answer stays fluent.
+  //
+  // It is not hypothetical: `SchedulerConfig::disable_chunked_mm_input`
+  // defaults to FALSE and nothing in this tree can turn it on, and
+  // `gather_mm_embeddings` hands a partial span through, so the served request
+  // path can produce exactly this step. Refused by name until image prefill is
+  // made atomic in the scheduler, which is a shared scheduler-policy seam owed
+  // by issue #2411 and row
+  // MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm.
+  VT_CHECK(pad_run == 0,
+           "deepseek-v4 image span: this step ends with " +
+               std::to_string(pad_run) +
+               " image-pad row(s) whose image-start identifier is in another "
+               "chunk. An image block must be scheduled whole "
+               "(.agents/specs/deepseek-v4-flash-vision.md, issue #2411)");
+  return spans;
+}
+
+void DeepseekV4VisibleRows(int64_t query, int64_t num_keys, int64_t sliding_window,
+                           const std::vector<DeepseekV4ImageSpan>& spans,
+                           std::vector<int64_t>* out) {
+  VT_CHECK(out != nullptr, "DeepseekV4VisibleRows: `out` must not be null");
+  const int64_t last = query < num_keys - 1 ? query : num_keys - 1;
+  if (last < 0) return;
+  // The causal window. `sliding_window` is an INCLUSIVE count of positions, so
+  // the oldest visible row is `query - (window - 1)`; 0 keeps the full prefix.
+  int64_t lo = 0;
+  if (sliding_window > 0) {
+    lo = query - (sliding_window - 1);
+    if (lo < 0) lo = 0;
+  }
+  // The span containing this query, if any. Inside it the rule is NON-CAUSAL:
+  // every position of the span sees every other one. Below the span's start the
+  // window still applies, which is what `swa_full_non_causal` means by
+  // "applied normally below it".
+  int64_t span_begin = -1, span_end = -1;
+  for (const DeepseekV4ImageSpan& s : spans) {
+    if (query >= s.begin && query < s.end) {
+      span_begin = s.begin;
+      span_end = s.end < num_keys ? s.end : num_keys;
+      break;
+    }
+  }
+  if (span_begin < 0) {
+    for (int64_t r = lo; r <= last; ++r) out->push_back(r);
+    return;
+  }
+  // Emit ascending and without duplicates: the span may start below `lo`, may
+  // start above it, and always reaches past `query`.
+  const int64_t first = lo < span_begin ? lo : span_begin;
+  const int64_t stop = last > span_end - 1 ? last : span_end - 1;
+  for (int64_t r = first; r <= stop; ++r) {
+    const bool in_span = r >= span_begin && r < span_end;
+    const bool in_window = r >= lo && r <= last;
+    if (in_span || in_window) out->push_back(r);
+  }
 }
 
 std::vector<float> DeepseekV4Model::Forward(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const DeepseekV4Weights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+    const std::vector<float>* inputs_embeds) {
   (void)attn_meta;
   (void)attn_kv;
   // EXL3 source: the routed experts are trellis linears and dispatch through the
   // W2 kernels. Checked FIRST because an EXL3 load carries no GGUF tower and its
   // refusals must name this row rather than the generic host-tower one.
   if (weights.has_exl3_weights) {
-    return DeepseekV4ForwardExl3(weights, queue, token_ids, positions, logits_indices);
+    return DeepseekV4ForwardExl3(weights, queue, token_ids, positions,
+                                 logits_indices, inputs_embeds);
   }
   // GGUF source: consume the keep-quant tower (memory-bounded — no ~1 TiB f32
   // tower). Safetensors/NVFP4 + the tiny-synthetic gate: the f32 host oracle.
   if (weights.has_gguf_weights) {
-    return DeepseekV4ForwardGguf(weights, queue, token_ids, positions, logits_indices);
+    return DeepseekV4ForwardGguf(weights, queue, token_ids, positions,
+                                 logits_indices, V4Miswire::kNone,
+                                 /*trace=*/nullptr, inputs_embeds);
   }
   (void)queue;
   VT_CHECK(weights.has_host_weights, kHostPending);
   return DeepseekV4ForwardHost(weights.host, weights.params, token_ids, positions,
-                               logits_indices);
+                               logits_indices, V4Miswire::kNone,
+                               /*trace=*/nullptr, inputs_embeds);
 }
 
 // FRAMEWORK-CONFORMANCE (device-resident logits): wrap the composed
@@ -3966,10 +4620,12 @@ ForwardLogits DeepseekV4ForwardExl3PagedLogits(
     std::vector<vt::Tensor>& paged_kv, int64_t kv_base,
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const std::vector<int32_t>& logits_indices,
-    DeepseekV4CompressorState* compressor) {
+    DeepseekV4CompressorState* compressor, int64_t rows_per_block,
+    const std::vector<float>* inputs_embeds) {
   std::vector<float> flat =
       DeepseekV4ForwardExl3Paged(weights, queue, paged_kv, kv_base, token_ids,
-                                 positions, logits_indices, compressor);
+                                 positions, logits_indices, compressor,
+                                 rows_per_block, inputs_embeds);
   const int64_t vocab = weights.params.vocab_size;
   const int64_t rows = vocab > 0 ? static_cast<int64_t>(flat.size()) / vocab : 0;
   return WrapV4DeviceLogits(std::move(flat), rows, vocab, queue);
@@ -3994,7 +4650,8 @@ ForwardLogits DeepseekV4Model::ForwardDevice(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const v1::CommonAttentionMetadata& attn_meta,
     const std::vector<PagedKvCache>& attn_kv, const DeepseekV4Weights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices,
+    const std::vector<float>* inputs_embeds) {
   (void)attn_meta;
   (void)attn_kv;
   VT_CHECK(weights.has_host_weights, kHostPending);
@@ -4006,10 +4663,46 @@ ForwardLogits DeepseekV4Model::ForwardDevice(
   // `Exl3Linear`'s refusal from "this arm cannot run on a GPU" into a
   // precondition that is already satisfied.
   V4Backend dev_be{/*device=*/true, /*q=*/&queue, /*gguf=*/nullptr};
+  dev_be.inputs_embeds = inputs_embeds;
   if (weights.has_exl3_weights) {
     (void)StageDeepseekV4Exl3TowerToDevice(queue, weights.exl3);
     dev_be.exl3 = &weights.exl3;
   }
+  // MODEL-MM-deepseek-v4 W7-CUDA (#2411,
+  // ISSUE-LOCAL-01M29KEXRT2GCS6C53DT2S3SPX): BIND THE KEEP-QUANT TOWER, in the
+  // same order `DeepseekV4Model::Forward` binds it (exl3 first, then gguf).
+  //
+  // WITHOUT THIS A GGUF CHECKPOINT CANNOT SERVE A SINGLE TOKEN HERE, and the
+  // failure was measured rather than reasoned about: on `thor:gpu0` a served
+  // image died with
+  //
+  //   vt: deepseek-v4 host GEMM: weight size mismatch: tensor `wq_a` layer 0
+  //   want [N=32,K=32] = 1024 elements, got 0 elements
+  //
+  // `got 0` is the tell, and it is not a wrong shape. `ForwardComposeImpl` reads
+  // `kq_src = be.gguf != nullptr` (:3217) and hands every layer `Lq = nullptr`
+  // when it is false, so every `Gemm` falls to the HOST-float arm -- and on a
+  // GGUF load the host MLA tower is EMPTY BY DESIGN, which
+  // `deepseek_v4_weights.cpp` asserts in as many words (`hl.wq_a.empty() && ...`).
+  // The weight reached neither arm. Layer 0's `wq_a` is simply the first GEMM the
+  // composition performs, so it is where the omission surfaces.
+  //
+  // WHY NOBODY SAW IT: the sibling `Forward` DOES dispatch on
+  // `has_gguf_weights`, but the registry sends the runner's default
+  // `gather_logits` path HERE unconditionally (deepseek_v4_registry.cpp:246),
+  // and no gate has ever driven this entry with a GGUF tower -- every
+  // `ForwardDevice` case in `tests/` belongs to another architecture, and
+  // `test_cuda_deepseek_v4.cpp` carries a host fixture only. A CPU build cannot
+  // reach the defect either, because `kDevicePending` above refuses first.
+  //
+  // THIS BINDS THE TOWER RATHER THAN DELEGATING to `DeepseekV4ForwardGguf`,
+  // because the device op families (kDeepseekV4{Mhc,Dsa,Compressor,Moe}) are the
+  // whole point of this entry and delegating would silently drop them. It is not
+  // a new combination: `Gemm`'s keep-quant arm already retags the block views to
+  // the queue's device, and binding `gguf` sets `dsa_dense` (:926), which turns
+  // the indexer/compressor arms off on every layer -- exactly what the GGUF
+  // sibling already does, so the DSA arms cannot see a half-bound backend.
+  if (weights.has_gguf_weights) dev_be.gguf = &weights.gguf;
   std::vector<float> flat =
       ForwardComposeImpl(weights.host, weights.params, token_ids, positions, logits_indices,
                          V4Miswire::kNone, /*trace=*/nullptr, dev_be);

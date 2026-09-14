@@ -225,6 +225,21 @@ struct DecodedImageRgb {
 // gate consumes raw 448x448x3 RGB (test_qwen3vl_e2e.cpp:116).
 using ImageCodecFn = std::function<DecodedImageRgb(const DecodedMedia&)>;
 
+// THE PRODUCTION CODEC, and there is exactly one.
+//
+// It decodes the raw-RGB container (`image/x-raw-rgb`) and REFUSES every
+// container format by name: no PNG/JPEG decoder is vendored, and that is the
+// NAMED MM-SERVE residual this header has recorded since ROAD-V1-MM W1.
+//
+// It lives here rather than as a lambda inside `server_main.cpp` because it is
+// not the server BINARY's, it is the LIBRARY's: `vllm_chat` installs the same
+// multimodal chat seam through `include/vllm.h` and has to hand every factory
+// the identical codec, or one entry point of one library would accept an image
+// the other refuses. It belongs to neither of them and to no architecture,
+// which is why every `MultiModalChatContext` carries it rather than growing one
+// per model.
+ImageCodecFn DefaultImageCodec();
+
 // The chat-prompt renderer seam (structurally IDENTICAL to serving_chat.h
 // ChatPromptFn — kept local so chat_mm.h need not pull serving_chat.h). The
 // server's real chat-template renderer (MakeChatTemplatePromptFn) plugs in here.

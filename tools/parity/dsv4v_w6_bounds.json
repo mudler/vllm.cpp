@@ -1,0 +1,327 @@
+{
+  "_what_this_is": [
+    "The RECORDED bounds dsv4v_w6_compare.py judges against, for the DeepSeek-V4",
+    "vision tower versus the `llama-cpp-dsv4vision` oracle (llama.cpp b10766).",
+    "Row MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm, issue #2411.",
+    "",
+    "The bounds live in a committed file rather than in the comparator so that a",
+    "later wave cannot derive a bound from the very run it is judging. Every",
+    "number below was measured BEFORE the run it now judges, by the rc job named",
+    "beside it, and every one of them is reproduced in the spec's",
+    "`### W6 evidence` section. THERE IS NO LONGER A DECLARED NUMBER HERE. The",
+    "one that existed, `best_match_margin_min = 0.01`, is replaced by",
+    "`best_match_margin_above_bf16_rounding`, because that precondition is now",
+    "DERIVED per run from the rows being judged instead of being set to a",
+    "constant this file chose. Its provenance records what the constant would",
+    "have turned red.",
+    "",
+    "EVERY JUDGED PROFILE DECLARES EVERY JUDGING KEY. The comparator validates a",
+    "resolved profile against `PROFILE_KEYS` and `STAGE_KEYS` before it judges",
+    "anything, and a missing key, a key of the wrong type and an unknown key are",
+    "each an ERROR with exit 4. Writing the key is not a formality: until",
+    "2026-09-12 an ABSENT key was read by nothing and the leg was judged without",
+    "that bound, so dropping `mean_rel_l2_max` from `shipped_bf16` printed",
+    "VERDICT PASS at rc 0 on data whose every image row was 50% off, and a",
+    "profile holding only `judged` did the same.",
+    "",
+    "A BOUND THAT IS DELIBERATELY NOT APPLIED IS WRITTEN AS `null` AND NAMES ITS",
+    "REASON UNDER `unbounded`. That is the whole difference between a bound this",
+    "project decided not to set and a bound somebody forgot."
+  ],
+  "statistic": "image_rows",
+  "_statistic_note": [
+    "`image_rows` is the per-row summary over the IMAGE rows of the token block",
+    "-- the aligner cells. The spec calls this 'cells mean relative L2'; it is",
+    "the same statistic under the spec's name, and it is the one the recorded",
+    "3.83% / 2.884% figures refer to.",
+    "",
+    "It is NOT the `-cells.f32` STAGE file, which holds the same aligner rows in",
+    "their pre-layout order. That is why every profile below marks the `cells`",
+    "stage diagnostic_only: judging it would re-judge this statistic under a",
+    "second name, and a second description of one quantity is a thing that can",
+    "drift from the first."
+  ],
+  "_stages_note": [
+    "`stages` names what a profile requires of the input/vit/cells dumps. A stage",
+    "listed here MUST be present in the report: a stage that never ran is not a",
+    "stage that passed, and until 2026-09-12 an ABSENT stage, a 100x-wrong stage",
+    "and a shape-mismatched stage all still printed VERDICT PASS, because only",
+    "`image_rows` was ever judged. The spec cites the vit numbers as evidence",
+    "that the error does not jump at a stage, so that sentence rested on nothing",
+    "executable until these rules existed.",
+    "",
+    "A `diagnostic_only` stage is PRESENCE-ONLY, and presence is still required.",
+    "The comparator used to skip such a stage before the presence check, so an",
+    "absent `cells` and a `cells` 100x wrong both exited 0. A diagnostic_only",
+    "stage therefore carries NO other key: a rule that judges no magnitude must",
+    "not also be able to hide a bound it failed to declare.",
+    "",
+    "MEMBERSHIP IS DECLARED, NOT INFERRED FROM WHAT HAPPENS TO BE WRITTEN HERE.",
+    "A judged profile must name EVERY stage the comparator knows about, and a",
+    "stage it does not require is written as `null` with its reason under",
+    "`unbounded` as `stages.<name>`. Until 2026-09-12 the `stages` KEY had to be",
+    "declared and its MEMBERSHIP did not, which made deleting a whole stage rule",
+    "the one way left to drop a bound while declaring nothing: measured on a leg",
+    "whose vit file was 100x wrong, deleting the `vit` rule exited 0 VERDICT",
+    "PASS and so did an empty `stages`, while the same data with the rule",
+    "present exited 1."
+  ],
+  "profiles": {
+    "shipped_bf16": {
+      "judged": true,
+      "sentinels_bf16_exact": true,
+      "permutation_identity_complete": true,
+      "best_match_margin_above_bf16_rounding": true,
+      "mean_rel_l2_max": 0.049,
+      "mean_cos_min": 0.998,
+      "max_degenerate_rows": 0,
+      "stages": {
+        "input": {
+          "bf16_of_oracle_exact": true,
+          "mean_rel_l2_max": null,
+          "mean_cos_min": null,
+          "max_degenerate_rows": null,
+          "unbounded": {
+            "mean_rel_l2_max": "The assertion on this stage is EXACTNESS, which is strictly stronger than any relative-L2 bound: if ours is exactly bf16(oracle) then no magnitude bound can add anything, and if it is not, the exactness rule has already failed. The spec records 0.12% mean relative L2 here as a reported value and sets no bound on it.",
+            "mean_cos_min": "The same: exactness already covers it, and the spec records no cosine floor for the input pixels.",
+            "max_degenerate_rows": "A patch that normalises to exactly zero is legitimate data rather than a defect, and no bound on this stage depends on rel_l2 or cos being defined, so a zero row here disables nothing. This is NOT the argument that applies to `image_rows`, where a zero row means the tower produced nothing for an aligner cell."
+          },
+          "_provenance": [
+            "The W6 evidence table records 'ours is exactly bf16(oracle)' for the",
+            "input pixels on every rung. It is an EXACTNESS claim, so it is",
+            "judged as one. READ THE SPEC BEFORE QUOTING IT AS ORDERING",
+            "EVIDENCE: the oracle dump writes this file in OUR patch-row order,",
+            "so it measures the normalisation ARITHMETIC and asserts the",
+            "ordering. The ordering evidence is the block-level permutation",
+            "check, which requires the identity for every image row AND a",
+            "best-match margin that makes the argmax mean something."
+          ]
+        },
+        "vit": {
+          "bf16_of_oracle_exact": false,
+          "mean_rel_l2_max": 0.0307,
+          "mean_cos_min": null,
+          "max_degenerate_rows": 0,
+          "unbounded": {
+            "mean_cos_min": "The spec records a vit mean cosine of 0.99934 as a measured value and declares no floor for it. Choosing one here would be a fresh bound invented by the wave that is judged by it, which is the thing this file exists to prevent."
+          },
+          "_provenance": [
+            "Built the same way as this profile's 3-condition cells bound, from",
+            "the same two recorded measurements at the VIT stage rather than at",
+            "the cells: 2.07% (ours bf16 vs OURS IN F32, vit column, rc job",
+            "0edbd4a9-cfd4-47e6-806b-0eb31df06383) + 1.00% (the oracle's own",
+            "bf16-input floor, vit column, rc job",
+            "2481ad2a-c109-4002-8ee6-13634a2bd7f5) = 3.07%.",
+            "",
+            "Measured INSIDE it on every leg that has run: 2.45% on the W6 CPU",
+            "arm against the oracle, 1.872% on the W7-CUDA arm against the same",
+            "oracle (rc job c472faab), and 1.51% on the W7-CUDA arm against our",
+            "own CPU block (rc job 665b2427-4b85-4e75-916b-d3ad3345ea24).",
+            "",
+            "Like the cells bound, this is a REGRESSION CATCHER rather than",
+            "independent evidence, and for the same triangle-inequality reason.",
+            "Its value is that a vit-stage regression can now fail a run at all.",
+            "",
+            "max_degenerate_rows 0: a vit row is a post-RMSNorm hidden state, so",
+            "a zero-norm one means the tower produced nothing for that patch. It",
+            "is a defect in its own right and it also makes this stage's",
+            "mean_rel_l2 nan, which the comparator refuses separately."
+          ]
+        },
+        "cells": {
+          "diagnostic_only": true,
+          "_provenance": [
+            "The `-cells.f32` stage is the aligner output BEFORE the block",
+            "layout: the same rows the judged `image_rows` statistic already",
+            "covers, in a different order. Bounding it would be a second",
+            "description of one measurement. Its presence IS required and is",
+            "reported; only its magnitude is unjudged."
+          ]
+        }
+      },
+      "unbounded": {},
+      "_provenance": [
+        "Conditions (1) and (3) of the three the spec's `THE BOUND` section sets.",
+        "",
+        "(1) sentinels exact + identity permutation. These are COPIES and a",
+        "PERMUTATION, so any error at all is a defect. This is the half of the",
+        "profile that does real work: it can fail without the tower changing",
+        "precision at all.",
+        "",
+        "(3) mean_rel_l2 <= 0.049 = 3.34% (ours bf16 vs OURS IN F32, rc job",
+        "0edbd4a9-cfd4-47e6-806b-0eb31df06383) + 1.57% (the oracle's own bf16",
+        "input floor, rc job 2481ad2a-c109-4002-8ee6-13634a2bd7f5), with",
+        "mean_cos >= 0.998. READ THE SPEC BEFORE QUOTING THIS NUMBER: given that",
+        "condition (2) holds, the triangle inequality already forces this bound,",
+        "so it is close to an identity rather than an independent test. It is",
+        "kept because it is the recorded gate and a gross regression still trips",
+        "it, not because passing it is separate evidence.",
+        "",
+        "max_degenerate_rows 0: an image row whose norm is zero on either side",
+        "has an UNDEFINED rel_l2 and cos. One such row made the mean over rows",
+        "nan, and `nan > limit` and `nan < limit` are both False, so it silently",
+        "disabled BOTH magnitude bounds above for every row. Measured: 99 rows",
+        "50% off plus one zero row printed VERDICT PASS and exited 0. An",
+        "all-zero aligner cell is also a defect in its own right.",
+        "",
+        "best_match_margin_above_bf16_rounding IS DERIVED, NOT DECLARED, and",
+        "that is the point of its shape. It is the precondition the",
+        "identity-permutation condition above never had: an argmax over",
+        "near-parallel rows is decided by rounding rather than by content. The",
+        "comparator requires `min_best_margin` -- the winner's cosine lead over",
+        "the runner-up, minimised over our image rows -- to be ABOVE the run's",
+        "own `bf16_rounding_scale`, which `bf16_rounding_scale()` computes from",
+        "the rows that run actually read, as the largest direction change half a",
+        "bf16 ULP can cause. No number in this file is consulted, so no wave can",
+        "be accused of picking the bound that judges it.",
+        "",
+        "WHY THE CONSTANT 0.01 WAS WITHDRAWN: it was a guess, and it would have",
+        "failed correct runs. MEASURED with the shipped best_match() at",
+        "realistic width (D=1280; the mutation fixture uses D=16): a shared",
+        "global component with 10% and 5% per-cell detail gives margins 0.00834",
+        "and 0.00210, and a 20-cell flat region gives 0.00875 and 0.00221.",
+        "Those are ordinary photographic geometries -- sky, a wall, a",
+        "background -- and `min_best_margin` is a MIN over 100 cells, so a",
+        "single flat pair decides the run. In all four the identity was STILL",
+        "best for 100 of 100 rows, so the constant would have RED four datasets",
+        "whose ordering claim was correct. The 0.229 the mutation fixture",
+        "measures is 16-dimensional pseudo-random rows, the least",
+        "photograph-like geometry available, so it was never evidence for 0.01.",
+        "",
+        "WHAT THE DERIVED BOUND STILL REFUSES: the degenerate smooth ramp it was",
+        "introduced for measures a margin of 1.47e-09 against a derived scale of",
+        "7.5e-06 and reds by three and a half decades, while the four",
+        "photographic geometries clear their own scale of about 3.9e-06 by",
+        "nearly three. The two cases are separated by seven decades rather than",
+        "by a number somebody chose between them."
+      ]
+    },
+    "shipped_bf16_block_only": {
+      "judged": true,
+      "sentinels_bf16_exact": true,
+      "permutation_identity_complete": true,
+      "best_match_margin_above_bf16_rounding": true,
+      "mean_rel_l2_max": 0.049,
+      "mean_cos_min": 0.998,
+      "max_degenerate_rows": 0,
+      "stages": {
+        "input": null,
+        "vit": null,
+        "cells": null
+      },
+      "unbounded": {
+        "stages.input": "llama-mtmd-cli is driven through MTMD_DEBUG_EMBEDDINGS, which writes the token BLOCK and nothing else, so oracle-cli-input.f32 does not exist and never did. Requiring it here would fail that leg for a reason that is not a defect. This is a DECLARATION that the stage is not required, not an omission: an omitted stage once had the same effect silently, which is the fail-open this shape closes.",
+        "stages.vit": "The same, for oracle-cli-vit.f32: the CLI leg produces no vit dump to require.",
+        "stages.cells": "The same, for oracle-cli-cells.f32: the CLI leg produces no cells dump to require."
+      },
+      "_provenance": [
+        "`shipped_bf16` with NO stage requirements, for the end-to-end CLI leg",
+        "only. llama-mtmd-cli is driven through MTMD_DEBUG_EMBEDDINGS, which",
+        "writes the token BLOCK and nothing else, so oracle-cli-input.f32,",
+        "-vit.f32 and -cells.f32 do not exist and never did. Requiring them here",
+        "would fail that leg for a reason that is not a defect.",
+        "",
+        "It is a SEPARATE profile rather than a relaxation of `shipped_bf16`",
+        "because the difference is a property of how the oracle is driven, and",
+        "naming it keeps the stage requirement intact everywhere else. The block",
+        "bounds are identical: this leg is judged exactly as hard on everything",
+        "it does produce."
+      ]
+    },
+    "f32_arm": {
+      "judged": true,
+      "sentinels_bf16_exact": true,
+      "permutation_identity_complete": true,
+      "best_match_margin_above_bf16_rounding": true,
+      "mean_rel_l2_max": 0.0157,
+      "mean_cos_min": null,
+      "max_degenerate_rows": 0,
+      "stages": {
+        "input": {
+          "bf16_of_oracle_exact": false,
+          "mean_rel_l2_max": null,
+          "mean_cos_min": null,
+          "max_degenerate_rows": null,
+          "unbounded": {
+            "mean_rel_l2_max": "PRESENCE-ONLY, and this says so rather than leaving a reader to infer a bound. The previous wording -- 'REQUIRED but NOT held to bf16 exactness' -- reads as 'held to something else', and nothing else was ever applied: measured, an `input` stage 100x wrong exited 0 PASS on this profile with no BOUND line printed, while a `vit` stage 100x wrong exited 1. There is no recorded f32-arm measurement at the input stage to bound it with. What this stage still proves is that the dump EXISTS and has the oracle's shape, which is what makes the vit and block numbers below numbers about the same image.",
+            "mean_cos_min": "The same: no recorded f32-arm input measurement exists, and a bound invented here would be a fresh one.",
+            "max_degenerate_rows": "See `shipped_bf16`: a patch that normalises to exactly zero is legitimate data, and no bound on this stage depends on rel_l2 or cos being defined."
+          },
+          "_provenance": [
+            "REQUIRED, PRESENCE-ONLY. The f32 arm feeds the exact f32 pixels",
+            "rather than the bf16-narrowed ones, so bf16_of_oracle_exact is the",
+            "wrong assertion for this leg and asserting it would fail a correct",
+            "run. No other recorded number exists for this stage on this arm, so",
+            "nothing is asserted about its magnitude and the file says that in",
+            "`unbounded` instead of leaving the silence to be read as a bound."
+          ]
+        },
+        "vit": {
+          "bf16_of_oracle_exact": false,
+          "mean_rel_l2_max": 0.01,
+          "mean_cos_min": null,
+          "max_degenerate_rows": 0,
+          "unbounded": {
+            "mean_cos_min": "The spec records no vit cosine floor for this arm either; see `shipped_bf16`."
+          },
+          "_provenance": [
+            "Condition (2) at the VIT stage: the f32 arm inside the oracle's own",
+            "floor. The oracle's bf16-input floor is 1.00% at vit (rc job",
+            "2481ad2a-c109-4002-8ee6-13634a2bd7f5) and our f32 arm measured",
+            "0.88% against it (rc job 0edbd4a9-cfd4-47e6-806b-0eb31df06383).",
+            "",
+            "Like the cells form of condition (2), this is the rule that tests",
+            "the FUNCTION rather than restating an identity: the floor is the",
+            "oracle measured against itself with its input moved by one bf16",
+            "step, so our arm can fail it without anything else changing."
+          ]
+        },
+        "cells": {
+          "diagnostic_only": true,
+          "_provenance": ["See `shipped_bf16`: the same rows as the judged statistic."]
+        }
+      },
+      "unbounded": {
+        "mean_cos_min": "The spec records no cosine floor for condition (2), and inventing one here would be a fresh bound rather than a recorded one."
+      },
+      "_provenance": [
+        "Condition (2): the f32 arm is within the oracle's OWN floor, cells mean",
+        "relative L2 <= 1.57%, measured 1.34% (rc job",
+        "0edbd4a9-cfd4-47e6-806b-0eb31df06383). This is the condition that tests",
+        "the FUNCTION: the floor is the oracle measured against itself with its",
+        "input moved by one bf16 step, so it is a bound our arm can fail without",
+        "any arithmetic elsewhere changing."
+      ]
+    },
+    "diagnostic": {
+      "judged": false,
+      "_provenance": [
+        "Localisation legs that measure a PERTURBATION rather than our agreement",
+        "with the oracle: the oracle against itself (floor), ours against the",
+        "oracle on a shared bf16 input (samein), and our bf16 arm against our own",
+        "f32 arm (selfdt). A 'failure' of one of these is not a defect claim, so",
+        "they are reported and not judged. They are listed EXPLICITLY rather than",
+        "reached by a default, because a default is how an unjudged tag becomes",
+        "an accidental pass."
+      ]
+    }
+  },
+  "tag_rules": [
+    ["lp0", "shipped_bf16"],
+    ["lp1", "shipped_bf16"],
+    ["lp2", "shipped_bf16"],
+    ["lp3", "shipped_bf16"],
+    ["cli", "shipped_bf16_block_only"],
+    ["cuda-lp*", "shipped_bf16"],
+    ["f32", "f32_arm"],
+    ["floor", "diagnostic"],
+    ["samein", "diagnostic"],
+    ["selfdt", "diagnostic"]
+  ],
+  "_unmatched_tag_note": [
+    "A tag no rule matches is UNJUDGED and exits 3. That is deliberate and it is",
+    "the whole point of this file: the defect being repaired here is a harness",
+    "that exited 0 while judging nothing, so 'no rule matched' must never be",
+    "reported as a pass. Add a rule for a new leg instead."
+  ]
+}

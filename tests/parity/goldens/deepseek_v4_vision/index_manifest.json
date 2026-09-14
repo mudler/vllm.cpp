@@ -1,0 +1,32 @@
+{
+  "all_names": {
+    "count": 72633,
+    "fnv1a64": "13575845987631797246",
+    "sha256": "2458f9e212c893b3160e852cce91e5f0829e22bd8089746505d5039204a053a0"
+  },
+  "classifications": {
+    "language": {
+      "count": 67658,
+      "fnv1a64": "8677341557823180208",
+      "sha256": "9c6bfc641f210d85478373d6d3fca102ca74f44439491f42da1af571466fb899"
+    },
+    "mtp": {
+      "count": 4708,
+      "fnv1a64": "5849746055649652446",
+      "sha256": "2c68e7a8f142281ed8fe03e8b4286ea3d1b9b2cd565e073e95be1df092ba15f3"
+    },
+    "vision": {
+      "count": 267,
+      "fnv1a64": "12270983010509813434",
+      "sha256": "304b313fd7e9db1d483d508c632f5eaaa2e7e8e2a09be8ba55a948bcb5390bfd"
+    }
+  },
+  "config_sha256": "6cd841bdd6702f5e2ac34671bc78047ed80817102465525ae2a41c502abbcd75",
+  "index_file": "model.safetensors.index.json",
+  "index_sha256": "507977e3d3818865264e68c0fdab139aa7f3929d0d0cf693dacc47428da56395",
+  "repo": "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+  "revision": "86f746b36186f0e567729a5c06a8c918caba82a9",
+  "shard_count": 48,
+  "tensor_count": 72633,
+  "total_size": 167811372792
+}

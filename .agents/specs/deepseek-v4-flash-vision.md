@@ -809,6 +809,90 @@ recorded with its verbatim message and the work stops there. No cause is
 guessed, and the blocker table in `## Owed` gains a row rather than a claim.
 
 ## Owed
+- **A CUDA BUILD DIES AT ENGINE CONSTRUCTION ON THE 4/4/8 GROUPS, AND THAT WALL
+  IS EARLIER THAN EVERY BLOCKER THIS SPEC PREVIOUSLY NAMED.** Measured
+  2026-09-14, rc job `fc593c9f-f550-4f1a-9adf-a8c734f48822`, `dgx:gpu0`, worker
+  `rc-worker-m6z8s`, GB10, driver 580.173.02, compute_cap 12.1, base
+  `f1dd76c8b680ee8a20f89f4070adf61db3671f32`, arch `121a`, fa2 ENABLED, CUTLASS
+  4.5.0, nvcc 13.0.88, 63 `.cu.o`, `CLI_MD5=57339dd3148052705974bda7ad11af83`,
+  `CMAKE_BUILD_TYPE=Release` with `-O3 -DNDEBUG`, so **NDEBUG IS DEFINED**. The
+  artefact was byte-verified on the worker at 82,438,622,112 B plus the
+  934,462,656 B projector.
+
+  **THE DEVICE GATE IS OPEN, AND THAT IS WHAT MAKES THIS MEASUREMENT NEW.**
+  `V4DeviceKernelsAvailable()` is TRUE on this build (31 cases / 90193
+  assertions / 0 failed / 0 skipped): the first run in which the four
+  `kDeepseekV4{Mhc,Dsa,Compressor,Moe}` ops were registered for `kCUDA`. Every
+  earlier leg was `-DVLLM_CPP_CUDA=OFF` and stopped at the W7-device refusal
+  (`deepseek_v4.cpp:4658`), which measured the build and not the model.
+
+  **THE NEW WALL.** `RUN_RC=1`, `WALL_S=886`, `OUT_BYTES=0`,
+  `VmHWM_kB=83460776` (79.6 GiB, so the tower really was materialized), ending
+  verbatim `vllm-cli: model load failed (status 2): vllm_engine_load: Block size
+  must be a multiple of 16.` File open, header parse, tensor mapping, KV-cache
+  config and the full weight load all SUCCEED; **engine construction FAILS**;
+  the first forward and sampling are NOT REACHED.
+
+  **MECHANISM, every anchor verified at `e1e92400c`.** `MakeDeepseekV4KVCache`
+  publishes the seven groups at `deepseek_v4_registry.cpp:546`, `:547`, `:548`
+  (the engine `block_size`), `:550` (`kSwaBlockSize = 64`, defined at `:399`),
+  and `:552`, `:554`, `:556` (4, 4 and 8), the geometry documented at `:501`.
+  256 and 64 pass `% 16`; **the 4, 4 and 8 DSA/compressor groups FAIL**. It is
+  reached from `GPUModelRunner::initialize_kv_cache`
+  (`src/vllm/v1/worker/gpu/runner.cpp:701`, called from the two constructor
+  BODIES at `:528` and `:633`), which calls `CheckKvCacheShape` at
+  `runner.cpp:1719`. **Note the exact site, because it is easy to
+  misattribute:** `CheckKvCacheShape` (`src/vllm/v1/attention/registry.cpp:150`)
+  does NOT emit this string — its own throw at `registry.cpp:173` is the
+  shape-mismatch message — it calls
+  `MakeAttentionBackend(device, name)->get_kv_cache_shape(...)` at
+  `registry.cpp:160`, and the string is thrown inside that call. The message is
+  **byte-identical at THREE sites**: `backend.cpp:253` (FlashAttention), `:268`
+  (ROCm, not applicable on a CUDA box) and `:279` (Triton MLA). **Which one
+  fired CANNOT be determined from the message**, and the log does not name the
+  resolved backend, so this entry does not guess. The predicate is
+  `supports_block_size` (`backend.cpp:153`, "a multiple of ANY declared size")
+  over the `{16}` declared at `include/vllm/v1/attention/backend.h:444`, `:546`
+  and `:604`; the base default is the permissive `{1}` at `backend.h:360`. It is
+  a `throw std::invalid_argument` and **NOT an `assert`, so NDEBUG cannot delete
+  it** — unlike `kv_cache_coordinator.cpp:386`.
+
+  **UPSTREAM PUBLISHES THE SAME SUB-16 SIZES AND HAS NO GLOBAL 16 RULE TO
+  RECONCILE AGAINST.** Read at the pinned oracle `e126687a9a`:
+  `vllm/models/deepseek_v4/compressor.py:152-167` hard-codes `block_size` 4 for
+  `compress_ratio` 4 and 8 for 128 and publishes it into a real
+  `SlidingWindowMLASpec` at `:173-185`; `sparse_swa.py:82-87` sets 64; the MLA
+  and indexer caches take `cache_config.block_size` (`attention.py:742`, `:787`),
+  lifted from `DEFAULT_BLOCK_SIZE = 16` (`config/cache.py:79`) to 256 by
+  `get_preferred_block_size` (`sparse_swa.py:130-132`) via
+  `platforms/interface.py:628-640`. So `{256,256,256,64,4,4,8}` is UPSTREAM's own
+  geometry, not an artefact of our factory. `supports_block_size`
+  (`vllm/v1/attention/backend.py:116-133`) defaults to `[MultipleOf(1)]`
+  (`:72-74`); the 16-multiple checks are per-backend overrides in exactly three
+  backends (`triton_attn.py:314`, `triton_mla.py:152`,
+  `rocm_aiter_unified_attn.py:53`). **The reconciliation is PER-GROUP BACKEND
+  DISPATCH**: the compressor group is served by `CompressorBackend`
+  (`compressor.py:189-190`) declaring `[MultipleOf(1)]` (`:66-68`),
+  `DeepseekSparseSWABackend` declares `[MultipleOf(64)]` (`sparse_swa.py:126-128`)
+  and `DeepseekV4IndexerBackend` declares `[256]`
+  (`backends/mla/indexer.py:194-196`). Upstream never asks a dense 16-multiple
+  backend about the compressor's block size. **Three alternatives were checked
+  and RULED OUT upstream, so none is available to copy**: the DSA cache IS a
+  KV-cache group (`compressor.py:133`, `:173`); there is no unifying pass
+  (`unify_kv_cache_spec_page_size`, `kv_cache_utils.py:1113-1175`, equalizes PAGE
+  SIZE and only ever RAISES a block size at `:1158-1162`, and the only cross-group
+  requirement is divisibility — `kv_cache_coordinator.py:92`,
+  `kv_cache_utils.py:1955`); and `kernel_block_size` (`worker/utils.py:442-483`,
+  `:310-376`) only ever selects a DIVISOR (`:371-375`), so it can never lift 4 to
+  16.
+
+  **WHAT IS OWED.** Per-group backend dispatch, so each group's block size is
+  validated against THAT group's own backend, with a `CompressorBackend`
+  equivalent declaring `MultipleOf(1)` and a sparse-SWA equivalent declaring
+  `MultipleOf(64)`. Until it lands the production path cannot serve this
+  architecture on ANY backend in this tree. The upstream caveat is recorded with
+  the measurement: the local vLLM checkout is at the PRIOR pin `5559679229` with
+  a dirty tree, and every line above was read as a blob AT `e126687a9a`.
 - **A MULTI-GROUP DeepSeek-V4 STILL CANNOT PREFIX-CACHE, AND THE COORDINATOR
   ASSERT THAT WOULD STOP IT IS LATENT BEHIND THE fp8_ds_mla REFUSAL.** This
   entry previously said a real Flash checkpoint ABORTS in
@@ -841,7 +925,26 @@ guessed, and the blocker table in `## Owed` gains a row rather than a claim.
   operator override. `RetypeAttentionSpec` is UNTOUCHED and still refuses every
   EXPLICIT `--kv-cache-dtype` on this topology.
 
-  **THE COORDINATOR ASSERT IS NOW REACHED, AND IT IS COMPILED OUT.** Measured
+  **THE COORDINATOR ASSERT IS NOW REACHED, AND IT IS COMPILED OUT.**
+
+  **PARTLY SUPERSEDED 2026-09-14 BY THE FIRST CUDA RUN, AND THE SCOPE OF THIS
+  PARAGRAPH IS NARROWER THAN IT READS. What falsified it is recorded here rather
+  than deleted.** "Reached" was measured through `LoadedEngine::FromModelDir` on
+  the ratio-bearing FIXTURE, and it still holds there. **On a CUDA `sm_121a`
+  build against the real checkpoint `kv_cache_coordinator.cpp:386` is NOT
+  reached at all**, so the NDEBUG-deleted assert is NOT what stops a CUDA build:
+  `initialize_kv_cache` runs in the BODY of the `GPUModelRunner` constructor
+  (`runner.cpp:528`, `:633`) and `runner_` is constructed at
+  `src/vllm/entrypoints/model_loader.cpp:2255` BEFORE `scheduler_` at `:2307` in
+  the same initializer list, and `scheduler_` is what builds `KVCacheManager` ->
+  `HybridKVCacheCoordinator`. The block-size throw therefore fires strictly
+  before the coordinator exists. Corroborated empirically: the CUDA run never
+  printed `Asynchronous scheduling is enabled` (emitted at
+  `model_loader.cpp:2443`), whereas the earlier CPU leg did print it and then
+  died later at `deepseek_v4.cpp:4658`. The bullet at the head of `## Owed`
+  carries that measurement.
+
+  **THE ORIGINAL PARAGRAPH, UNCHANGED, FOLLOWS.** Measured
   2026-09-13 on `7a62a7fca` through `LoadedEngine::FromModelDir` with the
   ratio-bearing fixture: DeepSeek-V4 registers `is_hybrid = false` and
   `has_inner_state = false` (`deepseek_v4_registry.cpp:54-55`), so

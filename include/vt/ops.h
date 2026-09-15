@@ -887,6 +887,13 @@ enum class OpId : uint8_t {
   kMoeGroupedGemmBf16Weighted,
   kMoeCombinePreweighted,
   kResidualRmsNorm,
+  // ClampedSwiGLU: silu(clamp(gate, max=limit)) * clamp(up, -limit, limit) at
+  // alpha=1, beta=0 — DeepSeek-V4's activation (activation.py:197-201) and
+  // GLM-5.3-Flash's ExpertGate (_apply_gate, modeling_glm5_next.py:137-142).
+  // Takes concatenated gate_up [T, 2D] -> out [T, D], same layout as SiluAndMul
+  // but with per-element clamping. Appended before kCount so no existing op's
+  // id shifts.
+  kClampedSwiGLU,
   kCount
 };
 
@@ -2418,6 +2425,7 @@ using ResidualRmsNormFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*a*/,
 using RmsNormGroupFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/,
                                 const Tensor& /*weight*/, const RmsNormGroupArgs&);
 using SiluAndMulFn = void (*)(Queue&, Tensor&, const Tensor&);
+using ClampedSwiGLUFn = void (*)(Queue&, Tensor&, const Tensor&, float);
 using GeluAndMulFn = void (*)(Queue&, Tensor&, const Tensor&);
 using MulScalarFn = void (*)(Queue&, Tensor&, const Tensor&, double);
 using SoftCapFn = void (*)(Queue&, Tensor&, const Tensor&, double);
@@ -3654,6 +3662,14 @@ void FusedChain(Queue& q, const FusedRecipe& recipe, Tensor& q_out, Tensor& k_ou
 // out[T,D] = silu(x[:, :D]) * x[:, D:], x is [T, 2D]; out f32 or bf16.
 // Note: computes in f32 (upstream forward_native computes in x's dtype); bf16 parity tests need bf16-eps tolerance.
 void SiluAndMul(Queue& q, Tensor& out, const Tensor& x);
+
+// out[T,D] = silu(clamp(gate_up[:, :D], max=limit)) * clamp(gate_up[:, D:], -limit, limit)
+// at alpha=1, beta=0. gate_up is [T, 2D] (gate = [:, :D], up = [:, D:]), same layout as
+// SiluAndMul. The gate clamp is MAX-ONLY; the up clamp is BOTH sides. Computed in f32,
+// silu narrowed through input dtype (same polarity as SiluAndMul). DeepSeek-V4
+// activation (activation.py:197-201), GLM-5.3-Flash ExpertGate
+// (modeling_glm5_next.py:137-142). CPU + CUDA + ROCm.
+void ClampedSwiGLU(Queue& q, Tensor& out, const Tensor& gate_up, float limit);
 
 // out[T,D] = gelu_tanh(x[:, :D]) * x[:, D:], x is [T, 2D]; out f32 or bf16.
 // gelu_tanh(a) = 0.5*a*(1 + tanh(sqrt(2/pi)*(a + 0.044715*a^3))) — the exact

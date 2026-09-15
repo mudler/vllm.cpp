@@ -13,6 +13,10 @@ void SoftCapKernelRocm(Queue& q, Tensor& out, const Tensor& x, double cap);
 void AddKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
 void GeluAndMulKernelRocm(Queue& q, Tensor& out, const Tensor& x);
 void SiluAndMulKernelRocm(Queue& q, Tensor& out, const Tensor& x);
+
+// ClampedSwiGLU (DeepSeek-V4 activation): silu(clamp(gate, max=limit)) *
+// clamp(up, -limit, limit) at alpha=1, beta=0. Same layout as SiluAndMul.
+void ClampedSwiGLUKernelRocm(Queue& q, Tensor& out, const Tensor& gate_up, float limit);
 void MatmulKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
 void MatmulBTKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
 // MLA/DSA campaign W1 (#2715). The batched GEMM lives beside its dense siblings
@@ -216,6 +220,9 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<GeluAndMulFn>(&GeluAndMulKernelRocm)));
     RegisterOp(OpId::kSiluAndMul, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<SiluAndMulFn>(&SiluAndMulKernelRocm)));
+    RegisterOp(OpId::kClampedSwiGLU, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<ClampedSwiGLUFn>(&ClampedSwiGLUKernelRocm)));
     RegisterOp(OpId::kMatmul, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulKernelRocm)));
     RegisterOp(OpId::kMatmulBT, DeviceType::kROCM,

@@ -334,6 +334,35 @@ void SiluAndMulKernelRocm(Queue& q, Tensor& out, const Tensor& x) {
   Check(hipGetLastError(), "silu_and_mul");
 }
 
+// ClampedSwiGLU (DeepSeek-V4 activation): gate clamped MAX-ONLY, up clamped
+// BOTH sides, then silu(gate)*up at alpha=1, beta=0. Same kernel structure as
+// SiluMulK with per-element clamping. NarrowTo<Tin> matches SiluMulK's polarity.
+template <typename Tin, typename Tout>
+__global__ void ClampedSwiGLUK(Tout* out, const Tin* x, int64_t n, int64_t d, float limit) {
+  for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n;
+       idx += gridDim.x * blockDim.x) {
+    const int64_t i = idx / d, j = idx - i * d;
+    const float g = fminf(Ld(x, i * 2 * d + j), limit);
+    const float up = fminf(fmaxf(Ld(x, i * 2 * d + d + j), -limit), limit);
+    St(out, idx, NarrowTo<Tin>(g / (1.0f + expf(-g))) * up);
+  }
+}
+
+void ClampedSwiGLUKernelRocm(Queue& q, Tensor& out, const Tensor& gate_up, float limit) {
+  const int64_t d = gate_up.shape[1] / 2, n = gate_up.shape[0] * d;
+  if (n == 0) return;
+  hipStream_t st = AsStream(q);
+  if (gate_up.dtype == DType::kBF16)
+    ClampedSwiGLUK<__hip_bfloat16, __hip_bfloat16><<<GridFor(n), kBlock, 0, st>>>(
+        out.Ptr<__hip_bfloat16>(), gate_up.Ptr<__hip_bfloat16>(), n, d, limit);
+  else if (gate_up.dtype == DType::kF32)
+    ClampedSwiGLUK<float, float>
+        <<<GridFor(n), kBlock, 0, st>>>(out.Ptr<float>(), gate_up.Ptr<float>(), n, d, limit);
+  else
+    VT_CHECK(false, "rocm clamped_swiglu dtype");
+  Check(hipGetLastError(), "clamped_swiglu");
+}
+
 // MatmulKernelRocm / MatmulBTKernelRocm live in rocm_matmul_hipblaslt.hip
 
 void RopeCosSinCacheKernelRocm(Queue& q, Tensor& cos_sin, const Tensor& pos,

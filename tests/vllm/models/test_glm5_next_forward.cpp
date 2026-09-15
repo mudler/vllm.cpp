@@ -1748,15 +1748,23 @@ TEST_CASE("glm5_next W9c-3 device: the device forward matches the host reference
   const vllm::Glm5NextWeights& w = Weights(model);
 
   const std::vector<int32_t> ids{3, 11, 7, 20};
-  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
 
-  // The host reference — the correctness truth.
-  const std::vector<float> host = gn::Glm5NextHostForward(w, ids, {}, q, nullptr);
+  // The host reference runs on a CPU queue — it is the correctness truth and
+  // uses double-accumulation host arithmetic throughout. VT_GLM5_NEXT_DEVICE
+  // must NOT be set here, or Glm5NextHostForward delegates to
+  // Glm5NextDeviceForward and the comparison is meaningless.
+  vt::Queue cpu_q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const std::vector<float> host = gn::Glm5NextHostForward(w, ids, {}, cpu_q, nullptr);
 
-  // The device forward. On CPU this exercises the vt::* kernel path (float32
-  // accumulation); on GPU it runs the full device compose. The stub throws
-  // "not implemented yet" until W9c-3 grows the implementation.
-  const std::vector<float> dev = gn::Glm5NextDeviceForward(w, ids, {}, q, nullptr);
+  // The device forward uses the best available queue. On a CUDA build this
+  // exercises the vt::* CUDA kernels; on a CPU-only build it uses the CPU
+  // vt::* kernels (float32 accumulation). The model is loaded on CPU either
+  // way, so the device forward uploads weight rows to the queue's device.
+  const bool cuda_here =
+      vt::TryGetBackend(vt::Device{vt::DeviceType::kCUDA, 0}) != nullptr;
+  vt::Queue dev_q{vt::Device{cuda_here ? vt::DeviceType::kCUDA
+                                       : vt::DeviceType::kCPU, 0}, nullptr};
+  const std::vector<float> dev = gn::Glm5NextDeviceForward(w, ids, {}, dev_q, nullptr);
 
   REQUIRE(dev.size() == host.size());
   const Gap gap = MaxGap(dev, host);

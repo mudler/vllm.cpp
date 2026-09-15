@@ -479,10 +479,18 @@ inline std::string BuildFixture(const FixtureOpts& o = FixtureOpts{}) {
 // Calling `LoadGlm5NextFromGguf` directly would skip `ModelRegistry::Resolve`
 // and the registry's factory, and that skip is exactly what would hide a
 // registration this wave never wired.
+// `device` is what the ENGINE resolved for the load. It defaults to `kCPU` so
+// every existing caller reads as the ordinary CPU load it always was, and a
+// CUDA-build caller that wants the CUDA residency policy passes `kCUDA`
+// explicitly. Using `CurrentPlatform().device_type()` here was wrong for the
+// same reason `model_registry.h:133-143` records: the probe answers `kCUDA` on
+// any process where the CUDA platform registered, while a test that creates a
+// CPU queue needs host-resident weights.
 inline std::unique_ptr<vllm::LoadedModel> LoadThroughRegistry(
-    const vllm::GgufFile& g) {
+    const vllm::GgufFile& g,
+    vt::DeviceType device = vt::DeviceType::kCPU) {
   const vllm::HfConfig config = vllm::Glm5NextHfConfigFromGguf(g);
-  const vllm::ModelSource source = vllm::ModelSource::FromGguf(g, vllm::platforms::CurrentPlatform().device_type());
+  const vllm::ModelSource source = vllm::ModelSource::FromGguf(g, device);
   return vllm::ModelRegistry::Load(config, source);
 }
 

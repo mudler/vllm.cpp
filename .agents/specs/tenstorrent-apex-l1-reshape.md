@@ -114,6 +114,10 @@ the logical shape without a device program and without CB allocation.
   later blockers get named when reached).
 - The 09-14 DRAM OOM record in the row spec gets superseded by this
   attribution in the outcome section.
+- F1: a test that consumes the committed served-geometry record (the
+  review notes below).
+- F2: migrate the hardcoded-geometry NormalizeDevF32Tile consumers
+  (kSigmoidGateBf16, L2Norm arms) to served-geometry commits.
 
 ## Stop conditions
 
@@ -123,3 +127,23 @@ the logical shape without a device program and without CB allocation.
 - If the focused test cannot go red on the current tree (the L1 fatal is
   config-dependent), record the config that reproduces it and stop for a
   decision.
+
+## Review notes (2026-09-15, fresh review PASS)
+
+The fresh review confirmed the regression guard (mutation 3: the free
+reshape reintroduced → the exact L1 fatal, red) and the guard
+narrowing (static: non-rank-2 path byte-equivalent to pre-fix). Two
+findings recorded, non-blocking:
+
+- F1: the served-geometry COMMITMENT in kCastBf16/kCastF32 is
+  mutation-invisible to the suite — the oracle is bytes-only, and the
+  committed record is not consumed by any observed serve. A follow-up
+  test that consumes the committed record (a serve at the native
+  geometry asserting no reshape fallback) is the owed test.
+- F2: other NormalizeDevF32Tile consumers with hardcoded geometry
+  commits (kSigmoidGateBf16, the L2Norm arms) predate this doctrine;
+  no regression today (a wide rank-2 shadow was L1-fatal there before
+  this fix too), but their migration to served-geometry commits is
+  owed with the same shape as this fix.
+
+Both ride the row's Owed list.

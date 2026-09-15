@@ -221,6 +221,9 @@ VT_V4_RESIDENT_W
 VT_V4_ROPE_FLOAT
 VT_V4_ROUTE_WARP_TOPK
 VT_W4A4_TRUE
+VT_VK_DISABLE
+VT_VK_DISABLE_PAGED_ATTN
+VT_VK_FENCE_TIMEOUT_MS
 # (VT_ASYNC_EXECUTOR_TRACE). Never set in production.
 # Gemma-4 MoE expert-execution tuning (#154, gemma4_moe.cpp / gemma4.cpp). Each
 # Inherited ROCm/Gemma-4 bring-up tactics. These are default-off diagnostic,

@@ -2983,6 +2983,8 @@ vllm_cpp_add_test(test_cuda_embedding_quant vt/test_cuda_embedding_quant.cpp)
 target_include_directories(test_cuda_embedding_quant PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # BACKEND-ROCM-QUANT-GATHER: the production gate starts at the public loader.
 vllm_cpp_add_test(test_capi_rocm_embedding_quant capi/test_rocm_embedding_quant.cpp)
+# Quantized WMMA reaches both formats through the public completion API.
+vllm_cpp_add_test(test_capi_rocm_quant_wmma capi/test_rocm_quant_wmma.cpp)
 vllm_cpp_add_test(test_rocm_embedding_quant vt/test_rocm_embedding_quant.cpp)
 target_include_directories(test_rocm_embedding_quant PRIVATE ${CMAKE_SOURCE_DIR}/src)
 if(VLLM_CPP_HIP)
@@ -2994,6 +2996,8 @@ endif()
 add_executable(rocm_quant_gather_capture ../tools/rocm_quant_gather/capture.cpp)
 target_link_libraries(rocm_quant_gather_capture PRIVATE vllm)
 target_include_directories(rocm_quant_gather_capture PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
+add_executable(rocm_quant_wmma_capture ../tools/rocm_quant_wmma/capture.cpp)
+target_link_libraries(rocm_quant_wmma_capture PRIVATE vllm)
 # CPU-ELEM-GEMM: the specialized + SIMD elementwise (bf16/f16/f32) GEMM. The
 # gate is BYTE-IDENTITY against an independent scalar reference across every
 # dtype combination, both weight orientations, ragged K/N, row-strided

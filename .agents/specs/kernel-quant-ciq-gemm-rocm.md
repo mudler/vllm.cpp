@@ -247,8 +247,8 @@ scale layout through the tile op.
 
 ## Owed
 
-- gfx1100 (RDNA3) WMMA tile: `VikashLoomba`'s audit on #2109, a separate row
-  and spec.
+- gfx1100 (RDNA3) WMMA admission: measured and completed by this change in
+  [KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA3](rocm-rdna3-quant-wmma.md).
 - gfx1151 (RDNA3.5) WMMA tile: needs Strix Halo hardware to verify; a
   separate row and spec.
 - hipBLASLt per-superblock scale support: unmeasured; recorded as an open

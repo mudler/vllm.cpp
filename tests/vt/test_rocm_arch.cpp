@@ -16,6 +16,7 @@
 #include <doctest/doctest.h>
 
 #include "vt/rocm/rocm_arch.h"
+#include "vt/rocm/rocm_quant_wmma_arch.h"
 #include "vt/rocm/rocm_skinny_gemm_arch.h"
 
 using vt::rocm::CapabilityFromGcnArch;
@@ -108,6 +109,27 @@ TEST_CASE("SharedK WMMA host gate is gfx1200/gfx1201 prefix, not substring") {
   static_assert(GcnArchNameIsGfx12PrefillWmma("gfx1201:xnack-"));
   static_assert(!GcnArchNameIsGfx12PrefillWmma("foogfx1201"));
   static_assert(!GcnArchNameIsGfx12PrefillWmma("gfx12010"));
+}
+
+TEST_CASE("quantized WMMA admits only measured device names and HIP features") {
+  using vt::rocm::GcnArchNameHasQuantWmma;
+  for (const char* name : {"gfx1100", "gfx1200", "gfx1201", "gfx1100:xnack-",
+                           "gfx1100:sramecc+:xnack-", "gfx1200:sramecc-",
+                           "gfx1201:xnack+:sramecc+"}) {
+    CAPTURE(std::string(name));
+    CHECK(GcnArchNameHasQuantWmma(name));
+  }
+  for (const char* name : {"", "gfx110", "gfx11000", "gfx1100garbage",
+                           "agfx1100", "gfx1100:", "gfx1100:xnack", "gfx1100:foo+",
+                           "gfx1100:xnack-:", "gfx1100::xnack-", "gfx1201garbage",
+                           "gfx1100:xnack-:xnack+", "gfx1200:sramecc+:sramecc+",
+                           "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151",
+                           "gfx1202", "gfx1210", "gfx942", "gfx1030"}) {
+    CAPTURE(std::string(name));
+    CHECK_FALSE(GcnArchNameHasQuantWmma(name));
+  }
+  CHECK_FALSE(vt::rocm::GcnArchNameIsGfx12PrefillWmma("gfx1100"));
+  CHECK_FALSE(vt::rocm::GcnArchNameIsGfx12PrefillWmma("gfx1100:xnack-"));
 }
 
 TEST_CASE("the parse is constexpr, so a wrong answer is a compile error") {

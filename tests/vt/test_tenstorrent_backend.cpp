@@ -755,6 +755,95 @@ TEST_CASE("kTENSTORRENT kCastBf16 / kCastF32 round-trip F32 values") {
   }
 }
 
+// RED-first for ISSUE-LOCAL-01M2K8WWA0X09VJF55NTS16VTV: a producer shadow
+// natively shaped [128, 6144] (the APEX gated-norm activation) reaches
+// kCastBf16, which serves it raw and hands NormalizeDevF32Tile(1, n). The
+// (1, n) arguments are the FLATTENED shape, so the logical-shape guard fires
+// and the free ttnn::reshape launched reshape_rm — whose staging CBs scale
+// with the 3,145,728 B f32 row, 2x the L1 cap, fatal at program allocation.
+// The shadow is device-authoritative (committed by a device Matmul, the same
+// CommitDevice2D path the production driver uses) and the oracle is the host
+// single-round RNE cast.
+static uint16_t RneF32ToBf16(float v) {
+  uint32_t bits;
+  std::memcpy(&bits, &v, 4);
+  const uint32_t lsb = (bits >> 16) & 1u;
+  const uint32_t rounded = bits + 0x7fffu + lsb;
+  return static_cast<uint16_t>(rounded >> 16);
+}
+
+TEST_CASE("kTENSTORRENT kCastBf16 serves a [128,6144] f32 shadow without the "
+          "L1-fatal reshape") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kCastBf16, DeviceType::kTENSTORRENT));
+  constexpr int64_t M = 128, K = 16, C = 6144;
+  const Device dev{DeviceType::kTENSTORRENT, 0};
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  auto cast_bf16 = reinterpret_cast<vt::CastBf16Fn>(
+      vt::GetOp(vt::OpId::kCastBf16, DeviceType::kTENSTORRENT));
+
+  // Producer: a device Matmul commits an f32 [M, C] shadow on mo. The b leg
+  // is all ones and every a value is exact, so the shadow holds known f32
+  // values without any readback of the committed slot.
+  std::vector<float> ha(static_cast<size_t>(M * K));
+  for (size_t i = 0; i < ha.size(); ++i)
+    ha[i] = static_cast<float>(static_cast<int>(i % 15) - 7) * 0.25f;
+  std::vector<float> hb(static_cast<size_t>(K * C), 1.0f);
+  std::vector<float> hout(static_cast<size_t>(M * C), -1.0f);
+  void* ma = backend.Alloc(ha.size() * sizeof(float));
+  void* mb = backend.Alloc(hb.size() * sizeof(float));
+  void* mo = backend.Alloc(hout.size() * sizeof(float));
+  void* mo_bf = backend.Alloc(hout.size() * sizeof(uint16_t));
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, ma, ha.data(), ha.size() * sizeof(float));
+  backend.Copy(q, mb, hb.data(), hb.size() * sizeof(float));
+  Tensor ta = Tensor::Contiguous(ma, vt::DType::kF32, dev, {M, K});
+  Tensor tb = Tensor::Contiguous(mb, vt::DType::kF32, dev, {K, C});
+  Tensor to = Tensor::Contiguous(mo, vt::DType::kF32, dev, {M, C});
+  reinterpret_cast<vt::MatmulFn>(
+      vt::GetOp(vt::OpId::kMatmul, DeviceType::kTENSTORRENT))(q, to, ta, tb);
+
+  // The cast input rides the committed [M, C] shadow (device-authoritative:
+  // device_current, host_current=false, dtype f32, numel == 786,432). The
+  // f32 wide-row shadow is built through the production kCastF32 arm on the
+  // committed matmul shadow, so the case exercises the 3,145,728 B f32 row
+  // the APEX e2e dies on, not just the bf16 one.
+  Tensor in2d = Tensor::Contiguous(mo, vt::DType::kF32, dev, {M, C});
+  void* mo_f32 = backend.Alloc(hout.size() * sizeof(float));
+  Tensor tf32 = Tensor::Contiguous(mo_f32, vt::DType::kF32, dev, {M * C});
+  auto cast_f32 = reinterpret_cast<vt::CastF32Fn>(
+      vt::GetOp(vt::OpId::kCastF32, DeviceType::kTENSTORRENT));
+  cast_f32(q, tf32, in2d);
+  Tensor in_f32 = Tensor::Contiguous(mo_f32, vt::DType::kF32, dev, {M, C});
+  Tensor out = Tensor::Contiguous(mo_bf, vt::DType::kBF16, dev, {M * C});
+  cast_bf16(q, out, in_f32);
+
+  // Readback and bit-exact compare against the host single-round RNE cast.
+  std::vector<uint16_t> got(static_cast<size_t>(M * C), 0xbeef);
+  backend.Copy(q, got.data(), mo_bf, got.size() * sizeof(uint16_t));
+  size_t bad = 0, first_bad = 0;
+  for (int64_t i = 0; i < M; ++i) {
+    const uint16_t want = RneF32ToBf16(ha[static_cast<size_t>(i * K)]);
+    for (int64_t j = 0; j < C; ++j) {
+      const size_t idx = static_cast<size_t>(i * C + j);
+      if (got[idx] != want) {
+        if (bad == 0) first_bad = idx;
+        ++bad;
+      }
+    }
+  }
+  backend.Free(ma);
+  backend.Free(mb);
+  backend.Free(mo);
+  backend.Free(mo_f32);
+  backend.Free(mo_bf);
+  CHECK_MESSAGE(bad == 0, "RNE mismatch: " << bad << " elements, first at "
+                                           << first_bad);
+}
+
 // Default Qwen3-dense RoPE (Metal M3b). Small T*H uses host apply (bit-exact);
 // large prefill uses device NeoX (BF16) — covered by PreferDeviceRope threshold.
 TEST_CASE("kTENSTORRENT kRopeNeox is BIT-EXACT vs a host F32 reference (small)") {

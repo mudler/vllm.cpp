@@ -4175,8 +4175,11 @@ void CastBf16Kernel(Queue&, Tensor& out, const Tensor& in) {
   ttnn::Tensor dev_in;
   if (ServeDeviceShadowRaw(in, 1, n, dev_in)) {
     ttnn::Tensor dev = NormalizeDevF32Tile(std::move(dev_in), 1, n);
+    // Commit the SERVED geometry (#2282): a rank-2 shadow keeps its native
+    // logical shape, and the record must name the geometry actually stored.
+    const auto dls = dev.logical_shape();
     CommitDeviceLogical2D(out, ttnn::typecast(dev, ttnn::DataType::BFLOAT16),
-                          1, n);
+                          dls[dls.rank() - 2], dls[dls.rank() - 1]);
     return;
   }
   {
@@ -4212,8 +4215,11 @@ void CastF32Kernel(Queue&, Tensor& out, const Tensor& in) {
   const uint32_t nf = static_cast<uint32_t>(in.Numel());
   ttnn::Tensor dev_in;
   if (ServeDeviceShadowRaw(in, 1, nf, dev_in)) {
-    CommitDeviceLogical2D(out, NormalizeDevF32Tile(std::move(dev_in), 1, nf),
-                          1, nf);
+    ttnn::Tensor dev = NormalizeDevF32Tile(std::move(dev_in), 1, nf);
+    // SERVED geometry, as in kCastBf16 above.
+    const auto dls = dev.logical_shape();
+    CommitDeviceLogical2D(out, std::move(dev), dls[dls.rank() - 2],
+                          dls[dls.rank() - 1]);
     return;
   }
   {
@@ -7488,13 +7494,30 @@ ttnn::Tensor ServeActF32(const Tensor& t, uint32_t rows, uint32_t cols,
 // of a TILE owner keeps the owner's tile padding — every one of those feeds
 // a downstream elementwise op a misaligned physical layout (the prefill
 // "Invalid subtile broadcast type" fatal). Materializing in ROW_MAJOR gives
-// a fresh contiguous buffer, the reshape on it is a pure metadata view,
-// and the final to_layout(TILE) rebuilds the padding from the true shape.
+// a fresh contiguous buffer; the elementwise chain on it is shape-agnostic,
+// and the final to_layout(TILE) rebuilds the padding from the tensor's own
+// (served) geometry. A rank-2 shadow keeps its native logical shape — the
+// callers commit that served geometry (see NormalizeDevF32Tile's comment).
 ttnn::Tensor NormalizeDevF32Tile(ttnn::Tensor x, uint32_t rows, uint32_t cols) {
   x = ttnn::to_layout(x, ttnn::Layout::ROW_MAJOR);
   const auto ls = x.logical_shape();
-  if (ls.rank() != 2 || ls[0] != rows || ls[1] != cols)
-    x = ttnn::reshape(x, ttnn::Shape({rows, cols}));
+  if (ls.rank() != 2 || ls[0] != rows || ls[1] != cols) {
+    // ISSUE-LOCAL-01M2K8WWA0X09VJF55NTS16VTV: a producer shadow natively
+    // shaped [T, W] (the APEX gated-norm activation [128, 6144]) must not
+    // take the free ttnn::reshape to (1, n) — reshape_rm's statically
+    // allocated staging CBs scale with the row width, and the 3,145,728 B
+    // f32 row is 2x the L1 cap (fatal at program allocation). The
+    // metadata view cannot serve it either: view_device on ROW_MAJOR with
+    // a CHANGED last dim rebuilds the buffer page mapping and the data
+    // comes back wrong (the focused cast test's bit-exact memcmp caught
+    // it) — which is why upstream routes this case through reshape_rm.
+    // The elementwise ops below (typecast, to_layout(TILE)) are
+    // shape-agnostic on the contiguous buffer, so a rank-2 shadow runs at
+    // its native geometry and the CALLER commits the served geometry (the
+    // #2282 served-geometry doctrine). The free reshape stays for the
+    // non-rank-2 cases the elementwise chain cannot carry as-is.
+    if (ls.rank() != 2) x = ttnn::reshape(x, ttnn::Shape({rows, cols}));
+  }
   if (x.dtype() != ttnn::DataType::FLOAT32)
     x = ttnn::typecast(x, ttnn::DataType::FLOAT32);
   return ttnn::to_layout(x, ttnn::Layout::TILE);

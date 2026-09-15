@@ -3484,13 +3484,16 @@ the result for the island op, re-upload — is the one this port follows.
 | 6 | Chunked lm_head | `forward.cpp:433-473` | `kMatmul` | yes | yes | MOVES |
 | 7 | DSA k-pool indexer | `dsa.cpp:168,365` | `kGlm5NextKpoolCompress`/`Select` | yes | yes | MOVES (closes O36) |
 | 8 | MoE combine | `moe.cpp:694` | `kMoeCombine` | yes | yes | MOVES |
-| 9 | Dense + shared MLP | `moe.cpp:473,672` | `kMatmul` | yes | yes | MOVES |
+| 9 | Dense + shared MLP | `moe.cpp:473,672` | `kMatmul` | yes | yes | HOST ISLAND (ClampedSwiGLU) |
 | 10 | Eager MLA attention | `attn.cpp:276` | `kMlaPrefillAttention`/`kMlaDecodeAttention` | yes | yes | HOST ISLAND (W9c-1) |
 | 11 | mHC sites | `mhc.cpp:21,53` | `kDeepseekV4Mhc` | yes | **NO** | HOST ISLAND (O34) |
 
-Arms 1-3 are already on the device. Arms 4-9 move to the device in this wave.
-Arms 10-11 stay as host-fallback islands, and each names the debt that owns the
-move.
+Arms 1-3 are already on the device. Arms 4-8 move to the device in this wave.
+Arm 9 stays as a host-fallback island because `deepseek_v4::ClampedSwiGLU`
+(`silu(clamp(gate, max=limit)) * clamp(up, -limit, limit)`) has no `vt::` device
+op, and the dense MLP's `ExpertGate` calls it. The arm moves when a
+`vt::ClampedSwiGLU` op is added. Arms 10-11 stay as host-fallback islands, and
+each names the debt that owns the move.
 
 **Arm 10 stays because W9c-1 is REFUSED, not because the provider is missing.**
 `kMlaPrefillAttention` and `kMlaDecodeAttention` are registered on both CUDA
@@ -3558,10 +3561,13 @@ In the specific:
    and weights, dispatch `vt::MoeCombine` on the device queue, one download of
    the combined output.
 
-7. **Dense and shared MLPs** (`glm5_next_moe.cpp:473,672`): `ResidentWeight`
-   for the three projections, `DBuf` for the activation, dispatch `vt::Matmul`
-   on the device queue. The shared MLP runs the same path as the dense MLP
-   because the only difference is which weights it reads.
+7. **Dense and shared MLPs** (`glm5_next_moe.cpp:473,672`): DEFERRED. The dense
+   MLP's `ExpertGate` calls `deepseek_v4::ClampedSwiGLU` —
+   `silu(clamp(gate, max=limit)) * clamp(up, -limit, limit)` — and no `vt::`
+   device op for clamped SwiGLU exists. The `vt::MoeSiluMul` op is plain
+   `silu(gate)*up` without clamping, so it is not a substitute. The arm stays on
+   the host until a `vt::ClampedSwiGLU` op is added. The shared MLP runs the same
+   path and is deferred for the same reason.
 
 8. **The opt-in gate** evolves. `VT_GLM5_NEXT_DEVICE_EXPERTS=1`
    (`glm5_next_forward.cpp:49-55`) currently enables the expert GEMM only.
@@ -6133,28 +6139,43 @@ Debts this row carries, each visible rather than waived:
   does NOT by itself clear the arm, and whatever run 2 returns, the top-5 and
   the MARGIN are what settle it rather than the token string.
 
+- **O55 -- THE DENSE+SHARED MLP STAYS ON THE HOST because
+  `deepseek_v4::ClampedSwiGLU` has no `vt::` device op.** The spec planned to
+  move arm 9 (dense + shared MLP) to the device in W9c-3. The implementation
+  discovered that `DenseMlpForward`'s `ExpertGate` calls
+  `deepseek_v4::ClampedSwiGLU(gate_up, intermediate, limit, alpha=1, beta=0)`,
+  which is `silu(clamp(gate, max=limit)) * clamp(up, -limit, limit)`. The
+  `vt::MoeSiluMul` op is plain `silu(gate)*up` without clamping, so it is not a
+  substitute. The arm moves when a `vt::ClampedSwiGLU` op is added. O55 owns
+  that gap.
+
 ## Now
 
-`ACTIVE`, 12 September 2026. The vLLM registration stop condition fired on
+`ACTIVE`, 14 September 2026. The vLLM registration stop condition fired on
 3 September. [Reconciliation #3045](glm5-next-upstream-reconciliation.md)
 expires the transformers algorithm exception and identifies the device-port
 source and tests. The global parity pin remains unchanged.
 
 W9c-3a (expert GEMM on device, [#2464]), W9c-2 (KDA recurrence + MoE router
-topk on device, [#3133]), and W9c-3b (KV binding device-resident, [#2480]) have
-landed. Three of eleven compute arms are on the device; the other eight run on
-the interposed CPU queue. O43 discloses that as a staged slice.
+topk on device, [#3133]), W9c-3b (KV binding device-resident, [#2480]), and
+W9c-3 (the compose forward, [#3174](https://github.com/mudler/vllm.cpp/issues/3174),
+[#3175](https://github.com/mudler/vllm.cpp/pull/3175)) have landed. Seven of
+eleven compute arms are on the device (embedding, RMSNorm, KDA recurrence, MoE
+router topk, MoE routed experts, MoE combine, lm_head); four run as host-fallback
+islands on the interposed CPU queue (k-pool indexer — CUDA-only ops, host on CPU;
+dense+shared MLP — O55; MLA attention — W9c-1; mHC sites — O34). The pattern is
+`kimi_linear_device.cpp`'s single-queue shape.
 
-The W9c-3 compose wave — `glm5_next_device.cpp` and the remaining eight arms
-— is SPEC'D ([#3174](https://github.com/mudler/vllm.cpp/issues/3174)) and
-unclaimed. It moves six arms to the device (RMSNorm, embedding gather, lm_head,
-k-pool indexer, MoE combine, dense+shared MLPs) and leaves two as host-fallback
-islands (MLA attention, owned by W9c-1; mHC sites, owned by O34). The pattern
-is `kimi_linear_device.cpp`'s single-queue shape, not `nemotron_h_device.cpp`'s
-two-queue bounce.
+The device forward is reached via `VT_GLM5_NEXT_DEVICE=1`, which delegates
+`Glm5NextHostForward` to `Glm5NextDeviceForward`. On a CPU queue the `vt::`
+kernels use float32 accumulation where the host reference uses double, so the
+output agrees within a float-vs-double envelope rather than byte-exact. The CPU
+test (device vs host, 1.0 max_abs tolerance, greedy-token agreement) passes:
+5740 assertions across 3 cases, 33/33 total.
 
-The real-model oracle gate remains `PENDING` under #1998. No new model run or
-performance result is established by this documentation change.
+The real-model oracle gate remains `PENDING` under #1998. No GPU gate has been
+run; the device forward has been tested on CPU only. The GPU gate on `dgx:gpu0`
+(`sm_121a`) and `strix:gpu0` (gfx1151) is owed.
 
 ### Status before the upstream reconciliation
 

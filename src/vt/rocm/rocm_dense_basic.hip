@@ -461,6 +461,36 @@ void CastF16KernelRocm(Queue& q, Tensor& out, const Tensor& in) {
   Check(hipGetLastError(), "cast_f16");
 }
 
+// T25: Permute V-heads from grouped (k*rpk+r) to tiled (r*num_k+k) order.
+__global__ void PermuteVHeadsK(__hip_bfloat16* out, const __hip_bfloat16* in,
+                               int num_k, int rpk, int dv,
+                               int64_t value_dim) {
+  const int64_t row = static_cast<int64_t>(blockIdx.y);
+  const int idx = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) +
+                  static_cast<int>(threadIdx.x);
+  if (idx >= value_dim) return;
+  const int t = idx / dv;   // tiled head index
+  const int h = idx % dv;   // offset within head
+  const int r = t / num_k;
+  const int k = t % num_k;
+  const int g = k * rpk + r;  // grouped head index
+  out[row * value_dim + static_cast<int64_t>(t) * dv + h] =
+      in[row * value_dim + static_cast<int64_t>(g) * dv + h];
+}
+
+void PermuteVHeadsKernelRocm(Queue& q, Tensor& out, const Tensor& in,
+                             int64_t T, int64_t num_k, int64_t rpk, int64_t dv) {
+  const int64_t value_dim = num_k * rpk * dv;
+  const int threads = 128;
+  const int blocks_x = static_cast<int>((value_dim + threads - 1) / threads);
+  dim3 grid(blocks_x, static_cast<unsigned>(T));
+  PermuteVHeadsK<<<grid, threads, 0, AsStream(q)>>>(
+      out.Ptr<__hip_bfloat16>(), in.Ptr<__hip_bfloat16>(),
+      static_cast<int>(num_k), static_cast<int>(rpk), static_cast<int>(dv),
+      value_dim);
+  Check(hipGetLastError(), "permute_v_heads");
+}
+
 // ---------------- QkvSplit ----------------
 template <typename T>
 __global__ void QkvSplitK(T* q_out, T* k_out, T* v_out, const T* qkv, int64_t t, int64_t q_dim,

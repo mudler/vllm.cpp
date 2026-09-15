@@ -80,6 +80,52 @@ __global__ void RmsNormGatedK(Tout* out, const Tx* x, const Tx* gate,
   }
 }
 
+// The donor kernel runs ONE THREAD PER ROW (`<<<rows, 1>>>`): each row walks
+// d twice serially — 24 launches/tok x 17.25us = 0.414 ms/tok of pure
+// single-thread latency. This arm gives each row a whole 256-thread block:
+// strided-per-thread sumsq with a wavefront-shfl reduction (width from
+// warpSize), then a strided gated store. The float association CHANGES
+// (opt-in flag, adjudication owed like its T6/T8 siblings); no quant
+// contract exists on this op.
+template <typename Tx, typename Tout>
+__global__ void RmsNormGatedCoopK(Tout* out, const Tx* x, const Tx* gate,
+                                  const Tx* w, int64_t rows, int64_t d,
+                                  int64_t gate_group, int64_t gate_outer, float eps,
+                                  bool sigmoid_gate) {
+  const int64_t i = blockIdx.x;  // one row per block
+  if (i >= rows) return;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int waveSz = warpSize;
+  __shared__ float partial[256 / 32];  // sized for the narrowest wavefront
+  const Tx* xrow = x + i * d;
+  // Pass 1: strided-per-thread sumsq — lanes touch consecutive addresses,
+  // which IS the coalesced pattern for a streaming pass.
+  float acc = 0.0f;
+  for (int64_t j = tid; j < d; j += 256) {
+    const float v = Ld(xrow, j);
+    acc += v * v;
+  }
+  for (int off = waveSz / 2; off > 0; off >>= 1)
+    acc += __shfl_down_sync(0xffffffffULL, acc, off);
+  if (tid % waveSz == 0) partial[tid / waveSz] = acc;
+  __syncthreads();
+  if (tid == 0) {
+    float t = 0.0f;
+    const int nw = 256 / waveSz;
+    for (int wv = 0; wv < nw; ++wv) t += partial[wv];
+    partial[0] = t;
+  }
+  __syncthreads();
+  const float inv = 1.0f / sqrtf(partial[0] / static_cast<float>(d) + eps);
+  // Pass 2: gated scaled store, same strided pattern.
+  const int64_t gbase = (i / gate_group) * gate_outer + (i % gate_group) * d;
+  for (int64_t j = tid; j < d; j += 256) {
+    const float z = Ld(gate, gbase + j);
+    const float act = sigmoid_gate ? Sigmoid(z) : Silu(z);
+    St(out, i * d + j, Ld(xrow, j) * inv * Ld(w, j) * act);
+  }
+}
+
 // ops.cpp contract: out bf16, attn f32-or-bf16, gate f32 (unrounded sigmoid
 // input). Tattn only.
 template <typename Tattn>
@@ -169,7 +215,6 @@ __global__ void AttnQkNormRopeGateK(Tqk* q_out, Tqk* k_out, Tgate* gate_out,
 }
 
 }  // namespace
-
 void RmsNormGatedKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
                             const Tensor& w, const RmsNormGatedArgs& args) {
   VT_CHECK(x.dtype == DType::kF32 || x.dtype == DType::kBF16,
@@ -183,6 +228,37 @@ void RmsNormGatedKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor
   const int64_t gate_outer = gate.stride[0];
   hipStream_t s = AsStream(q);
   const unsigned grid = static_cast<unsigned>(t);
+  // T9 opt-in arm (read PER CALL like the sibling flags): one block per
+  // row, cooperative reduction. Default OFF keeps the donor kernel.
+  const char* coop_e = std::getenv("VT_GDN_NORMGATED_COOP");
+  const bool coop = coop_e != nullptr && coop_e[0] == '1' && coop_e[1] == '\0';
+  if (coop) {
+    if (x.dtype == DType::kF32) {
+      if (out.dtype == DType::kF32) {
+        RmsNormGatedCoopK<float, float><<<grid, 256, 0, s>>>(
+            out.Ptr<float>(), x.Ptr<float>(), gate.Ptr<float>(), w.Ptr<float>(), t, d,
+            gate_group, gate_outer, args.eps, args.sigmoid_gate);
+      } else {
+        RmsNormGatedCoopK<float, __hip_bfloat16><<<grid, 256, 0, s>>>(
+            out.Ptr<__hip_bfloat16>(), x.Ptr<float>(), gate.Ptr<float>(), w.Ptr<float>(),
+            t, d, gate_group, gate_outer, args.eps, args.sigmoid_gate);
+      }
+    } else {
+      if (out.dtype == DType::kF32) {
+        RmsNormGatedCoopK<__hip_bfloat16, float><<<grid, 256, 0, s>>>(
+            out.Ptr<float>(), x.Ptr<__hip_bfloat16>(), gate.Ptr<__hip_bfloat16>(),
+            w.Ptr<__hip_bfloat16>(), t, d, gate_group, gate_outer, args.eps,
+            args.sigmoid_gate);
+      } else {
+        RmsNormGatedCoopK<__hip_bfloat16, __hip_bfloat16><<<grid, 256, 0, s>>>(
+            out.Ptr<__hip_bfloat16>(), x.Ptr<__hip_bfloat16>(), gate.Ptr<__hip_bfloat16>(),
+            w.Ptr<__hip_bfloat16>(), t, d, gate_group, gate_outer, args.eps,
+            args.sigmoid_gate);
+      }
+    }
+    Check(hipGetLastError(), "rmsnorm_gated coop launch");
+    return;
+  }
   if (x.dtype == DType::kF32) {
     if (out.dtype == DType::kF32) {
       RmsNormGatedK<float, float><<<grid, 1, 0, s>>>(

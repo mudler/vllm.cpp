@@ -21,9 +21,10 @@
 //   (2) DSA/MLA attention — Attention() is a monolithic host function. The
 //       k-pool indexer ops (kGlm5NextKpoolCompress/Select) are CUDA-only, so on
 //       a CPU queue the indexer stays on host too.
-//   (3) Dense+shared MLP — DenseMlpForward uses deepseek_v4::ClampedSwiGLU,
-//       and no vt::ClampedSwiGLU device op exists. The dense MLP stays on host
-//       until one is added.
+//   (3) Dense+shared MLP — NOW ON DEVICE via vt::ClampedSwiGLU + vt::MatmulBT.
+//       The gate/up projections are stacked into one [2I,H] weight so a single
+//       MatmulBT produces the fused [T, 2I] gate|up buffer that ClampedSwiGLU
+//       consumes. Previously a host island (issue #3201).
 //
 // On a CPU queue the vt:: kernels use float32 accumulation where the host
 // reference uses double, so the output agrees within a float-vs-double envelope
@@ -93,6 +94,37 @@ void DeviceRmsNorm(const Dev& d, float* out, const float* in,
   dout.Download(d, out);
 }
 
+// Dense MLP on device: stack gate_proj [I,H] + up_proj [I,H] into [2I,H],
+// one MatmulBT produces the fused gate|up [T, 2I], ClampedSwiGLU applies the
+// clamped-silu activation, then MatmulBT with down_proj [H,I] produces [T, H].
+// The stacking is required because vt::MatmulBT demands a contiguous output
+// tensor, so two separate gate/up calls cannot share a [T, 2I] buffer.
+std::vector<float> DeviceDenseMlpForward(
+    const Dev& d, const DenseMlpWeights& w,
+    const std::vector<float>& normed,
+    int64_t H, int64_t I, int64_t T, float limit) {
+  std::vector<float> stacked(static_cast<size_t>(2 * I * H));
+  std::copy(w.gate_proj.begin(), w.gate_proj.end(), stacked.begin());
+  std::copy(w.up_proj.begin(), w.up_proj.end(),
+            stacked.begin() + static_cast<size_t>(I * H));
+
+  DBuf dh(d, DType::kF32, {T, H}, normed.data());
+  Tensor sw = WF32(d, stacked, {2 * I, H});
+  DBuf dgu(d, DType::kF32, {T, 2 * I});
+  vt::MatmulBT(d.q, dgu.t(), dh.t(), sw);
+
+  DBuf da(d, DType::kF32, {T, I});
+  vt::ClampedSwiGLU(d.q, da.t(), dgu.t(), limit);
+
+  Tensor dw = WF32(d, w.down_proj, {H, I});
+  DBuf dout(d, DType::kF32, {T, H});
+  vt::MatmulBT(d.q, dout.t(), da.t(), dw);
+
+  std::vector<float> out(static_cast<size_t>(T * H));
+  dout.Download(d, out.data());
+  return out;
+}
+
 }  // namespace
 
 std::vector<float> Glm5NextDeviceForward(
@@ -106,7 +138,9 @@ std::vector<float> Glm5NextDeviceForward(
   const int64_t hc = p.mhc.mult;
   const int64_t L = p.num_hidden_layers;
   const float eps = static_cast<float>(p.rms_norm_eps);
-  (void)lm_head_chunk_bytes;  // reserved for production chunking; unused in the compose forward
+  if (lm_head_chunk_bytes <= 0)
+    Fail("lm_head_chunk_bytes must be > 0, got " +
+         std::to_string(lm_head_chunk_bytes));
 
   if (T <= 0) Fail("the step carries no tokens");
   if (H <= 0 || V <= 0) Fail("hidden_size or vocab_size is 0");
@@ -116,8 +150,8 @@ std::vector<float> Glm5NextDeviceForward(
   // memory; on CUDA it uploads/downloads. Reached via VT_GLM5_NEXT_DEVICE=1.
   Dev d{vt::GetBackend(queue.device), queue};
 
-  // A CPU host queue for the host-fallback islands (mHC, DSA attention, dense
-  // MLP). When the caller's queue is already CPU, reuse it.
+  // A CPU host queue for the host-fallback islands (mHC, DSA attention).
+  // When the caller's queue is already CPU, reuse it.
   vt::Queue host_queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
   vt::Queue& hq = queue.device.type == vt::DeviceType::kCPU ? queue : host_queue;
 
@@ -154,8 +188,8 @@ std::vector<float> Glm5NextDeviceForward(
 
   // ── the layer loop ──────────────────────────────────────────────────────────
   // Mirrors DecoderLayerForward but swaps the host double-acc RmsNorm for the
-  // device float-acc vt::RmsNorm. The mHC sites, DSA attention, and dense MLP
-  // stay on host as islands.
+  // device float-acc vt::RmsNorm. The mHC sites and DSA attention stay on host
+  // as islands.
   std::vector<int32_t> topk;
   int64_t topk_width = 0;
 
@@ -253,11 +287,12 @@ std::vector<float> Glm5NextDeviceForward(
     DeviceRmsNorm(d, normed.data(), collapsed.data(),
                   w.post_attention_layernorm, T, H, eps);
 
-    // ── MLP — HOST ISLAND (dense) / device arm (MoE) ────────────────────
+    // ── MLP — device arm (dense via ClampedSwiGLU) / device arm (MoE) ───
     std::vector<float> mlp_out;
     if (w.mlp_kind == Glm5NextMlpKind::kDense) {
-      mlp_out = DenseMlpForward(w.dense_mlp, normed, H, p.intermediate_size,
-                                T, static_cast<float>(p.swiglu_limit));
+      mlp_out = DeviceDenseMlpForward(d, w.dense_mlp, normed, H,
+                                     p.intermediate_size, T,
+                                     static_cast<float>(p.swiglu_limit));
     } else {
       mlp_out = MoeForward(MoeDimsFrom(p), w.moe, normed, T, hq, &d);
     }

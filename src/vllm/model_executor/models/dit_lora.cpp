@@ -1,9 +1,10 @@
-// LTX-2.5 IC-LoRA adapter reading and fusion. See ltx2_lora.h for the upstream
-// anchors, the dtype argument, and the two deliberate divergences.
+// DiT LoRA adapter reading and fusion. See dit_lora.h for the upstream anchors,
+// the dtype argument, and the two deliberate divergences.
 //
-// A separate translation unit from `ltx2_loader.cpp` for the reason that file's
-// siblings already record: `ltx2_loader.cpp` is 1500 lines that several rows
-// edit concurrently, and a new family does not need to lock it.
+// Generalized from ltx2_lora.cpp (row ROAD-V1-DIT-LORA). The fusion arithmetic,
+// adapter loading, spec parsing, and metadata factor reading are generic. Only
+// the contract name rewrite is model-specific, and it is injected via the
+// `prefixes` parameter.
 //
 // The `(B * strength) @ A` product is `vt::Matmul`, the shared row-major GEMM
 // seam, and NOT a loop in this file (LTX25-LORA-FUSE-SEAM, #1202). The seam
@@ -11,7 +12,7 @@
 // note argues for is byte-identical either way, and the row's gate asserts that
 // as byte equality — it changes only who executes it. The reason is written
 // beside the call.
-#include "vllm/model_executor/models/ltx2_lora.h"
+#include "vllm/model_executor/models/dit_lora.h"
 
 #include <algorithm>
 #include <cstring>
@@ -29,7 +30,7 @@ namespace vllm {
 namespace {
 
 [[noreturn]] void Fail(const std::string& what) {
-  throw std::runtime_error("ltx2 lora: " + what);
+  throw std::runtime_error("dit lora: " + what);
 }
 
 std::string ShapeText(const std::vector<int64_t>& shape) {
@@ -40,8 +41,6 @@ std::string ShapeText(const std::vector<int64_t>& shape) {
   return out + "]";
 }
 
-// LTXV_LORA_COMFY_RENAMING_MAP is a single prefix strip (`sd_ops.py:136`).
-constexpr const char* kComfyPrefix = "diffusion_model.";
 constexpr const char* kLoraASuffix = ".lora_A.weight";
 constexpr const char* kLoraBSuffix = ".lora_B.weight";
 
@@ -101,10 +100,24 @@ std::vector<uint16_t> ReadFactorAsBf16(const std::string& key, const StTensor& t
        ", which this reader does not read. LoRA factors are BF16 or F32.");
 }
 
+// Strip the first matching prefix from `module`. A prefix matches when
+// `module` starts with it. Returns true when a prefix was stripped.
+bool StripPrefix(std::string& module, const std::vector<std::string>& prefixes) {
+  for (const std::string& prefix : prefixes) {
+    const size_t plen = prefix.size();
+    if (module.size() > plen && module.compare(0, plen, prefix) == 0) {
+      module = module.substr(plen);
+      return true;
+    }
+  }
+  return false;
+}
+
 }  // namespace
 
-bool Ltx2LoraContractName(const std::string& key, std::string* out_target,
-                          bool* out_is_a) {
+bool DitLoraContractName(const std::string& key,
+                          const std::vector<std::string>& prefixes,
+                          std::string* out_target, bool* out_is_a) {
   bool is_a = false;
   const char* suffix = nullptr;
   if (HasSuffix(key, kLoraASuffix)) {
@@ -116,20 +129,18 @@ bool Ltx2LoraContractName(const std::string& key, std::string* out_target,
     return false;
   }
   std::string module = key.substr(0, key.size() - std::strlen(suffix));
-  // LTXV_LORA_COMFY_RENAMING_MAP: strip `diffusion_model.` when present
-  // (`sd_ops.py:136`). The DiT contract's own names are already stripped of
-  // `model.diffusion_model.` by the loader's plan, so the two meet.
-  const size_t plen = std::strlen(kComfyPrefix);
-  if (module.size() > plen && module.compare(0, plen, kComfyPrefix) == 0) {
-    module = module.substr(plen);
-  }
+  // Strip any model-specific ComfyUI prefix. LTXV_LORA_COMFY_RENAMING_MAP
+  // strips `diffusion_model.` (sd_ops.py:136); H3 adapters carry
+  // `model.diffusion_model.`. The DiT contract's own names are already stripped
+  // by the loader's plan, so the two meet.
+  StripPrefix(module, prefixes);
   if (module.empty()) return false;
   if (out_target != nullptr) *out_target = module + ".weight";
   if (out_is_a != nullptr) *out_is_a = is_a;
   return true;
 }
 
-int64_t Ltx2ReadLoraMetadataFactor(const std::map<std::string, std::string>& metadata,
+int64_t DitReadLoraMetadataFactor(const std::map<std::string, std::string>& metadata,
                                    const std::string& key, const std::string& path) {
   const auto it = metadata.find(key);
   // Absent is 1, which is upstream's default (`iclora_utils.py:35, 46`).
@@ -151,12 +162,13 @@ int64_t Ltx2ReadLoraMetadataFactor(const std::map<std::string, std::string>& met
   return static_cast<int64_t>(value);
 }
 
-Ltx2LoraAdapter Ltx2LoraAdapter::Open(const Ltx2LoraSpec& spec,
-                                      const std::vector<std::string>& contract) {
+DitLoraAdapter DitLoraAdapter::Open(const DitLoraSpec& spec,
+                                     const std::vector<std::string>& contract,
+                                     const std::vector<std::string>& prefixes) {
   if (spec.path.empty()) Fail("an adapter path is empty");
   const std::set<std::string> known(contract.begin(), contract.end());
 
-  Ltx2LoraAdapter out;
+  DitLoraAdapter out;
   out.path_ = spec.path;
   out.strength_ = spec.strength;
 
@@ -176,7 +188,7 @@ Ltx2LoraAdapter Ltx2LoraAdapter::Open(const Ltx2LoraSpec& spec,
   for (const std::string& key : file.Names()) {
     std::string target;
     bool is_a = false;
-    if (!Ltx2LoraContractName(key, &target, &is_a)) continue;
+    if (!DitLoraContractName(key, prefixes, &target, &is_a)) continue;
     auto& side = is_a ? a_of : b_of;
     if (side.count(target) != 0) {
       Fail("'" + spec.path + "' carries two " + std::string(is_a ? "A" : "B") +
@@ -201,7 +213,7 @@ Ltx2LoraAdapter Ltx2LoraAdapter::Open(const Ltx2LoraSpec& spec,
            "' with no matching B factor");
     }
     if (known.count(target) == 0) {
-      // The divergence argued in ltx2_lora.h and the row's spec §4.1: upstream
+      // The divergence argued in dit_lora.h and the row's spec §4.1: upstream
       // skips (`fuse_loras.py:135-137`), this refuses.
       Fail("'" + spec.path + "' targets '" + target +
            "', which the DiT contract does not bind. Upstream would SKIP this key "
@@ -213,7 +225,7 @@ Ltx2LoraAdapter Ltx2LoraAdapter::Open(const Ltx2LoraSpec& spec,
     const StTensor& a = *kv.second;
     const StTensor& b = *b_it->second;
 
-    Ltx2LoraFactorPair pair;
+    DitLoraFactorPair pair;
     pair.target = target;
     // A is [rank, in], B is [out, rank] (`fuse_loras.py:196-198` pairs them for
     // a [out, in] weight).
@@ -238,16 +250,16 @@ Ltx2LoraAdapter Ltx2LoraAdapter::Open(const Ltx2LoraSpec& spec,
   return out;
 }
 
-const Ltx2LoraFactorPair* Ltx2LoraAdapter::Find(const std::string& name) const {
-  for (const Ltx2LoraFactorPair& p : pairs_) {
+const DitLoraFactorPair* DitLoraAdapter::Find(const std::string& name) const {
+  for (const DitLoraFactorPair& p : pairs_) {
     if (p.target == name) return &p;
   }
   return nullptr;
 }
 
-Ltx2LoraReferenceFactors Ltx2ResolveLoraReferenceFactors(
-    const std::vector<Ltx2LoraAdapter>& adapters) {
-  Ltx2LoraReferenceFactors out;
+DitLoraReferenceFactors DitResolveLoraReferenceFactors(
+    const std::vector<DitLoraAdapter>& adapters) {
+  DitLoraReferenceFactors out;
   if (adapters.empty()) return out;
   // ic_lora.py:150-173, over the WHOLE list. Row LTX25-LORA-FUSION lifted the
   // arity cap that used to refuse a second adapter here, so both conflict
@@ -256,9 +268,9 @@ Ltx2LoraReferenceFactors Ltx2ResolveLoraReferenceFactors(
   // `dubit.py:364-365` and `hdr_ic_lora.py:271-272` still take exactly one
   // adapter each; that is a property of those two PIPELINE ENTRY POINTS, not of
   // the fuser, and `--lora` has always been repeatable (`utils/args.py:600-611`).
-  for (const Ltx2LoraAdapter& lora : adapters) {
+  for (const DitLoraAdapter& lora : adapters) {
     const int64_t scale =
-        Ltx2ReadLoraMetadataFactor(lora.metadata(), "reference_downscale_factor", lora.path());
+        DitReadLoraMetadataFactor(lora.metadata(), "reference_downscale_factor", lora.path());
     if (scale != 1) {
       if (out.downscale != 1 && out.downscale != scale) {
         Fail("conflicting reference_downscale_factor values in LoRAs: already have " +
@@ -267,7 +279,7 @@ Ltx2LoraReferenceFactors Ltx2ResolveLoraReferenceFactors(
       }
       out.downscale = scale;
     }
-    const int64_t temporal = Ltx2ReadLoraMetadataFactor(
+    const int64_t temporal = DitReadLoraMetadataFactor(
         lora.metadata(), "reference_temporal_scale_factor", lora.path());
     if (temporal != 1) {
       if (out.temporal != 1 && out.temporal != temporal) {
@@ -282,19 +294,19 @@ Ltx2LoraReferenceFactors Ltx2ResolveLoraReferenceFactors(
   return out;
 }
 
-bool Ltx2FuseLoraIntoTensor(const std::vector<Ltx2LoraAdapter>& adapters,
+bool DitFuseLoraIntoTensor(const std::vector<DitLoraAdapter>& adapters,
                             const std::string& target, vt::DType dtype, int64_t rows,
                             int64_t cols, uint8_t* buffer, size_t buffer_bytes) {
   if (adapters.empty()) return false;
 
-  // The aggregator. BF16 BY DECLARATION — see the dtype note in ltx2_lora.h.
+  // The aggregator. BF16 BY DECLARATION — see the dtype note in dit_lora.h.
   // `has_delta` rather than an empty vector, because a delta of exactly zero is
   // a legitimate (if useless) adapter and must still count as fused.
   std::vector<uint16_t> agg;
   bool has_delta = false;
 
-  for (const Ltx2LoraAdapter& lora : adapters) {
-    const Ltx2LoraFactorPair* pair = lora.Find(target);
+  for (const DitLoraAdapter& lora : adapters) {
+    const DitLoraFactorPair* pair = lora.Find(target);
     if (pair == nullptr) continue;
     if (pair->out_features != rows || pair->in_features != cols) {
       Fail("'" + lora.path() + "' targets '" + target + "' with a [" +
@@ -331,7 +343,7 @@ bool Ltx2FuseLoraIntoTensor(const std::vector<Ltx2LoraAdapter>& adapters,
       //
       // IT COSTS ONE TRANSIENT f32 BUFFER of the target's shape, live only
       // while this adapter folds in and only on a tensor a previous adapter
-      // already touched. `ltx2_loader.h`'s "one host buffer live at a time"
+      // already touched. The loader's "one host buffer live at a time"
       // invariant is about the DEVICE copy and is unaffected; the peak here is
       // the bf16 aggregator plus this, freed before the next target.
       if (pair->rank > 0 && !agg.empty()) {
@@ -381,7 +393,7 @@ bool Ltx2FuseLoraIntoTensor(const std::vector<Ltx2LoraAdapter>& adapters,
     // therefore the wrong member of the pair here, notwithstanding that it is
     // the one the sibling text-tower row took.)
     //
-    // The guard is not reachable through `Ltx2LoraAdapter::Open`, which is the
+    // The guard is not reachable through `DitLoraAdapter::Open`, which is the
     // only way a pair is built: `ReadFactorAsBf16` refuses an empty factor, and
     // A is [rank, in], so `rank == 0` is already a refusal by the time anything
     // gets here — as is a zero-sized target, whose `agg` would be empty. It is
@@ -437,8 +449,7 @@ bool Ltx2FuseLoraIntoTensor(const std::vector<Ltx2LoraAdapter>& adapters,
     return true;
   }
   Fail("'" + target + "' materialized as a dtype this fuser does not write. FP8 and NVFP4 "
-       "never reach here: MaterializeDitTensor dequantizes both to BF16 before returning "
-       "(ltx2_loader.cpp, the F8_E4M3 and U8 branches both `return vt::DType::kBF16`).");
+       "never reach here: the materializer dequantizes both to BF16 before returning.");
 }
 
 }  // namespace vllm

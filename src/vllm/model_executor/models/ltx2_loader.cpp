@@ -563,7 +563,7 @@ std::vector<Ltx2LoraAdapter> OpenDitLoras(const Ltx2DitLoadOptions& options,
   std::vector<Ltx2LoraAdapter> out;
   out.reserve(options.loras.size());
   for (const Ltx2LoraSpec& spec : options.loras) {
-    out.push_back(Ltx2LoraAdapter::Open(spec, names));
+    out.push_back(DitLoraAdapter::Open(spec, names, {"diffusion_model."}));
   }
   // The caller resolves the reference factors immediately, and that call is what
   // refuses conflicting metadata across the adapters — before any tensor is
@@ -579,7 +579,7 @@ bool FuseLorasInto(const std::vector<Ltx2LoraAdapter>& loras, const Ltx2TensorSp
   // refused a pair naming a name outside the contract, so this is a shape
   // filter rather than a silent skip of a possible target.
   if (spec.shape.size() != 2) return false;
-  return Ltx2FuseLoraIntoTensor(loras, spec.name, dtype, spec.shape[0], spec.shape[1],
+  return DitFuseLoraIntoTensor(loras, spec.name, dtype, spec.shape[0], spec.shape[1],
                                 buffer.data(), buffer.size());
 }
 
@@ -716,7 +716,7 @@ Ltx2DitCheckpoint Ltx2LoadDitFromSafetensors(const SafetensorsFile& file,
   }
 
   const std::vector<Ltx2LoraAdapter> loras = OpenDitLoras(options, contract);
-  out.lora_reference = Ltx2ResolveLoraReferenceFactors(loras);
+  out.lora_reference = DitResolveLoraReferenceFactors(loras);
   int64_t fused = 0;
   for (const Ltx2TensorSpec& spec : contract) {
     auto buffer = std::make_shared<Ltx2HostBuffer>();
@@ -777,7 +777,7 @@ Ltx2DitCheckpoint Ltx2StreamDitToDevice(vt::Queue& queue, const SafetensorsFile&
   }
 
   const std::vector<Ltx2LoraAdapter> loras = OpenDitLoras(options, contract);
-  out.lora_reference = Ltx2ResolveLoraReferenceFactors(loras);
+  out.lora_reference = DitResolveLoraReferenceFactors(loras);
   int64_t fused = 0;
   vt::Backend& backend = vt::GetBackend(queue.device.type);
   for (const Ltx2TensorSpec& spec : contract) {

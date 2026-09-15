@@ -1001,10 +1001,10 @@ add_library(vllm STATIC
   # FP8 and torchao-NVFP4 DiT arms, the torchao-NVFP4 text encoder, and the
   # load-time device staging GB10's ATS penalty makes the default.
   src/vllm/model_executor/models/ltx2_loader.cpp
-  # LTX-2.5 (ROW LTX25-IC-LORA, issue #923): reading an IC-LoRA adapter and its
-  # `__metadata__`, and the bf16 delta the loader fuses into every arm. Its own
-  # TU for the same reason as the two above.
-  src/vllm/model_executor/models/ltx2_lora.cpp
+  # DiT LoRA (ROW ROAD-V1-DIT-LORA): the shared load-time-fusion seam for
+  # diffusion transformers. Generalized from the LTX-2.5 implementation so both
+  # LTX-2.5 and MiniMax-H3 use it. Its own TU to avoid locking the loader.
+  src/vllm/model_executor/models/dit_lora.cpp
   src/vllm/entrypoints/openai/video_api.cpp
   src/vllm/entrypoints/openai/speech_api.cpp
   src/vllm/entrypoints/openai/speech_api_synthesize.cpp

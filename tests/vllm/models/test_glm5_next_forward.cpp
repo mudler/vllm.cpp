@@ -72,6 +72,7 @@
 #include "support/glm5_next_gguf_fixture.h"
 #include "support/glm5_next_forward_fixture.h"
 #include "vllm/model_executor/models/glm5_next_bridge.h"
+#include "vllm/model_executor/models/glm5_next_device.h"  // W9c-3
 #include "vllm/model_executor/models/glm5_next_forward.h"
 #include "vllm/model_executor/models/glm5_next_kv.h"  // W9c-3b (#2480)
 #include "vllm/model_executor/models/glm5_next_layer.h"
@@ -1727,4 +1728,56 @@ TEST_CASE("glm5_next: a published device buffer over an EMPTY step is refused by
   CHECK_THROWS_WITH_AS(vllm::ModelRegistry::Forward(*model, in),
                        doctest::Contains("disagree about the step's shape"),
                        std::runtime_error);
+}
+
+// ═══ (8) W9c-3 — the device compose forward ═══════════════════════════════
+//
+// `Glm5NextDeviceForward` routes the nine device-capable arms through `vt::*`
+// device ops on the queue, with MLA attention and mHC sites as host-fallback
+// islands (the `kimi_linear_device.cpp` single-queue pattern). On a CPU queue
+// the `vt::*` kernels use float32 accumulation where the host reference uses
+// double, so the output agrees within a float-vs-double envelope rather than
+// byte-exact. On a GPU the device kernels match upstream PyTorch's float32
+// numerics and the gate tightens to NMSE < 1e-10 (spec W9c-3 gates).
+
+TEST_CASE("glm5_next W9c-3 device: the device forward matches the host reference") {
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
+  REQUIRE(model != nullptr);
+  const vllm::Glm5NextWeights& w = Weights(model);
+
+  const std::vector<int32_t> ids{3, 11, 7, 20};
+  vt::Queue q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+
+  // The host reference — the correctness truth.
+  const std::vector<float> host = gn::Glm5NextHostForward(w, ids, {}, q, nullptr);
+
+  // The device forward. On CPU this exercises the vt::* kernel path (float32
+  // accumulation); on GPU it runs the full device compose. The stub throws
+  // "not implemented yet" until W9c-3 grows the implementation.
+  const std::vector<float> dev = gn::Glm5NextDeviceForward(w, ids, {}, q, nullptr);
+
+  REQUIRE(dev.size() == host.size());
+  const Gap gap = MaxGap(dev, host);
+  CHECK(gap.nonfinite == 0);
+  // CPU: vt::* kernels use float32 acc where the host uses double. The
+  // tolerance accommodates the accumulation-order divergence; on GPU the
+  // gate tightens to NMSE < 1e-10 (spec W9c-3).
+  CHECK(gap.max_abs < 1.0);
+
+  // The greedy token (argmax over each row) must agree: a forward that
+  // produced finite but wrong logits would pass the tolerance and fail here.
+  const int64_t V = static_cast<int64_t>(kVocab);
+  const int64_t rows = static_cast<int64_t>(host.size()) / V;
+  REQUIRE(rows * V == static_cast<int64_t>(host.size()));
+  for (int64_t r = 0; r < rows; ++r) {
+    int32_t best_dev = 0, best_host = 0;
+    for (int64_t o = 1; o < V; ++o) {
+      const size_t idx = static_cast<size_t>(r * V + o);
+      if (dev[idx] > dev[static_cast<size_t>(r * V + best_dev)]) best_dev = static_cast<int32_t>(o);
+      if (host[idx] > host[static_cast<size_t>(r * V + best_host)]) best_host = static_cast<int32_t>(o);
+    }
+    CHECK(best_dev == best_host);
+  }
 }

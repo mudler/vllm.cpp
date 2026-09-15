@@ -17,12 +17,43 @@
 #ifndef VLLM_MODEL_EXECUTOR_MODELS_GLM5_NEXT_DEVICE_H_
 #define VLLM_MODEL_EXECUTOR_MODELS_GLM5_NEXT_DEVICE_H_
 
+#include <cstdint>
+#include <vector>
+
+#include "vt/ops.h"  // vt::Queue
+
+namespace vllm {
+struct Glm5NextWeights;  // defined in glm5_next_loader.h (vllm, not vllm::glm5_next)
+}  // namespace vllm
+
 namespace vllm::glm5_next {
+
+struct LayerCache;
 
 // True iff BOTH k-pool ops have a CUDA provider. Both, because the family is
 // only useful as a pair: the compress op publishes the compacted pool count the
 // select op reads, so half a family is not a usable half of the capability.
 bool KpoolDeviceOpsAvailable();
+
+// W9c-3 — the device-resident compose forward. Mirrors `Glm5NextHostForward`'s
+// signature but routes the nine device-capable arms through `vt::*` device ops
+// on the queue, with MLA attention and mHC sites as host-fallback islands (the
+// kimi_linear_device.cpp single-queue pattern). Reached when
+// `VT_GLM5_NEXT_DEVICE=1`.
+//
+// On a CPU queue the `vt::*` kernels use float32 accumulation where the host
+// reference uses double, so the output agrees within a float-vs-double envelope
+// rather than byte-exact. On a GPU the device kernels match upstream PyTorch's
+// float32 numerics.
+//
+// `caches` is null for a one-shot forward, or exactly `num_hidden_layers`
+// layer states carried across steps — the same contract as
+// `Glm5NextHostForward`.
+std::vector<float> Glm5NextDeviceForward(
+    const Glm5NextWeights& weights, const std::vector<int32_t>& token_ids,
+    const std::vector<int32_t>& logits_indices, vt::Queue& queue,
+    std::vector<LayerCache>* caches,
+    int64_t lm_head_chunk_bytes = int64_t{64} << 20);
 
 }  // namespace vllm::glm5_next
 

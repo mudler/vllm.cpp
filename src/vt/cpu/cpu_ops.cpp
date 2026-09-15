@@ -1480,6 +1480,14 @@ void RopeCosSinCacheKernel(Queue&, Tensor& cos_sin, const Tensor& positions, con
     const int64_t p =
         positions.dtype == DType::kI32 ? positions.Ptr<int32_t>()[i] : positions.Ptr<int64_t>()[i];
     for (int64_t pair = 0; pair < half; ++pair) {
+      if (args.linear_scaling_factor > 0.f) {
+        const float exponent = static_cast<float>(2 * pair) / static_cast<float>(rot);
+        const float inv = 1.f / std::pow(args.base, exponent);
+        const float angle = (static_cast<float>(p) / args.linear_scaling_factor) * inv;
+        StoreF32(cos_sin, i * rot + pair, std::cos(angle));
+        StoreF32(cos_sin, i * rot + half + pair, std::sin(angle));
+        continue;
+      }
       double freq = std::pow(base, -2.0 * static_cast<double>(pair) / static_cast<double>(rot));
       freq = Llama3ScaleFreq(freq, args);
       const double angle = static_cast<double>(p) * freq;

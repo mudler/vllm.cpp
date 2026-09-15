@@ -173,7 +173,7 @@ speed-pending, which [BENCHMARKS.md](BENCHMARKS.md) tracks.
 | `Phi3ForCausalLM` | microsoft/phi-4 (14B), Phi-3 | strict 16/16 vs vLLM 0.25.0 | pending |
 | `GemmaForCausalLM` | google/gemma-1.1-2b-it, unsloth/gemma-2b | near-tie 48/48 vs vLLM 0.25.0 | pending |
 | `Gemma2ForCausalLM` | google/gemma-2-2b-it | near-tie 48/48 vs vLLM 0.25.0 | pending |
-| `Gemma3ForCausalLM` | google/gemma-3-1b-it | strict 48/48 vs vLLM 0.25.0 | pending |
+| `Gemma3ForCausalLM` | google/gemma-3-1b-it; BF16 Gemma 3 4B text export with linear RoPE | 1B: strict 48/48 reconfirmed at vLLM e126687a9a; 4B: default gfx1100 WMMA and scalar prefill pass the original 96-token and expanded 256-token gates at cache blocks 16 and 32; eligible decode uses HIP graphs ([evidence](bench-evidence/rocm-rdna3-attention-wmma/README.md)) | pending |
 | `Gemma4ForConditionalGeneration` | Gemma-4 multimodal (unsloth/gemma-4-E4B-it) | text strict, image mm near-tie; audio pending | pending |
 | `Gemma4UnifiedForConditionalGeneration` | Gemma-4 "unified" HF export (google/gemma-4-12B-it), no-PLE dense layout | shares the Gemma-4 text+mm forward; loads on the same factory (contributor #140); no separate oracle gate for this arch name yet | pending |
 | `GraniteForCausalLM` | ibm-granite/granite-3.3-2b-instruct | near-tie 16/16 vs vLLM 0.25.0 | pending |

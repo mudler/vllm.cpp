@@ -2155,6 +2155,8 @@ vllm_cpp_add_test(test_chunked_local_attention
   vllm/v1/attention/test_chunked_local_attention.cpp)
 vllm_cpp_add_test(test_rotary_embedding
   vllm/model_executor/layers/rotary_embedding/test_rotary_embedding.cpp)
+vllm_cpp_add_test(test_linear_scaling_rope
+  vllm/model_executor/layers/rotary_embedding/test_linear_scaling_rope.cpp)
 vllm_cpp_add_test(test_pooler
   vllm/model_executor/layers/pooler/test_pooler.cpp)
 vllm_cpp_add_test(test_pooler_heads
@@ -3337,6 +3339,7 @@ vllm_cpp_add_test(test_ops_activation vt/test_ops_activation.cpp)
 vllm_cpp_add_test(test_ops_rope vt/test_ops_rope.cpp)
 vllm_cpp_add_test(test_ops_rope_cache vt/test_ops_rope_cache.cpp)
 vllm_cpp_add_test(test_ops_fused_norm_rope vt/test_ops_fused_norm_rope.cpp)
+vllm_cpp_add_test(test_compiled_gemma vt/test_compiled_gemma.cpp)
 vllm_cpp_add_test(test_ops_gdn vt/test_ops_gdn.cpp)
 target_include_directories(test_ops_gdn PRIVATE ${CMAKE_SOURCE_DIR}/src)
 if(VLLM_CPP_TRITON)

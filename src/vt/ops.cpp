@@ -1931,6 +1931,12 @@ void RopeCosSinCache(Queue& q, Tensor& cos_sin, const Tensor& positions, const R
            "rope_cos_sin_cache: contiguous required");
   VT_CHECK(cos_sin.device == q.device && positions.device == q.device,
            "rope_cos_sin_cache: device mismatch (cos_sin/positions/queue)");
+  VT_CHECK(std::isfinite(args.base) && args.base > 0.f,
+           "rope_cos_sin_cache: base must be finite and positive");
+  VT_CHECK(std::isfinite(args.linear_scaling_factor) && args.linear_scaling_factor >= 0.f,
+           "rope_cos_sin_cache: linear factor must be finite and nonnegative");
+  VT_CHECK(args.linear_scaling_factor == 0.f || args.llama3_scaling_factor <= 0.f,
+           "rope_cos_sin_cache: linear and Llama-3 scaling are mutually exclusive");
   reinterpret_cast<RopeCosSinCacheFn>(GetOp(OpId::kRopeCosSinCache, q.device.type))(q, cos_sin,
                                                                                     positions, args);
 }

@@ -4,6 +4,7 @@
 //   vllm/model_executor/layers/rotary_embedding/base.py:13-252,298-318
 // @ e24d1b24fe96.
 #include "vllm/model_executor/layers/rotary_embedding/base.h"
+#include "vllm/model_executor/layers/rotary_embedding/linear_scaling_rope.h"
 
 #include <algorithm>
 #include <cmath>
@@ -240,6 +241,12 @@ std::shared_ptr<RotaryEmbeddingBase> get_rope(
           head_size, rotary_dim, max_position, rope_parameters.rope_theta,
           is_neox_style, dtype);
     }
+  } else if (rope_parameters.rope_type == "linear") {
+    if (!rope_parameters.factor.has_value())
+      throw std::invalid_argument("linear RoPE requires factor");
+    embedding = std::make_shared<LinearScalingRotaryEmbedding>(
+        head_size, rotary_dim, max_position, rope_parameters.rope_theta,
+        is_neox_style, *rope_parameters.factor, dtype);
   } else if (rope_parameters.rope_type == "dynamic") {
     if (rope_parameters.alpha.has_value()) {
       embedding = std::make_shared<DynamicNTKAlphaRotaryEmbedding>(

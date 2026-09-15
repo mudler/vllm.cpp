@@ -294,6 +294,12 @@ const char* OpNameImpl(OpId op) {
       return "RmsNorm";
     case OpId::kResidualRmsNorm:
       return "ResidualRmsNorm";
+    case OpId::kScaledRmsNorm:
+      return "ScaledRmsNorm";
+    case OpId::kSandwichRmsNorm:
+      return "SandwichRmsNorm";
+    case OpId::kCompiledGeluErfMul:
+      return "CompiledGeluErfMul";
     case OpId::kSiluAndMul:
       return "SiluAndMul";
     case OpId::kRopeNeox:

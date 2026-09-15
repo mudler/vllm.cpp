@@ -343,6 +343,12 @@ class Platform {
   // platform POLICY gate, mirroring upstream.
   virtual bool support_static_graph_mode() const { return false; }
 
+  // Model-specific admission can be narrower than the platform-wide default.
+  virtual bool support_static_graph_for_model(const std::vector<std::string>& /*architectures*/,
+                                              int /*device_index*/) const {
+    return support_static_graph_mode();
+  }
+
   // #1625/#2812: whether a decode family needs the EXPLICIT capture opt-in on
   // this platform. TT's static-graph mode is default-on since the #1625 flip,
   // but only the Qwen3-dense family carries committed captured-arm gate

@@ -894,6 +894,9 @@ enum class OpId : uint8_t {
   // but with per-element clamping. Appended before kCount so no existing op's
   // id shifts.
   kClampedSwiGLU,
+  kScaledRmsNorm,
+  kSandwichRmsNorm,
+  kCompiledGeluErfMul,
   kCount
 };
 
@@ -1148,6 +1151,11 @@ struct RopeArgs {
   // temporal/height/width counts in the half-rotary frequency dimension.
   std::array<int32_t, 3> mrope_section = {0, 0, 0};
   bool mrope_interleaved = false;
+
+  // RopeCosSinCache only: positive selects the primary's FP32 cache math,
+  // including position / factor before the outer product. One is unscaled.
+  // Zero preserves the legacy FP64 cache math and Llama-3 rescaling.
+  float linear_scaling_factor = 0.0f;
 
   // Llama-3 rope frequency rescaling (rope_type=="llama3", e.g. Llama-3.2). When
   // llama3_scaling_factor <= 0 (the default) NO rescale is applied and the RoPE

@@ -160,6 +160,58 @@ const Registrar kRegistrar;
 
 Queue XpuQueue() { return Queue{Device{DeviceType::kXPU, 0}, nullptr}; }
 
+TEST_CASE("resident generated tensor owns device data without host staging") {
+  Queue q = XpuQueue();
+  vllm::dense_attn::Dev d{Fake(), q};
+  OwnedTensor w;
+  w.dtype = DType::kBF16;
+  w.rank = 2;
+  w.shape[0] = 3;
+  w.shape[1] = 8;
+  int calls = 0;
+  auto initialize = [&](Tensor& target) {
+    ++calls;
+    CHECK(target.Bytes() == 48);
+    Fake().Memset(q, target.data, 0x42, target.Bytes());
+  };
+  SUBCASE("device generation is memoized and remains populated") {
+    const Tensor a = vllm::dense_attn::ResidentWeight(d, w, {}, initialize);
+    const Tensor b = vllm::dense_attn::ResidentWeight(d, w, {}, initialize);
+    CHECK(calls == 1);
+    CHECK(a.data == b.data);
+    CHECK_FALSE(w.Empty());
+    CHECK(w.bytes.empty());
+    CHECK(static_cast<const uint8_t*>(a.data)[47] == 0x42);
+  }
+  SUBCASE("a failed initializer leaves no resident value") {
+    CHECK_THROWS(vllm::dense_attn::ResidentWeight(
+        d, w, {}, [](Tensor&) { throw std::runtime_error("failed generation"); }));
+    CHECK(w.d_dev == nullptr);
+    CHECK(w.Empty());
+    CHECK_NOTHROW(vllm::dense_attn::ResidentWeight(d, w, {}, initialize));
+  }
+  SUBCASE("size overflow fails before allocation") {
+    const int allocations = Fake().allocs;
+    CHECK_THROWS(vllm::dense_attn::ResidentWeight(d, w, {INT64_MAX, 8}, initialize));
+    CHECK(Fake().allocs == allocations);
+    CHECK(calls == 0);
+  }
+  SUBCASE("invalid rank fails before reading the shape array") {
+    w.rank = vt::kMaxRank + 1;
+    const int allocations = Fake().allocs;
+    CHECK_THROWS(vllm::dense_attn::ResidentWeight(d, w, {}, initialize));
+    CHECK(Fake().allocs == allocations);
+  }
+  SUBCASE("ordinary empty weights still fail") {
+    CHECK_THROWS(vllm::dense_attn::ResidentWeight(d, w));
+  }
+  SUBCASE("CPU aliasing still requires actual host bytes") {
+    Queue cpu{Device{DeviceType::kCPU, 0}, nullptr};
+    CHECK_THROWS(vllm::dense_attn::ResidentWeight({Fake(), cpu}, w, {}, initialize));
+    CHECK(calls == 0);
+  }
+}
+
 constexpr int64_t kN = 6;
 constexpr int64_t kK = 8;
 

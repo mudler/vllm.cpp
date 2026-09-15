@@ -2,9 +2,8 @@
 //
 // PORTED FROM: src/vt/cuda/cuda_ops.cu EmbeddingKernel (grid-stride gather with
 // in-kernel id clamp + atomic error flag). Simplified host path: allocate a
-// one-shot error flag, launch, synchronize, throw — same correctness contract
-// as the original CUDA M0.6 shape (ops.h). The CUDA ring is a later speed
-// concern; discrete R9700 needs a working op first.
+// resident per-queue error flag, launch, copy the flag, synchronize, throw — same
+// checked contract as the original CUDA M0.6 shape (ops.h).
 //
 // Wavefront-agnostic: no warp primitives, only grid-stride over elements.
 #include <hip/hip_bf16.h>
@@ -14,6 +13,7 @@
 #include <string>
 #include <type_traits>
 
+#include "vt/grow_only_stream_scratch.h"
 #include "vt/ops.h"
 #include "vt/rocm/rocm_device_bind.h"
 #include "vt/rocm/rocm_f16_codec.h"
@@ -134,9 +134,23 @@ void EmbeddingKernelRocm(Queue& q, Tensor& out, const Tensor& table,
   VT_CHECK(table.shape[0] > 0, "rocm embedding: empty table (vocab 0)");
 
   hipStream_t s = static_cast<hipStream_t>(q.handle);
-  EmbeddingErr* derr = nullptr;
-  Check(hipMalloc(reinterpret_cast<void**>(&derr), sizeof(EmbeddingErr)),
-        "hipMalloc embedding flag");
+  // The shared scratch seam retains one bounds record per queue identity.
+  // Synchronization below ends each use before the next call clears the flag.
+  // Keeping these 16 bytes resident avoids a hipMalloc/hipFree pair per token.
+  static vt::GrowOnlyStreamScratch<uint64_t> records;
+  auto* derr =
+      static_cast<EmbeddingErr*>(records.Ensure(q.id, sizeof(EmbeddingErr), [](size_t bytes) {
+        void* record = nullptr;
+        Check(hipMalloc(&record, bytes), "embedding bounds allocation");
+        return record;
+      }));
+  static vt::GrowOnlyStreamScratch<uint64_t> host_records;
+  auto* herr =
+      static_cast<EmbeddingErr*>(host_records.Ensure(q.id, sizeof(EmbeddingErr), [](size_t bytes) {
+        void* record = nullptr;
+        Check(hipHostMalloc(&record, bytes), "embedding bounds host allocation");
+        return record;
+      }));
   Check(hipMemsetAsync(derr, 0, sizeof(EmbeddingErr), s), "hipMemset embedding flag");
 
   if (table.dtype == DType::kF32) {
@@ -147,17 +161,14 @@ void EmbeddingKernelRocm(Queue& q, Tensor& out, const Tensor& table,
     LaunchEmbeddingIn<__hip_bfloat16>(s, out, table, ids, derr);
   }
   Check(hipGetLastError(), "embedding launch");
+  // Pinned storage avoids pageable staging on this per-token checked readback.
+  Check(hipMemcpyAsync(herr, derr, sizeof(EmbeddingErr), hipMemcpyDeviceToHost, s),
+        "embedding flag D2H");
   Check(hipStreamSynchronize(s), "embedding sync");
 
-  EmbeddingErr herr{};
-  Check(hipMemcpy(&herr, derr, sizeof(EmbeddingErr), hipMemcpyDeviceToHost),
-        "embedding flag D2H");
-  Check(hipFree(derr), "hipFree embedding flag");
-
-  if (herr.status != 0) {
-    throw std::runtime_error("vt rocm: embedding: id " + std::to_string(herr.id) +
-                             " out of range [0, " +
-                             std::to_string(table.shape[0]) + ")");
+  if (herr->status != 0) {
+    throw std::runtime_error("vt rocm: embedding: id " + std::to_string(herr->id) +
+                             " out of range [0, " + std::to_string(table.shape[0]) + ")");
   }
 }
 

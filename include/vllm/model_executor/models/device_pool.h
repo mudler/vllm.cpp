@@ -76,6 +76,7 @@ class DevicePool {
   explicit DevicePool(vt::Backend& b) : backend_(&b) {}
   DevicePool(const DevicePool&) = delete;
   DevicePool& operator=(const DevicePool&) = delete;
+  static bool SupportsCapture() { return !Bypass(); }
 
   // BEST-FIT BORROW (#1922). The guarantee a caller gets, stated as a ratio:
   // while it holds a block borrowed from a larger class it holds at most this

@@ -36,15 +36,15 @@ namespace {
 std::string FindGemma3_1BSnapshot() {
   const char* home = std::getenv("HOME");
   if (home == nullptr) return "";
-  const fs::path snaps = fs::path(home) /
-                         ".cache/huggingface/hub/"
-                         "models--google--gemma-3-1b-it/snapshots";
-  std::error_code ec;
-  if (!fs::is_directory(snaps, ec)) return "";
-  for (const auto& e : fs::directory_iterator(snaps, ec)) {
-    if (fs::exists(e.path() / "config.json", ec) &&
-        fs::exists(e.path() / "model.safetensors", ec)) {
-      return e.path().string();
+  for (const char* owner : {"google", "unsloth"}) {
+    const fs::path snaps = fs::path(home) / ".cache/huggingface/hub" /
+                           (std::string("models--") + owner + "--gemma-3-1b-it") / "snapshots";
+    std::error_code ec;
+    if (!fs::is_directory(snaps, ec)) continue;
+    for (const auto& e : fs::directory_iterator(snaps, ec)) {
+      if (fs::exists(e.path() / "config.json", ec) &&
+          fs::exists(e.path() / "model.safetensors", ec))
+        return e.path().string();
     }
   }
   return "";
@@ -70,8 +70,8 @@ TEST_CASE("gemma3 W2 loader: gemma-3-1b-it safetensors -> Gemma3Weights") {
   if (snap.empty()) {
     MESSAGE(
         "SKIP: gemma-3-1b-it checkpoint absent "
-        "(~/.cache/huggingface/hub/models--google--gemma-3-1b-it); "
-        "run on dgx for the W2 load gate.");
+        "(google/gemma-3-1b-it or unsloth/gemma-3-1b-it in the HF cache); "
+        "cache the checkpoint to run the W2 load gate.");
     return;
   }
 

@@ -383,6 +383,16 @@ constexpr FusedRecipe kAttnQkNormRope = {
     /*fast_op=*/static_cast<int>(OpId::kAttnQkNormRope),
 };
 
+// Gemma uses 1+w at both head norms. ROCm retains the normalized FP32
+// values through rotation and rounds once, as the compiled primary does.
+constexpr FusedRecipe kAttnQkNormRopeGemma = [] {
+  auto recipe = kAttnQkNormRope;
+  recipe.steps[0].gemma = true;
+  recipe.steps[1].gemma = true;
+  recipe.name = "attn_qk_norm_rope_gemma";
+  return recipe;
+}();
+
 // kAttnQkNormRopeFullWidth — the FULL-WIDTH qk-norm variant of kAttnQkNormRope
 // (D3, arch-fusion-fold-plan-2026-07-30 Tier-D3). Structurally identical to
 // kAttnQkNormRope EXCEPT the two RMSNorm steps carry the `norm_full_width` shape

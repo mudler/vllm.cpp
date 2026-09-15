@@ -1424,7 +1424,7 @@ void FusedNormRopeKernelCuda(Queue& q, Tensor& latent_out, Tensor& pe_out, const
 template <typename Tid>
 __global__ void RopeCosSinCacheKernel(float* cos_sin, const Tid* pos, int64_t t, int rot,
                                       int64_t half, double base, double l3_sf, double l3_lo,
-                                      double l3_hi, double l3_omax) {
+                                      double l3_hi, double l3_omax, float linear) {
   const int64_t n = t * half;
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < n;
@@ -1432,6 +1432,14 @@ __global__ void RopeCosSinCacheKernel(float* cos_sin, const Tid* pos, int64_t t,
     const int64_t pair = idx % half;
     const int64_t tok = idx / half;
     const int64_t p = static_cast<int64_t>(pos[tok]);
+    if (linear > 0.f) {
+      const float exponent = static_cast<float>(2 * pair) / static_cast<float>(rot);
+      const float inv = 1.f / powf(static_cast<float>(base), exponent);
+      const float angle = (static_cast<float>(p) / linear) * inv;
+      cos_sin[tok * rot + pair] = cosf(angle);
+      cos_sin[tok * rot + half + pair] = sinf(angle);
+      continue;
+    }
     double freq = pow(base, -2.0 * static_cast<double>(pair) / static_cast<double>(rot));
     freq = Llama3ScaleFreq(freq, l3_sf, l3_lo, l3_hi, l3_omax);
     const double angle = static_cast<double>(p) * freq;
@@ -1454,11 +1462,11 @@ void RopeCosSinCacheKernelCuda(Queue& q, Tensor& cos_sin, const Tensor& pos, con
   if (pos.dtype == DType::kI32) {
     RopeCosSinCacheKernel<int32_t><<<GridFor(n), kBlock, 0, s>>>(
         cos_sin.Ptr<float>(), pos.Ptr<int32_t>(), t, args.rotary_dim, half, base,
-        l3_sf, l3_lo, l3_hi, l3_omax);
+        l3_sf, l3_lo, l3_hi, l3_omax, args.linear_scaling_factor);
   } else {
     RopeCosSinCacheKernel<int64_t><<<GridFor(n), kBlock, 0, s>>>(
         cos_sin.Ptr<float>(), pos.Ptr<int64_t>(), t, args.rotary_dim, half, base,
-        l3_sf, l3_lo, l3_hi, l3_omax);
+        l3_sf, l3_lo, l3_hi, l3_omax, args.linear_scaling_factor);
   }
   Check(cudaGetLastError(), "rope_cos_sin_cache launch");
 }

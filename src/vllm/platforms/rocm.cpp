@@ -16,12 +16,12 @@
 // rocm.py:444). Every value below either cites the upstream line it mirrors or
 // says outright that it is a W0 placeholder — there is no third category, and no
 // value here is a guess dressed as a decision.
-#include "vllm/platforms/interface.h"
-
 #include <cstddef>
 #include <vector>
 
+#include "vllm/platforms/interface.h"
 #include "vt/backend.h"
+#include "vt/rocm/rocm_attn_wmma_arch.h"
 #include "vt/rocm/rocm_runtime.h"
 
 namespace vllm::platforms {
@@ -79,6 +79,12 @@ class RocmPlatform final : public Platform {
   // probe rather than hardcoding an answer for a board nobody here can check.
   bool host_memory_is_device_addressable() const override {
     return vt::rocm::HostMemoryIsDeviceAddressable(0);
+  }
+
+  bool support_static_graph_for_model(const std::vector<std::string>& architectures,
+                                      int device_index) const override {
+    return architectures == std::vector<std::string>{"Gemma3ForCausalLM"} &&
+           vt::rocm::GcnArchNameHasGemmaDecodeWmma(vt::rocm::DeviceArchName(device_index));
   }
 
   // --- W0 placeholders. Each is the BASE class answer, stated explicitly here

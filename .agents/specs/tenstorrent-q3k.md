@@ -122,3 +122,45 @@ to the dot:
   escalate; no residency redesign in this wave. A device stack-budget
   refusal that survives the per-128 restructuring fallback is an
   escalate, not a redesign.
+
+## Outcome
+
+Landed 2026-09-15 (PR #3204, squash `5f83792a7`). Q3_K decodes on-core
+bit-exact: op sweep 185/185 assertions (8 encodings x (18 shapes +
+f32-activation leg)) vs `VecDotQ3_KQ8_K`; default-path env-unset leg
+13/13; route pin 11/11; full backend suite 76/76 cases, 775,070
+assertions, 0 failed on the P150 — every device run behind a cleared
+tt-metal cache after the stale-binary hazard surfaced mid-implementation
+(identical source passed/failed per cache state until
+`rm -rf ~/.cache/tt-metal-cache/*`). Fresh review PASS: 9/9 claimed
+guarantees mutation-verified red, including both spec-named traps (the
+`auxs[2]` `tmp >> 4` splice shift and the hmask `? 0 : 4` polarity
+flip) and both fold-association sites — the ascending 8-lane final
+`sumf` fold proved float-association LOAD-BEARING (reversed order went
+red). Symbol-by-symbol fidelity verdict: FAITHFUL; the only deltas are
+cosmetic explicitness and `kq_load16/32` byte reads.
+
+Measured and rejected:
+
+- The spec's per-128 restructuring fallback for `aux8[256]` stack
+  pressure was NOT needed: linked brisc.elf shows text 25,948 B and
+  `.data` 1,284 B — comfortably inside budget. Kept the
+  statement-for-statement single-pass structure.
+- A separate copy of the CPU reference's `aux16` staging: unnecessary;
+  the device port keeps the same two 8-lane folds per j.
+
+Default values and why:
+
+- `enc_sel` 7 — 4/5/6 are taken by waves 1-2; 7 is the next free arm.
+- Unconditional int8-dot dispatch, extending the waves-1-2 guard — same
+  reachability rule; the dispatch-only mutation went red on the
+  default-path leg.
+- No tables file: Q3_K uses only the inline `kmask1`/`kmask2`
+  constants, so wave 3 adds no device text beyond the dot itself.
+
+Gates state: op oracle PASS, route PASS, backend suite PASS; the APEX
+e2e generation gate stays recorded OOM/owed (Q4_K grouped repair-plane
+residency, keep-quant W4 territory). With waves 1-3 landed, every
+quantized census arm of APEX-I-Nano (297 IQ + 78 Q3_K of 2,598 tensors)
+is in the registered set; W4a grouped E=1 arms and the APEX e2e gate
+remain owed.

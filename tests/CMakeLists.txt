@@ -900,6 +900,13 @@ target_include_directories(test_deepseek_v4_mtp PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # kernels match the references. NOT a real-checkpoint token gate (W8, multi-Spark).
 vllm_cpp_add_test(test_cuda_deepseek_v4 vllm/models/test_cuda_deepseek_v4.cpp)
 target_include_directories(test_cuda_deepseek_v4 PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# O34: the ROCm/HIP arm of the DeepSeek-V4 MHC device-kernel family. A 1:1 mirror
+# of the CUDA MHC cases above, run against the ROCm provider registered in
+# rocm_deepseek_v4.hip. The device cases SKIP on a build without a ROCm backend
+# (exit 77 — "assertions: 0 ... SUCCESS!" is not a pass, tests/CMakeLists.txt:30-38).
+vllm_cpp_add_test(test_rocm_deepseek_v4_mhc vt/test_rocm_deepseek_v4_mhc.cpp)
+target_include_directories(test_rocm_deepseek_v4_mhc PRIVATE ${CMAKE_SOURCE_DIR}/src)
+set_tests_properties(test_rocm_deepseek_v4_mhc PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 # KIMI-K3 W2/W5 SCAFFOLDING (KimiK3ForConditionalGeneration) — the DERIVE-AND-SHIP
 # structural gate: registry-resolve + nested-config descent + text-backbone
 # enumeration + REFUSE-by-name forward + MXFP4-refuse loader. No checkpoint / GPU;

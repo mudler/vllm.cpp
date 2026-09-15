@@ -1027,6 +1027,19 @@ class RealTreeTests(unittest.TestCase):
                     len(reason), 40, f"{rel}[{bucket}] allowlist reason is not a reason"
                 )
 
+    def test_deepseek_v4_device_allowlist_pins_mhc_rocm_fallback(self) -> None:
+        # O34 (#3198) added one OpRegistered(kDeepseekV4Mhc, kCUDA) probe to
+        # MhcDevice() so it can try kCUDA and fall back to kROCm. The allowlist
+        # for this file must read exactly 9 — 8 hides the ROCm probe and the
+        # checker reports the real tree as non-compliant; 10 hides a future leak.
+        entry = dl.ALLOWLIST.get(
+            "src/vllm/model_executor/models/deepseek_v4_device.cpp", {}
+        )
+        self.assertIn("kcuda", entry, "deepseek_v4_device.cpp must be allowlisted")
+        count, reason = entry["kcuda"]
+        self.assertEqual(count, 9, "deepseek_v4_device.cpp kcuda budget must be 9")
+        self.assertIn("O34", reason, "the O34 ROCm fallback must be the stated reason")
+
     def test_leakage_is_concentrated_in_one_model_file(self) -> None:
         # The audit's headline finding, asserted as an executable fact rather than
         # a claim in a document: the shared layer's device branching is not spread

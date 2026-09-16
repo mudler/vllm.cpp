@@ -205,6 +205,35 @@ bool DitFuseLoraIntoTensor(const std::vector<DitLoraAdapter>& adapters,
                             const std::string& target, vt::DType dtype, int64_t rows,
                             int64_t cols, uint8_t* buffer, size_t buffer_bytes);
 
+// ── per-load fusion helpers ────────────────────────────────────────────────
+//
+// The three steps every DiT loader performs around the materialize loop. They
+// are model-agnostic: a loader passes its own tensor-spec type's `name` and
+// `shape` fields, and its model's ComfyUI `prefixes`. LTX2.5 and MiniMax-H3
+// both call these; no loader has its own copy.
+
+// Open every requested adapter against the contract this load will bind, and
+// resolve the reference factors. `contract_names` is the set of tensor names
+// the DiT actually binds; `prefixes` is the ComfyUI prefix set to strip.
+std::vector<DitLoraAdapter> DitOpenLoras(
+    const std::vector<DitLoraSpec>& specs,
+    const std::vector<std::string>& contract_names,
+    const std::vector<std::string>& prefixes);
+
+// Fuse LoRA deltas into one tensor's host buffer. Returns false (no-op) when
+// the tensor is not rank 2 or no adapters are loaded — a shape filter, not a
+// silent skip of a possible target, because `DitLoraAdapter::Open` has already
+// refused a pair naming a tensor outside the contract.
+bool DitFuseLorasIntoBuffer(
+    const std::vector<DitLoraAdapter>& loras,
+    const std::string& name, const std::vector<int64_t>& shape,
+    vt::DType dtype, uint8_t* buffer, size_t buffer_bytes);
+
+// Refuse adapters that fused into zero tensors. A LoRA that fused nothing
+// renders identically to no LoRA at all, so reporting success is the failure.
+void DitCheckLorasWereApplied(
+    const std::vector<DitLoraAdapter>& loras, int64_t fused);
+
 // The extras-map keys every DiT family uses for load-time LoRA. LTX2.5 defines
 // `kLtx2LoraPathExtra` / `kLtx2LoraStrengthExtra` as aliases of these; H3 uses
 // them directly. The spelling mirrors upstream's repeatable `--lora PATH [STRENGTH]`

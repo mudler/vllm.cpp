@@ -186,6 +186,9 @@ vllm_cpp_add_test(test_minimax_h3 vllm/models/test_minimax_h3.cpp)
 # VT-CONV1D-MODEL-BLOCK (#1684): the time-block case reads `Conv1dTimeBlock` so
 # it asserts the geometry it claims. Same reach as test_vocoder1d.
 target_include_directories(test_minimax_h3 PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# ROAD-V1-DIT-LORA: H3-specific contract name rewriting (model.diffusion_model.
+# prefix) and load-time fusion through the shared dit_lora seam.
+vllm_cpp_add_test(test_h3_lora vllm/models/test_h3_lora.cpp)
 # MiniMax-Music3 W1 (#672): the six-component diffusers-arm loader, gated against
 # the REAL checkpoint's headers (minimax_music3_manifest.inc, 1012 tensors, no
 # weight bytes) so CI never needs the 28.5 GB asset.

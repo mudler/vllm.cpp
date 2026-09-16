@@ -1114,11 +1114,22 @@ void BindStreamedDitViewsFp4(const std::map<std::string, Tensor>& views,
 }  // namespace
 
 MiniMaxH3DitDeviceWeights StreamMiniMaxH3DitToDeviceBf16(vt::Queue& queue, const GgufFile& file,
-                                                         MiniMaxH3DitParams* out_params) {
+                                                         MiniMaxH3DitParams* out_params,
+                                                         const MiniMaxH3DitLoadOptions& options) {
   vt::Backend& backend = vt::GetBackend(queue.device.type);
   const std::vector<MiniMaxH3TensorSpec> manifest = EnumerateMiniMaxH3GgufTensors(file);
   const MiniMaxH3DitParams params = ParseMiniMaxH3DitParamsFromGgufManifest(manifest);
   if (out_params != nullptr) *out_params = params;
+
+  // Open the LoRA adapters against the contract, if any. H3's ComfyUI prefix is
+  // `model.diffusion_model.` (and the bare `diffusion_model.` variant), so both
+  // are stripped before the `.lora_{A,B}.weight` -> `.weight` rewrite.
+  std::vector<std::string> contract_names;
+  contract_names.reserve(manifest.size());
+  for (const MiniMaxH3TensorSpec& spec : manifest) contract_names.push_back(spec.name);
+  const std::vector<DitLoraAdapter> loras = DitOpenLoras(
+      options.loras, contract_names, {"model.diffusion_model.", "diffusion_model."});
+  int64_t fused = 0;
 
   // Opt the mapping into page release: without this the DropSpanResidency calls
   // below are no-ops and the read-once file pages accumulate against the same
@@ -1166,6 +1177,13 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3DitToDeviceBf16(vt::Queue& queue, const
         src = bf16.data();
         bytes = bf16.size() * sizeof(uint16_t);
       }
+      // Fuse LoRA deltas into the host buffer before upload (load-time fusion,
+      // row ROAD-V1-DIT-LORA). The buffer is mutable: f32/bf16 are local and die
+      // after the copy.
+      if (DitFuseLorasIntoBuffer(loras, spec.name, spec.shape, want,
+          reinterpret_cast<uint8_t*>(const_cast<void*>(src)), bytes)) {
+        ++fused;
+      }
       void* p = backend.Alloc(bytes);
       std::shared_ptr<void> owner(p, [&backend](void* q) { backend.Free(q); });
       backend.Copy(queue, p, src, bytes);
@@ -1182,6 +1200,8 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3DitToDeviceBf16(vt::Queue& queue, const
       std::fflush(stderr);
     }
   }
+
+  DitCheckLorasWereApplied(loras, fused);
 
   MiniMaxH3DitWeights& w = staged.weights;
   // rope.inv_freq is read on the HOST (BuildRopeCosSin runs before any kernel), so
@@ -1221,7 +1241,8 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3DitToDeviceBf16(vt::Queue& queue, const
 // the host buffer die before the next, so peak is the device copy plus one tensor.
 MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceBf16(vt::Queue& queue,
                                                            const SafetensorsFile& file,
-                                                           MiniMaxH3DitParams* out_params) {
+                                                           MiniMaxH3DitParams* out_params,
+                                                           const MiniMaxH3DitLoadOptions& options) {
   vt::Backend& backend = vt::GetBackend(queue.device.type);
   const bool trace = std::getenv("VT_H3_PROGRESS") != nullptr;
 
@@ -1254,6 +1275,13 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceBf16(vt::Queue& queue,
   }
   const MiniMaxH3DitParams params = ParseMiniMaxH3DitParamsFromGgufManifest(manifest);
   if (out_params != nullptr) *out_params = params;
+
+  std::vector<std::string> contract_names;
+  contract_names.reserve(manifest.size());
+  for (const MiniMaxH3TensorSpec& spec : manifest) contract_names.push_back(spec.name);
+  const std::vector<DitLoraAdapter> loras = DitOpenLoras(
+      options.loras, contract_names, {"model.diffusion_model.", "diffusion_model."});
+  int64_t fused = 0;
 
   MiniMaxH3DitDeviceWeights staged;
   std::map<std::string, Tensor> views;
@@ -1345,6 +1373,10 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceBf16(vt::Queue& queue,
       }
     }
 
+    if (DitFuseLorasIntoBuffer(loras, spec.name, spec.shape, want,
+        reinterpret_cast<uint8_t*>(const_cast<void*>(src)), bytes)) {
+      ++fused;
+    }
     void* pdev = backend.Alloc(bytes);
     std::shared_ptr<void> owner(pdev, [&backend](void* q) { backend.Free(q); });
     backend.Copy(queue, pdev, src, bytes);
@@ -1359,6 +1391,7 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceBf16(vt::Queue& queue,
     }
   }
 
+  DitCheckLorasWereApplied(loras, fused);
   BindStreamedDitViews(views, params, &staged.weights);
   return staged;
 }
@@ -1371,7 +1404,8 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceBf16(vt::Queue& queue,
 // arm because the ~16 GB of packed FP4 never expands to ~66 GB of bf16.
 MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceFp4(vt::Queue& queue,
                                                          const SafetensorsFile& file,
-                                                         MiniMaxH3DitParams* out_params) {
+                                                         MiniMaxH3DitParams* out_params,
+                                                         const MiniMaxH3DitLoadOptions& options) {
   vt::Backend& backend = vt::GetBackend(queue.device.type);
   const bool trace = std::getenv("VT_H3_PROGRESS") != nullptr;
 
@@ -1400,6 +1434,13 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceFp4(vt::Queue& queue,
   }
   const MiniMaxH3DitParams params = ParseMiniMaxH3DitParamsFromGgufManifest(manifest);
   if (out_params != nullptr) *out_params = params;
+
+  std::vector<std::string> contract_names;
+  contract_names.reserve(manifest.size());
+  for (const MiniMaxH3TensorSpec& spec : manifest) contract_names.push_back(spec.name);
+  const std::vector<DitLoraAdapter> loras = DitOpenLoras(
+      options.loras, contract_names, {"model.diffusion_model.", "diffusion_model."});
+  int64_t fused = 0;
 
   MiniMaxH3DitDeviceWeights staged;
   std::map<std::string, Tensor> views;
@@ -1485,6 +1526,10 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceFp4(vt::Queue& queue,
         src = bf16.data();
         bytes = bf16.size() * sizeof(uint16_t);
       }
+      if (DitFuseLorasIntoBuffer(loras, spec.name, spec.shape, want,
+          reinterpret_cast<uint8_t*>(const_cast<void*>(src)), bytes)) {
+        ++fused;
+      }
       void* pdev = backend.Alloc(bytes);
       std::shared_ptr<void> owner(pdev, [&backend](void* q) { backend.Free(q); });
       backend.Copy(queue, pdev, src, bytes);
@@ -1500,6 +1545,7 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceFp4(vt::Queue& queue,
     }
   }
 
+  DitCheckLorasWereApplied(loras, fused);
   BindStreamedDitViewsFp4(views, fp4, params, &staged.weights);
   return staged;
 }
@@ -1528,7 +1574,7 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceFp4(vt::Queue& queue,
 // the page cache does not accumulate against the pool the weights live in.
 MiniMaxH3DitDeviceWeights StreamMiniMaxH3ShardedToDeviceBf16(
     vt::Queue& queue, const MiniMaxH3ShardedCheckpoint& ckpt,
-    MiniMaxH3DitParams* out_params) {
+    MiniMaxH3DitParams* out_params, const MiniMaxH3DitLoadOptions& options) {
   vt::Backend& backend = vt::GetBackend(queue.device.type);
   const bool trace = std::getenv("VT_H3_PROGRESS") != nullptr;
 
@@ -1537,6 +1583,13 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3ShardedToDeviceBf16(
   const std::vector<MiniMaxH3TensorSpec> manifest = EnumerateMiniMaxH3ShardedTensors(ckpt);
   const MiniMaxH3DitParams params = ParseMiniMaxH3DitParamsFromGgufManifest(manifest);
   if (out_params != nullptr) *out_params = params;
+
+  std::vector<std::string> contract_names;
+  contract_names.reserve(manifest.size());
+  for (const MiniMaxH3TensorSpec& spec : manifest) contract_names.push_back(spec.name);
+  const std::vector<DitLoraAdapter> loras = DitOpenLoras(
+      options.loras, contract_names, {"model.diffusion_model.", "diffusion_model."});
+  int64_t fused = 0;
 
   MiniMaxH3ShardStreamStats& stats = MutableMiniMaxH3ShardStreamStats();
   stats = MiniMaxH3ShardStreamStats{};
@@ -1626,6 +1679,23 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3ShardedToDeviceBf16(
       ++stats.converted_uploads;
     }
 
+    // Fuse LoRA deltas into a mutable host buffer before upload. When the source
+    // is a read-only mmap ("already" direct path), a targeted tensor is copied
+    // first; the mutable buffer survives until Synchronize below.
+    std::vector<uint8_t> lora_buf;
+    if (!loras.empty()) {
+      bool targeted = false;
+      for (const DitLoraAdapter& lora : loras)
+        if (lora.Find(spec.name)) { targeted = true; break; }
+      if (targeted) {
+        lora_buf.assign(static_cast<const uint8_t*>(src),
+                        static_cast<const uint8_t*>(src) + bytes);
+        if (DitFuseLorasIntoBuffer(loras, spec.name, spec.shape, want,
+            lora_buf.data(), bytes))
+          ++fused;
+        src = lora_buf.data();
+      }
+    }
     void* pdev = backend.Alloc(bytes);
     std::shared_ptr<void> owner(pdev, [&backend](void* q) { backend.Free(q); });
     backend.Copy(queue, pdev, src, bytes);
@@ -1645,6 +1715,7 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3ShardedToDeviceBf16(
     }
   }
 
+  DitCheckLorasWereApplied(loras, fused);
   BindStreamedDitViews(views, params, &staged.weights);
   return staged;
 }

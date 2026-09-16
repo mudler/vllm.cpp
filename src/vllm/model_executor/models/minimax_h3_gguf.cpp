@@ -296,10 +296,18 @@ void BindMiniMaxH3DitViews(MiniMaxH3GgufDit* out) {
   out->weights.audio_out_b = view("final_layer.audio_out.bias");
 }
 
-MiniMaxH3GgufDit LoadMiniMaxH3DitFromGguf(const GgufFile& file, bool keep_quant) {
+MiniMaxH3GgufDit LoadMiniMaxH3DitFromGguf(const GgufFile& file, bool keep_quant,
+                                           const MiniMaxH3DitLoadOptions& options) {
   MiniMaxH3GgufDit out;
   const std::vector<MiniMaxH3TensorSpec> manifest = EnumerateMiniMaxH3GgufTensors(file);
   out.params = ParseMiniMaxH3DitParamsFromGgufManifest(manifest);
+
+  std::vector<std::string> contract_names;
+  contract_names.reserve(manifest.size());
+  for (const MiniMaxH3TensorSpec& spec : manifest) contract_names.push_back(spec.name);
+  const std::vector<DitLoraAdapter> loras = DitOpenLoras(
+      options.loras, contract_names, {"model.diffusion_model.", "diffusion_model."});
+  int64_t fused = 0;
 
   for (const MiniMaxH3TensorSpec& spec : manifest) {
     const GgufTensorInfo& info = file.Get(spec.name);
@@ -329,17 +337,32 @@ MiniMaxH3GgufDit LoadMiniMaxH3DitFromGguf(const GgufFile& file, bool keep_quant)
     out.storage[spec.name] = DequantGgufRowToF32(info.ggml_type, info.data, numel);
     VT_CHECK(static_cast<int64_t>(out.storage[spec.name].size()) == numel,
              "minimax_h3 gguf: dequant produced the wrong element count");
+    if (DitFuseLorasIntoBuffer(loras, spec.name, spec.shape, vt::DType::kF32,
+        reinterpret_cast<uint8_t*>(out.storage[spec.name].data()),
+        out.storage[spec.name].size() * sizeof(float))) {
+      ++fused;
+    }
   }
 
+  DitCheckLorasWereApplied(loras, fused);
   BindMiniMaxH3DitViews(&out);
   return out;
 }
 
 
-MiniMaxH3GgufDit LoadMiniMaxH3DitFromGgufBf16(const GgufFile& file) {
+MiniMaxH3GgufDit LoadMiniMaxH3DitFromGgufBf16(const GgufFile& file,
+                                             const MiniMaxH3DitLoadOptions& options) {
   MiniMaxH3GgufDit out;
   const std::vector<MiniMaxH3TensorSpec> manifest = EnumerateMiniMaxH3GgufTensors(file);
   out.params = ParseMiniMaxH3DitParamsFromGgufManifest(manifest);
+
+  std::vector<std::string> contract_names;
+  contract_names.reserve(manifest.size());
+  for (const MiniMaxH3TensorSpec& spec : manifest) contract_names.push_back(spec.name);
+  const std::vector<DitLoraAdapter> loras = DitOpenLoras(
+      options.loras, contract_names, {"model.diffusion_model.", "diffusion_model."});
+  int64_t fused = 0;
+
   for (const MiniMaxH3TensorSpec& spec : manifest) {
     const GgufTensorInfo& info = file.Get(spec.name);
     int64_t numel = 1;
@@ -362,6 +385,11 @@ MiniMaxH3GgufDit LoadMiniMaxH3DitFromGgufBf16(const GgufFile& file) {
     if (MiniMaxH3IsFp32IslandTensor(spec.name)) {
       out.storage[spec.name] = DequantGgufRowToF32(info.ggml_type, info.data, numel);
       out.shapes[spec.name] = spec.shape;
+      if (DitFuseLorasIntoBuffer(loras, spec.name, spec.shape, vt::DType::kF32,
+          reinterpret_cast<uint8_t*>(out.storage[spec.name].data()),
+          out.storage[spec.name].size() * sizeof(float))) {
+        ++fused;
+      }
       continue;
     }
     // Straight to bf16: going via f32 would double the peak for no benefit, and the
@@ -370,7 +398,13 @@ MiniMaxH3GgufDit LoadMiniMaxH3DitFromGgufBf16(const GgufFile& file) {
     VT_CHECK(static_cast<int64_t>(out.bf16_storage[spec.name].size()) == numel,
              "minimax_h3 gguf bf16: dequant produced the wrong element count");
     out.shapes[spec.name] = spec.shape;
+    if (DitFuseLorasIntoBuffer(loras, spec.name, spec.shape, vt::DType::kBF16,
+        reinterpret_cast<uint8_t*>(out.bf16_storage[spec.name].data()),
+        out.bf16_storage[spec.name].size() * sizeof(uint16_t))) {
+      ++fused;
+    }
   }
+  DitCheckLorasWereApplied(loras, fused);
   BindMiniMaxH3DitViews(&out);
   return out;
 }

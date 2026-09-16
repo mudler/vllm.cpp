@@ -93,6 +93,9 @@ struct MiniMaxH3VideoModelParams {
   // projections through the Marlin W4A16 GEMM (the pre-fold --fp4-resident).
   int32_t fp4_resident = 0;
   int64_t encoder_max_layers = 0;  // 0 => all layers
+  // Load-time LoRA adapters ride here as indexed `lora_path` / `lora_strength`
+  // pairs, the same convention LTX2.5 uses (row ROAD-V1-DIT-LORA).
+  std::map<std::string, std::string> extras;
 };
 
 // ── Per-generation parameters (the C ABI mirror is vllm_video_params). ──────

@@ -543,4 +543,43 @@ bool IsDitLoraIndexedExtra(const std::string& key) {
   return LoraExtraIndex(key, nullptr);
 }
 
+// ── per-load fusion helpers ─────────────────────────────────────────────────
+
+std::vector<DitLoraAdapter> DitOpenLoras(
+    const std::vector<DitLoraSpec>& specs,
+    const std::vector<std::string>& contract_names,
+    const std::vector<std::string>& prefixes) {
+  if (specs.empty()) return {};
+  std::vector<DitLoraAdapter> out;
+  out.reserve(specs.size());
+  for (const DitLoraSpec& spec : specs) {
+    out.push_back(DitLoraAdapter::Open(spec, contract_names, prefixes));
+  }
+  return out;
+}
+
+bool DitFuseLorasIntoBuffer(
+    const std::vector<DitLoraAdapter>& loras,
+    const std::string& name, const std::vector<int64_t>& shape,
+    vt::DType dtype, uint8_t* buffer, size_t buffer_bytes) {
+  if (loras.empty()) return false;
+  if (shape.size() != 2) return false;
+  return DitFuseLoraIntoTensor(loras, name, dtype, shape[0], shape[1],
+                                buffer, buffer_bytes);
+}
+
+void DitCheckLorasWereApplied(
+    const std::vector<DitLoraAdapter>& loras, int64_t fused) {
+  if (loras.empty() || fused > 0) return;
+  std::string paths;
+  for (const DitLoraAdapter& lora : loras) {
+    paths += std::string(paths.empty() ? "" : ", ") + "'" + lora.path() + "'";
+  }
+  Fail("the adapter(s) " + paths +
+       " fused into ZERO tensors of this checkpoint. Every A/B pair named a tensor the "
+       "contract binds, so the delta was computed for none of them — which means the "
+       "render would be byte-identical to loading no adapter, while reporting success. "
+       "Refusing instead.");
+}
+
 }  // namespace vllm

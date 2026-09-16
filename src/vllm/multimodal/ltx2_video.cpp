@@ -385,59 +385,6 @@ double ExtraDouble(const std::map<std::string, std::string>& extras, const std::
   }
 }
 
-// The IC-LoRA strength (utils/args.py:600-611). Upstream's `LoraAction` parses
-// it as a plain float and applies no range clamp, so neither does this: a
-// negative or >1 strength is a legitimate, if unusual, request that upstream
-// honours, and refusing it here would diverge. What IS refused is a value that
-// is not a number at all, which upstream's `float()` would raise on too.
-//
-// Not `ExtraDouble` above, and deliberately: that one reports "not a finite
-// number of SECONDS", which is the wrong noun for a strength, and it defaults a
-// missing key while this one is only ever called on a key that is present.
-double ParseLoraStrength(const std::string& key, const std::string& raw) {
-  try {
-    size_t consumed = 0;
-    const double value = std::stod(raw, &consumed);
-    if (consumed != raw.size()) throw std::invalid_argument("trailing");
-    if (!std::isfinite(value)) throw std::invalid_argument("non-finite");
-    return value;
-  } catch (const std::exception&) {
-    Fail("the extra '" + key + "' is '" + raw + "', which is not a finite number");
-  }
-}
-
-// The suffix that names adapter `index` in the load extras: adapter 1 is the
-// unindexed `lora_path` / `lora_strength` every existing caller already writes.
-std::string LoraIndexSuffix(int64_t index) {
-  return index == 1 ? std::string() : "_" + std::to_string(index);
-}
-
-// `lora_path_<n>` or `lora_strength_<n>` with n >= 2 — the indexed spelling of
-// upstream's REPEATABLE `--lora`. False for everything else, `..._1` included:
-// the first adapter is spelled without an index, and admitting a second
-// spelling for it would let `lora_path` and `lora_path_1` disagree with no
-// defensible winner. `CheckKnownExtras` refuses `..._1` by name for that reason
-// rather than as an unknown key.
-bool LoraExtraIndex(const std::string& key, int64_t* out_index) {
-  for (const char* base : {kLtx2LoraPathExtra, kLtx2LoraStrengthExtra}) {
-    const std::string prefix = std::string(base) + "_";
-    if (key.size() <= prefix.size()) continue;
-    if (key.compare(0, prefix.size(), prefix) != 0) continue;
-    const std::string digits = key.substr(prefix.size());
-    // A leading zero, a non-digit or a length no `int64_t` needs is not an
-    // index. Bounded before `stoll` so this cannot throw on a hostile key.
-    if (digits[0] == '0' || digits.size() > 6) return false;
-    for (const char c : digits) {
-      if (c < '0' || c > '9') return false;
-    }
-    const int64_t index = std::stoll(digits);
-    if (index < 2) return false;
-    if (out_index != nullptr) *out_index = index;
-    return true;
-  }
-  return false;
-}
-
 // `lora_path_1` / `lora_strength_1` refuse BY NAME rather than as unknown keys.
 // The caller has understood the indexed family and mis-spelled its first member,
 // and the generic message would send them hunting for a typo in a key they got
@@ -615,7 +562,7 @@ void CheckKnownExtras(const std::map<std::string, std::string>& extras) {
     // The indexed IC-LoRA family (row LTX25-LORA-FUSION). It is a PATTERN and
     // not a listable set because upstream's `--lora` has no arity bound
     // (`utils/args.py:600-611`), so the enumerated array above cannot hold it.
-    if (!known && LoraExtraIndex(kv.first, nullptr)) known = true;
+    if (!known && IsDitLoraIndexedExtra(kv.first)) known = true;
     if (!known) {
       RefuseLoraIndexOne(kv.first);
       std::string listing;
@@ -690,41 +637,11 @@ Ltx2AutoDuration ParseAutoDuration(const std::map<std::string, std::string>& ext
 // no `lora_path_2` believes three adapters are being fused; sliding the third
 // into the second slot would fuse two and report success.
 std::vector<Ltx2LoraSpec> ResolveLoraSpecs(const std::map<std::string, std::string>& extras) {
-  std::vector<Ltx2LoraSpec> out;
-  for (int64_t index = 1;; ++index) {
-    const std::string path_key = std::string(kLtx2LoraPathExtra) + LoraIndexSuffix(index);
-    const std::string strength_key =
-        std::string(kLtx2LoraStrengthExtra) + LoraIndexSuffix(index);
-    const std::string path = VideoExtra(extras, path_key);
-    const std::string strength = VideoExtra(extras, strength_key);
-    if (path.empty()) {
-      // The same refusal the one-adapter arm has always carried, now per index.
-      if (!strength.empty()) {
-        Fail("'" + strength_key + "' was given without '" + path_key +
-             "'. A strength with no adapter fuses nothing, and silently doing nothing is "
-             "what this refusal exists to prevent.");
-      }
-      break;
-    }
-    Ltx2LoraSpec spec;
-    spec.path = path;
-    // Absent is DEFAULT_LORA_STRENGTH, per adapter, exactly as upstream's
-    // `--lora PATH` with no second word is (`utils/args.py:607-608`).
-    if (!strength.empty()) spec.strength = ParseLoraStrength(strength_key, strength);
-    out.push_back(std::move(spec));
-  }
-  const int64_t next = static_cast<int64_t>(out.size()) + 1;
-  for (const auto& kv : extras) {
-    int64_t index = 0;
-    if (!LoraExtraIndex(kv.first, &index) || index <= next) continue;
-    Fail("the load carries '" + kv.first + "' but no '" + std::string(kLtx2LoraPathExtra) +
-         LoraIndexSuffix(next) + "', so the adapters are not numbered 1..N with no gaps. " +
-         std::to_string(out.size()) +
-         " adapter(s) would be fused and the rest silently dropped. Number them from 1 — the "
-         "first is '" +
-         std::string(kLtx2LoraPathExtra) + "' with no index — or drop '" + kv.first + "'.");
-  }
-  return out;
+  // Delegates to the shared DiT LoRA resolution (row ROAD-V1-DIT-LORA). The
+  // indexed-key transport, gap refusal, and strength-without-path refusal all
+  // live in `ResolveDitLoraSpecs` now, so every DiT family shares one
+  // implementation. `Ltx2LoraSpec` is an alias for `DitLoraSpec`.
+  return ResolveDitLoraSpecs(extras);
 }
 
 // `detect_model_version` normalizes the separator before parsing

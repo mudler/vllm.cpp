@@ -15,7 +15,9 @@
 #include "vllm/model_executor/models/dit_lora.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -450,6 +452,95 @@ bool DitFuseLoraIntoTensor(const std::vector<DitLoraAdapter>& adapters,
   }
   Fail("'" + target + "' materialized as a dtype this fuser does not write. FP8 and NVFP4 "
        "never reach here: the materializer dequantizes both to BF16 before returning.");
+}
+
+// ── extras-map resolution ───────────────────────────────────────────────────
+
+namespace {
+
+std::string LoraIndexSuffix(int64_t index) {
+  return index == 1 ? std::string() : "_" + std::to_string(index);
+}
+
+bool LoraExtraIndex(const std::string& key, int64_t* out_index) {
+  for (const char* base : {kDitLoraPathExtra, kDitLoraStrengthExtra}) {
+    const std::string prefix = std::string(base) + "_";
+    if (key.size() <= prefix.size()) continue;
+    if (key.compare(0, prefix.size(), prefix) != 0) continue;
+    const std::string digits = key.substr(prefix.size());
+    if (digits[0] == '0' || digits.size() > 6) return false;
+    for (const char c : digits) {
+      if (c < '0' || c > '9') return false;
+    }
+    const int64_t index = std::stoll(digits);
+    if (index < 2) return false;
+    if (out_index != nullptr) *out_index = index;
+    return true;
+  }
+  return false;
+}
+
+double ParseLoraStrength(const std::string& key, const std::string& raw) {
+  try {
+    size_t consumed = 0;
+    const double value = std::stod(raw, &consumed);
+    if (consumed != raw.size()) throw std::invalid_argument("trailing");
+    if (!std::isfinite(value)) throw std::invalid_argument("non-finite");
+    return value;
+  } catch (const std::exception&) {
+    Fail("the extra '" + key + "' is '" + raw + "', which is not a finite number");
+  }
+}
+
+std::string ExtraGet(const std::map<std::string, std::string>& extras,
+                    const std::string& key) {
+  auto it = extras.find(key);
+  return it == extras.end() ? std::string() : it->second;
+}
+
+}  // namespace
+
+std::vector<DitLoraSpec> ResolveDitLoraSpecs(
+    const std::map<std::string, std::string>& extras) {
+  std::vector<DitLoraSpec> out;
+  for (int64_t index = 1;; ++index) {
+    const std::string path_key =
+       std::string(kDitLoraPathExtra) + LoraIndexSuffix(index);
+    const std::string strength_key =
+       std::string(kDitLoraStrengthExtra) + LoraIndexSuffix(index);
+    const std::string path = ExtraGet(extras, path_key);
+    const std::string strength = ExtraGet(extras, strength_key);
+    if (path.empty()) {
+      if (!strength.empty()) {
+       Fail("'" + strength_key + "' was given without '" + path_key +
+            "'. A strength with no adapter fuses nothing, and silently doing "
+            "nothing is what this refusal exists to prevent.");
+      }
+      break;
+    }
+    DitLoraSpec spec;
+    spec.path = path;
+    if (!strength.empty()) spec.strength = ParseLoraStrength(strength_key, strength);
+    out.push_back(std::move(spec));
+  }
+  const int64_t next = static_cast<int64_t>(out.size()) + 1;
+  for (const auto& kv : extras) {
+    int64_t index = 0;
+    if (!LoraExtraIndex(kv.first, &index) || index <= next) continue;
+    Fail("the load carries '" + kv.first + "' but no '" +
+        std::string(kDitLoraPathExtra) + LoraIndexSuffix(next) +
+        "', so the adapters are not numbered 1..N with no gaps. " +
+        std::to_string(out.size()) +
+        " adapter(s) would be fused and the rest silently dropped. Number them "
+        "from 1 — the first is '" +
+        std::string(kDitLoraPathExtra) +
+        "' with no index — or drop '" + kv.first + "'.");
+  }
+  return out;
+}
+
+bool IsDitLoraIndexedExtra(const std::string& key) {
+  return LoraExtraIndex(key, nullptr);
 }
 
 }  // namespace vllm

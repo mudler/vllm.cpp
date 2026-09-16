@@ -205,4 +205,28 @@ bool DitFuseLoraIntoTensor(const std::vector<DitLoraAdapter>& adapters,
                             const std::string& target, vt::DType dtype, int64_t rows,
                             int64_t cols, uint8_t* buffer, size_t buffer_bytes);
 
+// The extras-map keys every DiT family uses for load-time LoRA. LTX2.5 defines
+// `kLtx2LoraPathExtra` / `kLtx2LoraStrengthExtra` as aliases of these; H3 uses
+// them directly. The spelling mirrors upstream's repeatable `--lora PATH [STRENGTH]`
+// (`utils/args.py:600-611`): adapter 1 is the unindexed `lora_path` / `lora_strength`,
+// adapter N >= 2 is `lora_path_<N>` / `lora_strength_<N>`.
+inline constexpr char kDitLoraPathExtra[] = "lora_path";
+inline constexpr char kDitLoraStrengthExtra[] = "lora_strength";
+
+// Read `lora_path[_<N>]` / `lora_strength[_<N>]` from the extras map and return
+// one `DitLoraSpec` per adapter, in index order. A gap in the sequence refuses
+// by name, as does a `lora_strength_<N>` without its `lora_path_<N>`.
+//
+// This is the shared resolution that LTX2.5's `ResolveLoraSpecs` and H3's video
+// engine both call. The function is model-agnostic: the prefix stripping happens
+// later, in `DitLoraAdapter::Open`.
+std::vector<DitLoraSpec> ResolveDitLoraSpecs(
+    const std::map<std::string, std::string>& extras);
+
+// True when `key` is `lora_path_<N>` or `lora_strength_<N>` with N >= 2 — the
+// indexed spelling of a DiT LoRA extra. Each family's extras-validation pass
+// calls this to recognize the repeatable family without listing it in a fixed
+// array, since upstream's `--lora` has no arity bound.
+bool IsDitLoraIndexedExtra(const std::string& key);
+
 }  // namespace vllm

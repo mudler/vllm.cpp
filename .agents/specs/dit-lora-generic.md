@@ -216,3 +216,52 @@ land together.
 - nvfp4-arm LoRA fusion (fuse into fp4-packed weights, or dequant-fuse-requant)
 - Runtime prompt-activated LoRA (`<lora:name:strength>`) — separate row
   `ROAD-V1-LORA-RUNTIME`
+
+## Outcome
+
+All five phases landed and were verified on GPU.
+
+### What was measured
+
+- Unit tests: 11 H3 LoRA tests pass (contract rewriting, fusion math,
+  check-was-applied refusal, extras resolution, gap refusal, `IsDitLoraExtra`).
+  17 LTX2 LoRA tests pass (unchanged behavior after migration to shared seam).
+  6 LocalAI `buildLoraExtras` tests pass. 92/92 vllm-cpp backend tests pass.
+- E2E on dgx:gpu0 (Grace Blackwell, sm_121a, CUDA 13.0, Q3_K_M GGUF ~15 GB,
+  bf16 dequant path):
+  - Positive: valid rank-8 bf16 LoRA targeting `blocks.0.attn.qkv_proj` fused
+    silently during 535/535 tensor stream. Hit VAE check (expected — no VAEs
+    supplied). Fusion succeeded.
+  - Negative: LoRA targeting `nonexistent.tensor` refused with "does not bind"
+    error during `DitOpenLoras`. LoRA was loaded and rejected.
+
+### What was rejected and why
+
+- Runtime punica-style LoRA (per-request, not load-time): vLLM-Omni uses
+  `DiffusionLoRAManager` for runtime matmul-delta fusion. Rejected for v1
+  because the tree's H3 uses load-time weight materialization (like LTX2),
+  not runtime matmul. Load-time fusion is the natural mirror. Runtime
+  activation is a separate row (`ROAD-V1-LORA-RUNTIME`).
+- Fusing into nvfp4-packed weights: out of scope. The fp4 arm refuses with a
+  named message if a LoRA targets an fp4 path. The streaming paths fuse on
+  the dequantized host buffer before repacking.
+- torch for synthetic LoRA creation in E2E: torch is not installed on the DGX.
+  Used safetensors + numpy with manual BF16 conversion instead.
+
+### Bug found and fixed during E2E
+
+`MiniMaxH3VideoModelParamsFromGeneric` filtered LoRA extras with
+`IsDitLoraIndexedExtra`, which only recognizes indexed keys (`lora_path_2`).
+The first adapter's base keys (`lora_path`, `lora_strength`) were silently
+dropped, so `--lora` fused nothing. Fixed by adding `IsDitLoraExtra` (commit
+`cc8ca06`).
+
+### Why each default has its value
+
+- Load-time fusion (not runtime): matches LTX2's proven pattern and the tree's
+  materialize-then-stream architecture.
+- `model.diffusion_model.` + `diffusion_model.` prefix set: ComfyUI adapters
+  carry the full prefix; bare-name adapters also work.
+- bf16 dequant path for E2E: the f32 path would use ~128 GB, exceeding 128 GB
+  unified memory. bf16 fits.
+- Strength defaults to 1.0: mirrors vLLM and LTX2.

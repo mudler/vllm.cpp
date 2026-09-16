@@ -543,6 +543,11 @@ bool IsDitLoraIndexedExtra(const std::string& key) {
   return LoraExtraIndex(key, nullptr);
 }
 
+bool IsDitLoraExtra(const std::string& key) {
+  if (key == kDitLoraPathExtra || key == kDitLoraStrengthExtra) return true;
+  return IsDitLoraIndexedExtra(key);
+}
+
 // ── per-load fusion helpers ─────────────────────────────────────────────────
 
 std::vector<DitLoraAdapter> DitOpenLoras(

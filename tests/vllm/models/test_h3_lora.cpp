@@ -353,3 +353,18 @@ TEST_CASE("h3 lora: IsDitLoraIndexedExtra recognizes the indexed keys") {
   CHECK_FALSE(vllm::IsDitLoraIndexedExtra("partition"));
   CHECK_FALSE(vllm::IsDitLoraIndexedExtra("random_key"));
 }
+
+TEST_CASE("h3 lora: IsDitLoraExtra recognizes base and indexed keys") {
+  // Base keys (index 1, no suffix) — these are the first adapter.
+  CHECK(vllm::IsDitLoraExtra("lora_path"));
+  CHECK(vllm::IsDitLoraExtra("lora_strength"));
+  // Indexed keys (N >= 2).
+  CHECK(vllm::IsDitLoraExtra("lora_path_2"));
+  CHECK(vllm::IsDitLoraExtra("lora_strength_3"));
+  CHECK(vllm::IsDitLoraExtra("lora_path_10"));
+  // Non-LoRA keys.
+  CHECK_FALSE(vllm::IsDitLoraExtra("partition"));
+  CHECK_FALSE(vllm::IsDitLoraExtra("random_key"));
+  CHECK_FALSE(vllm::IsDitLoraExtra("lora_path_1"));  // index 1 uses no suffix
+  CHECK_FALSE(vllm::IsDitLoraExtra("lora_path_0"));  // no zero index
+}

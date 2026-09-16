@@ -797,7 +797,7 @@ MiniMaxH3VideoModelParams MiniMaxH3VideoModelParamsFromGeneric(const VideoModelP
   // Pass through LoRA-related extras (row ROAD-V1-DIT-LORA). `partition` is
   // already extracted above; every other known key is a LoRA index.
   for (const auto& [key, val] : params.extras) {
-    if (key != "partition" && IsDitLoraIndexedExtra(key)) {
+    if (key != "partition" && IsDitLoraExtra(key)) {
       mp.extras[key] = val;
     }
   }

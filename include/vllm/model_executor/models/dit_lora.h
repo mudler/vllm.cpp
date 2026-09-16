@@ -258,4 +258,10 @@ std::vector<DitLoraSpec> ResolveDitLoraSpecs(
 // array, since upstream's `--lora` has no arity bound.
 bool IsDitLoraIndexedExtra(const std::string& key);
 
+// True when `key` is any DiT LoRA extra: the base `lora_path` / `lora_strength`
+// (index 1, no suffix) or any indexed variant `lora_path_<N>` / `lora_strength_<N>`
+// (N >= 2). Use this to pass through the full LoRA family in a conversion that
+// filters extras, so the first adapter is not silently dropped.
+bool IsDitLoraExtra(const std::string& key);
+
 }  // namespace vllm

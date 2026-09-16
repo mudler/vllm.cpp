@@ -444,7 +444,7 @@ constexpr char kLtx2AutoDurationExtra[] = "auto_duration";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 695 697 1339 1435 1531 1547 1682 1686 1844 1880 2032 2150 2192 2234 2236
+// 646 647 1264 1360 1456 1472 1607 1611 1769 1805 1957 2075 2117 2159 2161
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -641,6 +641,14 @@ std::vector<Ltx2LoraSpec> ResolveLoraSpecs(const std::map<std::string, std::stri
   // indexed-key transport, gap refusal, and strength-without-path refusal all
   // live in `ResolveDitLoraSpecs` now, so every DiT family shares one
   // implementation. `Ltx2LoraSpec` is an alias for `DitLoraSpec`.
+  //
+  // The shared seam reads `kDitLoraPathExtra` / `kDitLoraStrengthExtra`, which
+  // are the same string literals this family declares as `kLtx2LoraPathExtra`
+  // / `kLtx2LoraStrengthExtra`. The asserts prove the alias so a future rename
+  // of either side is caught at compile time, and they are the readers that
+  // keep both keys in `kKnownLoadExtras[]` served.
+  static_assert(std::string_view(kLtx2LoraPathExtra) == kDitLoraPathExtra);
+  static_assert(std::string_view(kLtx2LoraStrengthExtra) == kDitLoraStrengthExtra);
   return ResolveDitLoraSpecs(extras);
 }
 

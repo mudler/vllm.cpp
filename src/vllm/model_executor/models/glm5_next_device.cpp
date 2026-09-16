@@ -15,8 +15,9 @@
 //   lm_head                 vt::MatmulBT (float acc, vs the host's chunked double)
 //
 // ─── HOST-FALLBACK ISLANDS (no portable device op) ─────────────────────────
-//   (1) mHC sites — MhcPre/MhcPost per token. kDeepseekV4Mhc has no ROCm/CUDA
-//       provider in the shared vt:: catalog, so the [T, hc, H] residual stream
+//   (1) mHC sites — MhcPre/MhcPost per token. kDeepseekV4Mhc now has both CUDA
+//       and ROCm providers (O34, #3199), but the device forward has not been
+//       rewired to call the device kernels. The [T, hc, H] residual stream
 //       lives on host because mHC wraps every sublayer.
 //   (2) DSA/MLA attention — Attention() is a monolithic host function. The
 //       k-pool indexer ops (kGlm5NextKpoolCompress/Select) are CUDA-only, so on

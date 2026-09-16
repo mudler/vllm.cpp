@@ -55,6 +55,7 @@ struct Engine {
   vllm_video_model_params base{};
   std::string encoder, tokenizer, vvae, vvae_cfg, avae, avae_cfg, embeds;
   std::vector<std::string> lora_keys, lora_values;
+  std::vector<const char*> extra_key_ptrs, extra_val_ptrs;
 };
 Engine g_engine;
 
@@ -369,8 +370,14 @@ int main(int argc, char** argv) {
   g_engine.base.device = g_engine.device == "cuda" ? 1 : 0;
   g_engine.base.dequant_bf16 = g_engine.dequant_bf16;
   if (!g_engine.lora_keys.empty()) {
-    g_engine.base.extra_keys = g_engine.lora_keys.data();
-    g_engine.base.extra_values = g_engine.lora_values.data();
+    g_engine.extra_key_ptrs.clear();
+    g_engine.extra_val_ptrs.clear();
+    for (size_t i = 0; i < g_engine.lora_keys.size(); ++i) {
+      g_engine.extra_key_ptrs.push_back(g_engine.lora_keys[i].c_str());
+      g_engine.extra_val_ptrs.push_back(g_engine.lora_values[i].c_str());
+    }
+    g_engine.base.extra_keys = g_engine.extra_key_ptrs.data();
+    g_engine.base.extra_values = g_engine.extra_val_ptrs.data();
     g_engine.base.n_extras = static_cast<int32_t>(g_engine.lora_keys.size());
   }
 

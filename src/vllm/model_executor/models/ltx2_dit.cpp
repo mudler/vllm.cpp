@@ -21,6 +21,7 @@
 
 #include "vt/backend.h"
 #include "vt/ops.h"
+#include "vllm/model_executor/models/dit_lora.h"
 
 namespace vllm {
 namespace {

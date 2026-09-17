@@ -33,6 +33,7 @@
 #include "vt/dtype.h"
 #include "vt/backend.h"
 #include "vt/ops.h"
+#include "vllm/model_executor/models/dit_lora.h"
 
 namespace vllm {
 namespace {
@@ -93,7 +94,8 @@ struct StreamDtype {
 // vt::MatmulBT + optional bias. Weight is [out_features, in_features], matching
 // every {Column,Row,QKV,MergedColumn}ParallelLinear at TP=1.
 void Linear(vt::Queue& q, const float* in, int64_t rows, int64_t in_features,
-            const Tensor& weight, const Tensor* bias, float* out) {
+            const Tensor& weight, const Tensor* bias, float* out,
+            const DitRuntimeLoraLayer* lora = nullptr) {
   const int64_t out_features = weight.shape[0];
   VT_CHECK(weight.rank == 2 && weight.shape[1] == in_features,
            "minimax_h3 linear: weight shape does not match input width");
@@ -108,6 +110,9 @@ void Linear(vt::Queue& q, const float* in, int64_t rows, int64_t in_features,
       float* dst = out + r * out_features;
       for (int64_t i = 0; i < out_features; ++i) dst[i] += b[i];
     }
+  }
+  if (lora != nullptr) {
+    DitApplyRuntimeLoraDelta(q, a, out, rows, out_features, lora);
   }
 }
 

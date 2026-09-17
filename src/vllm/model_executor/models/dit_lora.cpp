@@ -736,4 +736,24 @@ DitParseLoraResult DitParseLoraTags(const std::string& prompt,
   return result;
 }
 
+// ── runtime LoRA delta (CPU path) ──────────────────────────────────────────
+
+void DitApplyRuntimeLoraDelta(vt::Queue& q, const vt::Tensor& a,
+                               float* out, int64_t rows, int64_t out_features,
+                               const DitRuntimeLoraLayer* lora) {
+  if (lora == nullptr) return;
+  const int64_t rank = lora->lora_a.shape[0];
+  std::vector<float> tmp_buf(static_cast<size_t>(rows * rank));
+  vt::Tensor tmp = vt::Tensor::Contiguous(tmp_buf.data(), vt::DType::kF32,
+                                          a.device, {rows, rank});
+  vt::MatmulBT(q, tmp, a, lora->lora_a);
+  std::vector<float> delta_buf(static_cast<size_t>(rows * out_features));
+  vt::Tensor delta = vt::Tensor::Contiguous(delta_buf.data(), vt::DType::kF32,
+                                            a.device, {rows, out_features});
+  vt::MatmulBT(q, delta, tmp, lora->lora_b);
+  vt::Tensor o = vt::Tensor::Contiguous(out, vt::DType::kF32, a.device,
+                                        {rows, out_features});
+  vt::Add(q, o, o, delta);
+}
+
 }  // namespace vllm

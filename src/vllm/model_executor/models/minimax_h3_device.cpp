@@ -53,6 +53,7 @@
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #include "vt/recipes.h"
+#include "vllm/model_executor/models/dit_lora.h"
 
 namespace vllm {
 namespace {
@@ -156,9 +157,13 @@ void H3DumpFingerprint(std::FILE* f, vt::Backend& backend, vt::Queue& q, const c
 // falls back to a redundant-dequant GEMM, so the arm is correct either way. The
 // dequant lives entirely inside the shared dispatcher — this adds NO quant code.
 void LinearDev(Dev d, const Tensor& in, int64_t rows, int64_t in_features, const Tensor& weight,
-               const Tensor* bias, Tensor& out, const Nvfp4Weight* fp4 = nullptr) {
+               const Tensor* bias, Tensor& out, const Nvfp4Weight* fp4 = nullptr,
+               const DitRuntimeLoraLayer* lora = nullptr) {
   Tensor a = dense_attn::Reshape(in, {rows, in_features});
   if (fp4 != nullptr && !fp4->Empty()) {
+    VT_CHECK(lora == nullptr,
+             "minimax_h3 device linear: runtime LoRA is not supported on the "
+             "nvfp4-resident arm — use the bf16 dequant path (spec §7)");
     VT_CHECK(fp4->k == in_features,
              "minimax_h3 fp4 linear: packed weight K does not match input width");
     Tensor o = dense_attn::Reshape(out, {rows, fp4->n});
@@ -175,6 +180,15 @@ void LinearDev(Dev d, const Tensor& in, int64_t rows, int64_t in_features, const
   vt::MatmulBT(d.q, o, a, weight);
   if (bias != nullptr && bias->data != nullptr) {
     vt::Add(d.q, o, o, *bias);  // rank-1 row-broadcast == a nn.Linear bias term
+  }
+  if (lora != nullptr) {
+    const int64_t rank = lora->lora_a.shape[0];
+    const int64_t out_features = weight.shape[0];
+    DBuf tmp(d, o.dtype, {rows, rank});
+    vt::MatmulBT(d.q, tmp.t(), a, lora->lora_a);
+    DBuf delta(d, o.dtype, {rows, out_features});
+    vt::MatmulBT(d.q, delta.t(), tmp.t(), lora->lora_b);
+    vt::Add(d.q, o, o, delta.t());
   }
 }
 

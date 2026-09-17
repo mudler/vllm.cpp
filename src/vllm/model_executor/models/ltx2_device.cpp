@@ -65,6 +65,7 @@
 #include "vllm/model_executor/models/dense_device_glue.h"
 #include "vt/backend.h"
 #include "vt/ops.h"
+#include "vllm/model_executor/models/dit_lora.h"
 
 namespace vllm {
 namespace {
@@ -188,7 +189,8 @@ struct Ctx {
 // `weight` is [out_features, in_features], torch's own nn.Linear layout, so
 // y = x @ W^T + b reads straight off the module.
 void LinearDev(Ctx& c, const Tensor& in, int64_t rows, int64_t in_features,
-               const Ltx2LinearWeight& w, Tensor& out) {
+               const Ltx2LinearWeight& w, Tensor& out,
+               const DitRuntimeLoraLayer* lora = nullptr) {
   VT_CHECK(w.weight.rank == 2 && w.weight.shape[1] == in_features,
            "ltx2 device linear: weight shape does not match input width");
   VT_CHECK(w.weight.dtype == c.s,
@@ -200,6 +202,15 @@ void LinearDev(Ctx& c, const Tensor& in, int64_t rows, int64_t in_features,
   vt::MatmulBT(c.d.q, o, a, w.weight);
   if (w.bias.data != nullptr) {
     vt::Add(c.d.q, o, o, w.bias);  // rank-1 row-broadcast == a nn.Linear bias term
+  }
+  if (lora != nullptr) {
+    const int64_t rank = lora->lora_a.shape[0];
+    const int64_t out_features = w.weight.shape[0];
+    DBuf tmp(c.d, c.s, {rows, rank});
+    vt::MatmulBT(c.d.q, tmp.t(), a, lora->lora_a);
+    DBuf delta(c.d, c.s, {rows, out_features});
+    vt::MatmulBT(c.d.q, delta.t(), tmp.t(), lora->lora_b);
+    vt::Add(c.d.q, o, o, delta.t());
   }
 }
 

@@ -330,4 +330,20 @@ struct DitRuntimeLoraState {
   std::map<std::string, DitRuntimeLoraLayer> layers;
 };
 
+// Compute the runtime LoRA delta and add it to the output:
+//   out += (a @ lora_a^T) @ lora_b^T
+//
+// `a` is [rows, in_features] (the reshaped input to the base linear),
+// `lora_a` is [rank, in_features], `lora_b` is [out_features, rank].
+// `out` points to [rows * out_features] f32 values that already hold the base
+// linear output; the delta is added in place. A null `lora` is a no-op.
+//
+// This is the CPU path's delta computation (ROAD-V1-LORA-RUNTIME phase 2).
+// The device path inlines the same formula with DBuf scratch, since device
+// buffer allocation is model-specific. Mirrors vLLM-Omni's base_linear apply
+// (base_linear.py:130-131): base weights are never touched.
+void DitApplyRuntimeLoraDelta(vt::Queue& q, const vt::Tensor& a,
+                               float* out, int64_t rows, int64_t out_features,
+                               const DitRuntimeLoraLayer* lora);
+
 }  // namespace vllm

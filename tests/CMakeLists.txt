@@ -189,6 +189,8 @@ target_include_directories(test_minimax_h3 PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # ROAD-V1-DIT-LORA: H3-specific contract name rewriting (model.diffusion_model.
 # prefix) and load-time fusion through the shared dit_lora seam.
 vllm_cpp_add_test(test_h3_lora vllm/models/test_h3_lora.cpp)
+# ROAD-V1-LORA-RUNTIME: prompt tag parsing and name resolution for runtime LoRA.
+vllm_cpp_add_test(test_dit_runtime_lora vllm/models/test_dit_runtime_lora.cpp)
 # MiniMax-Music3 W1 (#672): the six-component diffusers-arm loader, gated against
 # the REAL checkpoint's headers (minimax_music3_manifest.inc, 1012 tensors, no
 # weight bytes) so CI never needs the 28.5 GB asset.

@@ -81,6 +81,7 @@
 #include <vector>
 
 #include "vt/dtype.h"
+#include "vt/tensor.h"
 
 namespace vllm {
 
@@ -263,5 +264,70 @@ bool IsDitLoraIndexedExtra(const std::string& key);
 // (N >= 2). Use this to pass through the full LoRA family in a conversion that
 // filters extras, so the first adapter is not silently dropped.
 bool IsDitLoraExtra(const std::string& key);
+
+// ── runtime prompt-activated LoRA (ROAD-V1-LORA-RUNTIME) ─────────────────────
+//
+// Load-time fusion (above) bakes adapter deltas into the base weights at load.
+// Runtime activation applies a per-forward additive delta WITHOUT modifying base
+// weights, so different requests can use different LoRAs without reloading.
+//
+// The prompt carries `<lora:name:strength>` tags; the engine strips them,
+// resolves each name to a safetensors file, and applies the delta at each linear
+// projection during the denoise loop. This mirrors vLLM-Omni's
+// DiffusionLoRAManager (per-layer additive delta, base_linear.py:69-134) and
+// LocalAI stable-diffusion.cpp's parse_loras_from_prompt (gosd.cpp:174-330).
+
+// One resolved runtime LoRA spec: a file path and a strength, from parsing
+// prompt tags. Duplicate adapters (same normalized path) accumulate strengths.
+struct DitRuntimeLoraSpec {
+  std::string path;
+  double strength = 1.0;
+};
+
+// The result of parsing prompt tags: the resolved specs and the cleaned prompt
+// (tags stripped, whitespace collapsed).
+struct DitParseLoraResult {
+  std::vector<DitRuntimeLoraSpec> loras;
+  std::string clean_prompt;
+};
+
+// Parse `<lora:name:strength>` tags from `prompt`, resolve each name to a file
+// path via `lora_dir`, and return the specs plus the cleaned prompt.
+//
+// Name resolution mirrors LocalAI sd.cpp's discover_lora_files + fallback chain
+// (gosd.cpp:110-158, 174-330): exact filename in `lora_dir`, absolute path,
+// case-insensitive match, relative path under `lora_dir`, extension probing
+// (`.safetensors`). Duplicate LoRAs (same normalized path) accumulate strengths.
+// A name that cannot be resolved is refused by name.
+DitParseLoraResult DitParseLoraTags(const std::string& prompt,
+                                     const std::string& lora_dir);
+
+// One layer's runtime LoRA factors, already on the compute device. The tensors
+// are non-owning views (`vt::Tensor`); the backing device memory is owned by the
+// model context that constructed the state. `lora_a` is [rank, in_features],
+// `lora_b` is [out_features, rank].
+//
+// The alpha/rank scaling is folded into `lora_b` at load time (mirrors
+// vLLM-Omni's optimize, manager.py:320), so the per-forward delta is a plain
+// `(x @ A^T) @ B^T` with no scaling. The `strength` is the prompt-tag strength,
+// also folded into `lora_b` at load.
+struct DitRuntimeLoraLayer {
+  vt::Tensor lora_a;
+  vt::Tensor lora_b;
+  float strength = 1.0;
+};
+
+// All loaded runtime LoRA layers for one generation, keyed by contract target
+// name (the same name `DitLoraContractName` produces). The forward path looks
+// up each linear's target name via `Find`; a nullptr return means no runtime LoRA
+// applies to that layer.
+struct DitRuntimeLoraState {
+  bool empty() const { return layers.empty(); }
+  const DitRuntimeLoraLayer* Find(const std::string& target) const {
+    auto it = layers.find(target);
+    return it != layers.end() ? &it->second : nullptr;
+  }
+  std::map<std::string, DitRuntimeLoraLayer> layers;
+};
 
 }  // namespace vllm

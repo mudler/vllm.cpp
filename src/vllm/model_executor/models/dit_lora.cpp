@@ -15,9 +15,12 @@
 #include "vllm/model_executor/models/dit_lora.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <map>
+#include <regex>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -498,6 +501,78 @@ std::string ExtraGet(const std::map<std::string, std::string>& extras,
   return it == extras.end() ? std::string() : it->second;
 }
 
+// Resolve a runtime lora adapter name to a file path, mirroring LocalAI sd.cpp's
+// discover_lora_files + fallback chain (gosd.cpp:110-158, 174-330). Tries, in
+// order: absolute path, exact filename in lora_dir, extension probing
+// (.safetensors), case-insensitive scan of lora_dir. A name with a path
+// separator that is not an absolute path is refused to prevent directory
+// traversal. A name that resolves to nothing is refused by name.
+std::string ResolveLoraName(const std::string& name,
+                             const std::string& lora_dir) {
+  namespace fs = std::filesystem;
+
+  auto to_lower = [](std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return s;
+  };
+  static const std::string kExt = ".safetensors";
+  auto has_ext = [&](const std::string& s) {
+    return s.size() > kExt.size() &&
+           s.compare(s.size() - kExt.size(), kExt.size(), kExt) == 0;
+  };
+
+  // Refuse names with path separators (except absolute paths) to prevent
+  // directory traversal.
+  if (!name.empty() && name[0] != '/') {
+    if (name.find('/') != std::string::npos ||
+        name.find('\\') != std::string::npos) {
+      Fail("the lora adapter name '" + name + "' contains a path separator. Only "
+           "simple filenames (resolved against lora_dir) and absolute paths are "
+           "accepted, to prevent directory traversal. Refusing.");
+    }
+  }
+
+  // 1. Absolute path.
+  if (!name.empty() && name[0] == '/') {
+    if (fs::exists(name)) return name;
+    Fail("the lora adapter path '" + name + "' does not exist.");
+  }
+
+  // 2. Exact filename in lora_dir.
+  {
+    fs::path p = fs::path(lora_dir) / name;
+    if (fs::exists(p)) return p.string();
+  }
+
+  // 3. Extension probing: append .safetensors.
+  if (!has_ext(name)) {
+    fs::path p = fs::path(lora_dir) / (name + kExt);
+    if (fs::exists(p)) return p.string();
+  }
+
+  // 4. Case-insensitive scan of lora_dir.
+  {
+    std::string name_lower = to_lower(name);
+    std::string with_ext_lower = name_lower;
+    if (!has_ext(name)) with_ext_lower += kExt;
+    std::error_code ec;
+    if (fs::is_directory(lora_dir, ec)) {
+      for (const auto& entry : fs::directory_iterator(lora_dir, ec)) {
+        if (ec) break;
+        std::string fn_lower = to_lower(entry.path().filename().string());
+        if (fn_lower == name_lower || fn_lower == with_ext_lower) {
+          return entry.path().string();
+        }
+      }
+    }
+  }
+
+  Fail("the lora adapter '" + name + "' was not found. Searched: exact filename in '" +
+       lora_dir + "', extension probing ('.safetensors'), and case-insensitive match "
+       "in '" + lora_dir + "'. Refusing rather than loading a model with no adapter.");
+}
+
 }  // namespace
 
 std::vector<DitLoraSpec> ResolveDitLoraSpecs(
@@ -585,6 +660,80 @@ void DitCheckLorasWereApplied(
        "contract binds, so the delta was computed for none of them — which means the "
        "render would be byte-identical to loading no adapter, while reporting success. "
        "Refusing instead.");
+}
+
+// ── runtime prompt-activated LoRA (ROAD-V1-LORA-RUNTIME) ─────────────────────
+
+DitParseLoraResult DitParseLoraTags(const std::string& prompt,
+                                     const std::string& lora_dir) {
+  DitParseLoraResult result;
+
+  static const std::regex kLoraTag(R"(<lora:([^:>]+):([^>]+)>)");
+
+  std::string clean;
+  size_t last_end = 0;
+
+  for (std::sregex_iterator it(prompt.begin(), prompt.end(), kLoraTag), end;
+       it != end; ++it) {
+    const std::smatch& m = *it;
+    const size_t pos = static_cast<size_t>(m.position());
+    clean += prompt.substr(last_end, pos - last_end);
+    last_end = pos + m.length();
+
+    const std::string name = m[1].str();
+    const std::string strength_str = m[2].str();
+
+    // Parse strength.
+    double strength = 1.0;
+    try {
+      size_t consumed = 0;
+      strength = std::stod(strength_str, &consumed);
+      if (consumed != strength_str.size() || !std::isfinite(strength)) {
+        throw std::invalid_argument("bad strength");
+      }
+    } catch (const std::exception&) {
+      Fail("the lora tag '<lora:" + name + ":" + strength_str +
+           ">' carries strength '" + strength_str +
+           "', which is not a finite number");
+    }
+
+    // Resolve name to a file path.
+    const std::string path = ResolveLoraName(name, lora_dir);
+
+    // Accumulate strength for duplicate adapters (same resolved path).
+    // Mirrors sd.cpp multiplier accumulation (gosd.cpp:300-310).
+    bool found = false;
+    for (auto& spec : result.loras) {
+      if (spec.path == path) {
+        spec.strength += strength;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      result.loras.push_back({path, strength});
+    }
+  }
+
+  // Append remaining text after the last tag.
+  clean += prompt.substr(last_end);
+
+  // Collapse whitespace: replace runs of whitespace with a single space, trim
+  // leading and trailing. Mirrors Go strings.TrimSpace(Join(Fields(s), " ")).
+  std::string collapsed;
+  bool in_ws = true;
+  for (char c : clean) {
+    if (std::isspace(static_cast<unsigned char>(c))) {
+      if (!in_ws) { collapsed += ' '; in_ws = true; }
+    } else {
+      collapsed += c;
+      in_ws = false;
+    }
+  }
+  if (!collapsed.empty() && collapsed.back() == ' ') collapsed.pop_back();
+
+  result.clean_prompt = collapsed;
+  return result;
 }
 
 }  // namespace vllm

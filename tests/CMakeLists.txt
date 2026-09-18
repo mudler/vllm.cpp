@@ -856,6 +856,14 @@ vllm_cpp_add_test(test_deepseek_v4_compressor vllm/models/test_deepseek_v4_compr
 # from-first-principles double-precision derivation. Full-model gate multi-Spark-
 # blocked; MoE/device-kernel are W6/W7 (.agents/specs/deepseek-v4-flash.md).
 vllm_cpp_add_test(test_deepseek_v4_mhc vllm/models/test_deepseek_v4_mhc.cpp)
+# DeepSeek-V4.1-Flash W3a — Engram: the n-gram hash over a compressed token
+# vocabulary, the prime bucket layout, the sharded fp8 / ue8m0 table lookup and
+# the sigmoid gate that injects the lookup into the hyper-connection manifold.
+# Ports tests/kernels/test_engram.py @ vLLM e77daef89e (778 lines), including
+# its two scalar oracles and their rtol=0/atol=0 tolerances; adds the ue8m0
+# byte-0 case its own fixtures cannot reach, and the prime-layout case upstream
+# leaves ungated (.agents/specs/deepseek-v4-1-flash.md, wave W3a).
+vllm_cpp_add_test(test_deepseek_v4_1_engram vllm/models/test_deepseek_v4_1_engram.cpp)
 # DeepSeek-V4-Flash W6 — the sqrtsoftplus + hash-routed MoE: the V4 router score
 # function (sqrt∘softplus), the noaux_tc bias-for-selection top-k, the hash
 # `tid2eid` route that bypasses top-k, and the clamped SwiGLU expert activation.

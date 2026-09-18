@@ -56,6 +56,29 @@ inline constexpr int kMxfp4GroupSize = 32;
 // QAT scales are always finite, but it is returned as NaN, not silently 2^128.
 float E8M0ToF32(uint8_t byte);
 
+// Decode one UE8M0 scale byte to f32 by BITCAST, the second of the two decodes
+// upstream uses. `vllm/models/deepseek_v4_1/common/engram.py:613-614` is
+// `scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)`, with the
+// comment "ue8m0 is a power of two, so its byte *is* the fp32 exponent field".
+//
+// The two forms agree for every byte in [1, 254] and differ at both ends:
+//   byte 0    bitcast -> +0.0            arithmetic -> 2^-127
+//   byte 255  bitcast -> +inf            arithmetic -> NaN (the OCP encoding)
+// Neither is wrong; they belong to different arms. MXFP8 decodes arithmetically
+// (`quantization/utils/mxfp8_utils.py:66`, and `:129-130` comments that it is
+// aware `sb == 0` yields 2^-127), and `E8M0ToF32` above serves that arm and its
+// two production callers — `mxfp4_dequant.cpp:63` and `nvfp4_dequant.cpp:122`,
+// counting invocations of `vllm::E8M0ToF32` under `src/` and `include/` and
+// excluding tests, comments and the unrelated `E8M0ToF32Half` /
+// `DE8M0ToF32Half` GGUF helpers. An earlier revision of this comment said
+// "six", which nothing in the tree supported.
+// Engram decodes by bitcast and needs +0.0 at byte 0. Do NOT merge
+// the two: nothing upstream pins them against each other, so no ported test
+// would catch a wrong choice. Row
+// `MODEL-MM-deepseek-v4-1-deepseek-v41-for-causal-lm`, issue
+// `ISSUE-LOCAL-01M2C40RNXB871VW0E560PVBFA`.
+float E8M0BitsToF32(uint8_t byte);
+
 // Dequantize a compressed-tensors MXFP4 weight matrix to bf16.
 //
 //   packed          [out_dim, in_dim/2]   U8, two E2M1 (fp4) per byte,

@@ -576,3 +576,44 @@ and `sha256sum -c`-verified after every mutation.
 The engine leg ran on **CPU** on the developer box. This change touches no
 device path, and the CUDA and Metal legs of §5/§5a are unaffected by it, but
 they were not re-run: no GPU lease was taken for this repair.
+
+## 8e. What §8 did NOT close (2026-09-18)
+
+§8 repaired ONE licence, in ONE file. The fresh review of
+[#2981](https://github.com/mudler/vllm.cpp/issues/2981) found the same shape
+elsewhere and filed it rather than widening that pull request. Both findings
+were re-verified against `7fa861392` on 2026-09-18 and both still hold.
+
+- **Four sibling SACRED gates still carry the pre-§8 form** —
+  `ISSUE-GH-2987`, owed below. `test_deepseek_v2_paged_engine.cpp:229-252`,
+  `test_glm4_moe_lite_paged_engine.cpp:141-162`,
+  `test_qwen3_32b_nvfp4a16_paged_engine.cpp:251-272` each keep the
+  `int64_t multi_cells = -1` sentinel inside `if (fs::exists(...))`, and
+  `test_qwen3coder_paged_engine.cpp:158` keeps the guard without the sentinel.
+  None of the four carries the `DK >= kMinDeterminismRuns` floor §8b added, so
+  the degenerate `K=1` capture licenses all four.
+- **§8's sentence "The sibling guard eleven lines earlier was already correct"
+  is too strong** —
+  [#2988](https://github.com/mudler/vllm.cpp/issues/2988), owned by this row.
+  That guard asserts NOTHING rather than asserting something unlicensed: with
+  `greedy_ids.npy` removed the case reports
+  `assertions: 0 | 0 passed | 0 failed | Status: SUCCESS!` at rc 0 on both the
+  pre-§8 and post-§8 binaries. The ctest entry, now at
+  `tests/CMakeLists.txt:3871-3875`, carries no `FAIL_REGULAR_EXPRESSION`, and
+  the case returns rather than exiting 77, so `SKIP_RETURN_CODE 77` never
+  fires. Removing `p3_prompt.i32` likewise drops the post-§8 binary from 43 to
+  42 assertions and still reports SUCCESS. Less bad than an unlicensed bar is
+  not correct.
+
+Neither is repaired here. Each of the four in the first bullet is another row's
+correctness bar, and repairing a bar belongs to the row that owns it.
+
+## Owed
+
+- `ISSUE-GH-2987` — the §8 licence treatment owed to the four sibling SACRED
+  gates named above. Filed rowless because the four gate files belong to four
+  different model rows and a `Row:` field holds one value, so no single row can
+  own it without misattributing the other three quarters; this spec anchors it
+  because §8b is the treatment that closes it. Each of the four needs its own
+  red-before on its owning row: remove the licence file and confirm the gate
+  reds instead of passing at a reduced assertion count.

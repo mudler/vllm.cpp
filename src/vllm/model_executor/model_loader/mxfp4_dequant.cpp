@@ -6,6 +6,7 @@
 #include "vllm/model_executor/model_loader/mxfp4_dequant.h"
 
 #include <cmath>
+#include <cstring>
 #include <limits>
 
 #include "vt/dtype.h"  // VT_CHECK, F32ToBF16
@@ -19,6 +20,21 @@ float E8M0ToF32(uint8_t byte) {
   if (byte == 0xFFU) return std::numeric_limits<float>::quiet_NaN();
   // ldexp(1, e) == 2^e exactly for e in [-127, 127] (finite normal f32 range).
   return std::ldexp(1.0F, static_cast<int>(byte) - 127);
+}
+
+float E8M0BitsToF32(uint8_t byte) {
+  // The BITCAST decode, `engram.py:613-614`:
+  //   scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+  // "ue8m0 is a power of two, so its byte *is* the fp32 exponent field."
+  // Byte 0 therefore yields +0.0 and byte 255 yields +inf, where the arithmetic
+  // `E8M0ToF32` above yields 2^-127 and NaN. Both are in use upstream, on
+  // different arms; see the header for which arm takes which.
+  float value = 0.0F;
+  const uint32_t bits = static_cast<uint32_t>(byte) << 23U;
+  static_assert(sizeof(float) == sizeof(uint32_t),
+                "E8M0BitsToF32 assumes a 32-bit float");
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
 }
 
 namespace {

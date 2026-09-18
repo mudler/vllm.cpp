@@ -816,6 +816,16 @@ target_include_directories(test_deepseek_v4_1_scaffold PRIVATE ${CMAKE_SOURCE_DI
 # `gguf_builder.h` is the shared in-memory GGUF fixture builder under tests/vllm.
 target_include_directories(test_deepseek_v4_1_scaffold PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm)
 
+# DeepSeek-V4.1-Flash W3c (indexer arm) + W3d (`kv_source_layer`-keyed KV
+# topology) host-reference gate. Ports the three upstream `indexer_k_store`
+# cases and the `fused_q_kv_rmsnorm` case at `e77daef89e`, and gates the
+# topology -- which has NO upstream test at all -- against the real published
+# config.json. No checkpoint / GPU.
+vllm_cpp_add_test(test_deepseek_v4_1_indexer vllm/models/test_deepseek_v4_1_indexer.cpp)
+target_compile_definitions(test_deepseek_v4_1_indexer PRIVATE
+  DEEPSEEK_V4_1_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/deepseek_v4_1")
+target_include_directories(test_deepseek_v4_1_indexer PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 # DeepSeek-V4-Pro shape-generality gate (#504): the Pro config descends through
 # the SAME ParseDeepseekV4Params with zero new keys, and compress_ratios alone
 # reproduces the compressor/indexer layer counts of BOTH real checkpoints

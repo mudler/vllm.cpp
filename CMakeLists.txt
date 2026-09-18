@@ -809,6 +809,11 @@ add_library(vllm STATIC
   # radius. W1 only: config descent + registration, every other arm refuses.
   src/vllm/model_executor/models/deepseek_v4_1_registry.cpp
   src/vllm/model_executor/models/deepseek_v4_1.cpp
+  # W3c (indexer arm) + W3d (`kv_source_layer`-keyed KV topology) host
+  # references. Nothing reaches them yet: W4 owns the host forward that
+  # composes W3a-W3f (ISSUE-LOCAL-01M2TMSCJJH7X8WZAM58PB3PMB, and the spec's
+  # `## Owed`).
+  src/vllm/model_executor/models/deepseek_v4_1_indexer.cpp
   src/vllm/model_executor/models/deepseek_v4_weights.cpp
   src/vllm/model_executor/models/deepseek_v4_vision_weights.cpp
   src/vllm/model_executor/models/deepseek_v4.cpp

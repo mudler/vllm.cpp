@@ -288,7 +288,7 @@ layer 20, which is also `candidate_source_layer_id`. But
 CROSS-LAYER SHARING, and both references say so in nearly the same words. The
 release's own `inference/model.py:82-84` comments them as "layers sharing a
 ratio also share one compressed KV and one indexer, produced by the first", and
-vLLM's `deepseek_v4_1/attention.py:244-291` at `e77daef89e` as "Compressors and
+vLLM's `deepseek_v4_1/attention.py:244-292` at `e77daef89e` as "Compressors and
 compressed-KV caches live only on `kv_source_layer_ids`; indexers only on
 `index_source_layer_ids`. Consumers reuse the most recently published source
 below them", resolving each consumer as
@@ -792,6 +792,39 @@ that ends in a claim.
   which is where the model state and its `prepare_inputs` land. Owned by this
   row, so it is deliberately NOT written as an owed local ID here, for the
   reason the `QUANT-GGUF-Q1_0` bullet above states.
+- **W3c/W3d landed UNREACHED, and this bullet is the disclosure AGENTS.md
+  §"Nothing lands dead" requires.** `deepseek_v4_1_indexer.{h,cpp}` carries the
+  indexer-K host op, the q/kv RMSNorm, the layer and model topology and the
+  per-layer RoPE selection. Its issue is row-owned and therefore NOT cited by id
+  here -- `## Owed` carries rowless ids only, which `issue_records.py:519`
+  enforces -- so the id lives in the landing commit body and in the file header,
+  which is where AGENTS.md puts it.
+  No production entry point calls any of them at their merge commit. The ROW
+  that owes the wiring is this one,
+  `MODEL-MM-deepseek-v4-1-deepseek-v41-for-causal-lm`; inside it, WAVE **W4**
+  owns the host forward that composes W3a-W3f and is what will call them. W4 is
+  a wave and not a row, and AGENTS.md §"Nothing lands dead" asks for the row, so
+  both are written here.
+  The gate is a unit gate over hand-built inputs, which proves that the
+  functions work and never that anything reaches them.
+- **Owed PERF, not a correctness gap: the MXFP8 query-quant fusion.**
+  `query_quant.py`'s `fused_q_kv_rmsnorm_quant` folds the MXFP8 activation
+  quantization into the norm, and `can_fuse_query_quant` (`query_quant.py:127`)
+  refuses it off CUDA and again off a FlashInfer CUTLASS/CuTeDSL MXFP8 linear.
+  `attention.py:602` therefore takes the plain `fused_q_kv_rmsnorm` branch
+  everywhere a host reference runs, so the host port is CORRECT and the fusion
+  is a Blackwell throughput arm that `W5` owns.
+- **Owed record repair: W3d's cache counts.** The `## Work breakdown` W3d row
+  says "Only FOUR compressed-KV caches and FOUR indexer-K caches exist (layers
+  2/8/14/20)". The cache counts are right; what the row omits is that
+  `index_source_layer_ids` has **EIGHT** entries `[2,8,14,20,24,28,32,36]`, so
+  EIGHT layers carry an indexer while only four ALLOCATE a K cache. The other
+  four (24/28/32/36) read layer 20's, because only a kv source owns the
+  `wk`/`k_norm` pair that produces keys (`attention.py:371-395`). Measured
+  2026-09-18 against the checked-in `config.json` fixture. The correction lives
+  in `deepseek_v4_1_indexer.h` and is executable in
+  `test_deepseek_v4_1_indexer.cpp`; rewriting the row's prose is owed to the
+  next change that edits that table.
 
 ## Stop conditions
 

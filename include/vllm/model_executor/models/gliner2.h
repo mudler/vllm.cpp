@@ -123,4 +123,29 @@ BoundaryMarginals BoundaryQueryHeadForward(
     const std::vector<float>& query_states, int64_t num_queries);
 
 }  // namespace gliner2
+
+// ── Production model (Phase 3b: registration) ───────────────────────────
+// Forward declarations to keep this header free of the safetensors and
+// config includes.
+class SafetensorsFile;
+struct HfConfig;
+
+// Combined model weights: the DeBERTa v2 encoder + the boundary head, with
+// their parsed configs. Materialized from a safetensors checkpoint by
+// LoadGliner2Weights and owned by Gliner2LoadedModel.
+struct Gliner2ModelWeights {
+  deberta_v2::Params encoder_params;
+  deberta_v2::Weights encoder_weights;
+  gliner2::BoundaryParams boundary_params;
+  gliner2::BoundaryHeadWeights boundary_head;
+};
+
+// Production weight loader: reads all F32 tensors from the safetensors
+// shards, infers the DeBERTa encoder config from weight shapes (falling
+// back to mdeberta-v3-base defaults for fields the checkpoint does not
+// carry), reads the boundary head config from config.raw["boundary_head"],
+// and calls deberta_v2::Load + gliner2::LoadBoundaryHead.
+Gliner2ModelWeights LoadGliner2Weights(
+    const std::vector<SafetensorsFile>& shards, const HfConfig& config);
+
 }  // namespace vllm

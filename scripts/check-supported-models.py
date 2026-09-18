@@ -53,13 +53,13 @@ REGISTER_RE = re.compile(
     r"""REGISTER_VLLM_MODEL\(\s*[A-Za-z0-9_]+\s*,\s*"([^"]+)"""
 )
 
-# Every registrable architecture string ends in one of these HF class suffixes;
-# the arch key in the FEATURES table is written verbatim in backticks. If a
-# future registered arch stops matching this, the self-check below fails loudly
-# rather than silently dropping it from the comparison.
+# Every registrable architecture string ends in one of these HF class suffixes
+# (or the GLiNER2 "Extractor" suffix); the arch key in the FEATURES table is
+# written verbatim in backticks. If a future registered arch stops matching this,
+# the self-check below fails loudly rather than silently dropping it.
 ARCH_TOKEN_RE = re.compile(
     r"`([A-Za-z0-9_]+(?:For(?:CausalLM|ConditionalGeneration|CTC|RNNT|TDT)"
-    r"|Model))`"
+    r"|Model|Extractor))`"
 )
 
 

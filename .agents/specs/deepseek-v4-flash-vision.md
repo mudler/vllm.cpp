@@ -809,8 +809,97 @@ recorded with its verbatim message and the work stops there. No cause is
 guessed, and the blocker table in `## Owed` gains a row rather than a claim.
 
 ## Owed
-- **A CUDA BUILD DIES AT ENGINE CONSTRUCTION ON THE 4/4/8 GROUPS, AND THAT WALL
-  IS EARLIER THAN EVERY BLOCKER THIS SPEC PREVIOUSLY NAMED.** Measured
+- **SUPERSESSION HEADER, 2026-09-18: THE RELEASED CHECKPOINT NOW LOADS AND
+  GENERATES THROUGH `vllm-cli` ON A CUDA `sm_110` BUILD, AND THE TWO WALLS THE
+  NEXT TWO BULLETS DESCRIBE ARE BOTH FALSIFIED AS THE CURRENT STOPPING POINT.
+  Nothing below is deleted; this entry says what falsified it and how far the
+  new result actually goes.**
+
+  **THE MEASUREMENT.** rc job `1ec05714-8cbd-41d6-8c45-9396f4d92223`,
+  `thor:gpu0` (NVIDIA Thor, compute_cap 11.0, driver 595.78, aarch64, 14 cpu,
+  122 GiB), 2026-09-18T17:42:56Z-18:57Z. Head
+  `7722c8c716f91be2188408d688e0cc5f3268c6f1`, verified ON THE WORKER by
+  re-hashing the extracted tree with `git write-tree` ->
+  `852f827f5bab1ac85b96a436f20e4e39c9ddf464`, not by trusting a label. Build
+  `Release` with **NDEBUG DEFINED** (compiled probe `rc=7`),
+  `-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110`, nvcc 13.0, 41
+  `.cu.o`, `fa2: DISABLED` (sm_110 is outside the FA-2 arch set), `BUILD_RC=0`
+  with every binary newly linked, cli md5 `964ef06d43231e8125673dae0fdfbc3c`,
+  device-kernel gate probe `PROBE_RC=0` at 31 cases / 90,193 assertions / 0
+  skipped. Artifact byte-verified on the worker: 5,305,248 + 49,991,832,128 +
+  32,441,484,736 = 82,438,622,112 B plus mmproj 934,462,656 B, from
+  `unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF` @
+  `b977d3c0ea2da58dbc12ddae8fb8951a7b3854d0`.
+
+  `vllm-cli --model .../DeepSeek-V4-Flash-Vision-Exp-UD-IQ1_S-00001-of-00003.gguf
+  --device cuda --prompt 'The capital of France is' --max-tokens 8
+  --temperature 0` exits `0` with 14 bytes on stdout, hexdump
+  `2050 6172 6973 0a23 0a23 0a23 0a0a` = `" Paris\n#\n#\n#\n\n"`,
+  `finish_reason=length prompt_tokens=5 completion_tokens=8 secs=215.981
+  tok_s=0.037`, peak RSS 77,631,316 kB (74.03 GiB), wall 1607 s of which
+  ~1391 s is load.
+
+  **WHAT FALSIFIED THE BLOCK-SIZE BULLET, asserted rather than assumed.** The
+  `vllm_engine_load: Block size must be a multiple of 16.` refusal is ABSENT
+  from this run, and the run reaches
+  `vllm.cpp: Asynchronous scheduling is enabled (max_concurrent_batches=2)`,
+  which only prints once the engine is BUILT. The first three log lines are
+  byte-identical to the 2026-09-13 run, so this is the same load reaching
+  further and not a different configuration. The per-group attention-backend
+  dispatch that landed on 2026-09-18 is what removed it, and the caveat its
+  row-owned issue carried -- "only a leased run against the real
+  82,438,622,112-byte artifact can show that the load gets past engine
+  construction there" -- is now answered. That issue is in this row's issue
+  directory; its ID is deliberately not repeated in this section, which is
+  reserved for rowless `_owed` IDs.
+
+  **THE EXPECTED W7-DEVICE WALL WAS ALSO REFUTED.**
+  `V4DeviceKernelsAvailable()` was TRUE on this build, so
+  `deepseek_v4.cpp:4658` `kDevicePending` never fired. The prediction that it
+  would be the next wall is wrong and is recorded here rather than removed from
+  where it was made.
+
+  **`kv_cache_coordinator.cpp:386` HAS STILL NEVER EXECUTED, AND THIS RUN DOES
+  NOT CHANGE THAT.** Release compiles the bare
+  `assert(block_size == hash_block_size)` out. The seven-group topology STILL
+  VIOLATES that equality; this build merely cannot say so. Record it as
+  **UNENFORCED, NOT SATISFIED**. A debug-assert build against the released
+  checkpoint would answer it and HAS NOT BEEN RUN. The hash-granularity port in
+  the second bullet below is therefore still owed, unchanged.
+
+  **WHAT THIS RESULT IS NOT, stated before anything reads it as a win.** It is
+  a LIVENESS result and not a correctness one. **ONLY THE FIRST TOKEN IS
+  MEANINGFUL**: ` Paris` is the right continuation, `#\n#\n#` is filler.
+  **NO ORACLE GATED THIS OUTPUT** -- no llama.cpp run, no vLLM run, no
+  comparison of any kind -- so it MUST NOT be recorded or cited as token
+  parity. `tok_s=0.037` is **NOT a speed claim**: there is no A/B, no
+  denominator, and the wall is load-dominated. No image was sent, so no
+  multimodal result exists for the released checkpoint either.
+
+  **`vllm-server` IS UNMEASURED IN EITHER DIRECTION on this run.** Its
+  readiness poll was 600 s against a ~1390 s load, so the server was still
+  loading when it was curled and killed, and `srv-completion.json` is 0 bytes.
+  That is an instrument limit, not a server refusal and not a server pass.
+
+  **THE `--device cpu` ARM STILL REFUSES, AT A NEW AND LATER WALL.** On the
+  same binary and artifact the aarch64 CPU load now gets past engine
+  construction and dies at the FIRST FORWARD with
+  `vt: deepseek-v4 keep-quant expert/group slice requires non-repacked blocks
+  (disable VT_CPU_QUANT_REPACK for the stacked-expert weights) at
+  src/vllm/model_executor/models/deepseek_v4.cpp:631` -- the
+  `VT_CHECK(!w.repacked, ...)` in `GemmRowSlice`, because the i8mm repack
+  auto-enables at load on an aarch64 CPU device and the stacked-expert
+  row-slice GEMM refuses a repacked block. It has its own row-owned issue under
+  `.agents/issues/MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm/`, named in
+  `## Now`; the ID is deliberately not repeated in this section, which is
+  reserved for rowless `_owed` IDs.
+- **SUPERSEDED 2026-09-18 AS THE CURRENT STOPPING POINT (see the supersession
+  header at the head of `## Owed`): this refusal is ABSENT from the `thor:gpu0`
+  CUDA `sm_110` run, which builds the engine and generates. The entry is kept
+  unchanged below because it is the record of how the wall was found and what it
+  cost to remove.** A CUDA BUILD DIES AT ENGINE CONSTRUCTION ON THE 4/4/8
+  GROUPS, AND THAT WALL IS EARLIER THAN EVERY BLOCKER THIS SPEC PREVIOUSLY
+  NAMED. Measured
   2026-09-14, rc job `fc593c9f-f550-4f1a-9adf-a8c734f48822`, `dgx:gpu0`, worker
   `rc-worker-m6z8s`, GB10, driver 580.173.02, compute_cap 12.1, base
   `f1dd76c8b680ee8a20f89f4070adf61db3671f32`, arch `121a`, fa2 ENABLED, CUTLASS
@@ -893,8 +982,16 @@ guessed, and the blocker table in `## Owed` gains a row rather than a claim.
   architecture on ANY backend in this tree. The upstream caveat is recorded with
   the measurement: the local vLLM checkout is at the PRIOR pin `5559679229` with
   a dirty tree, and every line above was read as a blob AT `e126687a9a`.
-- **A MULTI-GROUP DeepSeek-V4 STILL CANNOT PREFIX-CACHE, AND THE COORDINATOR
-  ASSERT THAT WOULD STOP IT IS LATENT BEHIND THE fp8_ds_mla REFUSAL.** This
+- **THE HEADLINE OF THIS ENTRY IS STALE AS OF 2026-09-18 AND THE BODY IS NOT:
+  the `fp8_ds_mla` refusal is no longer what the assert is latent behind, since
+  the released checkpoint now builds its engine and generates on CUDA
+  `sm_110`. What is UNCHANGED is the part that matters — `kv_cache_coordinator.cpp:386`
+  has still never EXECUTED, because Release compiles the bare `assert` out and
+  that run was Release. The equality is UNENFORCED, not satisfied, and the
+  hash-granularity port below is still owed. The original headline and body
+  follow.** A MULTI-GROUP DeepSeek-V4 STILL CANNOT PREFIX-CACHE, AND THE
+  COORDINATOR ASSERT THAT WOULD STOP IT IS LATENT BEHIND THE fp8_ds_mla
+  REFUSAL. This
   entry previously said a real Flash checkpoint ABORTS in
   `HybridKVCacheCoordinator`. **That was a prediction and it is false**, measured
   2026-09-13 through `LoadedEngine::FromModelDir` on a fixture carrying real
@@ -1267,7 +1364,7 @@ guessed, and the blocker table in `## Owed` gains a row rather than a claim.
   | 2 | `DeepSeek-V4 vision queue and weights must share one device` | **CLOSED by W7-CUDA.** See `### W7-CUDA evidence` |
   | 3 | the host GEMM's weight size mismatch, thrown as the anonymous `vt: MatVec weight size mismatch` until it was named | **CLOSED.** Named, then root-caused to `ForwardDevice` never binding the keep-quant tower, then repaired. Measured gone on `thor:gpu0`, rc job `1b46515d-8caf-4c49-823e-efc7a1f3e3f4`. This entry |
   | 4 | `deepseek-v4 MoE: this step carries image rows, which route on the vision bias `exp_probs_b_vl`, and the device router takes one bias for the whole call with no per-row selector` | **CLOSED by W7-CUDA.** `route` and `route_ip` take `vision_bias` + `is_media_token` and both CUDA kernels select per row, so the step is SERVED rather than refused. `thor:gpu0`, rc job `bc9c74ce-e9f6-47e1-bde0-bb0939ad0ed8`: `image: served`, aarch64 repack ON and OFF alike |
-  | 5 | — | **NO FURTHER BLOCKER IS KNOWN ON THE SYNTHETIC FIXTURE.** With blocker 4 closed `test_deepseek_v4_mm_chat` returns an answer. This says nothing about the RELEASED checkpoint, which this row has still never served, and the blocker order has moved five times already — so this row is "none known", never "none exists" |
+  | 5 | — | **UPDATED 2026-09-18: the released checkpoint HAS now been served on CUDA `sm_110` — `vllm-cli` emits ` Paris` as its first token (rc job `1ec05714-8cbd-41d6-8c45-9396f4d92223`), so the sentence below saying this row has never served it is superseded and kept for provenance. That run is LIVENESS only: no oracle gated it, and no image was sent. The live blocker is now the `--device cpu` arm, which refuses at `deepseek_v4.cpp:631` on repacked stacked-expert blocks.** NO FURTHER BLOCKER IS KNOWN ON THE SYNTHETIC FIXTURE. With blocker 4 closed `test_deepseek_v4_mm_chat` returns an answer. This says nothing about the RELEASED checkpoint, which this row has still never served, and the blocker order has moved five times already — so this row is "none known", never "none exists" |
 
   **THE EXACT FAILING INVOCATION.** `test_deepseek_v4_mm_chat`'s served image
   request died with
@@ -2464,6 +2561,22 @@ The reader is not reached from production. `## Owed` names what is unreached,
 the row that owns the wiring and issue #2411.
 
 ## Now
+
+**2026-09-18: THE RELEASED CHECKPOINT PRODUCED A TOKEN THROUGH A PRODUCTION
+ENTRY POINT FOR THE FIRST TIME.** On `thor:gpu0`, rc job
+`1ec05714-8cbd-41d6-8c45-9396f4d92223`, a CUDA `sm_110` Release build of head
+`7722c8c716f91be2188408d688e0cc5f3268c6f1` loaded the 82,438,622,112-byte
+UD-IQ1_S artifact through `vllm-cli` and emitted ` Paris` for `The capital of
+France is`. **This is LIVENESS, not parity**: only the first token is
+meaningful, the rest is filler, NO ORACLE gated it, and `tok_s=0.037` is not a
+speed claim. It falsifies two records this spec carried — the engine-construction
+block-size wall and the expected `deepseek_v4.cpp:4658` W7-device wall — and it
+does NOT close `kv_cache_coordinator.cpp:386`, which Release still compiles out
+and which has still never executed. `vllm-server` remains unmeasured. The
+`--device cpu` arm on aarch64 refuses at the first forward at
+`deepseek_v4.cpp:631`, tracked as
+`ISSUE-LOCAL-01M2TYBE9TWX09XG62QVA5TXHZ`. The supersession header at the top of
+`## Owed` carries the full build recipe, the hexdump and the caveats.
 
 `ACTIVE`. W1, W2, W3, W4 and W5 have landed on the row branch, W6 ran the first
 real-weight gates, and W7-CUDA has run the first DEVICE ones.

@@ -50,6 +50,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -60,6 +61,9 @@
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/core/kv_cache_utils.h"
 #include "vllm/v1/kv_cache_interface.h"
+#include "vllm/v1/attention/backend.h"
+#include "vllm/v1/attention/registry.h"
+#include "vllm/v1/worker/gpu/runner.h"
 
 namespace {
 
@@ -384,6 +388,23 @@ TEST_CASE("dsv4_multigroup_construct_child" * doctest::skip()) {
     std::fflush(stdout);
     std::_Exit(0);
   }
+  // MODEL-MM-deepseek-v4 per-group attention-backend dispatch
+  // (ISSUE-LOCAL-01M2EMPC6T63TVDPQ90GVPRC5F): report the backend the runner
+  // RESOLVED for each published cache, beside that cache's own block size. This
+  // is read from `LoadedEngine::runner()`, so it is the engine's own resolution
+  // on the DEFAULT configuration and not a second computation of it.
+  if (engine != nullptr) {
+    const vllm::v1::GPUModelRunner& runner = engine->runner();
+    const std::vector<std::string>& names = runner.attn_backend_names();
+    const std::vector<vllm::PagedKvCache>& caches = runner.attn_kv();
+    std::string line = "BACKENDS=";
+    for (size_t i = 0; i < names.size(); ++i) {
+      if (i != 0) line += ";";
+      line += (names[i].empty() ? std::string("-") : names[i]) + ":" +
+              std::to_string(i < caches.size() ? caches[i].block_size : -1);
+    }
+    std::printf("%s\n", line.c_str());
+  }
   std::printf("CONSTRUCT=%s\n", engine != nullptr ? "ok" : "null");
   std::fflush(stdout);
   std::_Exit(0);
@@ -476,4 +497,266 @@ TEST_CASE("serve: an EXPLICIT --kv-cache-dtype on the same topology is still ref
   // as a hash-block-size complaint instead, the refusal order moved and every
   // comment above it is stale.
   CHECK(message.find("hash_block_size") == std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// (4) THE WALL A REAL CHECKPOINT MEETS ON A CUDA BOX, AND THE UPSTREAM SHAPE
+//     THAT REMOVES IT. ISSUE-LOCAL-01M2EMPC6T63TVDPQ90GVPRC5F.
+//
+// MEASURED 2026-09-14 on `dgx:gpu0` (GB10, sm_121a, Release/NDEBUG, rc job
+// fc593c9f) against the real 82,438,622,112-byte
+// `unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF` @ `b977d3c0ea2d`: the tower
+// materialized (VmHWM 79.6 GiB, 886 s) and the engine then died, verbatim:
+//
+//   vllm-cli: model load failed (status 2): vllm_engine_load: Block size must
+//   be a multiple of 16.
+//
+// WHICH BACKEND FIRED, since the string is emitted byte-identically at THREE
+// sites (`backend.cpp:253`, `:268`, `:279`) and the log names none of them.
+// Every group this factory publishes is FUSED — `MLAAttentionSpec` or
+// `SlidingWindowMLASpec` — so `runner.cpp:1412` marks all nine caches MLA and
+// the view loop takes the `is_mla` arm for every one of them. That arm resolved
+// the MLA backend ONCE and cached it (`mla_backend_resolved`), so the first
+// group (256 tokens) resolved `TRITON_MLA` and the 4/4/8 groups inherited it:
+// `backend.cpp:279`. On a CPU box the same arm resolves NOTHING (no MLA backend
+// is registered for `kCPU`), the name is empty, and `CheckKvCacheShape` is
+// skipped entirely — which is why this suite was green on a defect that stops
+// every CUDA load. BOTH OUTCOMES ARE THE SAME DEFECT: one backend is asked
+// about a group it does not serve.
+//
+// UPSTREAM DISPATCHES PER GROUP, and that is what this case pins. The LAYER
+// names its own backend (`gpu_model_runner.py:7150`,
+// `layers[layer_name].get_attn_backend()`, keyed at `:7170`): the compressor
+// states name `CompressorBackend`, which declares `[MultipleOf(1)]`
+// (`compressor.py:66-68`, `:189-190`), the SWA cache names
+// `DeepseekSparseSWABackend` at `[MultipleOf(64)]` (`sparse_swa.py:116-118`,
+// `:126-128`), and the indexer key cache names `DeepseekV4IndexerBackend` at
+// `[256]` (`indexer.py:194-196`). Upstream has NO global 16-multiple rule at
+// all: the default is `[MultipleOf(1)]` (`backend.py:72-74`) and the 16 is a
+// per-backend override in exactly three backends (`triton_attn.py:314`,
+// `triton_mla.py:152`, `rocm_aiter_unified_attn.py:53`).
+//
+// READ THE COUNTS, NOT THE BANNER, and read this case's FAILURE MESSAGE: a
+// green here means the engine resolved a backend that ACCEPTS each group's own
+// block size. It does not mean that backend has a kernel. Nothing dispatches on
+// `attn_backend_names_` yet (`runner.cpp`, owed to #1332 M4), and the DSA
+// forward is the model's own op path.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Parse `BACKENDS=name:block;name:block;...` out of the child's stream.
+std::vector<std::pair<std::string, int>> ParseBackends(const std::string& out) {
+  std::vector<std::pair<std::string, int>> parsed;
+  const std::size_t at = out.find("BACKENDS=");
+  if (at == std::string::npos) return parsed;
+  const std::size_t eol = out.find('\n', at);
+  const std::string line =
+      out.substr(at + 9, eol == std::string::npos ? std::string::npos
+                                                  : eol - (at + 9));
+  std::size_t pos = 0;
+  while (pos <= line.size() && !line.empty()) {
+    const std::size_t sep = line.find(';', pos);
+    const std::string entry =
+        line.substr(pos, sep == std::string::npos ? std::string::npos : sep - pos);
+    const std::size_t colon = entry.rfind(':');
+    if (colon != std::string::npos) {
+      parsed.emplace_back(entry.substr(0, colon),
+                          std::atoi(entry.c_str() + colon + 1));
+    }
+    if (sep == std::string::npos) break;
+    pos = sep + 1;
+  }
+  return parsed;
+}
+
+}  // namespace
+
+TEST_CASE("serve: every DeepSeek-V4 KV group resolves a backend that ACCEPTS its own block size") {
+  const ChildOutcome child = RunConstructChild();
+  INFO("child output:\n" << child.output);
+
+  // This case is about what the engine resolved, so it needs an engine. In a
+  // build where the deferral assert is live the child dies BEFORE it can report,
+  // and that outcome is case (2)'s to assert, not this one's.
+  if (kDeferralAssertLive) return;
+  REQUIRE(child.output.find("CONSTRUCT=ok") != std::string::npos);
+
+  const std::vector<std::pair<std::string, int>> resolved =
+      ParseBackends(child.output);
+  // Nine caches: 2 latent + 1 indexer key + 3 SWA + 3 compressor states, in the
+  // factory's publication order (`deepseek_v4_registry.cpp:546-556`).
+  REQUIRE(resolved.size() == 9);
+
+  // (i) THE PROPERTY, per cache. A backend the engine RESOLVED for a group must
+  // accept that group's block size. Asked of the backend by name, through the
+  // same registry `CheckKvCacheShape` uses, so a name that no device registers
+  // fails here rather than at a customer's engine construction.
+  const vt::DeviceType device = vt::DeviceType::kCPU;
+  for (std::size_t i = 0; i < resolved.size(); ++i) {
+    const std::string& name = resolved[i].first;
+    const int block = resolved[i].second;
+    CAPTURE(i);
+    CAPTURE(name);
+    CAPTURE(block);
+    if (name == "-") continue;  // op-driven: no backend was consulted
+    REQUIRE(vllm::v1::HasAttentionBackend(device, name));
+    const std::unique_ptr<vllm::v1::AttentionBackend> backend =
+        vllm::v1::MakeAttentionBackend(device, name);
+    CHECK_MESSAGE(backend->supports_block_size(block),
+                  "the engine resolved backend '"
+                      << name << "' for a KV cache group whose block size is "
+                      << block << ", and that backend REFUSES that block size. "
+                      "This is the defect that killed a real "
+                      "DeepSeek-V4-Flash-Vision load at engine construction "
+                      "with 'Block size must be a multiple of 16.' — one "
+                      "backend is being asked about a group it does not serve "
+                      "(ISSUE-LOCAL-01M2EMPC6T63TVDPQ90GVPRC5F).");
+  }
+
+  // (ii) THE MIRROR. The three DSA group kinds resolve the backends upstream's
+  // own layers name, and they resolve them BY NAME rather than by winning a
+  // capability walk — upstream never puts these in a priority list either.
+  CHECK(resolved[2].first == "DEEPSEEK_V4_INDEXER");   // indexer key, 256
+  CHECK(resolved[2].second == 256);
+  for (std::size_t i = 3; i < 6; ++i) {
+    CAPTURE(i);
+    CHECK(resolved[i].first == "DEEPSEEK_SPARSE_SWA");  // sparse SWA, 64
+    CHECK(resolved[i].second == 64);
+  }
+  for (std::size_t i = 6; i < 9; ++i) {
+    CAPTURE(i);
+    CHECK(resolved[i].first == "CompressorBackend");    // compressor states
+  }
+  CHECK(resolved[6].second == 4);
+  CHECK(resolved[7].second == 4);
+  CHECK(resolved[8].second == 8);
+
+  // (iii) The two MLA latent groups are NOT given a name by the factory: they go
+  // through the ordinary selector, exactly as upstream's MLA attention layer
+  // does. On a CPU box no MLA backend is registered, so they read as op-driven.
+  CHECK(resolved[0].first != "CompressorBackend");
+  CHECK(resolved[1].first != "CompressorBackend");
+}
+
+// ---------------------------------------------------------------------------
+// (5) THE GUARD THAT MUST SURVIVE THE FIX.
+//
+// The 16-multiple refusal is CORRECT for the backends that declare it. Removing
+// or widening it would make case (4) green while letting a 4-token group land on
+// a backend that genuinely cannot page it. This case fails if anyone "fixes"
+// DeepSeek-V4 that way.
+// ---------------------------------------------------------------------------
+TEST_CASE("the 16-multiple refusal is intact, and the DSA backends declare upstream's own lists") {
+  using vllm::v1::AttentionBackend;
+  using vllm::v1::MakeAttentionBackend;
+  const vt::DeviceType kCpu = vt::DeviceType::kCPU;
+
+  // FLASH_ATTN: flash_attn.py:82-84, MultipleOf(16). Still refuses 4, with the
+  // verbatim string a real checkpoint met.
+  const std::unique_ptr<AttentionBackend> flash =
+      MakeAttentionBackend(kCpu, "FLASH_ATTN");
+  CHECK_FALSE(flash->supports_block_size(4));
+  CHECK(flash->supports_block_size(16));
+  std::string flash_message;
+  try {
+    flash->get_kv_cache_shape(4, 4, 1, 512);
+  } catch (const std::exception& e) {
+    flash_message = e.what();
+  }
+  CHECK(flash_message == "Block size must be a multiple of 16.");
+
+  // CompressorBackend: compressor.py:66-68 [MultipleOf(1)] and :70-72
+  // head sizes [512, 1024]. 4 and 8 are the two sizes the model publishes
+  // (compressor.py:152-167).
+  const std::unique_ptr<AttentionBackend> compressor =
+      MakeAttentionBackend(kCpu, "CompressorBackend");
+  CHECK(compressor->get_name() == "CompressorBackend");
+  CHECK(compressor->get_supported_kernel_block_sizes() == std::vector<int>{1});
+  CHECK(compressor->supports_block_size(4));
+  CHECK(compressor->supports_block_size(8));
+  CHECK(compressor->supports_block_size(1));
+  CHECK(compressor->get_supported_head_sizes() ==
+        std::vector<int>{512, 1024});
+  CHECK(compressor->is_mla());
+  // ONE vector per token, not K+V: the fused rank-3 view CheckKvCacheShape
+  // expects for every group this model publishes.
+  CHECK(compressor->get_kv_cache_shape(7, 4, 1, 2048) ==
+        std::vector<int64_t>{7, 4, 2048});
+
+  // DeepseekSparseSWABackend: sparse_swa.py:126-128 [MultipleOf(64)], :133-136
+  // head sizes [512]. 64 is what the model publishes (sparse_swa.py:82-87);
+  // 4 is refused, which is the whole point of a PER-GROUP answer.
+  const std::unique_ptr<AttentionBackend> swa =
+      MakeAttentionBackend(kCpu, "DEEPSEEK_SPARSE_SWA");
+  CHECK(swa->get_name() == "DEEPSEEK_SPARSE_SWA");
+  CHECK(swa->get_supported_kernel_block_sizes() == std::vector<int>{64});
+  CHECK(swa->supports_block_size(64));
+  CHECK(swa->supports_block_size(256));
+  CHECK_FALSE(swa->supports_block_size(4));
+  CHECK_FALSE(swa->supports_block_size(16));
+  CHECK(swa->get_supported_head_sizes() == std::vector<int>{512});
+  CHECK(swa->is_mla());
+
+  // DeepseekV4IndexerBackend: indexer.py:194-196, the EXACT size 256 and not a
+  // multiple-of rule, so 64 and 512 are both refused.
+  const std::unique_ptr<AttentionBackend> indexer =
+      MakeAttentionBackend(kCpu, "DEEPSEEK_V4_INDEXER");
+  CHECK(indexer->get_name() == "DEEPSEEK_V4_INDEXER");
+  CHECK(indexer->get_supported_kernel_block_sizes() == std::vector<int>{256});
+  CHECK(indexer->supports_block_size(256));
+  CHECK_FALSE(indexer->supports_block_size(64));
+  CHECK(indexer->is_mla());
+
+  // ...and all three are registered for CUDA too, because the load this row
+  // exists to unblock is a CUDA load.
+  CHECK(vllm::v1::HasAttentionBackend(vt::DeviceType::kCUDA,
+                                      "CompressorBackend"));
+  CHECK(vllm::v1::HasAttentionBackend(vt::DeviceType::kCUDA,
+                                      "DEEPSEEK_SPARSE_SWA"));
+  CHECK(vllm::v1::HasAttentionBackend(vt::DeviceType::kCUDA,
+                                      "DEEPSEEK_V4_INDEXER"));
+  // ...and none of them is in any platform priority list, so a capability walk
+  // can never land on one. Upstream's are named by a layer, never selected.
+  CHECK(vllm::v1::MakeAttentionBackend(vt::DeviceType::kCUDA, "TRITON_MLA")
+            ->get_supported_kernel_block_sizes() == std::vector<int>{16});
+
+  // THE CUDA REFUSAL AND ITS REPAIR, at the exact function that threw on
+  // dgx:gpu0. `CheckKvCacheShape` (`registry.cpp:150`) is what
+  // `GPUModelRunner::initialize_kv_cache` calls per cache, and it is the call at
+  // `registry.cpp:160` that reached `TritonMLABackend::get_kv_cache_shape`.
+  // This box has no GPU, but the throw is host metadata and needs none: asking
+  // the same question the CUDA engine asked reproduces the same answer.
+  //
+  // (a) The OLD routing — TRITON_MLA asked about a 4-token compressor group —
+  //     still refuses, verbatim. This is the string a real 82 GB checkpoint
+  //     died on, and it must stay reachable.
+  std::string cuda_message;
+  try {
+    vllm::v1::CheckKvCacheShape(vt::DeviceType::kCUDA, "TRITON_MLA",
+                                /*num_blocks=*/256, /*block_size=*/4,
+                                /*num_kv_heads=*/1, /*head_size=*/2048,
+                                /*is_mla=*/true);
+  } catch (const std::exception& e) {
+    cuda_message = e.what();
+  }
+  CHECK(cuda_message == "Block size must be a multiple of 16.");
+
+  // (b) The NEW routing — the group's OWN backend asked the same question —
+  //     accepts it, and declares the fused rank-3 view the engine allocates.
+  //     Nothing was widened to get here: TRITON_MLA's answer in (a) is
+  //     unchanged.
+  CHECK_NOTHROW(vllm::v1::CheckKvCacheShape(
+      vt::DeviceType::kCUDA, "CompressorBackend", /*num_blocks=*/256,
+      /*block_size=*/4, /*num_kv_heads=*/1, /*head_size=*/2048,
+      /*is_mla=*/true));
+  CHECK_NOTHROW(vllm::v1::CheckKvCacheShape(
+      vt::DeviceType::kCUDA, "CompressorBackend", 256, 8, 1, 1024, true));
+  CHECK_NOTHROW(vllm::v1::CheckKvCacheShape(
+      vt::DeviceType::kCUDA, "DEEPSEEK_SPARSE_SWA", 256, 64, 1, 512, true));
+  CHECK_NOTHROW(vllm::v1::CheckKvCacheShape(
+      vt::DeviceType::kCUDA, "DEEPSEEK_V4_INDEXER", 256, 256, 1, 132, true));
+  // ...and the two latent groups keep the answer they always had: 256 is a
+  // multiple of 16, so TRITON_MLA serves them exactly as before.
+  CHECK_NOTHROW(vllm::v1::CheckKvCacheShape(vt::DeviceType::kCUDA, "TRITON_MLA",
+                                            256, 256, 1, 512, true));
 }

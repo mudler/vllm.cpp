@@ -38,6 +38,9 @@
 #include "vllm/model_executor/models/host_token_ids.h"  // ResolveHostTokenIds
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits carrier
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
+#include "vllm/model_executor/models/deepseek_v4_compressor.h"  // CompressorBackend
+#include "vllm/v1/attention/backends/mla/indexer.h"
+#include "vllm/v1/attention/backends/mla/sparse_swa.h"
 #include "vllm/v1/kv_cache_dtype.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/dtype.h"
@@ -508,8 +511,21 @@ v1::KVCacheConfig MakeDeepseekV4KVCache(const HfConfig& config, int block_size,
   v1::KVCacheConfig kv;
   kv.num_blocks = num_blocks;
 
+  // THE BACKEND EACH GROUP NAMES, mirroring each upstream LAYER's
+  // `get_attn_backend()` (`gpu_model_runner.py:7150` is what reads it). This is
+  // what makes a 4-token compressor group legal: it is validated against
+  // `CompressorBackend`'s `[MultipleOf(1)]` (`compressor.py:66-68`) instead of
+  // against whichever backend the engine resolved for the LATENT cache, whose
+  // `% 16` rule was never about this group. Before this, a real
+  // DeepSeek-V4-Flash-Vision load died at engine construction with `Block size
+  // must be a multiple of 16.` (ISSUE-LOCAL-01M2EMPC6T63TVDPQ90GVPRC5F).
+  //
+  // `backend` EMPTY keeps the platform selector, which is what the two latent
+  // `MLAAttentionSpec` groups take — upstream's MLA attention layer resolves
+  // through the ordinary selector too.
   const auto add_mla = [&](std::vector<std::string> names, int hs, int ratio,
-                           bool ds_mla_layout) {
+                           bool ds_mla_layout,
+                           const std::string& backend = std::string()) {
     if (names.empty()) return;
     kv.kv_cache_groups.emplace_back(
         std::move(names),
@@ -523,9 +539,11 @@ v1::KVCacheConfig MakeDeepseekV4KVCache(const HfConfig& config, int block_size,
             kAlignment, ratio,
             ds_mla_layout ? std::optional<std::string>(kModelVersion)
                           : std::nullopt));
+    kv.kv_cache_groups.back().attn_backend = backend;
   };
   const auto add_swa_mla = [&](std::vector<std::string> names, int bs, int hs,
-                               vt::DType dt, int window, bool ds_mla_layout) {
+                               vt::DType dt, int window, bool ds_mla_layout,
+                               const std::string& backend) {
     if (names.empty()) return;
     kv.kv_cache_groups.emplace_back(
         std::move(names),
@@ -537,6 +555,7 @@ v1::KVCacheConfig MakeDeepseekV4KVCache(const HfConfig& config, int block_size,
             ds_mla_layout ? std::optional<std::string>(kModelVersion)
                           : std::nullopt,
             ds_mla_layout ? kLatentQuantMode : v1::KVQuantMode::kNone));
+    kv.kv_cache_groups.back().attn_backend = backend;
   };
 
   // Group order is ours and is documented rather than incidental: the
@@ -545,16 +564,24 @@ v1::KVCacheConfig MakeDeepseekV4KVCache(const HfConfig& config, int block_size,
   // state populations).
   add_mla(std::move(c4a_latent), head_size, /*ratio=*/4, /*ds_mla_layout=*/true);
   add_mla(std::move(c128a_latent), head_size, /*ratio=*/128, true);
+  // `indexer.py:183-196` — the indexer key cache is served by
+  // DEEPSEEK_V4_INDEXER, which declares the EXACT size 256.
   add_mla(std::move(indexer_key), indexer_head_size, /*ratio=*/4,
-          /*ds_mla_layout=*/false);
+          /*ds_mla_layout=*/false, v1::DeepseekV4IndexerBackend::kName);
+  // `sparse_swa.py:116-118` — MultipleOf(64), which is the block size two lines
+  // of arithmetic above already fixed at 64.
   add_swa_mla(std::move(swa), kSwaBlockSize, head_size, kByteDType, swa_window,
-              /*ds_mla_layout=*/true);
+              /*ds_mla_layout=*/true, v1::DeepseekSparseSWABackend::kName);
+  // `compressor.py:189-190` — MultipleOf(1), which is what makes 4 and 8 legal.
   add_swa_mla(std::move(c4_attn_state), /*bs=*/4, c4_attn_state_dim,
-              vt::DType::kF32, /*window=*/8, /*ds_mla_layout=*/false);
+              vt::DType::kF32, /*window=*/8, /*ds_mla_layout=*/false,
+              deepseek_v4::CompressorBackend::kName);
   add_swa_mla(std::move(c4_indexer_state), /*bs=*/4, c4_indexer_state_dim,
-              vt::DType::kF32, /*window=*/8, /*ds_mla_layout=*/false);
+              vt::DType::kF32, /*window=*/8, /*ds_mla_layout=*/false,
+              deepseek_v4::CompressorBackend::kName);
   add_swa_mla(std::move(c128_attn_state), /*bs=*/8, c128_state_dim,
-              vt::DType::kF32, /*window=*/128, /*ds_mla_layout=*/false);
+              vt::DType::kF32, /*window=*/128, /*ds_mla_layout=*/false,
+              deepseek_v4::CompressorBackend::kName);
   return kv;
 }
 

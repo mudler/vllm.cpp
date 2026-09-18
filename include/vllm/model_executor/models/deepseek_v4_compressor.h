@@ -77,7 +77,11 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include <string>
 #include <vector>
+
+#include "vllm/v1/attention/backend.h"
 
 namespace vllm::deepseek_v4 {
 
@@ -284,5 +288,73 @@ std::vector<float> CompressorStepCycle(std::vector<float>* state_kv,
                                        // rows are `coff*head_dim` wide and a window
                                        // position's ROLE picks which half it reads.
                                        int64_t coff = 1);
+
+// ─── THE COMPRESSOR'S OWN ATTENTION BACKEND (compressor.py:59-77) ────────────
+//
+// Upstream's `CompressorStateCache` is an `AttentionLayerBase` that publishes a
+// real `SlidingWindowMLASpec` (`compressor.py:173-185`) at 4 tokens per block
+// for compress_ratio 4 and 8 for 128 (`:152-167`) and NAMES this backend
+// (`:189-190`, `get_attn_backend`). Those sizes are legal because THIS backend
+// declares `[MultipleOf(1)]` (`:66-68`) — upstream has no global 16-multiple
+// rule, only per-backend overrides in three dense backends
+// (`triton_attn.py:314`, `triton_mla.py:152`, `rocm_aiter_unified_attn.py:53`).
+//
+// Without it, a compressor group is validated against whichever backend the
+// engine happened to resolve for the model's LATENT cache, and a real
+// DeepSeek-V4-Flash-Vision load dies at engine construction with `Block size
+// must be a multiple of 16.` (ISSUE-LOCAL-01M2EMPC6T63TVDPQ90GVPRC5F, measured
+// on dgx:gpu0 2026-09-14). It lives beside the compressor because upstream's
+// lives in the same file as the layer that names it.
+//
+// Host metadata only: the compressor forward is the reference implementation
+// above and, on device, `deepseek_v4_device.cpp`. See `## Owed` in
+// `.agents/specs/dsv4-per-group-attn-backend.md`.
+class CompressorBackend final : public vllm::v1::AttentionBackend {
+ public:
+  // compressor.py:62-64. Upstream's own spelling, class-cased rather than the
+  // SCREAMING_CASE the enum-registered backends use, because upstream's
+  // `get_name()` returns exactly this string.
+  static constexpr const char* kName = "CompressorBackend";
+
+  std::string get_name() const override { return kName; }
+
+  // compressor.py:66-68 — `[MultipleOf(1)]`, i.e. every block size. This is the
+  // upstream DEFAULT (`backend.py:72-74`) stated explicitly, exactly as
+  // upstream states it.
+  std::vector<int> get_supported_kernel_block_sizes() const override {
+    return {1};
+  }
+
+  // compressor.py:70-72. `2*coff*head_dim` with head_dim 512: 2048 for ratio 4
+  // and 1024 for ratio 128 — upstream's list is the INDEXER-free pair {512,
+  // 1024}, and the wider attention-state rows are accepted because
+  // `supports_head_size` is only consulted by the capability walk, which never
+  // reaches a named backend.
+  std::vector<int> get_supported_head_sizes() const override {
+    return {512, 1024};
+  }
+
+  // `compressor.py:131-132` binds `[B, H=1, N, C] -> [B, N, C]`: ONE vector per
+  // token, so the paged view is the fused rank-3 MLA one that
+  // `CheckKvCacheShape` expects.
+  bool is_mla() const override { return true; }
+
+  // compressor.py:145-147 — the state cache is a sliding window.
+  bool supports_sliding_window() const override { return true; }
+
+  // compressor.py:170 asserts f32 for the state dtype.
+  std::vector<vt::DType> supported_dtypes() const override {
+    return {vt::DType::kF32, vt::DType::kBF16, vt::DType::kF16};
+  }
+  std::vector<std::string> supported_kv_cache_dtypes() const override {
+    return {"auto", "float32", "bfloat16", "float16", "fp8", "fp8_e4m3",
+            "fp8_ds_mla"};
+  }
+
+  std::vector<int64_t> get_kv_cache_shape(
+      int64_t num_blocks, int64_t block_size, int64_t num_kv_heads,
+      int64_t head_size,
+      const std::string& cache_dtype_str = "auto") const override;
+};
 
 }  // namespace vllm::deepseek_v4

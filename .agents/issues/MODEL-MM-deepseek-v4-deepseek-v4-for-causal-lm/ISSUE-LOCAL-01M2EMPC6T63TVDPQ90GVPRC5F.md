@@ -1,14 +1,14 @@
 ID: ISSUE-LOCAL-01M2EMPC6T63TVDPQ90GVPRC5F
 Title: DeepSeek-V4 cannot serve on any backend here: its KV factory publishes 4/8-token groups and every attention backend declares {16}, so a CUDA build dies at engine construction
 Row: MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm
-State: OPEN
+State: CLOSED
 Kind: bug
 GitHub: -
 Mirror: PENDING
 Availability: FULL
 Created: 2026-09-14
-Updated: 2026-09-14
-Closed: -
+Updated: 2026-09-18
+Closed: 2026-09-18
 
 ## Problem
 
@@ -38,4 +38,66 @@ EVIDENCE CAVEAT ON THE UPSTREAM SIDE: the local vLLM checkout at /home/mudler/_g
 
 ## Resolution
 
--
+FIXED 2026-09-18 by porting upstream's PER-GROUP ATTENTION-BACKEND DISPATCH, on
+branch `row/MODEL-MM-deepseek-v4-blocksize-dispatch` from base
+`bca4ab09fcaa6e718fbc25740816f60be417bddb`. Spec:
+`.agents/specs/dsv4-per-group-attn-backend.md`.
+
+WHICH OF THE THREE SITES FIRED, which this record deliberately did not guess and
+which is now determined. Every group `MakeDeepseekV4KVCache` publishes is FUSED
+-- `MLAAttentionSpec` or `SlidingWindowMLASpec` -- so `runner.cpp:1412` marks all
+nine caches MLA and the view loop takes the `is_mla` arm for every one. That arm
+resolved the MLA backend ONCE and cached it in `mla_backend_resolved`, so the
+first group (256 tokens) resolved `TRITON_MLA` and the 4/4/8 compressor and
+indexer groups inherited it. The site is `backend.cpp:279`,
+`TritonMLABackend::get_kv_cache_shape`. `backend.cpp:253` (FlashAttention) and
+`:268` (ROCm) did not fire, because no group ever reached the dense arm.
+
+WHY NO TEST SAW IT. On a CPU box the same `is_mla` arm resolves NOTHING -- no MLA
+backend is registered for `kCPU` -- the name is empty, and `CheckKvCacheShape` is
+skipped entirely. `tests/vllm/entrypoints/test_deepseek_v4_multigroup_kv.cpp` was
+therefore green on a defect that stops every CUDA load. Measured on this tree at
+base: the child engine reported
+`BACKENDS=-:256;-:256;-:256;-:64;-:64;-:64;-:4;-:4;-:8`, i.e. nine caches and not
+one backend consulted.
+
+WHAT CHANGED. `KVCacheGroupSpec` gained `attn_backend`, upstream's
+`AttentionGroupKey.attn_backend` (`gpu_model_runner.py:7170`), whose value comes
+from the LAYER at `:7150`. `MakeDeepseekV4KVCache` now names it per group exactly
+as each upstream layer's `get_attn_backend()` does: `DEEPSEEK_V4_INDEXER` for the
+indexer key cache (`indexer.py:183-196`, `[256]`), `DEEPSEEK_SPARSE_SWA` for the
+sliding-window cache (`sparse_swa.py:116-118`, `:126-128`, `[MultipleOf(64)]`)
+and `CompressorBackend` for the three compressor states
+(`compressor.py:189-190`, `:66-68`, `[MultipleOf(1)]`). The three backends are
+new and are host metadata only. `GPUModelRunner::initialize_kv_cache` uses a
+named backend directly and keeps its existing lazy dense/MLA resolution for every
+unnamed group, so every other topology resolves byte-identically.
+
+THE `% 16` REFUSAL IS UNTOUCHED, and that is asserted rather than described.
+`FlashAttentionBackend`, `RocmAttentionBackend` and `TritonMLABackend` still
+declare `{16}` and still throw the verbatim `Block size must be a multiple of
+16.`; `CheckKvCacheShape(kCUDA, "TRITON_MLA", 256, 4, 1, 2048, true)` reproduces
+that exact string in the test. The defect was never that check. It was that the
+wrong backend was consulted.
+
+EVIDENCE. `tests/vllm/entrypoints/test_deepseek_v4_multigroup_kv.cpp`, which
+enters at `LoadedEngine::FromModelDir` on DEFAULT `EngineParams`, in a Release
+(`-O3 -DNDEBUG`) build on this host. RED before the change: `test cases: 5 | 3
+passed | 2 failed`, `assertions: 51 | 44 passed | 7 failed`, binary md5
+`34bb7ba872dbe6631cb264ce0b2de745`. GREEN after: `test cases: 5 | 5 passed | 0
+failed | 1 skipped`, `assertions: 96 | 96 passed | 0 failed`, binary md5
+`8976153e512bcc9e22d5576a91b1385b`. The child engine now reports
+`BACKENDS=-:256;-:256;DEEPSEEK_V4_INDEXER:256;DEEPSEEK_SPARSE_SWA:64;DEEPSEEK_SPARSE_SWA:64;DEEPSEEK_SPARSE_SWA:64;CompressorBackend:4;CompressorBackend:4;CompressorBackend:8`
+and `CONSTRUCT=ok`. The suite still answers identically without `NDEBUG`
+(default configure: `5 | 5 passed`, `64 | 64 passed`, md5
+`cdd63175f76328d7b593943698ae6dc1`). 67 attention / KV / DeepSeek-V4 / runner
+suites run green beside it, 3 skipped for absent devices.
+
+WHAT IS NOT CLOSED BY THIS. The fixture is SYNTHETIC. Only a leased run against
+the real 82,438,622,112-byte artifact can show that the load gets past engine
+construction there, and no such run was taken for this change. The next wall on
+the production path is unchanged and is NOT this issue: the W7-device forward
+refusal at `deepseek_v4.cpp:4658`, owned by
+`.agents/specs/deepseek-v4-device-decode.md`. The resolved backend name is
+RECORDED and not DISPATCHED on (owed to #1332 M4), so a correct name here is not
+a working kernel.

@@ -76,6 +76,7 @@ class QuantDotScratchPool {
                                              // __device__ syntax, no CUDA)
 #include "vt/ops.h"
 #include "vt/quant.h"
+#include "vt/rocm/rocm_iq_table_seal.h"
 #include "vt/rocm/rocm_norm_quant_bridge.h"
 
 // Forward declarations: the optimized K-quant GEMM kernels in
@@ -100,6 +101,7 @@ using vt::cpu::BlockIQ1_XXXS;
 using vt::cpu::BlockIQ2_S;
 using vt::cpu::BlockIQ2_XXS;
 using vt::cpu::BlockIQ3_XXS;
+using vt::cpu::BlockIQ4_XS;
 using vt::cpu::BlockQ2_K;
 using vt::cpu::BlockQ3_K;
 using vt::cpu::BlockQ4_K;
@@ -574,6 +576,63 @@ __device__ inline float DotIQ1XXXS(const BlockIQ1_XXXS* xb, const BlockQ8_K* yb)
          (static_cast<float>(sumi) + 0.125f * static_cast<float>(sumi1));
 }
 
+// IQ4_XS x Q8_K: cuda_quant_dot.cu DotIQ4XS (KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT,
+// #1940). IQ4_XS shares IQ4_NL's 16-entry d_kvalues_iq4nl codebook and NOT its
+// activation pairing: its block is a 256-element SUPER-block, so it dots
+// Q8_K. The `ib` loop steps by TWO because one `scales_l` byte serves two
+// sub-blocks; `d1`/`d2` are formed as f32 BEFORE the integer sums fold in, so
+// a super-block is EIGHT f32 accumulation steps -- upstream's association,
+// kept rather than hoisted into one integer accumulator. FinalFactor<kIQ4_XS>
+// is 1 (the per-sub-block delta is already folded in as `d1`/`d2` here).
+//
+// CUDA's port of this body needed __fmul_rn/__fadd_rn in place of `*`/`+`,
+// because nvcc's default -fmad=true silently contracts the two-rounding
+// sequence into a single-rounding FMA and measurably disagreed with the
+// oracle by 1-4 ULP on two of eight real super-blocks (cuda_quant_dot.cu,
+// same function, extensively commented on this exact point). This project's
+// CMakeLists.txt already passes -ffp-contract=off to $<COMPILE_LANGUAGE:HIP>
+// project-wide (unlike its CXX-only reach on the CUDA side), and that flag is
+// on this translation unit's own compile line, so plain `*`/`+` is used here
+// rather than carrying the CUDA workaround over unexamined -- the row's
+// bit-exact golden-vector gate is what actually proves this, not this comment;
+// if that gate goes red, apply the same non-fused-multiply discipline HIP
+// provides before assuming anything else is wrong.
+__device__ inline float DotIQ4XS(const BlockIQ4_XS* xb, const BlockQ8_K* yb) {
+  const float d4d8 = DF16ToF32(xb->d) * yb->d;
+  uint16_t h = xb->scales_h;
+  const uint8_t* qs = xb->qs;
+  const int8_t* q8 = yb->qs;
+  float sumf = 0.0f;
+  for (int ib = 0; ib < kQK_K / 32; ib += 2) {
+    const uint8_t ls1 =
+        static_cast<uint8_t>((xb->scales_l[ib / 2] & 0xf) | ((h << 4) & 0x30));
+    const uint8_t ls2 =
+        static_cast<uint8_t>((xb->scales_l[ib / 2] >> 4) | ((h << 2) & 0x30));
+    h = static_cast<uint16_t>(h >> 4);
+    const float d1 = d4d8 * (ls1 - 32);
+    const float d2 = d4d8 * (ls2 - 32);
+    int sumi1 = 0;
+    int sumi2 = 0;
+    for (int j = 0; j < 16; ++j) {
+      sumi1 += q8[j + 0] * vt::cuda::d_kvalues_iq4nl[qs[j] & 0xf];
+      sumi2 += q8[j + 16] * vt::cuda::d_kvalues_iq4nl[qs[j] >> 4];
+    }
+    sumf += d1 * static_cast<float>(sumi1 + sumi2);
+    qs += 16;
+    q8 += 32;
+    sumi1 = 0;
+    sumi2 = 0;
+    for (int j = 0; j < 16; ++j) {
+      sumi1 += q8[j + 0] * vt::cuda::d_kvalues_iq4nl[qs[j] & 0xf];
+      sumi2 += q8[j + 16] * vt::cuda::d_kvalues_iq4nl[qs[j] >> 4];
+    }
+    sumf += d2 * static_cast<float>(sumi1 + sumi2);
+    qs += 16;
+    q8 += 32;
+  }
+  return sumf;
+}
+
 // ---------------------------------------------------------------------------
 // WType tags + DotSuperblock dispatch — mirrors the CUDA file's table.
 // ---------------------------------------------------------------------------
@@ -588,6 +647,7 @@ enum class WType : int {
   kIQ2_S = 7,
   kIQ1_S = 8,
   kIQ1_XXXS = 9,
+  kIQ4_XS = 10,
 };
 
 template <WType W>
@@ -628,6 +688,10 @@ __device__ inline float DotSuperblock<WType::kIQ2_S>(const void* w, const BlockQ
 template <>
 __device__ inline float DotSuperblock<WType::kIQ1_S>(const void* w, const BlockQ8_K* a) {
   return DotIQ1S(static_cast<const BlockIQ1_S*>(w), a);
+}
+template <>
+__device__ inline float DotSuperblock<WType::kIQ4_XS>(const void* w, const BlockQ8_K* a) {
+  return DotIQ4XS(static_cast<const BlockIQ4_XS*>(w), a);
 }
 template <>
 __device__ inline float DotSuperblock<WType::kIQ1_XXXS>(const void* w, const BlockQ8_K* a) {
@@ -779,6 +843,10 @@ bool IsRocmKeepQuantSupported(DType dt, WType* out) {
     case DType::kIQ2_S: *out = WType::kIQ2_S; return true;
     case DType::kIQ1_S: *out = WType::kIQ1_S; return true;
     case DType::kIQ1_XXXS: *out = WType::kIQ1_XXXS; return true;
+    // IQ4_XS: KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT (#1940). A 256-element
+    // super-block that dots Q8_K, so it belongs to this table and not to
+    // IQ4_NL's 32-element Q8_0 pairing, despite sharing its codebook.
+    case DType::kIQ4_XS: *out = WType::kIQ4_XS; return true;
     // Q4_0 / Q8_0 / IQ4_NL / MXFP4 dot a Q8_0 activation and have no native arm
     // here. IQ4_NL is in that class since QUANT-GGUF-IQ4_NL, and it is why the
     // delegation lists above name it: this predicate can never admit it, so the
@@ -903,6 +971,7 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a,
     case WType::kIQ2_S: LaunchGemm<WType::kIQ2_S>(out, weight, act, m, n, nsb, w_row_bytes, w_block_bytes, s); break;
     case WType::kIQ1_S: LaunchGemm<WType::kIQ1_S>(out, weight, act, m, n, nsb, w_row_bytes, w_block_bytes, s); break;
     case WType::kIQ1_XXXS: LaunchGemm<WType::kIQ1_XXXS>(out, weight, act, m, n, nsb, w_row_bytes, w_block_bytes, s); break;
+    case WType::kIQ4_XS: LaunchGemm<WType::kIQ4_XS>(out, weight, act, m, n, nsb, w_row_bytes, w_block_bytes, s); break;
     // IsRocmKeepQuantSupported answered yes, so a missing case must be LOUD:
     // launching nothing leaves `out` stale while callers see success (#967).
     default:
@@ -975,6 +1044,7 @@ void MatmulBTQuantGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
     case WType::kIQ2_S: LaunchGroupedGemm<WType::kIQ2_S>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
     case WType::kIQ1_S: LaunchGroupedGemm<WType::kIQ1_S>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
     case WType::kIQ1_XXXS: LaunchGroupedGemm<WType::kIQ1_XXXS>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
+    case WType::kIQ4_XS: LaunchGroupedGemm<WType::kIQ4_XS>(out, wt, qact, eids, P, n, nsb, w_row_bytes, w_block_bytes, bcast, s); break;
     default:
       throw std::runtime_error(
           std::string("vt rocm: matmul_bt_quant_grouped: no grouped kernel for "
@@ -987,6 +1057,31 @@ void MatmulBTQuantGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
 // static registrar — this file deliberately carries no Registrar of its own.
 // A second registration of the same OpId+DeviceType would make which registrar
 // wins depend on static-init order across translation units.
+
+// Device-codebook drift seal (#3067), mirroring cuda_quant_dot.cu's. The copy
+// belongs in whichever translation unit compiles the symbols the ROCm dots
+// actually read, so that the test sees device bytes rather than host literals.
+// That unit is this one: the dots above index the `vt::cuda` tables
+// cuda_quant_iq_tables.cuh defines, and HIP compiles that header's plain
+// __device__ declarations into this module's own device image.
+void SnapshotIqTablesFromDevice(IqTableSnapshot* out) {
+  static_assert(sizeof(out->kmask_iq2xs) == sizeof(vt::cuda::d_kmask_iq2xs), "kmask extent");
+  static_assert(sizeof(out->ksigns_iq2xs) == sizeof(vt::cuda::d_ksigns_iq2xs), "ksigns extent");
+  static_assert(sizeof(out->iq3xxs_grid) == sizeof(vt::cuda::d_iq3xxs_grid), "iq3xxs grid extent");
+  static_assert(sizeof(out->kvalues_iq4nl) == sizeof(vt::cuda::d_kvalues_iq4nl), "iq4nl values extent");
+  CheckHip(hipMemcpyFromSymbol(out->kmask_iq2xs, HIP_SYMBOL(vt::cuda::d_kmask_iq2xs),
+                               sizeof(vt::cuda::d_kmask_iq2xs)),
+           "snapshot d_kmask_iq2xs");
+  CheckHip(hipMemcpyFromSymbol(out->ksigns_iq2xs, HIP_SYMBOL(vt::cuda::d_ksigns_iq2xs),
+                               sizeof(vt::cuda::d_ksigns_iq2xs)),
+           "snapshot d_ksigns_iq2xs");
+  CheckHip(hipMemcpyFromSymbol(out->iq3xxs_grid, HIP_SYMBOL(vt::cuda::d_iq3xxs_grid),
+                               sizeof(vt::cuda::d_iq3xxs_grid)),
+           "snapshot d_iq3xxs_grid");
+  CheckHip(hipMemcpyFromSymbol(out->kvalues_iq4nl, HIP_SYMBOL(vt::cuda::d_kvalues_iq4nl),
+                               sizeof(vt::cuda::d_kvalues_iq4nl)),
+           "snapshot d_kvalues_iq4nl");
+}
 
 }  // namespace vt::rocm
 

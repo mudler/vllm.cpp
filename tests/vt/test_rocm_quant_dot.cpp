@@ -2,8 +2,9 @@
 // provider for `OpId::kMatmulBTQuant` / `kMatmulBTQuantGrouped`
 // (src/vt/rocm/rocm_quant_dot.hip) is measured against the LANDED CPU
 // keep-quant reference (src/vt/cpu/cpu_quant_gemm.cpp — the oracle) and an
-// INDEPENDENT f64 dequantize-then-dot, on the ten Q8_K-family encodings the
-// CUDA sibling serves (test_cuda_quant_dot.cpp's WeightCase table).
+// INDEPENDENT f64 dequantize-then-dot, on the eleven Q8_K-family encodings
+// this provider serves (a subset of test_cuda_quant_dot.cpp's WeightCase
+// table, which also carries IQ2_XS — ROCm has no provider for that one).
 //
 // THE GATE mirrors the CUDA file: the Q8_K activation quant and the whole
 // INTEGER dot are bit-identical to the CPU reference by construction, so
@@ -121,6 +122,17 @@ const WeightCase kCases[] = {
     {DType::kQ4_K, 256, 144, 0, 2, "q4_K"},
     {DType::kQ5_K, 256, 176, 0, 2, "q5_K"},
     {DType::kQ6_K, 256, 210, 208, -1, "q6_K"},
+    // KERNEL-QUANT-CIQ-GEMM-ROCM-IQUANT (#1940). The eleventh Q8_K-family
+    // encoding `IsRocmKeepQuantSupported` admits, and the last one this table
+    // was missing. Geometry is the CUDA sibling's row verbatim
+    // (test_cuda_quant_dot.cpp): `ggml-common.h:454-460` lays the 136-byte
+    // block out as d@0 (f16), scales_h@2 (u16), scales_l@4, qs@8, so `d_off` is
+    // 0 and there is no `dmin` — the per-sub-block delta is `d * (ls - 32)`,
+    // spliced from a scales_l nibble and a scales_h bit pair.
+    // APPENDED AFTER the Q8_K family and BEFORE q8_0 on purpose: the MMVQ and
+    // fused-norm cases below index this table positionally ({5}, {7, 8, 9}),
+    // so a row inserted higher would silently re-point them at other formats.
+    {DType::kIQ4_XS, 256, 136, 0, -1, "iq4_xs"},
     // Q8_0 is NOT a Q8_K-superblock encoding: it dots a Q8_0 activation and is
     // served by the *Gdn kernels this file delegates to.
     {DType::kQ8_0, 32, 34, 0, -1, "q8_0"},
@@ -1039,7 +1051,8 @@ TEST_CASE(
   vt::rocm::Q8KResetRouteDispatchCountsForTest();
 #endif
 
-  // All ten encodings, decode + prefill shapes, broadcast and per-row arms —
+  // Every encoding in kCases (eleven Q8_K-family plus Q8_0), decode + prefill
+  // shapes, broadcast and per-row arms —
   // the same matrix the CUDA grouped gate runs, over a POISONED output buffer.
   struct GroupedShape {
     int64_t P;

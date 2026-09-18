@@ -380,3 +380,99 @@ close them):**
   `output_ids_` but not `output_sizes_`. No ported case has
   `total_num_kv_heads < tp_size`, so nothing catches it; the replicated-kv TP
   case lands with the TP row that can actually run it.
+
+## W3 as specified
+
+W3 ports the LoRA metadata and mapping layer: `LoRAMapping`,
+`convert_mapping`, `compute_meta`, the sgmv prefill segmentation, and the
+`PunicaWrapperBase` state machine. W1+W2 own the kernel apply (the
+shrink/expand GEMM); W3 owns the index arithmetic that FEEDS those kernels.
+
+### Port map
+
+| New file | Ports FROM (pinned vLLM) |
+|---|---|
+| `include/vllm/lora/mapping.h` | `layers/utils.py:27-42` (`LoRAMappingType`, `LoRAMapping`), `punica_wrapper/utils.py:15-50` (`compute_meta`), `punica_wrapper/utils.py:54-160` (`convert_mapping`), `punica_wrapper/punica_base.py:124-299` (`PunicaWrapperBase` state + `update_metadata` + property accessors) |
+| `src/vllm/lora/mapping.cpp` | the same ranges |
+| `tests/vllm/lora/test_lora_mapping.cpp` | `tests/lora/utils.py:108-200` (`PunicaTensors`, `generate_data_for_nslices` — the sgmv metadata structure), `tests/lora/test_punica_ops.py:36-290` (sgmv segment clustering + reference), `tests/lora/test_layers.py:310-465` (`LoRAMapping` + `update_metadata` integration) |
+| `CMakeLists.txt` (+) | add `src/vllm/lora/mapping.cpp` to the LoRA source list (line ~736) |
+
+### Deviations (recorded per discipline)
+
+- **torch tensors → `std::vector<int64_t>`.** The four index arrays
+  (`base_indices`, `sampler_indices`, `sampler_indices_padded`,
+  `embeddings_indices`) and the sgmv metadata (`b_seq_start`, `seq_lengths`,
+  `lora_indices_per_batch`) are integer index vectors, not float compute. We
+  store them as `std::vector<int64_t>` (matching vLLM's `torch.long` dtype).
+  The pre-allocated buffer pattern (`torch.empty(max_num_batched_tokens)`)
+  becomes a `std::vector<int64_t>` sized to `max_num_batched_tokens` at
+  construction, with a length field (`indices_len`) tracking the live prefix.
+- **`async_tensor_h2d` removed.** vLLM wraps the H2D transfer in
+  `async_tensor_h2d`; we are CPU-only, so the list-to-tensor conversion is a
+  plain copy into the `std::vector`.
+- **`PunicaWrapperBase` is metadata-only.** In vLLM, `PunicaWrapperBase`
+  (punica_base.py:124) declares abstract methods `add_shrink` / `add_expand`
+  / `add_lora_linear` / `add_lora_logits` (:301-449) that the concrete
+  `PunicaWrapperCPU` implements. In vllm.cpp, the apply ops are already free
+  functions from W1+W2 (`punica.h`: `BgmvShrink`, `AddShrink`, `AddExpand`,
+  `AddLoraLinear`, `AddLoraLogits`). The W3 class owns ONLY the metadata state
+  (`update_metadata`, the four index buffers, the sgmv prefill tensors, and
+  the property accessors). It does NOT re-declare the apply methods. A later
+  wave (W5) will wire the wrapper's `token_lora_indices` accessor into the
+  free-function apply calls, completing the `PunicaWrapperCPU` equivalence.
+- **`_get_lora_device` NOT ported.** `layers/utils.py:45-60` inspects
+  `nn.Module` attributes (`weight`, `weight_packed`, `qweight`) to find the
+  torch device of the base layer's weights. vllm.cpp has no `nn.Module` or
+  `torch.device` abstraction; weight placement is decided at adapter-load time
+  (W4). `test_layers_utils.py` tests only this function, so it is SKIP-with-
+  reason, tracked to W4.
+- **`embeddings_indices` `-1` clamp.** vLLM uses
+  `torch.where(embeddings_indices == -1, max_loras - 1, embeddings_indices)`
+  (utils.py:133-135). We use a plain loop over the vector. Same semantics.
+- **`sampler_indices_padded` arithmetic.** vLLM computes
+  `arange(0, n) + sampler_indices_padded * n` (utils.py:142-144) — a batched
+  scatter index for the sampler. We port this as the same elementwise loop.
+- **`extra_vocab_size` hardcoded to 0.** vLLM's `_update_base_metadata`
+  (punica_base.py:178) sets `extra_vocab_size = 0` with a NOTE that LoRA extra
+  vocab support is removed. We mirror this: `convert_mapping` takes
+  `extra_vocab_size` as a parameter (matching the upstream signature) but
+  `UpdateMetadata` always passes 0.
+
+### Tests to port
+
+Named traceably after the upstream cases.
+
+- `utils.py::PunicaTensors` / `generate_data_for_nslices` (`:108-200`) →
+  test helper that builds a batch with per-segment LoRA indices and the
+  `b_seq_start_loc` / `seq_len_tensor` / `lora_indices_tensor` structure.
+  Ported as a C++ helper in the test file.
+- `test_punica_ops.py` sgmv segment clustering → `compute_meta` tests:
+  consecutive identical LoRA IDs collapse into one segment; `-1` sentinel
+  produces `no_lora = true` when the whole batch is `-1`; `batch_size`,
+  `max_length`, `token_nums` are computed correctly. The upstream tests reach
+  this through `generate_data_for_nslices` + `check_lora_shrink_kernel` /
+  `check_lora_expand_kernel` (`:142-290`); we test `compute_meta` directly
+  since the kernel apply is already gated in W1.
+- `test_layers.py::LoRAMapping` + `update_metadata` integration (`:310-465`)
+  → `convert_mapping` tests: a `LoRAMapping` with known `index_mapping` /
+  `prompt_mapping` produces the correct `base_indices`, `sampler_indices`,
+  `sampler_indices_padded`, `embeddings_indices`; `-1` sentinel maps to
+  `max_loras - 1` in the padded/embedding indices; `is_prefill` triggers the
+  sgmv prefill path.
+- `test_layers_utils.py` → SKIP-with-reason (`_get_lora_device` not
+  portable; tracked to W4).
+
+### Gate
+
+```sh
+cmake -S . -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF
+cmake --build build-cpu -j 18
+ctest --test-dir build-cpu -R 'test_lora_mapping|test_punica_cpu|test_lora_layers' --output-on-failure
+```
+
+- CPU `-Werror` clean build; `test_lora_mapping` all cases green.
+- RED-first: the absent `mapping.h` / `mapping.cpp` produces a compile
+  failure; `compute_meta` with the wrong segment count produces a test
+  failure.
+- `test_punica_cpu` (8/8) + `test_lora_layers` (16/16) still green — no
+  regressions from the new files.

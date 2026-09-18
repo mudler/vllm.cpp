@@ -3,13 +3,17 @@
 Row: MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm
 Issue: ISSUE-LOCAL-01M2EMPC6T63TVDPQ90GVPRC5F
 Upstream pin: vLLM `e126687a9a` (`.agents/upstream-sync.md`)
-State: ACTIVE
+State: DONE
 
 ## Now
 
-The row is at engine construction. A real DeepSeek-V4-Flash-Vision checkpoint
-loads its full tower and then dies with `Block size must be a multiple of 16.`
-This spec ports the upstream mechanism that makes that block size legal.
+DONE 2026-09-18. The per-group dispatch is ported and the production-shaped
+fixture gets past engine construction with every group answered by the backend
+that serves it. The fixture is SYNTHETIC: only a leased run against the real
+82,438,622,112-byte artifact can show the checkpoint itself gets further, and no
+such run was taken. The next wall on that path is the W7-device forward refusal
+at `deepseek_v4.cpp:4658`, owned by
+`.agents/specs/deepseek-v4-device-decode.md`.
 
 ## Scope
 
@@ -165,3 +169,61 @@ loader entry every server and command line takes for a `.gguf`.
 - Stop and report `NEEDS_DECISION` if making a group load requires weakening the
   `% 16` refusal in any of the three backends that declare it.
 - Stop if the synthetic fixture stops reproducing the seven-group topology.
+
+## Outcome
+
+WHICH OF THE THREE REFUSAL SITES FIRED, measured rather than guessed. Every
+group this factory publishes is fused, so `runner.cpp:1412` marks all nine
+caches MLA and the view loop takes the `is_mla` arm for every one. That arm
+cached its resolution, the 256-token latent group resolved `TRITON_MLA`, and the
+4/4/8 groups inherited it: the site is `backend.cpp:279`. The FlashAttention and
+ROCm copies of the same string never ran, because no group reached the dense arm.
+
+WHY THE SUITE WAS GREEN ON A DEFECT THAT STOPS EVERY CUDA LOAD. On a CPU box the
+same arm resolves nothing — no MLA backend is registered for `kCPU` — the name is
+empty, and `CheckKvCacheShape` is skipped outright. At base the child engine
+reported nine caches and not one backend consulted:
+`BACKENDS=-:256;-:256;-:256;-:64;-:64;-:64;-:4;-:4;-:8`. An engine that consults
+NO backend and an engine that consults the WRONG one are the same defect, and
+the new case fails on both, which is why it could be written red here and is
+meaningful on the box where the checkpoint actually dies.
+
+WHAT WAS REJECTED.
+
+- **Widening or deleting the `% 16` rule.** It is correct for the three backends
+  that declare it, and upstream keeps it in exactly those three
+  (`triton_attn.py:314`, `triton_mla.py:152`,
+  `rocm_aiter_unified_attn.py:53`). Removing it would let a 4-token group land on
+  a backend that cannot page it, and the fixture would go green on that too. A
+  case now asserts the verbatim refusal survives.
+- **Re-resolving per group through the SELECTOR instead of caching.** This looks
+  like the smaller change and it is wrong: no registered backend accepts a
+  4-token MLA group, so the walk throws, the runner's `catch` swallows it, and
+  the group silently becomes op-driven. That converts a loud wall into a quiet
+  one. The missing piece was a backend that legitimately serves those groups.
+- **A spec-kind predicate instead of a named backend.** The compressor states
+  and the sparse-SWA cache publish the SAME spec class
+  (`SlidingWindowMLASpec`) upstream and here, so spec kind cannot tell them
+  apart. Upstream's key is the LAYER (`gpu_model_runner.py:7150`), and a name on
+  the group is the nearest expressible form of that key in this tree.
+
+WHY EACH DEFAULT HAS ITS VALUE.
+
+- `KVCacheGroupSpec::attn_backend` defaults to EMPTY, meaning "resolve through
+  the platform selector". Empty is what every other model publishes, so the
+  runner enters its pre-existing lazy resolution exactly as often as before and
+  no other topology moves.
+- The two latent `MLAAttentionSpec` groups are deliberately left unnamed:
+  upstream's MLA attention layer resolves through the ordinary selector too, so
+  naming them would diverge and would also hard-code `TRITON_MLA` onto devices
+  that have no MLA backend.
+- The three new backends register for EVERY `DeviceType` and appear in NO
+  platform priority list. Both halves are upstream's shape: nothing in their
+  metadata is device-specific, and a layer names them rather than a capability
+  walk selecting them. A missing registration would turn a named group into a
+  hard throw at a customer's engine construction, which is the failure this row
+  exists to remove.
+- `DEEPSEEK_V4_INDEXER` declares `{256}` and not `{1}`. `supports_block_size`
+  reads every entry as a MultipleOf, so `{256}` refuses 64 — which is the
+  nearest expressible form of upstream's exact `[256]` and is what makes the
+  indexer's answer different from the SWA cache's.

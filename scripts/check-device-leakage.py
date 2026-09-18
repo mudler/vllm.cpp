@@ -404,6 +404,26 @@ ALLOWLIST: dict[str, dict[str, tuple[object, str]]] = {
         "kcuda": (1, "the `(kCUDA, \"GDN_ATTN\")` registrar key — same reason as "
                      "backend.cpp above."),
     },
+    "src/vllm/v1/attention/backends/mla/sparse_swa.cpp": {
+        "kcuda": (1, "the `(kCUDA, \"DEEPSEEK_SPARSE_SWA\")` registrar key — same "
+                     "reason as backend.cpp above. The backend is host metadata "
+                     "with no device code at all; the key exists because a "
+                     "DeepSeek-V4 KV group NAMES it and the registry is keyed by "
+                     "(DeviceType, name), so a missing kCUDA row would throw at "
+                     "engine construction on the one device this row exists to "
+                     "unblock (ISSUE-LOCAL-01M2EMPC6T63TVDPQ90GVPRC5F)."),
+    },
+    "src/vllm/v1/attention/backends/mla/indexer.cpp": {
+        "kcuda": (1, "the `(kCUDA, \"DEEPSEEK_V4_INDEXER\")` registrar key — same "
+                     "reason as sparse_swa.cpp above."),
+    },
+    "src/vllm/model_executor/models/deepseek_v4_compressor.cpp": {
+        "kcuda": (1, "the `(kCUDA, \"CompressorBackend\")` registrar key — same "
+                     "reason as sparse_swa.cpp above. It lives in the compressor "
+                     "TU because upstream's `CompressorBackend` lives in the same "
+                     "file as the layer that names it (`compressor.py:59-77`, "
+                     ":189-190)."),
+    },
     "src/vllm/model_executor/models/deepseek_v4_device.cpp": {
         "kcuda": (9, "the DeepSeek-V4 CUDA device-forward RESOLVER TU (W7-device): "
                      "4 `GetOp` + 5 `OpRegistered` lookups that fetch the "

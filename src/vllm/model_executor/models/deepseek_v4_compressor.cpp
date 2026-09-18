@@ -8,9 +8,13 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <stdexcept>
+#include <string>
 
 #include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"  // F32ToF8E4M3, kFloat8E4M3Max
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"  // F8E4M3ToF32
+#include "vllm/v1/attention/registry.h"
 #include "vt/dtype.h"  // VT_CHECK, BF16ToF32, F32ToBF16
 
 namespace vllm::deepseek_v4 {
@@ -384,5 +388,52 @@ std::vector<float> CompressorStepCycle(std::vector<float>* state_kv,
   }
   return emitted;
 }
+
+// ─── CompressorBackend (compressor.py:59-77) ─────────────────────────────────
+
+std::vector<int64_t> CompressorBackend::get_kv_cache_shape(
+    int64_t num_blocks, int64_t block_size, int64_t num_kv_heads,
+    int64_t head_size, const std::string& /*cache_dtype_str*/) const {
+  // `[MultipleOf(1)]` accepts every positive size, so this can only fire on a
+  // zero or negative one. It is written against the backend's OWN declared list
+  // rather than omitted, because the value of the per-group dispatch is that
+  // each group is answered by its own backend's rule — including this one's,
+  // which is "no constraint".
+  if (!supports_block_size(static_cast<int>(block_size)) || block_size <= 0) {
+    throw std::invalid_argument(
+        "CompressorBackend: block size must be positive (got " +
+        std::to_string(block_size) + ").");
+  }
+  // compressor.py:131-132 — `[B, H=1, N, C] -> [B, N, C]`.
+  if (num_kv_heads != 1) {
+    throw std::invalid_argument(
+        "CompressorBackend: the compressor state cache holds one vector per "
+        "token, so num_kv_heads must be 1.");
+  }
+  return {num_blocks, block_size, head_size};
+}
+
+namespace {
+// Registered for every device type and in no platform priority list. Both
+// halves are deliberate and are argued once, in
+// src/vllm/v1/attention/backends/mla/sparse_swa.cpp.
+vllm::v1::AttentionBackendFactory MakeCompressorBackend =
+    []() -> std::unique_ptr<vllm::v1::AttentionBackend> {
+  return std::make_unique<CompressorBackend>();
+};
+const vllm::v1::AttentionBackendRegistrar kCompressorCuda{
+    vt::DeviceType::kCUDA, CompressorBackend::kName, MakeCompressorBackend};
+const vllm::v1::AttentionBackendRegistrar kCompressorCpu{
+    vt::DeviceType::kCPU, CompressorBackend::kName, MakeCompressorBackend};
+const vllm::v1::AttentionBackendRegistrar kCompressorRocm{
+    vt::DeviceType::kROCM, CompressorBackend::kName, MakeCompressorBackend};
+const vllm::v1::AttentionBackendRegistrar kCompressorMetal{
+    vt::DeviceType::kMETAL, CompressorBackend::kName, MakeCompressorBackend};
+const vllm::v1::AttentionBackendRegistrar kCompressorVulkan{
+    vt::DeviceType::kVULKAN, CompressorBackend::kName, MakeCompressorBackend};
+const vllm::v1::AttentionBackendRegistrar kCompressorTenstorrent{
+    vt::DeviceType::kTENSTORRENT, CompressorBackend::kName,
+    MakeCompressorBackend};
+}  // namespace
 
 }  // namespace vllm::deepseek_v4

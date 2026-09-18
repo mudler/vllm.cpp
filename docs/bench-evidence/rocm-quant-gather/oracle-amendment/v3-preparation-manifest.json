@@ -1,0 +1,48 @@
+{
+  "command": {
+    "bytes": 5350,
+    "sha256": "cd76a5f310854b53987785e0904c8c4292020895bf17ccf9802642698ef7ac24"
+  },
+  "driver": {
+    "bytes": 4294,
+    "sha256": "8fd8433d8b8ce41a490af00e9cb58c96ba5a199f250182ab2ed6255a818c7c23"
+  },
+  "driver_diff": {
+    "bytes": 1372,
+    "sha256": "de80d56a7cddd4d9e6d528a9870905b3bdd4bb953f5ed736e7e488cebdd5b03b"
+  },
+  "primary_import": {
+    "bytes": 7227,
+    "sha256": "1ddd29da328db6817b5b15119c228cad55b1f2d4e5acc143c80d70966a5c2d75"
+  },
+  "original_driver_preserved": {
+    "bytes": 3998,
+    "sha256": "a8bd0a4c815fb0df6934f69b15bf54179c5204630e617a3cd000bda5100aed2b"
+  },
+  "input_files": {
+    "/home/vikash/.cache/rdna3-gather-impl/primary-model-v1/model/config.json": {
+      "bytes": 974,
+      "sha256": "919812c5a2a3cfae586873cc965f0f4b33179a7ca96b8d8b1afcdac88afca71e"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/primary-model-v1/model/Q4_0.gguf": {
+      "bytes": 944192,
+      "sha256": "663597e28852d64097f7a67542675e4575ee158d3c5e6e2143aadd1b4188f4af"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/plugin-artifact/vllm_gguf_plugin/_C_gguf.abi3.so": {
+      "bytes": 5175208,
+      "sha256": "592af79c210496e96eaa7bd409ae0a67e7de8c334aa9f782082c7639ba300138"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/evidence/plugin-artifact-sha256.json": {
+      "bytes": 16561,
+      "sha256": "b4def029f9693f89654fa2c60433c9a82dd9924909bced7b772ec609e648f5bf"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/primary-model-v3/primary.py": {
+      "bytes": 7227,
+      "sha256": "1ddd29da328db6817b5b15119c228cad55b1f2d4e5acc143c80d70966a5c2d75"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/primary-model-v3/primary_model.py": {
+      "bytes": 4294,
+      "sha256": "8fd8433d8b8ce41a490af00e9cb58c96ba5a199f250182ab2ed6255a818c7c23"
+    }
+  }
+}

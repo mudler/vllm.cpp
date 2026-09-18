@@ -1,0 +1,11 @@
+{
+  "base": "94ac5d1742c540fc5cbc2084d0fb74fdfd5dab41",
+  "paths": [
+    "src",
+    "include",
+    "CMakeLists.txt",
+    "tests/CMakeLists.txt"
+  ],
+  "all_unchanged": true,
+  "diff_bytes": 0
+}

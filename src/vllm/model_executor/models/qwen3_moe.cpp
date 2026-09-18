@@ -35,6 +35,7 @@
 #include "vllm/model_executor/models/decode_graph_sizes.h"  // DecodeGraphSizes/PadToCaptureSize
 #include "vllm/model_executor/models/dense_attn_block.h"    // shared AttnBlock + device glue
 #include "vllm/model_executor/models/device_pool.h"         // DevicePool/Pool/ActivePool (shared)
+#include "vllm/model_executor/models/lm_head_projection.h"  // lm_head::Project (#3116)
 #include "vllm/model_executor/models/qwen3_5_internal.h"    // detail::EndExpertStreamStep
 #include "vllm/model_executor/device_placement.h"
 #include "vllm/model_executor/moe_placement_seam.h"
@@ -63,31 +64,43 @@ using namespace dense_attn;
 
 // One Qwen3-Coder decoder layer (qwen3_moe.py::Qwen3MoeDecoderLayer): input norm
 // (std add+RMSNorm) -> attention -> post norm (std add+RMSNorm) -> MoE block. The
-// residual accumulator `res` (bf16 [T,H]) is threaded through the two fused
-// add+RMSNorm producers; `hidden`/`hidden_hold` carry the current block-output
-// delta — a device tensor whose storage is either the previous layer's owning
-// MoeBlockOutput (`hidden_hold`) or the embedding buffer (held by the caller). The
-// MoE block output becomes the new delta, so the final RMSNorm fuses it into res.
+// BF16 residual accumulator `res` follows the backend's numeric policy. Legacy
+// callers retain the block-output delta in `hidden`. The compiled policy keeps
+// attention and residual operands alive through MoE, then consumes their ordered
+// expression here and transfers ownership of the normalized next input.
 void RunMoeLayer(Dev d, const Qwen3MoeLayerWeights& layer, const HfConfig& cfg,
                  Tensor& hidden, std::shared_ptr<void>& hidden_hold, DBuf& res,
                  const StepInputs& si, const CommonAttentionMetadata& meta,
-                 const PagedKvCache& kv, int64_t T, int64_t layer_index) {
+                 const PagedKvCache& kv, int64_t T, int64_t layer_index,
+                 const OwnedTensor* following_norm, bool final_layer) {
   const int64_t H = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
+  const bool compiled_residual = following_norm != nullptr;
 
-  Tensor w_in = ResidentWeight(d, layer.input_layernorm, {H});
-  DBuf dhn(d, DType::kBF16, {T, H});
-  if (FusedChainAdoptEnabled()) {
-    vt::FusedChain(d.q, dhn.t(), hidden, w_in, &res.t(), vt::kFusedAddRmsNormStd, eps);
-  } else {
-    vt::RmsNorm(d.q, dhn.t(), hidden, w_in, vt::RmsNormArgs{eps, false}, &res.t());
+  DBuf dhn;
+  Tensor normalized = hidden;
+  if (!compiled_residual || layer_index == 0) {
+    Tensor w_in = ResidentWeight(d, layer.input_layernorm, {H});
+    dhn = DBuf(d, DType::kBF16, {T, H});
+    if (FusedChainAdoptEnabled()) {
+      vt::FusedChain(d.q, dhn.t(), hidden, w_in, &res.t(), vt::kFusedAddRmsNormStd, eps);
+    } else {
+      vt::RmsNorm(d.q, dhn.t(), hidden, w_in, vt::RmsNormArgs{eps, false}, &res.t());
+    }
+    normalized = dhn.t();
   }
 
-  DBuf attn = AttnBlock(d, layer.attn, cfg, dhn.t(), si, meta, kv, T);
+  DBuf attn = AttnBlock(d, layer.attn, cfg, normalized, si, meta, kv, T);
 
   Tensor w_post = ResidentWeight(d, layer.post_attention_layernorm, {H});
   DBuf dh2(d, DType::kBF16, {T, H});
-  if (FusedChainAdoptEnabled()) {
+  if (compiled_residual) {
+    const vt::ResidualRmsNormArgs args{eps, {vt::ResidualNormExpr::kAdd}};
+    if (FusedChainAdoptEnabled())
+      vt::FusedChain(d.q, dh2.t(), attn.t(), res.t(), nullptr, w_post, args);
+    else
+      vt::ResidualRmsNorm(d.q, dh2.t(), attn.t(), res.t(), nullptr, w_post, args);
+  } else if (FusedChainAdoptEnabled()) {
     vt::FusedChain(d.q, dh2.t(), attn.t(), w_post, &res.t(), vt::kFusedAddRmsNormStd, eps);
   } else {
     vt::RmsNorm(d.q, dh2.t(), attn.t(), w_post, vt::RmsNormArgs{eps, false}, &res.t());
@@ -116,8 +129,26 @@ void RunMoeLayer(Dev d, const Qwen3MoeLayerWeights& layer, const HfConfig& cfg,
       /*placeable=*/layer.moe.expert_gate_fp4.empty(),
       "the routed experts are fp4-resident and their device residents are "
       "built at load");
-  hidden = moe.tensor;
-  hidden_hold = std::move(moe.storage);
+  if (compiled_residual) {
+    // vLLM e126687a9a generated ctj2x6:33-58 and c5slugd:33-56 normalize
+    // m + (attention + residual). Consume it while all three owners are alive.
+    // The next layer receives an already-normalized input, avoiding a second
+    // norm over its rounded BF16 residual. The final layer has no residual store.
+    Tensor weight = ResidentWeight(d, *following_norm, {H});
+    DBuf next(d, DType::kBF16, {T, H});
+    const vt::ResidualRmsNormArgs args{
+        eps, {vt::ResidualNormExpr::kDeltaPlusAdd, !final_layer, false, !final_layer}};
+    Tensor* residual_out = final_layer ? nullptr : &res.t();
+    if (FusedChainAdoptEnabled())
+      vt::FusedChain(d.q, next.t(), attn.t(), res.t(), &moe.tensor, weight, args, residual_out);
+    else
+      vt::ResidualRmsNorm(d.q, next.t(), attn.t(), res.t(), &moe.tensor, weight, args, residual_out);
+    hidden = next.t();
+    hidden_hold = next.ReleaseShared();
+  } else {
+    hidden = moe.tensor;
+    hidden_hold = std::move(moe.storage);
+  }
 }
 
 // GatherRows: gather the idx-indexed rows of `src` [.,H] into contiguous `dst`.
@@ -213,23 +244,37 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
   Tensor hidden = hidden_in;
   std::shared_ptr<void> hidden_hold;  // owns the current MoE-output delta storage
 
+  const bool compiled_residual =
+      d.b.GetResidualNormPolicy() == vt::ResidualNormPolicy::kCompiledExpression;
+  VT_CHECK(!compiled_residual || vt::OpRegistered(vt::OpId::kResidualRmsNorm, d.q.device.type),
+           "qwen3 moe: compiled residual policy requires the complete residual RMS norm operation");
+
   DBuf res(d, DType::kBF16, {T, H});
   res.Zero(d);
 
   StepInputs si = BuildStepInputs(d, positions, attn_meta, config);
 
-  for (int64_t l = 0; l < config.num_hidden_layers; ++l)
+  for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
+    const bool final_layer = l + 1 == config.num_hidden_layers;
+    const OwnedTensor* following_norm = !compiled_residual ? nullptr :
+        (final_layer ? &weights.final_norm : &weights.layers[static_cast<size_t>(l + 1)].input_layernorm);
     RunMoeLayer(d, weights.layers[static_cast<size_t>(l)], config, hidden,
                 hidden_hold, res, si, attn_meta, attn_kv[static_cast<size_t>(l)], T,
-                /*layer_index=*/l);
+                /*layer_index=*/l, following_norm, final_layer);
+  }
 
   // Final RMSNorm over the fused stream (res += hidden; std norm), then lm_head.
-  Tensor w_fn = ResidentWeight(d, weights.final_norm, {H});
-  DBuf dnorm(d, DType::kBF16, {T, H});
-  if (FusedChainAdoptEnabled()) {
-    vt::FusedChain(d.q, dnorm.t(), hidden, w_fn, &res.t(), vt::kFusedAddRmsNormStd, eps);
-  } else {
-    vt::RmsNorm(d.q, dnorm.t(), hidden, w_fn, vt::RmsNormArgs{eps, false}, &res.t());
+  DBuf dnorm;
+  Tensor final_normalized = hidden;
+  if (!compiled_residual) {
+    Tensor w_fn = ResidentWeight(d, weights.final_norm, {H});
+    dnorm = DBuf(d, DType::kBF16, {T, H});
+    if (FusedChainAdoptEnabled()) {
+      vt::FusedChain(d.q, dnorm.t(), hidden, w_fn, &res.t(), vt::kFusedAddRmsNormStd, eps);
+    } else {
+      vt::RmsNorm(d.q, dnorm.t(), hidden, w_fn, vt::RmsNormArgs{eps, false}, &res.t());
+    }
+    final_normalized = dnorm.t();
   }
 
   // lm_head. UNTIED (Qwen3-Coder): the loaded Matmul-B [H,vocab] lm_head via
@@ -241,21 +286,17 @@ DBuf ForwardLayers(Dev d, const Tensor& hidden_in,
 
   const bool do_gather = !logits_indices.empty() &&
                          static_cast<int64_t>(logits_indices.size()) < T;
-  Tensor src = dnorm.t();
+  Tensor src = final_normalized;
   DBuf dgather(d, DType::kBF16, do_gather ? std::vector<int64_t>{
                                                 static_cast<int64_t>(logits_indices.size()), H}
                                           : std::vector<int64_t>{1, 1});
   if (do_gather) {
-    GatherRows(d, dgather.ptr(), dnorm.t(), logits_indices, H);
+    GatherRows(d, dgather.ptr(), final_normalized, logits_indices, H);
     src = dgather.t();
   }
-  const int64_t n_out = src.shape[0];
-  DBuf logits(d, DType::kF32, {n_out, vocab});
-  if (tied)
-    vt::MatmulBT(d.q, logits.t(), src, lm);
-  else
-    vt::Matmul(d.q, logits.t(), src, lm);
-  return logits;
+  // The head projection and its OUTPUT DTYPE live on one seam (#3116) so the
+  // boundary a focused test replays is the boundary this forward runs.
+  return lm_head::Project(d, src, lm, tied);
 }
 
 // Full eager forward body: embed (host token_ids) then the capturable layer

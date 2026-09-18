@@ -1,0 +1,148 @@
+{
+  "upstream_revision": "e126687a9a828d513c01a07cd69f025f27d63280",
+  "upstream_test": "tests/kernels/test_fused_qk_norm_rope_gate.py:49-67",
+  "model_split": "vllm/model_executor/models/qwen3_next.py:424-433",
+  "adaptation": "Only split preparation; contiguous query/gate snapshots preserve upstream BF16 bytes.",
+  "seed": 13,
+  "dtype": "bfloat16",
+  "head_dim": 256,
+  "vllm": "0.28.1rc1.dev132+ge126687a9",
+  "torch": "2.12.0+git6bbd260",
+  "hip": "7.2.53211",
+  "generator_sha256": "6e3dfa7c11f38e8fa01e682b5b7680b3207585ea6b5f71d9d142cb6349d34f9c",
+  "cases": [
+    {
+      "tokens": 1,
+      "query_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "input": {
+        "offset": 0,
+        "bytes": 24576,
+        "sha256": "fe2c04e9c865538d17d786b3d2e0ce0642734783e8349010d42c1d5560afbaf4"
+      },
+      "query": {
+        "offset": 24576,
+        "bytes": 12288,
+        "sha256": "b0eb9423454fbc1f2ee3254f99905a8a1052210010eb1d2abec7108f4ffb742f"
+      },
+      "gate": {
+        "offset": 36864,
+        "bytes": 12288,
+        "sha256": "d58f8013c8a10441b8784cb1e7858ddbae8003b0f4a90049383e4831f6d92ae3"
+      }
+    },
+    {
+      "tokens": 1,
+      "query_heads": 16,
+      "kv_heads": 2,
+      "head_dim": 256,
+      "input": {
+        "offset": 49152,
+        "bytes": 16384,
+        "sha256": "e0dc6965d6afefa28a3a48222fd04ec68895d88e87e4049f89305322812e47d9"
+      },
+      "query": {
+        "offset": 65536,
+        "bytes": 8192,
+        "sha256": "d9add44e7ffa2b70680321622be63ecccd05990fea2298589388c3a1f1f3270c"
+      },
+      "gate": {
+        "offset": 73728,
+        "bytes": 8192,
+        "sha256": "6bd7239d11815bc97b901bc9845414a8cda69c2efcc3c22a9a5ebf337f7a4831"
+      }
+    },
+    {
+      "tokens": 4,
+      "query_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "input": {
+        "offset": 81920,
+        "bytes": 98304,
+        "sha256": "4de0436cfdb1c17b3041fcd9d2f2642974ac75c752b5ec6a52eefc11c7816aae"
+      },
+      "query": {
+        "offset": 180224,
+        "bytes": 49152,
+        "sha256": "3078253b67e3be3082f7f84ecfc468542895fb082deb65e3c725da92f49e433c"
+      },
+      "gate": {
+        "offset": 229376,
+        "bytes": 49152,
+        "sha256": "1ca9d0d07dfd7f2e5d0400fd37b21a5b360d3784f148a662ba556cddc3b967f2"
+      }
+    },
+    {
+      "tokens": 4,
+      "query_heads": 16,
+      "kv_heads": 2,
+      "head_dim": 256,
+      "input": {
+        "offset": 278528,
+        "bytes": 65536,
+        "sha256": "e35eb7b78a3576c3977f8e10380397f6c0addf8c359eff3bbe339e9e1380b6e8"
+      },
+      "query": {
+        "offset": 344064,
+        "bytes": 32768,
+        "sha256": "0efc595f85c2dc226896994ecd71f224d2adda8825847b9b5c3d2972fb72a816"
+      },
+      "gate": {
+        "offset": 376832,
+        "bytes": 32768,
+        "sha256": "66e7472ca0e46606c603fbccc843533e3efe5ac23d03c1711c30fc0c2b0bc56c"
+      }
+    },
+    {
+      "tokens": 37,
+      "query_heads": 24,
+      "kv_heads": 4,
+      "head_dim": 256,
+      "input": {
+        "offset": 409600,
+        "bytes": 909312,
+        "sha256": "95090a07349cedb63eedd20a5966aee015595df320dbe6c0f53830e56e97c90a"
+      },
+      "query": {
+        "offset": 1318912,
+        "bytes": 454656,
+        "sha256": "00831ed2f020915a8898679f07cd509b05eea738f72caa44819a758b9f156489"
+      },
+      "gate": {
+        "offset": 1773568,
+        "bytes": 454656,
+        "sha256": "4ef755701e53a93c4c52ba2fa9864cc27eaf0d3e64e1e343aa385bb250d8f1e5"
+      }
+    },
+    {
+      "tokens": 37,
+      "query_heads": 16,
+      "kv_heads": 2,
+      "head_dim": 256,
+      "input": {
+        "offset": 2228224,
+        "bytes": 606208,
+        "sha256": "632e173df2ffe1819468f1e2cfe9f6599449108c7a452fbd58e0610705190241"
+      },
+      "query": {
+        "offset": 2834432,
+        "bytes": 303104,
+        "sha256": "f040e75f1d38b600b281cf74f8a6bdd7c9d30a109fc0c851c43beecfa173a24b"
+      },
+      "gate": {
+        "offset": 3137536,
+        "bytes": 303104,
+        "sha256": "46413f84f3a025d83e58d8a771caf530dc2def043b46c63859252661ca510398"
+      }
+    }
+  ],
+  "compilation_custom_ops": [
+    "+sparse_attn_indexer",
+    "none"
+  ],
+  "data_file": "cases.bin",
+  "data_bytes": 3440640,
+  "data_sha256": "dca91b8782df22399751c4b5f729e8742ac5a7e094dc963be0fb6b64e98cc605"
+}

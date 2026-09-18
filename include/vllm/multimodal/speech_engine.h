@@ -201,10 +201,10 @@ class SpeechEngine {
   // is held through a `unique_ptr` or a `shared_ptr` everywhere in this tree, and
   // a future copy would be a second engine sharing one lock's worth of nothing.
   // A compile error at the seam is the right place to learn that.
-  SpeechEngine(const SpeechEngine&) = default;
-  SpeechEngine& operator=(const SpeechEngine&) = default;
-  SpeechEngine(SpeechEngine&&) = default;
-  SpeechEngine& operator=(SpeechEngine&&) = default;
+  SpeechEngine(const SpeechEngine&) = delete;
+  SpeechEngine& operator=(const SpeechEngine&) = delete;
+  SpeechEngine(SpeechEngine&&) = delete;
+  SpeechEngine& operator=(SpeechEngine&&) = delete;
 
  private:
   std::mutex synthesize_mutex_;

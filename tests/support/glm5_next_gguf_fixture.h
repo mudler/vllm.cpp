@@ -200,6 +200,9 @@ inline float Q8_0ValueAt(int64_t i, int64_t cols, int64_t tag) {
 struct FixtureOpts {
   std::string drop;
   std::string bad_shape;
+  // Q4_0 has the same 32-element block geometry, but no ROCm device arm.
+  // The default preserves the existing Q8_0 fixture bytes.
+  bool q4_0_experts = false;
   // Write `ssm_a` on layer 0 as a POSITIVE value — what a converter that
   // skipped llama.cpp #27752's `-torch.exp` would emit. `log(-x)` is then
   // undefined and the loader must refuse by name rather than store a NaN.
@@ -209,6 +212,22 @@ struct FixtureOpts {
 };
 
 namespace detail {
+
+inline std::string ExpertBytes(const FixtureOpts& o, int64_t rows,
+                               int64_t cols, int64_t tag) {
+  if (!o.q4_0_experts) return Q8_0Bytes(rows, cols, tag);
+  const int64_t blocks = rows * (cols / 32);
+  std::string data(static_cast<size_t>(blocks) * 18, '\0');
+  for (int64_t b = 0; b < blocks; ++b) {
+    const uint16_t scale = vt::F32ToF16(0.5F);
+    std::memcpy(data.data() + b * 18, &scale, sizeof(scale));
+    for (int64_t i = 0; i < 16; ++i) {
+      data[static_cast<size_t>(b * 18 + 2 + i)] = static_cast<char>(
+          ((b + i + tag) % 16) | (((b + i + tag + 7) % 16) << 4));
+    }
+  }
+  return data;
+}
 
 inline void Add(gguf_test::GgufModelBuilder& b, const FixtureOpts& o,
                 const std::string& name, const std::vector<uint64_t>& ne_dims,
@@ -426,13 +445,14 @@ inline std::string BuildFixture(const FixtureOpts& o = FixtureOpts{}) {
       AddF32(b, o, Blk(L, "exp_probs_b.bias"), {kExperts}, Base(L, 25));
       // The three stacked banks, at Q8_0 so the keep-quant arm runs.
       detail::Add(b, o, Blk(L, "ffn_gate_exps.weight"),
-                  Ne({kExperts, kMoeI, kH}), 8,
-                  Q8_0Bytes(kExperts * kMoeI, kH, 10 * L + 1));
+                  Ne({kExperts, kMoeI, kH}), o.q4_0_experts ? 2 : 8,
+                  detail::ExpertBytes(o, kExperts * kMoeI, kH, 10 * L + 1));
       detail::Add(b, o, Blk(L, "ffn_up_exps.weight"), Ne({kExperts, kMoeI, kH}),
-                  8, Q8_0Bytes(kExperts * kMoeI, kH, 10 * L + 2));
+                  o.q4_0_experts ? 2 : 8,
+                  detail::ExpertBytes(o, kExperts * kMoeI, kH, 10 * L + 2));
       detail::Add(b, o, Blk(L, "ffn_down_exps.weight"),
-                  Ne({kExperts, kH, kMoeI}), 8,
-                  Q8_0Bytes(kExperts * kH, kMoeI, 10 * L + 3));
+                  Ne({kExperts, kH, kMoeI}), o.q4_0_experts ? 2 : 8,
+                  detail::ExpertBytes(o, kExperts * kH, kMoeI, 10 * L + 3));
       AddF32(b, o, Blk(L, "ffn_gate_shexp.weight"), {kMoeI, kH}, Base(L, 26));
       AddF32(b, o, Blk(L, "ffn_up_shexp.weight"), {kMoeI, kH}, Base(L, 27));
       AddF32(b, o, Blk(L, "ffn_down_shexp.weight"), {kH, kMoeI}, Base(L, 28));
@@ -459,10 +479,18 @@ inline std::string BuildFixture(const FixtureOpts& o = FixtureOpts{}) {
 // Calling `LoadGlm5NextFromGguf` directly would skip `ModelRegistry::Resolve`
 // and the registry's factory, and that skip is exactly what would hide a
 // registration this wave never wired.
+// `device` is what the ENGINE resolved for the load. It defaults to `kCPU` so
+// every existing caller reads as the ordinary CPU load it always was, and a
+// CUDA-build caller that wants the CUDA residency policy passes `kCUDA`
+// explicitly. Using `CurrentPlatform().device_type()` here was wrong for the
+// same reason `model_registry.h:133-143` records: the probe answers `kCUDA` on
+// any process where the CUDA platform registered, while a test that creates a
+// CPU queue needs host-resident weights.
 inline std::unique_ptr<vllm::LoadedModel> LoadThroughRegistry(
-    const vllm::GgufFile& g) {
+    const vllm::GgufFile& g,
+    vt::DeviceType device = vt::DeviceType::kCPU) {
   const vllm::HfConfig config = vllm::Glm5NextHfConfigFromGguf(g);
-  const vllm::ModelSource source = vllm::ModelSource::FromGguf(g, vllm::platforms::CurrentPlatform().device_type());
+  const vllm::ModelSource source = vllm::ModelSource::FromGguf(g, device);
   return vllm::ModelRegistry::Load(config, source);
 }
 

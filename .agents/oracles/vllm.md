@@ -222,10 +222,19 @@ its golden was captured under.
 **A residual this table exists to hold, and does not yet close.** Every checker
 reads the `gateable` field, not the prose above it, and no field names the device
 or the model a `yes` was measured on. So `gateable = yes` is as strong as the
-best row here, and the best row here is at the prior pin. Whoever adds the first
-row at `e126687a9a` — the token gate on `dgx:gpu0`
-([#2794](https://github.com/mudler/vllm.cpp/issues/2794)) is the obvious
-candidate — closes that gap for one board and no more.
+best row here. **This paragraph used to end "and the best row here is at the
+prior pin. Whoever adds the first row at `e126687a9a` — the token gate on
+`dgx:gpu0` ([#2794](https://github.com/mudler/vllm.cpp/issues/2794)) is the
+obvious candidate — closes that gap for one board and no more", and the table
+directly above it now falsifies that.** The `dgx:gpu0` row IS at `e126687a9a`,
+captured 2026-09-04, and #2794 closed `COMPLETED` on 2026-09-06
+(`gh issue view 2794 --repo mudler/vllm.cpp --json state,closedAt,stateReason`,
+read 2026-09-12). The residual is therefore narrower and still open: the gap is
+closed for ONE board and ONE gate model, `facebook/opt-125m` at six prompts and
+sixteen tokens. It is not closed for `thor:gpu0`, for `strix:gpu0`, or for any
+production checkpoint at this pin, and no field records that limit. Whoever adds
+the next row at `e126687a9a` narrows it further; nobody closes it by reading the
+field.
 
 **gfx1151 needs five packages a bare ROCm image does not carry**, and each of
 their absences presents as a device failure rather than as a provisioning gap:

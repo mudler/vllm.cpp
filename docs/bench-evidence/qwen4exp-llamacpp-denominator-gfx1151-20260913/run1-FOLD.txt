@@ -1,0 +1,13 @@
+legs_designed=6 legs_completed=6 legs_failed=0
+leg 1 rc=0 avg_ts=26.041122 stddev=0.617733 reps=[26.345, 26.4481, 25.3303]
+leg 2 rc=0 avg_ts=25.681147 stddev=0.906239 reps=[26.0372, 26.3553, 24.651]
+leg 3 rc=0 avg_ts=24.466618 stddev=0.453652 reps=[24.5384, 24.8801, 23.9814]
+leg 4 rc=0 avg_ts=25.734857 stddev=0.583982 reps=[25.8539, 26.2501, 25.1005]
+leg 5 rc=0 avg_ts=25.579065 stddev=1.001905 reps=[25.9073, 26.3757, 24.4542]
+leg 6 rc=0 avg_ts=25.691706 stddev=0.736071 reps=[26.0525, 26.1777, 24.8448]
+MEDIAN_OF_LEGS=25.6864
+MEAN_OF_LEGS=25.5324
+MIN_LEG=24.4666 MAX_LEG=26.0411
+LEG_SPREAD_PCT_OF_MEDIAN=6.130
+MEDIAN_OF_REPS=25.8806 MIN_REP=23.9814 MAX_REP=26.4481 REP_SPREAD_PCT=9.531
+N_REPS=18

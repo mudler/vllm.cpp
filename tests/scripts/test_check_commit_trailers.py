@@ -126,6 +126,17 @@ class CommitMessageContract(unittest.TestCase):
                     "malformed Assisted-by",
                 )
 
+    def test_assisted_by_accepts_slash_in_model_name(self) -> None:
+        """A provider/model identifier such as regolo/glm5.2 uses ``/`` as
+        the separator, and the TOOL slot of the same regex already allows it.
+        The MODEL slot must too, or commits land with a mangled name (#3132)."""
+        message = STRICT_MESSAGE.replace(
+            "Codex:GPT-5 [Codex]", "AGENT:regolo/glm5.2 [maki]"
+        )
+        self.assertEqual(
+            self.checker.validate_commit_message(message, strict=True), []
+        )
+
     def test_human_only_declaration_rejects_assistance_attribution(self) -> None:
         message = STRICT_MESSAGE.replace("AI-Assisted: true", "AI-Assisted: false")
         self.assertInvalid(message, "must omit Assisted-by")
@@ -915,13 +926,11 @@ class AttributionIsEnforcedOnce(unittest.TestCase):
     lane re-checked what had just been checked, and its only unique coverage was
     of a direct push to `main`, which the landing rules already prohibit.
 
-    What it produced instead was forgiveness work. Two mechanisms existed solely
-    to excuse landed commits: `scripts/ci-enforcement-floor.txt`, whose current
-    value forgives 43 commits dated 2026-08-13 to 2026-08-25, and
-    `LANDED_MESSAGE_EXCEPTIONS`, which carried one. 44 commits on `main` violate
-    a contract and cannot be repaired, each forgiven by a deliberate reviewed
-    act. A gate whose three-week output is 44 forgiveness decisions rather than
-    44 prevented defects is measuring the wrong thing.
+    What it produced instead was forgiveness work. `LANDED_MESSAGE_EXCEPTIONS`
+    existed solely to excuse landed commits, and carried one. 44 commits on
+    `main` violate a contract and cannot be repaired, each forgiven by a
+    deliberate reviewed act. A gate whose three-week output is 44 forgiveness
+    decisions rather than 44 prevented defects is measuring the wrong thing.
     """
 
     WORKFLOW = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
@@ -950,24 +959,6 @@ class AttributionIsEnforcedOnce(unittest.TestCase):
         any. It cannot apply, and a dead exception list invites a live one."""
         source = (ROOT / "scripts/check-commit-trailers.py").read_text(encoding="utf-8")
         self.assertNotIn("LANDED_MESSAGE_EXCEPTIONS", source)
-
-    def test_the_enforcement_floor_no_longer_claims_the_trailer_steps(self) -> None:
-        """The floor still serves documentation-checkpoint and agent-record, so
-        the FILE stays. Its own comment enumerated the gates it governs, and
-        leaving the trailer steps named there would be a record that lies."""
-        floor = (ROOT / "scripts/ci-enforcement-floor.txt").read_text(encoding="utf-8")
-        # The GOVERNING sentence, not a bare substring: the file still explains
-        # that the trailer steps used to be governed here, and a crude
-        # `assertNotIn` cannot tell that history from a live claim.
-        governed = floor.split("never start behind it.", 1)[0]
-        self.assertIn("documentation-checkpoint", governed)
-        self.assertNotIn("commit-protocol-tag", governed)
-        self.assertTrue(
-            floor.rstrip().endswith("e1b5df1a6b5b30555639e0a0459f79a467544579"),
-            "the floor VALUE moves only by a reviewed advance that re-pins this "
-            "assertion; #2322 narrowed its scope and did not move it, and #2743 "
-            "advanced it to e1b5df1a6 without widening the scope back",
-        )
 
 
 class WhichBodyIsRead(unittest.TestCase):

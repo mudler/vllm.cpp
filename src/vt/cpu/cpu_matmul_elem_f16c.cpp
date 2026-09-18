@@ -1,6 +1,7 @@
 #include "vt/cpu/cpu_matmul_elem_f16c.h"
 
 #include "vt/quant.h"
+#include "vt/unaligned.h"
 
 #include <immintrin.h>
 
@@ -49,7 +50,7 @@ void BtM2F16c(const float* af, int64_t a_stride, const void* bv, int64_t k,
       const float av = af[r * a_stride + pt];
       for (int lane = 0; lane < kElemLanes; ++lane) {
         acc[r * kElemLanes + lane] +=
-            av * F16ToF32(b[static_cast<int64_t>(lane) * k + pt]);
+            av * F16ToF32(vt::LoadUnaligned<uint16_t>(b + static_cast<int64_t>(lane) * k + pt));
       }
     }
   }
@@ -81,7 +82,7 @@ void Bt16F16c(const float* af, const void* bv, int64_t k, float* acc) {
   for (; p < k; ++p) {
     const float av = af[p];
     for (int lane = 0; lane < kElemLanes; ++lane) {
-      acc[lane] += av * F16ToF32(b[static_cast<int64_t>(lane) * k + p]);
+      acc[lane] += av * F16ToF32(vt::LoadUnaligned<uint16_t>(b + static_cast<int64_t>(lane) * k + p));
     }
   }
 }

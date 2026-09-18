@@ -205,6 +205,35 @@ void KeepQuantChunkRowsOverrideForTest(int64_t rows);
 bool KeepQuantWordShadowPresentForTest(const void* host);
 bool DecodedWeightShadowPresentForTest(const void* host);
 bool EmbedTableShadowPresentForTest(const void* host);
+// W4d W0 (#3042): device-side allocation trace — interleaves
+// get_memory_view snapshots between ops to attribute the 27B OOM.
+// Gated by VT_TT_ALLOC_TRACE. The snapshot count and max-allocation-delta
+// probes are the red-first observables: zero before any device work,
+// positive after the keep-quant path runs instrumented.
+void AllocTraceSnapshot(MeshDevice& device, const char* label);
+int64_t AllocTraceSnapshotCountForTest();
+int64_t AllocTraceMaxDeltaForTest();
+void ResetAllocTraceForTest();
+// W4d W2 (#3042): total free DRAM across banks, the residency-reclaim
+// observable — the W1 trace proved the decode planes never return to the
+// allocator; this is the red-first probe the reclaim test asserts on.
+int64_t FreeDeviceDramBytesForTest();
+// Total DRAM across banks (capacity, not free) — the platform's probed
+// total for the placement fit (ISSUE-LOCAL-01M2ACXRJYFW7R7BP2ABQS3VY2).
+int64_t DeviceDramTotalBytes();
+// W4d W3 focused-test hook: stage `t`'s bf16 TILE form exactly as
+// EnsureDevice2D does (creating the slot's persistent buffer), reproducing
+// the loader's weight staging before a keep-quant matmul.
+void StageWeightBf16ForTest(const Tensor& t, MeshDevice& device);
+// W4d W6: stage the keep-quant word shadow for a block-quant weight at
+// LOAD time (the residency pre-pass; no-op for non-block dtypes).
+void StageKeepQuantWordsFor(const Tensor& packed);
+// Attribution (W4d W3): dump resident slot bytes by holder (device shadow /
+// persistent staged buffer / gemma) + top holders. Gated by the caller.
+void DumpSlotCensus(const char* label);
+// W4d W3: release consumer shadows whose rows match the warm forward's
+// shape (recipe-gated via VT_TT_RELEASE_WARM_ROWS; see the ops-side comment).
+void ReleaseWarmShapeSlots(uint32_t rows);
 #else
 inline int64_t KeepQuantCaptureStagingWrites() { return 0; }
 inline void ResetKeepQuantCaptureStagingWritesForTest() {}
@@ -213,6 +242,16 @@ inline void KeepQuantChunkRowsOverrideForTest(int64_t) {}
 inline bool KeepQuantWordShadowPresentForTest(const void*) { return false; }
 inline bool DecodedWeightShadowPresentForTest(const void*) { return false; }
 inline bool EmbedTableShadowPresentForTest(const void*) { return false; }
+inline void AllocTraceSnapshot(MeshDevice&, const char*) {}
+inline int64_t AllocTraceSnapshotCountForTest() { return 0; }
+inline int64_t AllocTraceMaxDeltaForTest() { return 0; }
+inline void ResetAllocTraceForTest() {}
+inline int64_t FreeDeviceDramBytesForTest() { return 0; }
+inline int64_t DeviceDramTotalBytes() { return 0; }
+inline void StageWeightBf16ForTest(const Tensor&, MeshDevice&) {}
+inline void StageKeepQuantWordsFor(const Tensor&) {}
+inline void DumpSlotCensus(const char*) {}
+inline void ReleaseWarmShapeSlots(uint32_t) {}
 #endif
 
 // ITEM 5 (rope): driver-side warm hook — populate the persistent device
@@ -252,7 +291,33 @@ inline bool ConvShadowServeable(const void*, int64_t, int64_t, int64_t) {
 }
 #endif
 
-// ITEM 5 (RAC): stage the persistent device update-idx / page-table tensors
+// Snapshot/restore the device shadow state for a set of GDN state buffers.
+// The decode graph warmup modifies the GDN state in place; the capture step
+// then reads the modified state, which has a different shape than the eager
+// warmup saw. Saving before the warmup and restoring before the capture
+// ensures both passes see the same initial state.
+#ifdef VLLM_CPP_TENSTORRENT
+// Opaque snapshot: the implementation stores the ttnn::Tensor and slot
+// fields internally; the header only exposes the struct size for stack
+// allocation. The model code passes the snapshot through without
+// inspecting it.
+struct GdnStateShadowSnapshot {
+  // Opaque storage for ttnn::Tensor + uint32 + bool fields.
+  alignas(16) char storage[64];
+};
+std::vector<GdnStateShadowSnapshot> SnapshotGdnStateShadows(
+    const std::vector<const void*>& ptrs);
+void RestoreGdnStateShadows(
+    const std::vector<const void*>& ptrs,
+    const std::vector<GdnStateShadowSnapshot>& snapshots);
+#else
+struct GdnStateShadowSnapshot {};
+inline std::vector<GdnStateShadowSnapshot> SnapshotGdnStateShadows(
+    const std::vector<const void*>&) { return {}; }
+inline void RestoreGdnStateShadows(
+    const std::vector<const void*>&,
+    const std::vector<GdnStateShadowSnapshot>&) {}
+#endif
 // for THIS slot mapping, outside capture (driver Refresh slot). No-op unless
 // VT_TT_HOST_FREE_DECODE. slot_mapping_owner is the host buffer the captured
 // ReshapeAndCache will see as its slot_mapping (keyed identity). page_table is

@@ -66,6 +66,31 @@ the warning text and matches the separately captured installed SDK revision.
 Do not derive kernel durations, time shares, or host idle bounds from these
 timestamps.
 
+**ANNOTATION 2026-09-13: that sentence is broader than the capture under it, and
+being read as a blanket refusal has cost a wave.** `cc0e827dd` closed the
+qwen4_exp placement question with "where our decode step time goes is
+unestablished" on the strength of it. Measured directly on
+`diag-kernel-control-asaj36ta--trace--e5367aefafa8--1_kernel_trace.csv.gz`: of
+its 85,737 rows, **zero** have `End < Start` and **zero** have `End == Start`;
+durations run 7 ns to 5.212 ms with a 52.301 us median; they sum to 11.749 s
+against a 12.551 s first-start-to-last-end span, an occupancy of **93.6%**; and
+the 62 swap warnings are **0.072%** of rows. The SDK repaired the rows it warned
+about and delivered a monotonic table. A per-ROW exactness claim is still
+refused, and #3040 still owns that. A RANKING over tens of thousands of rows is
+not: assuming all 62 adjusted rows were maximally wrong and each really cost the
+trace's longest kernel bounds the aggregate error at **2.75%** of the budget.
+`scripts/rocm-rank-kernels.py` computes that bound itself from
+`--swap-warnings`, and refuses outright (exit 4) if any inverted row survives.
+
+**A SEPARATE FAILURE NOW BLOCKS NEW CAPTURES ON THIS BOARD, and it is not this
+one.** On 2026-09-13 the same profiler revision (`97f5574fe`) on a bare Ubuntu
+`rc` worker wrote **zero dispatch records** in four leases: `ring_buffer.cpp:106`
+fails to `mmap` with `EINVAL` at output generation, aborts at FATAL, and then
+deadlocks in its own signal handler ignoring SIGTERM. The capture in THIS folder
+was taken inside a purpose-built podman image, which is the difference under
+suspicion. See `ISSUE-LOCAL-01M2DQC3M3VHKDEZYPA8BSRCAV` and
+[`rocm-kernel-attrib-gfx1151-20260913.md`](../rocm-kernel-attrib-gfx1151-20260913.md).
+
 The complete kernel-only CSV contains 85,737 dispatch rows, including 64
 `ArgmaxK` and 4,096 `MoeSiluMulK` calls. These counts identify executed
 kernels, not their timing contribution.

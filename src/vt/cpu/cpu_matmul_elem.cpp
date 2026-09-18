@@ -60,7 +60,7 @@ void Bt16Portable(const float* af, const void* bv, int64_t k, float* acc) {
   for (int64_t p = 0; p < k; ++p) {
     const float av = af[p];
     for (int l = 0; l < kElemLanes; ++l) {
-      s[l] += av * E::Cvt(b[static_cast<int64_t>(l) * k + p]);
+      s[l] += av * E::Cvt(vt::LoadUnaligned<typename E::T>(b + static_cast<int64_t>(l) * k + p));
     }
   }
   for (int l = 0; l < kElemLanes; ++l) acc[l] = s[l];
@@ -76,7 +76,7 @@ void Nk16Portable(const float* af, const void* bv, int64_t k, int64_t n, float* 
     const float av = af[p];
     const typename E::T* row = b + p * n;
     for (int l = 0; l < kElemLanes; ++l) {
-      s[l] += av * E::Cvt(row[l]);
+      s[l] += av * E::Cvt(vt::LoadUnaligned<typename E::T>(row + l));
     }
   }
   for (int l = 0; l < kElemLanes; ++l) acc[l] = s[l];
@@ -99,7 +99,7 @@ void NkM4Portable(const float* af, int64_t a_stride, const void* bv, int64_t k,
   for (int64_t p = 0; p < k; ++p) {
     const typename E::T* row = b + p * n;
     float w[kElemLanes];
-    for (int l = 0; l < kElemLanes; ++l) w[l] = E::Cvt(row[l]);
+    for (int l = 0; l < kElemLanes; ++l) w[l] = E::Cvt(vt::LoadUnaligned<typename E::T>(row + l));
     for (int r = 0; r < kMrNkPortable; ++r) {
       const float av = af[r * a_stride + p];
       for (int l = 0; l < kElemLanes; ++l) s[r][l] += av * w[l];
@@ -183,7 +183,7 @@ void Bt16Neon(const float* af, const void* bv, int64_t k, float* acc) {
   for (; p < k; ++p) {  // K tail, still in p order per lane
     const float av = af[p];
     for (int l = 0; l < kElemLanes; ++l) {
-      acc[l] += av * E::Cvt(b[static_cast<int64_t>(l) * k + p]);
+      acc[l] += av * E::Cvt(vt::LoadUnaligned<typename E::T>(b + static_cast<int64_t>(l) * k + p));
     }
   }
 }
@@ -229,7 +229,7 @@ void BtM4Neon(const float* af, int64_t a_stride, const void* bv, int64_t k, floa
     for (int r = 0; r < kMrNeon; ++r) {
       const float av = af[r * a_stride + pt];
       for (int l = 0; l < kElemLanes; ++l) {
-        acc[r * kElemLanes + l] += av * E::Cvt(b[static_cast<int64_t>(l) * k + pt]);
+        acc[r * kElemLanes + l] += av * E::Cvt(vt::LoadUnaligned<typename E::T>(b + static_cast<int64_t>(l) * k + pt));
       }
     }
   }
@@ -328,7 +328,7 @@ void Bt16Sse2(const float* af, const void* bv, int64_t k, float* acc) {
   for (; p < k; ++p) {
     const float av = af[p];
     for (int l = 0; l < kElemLanes; ++l) {
-      acc[l] += av * E::Cvt(b[static_cast<int64_t>(l) * k + p]);
+      acc[l] += av * E::Cvt(vt::LoadUnaligned<typename E::T>(b + static_cast<int64_t>(l) * k + p));
     }
   }
 }
@@ -374,7 +374,7 @@ void BtM2Sse2(const float* af, int64_t a_stride, const void* bv, int64_t k, floa
     for (int r = 0; r < kMrSse2; ++r) {
       const float av = af[r * a_stride + pt];
       for (int l = 0; l < kElemLanes; ++l) {
-        acc[r * kElemLanes + l] += av * E::Cvt(b[static_cast<int64_t>(l) * k + pt]);
+        acc[r * kElemLanes + l] += av * E::Cvt(vt::LoadUnaligned<typename E::T>(b + static_cast<int64_t>(l) * k + pt));
       }
     }
   }

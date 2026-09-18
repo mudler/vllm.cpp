@@ -1,0 +1,108 @@
+{
+  "files": {
+    "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/inputs/manifest.json": {
+      "bytes": 1126,
+      "sha256": "9e1536b648a31c31262f0dfa3f01ce3693b747f7472972310649a4d19ce9cc4e"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/inputs/IQ1_XXXS-256.packed": {
+      "bytes": 190,
+      "sha256": "689284b70f0d1d4377bd6bc5cb607377862cdcce28b1bdaa3ee1b41c51e5c127"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/inputs/MXFP4-256.packed": {
+      "bytes": 680,
+      "sha256": "5f887e137c3fe120e2044e675622696b5ccd6603d5b46a18b640ba5abb8068e5"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/inputs/Q8_K-256.packed": {
+      "bytes": 1460,
+      "sha256": "81c780fb2f98e9d3ec7add68960cc5856b10de665f3e8b3a88b21e944664c97e"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/inputs/Q8_K-256.ids": {
+      "bytes": 16,
+      "sha256": "0b975a0d33e8d060ec1659248177222f2cf938ebf8b0439a70996d3a7f8fdf89"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/inputs/IQ1_XXXS-256.ids": {
+      "bytes": 16,
+      "sha256": "0b975a0d33e8d060ec1659248177222f2cf938ebf8b0439a70996d3a7f8fdf89"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/inputs/MXFP4-256.ids": {
+      "bytes": 16,
+      "sha256": "0b975a0d33e8d060ec1659248177222f2cf938ebf8b0439a70996d3a7f8fdf89"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/trace-v1/native-capture": {
+      "bytes": 30693264,
+      "sha256": "2569a80c1bddec3ebd9332e1ca2cfb9d316df5db6e8afe17a51ab66d09438698"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-stock-build/rocm_gather_secondary": {
+      "bytes": 5736280,
+      "sha256": "7b9a2e2d0dc95afbf592b5b1678bdc67e0fe2204529f1afe3b0b1f03566f28c2"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-fork-build/rocm_gather_secondary": {
+      "bytes": 5715184,
+      "sha256": "cad537f239dc0c4ca70e5b80548f39f297117494269ca2b9b5de8191aa2f4bc1"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/tools/rocm_quant_gather/stock_shapes.py": {
+      "bytes": 1961,
+      "sha256": "e09a1ae74a1e55193bcae982606e68ec14a86ff9e98192c729d0aafe487c5321"
+    }
+  },
+  "secondary_runs": [
+    {
+      "argv": [
+        "/home/vikash/.cache/rdna3-gather-impl/llama-stock-build/rocm_gather_secondary",
+        "gather",
+        "15",
+        "5",
+        "256",
+        "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/inputs/Q8_K-256.packed",
+        "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/inputs/Q8_K-256.ids",
+        "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/secondary/Q8_K-256-f32.bin"
+      ],
+      "exit_code": 0,
+      "log": "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/secondary/Q8_K-256.log"
+    },
+    {
+      "argv": [
+        "/home/vikash/.cache/rdna3-gather-impl/llama-stock-build/rocm_gather_secondary",
+        "gather",
+        "39",
+        "5",
+        "256",
+        "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/inputs/MXFP4-256.packed",
+        "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/inputs/MXFP4-256.ids",
+        "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/secondary/MXFP4-256-f32.bin"
+      ],
+      "exit_code": 0,
+      "log": "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/secondary/MXFP4-256.log"
+    },
+    {
+      "argv": [
+        "/home/vikash/.cache/rdna3-gather-impl/llama-fork-build/rocm_gather_secondary",
+        "gather",
+        "66",
+        "5",
+        "256",
+        "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/inputs/IQ1_XXXS-256.packed",
+        "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/inputs/IQ1_XXXS-256.ids",
+        "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/secondary/IQ1_XXXS-256-f32.bin"
+      ],
+      "exit_code": 0,
+      "log": "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/secondary/IQ1_XXXS-256.log"
+    }
+  ],
+  "native": {
+    "argv": [
+      "/home/vikash/.cache/rdna3-gather-impl/trace-v1/native-capture",
+      "capture",
+      "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/inputs/manifest.json",
+      "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/native"
+    ],
+    "env": {
+      "HIP_VISIBLE_DEVICES": "0",
+      "ROCR_VISIBLE_DEVICES": "0"
+    },
+    "cwd": "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1",
+    "log": "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/native.log"
+  },
+  "gate": "Stock test_get_rows applicable width256 rows5 four IDs contiguous unbatched. Q8_K uses upstream direct decoder; MXFP4 and IQ1_XXXS use real graphs. f32 exact; bf16 explicit RNE.",
+  "authority": "Only root operator runs native under GPU0 mutex; secondary recipes are CPU only"
+}

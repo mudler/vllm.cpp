@@ -64,7 +64,16 @@ TEST_CASE("registry_imports: every registered architecture has a complete factor
   // three: the checkpoint's 46th layer is an MTP block the transformers
   // reference discards rather than a second architecture string, and the
   // text-only `Glm5NextForCausalLM` is declared by no published artifact.
-  REQUIRE(registrations.size() == 45);
+  // 44 -> 45 on MODEL-MM-deepseek-v4-1-deepseek-v41-for-causal-lm (W1,
+  // ISSUE-LOCAL-01M2C04E8N4NTXYNS584M1TSFP): `DeepseekV41ForCausalLM`, its own
+  // additive TU. Upstream registers it at `registry.py:379` @ `e77daef89e`,
+  // BEYOND our parity pin, and registration claims no gate against the oracle
+  // (the standing #490 gives `Qwen3_5ForCausalLM`). It moves the count by ONE
+  // and not by two: upstream's text-only `DeepseekV41LLMForCausalLM` is
+  // internal and declared by no published artifact, and the `DSparkV41DraftModel`
+  // speculator (registry.py:647) is INVENTORIED and deliberately NOT registered.
+  // 45 -> 46 on BACKEND-VULKAN-TQ1_0: `MapleForCausalLM`, its own additive TU.
+  REQUIRE(registrations.size() == 46);
 
   for (const ModelRegistration& registration : registrations) {
     CAPTURE(registration.architecture);
@@ -165,7 +174,7 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   // with the kExampleConfigArchitectures ledger; adding a model appends its two
   // entries here.
   const std::vector<std::string_view> supported = ModelRegistry::SupportedArchs();
-  REQUIRE(supported.size() == 45);
+  REQUIRE(supported.size() == 46);
   CHECK(std::is_sorted(supported.begin(), supported.end()));
   // The full byte-order sequence. Note "MiniCPM3" < "MiniCPMF" and "Phi3" <
   // "PhiF" ('3' 0x33 < 'F' 0x46); "OPT" < "Olmo" ('P' 0x50 < 'l' 0x6C); and among
@@ -176,6 +185,10 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   const std::vector<std::string_view> kSortedArchs{
       "CohereForCausalLM",
       "DeepseekV2ForCausalLM",
+      // "DeepseekV41For" < "DeepseekV4For": they agree through "DeepseekV4" and
+      // then differ at '1' 0x31 against 'F' 0x46, so the V4.1 arm sorts BEFORE
+      // the V4 one rather than after it.
+      "DeepseekV41ForCausalLM",
       "DeepseekV4ForCausalLM",
       "Dots3NoteForCausalLM",
       "Gemma2ForCausalLM",
@@ -657,9 +670,13 @@ TEST_CASE("Qwen3.5 SSM cache dtype accepts upstream torch aliases exactly") {
 TEST_CASE("hf_registry_coverage: every registration has an example config fixture") {
   // C++ fixture registry for the currently implemented subset. Keep this list
   // alias-for-alias with the central ordered table, mirroring HF_EXAMPLE_MODELS.
-  constexpr std::array<std::string_view, 45> kExampleConfigArchitectures{
+  constexpr std::array<std::string_view, 46> kExampleConfigArchitectures{
       "CohereForCausalLM",
       "DeepseekV2ForCausalLM",
+      // "DeepseekV41For" < "DeepseekV4For": they agree through "DeepseekV4" and
+      // then differ at '1' 0x31 against 'F' 0x46, so the V4.1 arm sorts BEFORE
+      // the V4 one rather than after it.
+      "DeepseekV41ForCausalLM",
       "DeepseekV4ForCausalLM",
       "Dots3NoteForCausalLM",
       "Gemma2ForCausalLM",
@@ -774,6 +791,7 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "Model architectures ['Gemma4ForCausalLM'] are not supported for now. "
       "Supported architectures: "
       "dict_keys(['CohereForCausalLM', 'DeepseekV2ForCausalLM', "
+      "'DeepseekV41ForCausalLM', "
       "'DeepseekV4ForCausalLM', 'Dots3NoteForCausalLM', 'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
       "'Gemma4ForConditionalGeneration', 'Gemma4UnifiedForConditionalGeneration', 'GemmaForCausalLM', "
       "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', "
@@ -799,6 +817,7 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "Model architectures ['UnknownA', 'UnknownB'] are not supported for now. "
       "Supported architectures: "
       "dict_keys(['CohereForCausalLM', 'DeepseekV2ForCausalLM', "
+      "'DeepseekV41ForCausalLM', "
       "'DeepseekV4ForCausalLM', 'Dots3NoteForCausalLM', 'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
       "'Gemma4ForConditionalGeneration', 'Gemma4UnifiedForConditionalGeneration', 'GemmaForCausalLM', "
       "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', "

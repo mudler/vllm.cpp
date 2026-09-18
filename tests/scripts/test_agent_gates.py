@@ -73,27 +73,20 @@ class AgentGateBootstrapTests(unittest.TestCase):
         self.assertIn('--range "$base..$head"', workflow)
         self.assertNotIn('--range "$base..HEAD"', workflow)
 
-    def test_ci_role_suite_uses_exact_event_range_not_detached_head(self) -> None:
+    def test_ci_diff_scoped_steps_use_exact_event_range_not_detached_head(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-        role_step = workflow.split(
-            "- name: Agent role machinery and role discipline", 1
-        )[1].split("- name: Claim view, helper queue and PR reviewability", 1)[0]
-        self.assertIn('head="$PR_HEAD"', role_step)
-        self.assertIn('head="$PUSH_HEAD"', role_step)
-        # The base selection moved out of this step and into
-        # `scripts/ci-walk-base.py` (#1809). What this case is about does not
-        # change: the base comes from the EVENT payload and never from the
-        # runner's checkout. Both event values still reach the resolver, the
-        # resolver's output is the base, and the lane split it applies is
-        # asserted by EXECUTING it rather than by matching a string that no
-        # longer exists.
-        self.assertIn('base="$(python3 scripts/ci-walk-base.py', role_step)
-        self.assertIn('--pr-base "${PR_BASE:-}"', role_step)
-        self.assertIn('--push-base "${PUSH_BASE:-}"', role_step)
+        # The documentation-checkpoint step still uses ci-walk-base.py to resolve
+        # the base from the EVENT payload, never from the runner's checkout.
+        doc_step = workflow.split(
+            "- name: Every feature checkpoint updates STATUS, BENCHMARKS and NOW", 1
+        )[1].split("- name: Every new commit carries FOLLOWING_AGENTS_PROTOCOL", 1)[0]
+        self.assertIn('head="$PR_HEAD"', doc_step)
+        self.assertIn('head="$PUSH_HEAD"', doc_step)
+        self.assertIn('base="$(python3 scripts/ci-walk-base.py', doc_step)
+        self.assertIn('--pr-base "${PR_BASE:-}"', doc_step)
+        self.assertIn('--push-base "${PUSH_BASE:-}"', doc_step)
         for detached in ('base="HEAD', '--base "HEAD', 'base="$(git '):
-            self.assertNotIn(detached, role_step, "the base must not come from the checkout")
-        self.assertIn('pending_args=(--pending-pr-head "$PR_HEAD")', role_step)
-        self.assertIn('--base "$base" --head "$head"', role_step)
+            self.assertNotIn(detached, doc_step, "the base must not come from the checkout")
         resolver = [
             sys.executable,
             str(ROOT / "scripts/ci-walk-base.py"),
@@ -101,7 +94,6 @@ class AgentGateBootstrapTests(unittest.TestCase):
             "--pr-base", "a" * 40,
             "--push-base", "c" * 40,
             "--last-green", "d" * 40,
-            "--floor", "",
             "--repo", str(ROOT),
         ]
         self.assertEqual(

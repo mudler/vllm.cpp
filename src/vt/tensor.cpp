@@ -64,6 +64,10 @@ Tensor Tensor::View(std::initializer_list<int64_t> new_shape) const {
   VT_CHECK(IsContiguous(), "View() requires a contiguous tensor");
   Tensor v = Contiguous(data, dtype, device, new_shape);
   VT_CHECK(v.Numel() == Numel(), "View() numel mismatch");
+  v.repacked = repacked;
+  v.q8_0_aligned = q8_0_aligned;
+  v.elem_kn_repacked = elem_kn_repacked;
+  v.weight_value_dtype = weight_value_dtype;
   return v;
 }
 

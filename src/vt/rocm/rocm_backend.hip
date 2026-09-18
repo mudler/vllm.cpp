@@ -38,17 +38,21 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "vt/backend.h"
+#include "rocm_f16_conversion.h"
 #define VT_GRAPH_DEDUP_HIP 1
 #include "vt/graph_dedup.h"
 #include "vt/graph_dedup_runtime.h"
 #include "vt/rocm/rocm_arch.h"
+#include "vt/rocm/rocm_pinned_h2d.h"
 
 namespace vt::rocm {
 namespace {
@@ -60,6 +64,55 @@ void Check(hipError_t err, const char* what) {
 }
 
 hipStream_t AsStream(const Queue& q) { return static_cast<hipStream_t>(q.handle); }
+
+// --- the bounded pinned bounce ring's two runtime probes -------------------
+// .agents/specs/rocm-chunked-pinned-h2d.md. Everything with a DECISION in it
+// lives in include/vt/rocm/rocm_pinned_h2d.h and is table-tested without HIP;
+// these two read the runtime and answer in that header's vocabulary.
+
+// Which of the four kinds a pointer is. The UNREGISTERED answer is the one this
+// change exists for -- a PROT_READ MAP_PRIVATE view of a GGUF shard, or any
+// other ordinary host storage the HIP runtime knows nothing about.
+//
+// TWO SHAPES OF "the runtime does not know this pointer", because HIP has
+// answered it both ways across versions and reading only one of them would make
+// the ring silently never engage: an error return (historically
+// hipErrorInvalidValue), and a success whose `type` is neither Host nor Device
+// and whose recorded host and device pointers are both null (CUDA's
+// cudaMemoryTypeUnregistered shape). Only `hipMemoryTypeHost` and
+// `hipMemoryTypeDevice` are named, because those two enumerators exist in every
+// HIP version this tree builds against; a managed or unified pointer falls out
+// as kOther, which is what it must be -- it is already device addressable and
+// must never be bounced.
+//
+// The last error is cleared immediately. hipPointerGetAttributes failing IS the
+// answer we want here, and leaving it sticky would poison the next Check().
+vt::rocm::PtrKind ClassifyPointer(const void* p) {
+  hipPointerAttribute_t attr{};
+  const hipError_t err = hipPointerGetAttributes(&attr, const_cast<void*>(p));
+  if (err != hipSuccess) {
+    (void)hipGetLastError();
+    return vt::rocm::PtrKind::kUnregisteredHost;
+  }
+  if (attr.type == hipMemoryTypeDevice) return vt::rocm::PtrKind::kDevice;
+  if (attr.type == hipMemoryTypeHost) return vt::rocm::PtrKind::kPinnedHost;
+  if (attr.devicePointer == nullptr && attr.hostPointer == nullptr) {
+    return vt::rocm::PtrKind::kUnregisteredHost;
+  }
+  return vt::rocm::PtrKind::kOther;
+}
+
+// FAIL CLOSED: a probe that does not answer is treated as "capturing", so the
+// staged path is refused rather than risking a hipEventSynchronize inside a
+// capture region, which aborts the capture.
+bool StreamIsCapturing(hipStream_t stream) {
+  hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+  if (hipStreamIsCapturing(stream, &status) != hipSuccess) {
+    (void)hipGetLastError();
+    return true;
+  }
+  return status != hipStreamCaptureStatusNone;
+}
 
 // One probe gathers the residency attributes and the capability together.
 // Mirrors vt/cuda/cuda_device_caps.h in shape but is NOT cached (every consumer
@@ -201,6 +254,10 @@ RocmMemoryPolicy MemoryPolicy(const DeviceCaps& caps) {
 }
 
 class RocmBackend final : public Backend {
+  struct CaptureScratch {
+    const Queue& queue;
+    ~CaptureScratch() { ResetF16ScratchCapture(queue); }
+  };
  public:
   // Non-throwing by design: constructed during static init by the registrar,
   // which probes the device beforehand. Same contract as CudaBackend.
@@ -214,6 +271,10 @@ class RocmBackend final : public Backend {
 
   int DeviceCapabilityMajor() const override { return major_; }
   int DeviceCapabilityMinor() const override { return minor_; }
+
+  ResidualNormPolicy GetResidualNormPolicy() const override {
+    return ResidualNormPolicy::kCompiledExpression;
+  }
 
   // Both branches satisfy the >= 64B contract Backend::Alloc owes StepArena:
   // hipMalloc aligns to at least 256 bytes as cudaMalloc does, and managed
@@ -266,7 +327,18 @@ class RocmBackend final : public Backend {
   }
   // hipMemcpyDefault infers direction from the pointer values, so one entry
   // point covers h2d, d2h and d2d — and pageable host pointers on an APU.
+  //
+  // A LARGE H2D OUT OF PAGEABLE HOST STORAGE TAKES A BOUNDED PINNED RING
+  // INSTEAD (.agents/specs/rocm-chunked-pinned-h2d.md). Handing this one call a
+  // multi-GiB pageable, file-backed range makes the ROCr runtime pin and
+  // describe all of it to the KFD, which is where gfx1151 spends three quarters
+  // of its wchan samples in svm_range_set_attr while a 67.56 GiB checkpoint
+  // never produces a token. Everything else — every copy under one chunk, every
+  // readback, every D2D, every already-pinned or managed source, and anything
+  // inside a graph capture — takes the single call below, byte for byte.
   void Copy(Queue& q, void* dst, const void* src, size_t bytes) override {
+    if (StagedCopy(q, dst, src, bytes)) return;
+    vt::rocm::NotePinnedH2DDirect();
     Check(hipMemcpyAsync(dst, src, bytes, hipMemcpyDefault, AsStream(q)), "hipMemcpyAsync");
   }
   Queue CreateQueue() override {
@@ -275,8 +347,8 @@ class RocmBackend final : public Backend {
     return Queue{Device{DeviceType::kROCM, device_}, stream};
   }
   void DestroyQueue(Queue& q) override {
-    if (q.handle == nullptr) return;
-    Check(hipStreamDestroy(AsStream(q)), "hipStreamDestroy");
+    if (q.handle != nullptr) Check(hipStreamDestroy(AsStream(q)), "hipStreamDestroy");
+    ReleaseF16ScratchQueue(q);
     q.handle = nullptr;
   }
   void Synchronize(Queue& q) override {
@@ -336,19 +408,23 @@ class RocmBackend final : public Backend {
   // process-wide mode change.
   bool SupportsGraphCapture() const override { return true; }
   void BeginCapture(Queue& q) override {
+    ResetF16ScratchCapture(q);
     Check(hipStreamBeginCapture(AsStream(q), hipStreamCaptureModeThreadLocal),
           "hipStreamBeginCapture");
   }
   void EndCapture(Queue& q) override {
+    CaptureScratch cleanup{q};
     hipGraph_t graph = nullptr;
     Check(hipStreamEndCapture(AsStream(q), &graph), "hipStreamEndCapture");
     if (exec_ != nullptr) {
       Check(hipGraphExecDestroy(exec_), "hipGraphExecDestroy");
+      ReleaseF16ScratchGraph(reinterpret_cast<void*>(exec_));
       exec_ = nullptr;
     }
     Check(hipGraphInstantiate(&exec_, graph, nullptr, nullptr, 0),
           "hipGraphInstantiate");
     Check(hipGraphDestroy(graph), "hipGraphDestroy");
+    RetainF16ScratchCapture(q, reinterpret_cast<void*>(exec_));
   }
   void Replay(Queue& q) override {
     Check(hipGraphLaunch(exec_, AsStream(q)), "hipGraphLaunch");
@@ -358,6 +434,7 @@ class RocmBackend final : public Backend {
   // stream graph and hand the exec back as an opaque handle the caller owns and
   // selects per padded batch size. Unlike EndCapture, nothing is stored here.
   void* EndCaptureGraph(Queue& q) override {
+    CaptureScratch cleanup{q};
     hipGraph_t graph = nullptr;
     Check(hipStreamEndCapture(AsStream(q), &graph), "hipStreamEndCapture");
     // ENG-CUDAGRAPH-DEDUP (#1162), the same wiring as the CUDA leg against the same
@@ -368,12 +445,15 @@ class RocmBackend final : public Backend {
       if (dedup_ == nullptr) {
         dedup_ = std::make_unique<vt::GraphDedupRegistry>(vt::graph_dedup_rt::Ops());
       }
-      return dedup_->Register(reinterpret_cast<void*>(graph));
+      void* handle = dedup_->Register(reinterpret_cast<void*>(graph));
+      RetainF16ScratchCapture(q, handle);
+      return handle;
     }
     hipGraphExec_t exec = nullptr;
     Check(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0),
           "hipGraphInstantiate");
     Check(hipGraphDestroy(graph), "hipGraphDestroy");
+    RetainF16ScratchCapture(q, reinterpret_cast<void*>(exec));
     return reinterpret_cast<void*>(exec);
   }
   // NOT ported: the CUDA leg's VT_BENCH_PROFILE_CONTROL block, which drives
@@ -405,10 +485,12 @@ class RocmBackend final : public Backend {
     if (graph == nullptr) return;
     if (dedup_ != nullptr && dedup_->Owns(graph)) {
       dedup_->Destroy(graph);
+      ReleaseF16ScratchGraph(graph);
       return;
     }
     Check(hipGraphExecDestroy(reinterpret_cast<hipGraphExec_t>(graph)),
           "hipGraphExecDestroy");
+    ReleaseF16ScratchGraph(graph);
   }
 
   // THE LOAD-BEARING BOOL. This is what decides whether the portable CPU
@@ -493,6 +575,113 @@ class RocmBackend final : public Backend {
   }
 
  private:
+  // The bounded pinned bounce ring. Oracle: llama-cpp 10bf611e5 (b10451),
+  // src/llama-model-loader.cpp:1440 (n_buffers = 4), :1449 (64 MiB), :1591-1642
+  // (wait on the slot's event, fill it, upload from it, record, advance).
+  //
+  // Returns true when it handled the copy. THE ORDER OF THE TERMS IS THE
+  // DESIGN, cheapest first, and each step is paid for only by the copies that
+  // got past the previous one:
+  //
+  //   1. the two size terms, with no HIP call at all -- about 1,361
+  //      ResidentWeight calls per forward step reach Copy on this row's
+  //      checkpoint, and a 4 KiB norm weight must not pay two
+  //      hipPointerGetAttributes calls to learn that it is small;
+  //   2. one hipStreamIsCapturing and two hipPointerGetAttributes;
+  //   3. EnsureRing, which is not a probe but an ALLOCATION.
+  //
+  // Those terms are the same terms ShouldStageH2D spells, which stays the
+  // single authority on the decision and is the thing the truth table gates.
+  bool StagedCopy(Queue& q, void* dst, const void* src, size_t bytes) {
+    const size_t chunk = vt::rocm::PinnedH2DChunkBytes();
+    if (chunk == 0 || bytes < chunk) return false;
+    hipStream_t stream = AsStream(q);
+    // Probed OUTSIDE the lock, and then handed to the predicate as term 4
+    // rather than being a second, separate guard. An early `return false` here
+    // would leave `in.stream_capturing` hardcoded false, which makes the term
+    // the truth table gates a value production never supplies -- the guard
+    // would be real but it would not be the guard the table describes.
+    const bool capturing = StreamIsCapturing(stream);
+
+    std::lock_guard<std::mutex> lock(h2d_mutex_);
+    vt::rocm::StagedH2DInputs in;
+    in.src = ClassifyPointer(src);
+    in.dst = ClassifyPointer(dst);
+    in.bytes = bytes;
+    in.chunk_bytes = chunk;
+    in.stream_capturing = capturing;
+    // THE RING IS ALLOCATED LAST, AND ONLY WHEN EVERY OTHER TERM ALREADY HOLDS.
+    // `EnsureRing` is not a question, it is 256 MiB of pinned host memory and
+    // four events. Asking it first -- as the first implementation did -- built
+    // the ring in every ROCm process that ever copies 64 MiB, including the ones
+    // that then take the direct path anyway because the source is already
+    // pinned, the destination is managed, or the copy is D2D.
+    // `VT_ROCM_MANAGED_ALLOC=1` on gfx1151 measured exactly that:
+    // `staged=0 direct=3 chunks=0 ring_bytes=268435456`. On that board the
+    // managed ceiling is bounded by HOST RAM (.agents/environment.md:95-100),
+    // so the wasted bytes come out of the resource that decides whether the
+    // model fits.
+    in.ring_available = false;
+    if (!vt::rocm::StagingTermsExceptRing(in)) return false;
+    in.ring_available = EnsureRing(chunk);
+    if (!vt::rocm::ShouldStageH2D(in)) return false;
+
+    size_t max_chunk = 0;
+    const size_t chunks = vt::rocm::RunStagedH2D(
+        h2d_ring_, bytes, chunk,
+        [&](size_t slot) {
+          Check(hipEventSynchronize(h2d_events_[slot]), "hipEventSynchronize");
+        },
+        [&](size_t slot, size_t off, size_t n) {
+          std::memcpy(h2d_slots_[slot], static_cast<const char*>(src) + off, n);
+        },
+        [&](size_t slot, size_t off, size_t n) {
+          Check(hipMemcpyAsync(static_cast<char*>(dst) + off, h2d_slots_[slot], n,
+                               hipMemcpyHostToDevice, stream),
+                "hipMemcpyAsync");
+          Check(hipEventRecord(h2d_events_[slot], stream), "hipEventRecord");
+          if (n > max_chunk) max_chunk = n;
+        });
+    if (chunks == 0) return false;
+    vt::rocm::NotePinnedH2DStaged(chunks, max_chunk);
+    return true;
+  }
+
+  // Allocated on first use and NEVER FREED, deliberately. RocmBackend instances
+  // live in a function-local static vector in the registrar below, so a
+  // destructor would run during static destruction, and calling hipHostFree or
+  // hipEventDestroy after the HIP runtime has begun tearing down is a hazard
+  // this file does not have today (exec_, the hipGraphExec_t, is likewise never
+  // destroyed). 256 MiB returned to the OS at exit() buys nothing and a
+  // teardown-order crash costs a measurement.
+  //
+  // A FAILED ALLOCATION FALLS BACK rather than refusing the model: the ring is a
+  // residency bound, not a correctness requirement, and no checkpoint should
+  // fail to load because 256 MiB of pinned memory was unavailable. Called with
+  // h2d_mutex_ held.
+  bool EnsureRing(size_t chunk) {
+    if (h2d_state_ != 0) return h2d_state_ == 1;
+    h2d_state_ = 2;  // failed, unless this function gets all the way through
+    if (hipSetDevice(device_) != hipSuccess) {
+      (void)hipGetLastError();
+      return false;
+    }
+    for (size_t i = 0; i < vt::rocm::kPinnedH2DBuffers; ++i) {
+      if (hipHostMalloc(&h2d_slots_[i], chunk, hipHostMallocDefault) != hipSuccess) {
+        (void)hipGetLastError();
+        return false;
+      }
+      if (hipEventCreateWithFlags(&h2d_events_[i], hipEventDisableTiming) != hipSuccess) {
+        (void)hipGetLastError();
+        return false;
+      }
+    }
+    h2d_ring_.n_buffers = vt::rocm::kPinnedH2DBuffers;
+    h2d_state_ = 1;
+    vt::rocm::NotePinnedH2DRingBytes(vt::rocm::kPinnedH2DBuffers * chunk);
+    return true;
+  }
+
   int device_ = 0;
   bool unified_memory_ = false;
   bool managed_alloc_ = false;
@@ -505,6 +694,15 @@ class RocmBackend final : public Backend {
   // ENG-CUDAGRAPH-DEDUP (#1162): built on the first capture, and only when
   // VT_CUDA_GRAPH_DEDUP asked for it, so an unset environment allocates nothing.
   std::unique_ptr<vt::GraphDedupRegistry> dedup_;
+  // 0 = not tried, 1 = ready, 2 = unavailable (tried once and failed).
+  int h2d_state_ = 0;
+  // Serialises the SHARED ring, not the copy: two threads staging at once would
+  // otherwise refill a slot another thread's DMA is still reading. A mutex on a
+  // path that only >= 64 MiB copies reach costs nothing measurable.
+  std::mutex h2d_mutex_;
+  vt::rocm::StagedH2DRing h2d_ring_;
+  void* h2d_slots_[vt::rocm::kPinnedH2DBuffers] = {};
+  hipEvent_t h2d_events_[vt::rocm::kPinnedH2DBuffers] = {};
 };
 
 // Registers every visible AMD GPU at its own Device{kROCM, i} slot, mirroring

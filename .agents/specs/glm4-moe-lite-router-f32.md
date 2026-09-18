@@ -29,8 +29,25 @@ PRIOR parity pin. The ACTIVE pin is `e126687a9a`. **One** token gate has now run
 at it and passed (`b55f63ed6`, job `7386f034-246a-4af5-9a04-f98aafffce54` on
 GB10, 2026-09-04, `IDS mismatched_positions 0 of 96`, `TOKENGATE_VERDICT PASS`),
 and that is a different model's battery: no `Glm4MoeLiteForCausalLM` golden has
-been re-captured at the active pin ([#2794](https://github.com/mudler/vllm.cpp/issues/2794)).
-Re-reading `glm4_moe.py` at the active pin is owed as O5.
+been re-captured at the active pin. **That obligation used to cite
+[#2794](https://github.com/mudler/vllm.cpp/issues/2794), which closed
+`COMPLETED` on 2026-09-06** (`gh issue view 2794 --repo mudler/vllm.cpp --json
+state,closedAt,stateReason` → `CLOSED`, `COMPLETED`, `2026-09-06T07:00:58Z`).
+What #2794 discharged is the OPT-125m capture named in the sentence above --
+that IS the gate `b55f63ed6` records -- so it discharged nothing here. What
+survives is this row's own re-capture, and it has **no tracker**, in those
+words: `Glm4MoeLiteForCausalLM` is not one of the four strict goldens the
+tokengate spec's `## Owed` carries (27B W4A4, 32B-NVFP4A16, 35B, Coder,
+[upstream-sync-headpin-tokengate.md](upstream-sync-headpin-tokengate.md#L569)),
+and `glm4_moe_lite_greedy` is instead a member of the "~30 model-matrix
+`*_greedy` rows" discharge line in [pin-advance.md](pin-advance.md#L480), whose
+premise that correction explicitly declines to re-examine for members other
+than OPT. So the re-capture obligation lives HERE, in this section, and nowhere
+else; visible debt beats a false anchor. The adjacent and DIFFERENT obligation
+— re-reading `glm4_moe.py` at the active pin — is owed as O5 below and is
+anchored on the pin-reconciliation queue,
+[#2611](https://github.com/mudler/vllm.cpp/issues/2611), which is unaffected by
+#2794 closing.
 
 **Upstream, read at `5559679229` — the pin the goldens were captured on.**
 `Glm4MoeLiteForCausalLM`'s MoE block is `Glm4MoeLite`, a bare subclass of

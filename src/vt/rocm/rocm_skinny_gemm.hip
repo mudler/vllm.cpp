@@ -23,8 +23,6 @@ namespace {
 constexpr int kLdsSize = 64 * 1024;  // gfx1100 (non-gfx95x)
 constexpr int kThrds = 32;           // wave32
 constexpr int kWvPrGrp = 16;
-constexpr int kYtile = 2;            // proven decode config (donor gfx1x, N small)
-constexpr int kUnrl = 2;
 constexpr int kAChunk = 8;
 
 using scalar8 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
@@ -36,6 +34,19 @@ union bigType {
 
 __device__ __forceinline__ unsigned int min__(uint32_t a, uint32_t b) {
   return min(a, b);
+}
+
+// gfx1151 detection (RDNA3.5) - matches vLLM's on_gfx1151()
+__device__ __forceinline__ bool on_gfx1151() {
+#if defined(__GFX11__)
+  // Runtime detection via hipDeviceGetAttribute
+  int arch = 0;
+  hipDeviceGetAttribute(&arch, hipDeviceAttributeGcnArch, 0);
+  // gfx1151 = 115100
+  return (arch >= 115100 && arch < 115200);
+#else
+  return false;
+#endif
 }
 
 // Donor's persistent-workgroup splitter (host-side in skinny_gemms.cu:1169).
@@ -51,8 +62,38 @@ inline int mindiv(int N, int div1, int div2) {
   return 0;
 }
 
+// gfx1151-specific dispatch config (mirrors vLLM's WVSPLIT_TILE logic)
+// Returns {YTILE, UNRL} pair based on K, N, and LDS fit
+struct YtileUnrl { int ytile; int unrl; };
+inline YtileUnrl SelectYtileUnrl(int K, int N, int M, int CuCount, bool fit_lds) {
+  // sYT = ceil(M / (CuCount * 4))
+  int sYT = (M + CuCount * 4 - 1) / (CuCount * 4);
+  
+  if (on_gfx1151()) {
+    // gfx1151-specific tuning (vLLM skinny_gemms.cu:1240-1258)
+    if (sYT <= 1) {
+      return {1, 4};
+    } else if ((K % 1024 == 512) && K >= 1536 && (sYT >= 40 || K >= 4096)) {
+      return {4, 1};
+    } else if (K < 1024) {
+      return {2, 4};
+    } else if (K <= 2048 && (N >= 2 || sYT <= 26)) {
+      return {1, 4};
+    } else if (N >= 2 && !fit_lds) {
+      return {1, 4};
+    } else if (N == 1) {
+      return {1, 2};
+    } else {
+      return {1, 1};
+    }
+  } else {
+    // Generic gfx1x fallback (YTILE=2, UNRL=2 as before)
+    return {2, 2};
+  }
+}
+
 // A (activation) fits LDS. N = decode batch (our M). bf16, f32 accum.
-template <int N>
+template <int N, int YTILE, int UNRL>
 __global__ void __launch_bounds__(kWvPrGrp * kThrds)
     wvSplitKSml(const int K, const int Kbp, const int Kap, const int M,
                 const __hip_bfloat16* __restrict__ B, const __hip_bfloat16* __restrict__ A,
@@ -69,33 +110,33 @@ __global__ void __launch_bounds__(kWvPrGrp * kThrds)
 
   if (threadIdx.y >= static_cast<uint32_t>(_WvPrGrp)) return;
 
-  uint32_t m = (blockIdx.x * _WvPrGrp + (threadIdx.y % _WvPrGrp)) * kYtile;
+  uint32_t m = (blockIdx.x * _WvPrGrp + (threadIdx.y % _WvPrGrp)) * YTILE;
 
   while (m < static_cast<uint32_t>(M)) {
-    float sum[N][kYtile] = {};
-    for (uint32_t k1 = 0; k1 < static_cast<uint32_t>(K); k1 += kThrds * kAChunk * kUnrl) {
-      bigType bigA[N][kUnrl] = {};
-      bigType bigB[kYtile][kUnrl];
+    float sum[N][YTILE] = {};
+    for (uint32_t k1 = 0; k1 < static_cast<uint32_t>(K); k1 += kThrds * kAChunk * UNRL) {
+      bigType bigA[N][UNRL] = {};
+      bigType bigB[YTILE][UNRL];
 #pragma unroll
-      for (uint32_t k2 = 0; k2 < kUnrl; k2++) {
+      for (uint32_t k2 = 0; k2 < UNRL; k2++) {
         uint32_t k = k1 + k2 * kThrds * kAChunk;
         uint32_t k_ = k + threadIdx.x * kAChunk;
         const __hip_bfloat16* B_ = &B[min__(k_, K - kAChunk)];
-        for (int y = 0; y < kYtile; y++)
+        for (int y = 0; y < YTILE; y++)
           bigB[y][k2].h8 = __builtin_nontemporal_load(
               (const scalar8*)(&B_[min__(y + m, M - 1) * Kbp]));
       }
 #pragma unroll
-      for (uint32_t k2 = 0; k2 < kUnrl; k2++) {
+      for (uint32_t k2 = 0; k2 < UNRL; k2++) {
         uint32_t k = k1 + k2 * kThrds * kAChunk;
         uint32_t k_ = k + threadIdx.x * kAChunk;
         if (k_ >= static_cast<uint32_t>(K)) break;
         for (int n = 0; n < N; n++) bigA[n][k2] = *((const bigType*)(&(s[k_ + Kap * n])));
       }
       // Interleaved MAC; bf16 pairs unpacked to f32 (donor DOT2C bf16 branch).
-      for (uint32_t k2 = 0; k2 < kUnrl; k2++) {
+      for (uint32_t k2 = 0; k2 < UNRL; k2++) {
         for (int n = 0; n < N; n++) {
-          for (int y = 0; y < kYtile; y++) {
+          for (int y = 0; y < YTILE; y++) {
 #pragma unroll
             for (uint32_t b = 0; b < kAChunk / 2; b++) {
               float2 a2 = __bfloat1622float2(*((__hip_bfloat162*)(&(bigA[n][k2].h[b * 2]))));
@@ -109,7 +150,7 @@ __global__ void __launch_bounds__(kWvPrGrp * kThrds)
     __builtin_amdgcn_sched_barrier(0);
     // Wave32 reduction: DPP row_shr 8/4/2/1 then shfl_xor(16).
     for (int n = 0; n < N; n++) {
-      for (int y = 0; y < kYtile; y++) {
+      for (int y = 0; y < YTILE; y++) {
         sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x118, 0xf, 0xf, 1);
         sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x114, 0xf, 0xf, 1);
         sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x112, 0xf, 0xf, 1);
@@ -119,9 +160,9 @@ __global__ void __launch_bounds__(kWvPrGrp * kThrds)
     }
     if (threadIdx.x == (kThrds - 1)) {
       for (int n = 0; n < N; n++)
-        for (int y = 0; y < kYtile; y++) C[m + y + n * M] = __float2bfloat16(sum[n][y]);
+        for (int y = 0; y < YTILE; y++) C[m + y + n * M] = __float2bfloat16(sum[n][y]);
     }
-    m += CuCount * _WvPrGrp * kYtile;
+    m += CuCount * _WvPrGrp * YTILE;
   }
 }
 
@@ -148,22 +189,84 @@ void WvSplitKBT(hipStream_t s, void* out, const void* a, const void* b, int M, i
                 int K, int device) {
   const int cu = DeviceCuCount(device);
   dim3 grid(cu), block(kThrds, kWvPrGrp);
-  const int wvPrGrp = mindiv(N, cu * kYtile, kWvPrGrp);
+  const int wvPrGrp = mindiv(N, cu * 2, kWvPrGrp);  // Use YTILE=2 for mindiv calc (conservative)
   auto* C = static_cast<__hip_bfloat16*>(out);
   auto* A = static_cast<const __hip_bfloat16*>(a);
   auto* B = static_cast<const __hip_bfloat16*>(b);
+  
+  // LDS fit check (activation matrix A must fit in LDS)
+  const bool fit_lds = (K * M <= 32768);
+  
+  // Select YTILE/UNRL based on gfx1151 tuning
+  YtileUnrl cfg = SelectYtileUnrl(K, N, M, cu, fit_lds);
+  
+  // Launch kernel with selected config
+  // Note: We need to dispatch based on YTILE and UNRL values
+  // This is a simplified dispatch - in practice, vLLM uses macros to generate all combinations
   switch (M) {
     case 1:
-      wvSplitKSml<1><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      if (cfg.ytile == 1 && cfg.unrl == 4)
+        wvSplitKSml<1, 1, 4><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else if (cfg.ytile == 1 && cfg.unrl == 2)
+        wvSplitKSml<1, 1, 2><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else if (cfg.ytile == 1 && cfg.unrl == 1)
+        wvSplitKSml<1, 1, 1><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else if (cfg.ytile == 2 && cfg.unrl == 4)
+        wvSplitKSml<1, 2, 4><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else if (cfg.ytile == 2 && cfg.unrl == 2)
+        wvSplitKSml<1, 2, 2><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else if (cfg.ytile == 4 && cfg.unrl == 1)
+        wvSplitKSml<1, 4, 1><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else
+        wvSplitKSml<1, 2, 2><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);  // fallback
       break;
     case 2:
-      wvSplitKSml<2><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      if (cfg.ytile == 1 && cfg.unrl == 4)
+        wvSplitKSml<2, 1, 4><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else if (cfg.ytile == 1 && cfg.unrl == 2)
+        wvSplitKSml<2, 1, 2><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else if (cfg.ytile == 1 && cfg.unrl == 1)
+        wvSplitKSml<2, 1, 1><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else if (cfg.ytile == 2 && cfg.unrl == 4)
+        wvSplitKSml<2, 2, 4><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else if (cfg.ytile == 2 && cfg.unrl == 2)
+        wvSplitKSml<2, 2, 2><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else if (cfg.ytile == 4 && cfg.unrl == 1)
+        wvSplitKSml<2, 4, 1><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else
+        wvSplitKSml<2, 2, 2><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);  // fallback
       break;
     case 3:
-      wvSplitKSml<3><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      if (cfg.ytile == 1 && cfg.unrl == 4)
+        wvSplitKSml<3, 1, 4><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else if (cfg.ytile == 1 && cfg.unrl == 2)
+        wvSplitKSml<3, 1, 2><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else if (cfg.ytile == 1 && cfg.unrl == 1)
+        wvSplitKSml<3, 1, 1><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else if (cfg.ytile == 2 && cfg.unrl == 4)
+        wvSplitKSml<3, 2, 4><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else if (cfg.ytile == 2 && cfg.unrl == 2)
+        wvSplitKSml<3, 2, 2><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else if (cfg.ytile == 4 && cfg.unrl == 1)
+        wvSplitKSml<3, 4, 1><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else
+        wvSplitKSml<3, 2, 2><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);  // fallback
       break;
     case 4:
-      wvSplitKSml<4><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      if (cfg.ytile == 1 && cfg.unrl == 4)
+        wvSplitKSml<4, 1, 4><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else if (cfg.ytile == 1 && cfg.unrl == 2)
+        wvSplitKSml<4, 1, 2><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else if (cfg.ytile == 1 && cfg.unrl == 1)
+        wvSplitKSml<4, 1, 1><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else if (cfg.ytile == 2 && cfg.unrl == 4)
+        wvSplitKSml<4, 2, 4><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else if (cfg.ytile == 2 && cfg.unrl == 2)
+        wvSplitKSml<4, 2, 2><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else if (cfg.ytile == 4 && cfg.unrl == 1)
+        wvSplitKSml<4, 4, 1><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);
+      else
+        wvSplitKSml<4, 2, 2><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu);  // fallback
       break;
     default:
       throw std::runtime_error("vt rocm: wvSplitK unsupported M=" + std::to_string(M));

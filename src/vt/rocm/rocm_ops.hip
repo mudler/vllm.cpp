@@ -1,6 +1,7 @@
 // ROCm op-table registration (BACKEND-ROCM).
 #include "vt/op_provider.h"
 #include "vt/ops.h"
+#include "vt/rocm/rocm_embedding_quant.h"
 
 namespace vt::rocm {
 
@@ -12,6 +13,10 @@ void SoftCapKernelRocm(Queue& q, Tensor& out, const Tensor& x, double cap);
 void AddKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
 void GeluAndMulKernelRocm(Queue& q, Tensor& out, const Tensor& x);
 void SiluAndMulKernelRocm(Queue& q, Tensor& out, const Tensor& x);
+
+// ClampedSwiGLU (DeepSeek-V4 activation): silu(clamp(gate, max=limit)) *
+// clamp(up, -limit, limit) at alpha=1, beta=0. Same layout as SiluAndMul.
+void ClampedSwiGLUKernelRocm(Queue& q, Tensor& out, const Tensor& gate_up, float limit);
 void MatmulKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
 void MatmulBTKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
 // MLA/DSA campaign W1 (#2715). The batched GEMM lives beside its dense siblings
@@ -85,6 +90,15 @@ void ApplyLogitBiasKernelRocm(Queue& q, Tensor& logits, const Tensor& rows, cons
                               const Tensor& biases);
 // Companion MoE-path op (same TU): elementwise silu(gate)*up.
 void MoeSiluMulKernelRocm(Queue& q, Tensor& out, const Tensor& gate, const Tensor& up);
+void MoeGroupedGemmBf16KernelRocm(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                  const Tensor*, const Tensor&);
+void MoeGroupedGemmBf16GateUpSiluKernelRocm(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                           const Tensor*, const Tensor&, const Tensor&);
+void MoeGroupedGemmBf16GateUpSiluNativeKernelRocm(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                                 const Tensor*, const Tensor&, const Tensor&);
+void MoeGroupedGemmBf16WeightedKernelRocm(Queue&, Tensor&, const Tensor&, const Tensor&,
+                                          const Tensor*, const Tensor&, const Tensor&);
+void MoeCombinePreweightedKernelRocm(Queue&, Tensor&, const Tensor&, const Tensor*, float);
 // MoE-path combine/gate ops (rocm_moe_chain.hip): shared-expert gate and the
 // weighted expert combinations.
 void SharedExpertGateKernelRocm(Queue& q, Tensor& out, const Tensor& sd, const Tensor& gl);
@@ -131,12 +145,34 @@ void GdnPrefillKernelRocm(Queue& q, Tensor& out, const Tensor& q_in, const Tenso
 void GdnDecodeKernelRocm(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
                          const Tensor& v, const Tensor& g, const Tensor& beta,
                          Tensor& state, const Tensor* state_idx, const GdnArgs& args);
+// BACKEND-ROCM-KDA (#2942, rocm_kda_scan.hip): per-K-channel-decay gated-delta
+// recurrence. Same shape as GdnPrefillFn; the only difference is g is [T,Hv,Dk]
+// (per-channel) not [T,Hv] (per-head). Staged slice: unreached by the model
+// forward until the CPU-only refusal at glm5_next_kda.cpp:322 lifts (W9c-2).
+void KdaGatedDeltaRuleKernelRocm(Queue& q, Tensor& out, const Tensor& q_in, const Tensor& k,
+                                 const Tensor& v, const Tensor& g, const Tensor& beta,
+                                 Tensor& state, const Tensor& qsl, const GdnArgs& args);
+// BACKEND-ROCM-KPOOL (#2942, rocm_glm5_next_kpool.hip): the GLM-5.3-Flash
+// k-pool DSA indexer pair. Staged slice: unreached by the model forward until
+// the compose (W9c-0, #2415) that would call them exists. No CPU provider by
+// design — the host reference glm5_next_dsa.cpp is the oracle, not a second
+// registration under the same OpId.
+void Glm5NextKpoolCompressRocm(Queue& q, Tensor& pool_keys, Tensor& pool_indices,
+                               Tensor& pool_valid, Tensor& num_pools, const Tensor& packed,
+                               const Tensor& ape);
+void Glm5NextKpoolSelectRocm(Queue& q, Tensor& topk_indices, Tensor& index_scores,
+                             const Tensor& q_states, const Tensor& head_weights,
+                             const Tensor& pool_keys, const Tensor& pool_indices,
+                             const Tensor& pool_valid, const Tensor& num_pools,
+                             const Tensor& valid_keys, const Tensor& q_mask,
+                             const Glm5NextKpoolSelectArgs& args);
 // BACKEND-ROCM-GDN-KERNELS family 5 (rocm_gdn_fused.hip): gated RMSNorm,
 // sigmoid gate, and the fused full-attention preamble.
 void RmsNormGatedKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
                             const Tensor& w, const RmsNormGatedArgs& args);
 void SigmoidGateBf16KernelRocm(Queue& q, Tensor& out, const Tensor& attn,
                                const Tensor& gate);
+void AttnGateSplitKernelRocm(Queue& q, Tensor& query, Tensor& gate, const Tensor& packed);
 // BACKEND-ROCM-EXL3 (rocm_exl3.hip): the fused EXL3 trellis linear, transcribed
 // from the PORTABLE CPU reference (cpu_exl3_kernels.cpp / cpu_exl3_dequant.cpp)
 // and not from the CUDA kernel, whose 90 KiB shared-memory budget, m16n8k16 mma,
@@ -151,6 +187,13 @@ void Exl3GemmKernelRocm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
 void FusedNormRopeKernelRocm(Queue& q, Tensor& latent_out, Tensor& pe_out, const Tensor& x,
                              const Tensor& w, const Tensor& positions, const Tensor& cache,
                              const RmsNormArgs& norm_args, const RopeArgs& rope_args);
+// The gate-free sibling (rocm_gdn_fused.hip): the Qwen3-dense qk-norm + partial
+// RoPE preamble. Registered so the fused-chain recipe `kAttnQkNormRope` takes its
+// fast realisation on ROCm instead of the Tier-0 composite.
+void AttnQkNormRopeKernelRocm(Queue& q, Tensor& q3, Tensor& k3, const Tensor& q_norm,
+                              const Tensor& k_norm, const Tensor& cos_sin,
+                              const Tensor& positions, const RmsNormArgs& na,
+                              const RopeArgs& ra);
 void AttnQkNormRopeGateKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& gate_out,
                                   const Tensor& qgate, const Tensor& kf,
                                   const Tensor& q_norm, const Tensor& k_norm,
@@ -165,6 +208,8 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<RmsNormFn>(&RmsNormKernelRocm)));
     RegisterOp(OpId::kEmbedding, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernelRocm)));
+    RegisterOp(OpId::kEmbeddingQuant, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingQuantKernelRocm)));
     RegisterOp(OpId::kMulScalar, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<MulScalarFn>(&MulScalarKernelRocm)));
     RegisterOp(OpId::kSoftCap, DeviceType::kROCM,
@@ -175,6 +220,9 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<GeluAndMulFn>(&GeluAndMulKernelRocm)));
     RegisterOp(OpId::kSiluAndMul, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<SiluAndMulFn>(&SiluAndMulKernelRocm)));
+    RegisterOp(OpId::kClampedSwiGLU, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<ClampedSwiGLUFn>(&ClampedSwiGLUKernelRocm)));
     RegisterOp(OpId::kMatmul, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulKernelRocm)));
     RegisterOp(OpId::kMatmulBT, DeviceType::kROCM,
@@ -248,6 +296,21 @@ struct Registrar {
                    static_cast<ApplyTokenMaskFn>(&ApplyTokenMaskKernelRocm)));
     RegisterOp(OpId::kMoeSiluMul, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<MoeSiluMulFn>(&MoeSiluMulKernelRocm)));
+    RegisterOp(OpId::kMoeGroupedGemmBf16, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<MoeGroupedGemmBf16Fn>(
+                   &MoeGroupedGemmBf16KernelRocm)));
+    RegisterOp(OpId::kMoeGroupedGemmBf16GateUpSilu, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<MoeGroupedGemmBf16GateUpSiluFn>(
+                   &MoeGroupedGemmBf16GateUpSiluKernelRocm)));
+    RegisterOp(OpId::kMoeGroupedGemmBf16GateUpSiluNative, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<MoeGroupedGemmBf16GateUpSiluNativeFn>(
+                   &MoeGroupedGemmBf16GateUpSiluNativeKernelRocm)));
+    RegisterOp(OpId::kMoeGroupedGemmBf16Weighted, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<MoeGroupedGemmBf16WeightedFn>(
+                   &MoeGroupedGemmBf16WeightedKernelRocm)));
+    RegisterOp(OpId::kMoeCombinePreweighted, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<MoeCombinePreweightedFn>(
+                   &MoeCombinePreweightedKernelRocm)));
     RegisterOp(OpId::kSharedExpertGate, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<SharedExpertGateFn>(&SharedExpertGateKernelRocm)));
@@ -283,12 +346,23 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<GdnPrefillFn>(&GdnPrefillKernelRocm)));
     RegisterOp(OpId::kGdnDecode, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<GdnDecodeFn>(&GdnDecodeKernelRocm)));
+    RegisterOp(OpId::kKdaGatedDeltaRule, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<KdaGatedDeltaRuleFn>(
+                   &KdaGatedDeltaRuleKernelRocm)));
+    RegisterOp(OpId::kGlm5NextKpoolCompress, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<Glm5NextKpoolCompressFn>(
+                   &Glm5NextKpoolCompressRocm)));
+    RegisterOp(OpId::kGlm5NextKpoolSelect, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<Glm5NextKpoolSelectFn>(
+                   &Glm5NextKpoolSelectRocm)));
     RegisterOp(OpId::kRmsNormGated, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<RmsNormGatedFn>(&RmsNormGatedKernelRocm)));
     RegisterOp(OpId::kSigmoidGateBf16, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<SigmoidGateBf16Fn>(&SigmoidGateBf16KernelRocm)));
+    RegisterOp(OpId::kAttnGateSplit, DeviceType::kROCM,
+               reinterpret_cast<void*>(static_cast<AttnGateSplitFn>(&AttnGateSplitKernelRocm)));
     RegisterOp(OpId::kExl3Gemm, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<Exl3GemmFn>(&Exl3GemmKernelRocm)));
     RegisterOp(
@@ -297,6 +371,9 @@ struct Registrar {
     RegisterOp(OpId::kAttnQkNormRopeGate, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<AttnQkNormRopeGateFn>(&AttnQkNormRopeGateKernelRocm)));
+    RegisterOp(OpId::kAttnQkNormRope, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<AttnQkNormRopeFn>(&AttnQkNormRopeKernelRocm)));
     // MLA/DSA campaign W1 (#2715). Before these lines each of these four
     // resolved to NO native ROCm kernel: the portable CPU reference tier where
     // it is eligible (which docs/ROCM.md:60-61 disqualifies a performance result

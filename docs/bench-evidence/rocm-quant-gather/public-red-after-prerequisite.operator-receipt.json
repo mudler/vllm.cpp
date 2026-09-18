@@ -1,0 +1,8 @@
+{
+  "recipe_sha256": "903b67613b2af4c102960e297c1f47ec19c809cd13ce2f57e1fd16dcdbe7ef71",
+  "head": "4fc300f93cfb075c0afddccdd476a552fa900cdb",
+  "exit_code": 1,
+  "elapsed_seconds": 1.344334363937378,
+  "files_verified_before_after": true,
+  "log_sha256": "943fd719efb6ea84e4e833043c7e2aa376843ce458d3bf8ffab7936e3d98a5db"
+}

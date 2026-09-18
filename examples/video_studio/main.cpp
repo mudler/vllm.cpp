@@ -54,6 +54,8 @@ struct Engine {
   // Everything except the DiT is shared between partitions, so a swap reuses it.
   vllm_video_model_params base{};
   std::string encoder, tokenizer, vvae, vvae_cfg, avae, avae_cfg, embeds;
+  std::vector<std::string> lora_keys, lora_values;
+  std::vector<const char*> extra_key_ptrs, extra_val_ptrs;
 };
 Engine g_engine;
 
@@ -296,6 +298,7 @@ const char* Arg(int argc, char** argv, int& i) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  int lora_count = 0;
   std::string host = "0.0.0.0";
   int port = 8080;
   g_ui_dir = "examples/video_studio/webui";
@@ -311,6 +314,20 @@ int main(int argc, char** argv) {
     else if (a == "--audio-vae") g_engine.avae = Arg(argc, argv, i);
     else if (a == "--audio-vae-config") g_engine.avae_cfg = Arg(argc, argv, i);
     else if (a == "--prompt-embeds") g_engine.embeds = Arg(argc, argv, i);
+    else if (a == "--lora") {
+      ++lora_count;
+      const std::string suffix = lora_count == 1 ? "" : "_" + std::to_string(lora_count);
+      g_engine.lora_keys.push_back("lora_path" + suffix);
+      g_engine.lora_values.push_back(Arg(argc, argv, i));
+      if (i + 1 < argc && argv[i + 1][0] != '-') {
+        g_engine.lora_keys.push_back("lora_strength" + suffix);
+        g_engine.lora_values.push_back(argv[++i]);
+      }
+    }
+    else if (a == "--lora-dir") {
+      g_engine.lora_keys.push_back("lora_dir");
+      g_engine.lora_values.push_back(Arg(argc, argv, i));
+    }
     else if (a == "--device") g_engine.device = Arg(argc, argv, i);
     else if (a == "--keep-quant") g_engine.dequant_bf16 = 0;
     else if (a == "--dequant-bf16") g_engine.dequant_bf16 = 1;
@@ -328,6 +345,8 @@ int main(int argc, char** argv) {
           "          [--device cpu|cuda] [--keep-quant|--dequant-bf16]\n"
           "          [--workdir DIR] [--ffmpeg PATH] [--ui DIR]\n"
           "          [--models-dir DIR]  offer every .gguf here in the picker\n"
+          "          [--lora <adapter.safetensors> [STRENGTH]]  fused at load; 1.0\n"
+          "          [--lora-dir DIR]  resolve <lora:name:strength> prompt tags\n"
           "          [--host H] [--port P]\n\n"
           "A browser console for MiniMax-H3 video generation: all three tasks,\n"
           "and the loaded checkpoint can be swapped without restarting.\n"
@@ -355,6 +374,17 @@ int main(int argc, char** argv) {
   g_engine.base.prompt_embeds_path = g_engine.embeds.empty() ? nullptr : g_engine.embeds.c_str();
   g_engine.base.device = g_engine.device == "cuda" ? 1 : 0;
   g_engine.base.dequant_bf16 = g_engine.dequant_bf16;
+  if (!g_engine.lora_keys.empty()) {
+    g_engine.extra_key_ptrs.clear();
+    g_engine.extra_val_ptrs.clear();
+    for (size_t i = 0; i < g_engine.lora_keys.size(); ++i) {
+      g_engine.extra_key_ptrs.push_back(g_engine.lora_keys[i].c_str());
+      g_engine.extra_val_ptrs.push_back(g_engine.lora_values[i].c_str());
+    }
+    g_engine.base.extra_keys = g_engine.extra_key_ptrs.data();
+    g_engine.base.extra_values = g_engine.extra_val_ptrs.data();
+    g_engine.base.n_extras = static_cast<int32_t>(g_engine.lora_keys.size());
+  }
 
   if (!g_engine.dit.empty()) {
     std::fprintf(stderr, "studio: loading %s ...\n", g_engine.dit.c_str());

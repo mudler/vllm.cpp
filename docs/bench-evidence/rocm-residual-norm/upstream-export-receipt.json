@@ -1,0 +1,12 @@
+{
+  "results": [
+    {
+      "name": "upstream",
+      "exit_code": 0,
+      "expected_exit": 0,
+      "seconds": 56.36936064995825,
+      "log_sha256": "f49d37cc9369d9bd83794885280cb053abc2b2694f68041886b9fa83428fa339"
+    }
+  ],
+  "inputs_verified_before_after": 4266
+}

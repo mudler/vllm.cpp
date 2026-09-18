@@ -125,12 +125,48 @@ class RocmPlatform final : public Platform {
   // probe) — the ONE field the device-fit check reads. The other two fields
   // stay DEFAULT/false, unlike CUDA's: `release_host_weights_after_upload`
   // and `uses_device_memory_pool` are separate policy questions (a discrete
-  // card's host-copy release and DevicePool reuse) this row does not touch,
-  // because on a unified part (780M, Strix Halo) freeing the host copy after
-  // "upload" would free the ONLY copy — the same answer CPU, Metal and Vulkan
-  // give for the same reason, and per-DEVICE (not per-DEVICE-TYPE) besides.
-  // Flip those when a discrete board's release/pool behavior is actually
-  // measured, not as a side effect of making the budget check reachable.
+  // card's host-copy release and DevicePool reuse) this row does not touch.
+  //
+  // THE REASON THIS COMMENT USED TO GIVE IS FALSE, AND SAYING SO IS THE POINT.
+  // It read: "on a unified part (780M, Strix Halo) freeing the host copy after
+  // 'upload' would free the ONLY copy — the same answer CPU, Metal and Vulkan
+  // give for the same reason". #2511 falsified that premise. gfx1151 reports
+  // `pageableMemoryAccess = 0`, so `HostMemoryIsDeviceAddressable` answers
+  // false (`vt/rocm/rocm_backend.hip`, and `host_memory_is_device_addressable`
+  // above), `ResidentWeight`'s host-alias arm is not taken, and its staging
+  // branch always makes a real second copy on the device. The host copy has not
+  // been the only copy on this part since that change landed. Left uncorrected,
+  // that sentence is what kept 65.488 GiB of spent GGUF source pages resident
+  // on a 31 GiB host until the load wedged in `svm_range_set_attr`
+  // (.agents/specs/rocm-host-residency-after-upload.md).
+  //
+  // THE FLAG NONETHELESS STAYS FALSE, and the reason is that flipping it WOULD
+  // change behaviour on this board, not that it would change none.
+  //
+  // A first draft of this comment said the flag had two readers,
+  // `ShouldReleaseHostWeights` and `ShouldInterleaveLoadStream`
+  // (`platforms/interface.h:88-96`), that both also require `marlin_committed`,
+  // which no ROCm path sets, and that flipping it here was therefore inert.
+  // That is false and a fresh review measured it. There is a THIRD reader and it
+  // requires no `marlin_committed`: `DirectDeviceLoadEligible`
+  // (`qwen3_5_dense_weights.cpp:146-180`) returns
+  // `platform.residency_policy().release_host_weights_after_upload` as its last
+  // term, and it is what gates `StageAndReleaseLoadedDense` at
+  // `qwen3_5_dense_weights.cpp:1205-1212` for every Qwen3.5-dense safetensors
+  // load. `needs_weight_staging()` is true on ROCm, so flipping this bit would
+  // arm a whole staging-and-release load path on gfx1151 that nobody has
+  // measured there. Correcting a false comment and installing a new one is the
+  // failure this file has now produced twice; the enumeration above is the whole
+  // of it, from `grep -rn release_host_weights_after_upload src include tests`.
+  //
+  // The host-residency release that the defect needed is gated instead on the
+  // property that is load-bearing and checkable at the call site — the device
+  // cannot dereference host memory and the source is a re-faultable read-only
+  // file mapping — in `MaybeReleaseStagedBorrowSource` (qwen3_5_weights.h),
+  // called from BOTH staging arms (`qwen3_5.cpp`'s `ResidentWeight` and
+  // `dense_attn_block.h`'s). Flip these two when a board's release/pool
+  // behavior is actually measured, not as a side effect of making the budget
+  // check reachable.
   ResidencyPolicy residency_policy() const override {
     ResidencyPolicy p;
     p.device_memory_total_bytes = device_memory_total_bytes_;

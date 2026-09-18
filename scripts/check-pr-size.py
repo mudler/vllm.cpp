@@ -323,6 +323,8 @@ RECORDED_BENCH_EVIDENCE = frozenset(
         "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r2-c1.clientlog",
         "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r2-c4.clientlog",
         "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r2-c8.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r1-c16.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r1-c32.clientlog",
         "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r2-c16.clientlog",
         "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r2-c32.clientlog",
         "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/PROBE.clientlog",
@@ -416,7 +418,6 @@ RETIRED_PATTERNS = (
 
 CHECKER_EVIDENCE_OVERRIDES = {
     "scripts/check-agent-record.py": "tests/scripts/test_agent_record.py",
-    "scripts/check-role-discipline.py": "tests/scripts/test_check_role_discipline.py",
     "scripts/check-doc-checkpoint.py": "tests/scripts/test_doc_checkpoint.py",
     # Its suite predates the test_check_<name> convention and CI runs it under
     # the older name, so the derived path pointed at a file that does not
@@ -833,17 +834,6 @@ def deleted_paths(base: str, head: str, *, repo: Path = ROOT) -> set[str]:
         ).splitlines()
         if line
     }
-
-
-def load_role_discipline():
-    spec = importlib.util.spec_from_file_location(
-        "check_role_discipline", ROOT / "scripts/check-role-discipline.py"
-    )
-    if spec is None or spec.loader is None:
-        raise ValueError("could not load role-discipline checker")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 EVIDENCE_REQUIRED_TOOLS = {

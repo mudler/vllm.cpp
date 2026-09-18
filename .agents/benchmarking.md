@@ -205,6 +205,22 @@ were host-side waste, not slow math.
 Before accepting a gap as "GPU-bound", trace both implementations with the same
 tool on the same workload and compare what actually ran.
 
+**On ROCm the decode-only window has a tool.**
+`scripts/rocm-rank-kernels.py` takes a `rocprofv3 --kernel-trace` CSV and ranks
+kernel time over windows delimited by the per-token sampler dispatch, so the
+prefill trap above is excluded by construction rather than by eye. It prints the
+set of per-step dispatch counts beside the table: one value means the window is a
+decode step, and more than one is a refusal instead of a plausible ranking. It
+also prints kernel-busy as a share of step wall, so host time stays visible
+rather than being attributed to kernels.
+
+Two cautions travel with it. It adds nothing to the engine, so the traced binary
+is the control binary and the profiler's cost is measurable as a tok/s A/B rather
+than fused into the result. And rocprofiler-sdk silently adjusts inverted
+timestamps ([#3040](https://github.com/mudler/vllm.cpp/issues/3040)) without
+marking which rows it touched, so pass `--swap-warnings N` from the run's stderr
+and the tool bounds the aggregate error for you.
+
 ## Recording it
 
 Record the exact build and run recipe, revisions, model hashes, environment,

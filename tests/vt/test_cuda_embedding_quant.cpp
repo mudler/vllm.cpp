@@ -264,14 +264,19 @@ TEST_CASE("the CUDA block gather is REGISTERED, so the residency policy can find
   // itself would be measuring its own setup rather than the product.
   CHECK(vt::OpRegistered(vt::OpId::kEmbeddingQuant, DeviceType::kCUDA));
 
-  // The four with no decoder must NOT be registered in any build: registering
+  // The three with no decoder must NOT be registered in any build: registering
   // the id without writing the decoder converts a clean load-time refusal into a
   // forward-time throw with the whole model resident.
-  for (DeviceType d : {DeviceType::kMETAL, DeviceType::kVULKAN, DeviceType::kROCM,
+  for (DeviceType d : {DeviceType::kMETAL, DeviceType::kVULKAN,
                        DeviceType::kTENSTORRENT}) {
     CAPTURE(vt::DeviceTypeName(d));
     CHECK_FALSE(vt::OpRegistered(vt::OpId::kEmbeddingQuant, d));
   }
+#ifdef VLLM_CPP_HIP
+  CHECK(vt::OpRegistered(vt::OpId::kEmbeddingQuant, DeviceType::kROCM));
+#else
+  CHECK_FALSE(vt::OpRegistered(vt::OpId::kEmbeddingQuant, DeviceType::kROCM));
+#endif
 #endif
 }
 

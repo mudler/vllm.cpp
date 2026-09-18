@@ -1,0 +1,42 @@
+== n_gen=64, r=3: legs_designed=12 legs_completed=12
+  leg  1 avg_ts=26.135345 stddev=0.554276 reps=[26.1469, 26.6838, 25.5754]
+  leg  2 avg_ts=25.742491 stddev=0.555019 reps=[26.0, 26.1219, 25.1055]
+  leg  3 avg_ts=25.883105 stddev=0.53479 reps=[26.1956, 26.1881, 25.2656]
+  leg  4 avg_ts=25.733778 stddev=0.727404 reps=[26.1258, 26.1811, 24.8945]
+  leg  5 avg_ts=25.917521 stddev=0.590809 reps=[26.1201, 26.3804, 25.2521]
+  leg  6 avg_ts=25.871629 stddev=0.909665 reps=[25.9604, 26.7337, 24.9208]
+  leg  7 avg_ts=26.003851 stddev=0.795198 reps=[26.0367, 26.7821, 25.1928]
+  leg  8 avg_ts=26.035939 stddev=0.642818 reps=[26.0912, 26.6493, 25.3673]
+  leg  9 avg_ts=25.68677 stddev=1.038134 reps=[26.0301, 26.5097, 24.5205]
+  leg 10 avg_ts=25.984914 stddev=0.481377 reps=[25.9718, 26.4727, 25.5102]
+  leg 11 avg_ts=25.869491 stddev=0.866729 reps=[26.2438, 26.4861, 24.8785]
+  leg 12 avg_ts=25.714014 stddev=0.826455 reps=[26.1009, 26.276, 24.7651]
+  MEDIAN_TOK_S=25.8774
+  MEAN_TOK_S=25.8816
+  MIN_LEG=25.6868
+  MAX_LEG=26.1353
+  LEG_SPREAD_PCT=1.7335
+  STDEV_OF_LEGS=0.1423
+  CV_PCT=0.5497
+  MEDIAN_OF_REPS=26.096
+  MIN_REP=24.5205
+  MAX_REP=26.7821
+  REP_SPREAD_PCT=8.6664
+  N_REPS=36
+== n_gen=32, r=3: legs_designed=4 legs_completed=4
+  leg  1 avg_ts=26.08372 stddev=0.478873 reps=[25.6148, 26.572, 26.0643]
+  leg  2 avg_ts=25.829148 stddev=0.300441 reps=[25.8468, 26.1204, 25.5203]
+  leg  3 avg_ts=25.791705 stddev=0.726052 reps=[25.0291, 25.8713, 26.4747]
+  leg  4 avg_ts=25.653147 stddev=0.298459 reps=[25.3091, 25.8431, 25.8072]
+  MEDIAN_TOK_S=25.8104
+  MEAN_TOK_S=25.8394
+  MIN_LEG=25.6531
+  MAX_LEG=26.0837
+  LEG_SPREAD_PCT=1.6682
+  STDEV_OF_LEGS=0.1796
+  CV_PCT=0.695
+  MEDIAN_OF_REPS=25.845
+  MIN_REP=25.0291
+  MAX_REP=26.572
+  REP_SPREAD_PCT=5.9698
+  N_REPS=12

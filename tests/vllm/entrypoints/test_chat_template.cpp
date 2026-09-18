@@ -16,12 +16,14 @@
 
 #include <doctest/doctest.h>
 
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -898,4 +900,200 @@ TEST_CASE("chat_template: argument normalization is assistant-history only") {
                       "{{ messages[0].tool_calls[0].function.arguments }}",
                       {user}, /*add_generation_prompt=*/false));
   CHECK(out == malformed);
+}
+
+// ─── ISSUE-LOCAL-01M2EAQ6R63BSRF1GVZ3JAR4A4: parse once, render per request ──
+// The chat path used to hand the template STRING to apply_chat_template on
+// every request, so minja re-parsed all 8952 chars of the Qwen3.8 template
+// (45 ms on a desktop core, against 0.1 ms to render) before each render.
+// Upstream compiles once: transformers' _compile_jinja_template is lru_cache'd,
+// and vLLM resolves the template once per model (vllm/renderers/hf.py).
+namespace {
+using vllm::entrypoints::ChatTemplateParseCountForTesting;
+
+// One request the prompt fn can be handed: the messages, the tools, the
+// per-request chat_template_kwargs, and add_generation_prompt.
+struct TemplateRequest {
+  std::vector<ChatMessage> messages;
+  std::vector<ChatCompletionToolsParam> tools;
+  nlohmann::ordered_json kwargs = nlohmann::ordered_json::object();
+  bool add_generation_prompt = true;
+};
+
+nlohmann::ordered_json Kwargs(const char* json) {
+  return nlohmann::ordered_json::parse(json);
+}
+
+// The shapes the chat endpoint actually sends to the Qwen3.8 target: reasoning
+// left to the template's default, forced on, forced off with an effort, tools
+// present, and a multi-turn history carrying a tool call, its result and prior
+// reasoning.
+std::vector<TemplateRequest> Qwen38Requests() {
+  std::vector<TemplateRequest> out;
+  out.push_back({SystemUser(), {}, nlohmann::ordered_json::object(), true});
+  out.push_back({{ChatMessage{"user", std::string("Janet's ducks lay 16 eggs "
+                                                  "per day. How much?")}},
+                 {},
+                 Kwargs(R"({"enable_thinking": true})"),
+                 true});
+  out.push_back({SystemUser(), {},
+                 Kwargs(R"({"enable_thinking": false, "reasoning_effort": "low"})"),
+                 true});
+  out.push_back({{ChatMessage{"user", std::string("what is the weather?")}},
+                 WeatherTool(),
+                 nlohmann::ordered_json::object(),
+                 true});
+
+  ChatMessage user{"user", std::string("What is the weather in Rome?")};
+  ChatMessage assistant = AssistantToolCall(R"({"city": "Rome"})", "get_weather");
+  assistant.reasoning = std::string("The user wants the weather in Rome.");
+  ChatMessage tool;
+  tool.role = "tool";
+  tool.tool_call_id = "call_1";
+  tool.name = "get_weather";
+  tool.content = "{\"temp\": 21}";
+  ChatMessage followup{"user", std::string("And tomorrow?")};
+  out.push_back({{ChatMessage{"system", std::string("Be brief.")}, user,
+                  assistant, tool, followup},
+                 WeatherTool(),
+                 Kwargs(R"({"enable_thinking": true, "reasoning_effort": "medium"})"),
+                 true});
+  out.push_back({MultiTurn(), {}, nlohmann::ordered_json::object(), false});
+  return out;
+}
+
+std::string Render(const vllm::entrypoints::openai::ChatPromptFn& fn,
+                   const TemplateRequest& r) {
+  return fn(r.messages, r.add_generation_prompt, r.tools, r.kwargs);
+}
+
+// The uncached path: a fresh parse of the template string for this one render.
+std::string RenderUncached(const std::string& tmpl, const TemplateRequest& r,
+                           const std::string& bos, const std::string& eos) {
+  return apply_chat_template(tmpl, r.messages, r.add_generation_prompt, bos,
+                             eos, r.tools, r.kwargs);
+}
+}  // namespace
+
+TEST_CASE("chat_template: the prompt fn parses its template once, not per "
+          "request") {
+  const std::string tmpl = ReadFixture("qwen38_chat_template.jinja");
+  const std::vector<TemplateRequest> requests = Qwen38Requests();
+
+  const std::uint64_t before = ChatTemplateParseCountForTesting();
+  auto fn = MakeChatTemplatePromptFn(tmpl, "", "<|im_end|>");
+  for (int round = 0; round < 3; ++round) {
+    for (const TemplateRequest& r : requests) (void)Render(fn, r);
+  }
+  // 18 renders through one prompt fn, one parse. A per-request parse reads 18.
+  CHECK(ChatTemplateParseCountForTesting() - before == 1);
+}
+
+TEST_CASE("chat_template: the cached prompt fn renders the bytes a fresh parse "
+          "renders") {
+  const std::string qwen38 = ReadFixture("qwen38_chat_template.jinja");
+  auto fn = MakeChatTemplatePromptFn(qwen38, "", "<|im_end|>");
+  for (const TemplateRequest& r : Qwen38Requests()) {
+    const std::string cached = Render(fn, r);
+    CHECK(cached == RenderUncached(qwen38, r, "", "<|im_end|>"));
+    CHECK(cached.find("<|im_start|>") != std::string::npos);
+  }
+
+  // The reasoning default really is a different prompt per shape, so the
+  // equality above is not comparing one constant string with itself.
+  const std::vector<TemplateRequest> reqs = Qwen38Requests();
+  CHECK(Render(fn, reqs[0]) != Render(fn, reqs[2]));
+
+  // The existing fixtures and the in-file templates.
+  const std::string qwen35 = ReadFixture("qwen35_chat_template.jinja");
+  auto fn35 = MakeChatTemplatePromptFn(qwen35, "", "<|im_end|>");
+  TemplateRequest tools_req{{ChatMessage{"user", std::string("weather?")}},
+                            WeatherTool(),
+                            nlohmann::ordered_json::object(),
+                            true};
+  TemplateRequest plain_req{SystemUser(), {}, nlohmann::ordered_json::object(),
+                            true};
+  CHECK(Render(fn35, tools_req) ==
+        RenderUncached(qwen35, tools_req, "", "<|im_end|>"));
+  CHECK(Render(fn35, plain_req) ==
+        RenderUncached(qwen35, plain_req, "", "<|im_end|>"));
+
+  const std::string gemma4 = ReadFixture("gemma4_tool_chat_template.jinja");
+  auto fn_g4 = MakeChatTemplatePromptFn(gemma4);
+  TemplateRequest g4_req{{ChatMessage{"user", std::string("Run date.")},
+                          AssistantToolCall(R"({"command":"date"})")},
+                         {},
+                         nlohmann::ordered_json::object(),
+                         false};
+  CHECK(Render(fn_g4, g4_req) == RenderUncached(gemma4, g4_req, "", ""));
+
+  for (const char* t : {kQwenTemplate, kToolTemplate}) {
+    auto small = MakeChatTemplatePromptFn(t, "<s>", "</s>");
+    CHECK(Render(small, tools_req) == RenderUncached(t, tools_req, "<s>", "</s>"));
+    CHECK(Render(small, plain_req) == RenderUncached(t, plain_req, "<s>", "</s>"));
+  }
+}
+
+TEST_CASE("chat_template: an unparseable template still fails per request, "
+          "with the error a fresh parse reports") {
+  // transformers compiles lazily inside apply_chat_template, so a broken
+  // template is a per-request error there, and api_server maps it to 400. The
+  // cached path keeps that: building the prompt fn does not throw, and every
+  // call throws the same ChatTemplateError a fresh parse throws.
+  for (const char* broken : {"{{ 'x'", "{% endfor %}", "{% for m in messages %}"}) {
+    std::optional<vllm::entrypoints::openai::ChatPromptFn> fn;
+    REQUIRE_NOTHROW(fn.emplace(MakeChatTemplatePromptFn(broken)));
+    std::string fresh;
+    try {
+      (void)apply_chat_template(broken, {}, false);
+    } catch (const ChatTemplateError& e) {
+      fresh = e.what();
+    }
+    REQUIRE_FALSE(fresh.empty());
+    for (int i = 0; i < 2; ++i) {
+      std::string cached;
+      try {
+        (void)(*fn)({}, false, {}, nlohmann::ordered_json::object());
+      } catch (const ChatTemplateError& e) {
+        cached = e.what();
+      }
+      CHECK(cached == fresh);
+    }
+  }
+}
+
+TEST_CASE("chat_template: one prompt fn renders correctly from many threads at "
+          "once") {
+  // The server renders on its HTTP worker threads, all through the ONE prompt
+  // fn server_main builds, so the shared parsed template must be safe to render
+  // concurrently. Each thread renders a different request, so a render that
+  // leaked state into the shared tree would show up as a wrong prompt.
+  const std::string tmpl = ReadFixture("qwen38_chat_template.jinja");
+  auto fn = MakeChatTemplatePromptFn(tmpl, "", "<|im_end|>");
+  const std::vector<TemplateRequest> requests = Qwen38Requests();
+  std::vector<std::string> reference;
+  for (const TemplateRequest& r : requests) reference.push_back(Render(fn, r));
+
+  constexpr int kThreads = 8;
+  constexpr int kRounds = 25;
+  std::vector<int> mismatches(kThreads, 0);
+  std::vector<int> errors(kThreads, 0);
+  std::vector<std::thread> workers;
+  for (int t = 0; t < kThreads; ++t) {
+    workers.emplace_back([&, t] {
+      for (int round = 0; round < kRounds; ++round) {
+        const size_t i = static_cast<size_t>(t + round) % requests.size();
+        try {
+          if (Render(fn, requests[i]) != reference[i]) ++mismatches[t];
+        } catch (const std::exception&) {
+          ++errors[t];
+        }
+      }
+    });
+  }
+  for (std::thread& w : workers) w.join();
+  for (int t = 0; t < kThreads; ++t) {
+    CHECK(mismatches[t] == 0);
+    CHECK(errors[t] == 0);
+  }
 }

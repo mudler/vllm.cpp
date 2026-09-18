@@ -1,0 +1,101 @@
+{
+  "scope": "Read-only frozen operation-oracle audit",
+  "files": {
+    "arithmetic-explanation.json": {
+      "bytes": 6572,
+      "sha256": "c04d32e481ef747672ed1d257206ea36968109e7a8c64bb2c6361d6e301966b7"
+    },
+    "audit_frozen.py": {
+      "bytes": 5841,
+      "sha256": "3f18f3da69fd097a993dbd7b9ae075de45ea032a723b81808fd485b72550cd6d"
+    },
+    "executing-source-artifacts.json": {
+      "bytes": 1951,
+      "sha256": "4eab933a9e2e85cae2929cdf46e27a95ed0341193551a7db495cca2caec4794d"
+    },
+    "explain_arithmetic-current-source.py": {
+      "bytes": 6191,
+      "sha256": "7b10ad36c9bbfa87fc1c274a6b17fcf4cec26fc0a915c69c1e457ddf1ff26f48"
+    },
+    "explain_arithmetic-v2-source-guard.py": {
+      "bytes": 6008,
+      "sha256": "21d47f226d555e218dd6b98de89ae4ab01dfc075eadce25eef91da4137d23ba7"
+    },
+    "explain_arithmetic.py": {
+      "bytes": 6008,
+      "sha256": "21d47f226d555e218dd6b98de89ae4ab01dfc075eadce25eef91da4137d23ba7"
+    },
+    "fork-binary-symbols.txt": {
+      "bytes": 240,
+      "sha256": "26109dc2d2ef7ed403d7fc7cbca45096377de93503ae113c4ffd4c4a0c32443c"
+    },
+    "generated-primary/dequantize_hip.cuh": {
+      "bytes": 22787,
+      "sha256": "497842aca4744b903c7fd19b6069be33fa50da9d4bb893634eda46ab9cb35ddd"
+    },
+    "generated-primary/dispatch_utils.h": {
+      "bytes": 483,
+      "sha256": "7a17e8ac27b25426fbfd2921d2ebcad6410b703736204e55e832037fd9f250cc"
+    },
+    "generated-primary/ggml-common_hip.h": {
+      "bytes": 85590,
+      "sha256": "b7d415d0cb626afb330cc67867418943b1ebe39eb648988f637b4f29af8e8a41"
+    },
+    "generated-primary/gguf_kernel.hip": {
+      "bytes": 22272,
+      "sha256": "f714989ddbd4c97bdcd924d5ca3316c60efdebcdffa5c9c818a93579023e4d72"
+    },
+    "generated-primary/torch_bindings.cpp": {
+      "bytes": 2363,
+      "sha256": "4fb80d903a1e860a080a04033b6a41eeb840b2bc68220fc509a0db5a5f1cafa7"
+    },
+    "hash-audit.json": {
+      "bytes": 15914,
+      "sha256": "86d02da770d682fe11e3360c760c5d27096d5180a17114c2f46f6b2ae04a1341"
+    },
+    "independent-audit.json": {
+      "bytes": 1591,
+      "sha256": "747faf446d92f45c645948c7fbda87552ed996736a29eee55069c6893716c26b"
+    },
+    "isolated-agent-onboard-result.json": {
+      "bytes": 362,
+      "sha256": "75a643bf8395e6b5f52e9230d50f49f8574e1d1ea3959be697633dd84720608e"
+    },
+    "isolated-agent-onboard.log": {
+      "bytes": 138,
+      "sha256": "0fd19afd79de4dc7e059bf9415f7cced93739f51df61127a5ab09c88e92a74ff"
+    },
+    "native-expression-source/rocm_quant_dequant.h": {
+      "bytes": 24598,
+      "sha256": "56b14d63308a6c3d8c19a6619217470fac88dd58599f95b4d9bf919f854f732d"
+    },
+    "native-expression-source/rocm_quant_iq_tables.h": {
+      "bytes": 110865,
+      "sha256": "d267d25ff1dd3f67749c251f87047f4b70c9650a99d04b524ff6c3313596a349"
+    },
+    "plugin-source-audit.json": {
+      "bytes": 323,
+      "sha256": "35b3cd72b0a1fe6c91c641ed169a19326fc052a6354d0c74f2549806a24979ef"
+    },
+    "primary-output-stats.json": {
+      "bytes": 12439,
+      "sha256": "88dc6f64749d5d8152b4d128f63e59323e2aa77d51961588cb846e7836e83652"
+    },
+    "report.md": {
+      "bytes": 9252,
+      "sha256": "ca646cdd818958214927f5cb5751efc3a111f29a64007432a4506f417bab956a"
+    },
+    "runtime-source-checks.json": {
+      "bytes": 358,
+      "sha256": "23e7fd990779705883e0be0da456e9fe22b8c41f45bc5e20906f58861b5f695a"
+    },
+    "secondary-git-identity.json": {
+      "bytes": 298,
+      "sha256": "3fd31d2cd85e273181b1dcf97eec92dcf4e43da564fc959b7220cb6b479444af"
+    },
+    "stock-binary-symbols.txt": {
+      "bytes": 197,
+      "sha256": "01bc5a8662f9c4a2164444ee140433681d489def952ce6795572becd05c7eab2"
+    }
+  }
+}

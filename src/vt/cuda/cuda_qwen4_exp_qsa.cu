@@ -73,7 +73,8 @@
 // This arm keeps all four:
 //
 //   1. the DOT `sum_d q[d]*k[d]` is sequential ascending f32 on ONE thread,
-//      never tree-reduced;
+//      never tree-reduced — one WHOLE dot per thread in both passes, which says
+//      nothing about WHICH thread, because the value does not depend on that;
 //   2. the MAX over the gathered rows is split across threads and block-reduced,
 //      which is exact and order-free — `max` is associative and commutative in
 //      IEEE arithmetic and it is the one reduction here that may be parallelised;
@@ -81,16 +82,38 @@
 //   4. the VALUE accumulation `acc[d] += w * v[d]` runs ascending over `p` and is
 //      parallel across `d` only, which each thread owns alone.
 //
-// THE COST IS STATED RATHER THAN LEFT TO BE FOUND. Pass 2's dot is sequential on
-// thread 0, so a block spends `|sel| * head_dim` dependent f32 operations on one
-// lane — ~525k per (token, head) at the released config. The lever that removes
-// it is named and NOT taken here: a deterministic tree reduction over `d` would
-// PRESERVE the gather-vs-dense property, because the dot's order would then
-// depend on `head_dim` alone and be identical in the sub-budget and the dense
-// run, while breaking the CPU-vs-CUDA relation the sequential dot keeps. That
-// trade is declined on the run that first puts this kernel on a device, because
-// it would replace a measured `max|diff|` with an argued one. The spec's
-// `## Owed` records it as a SPEED item with its condition.
+// THE COST THIS HEADER USED TO STATE HAS BEEN REMOVED, and the removal did not
+// need the lever it declined. Pass 2's dot WAS sequential on thread 0, so a
+// block spent `|sel| * head_dim` dependent f32 operations on one lane — ~525k
+// per (token, head) at the released config — and that single lane MEASURED
+// 86.4% and 88.8%, in two independent `thor:gpu0` runs, of this kernel's wall
+// time (`ISSUE-LOCAL-01M2DJ8Y4DFQMDG9GMWEK93142`). Pass 2 now spreads its tile
+// ONE WHOLE DOT PER THREAD, exactly as pass 1 already did, and only the SUM over
+// `s` stays on thread 0. WHICH THREAD evaluates a given dot was never part of any
+// of the four orders; WHAT EACH THREAD DOES INSIDE ITS OWN DOT still is, so
+// orders 1, 3 and 4 are each as load-bearing after this change as before it, and
+// the list above is the statement of record. An earlier revision of this
+// paragraph named only order 3, which understates: order 1 is the ascending walk
+// over `d` that the moved dot itself performs, and order 4 is the ascending walk
+// over `p` in the value accumulation the tile feeds.
+//
+// AND ORDER 3 IS THE ONE THE SUITE NOW MEASURES. It was argued here and gated by
+// nothing: a fresh review reassociated this fold two ways on `thor:gpu0` -- a
+// descending fold, and the warp-shuffle tree the paragraph below declines -- and
+// all three committed suites passed unmodified. The repair is the softmax-fold
+// probe (`Qwen4ExpQsaAttnArgs::softmax_probe_weights`), which hands the test the
+// weights this kernel computed so the ascending fold can be recomputed on the
+// host FROM THE DEVICE'S OWN FLOATS and compared BIT for BIT. A tolerance cannot
+// do this job and that is measured, not assumed: the reassociated denominator
+// sits at 0.01-0.02% of the derived arm-vs-arm bound, and the worst ratio on a
+// CORRECT kernel is HIGHER than on a reassociated one.
+//
+// The tree reduction over `d` remains named and NOT taken: it would PRESERVE the
+// gather-vs-dense property, because the dot's order would then depend on
+// `head_dim` alone and be identical in the sub-budget and the dense run, while
+// breaking the CPU-vs-CUDA relation the sequential dot keeps. That trade would
+// replace a measured `max|diff|` with an argued one, and the change above is
+// bit-identity-preserving and did not require it.
 //
 // ─── TWO REFUSALS THIS ARM IMPOSES THAT THE CPU ARM DOES NOT ─────────────────
 // `head_dim > 1024` IS REFUSED BY NAME. One thread block serves one
@@ -344,11 +367,17 @@ void Qwen4ExpQsaCompressKernelCuda(Queue& q, Tensor& block_keys, const Tensor& r
 // the parallel path AGENTS.md "Shared seams" forbids AND would have to be kept
 // bit-identical to this one by hand.
 //
-// How many rows the tile below carries between thread 0 and the block. It exists
-// to amortise `__syncthreads`, NOT to change any order: thread 0 still walks `s`
-// ASCENDING and still accumulates `denom` ascending, and the block still applies
-// the tile's weights to `acc[d]` in ascending `s`. With `|sel|` up to 2051 at the
-// released config this turns ~4100 barrier pairs into ~130.
+// How many rows the tile below carries between the block and thread 0. It exists
+// to amortise `__syncthreads`, NOT to change any order: thread 0 still folds
+// `denom` over the tile ASCENDING, and the block still applies the tile's
+// weights to `acc[d]` in ascending `s`. With `|sel|` up to 2051 at the released
+// config this turns ~4100 barrier pairs into ~130.
+//
+// IT IS ALSO THE WIDTH OF THE TILE'S THREAD MAPPING, and 32 is the value that
+// makes that mapping need no bound: `BlockWidthFor` floors `blockDim.x` at 32,
+// so every entry `u < n <= 32` has a thread for every `DH` this op admits.
+// Raising it above 32 requires a real bound against `blockDim.x`, a case that
+// exercises `DH < kSelTile`, and `s_ptile`/`s_wtile` moving with it.
 constexpr int kSelTile = 32;
 
 // The one address that differs between the two arms, mirroring vLLM's paged read
@@ -376,7 +405,8 @@ __global__ void QsaGatherAttentionKernel(
     int64_t HQ, int64_t DH, int64_t HKV, int64_t groups, int64_t topk, int64_t CR, float scale,
     bool paged, const int32_t* pages, int64_t page_size, int64_t num_phys_pages,
     int64_t max_kv, int64_t k_s0, int64_t k_s1, int64_t k_s2, int64_t v_s0, int64_t v_s1,
-    int64_t v_s2, unsigned long long* visited) {
+    int64_t v_s2, unsigned long long* visited, float* wprobe, float* dprobe,
+    int64_t wstride) {
   extern __shared__ float s_attn[];
   float* s_q = s_attn;                       // [DH] the query row
   float* s_red = s_attn + DH;                // [blockDim/32] warp partials
@@ -497,41 +527,78 @@ __global__ void QsaGatherAttentionKernel(
     }
     const float m = s_m;
 
-    // Pass 2: the softmax weights and the value reduction, ASCENDING. Thread 0
-    // walks `s` in order and accumulates `denom` in order; the block applies each
-    // tile's weights to `acc[d]` in the same order. `kSelTile` amortises the
+    // Pass 2: the softmax weights and the value reduction, ASCENDING. The ORDER
+    // that is load-bearing is the SUM OVER `s`: `denom` is still accumulated by
+    // thread 0 alone, walking `u` from 0 to `n` ascending, so nothing here
+    // reassociates and the bit relation to the CPU arm is untouched. What is NOT
+    // order-bearing is the dot product over `d` INSIDE one `s` — it is a
+    // self-contained ascending f32 accumulation whose value does not depend on
+    // which thread runs it — so the tile's dots go ONE WHOLE DOT PER THREAD, the
+    // same arrangement pass 1 above already uses. Thread 0 used to recompute
+    // every selected key's dot by itself while the block waited, and that single
+    // lane MEASURED 86-89% of this kernel's wall time on `thor:gpu0`
+    // (`ISSUE-LOCAL-01M2DJ8Y4DFQMDG9GMWEK93142`). `kSelTile` amortises the
     // barriers and changes no order at all.
+    //
+    // THE TILE-TO-THREAD MAPPING IS SAFE WITHOUT A BOUND CHECK, and that is a
+    // property of the constants and not an assumption: `BlockWidthFor` floors
+    // `blockDim.x` at 32 and `kSelTile` is 32, so `n <= kSelTile <= blockDim.x`
+    // for every `DH` this op admits. Raising `kSelTile` gives that up and would
+    // need a real bound against `blockDim.x`.
+    //
+    // THE BARRIER COUNT DOES NOT CHANGE. Threads `u < n` write the tile,
+    // `__syncthreads`, then thread 0 folds `denom` (a READ of `s_wtile`) while
+    // the block applies the tile to `acc[d]` (also a read). Concurrent reads are
+    // not a hazard, and the trailing barrier that already keeps the next tile's
+    // writes off them is still there.
     float acc = 0.0f;  // this thread's acc[d], d == threadIdx.x
     if (threadIdx.x == 0) s_denom = 0.0f;
     __syncthreads();
     for (int64_t s0 = 0; s0 < selcount; s0 += kSelTile) {
       const int64_t n = (selcount - s0) < kSelTile ? (selcount - s0) : kSelTile;
-      if (threadIdx.x == 0) {
-        float denom = s_denom;
-        for (int64_t u = 0; u < n; ++u) {
-          const int64_t s = s0 + u;
-          int64_t p;
-          if (s < nsel_blocks * CR) {
-            p = static_cast<int64_t>(ids[t * topk + s / CR]) * CR + (s % CR);
-          } else {
-            p = complete * CR + (s - nsel_blocks * CR);
-          }
-          const int64_t base = RowBase(paged, pages, page_size, num_phys_pages, k_str, HKV, DH,
-                                       p, kvh);
-          if (base < 0) { s_bad = 1; s_wtile[u] = 0.0f; s_ptile[u] = -1; continue; }
-          ++reads;
+      if (threadIdx.x < n) {
+        const int64_t u = threadIdx.x;
+        const int64_t s = s0 + u;
+        int64_t p;
+        if (s < nsel_blocks * CR) {
+          p = static_cast<int64_t>(ids[t * topk + s / CR]) * CR + (s % CR);
+        } else {
+          p = complete * CR + (s - nsel_blocks * CR);
+        }
+        const int64_t base = RowBase(paged, pages, page_size, num_phys_pages, k_str, HKV, DH,
+                                     p, kvh);
+        if (base < 0) {
+          // The poison path, unchanged in value: `s_bad` is already written
+          // racily from many threads with this same value by pass 1.
+          s_bad = 1;
+          s_wtile[u] = 0.0f;
+          s_ptile[u] = -1;
+        } else {
+          ++reads;  // COUNTED AT THE READ, now by the thread that performs it
           float dot = 0.0f;
           for (int64_t d = 0; d < DH; ++d) {
             dot = __fadd_rn(dot, __fmul_rn(s_q[d], LoadAt(key, k_tag, base + d)));
           }
           const float w = expf(__fsub_rn(__fmul_rn(dot, scale), m));
-          denom = __fadd_rn(denom, w);
+          // THE PROBE, and it publishes the value the fold below will read --
+          // `s_wtile[u]` itself, not a recomputation of it. See
+          // `Qwen4ExpQsaAttnArgs::softmax_probe_weights`.
+          if (wprobe != nullptr && s < wstride) wprobe[pair * wstride + s] = w;
           s_wtile[u] = w;
           s_ptile[u] = p;
         }
-        s_denom = denom;
       }
       __syncthreads();
+      if (threadIdx.x == 0) {
+        // The SUM OVER `s`, still serial and still ascending. A poisoned entry
+        // folds its `0.0f`, which is this accumulator's identity — `s_denom`
+        // starts at `+0.0f` and every `w` is non-negative, so it never holds
+        // `-0.0f`, the one value `+0.0f` would change — and the row it poisons
+        // is overwritten with NaN below regardless.
+        float denom = s_denom;
+        for (int64_t u = 0; u < n; ++u) denom = __fadd_rn(denom, s_wtile[u]);
+        s_denom = denom;
+      }
       if (threadIdx.x < DH) {
         const int64_t d = threadIdx.x;
         for (int64_t u = 0; u < n; ++u) {
@@ -552,6 +619,9 @@ __global__ void QsaGatherAttentionKernel(
       continue;
     }
     const float denom = s_denom;
+    // Published AFTER the poison check on purpose: a malformed row's weights are
+    // not the weights of any well-formed softmax, so it publishes no denominator.
+    if (dprobe != nullptr && threadIdx.x == 0) dprobe[pair] = denom;
     if (threadIdx.x < DH) {
       StoreAt(out, out_tag, (t * HQ + h) * DH + threadIdx.x, __fdiv_rn(acc, denom));
     }
@@ -597,6 +667,31 @@ void Qwen4ExpQsaGatherAttentionKernelCuda(Queue& q, Tensor& out, const Tensor& q
   // The device counter and its copy-back, allocated ONLY when the caller passed
   // the instrument. `keys_visited == nullptr` is the production path and takes
   // neither the allocation nor the synchronise.
+  // The softmax-fold probe, on the same terms: allocated ONLY when the caller
+  // passed it, and `nullptr` on the production path. A caller sets the weights
+  // buffer, the denominator buffer and the stride together or sets none.
+  VT_CHECK((args.softmax_probe_weights != nullptr) == (args.softmax_probe_denom != nullptr) &&
+               (args.softmax_probe_weights == nullptr) == (args.softmax_probe_stride == 0),
+           std::string("cuda ") + kOp +
+               ": softmax_probe_weights, softmax_probe_denom and softmax_probe_stride are "
+               "one instrument and must be set together or all left unset");
+  const bool probing = args.softmax_probe_denom != nullptr;
+  const size_t wprobe_bytes =
+      static_cast<size_t>(pairs) * static_cast<size_t>(args.softmax_probe_stride) *
+      sizeof(float);
+  const size_t dprobe_bytes = static_cast<size_t>(pairs) * sizeof(float);
+  float* d_wprobe = nullptr;
+  float* d_dprobe = nullptr;
+  if (probing) {
+    Check(cudaMalloc(&d_wprobe, wprobe_bytes), "qwen4_exp_qsa_gather_attention probe alloc");
+    Check(cudaMalloc(&d_dprobe, dprobe_bytes),
+          "qwen4_exp_qsa_gather_attention probe denom alloc");
+    Check(cudaMemsetAsync(d_wprobe, 0, wprobe_bytes, AsStream(q)),
+          "qwen4_exp_qsa_gather_attention probe zero");
+    Check(cudaMemsetAsync(d_dprobe, 0, dprobe_bytes, AsStream(q)),
+          "qwen4_exp_qsa_gather_attention probe denom zero");
+  }
+
   unsigned long long* d_visited = nullptr;
   if (args.keys_visited != nullptr) {
     Check(cudaMalloc(&d_visited, sizeof(unsigned long long)),
@@ -615,7 +710,8 @@ void Qwen4ExpQsaGatherAttentionKernelCuda(Queue& q, Tensor& out, const Tensor& q
       block_ids.shape[1], args.compress_ratio, args.scale, paged,
       paged ? args.kv_block_table->Ptr<int32_t>() : nullptr, page_size,
       paged ? key.shape[0] : 0, max_kv, key.stride[0], key.stride[1], key.stride[2],
-      value.stride[0], value.stride[1], value.stride[2], d_visited);
+      value.stride[0], value.stride[1], value.stride[2], d_visited, d_wprobe, d_dprobe,
+      args.softmax_probe_stride);
   Check(cudaGetLastError(), "qwen4_exp_qsa_gather_attention launch");
 
   if (args.keys_visited != nullptr) {
@@ -627,6 +723,18 @@ void Qwen4ExpQsaGatherAttentionKernelCuda(Queue& q, Tensor& out, const Tensor& q
           "qwen4_exp_qsa_gather_attention keys_visited sync");
     Check(cudaFree(d_visited), "qwen4_exp_qsa_gather_attention keys_visited free");
     *args.keys_visited = static_cast<int64_t>(host);
+  }
+
+  if (probing) {
+    Check(cudaMemcpyAsync(args.softmax_probe_weights, d_wprobe, wprobe_bytes,
+                          cudaMemcpyDeviceToHost, AsStream(q)),
+          "qwen4_exp_qsa_gather_attention probe copy-back");
+    Check(cudaMemcpyAsync(args.softmax_probe_denom, d_dprobe, dprobe_bytes,
+                          cudaMemcpyDeviceToHost, AsStream(q)),
+          "qwen4_exp_qsa_gather_attention probe denom copy-back");
+    Check(cudaStreamSynchronize(AsStream(q)), "qwen4_exp_qsa_gather_attention probe sync");
+    Check(cudaFree(d_wprobe), "qwen4_exp_qsa_gather_attention probe free");
+    Check(cudaFree(d_dprobe), "qwen4_exp_qsa_gather_attention probe denom free");
   }
 }
 

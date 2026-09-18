@@ -99,6 +99,14 @@ unsigned GridFor(int64_t n) {
   return static_cast<unsigned>(blocks < 4096 ? blocks : 4096);
 }
 
+// ONE BLOCK PER ITEM, for a kernel whose item is a whole reduction group rather
+// than one output element. Same 4096 cap, so the caller's loop must still be a
+// grid stride; `n >= 1` at every call site here (the `T == 0 || flat == 0`
+// early return is above them), and the `max(1)` is a floor, not a promise.
+unsigned GridForGroups(int64_t n) {
+  return static_cast<unsigned>(n < 1 ? 1 : (n < 4096 ? n : 4096));
+}
+
 // The runtime dtype tag described in the header. Local to this TU for the same
 // reason `cpu_qwen4_exp.cpp` keeps a local copy of `LoadF32At`/`StoreF32At`:
 // hoisting it would edit a translation unit several other rows are working in,
@@ -228,17 +236,49 @@ void Qwen4ExpGatedResidualWriteBackKernelCuda(Queue& q, Tensor& hyper, const Ten
 // divergence has two named sources and no third: the GEMM's association and
 // `exp`.
 //
-// ─── THE REDUCTION WIDTH IS INHERITED, NOT CHOSEN ───────────────────────────
-// `cpu_qwen4_exp.cpp` accumulates the grouped sum of squares in **double**, and
-// its own header measures why: "on magnitude-separated data, a float accumulator
-// and this one differ by 742x". W6-CUDA's split table records that "an
-// f32-accumulating CUDA kernel does not inherit that". This arm therefore
-// accumulates in `double` with `__dadd_rn`/`__dmul_rn` and narrows exactly where
-// the host narrows — `static_cast<float>(ss / static_cast<double>(H)) + eps` —
-// so no width decision is made here at all. `vt::RmsNormGroup`'s CUDA arm in
-// `cuda_rms_norm_group.cu` reduces the same SHAPE in **f32**, deliberately, and
-// the two must NOT be unified: each keeps the width its own oracle was dumped
-// in.
+// ─── THE REDUCTION WIDTH IS FP32, AND W7 CHOSE IT ───────────────────────────
+// **THE PARAGRAPH THAT STOOD HERE WAS WRONG, AND IT IS REPLACED RATHER THAN
+// AMENDED.** It read: "`cpu_qwen4_exp.cpp` accumulates the grouped sum of
+// squares in **double** ... This arm therefore accumulates in `double` ... so no
+// width decision is made here at all." Inheriting the host reference's width was
+// not "no decision"; it was a decision, and it was the wrong one.
+//
+// `qwen4_exp_hc.h:99-104` states the rule this arm must follow, and it names
+// BOTH arms in one paragraph: the double is "the `deepseek_v4_mhc.cpp` house
+// convention for a HOST REFERENCE", while "Upstream runs the norm in fp32
+// (`self._norm(x.float())`) and vLLM likewise (`x = x.float()`) ... this is a
+// CPU reference and THE DEVICE ARM IS THE THING THAT MUST BE FP32-ACCUMULATE and
+// gated against these numbers." The device arm was the outlier. Moving it to
+// fp32 moves it TOWARD the oracle, so this is not a parity divergence, and
+// AGENTS.md names the failure it removes: "A token gate cannot detect a dtype
+// that is too wide."
+//
+// The "742x" measurement the old paragraph quoted is real and is about the CPU
+// arm's ASCENDING SERIAL walk. It is not an argument for this arm, which no
+// longer walks serially: a block tree reduction's error grows like
+// sqrt(log K) * u rather than the serial sqrt(K) * u, so the parallel fp32 shape
+// is BETTER conditioned than the serial fp32 one the measurement rejected.
+// `vt::RmsNormGroup`'s CUDA arm in `cuda_rms_norm_group.cu` reduces the same
+// SHAPE in f32, and the two now agree on width — but they still must NOT be
+// unified, because each answers to its own oracle and its own op contract.
+//
+// ─── AND THE PARALLEL SHAPE, WHICH WAS THE LARGER DEFECT ─────────────────────
+// The kernel used to run ONE THREAD PER (token, hc stream), launched
+// `GridFor(T * hc)`. The released Qwen3.8-Flash-Next has `hc_count = 4` and
+// decode runs at T = 1, so four threads did all of it on a 48-SM GB10, each
+// walking H = 2560 twice. MEASURED on `dgx:gpu0` (nsys, 2026-09-12, released
+// UD-IQ1_S): 40.7% of ALL GPU kernel time, ~435 us a call, ~42 ms of a 116.9 ms
+// decode step. It is now ONE BLOCK PER (token, hc) group with a warp-shuffle
+// tree reduction, and the normalize-and-write loop that follows is
+// order-independent and strides across the block.
+//
+// THE GROUP LOOP IS A GRID STRIDE because `GridForGroups` caps the grid at 4096
+// blocks, exactly as `GridFor` does. IT CARRIES NO TRAILING `__syncthreads()`,
+// and that is an ordering argument rather than a green run: the two barriers
+// INSIDE the body already separate both cross-iteration shared accesses, and
+// the loop's trip count is BLOCK-UNIFORM, so every thread reaches both of them
+// on every trip. The paragraph at the bottom of the loop names the two hazards
+// and which barrier orders each, and records the racecheck run that measures it.
 //
 // The scratch is ONE `cudaMalloc` sliced four ways, freed before return. A
 // per-call allocation in a decode loop is a cost, and it is recorded in the
@@ -252,43 +292,110 @@ __device__ inline float SigmoidF(float x) {
   return __frcp_rn(__fadd_rn(1.0f, expf(-x)));
 }
 
-// STAGE 1 — the grouped RMS norm, ONE THREAD PER (token, hc stream). Each group
-// is `hidden` CONSECUTIVE elements, so no thread can see another's group, and
-// the walk is the host's ascending one.
+// STAGE 1 — the grouped RMS norm, ONE BLOCK PER (token, hc stream) group. Each
+// group is `hidden` CONSECUTIVE elements, so no block can see another's group.
+// The per-group walk is no longer the host's ascending serial one; it is a
+// strided partial per thread followed by a warp-shuffle tree, in f32. See the
+// two header sections above for why the width and the shape both changed.
 __global__ void HcGroupedNormKernel(float* normed, const void* hyper, DTag hyper_tag,
                                     const void* hc_norm_w, DTag w_tag, int64_t T, int64_t hc,
                                     int64_t H, float eps) {
+  // One slot per warp of the block. This kernel is `static` to the TU and has
+  // exactly ONE launch site, which passes `kBlock`, so the array is sized from
+  // that constant; every index below is still computed from `blockDim.x`, and
+  // the `lane < nwarp` guard is what keeps a short block from reading a slot no
+  // warp wrote. A second launch site with a different block size would have to
+  // resize this array, and that is why there is not one.
+  __shared__ float s_part[kBlock / 32];
+  __shared__ float s_r;
   const int64_t flat = hc * H;
   const int64_t total = T * hc;
-  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
-  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < total;
-       idx += step) {
-    const int64_t t = idx / hc;
-    const int64_t j = idx - t * hc;
+  const unsigned lane = threadIdx.x & 31u;
+  const unsigned warp = threadIdx.x >> 5;
+  const unsigned nwarp = blockDim.x >> 5;
+  for (int64_t g = static_cast<int64_t>(blockIdx.x); g < total;
+       g += static_cast<int64_t>(gridDim.x)) {
+    const int64_t t = g / hc;
+    const int64_t j = g - t * hc;
     const int64_t base = t * flat + j * H;
-    // `x.reshape(...).pow(2).mean(-1)` over the GROUP. DOUBLE, inherited from
-    // the CPU arm rather than chosen — see the header.
-    double ss = 0.0;
-    for (int64_t h = 0; h < H; ++h) {
-      const double v = static_cast<double>(LoadAt(hyper, hyper_tag, base + h));
-      ss = __dadd_rn(ss, __dmul_rn(v, v));
+    // `x.reshape(...).pow(2).mean(-1)` over the GROUP, in f32 — upstream's and
+    // vLLM's width. Every thread of the block takes a strided slice; a thread
+    // whose slice is empty (H < blockDim.x) contributes an exact 0.
+    float part = 0.0f;
+    for (int64_t h = static_cast<int64_t>(threadIdx.x); h < H;
+         h += static_cast<int64_t>(blockDim.x)) {
+      const float v = LoadAt(hyper, hyper_tag, base + h);
+      part = __fadd_rn(part, __fmul_rn(v, v));
     }
-    // eps is INSIDE the rsqrt, added to the MEAN SQUARE, never to the norm. The
-    // narrowing point is the host's: the quotient becomes float BEFORE eps is
-    // added.
-    const float r = __frcp_rn(sqrtf(
-        __fadd_rn(static_cast<float>(__ddiv_rn(ss, static_cast<double>(H))), eps)));
-    for (int64_t h = 0; h < H; ++h) {
+    // `_rn` throughout, for the same reason the rest of this TU spells it out:
+    // nvcc's `-fmad` is ON by default and is not pinned, so a plain `a + b * b`
+    // would contract and silently change the rounding.
+    for (unsigned off = 16; off > 0; off >>= 1) {
+      part = __fadd_rn(part, __shfl_down_sync(0xffffffffu, part, off));
+    }
+    if (lane == 0) s_part[warp] = part;
+    __syncthreads();
+    if (warp == 0) {
+      float v = (lane < nwarp) ? s_part[lane] : 0.0f;
+      for (unsigned off = 16; off > 0; off >>= 1) {
+        v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, off));
+      }
+      if (lane == 0) {
+        // eps is INSIDE the rsqrt, added to the MEAN SQUARE, never to the norm.
+        // The narrowing point is gone rather than moved: the quotient was
+        // already float at this line, and eps is still added to it and nowhere
+        // else.
+        s_r = __frcp_rn(sqrtf(__fadd_rn(__fdiv_rn(v, static_cast<float>(H)), eps)));
+      }
+    }
+    __syncthreads();
+    const float r = s_r;
+    // ORDER-INDEPENDENT, so it simply strides across the block: every output
+    // element reads operands no other thread writes.
+    for (int64_t h = static_cast<int64_t>(threadIdx.x); h < H;
+         h += static_cast<int64_t>(blockDim.x)) {
       // THE `1 +` IS THE OP'S. `hc_norm_w` is the RAW HuggingFace gamma, centred
       // on zero (#2218); dropping the fold scales the stream by ~0 and reads as
       // a corrupt checkpoint rather than as a wiring bug. THE FOLD IS f32, which
-      // is upstream's width (`1.0 + self.weight.float()`, :177) and not a
-      // convenience — the double above isolates the REDUCTION and must not also
-      // move the multiplier.
+      // is upstream's width (`1.0 + self.weight.float()`, :177).
       const float w = LoadAt(hc_norm_w, w_tag, j * H + h);
       normed[base + h] = __fmul_rn(__fmul_rn(LoadAt(hyper, hyper_tag, base + h), r),
                                    __fadd_rn(1.0f, w));
     }
+    // NO TRAILING `__syncthreads()` BELONGS HERE. `s_part` and `s_r` are the
+    // only shared state, so the grid stride has exactly TWO cross-iteration
+    // hazards, and each already has one of the barriers above between its ends:
+    //
+    //   `s_part` WAR -- warp 0 READS `s_part[lane]` in the cross-warp fold of
+    //   trip g; lane 0 of every warp WRITES `s_part[warp]` at trip g+1. The
+    //   SECOND barrier of trip g (the one after `s_r` is set) stands between
+    //   them.
+    //
+    //   `s_r` WAR -- every thread READS `s_r` into `r` at trip g; thread 0
+    //   WRITES `s_r` at trip g+1 inside the `warp == 0` fold. The FIRST barrier
+    //   of trip g+1 (the one after the per-warp partials land) stands between
+    //   them.
+    //
+    // The two RAW pairs are inside one trip and the same two barriers order
+    // them. Every step of this rests on the trip count being BLOCK-UNIFORM, and
+    // it is: `g` is seeded from `blockIdx.x` and stepped by `gridDim.x`, neither
+    // of which varies within a block, so no thread leaves the loop while another
+    // is still in it. `r` is a REGISTER copy, and `__syncthreads()` is a
+    // compiler barrier as well as a hardware one, so the load of `s_r` cannot be
+    // sunk past the next trip's first barrier.
+    //
+    // MEASURED, NOT ASSUMED, AND IT IS THE EARLIER CLAIM THAT WAS WRONG. A
+    // trailing barrier here is an EQUIVALENT MUTANT: W7 mutation M3 added one
+    // back and the `[MEASURED]` lines were digit-for-digit identical to these
+    // bytes. `compute-sanitizer --tool racecheck --racecheck-detect-level info`
+    // on `thor:gpu0` (sm_110, CUDA 13.0.88), driven by the `MORE GROUPS THAN
+    // BLOCKS` case -- 4800 groups, the only committed case that takes a second
+    // trip -- reports `0 hazards displayed (0 errors, 0 warnings)` and exits 0.
+    // The instrument is not blind to this kernel: deleting the SECOND barrier
+    // above instead makes the same run report `2 hazards displayed`, tens of
+    // thousands of hazards inside `HcGroupedNormKernel`, and RED cases. So the
+    // barriers this loop keeps are exactly the ones the memory model needs, and
+    // racecheck -- not a value gate -- is the instrument that gates them.
   }
 }
 
@@ -399,7 +506,10 @@ void Qwen4ExpGatedResidualKernelCuda(Queue& q, Tensor& mixed, Tensor* injection,
     ~FreeGuard() { if (p != nullptr) cudaFree(p); }
   } guard{scratch};
 
-  HcGroupedNormKernel<<<GridFor(T * hc), kBlock, 0, AsStream(q)>>>(
+  // ONE BLOCK PER GROUP, not one thread per group. `GridForGroups` keeps the
+  // same 4096-block cap `GridFor` applies, which is why the kernel's group loop
+  // is a grid stride.
+  HcGroupedNormKernel<<<GridForGroups(T * hc), kBlock, 0, AsStream(q)>>>(
       d_normed, hyper.data, hyper_tag, hc_norm_w.data, w_tag, T, hc, H, args.eps);
   Check(cudaGetLastError(), "qwen4_exp_gated_residual norm launch");
 

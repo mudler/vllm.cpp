@@ -711,6 +711,55 @@ void SiluAndMulKernelCuda(Queue& q, Tensor& out, const Tensor& x) {
   }
 }
 
+// ClampedSwiGLU (DeepSeek-V4 activation, activation.py:197-201): gate clamped
+// MAX-ONLY, up clamped BOTH sides, then silu(gate)*up at alpha=1, beta=0.
+// Same kernel structure as SiluAndMulKernel with per-element clamping.
+template <typename Tin, typename Tout>
+__global__ void ClampedSwiGLUKernel(Tout* out, const Tin* x, int64_t n, int64_t d,
+                                     float limit) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; idx < n;
+       idx += step) {
+    const int64_t i = idx / d;
+    const int64_t j = idx - i * d;
+    const float gate = fminf(Load(x, i * 2 * d + j), limit);
+    const float up = fminf(fmaxf(Load(x, i * 2 * d + d + j), -limit), limit);
+    const float silu = gate / (1.0f + expf(-gate));
+    Store(out, idx, silu * up);
+  }
+}
+
+template <typename Tin>
+void LaunchClampedSwiGLU(cudaStream_t s, Tensor& out, const Tensor& gate_up, float limit) {
+  const int64_t t = gate_up.shape[0], d = gate_up.shape[1] / 2;
+  const int64_t n = t * d;
+  if (n == 0) return;
+  switch (out.dtype) {
+    case DType::kF32:
+      ClampedSwiGLUKernel<Tin, float>
+          <<<GridFor(n), kBlock, 0, s>>>(out.Ptr<float>(), gate_up.Ptr<Tin>(), n, d, limit);
+      break;
+    case DType::kBF16:
+      ClampedSwiGLUKernel<Tin, __nv_bfloat16>
+          <<<GridFor(n), kBlock, 0, s>>>(out.Ptr<__nv_bfloat16>(), gate_up.Ptr<Tin>(), n, d,
+                                         limit);
+      break;
+    default: VT_CHECK(false, "cuda clamped_swiglu: unsupported out dtype");
+  }
+  Check(cudaGetLastError(), "clamped_swiglu launch");
+}
+
+void ClampedSwiGLUKernelCuda(Queue& q, Tensor& out, const Tensor& gate_up, float limit) {
+  switch (gate_up.dtype) {
+    case DType::kF32: LaunchClampedSwiGLU<float>(AsStream(q), out, gate_up, limit); break;
+    case DType::kBF16:
+      LaunchClampedSwiGLU<__nv_bfloat16>(AsStream(q), out, gate_up, limit);
+      break;
+    default:
+      VT_CHECK(false, "cuda clamped_swiglu: unsupported input dtype (f32/bf16 only)");
+  }
+}
+
 // ---------------------------------------------------------------------------
 // gelu_and_mul (Gemma GeGLU): out = gelu_tanh(gate) * up. gelu_tanh is the
 // exact `gelu_pytorch_tanh` / F.gelu(approximate="tanh") — computed in f32 then
@@ -4056,6 +4105,9 @@ struct Registrar {
                    static_cast<RmsNormQuantFp8Fn>(&RmsNormQuantFp8KernelCuda)));
     RegisterOp(OpId::kSiluAndMul, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<SiluAndMulFn>(&SiluAndMulKernelCuda)));
+    RegisterOp(OpId::kClampedSwiGLU, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<ClampedSwiGLUFn>(&ClampedSwiGLUKernelCuda)));
     RegisterOp(OpId::kGeluAndMul, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<GeluAndMulFn>(&GeluAndMulKernelCuda)));
     RegisterOp(OpId::kMulScalar, DeviceType::kCUDA,

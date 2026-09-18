@@ -1,0 +1,12 @@
+{
+  "base": "b46852d13f7c8776557dab170e02ebea50cdfdec",
+  "path": ".agents/engine-matrix.md",
+  "changed_rows": [
+    "SPEC-MTP-GGUF",
+    "SPEC-DFLASH-GGUF"
+  ],
+  "unrelated_lines_byte_identical": true,
+  "baseline_unchanged": true,
+  "before_sha256": "699166f84e6987612df8f12f235758169f0da86ffbf305a2aaedf05c61d59ce9",
+  "after_sha256": "c621448ac7fcf479a1187ab7f33bd63dce5da48109a467e1a8712f9c008b9147"
+}

@@ -688,6 +688,8 @@ MoeLayerWeights BridgeMoeLayer(const Glm5NextMoeWeights& src, const MoeDims& d,
                                const std::string& what, int64_t byte_ceiling) {
   d.Validate();
   MoeLayerWeights out;
+  out.compute_device = src.compute_device;
+  out.expert_group = what;
   // f32 in the file and f32 here: `F.linear(hidden.float(), weight.float())`
   // (`:158`) is upstream's own dtype, not a widening this bridge chose.
   out.router_weight = DecodeShaped(src.router, what + ".router",

@@ -66,4 +66,9 @@ The quoted text below is historical evidence only. It does not define issue auth
 
 ## Resolution
 
--
+The native provider implementation is tracked by
+[#3094](https://github.com/mudler/vllm.cpp/issues/3094) and
+[its committed spec](../../specs/rocm-bf16-moe.md). Both legacy provider IDs
+are registered on ROCm, with separate typed native BF16 modes for the pinned
+oracle's arithmetic. This issue remains open until the reviewed implementation
+lands. The complete production token and performance gates are not yet satisfied.

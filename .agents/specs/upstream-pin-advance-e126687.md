@@ -229,14 +229,36 @@ longer satisfies.
 
 ## 5. What the advance costs, said before anything else can imply otherwise
 
-### 5.1 No gate has been run at this pin, and every golden predates it
+### 5.1 No gate had been run at this pin when this wave landed, and every golden predated it
+
+**This heading read "No gate has been run at this pin" until 2026-09-12, and a
+gate has run since.** What follows describes the state at this wave's merge base
+`23ac6f1a7`; the paragraph after it records what discharged part of it.
 
 The 2026-07-26 advance re-captured goldens on the new oracle on GB10 and recorded
 zero real drift (`pin-advance.md` §7 W3b). **This advance has no such pass.** Every
 committed golden in `tests/parity/goldens/` was captured against `555967922` or
-earlier. The declared token-exact gate at the target is
+earlier. The declared token-exact gate at the target was
 [#2794](https://github.com/mudler/vllm.cpp/issues/2794), which additionally records
 that the OPT golden was never re-validated at the OLD pin either.
+
+**UPDATE 2026-09-12: #2794 is closed, and the gate it declared has run and
+PASSED.** `gh issue view 2794 --repo mudler/vllm.cpp --json
+state,closedAt,stateReason` reads `CLOSED`, `COMPLETED`, `2026-09-06T07:00:58Z`.
+The declared gate is the OPT-125m oracle battery at six prompts and sixteen
+tokens, and it ran on `dgx:gpu0` on 2026-09-04 — job
+`7386f034-246a-4af5-9a04-f98aafffce54`, `IDS mismatched_positions 0 of 96`,
+`TOKENGATE_VERDICT PASS`, the candidate byte-identical to the committed bar
+([`../../docs/bench-evidence/opt125m-token-gate-e126687-dgx-20260904.md`](../../docs/bench-evidence/opt125m-token-gate-e126687-dgx-20260904.md),
+[`../sync/2026-09-05-e126687-pingate.md`](../sync/2026-09-05-e126687-pingate.md)).
+**That discharges one golden and not this section's wider claim.** The other four
+strict goldens — 27B W4A4, 32B-NVFP4A16, 35B, Coder — are still owed at
+`e126687a9a`, and they are NOT re-anchored on an issue, because an `## Owed`
+bullet pointing at a closed issue is how an obligation stops being read. They
+live under `## Owed` in
+[`upstream-sync-headpin-tokengate.md`](upstream-sync-headpin-tokengate.md) (the
+bullet at `:569`), and whoever takes one files the issue then;
+[`../oracles/vllm.md`](../oracles/vllm.md) `:93` states the same split.
 
 The run half's six-prompt, sixteen-token agreement with `opt_greedy` is
 informative and is not a gate; the wave that measured it said so
@@ -333,7 +355,7 @@ applies to any shallow clone.
 |---|---|
 | Step 6 comes back red and the published ratios do not survive | Accepted by the developer ruling; §1 states that the response is to revert the pin. #2818 carries that sentence too |
 | A source-built oracle is refused on `vllm_distribution_version` | §6. Recorded, not papered over; #2818 owes the corrected measurement |
-| Goldens drift at the new pin and nobody knows yet | #2794. §5.1 says no gate has run rather than implying one has |
+| Goldens drift at the new pin and nobody knows yet | §5.1, which said no gate had run rather than implying one had. Partly retired on 2026-09-12: #2794 closed `COMPLETED` on 2026-09-06 and the OPT-125m gate PASSED at this pin on 2026-09-04. The risk survives for the other four strict goldens, un-anchored under `## Owed` in [`upstream-sync-headpin-tokengate.md`](upstream-sync-headpin-tokengate.md) `:569` |
 | The queue's discharge lives in an unmerged pull request | §3 names it and its state at the merge base |
 | Per-file headers now lag the pin | §5.3 is the ledger note the protocol asks for |
 | Somebody reads `gateable = yes` as "every row can be gated" | §5.2, and the same limit is written into `.agents/oracles/vllm.md` beside the block. The residual is real and is NOT closed: every checker reads the field, not the prose, and no field names the device or model the `yes` was measured on. The device-scoped table now says outright that it holds ZERO rows at this pin |
@@ -387,9 +409,20 @@ consistency. Each is a command, not a description.
 
 - [#2818](https://github.com/mudler/vllm.cpp/issues/2818) — step 6, post-hoc at
   the new pin: five rows, `C1c`, and a red means revert.
-- [#2794](https://github.com/mudler/vllm.cpp/issues/2794) — the declared
+- ~~[#2794](https://github.com/mudler/vllm.cpp/issues/2794) — the declared
   token-exact gate at the target, on `dgx:gpu0`, which also answers the OPT
-  golden that was never re-validated at the old pin.
+  golden that was never re-validated at the old pin.~~ **DISCHARGED 2026-09-04,
+  issue closed `COMPLETED` 2026-09-06** (`gh issue view 2794 --repo
+  mudler/vllm.cpp --json state,closedAt,stateReason`). The gate ran on
+  `dgx:gpu0`, job `7386f034-246a-4af5-9a04-f98aafffce54`, and PASSED at
+  `IDS mismatched_positions 0 of 96`. §5.1 records it.
+- **The other four strict goldens at the target** — 27B W4A4, 32B-NVFP4A16, 35B,
+  Coder — re-captured at `5559679229` and none of them at `e126687a9a`. This is
+  what survives the bullet above rather than a new obligation, and it carries NO
+  issue by design: it lives under `## Owed` in
+  [`upstream-sync-headpin-tokengate.md`](upstream-sync-headpin-tokengate.md)
+  (the bullet at `:569`), which is the surface that owns it, and whoever takes
+  one files the issue then.
 - [#2611](https://github.com/mudler/vllm.cpp/issues/2611) — a reading on
   `dgx:gpu0`, the 290-entry queue, and with it the >= 177 per-file headers §5.3
   leaves behind the pin.

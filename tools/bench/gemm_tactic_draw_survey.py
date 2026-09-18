@@ -133,6 +133,7 @@ EXIT_CACHE_MISSING = 77        # a draw published no cache document
 EXIT_LEG_NOT_FROZEN = 78       # a scoring leg tuned instead of loading frozen
 EXIT_BINARY_DIFFERS = 79       # two legs are two binaries; only the draw may vary
 EXIT_ARM_MIXED = 81            # one evidence root holds both tactic-set arms
+EXIT_ACT_ARM_MIXED = 82        # one evidence root holds both NVFP4 ACTIVATION arms
 
 
 # ---------------------------------------------------------------------------
@@ -1061,6 +1062,7 @@ def run_draw(
     cfg: Mapping[str, Any],
     *,
     tactic_set: str = "full",
+    modelopt_w4a4: bool = False,
     dry_run: bool = False,
     smoke: bool = False,
     mirror: pathlib.Path | None = None,
@@ -1106,6 +1108,14 @@ def run_draw(
     # line the diagnostic reads.
     env["VT_FP4_FULL_TACTICS"] = "1" if tactic_set == "full" else "0"
     env["VT_FP4_AUTOTUNE_VERBOSE"] = "1"
+    # THE ACTIVATION ARM, SET AND NEVER INHERITED. Unset, a ModelOpt NVFP4
+    # checkpoint keeps `alpha` at 0, `IsTrueW4A4()` is false, and the weight
+    # routes to the W4A16 Marlin arm -- which `dense_nvfp4_gemm.h` says
+    # carries NO tactic path. The survey would then tune nothing and report a
+    # clean run over zero draws. "0" is written explicitly for the same reason
+    # the tactic-set arm is: a draw whose GEMM was chosen by the operator's
+    # ambient shell is a draw nobody can attribute afterwards.
+    env["VT_MODELOPT_W4A4"] = "1" if modelopt_w4a4 else "0"
 
     command = draw_command(bench, model, cfg)
     if dry_run:
@@ -1129,6 +1139,7 @@ def run_draw(
         "cache_sha256": sha256_file(cache) if cache.is_file() else None,
         "cache_bytes": cache.stat().st_size if cache.is_file() else 0,
         "tactic_set": tactic_set,
+        "modelopt_w4a4": bool(modelopt_w4a4),
         "algo": parse_algo_lines(stderr),
         "fp4": parse_fp4_lines(stderr),
         "autotune": parse_autotune_lines(stderr),
@@ -1278,6 +1289,22 @@ def check_draw_preconditions(records: Sequence[Mapping[str, Any]]) -> tuple[int,
             "through a >1% stickiness damper, so the two arms choose by "
             "DIFFERENT RULES. A draw spread pooled across them names no rule and "
             "cannot be interpreted; run one root per arm"
+        ]
+
+    act_arms = {r.get("modelopt_w4a4") for r in records}
+    if len(act_arms) > 1 or None in act_arms:
+        return EXIT_ACT_ARM_MIXED, [
+            "this evidence root holds more than one NVFP4 activation arm "
+            f"({sorted(str(a) for a in act_arms)}). `VT_MODELOPT_W4A4=1` "
+            "consumes a MODELOPT checkpoint's `input_scale`, flipping "
+            "`IsTrueW4A4()` onto the CUTLASS fp4-activation GEMM; unset, the "
+            "same weights route to the W4A16 Marlin arm, which carries no "
+            "tactic path at all. (The compressed-tensors spelling is not "
+            "gated by the knob: `LoadCtNvfp4Raw` sets `alpha` "
+            "unconditionally, so there the arm is decided by the artifact.) "
+            "The arms can therefore run DIFFERENT GEMMs, "
+            "and a draw spread pooled across them names no path; run one root "
+            "per arm"
         ]
 
     binaries = {r.get("binary_sha256") for r in records}
@@ -1479,6 +1506,12 @@ def reduce_evidence(
         # not say which selection rule produced it is not interpretable, and a
         # report gets read out of the directory it was written in.
         "tactic_set": sorted({r.get("tactic_set") for r in records if r.get("tactic_set")}),
+        # The ACTIVATION arm, top-level for the same reason: a tactic number
+        # that does not say which GEMM produced it is not interpretable.
+        "modelopt_w4a4": sorted(
+            {bool(r.get("modelopt_w4a4")) for r in records
+             if r.get("modelopt_w4a4") is not None}
+        ),
         "draws_recorded": [r.get("label") for r in records],
         "preconditions": {
             "exit_code": code,
@@ -1615,6 +1648,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                            "argmin; the shipped default) and 'w1' sets it to 0 "
                            "(4 candidates behind the >1%% stickiness damper). The two "
                            "select by different rules, so ONE ARM PER EVIDENCE ROOT")
+    draw.add_argument("--modelopt-w4a4", action="store_true",
+                      help="consume a ModelOpt checkpoint's input_scale "
+                           "(VT_MODELOPT_W4A4=1), flipping IsTrueW4A4() onto "
+                           "the CUTLASS fp4-activation GEMM. WITHOUT it a "
+                           "ModelOpt NVFP4 checkpoint runs the W4A16 Marlin "
+                           "arm, which has no tactic path, and the survey "
+                           "tunes nothing. ONE ARM PER EVIDENCE ROOT")
     draw.add_argument("--mirror", type=pathlib.Path,
                       help="copy the evidence root here AFTER EACH DRAW. The "
                            "local root is a real filesystem the engine can "
@@ -1668,13 +1708,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
         write_json(
             args.evidence / "draw-config.json",
-            dict(cfg, tactic_set=args.tactic_set, smoke=bool(args.smoke)),
+            dict(cfg, tactic_set=args.tactic_set,
+                 modelopt_w4a4=bool(args.modelopt_w4a4), smoke=bool(args.smoke)),
         )
         records: list[dict[str, Any]] = []
         for index in range(args.draws):
             record = run_draw(
                 index, args.evidence, args.bench, args.model, cfg,
-                tactic_set=args.tactic_set, dry_run=args.dry_run,
+                tactic_set=args.tactic_set,
+                modelopt_w4a4=bool(args.modelopt_w4a4), dry_run=args.dry_run,
                 smoke=args.smoke, mirror=args.mirror,
             )
             records.append(record)

@@ -1,0 +1,13 @@
+{
+  "argv": [
+    "/home/vikash/.cache/residual-norm-impl/green-freeze-2/build-residual-hip/tests/test_ops_residual_rmsnorm"
+  ],
+  "environment": {
+    "VT_ROCM_MOE_FIXTURE": "/home/vikash/vllm.cpp-rdna3-moe-impl/build-rdna3-moe-hip/fixture",
+    "HIP_VISIBLE_DEVICES": "0,1",
+    "ROCR_VISIBLE_DEVICES": "0,1",
+    "TMPDIR": "/home/vikash/.cache/residual-norm-impl/tmp",
+    "VT_ROCM_MOE_ORACLE": "/home/vikash/vllm.cpp-rdna3-moe-impl/build-rdna3-moe-hip/evidence/oracle-selection-6/production.json",
+    "VT_FUSED_CHAIN_ADOPT": "1"
+  }
+}

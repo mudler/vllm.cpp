@@ -1,9 +1,11 @@
 # GATE-PR-BODY-TRAILERS: read the bytes the squash will land, in the operator's own shell
 
 **Issue:** [#1263](https://github.com/mudler/vllm.cpp/issues/1263).
-**Kind:** one new operator command plus the procedure that names it. No checker
-rule changes and no checker is edited: `scripts/check-commit-trailers.py` is not
-touched by this row.
+**Kind:** one new operator command plus the procedure that names it, and (since
+2026-09-11) one rule the command applies itself. `scripts/check-commit-trailers.py`
+is still not touched by this row; the added rule lives in `scripts/agent-pr-body.py`,
+which this row owns, and it reads the canonical local issue records rather than any
+commit trailer.
 **Row:** `GATE-PR-BODY-TRAILERS`.
 
 ## Now
@@ -219,6 +221,9 @@ reaches a network.
 | `test_the_landing_procedure_names_the_command` | `AGENTS.md` and `.agents/workflow.md` name it, so the entry point cannot be deleted silently. |
 | `test_the_suite_is_registered_where_gates_run` | A suite nothing runs is not a gate. |
 | `test_the_spec_table_names_exactly_these_cases` | This table is compared with the loaded suite, not sampled, so it cannot go stale inside the change that writes it. |
+| `test_closing_an_issue_with_no_local_record_warns_but_is_accepted` | A missing record is migration debt rather than a contradiction: an authority that does not exist cannot disagree with the body, and this arm fired on 22 of 24 refusals across the open queue. |
+| `test_closing_an_issue_whose_record_reads_open_is_refused` | The arm that earns a refusal: the record exists and reads OPEN, so closing the mirror leaves the authoritative half saying OPEN. |
+| `test_a_bare_reference_without_a_closing_keyword_is_accepted` | The gate is narrow deliberately. Open pull requests carry six to ten bare `#N` citations each, most without a local record, and failing those would fire the gate on ordinary work rather than on the defect. |
 
 ## Gates
 

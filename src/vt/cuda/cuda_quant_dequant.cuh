@@ -384,9 +384,9 @@ struct DqQ6_K {
 };
 
 // block_q8_K = { f32 d; i8 qs[256]; i16 bsums[16] } — DequantQ8_K.
-// Activation-only encoding; it never appears as a FILE weight, so it can never
-// reach the gather from the loader. It is here because the CPU table carries it
-// and an asymmetric capability list is a defect waiting to be found later.
+// Activation-only encoding with no weight-side vec_dot, but a GGUF file can
+// carry it: the reader admits id 15 and the decode-only embedding gather takes
+// it packed, so this decoder belongs here beside the CPU table's entry.
 struct DqQ8_K {
   static constexpr int kBytes = 292;
   static constexpr int kElems = 256;

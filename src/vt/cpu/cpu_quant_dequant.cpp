@@ -265,9 +265,9 @@ void DequantQ6_K(const uint8_t* data, int64_t nb, float* y) {
 }
 
 // block_q8_K = { f32 d; i8 qs[256]; i16 bsums[16]; } (292 bytes)
-// dequantize_row_q8_K (ggml-quants.c). Q8_K is the K-quant ACTIVATION type; it
-// never appears in a GGUF file, but the decoder completes the table and lets
-// the activation-quant round trip be unit-tested in G2.
+// dequantize_row_q8_K (ggml-quants.c). Q8_K is the K-quant ACTIVATION type; a
+// GGUF file can still carry it (the reader admits id 15) and the decode-only
+// embedding gather takes it packed. The decoder completes the table for G2.
 void DequantQ8_K(const uint8_t* data, int64_t nb, float* y) {
   constexpr int qk = 256;
   for (int64_t i = 0; i < nb; ++i) {

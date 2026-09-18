@@ -17,6 +17,8 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -35,9 +37,15 @@ using vt::DType;
 using vt::Queue;
 using vt::Tensor;
 
-bool HasCuda() {
+// Preserve the CUDA cases and allow the same fixtures on the ROCm provider.
+DeviceType TestDevice() {
+  const char* device = std::getenv("VT_MOE_TEST_DEVICE");
+  return device != nullptr && std::strcmp(device, "rocm") == 0
+             ? DeviceType::kROCM : DeviceType::kCUDA;
+}
+bool HasDevice() {
   try {
-    vt::GetBackend(DeviceType::kCUDA);
+    vt::GetBackend(TestDevice());
     return true;
   } catch (const std::runtime_error&) {
     return false;
@@ -131,7 +139,7 @@ std::vector<uint16_t> RandomBf16(size_t numel, uint32_t seed) {
 // exercises the bf16 output dtype (down) vs f32 (gate/up).
 void RunGroupedBf16Case(int64_t e_count, int64_t t_rows, int64_t top_k, int64_t k_dim,
                         int64_t n_cols, uint32_t seed, bool use_row_map, bool bf16_out) {
-  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Backend& gpu = vt::GetBackend(TestDevice());
   const int64_t P = t_rows * top_k;
   // With identity routing the activation IS the per-pair buffer, so it has P rows.
   const int64_t act_rows = use_row_map ? t_rows : P;
@@ -206,7 +214,7 @@ void RunGroupedBf16Case(int64_t e_count, int64_t t_rows, int64_t top_k, int64_t 
 // fixed ascending order (never atomicAdd), so greedy decode stays reproducible.
 bool GroupedBf16Bitwise(int64_t e_count, int64_t t_rows, int64_t top_k, int64_t k_dim,
                         int64_t n_cols, uint32_t seed, int reps) {
-  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Backend& gpu = vt::GetBackend(TestDevice());
   const int64_t P = t_rows * top_k;
   std::vector<std::vector<uint16_t>> w(static_cast<size_t>(e_count));
   for (int64_t e = 0; e < e_count; ++e)
@@ -250,9 +258,9 @@ bool GroupedBf16Bitwise(int64_t e_count, int64_t t_rows, int64_t top_k, int64_t 
 }  // namespace
 
 // P = 6 < kTileMinRows(32) -> naive one-thread-per-output kernel, f32 out (gate/up).
-TEST_CASE("CUDA moe_grouped_gemm_bf16 naive path (small P) matches the per-expert reference") {
-  if (!HasCuda()) {
-    MESSAGE("no CUDA backend registered; skipping");
+TEST_CASE("GPU moe_grouped_gemm_bf16 naive path (small P) matches the per-expert reference") {
+  if (!HasDevice()) {
+    MESSAGE("requested GPU backend is unavailable; skipping");
     return;
   }
   RunGroupedBf16Case(/*e_count=*/5, /*t_rows=*/3, /*top_k=*/2, /*k_dim=*/64, /*n_cols=*/8,
@@ -262,9 +270,9 @@ TEST_CASE("CUDA moe_grouped_gemm_bf16 naive path (small P) matches the per-exper
 // P = 40 (kTileMinRows <= P <= kMoeDecodeMaxP) -> BM=16 decode WMMA tile. K=80 is a
 // multiple of 16 but NOT of BK=32 (partial last K-tile); N=130 crosses the BN=64
 // tile boundary unevenly. Mirrors the NVFP4 tiled-path case's awkward shapes.
-TEST_CASE("CUDA moe_grouped_gemm_bf16 decode WMMA tile (BM=16) matches the per-expert reference") {
-  if (!HasCuda()) {
-    MESSAGE("no CUDA backend registered; skipping");
+TEST_CASE("GPU moe_grouped_gemm_bf16 decode WMMA tile (BM=16) matches the per-expert reference") {
+  if (!HasDevice()) {
+    MESSAGE("requested GPU backend is unavailable; skipping");
     return;
   }
   RunGroupedBf16Case(/*e_count=*/7, /*t_rows=*/20, /*top_k=*/2, /*k_dim=*/80, /*n_cols=*/130,
@@ -272,9 +280,9 @@ TEST_CASE("CUDA moe_grouped_gemm_bf16 decode WMMA tile (BM=16) matches the per-e
 }
 
 // P = 1024 > kMoeDecodeMaxP(512) -> BM=64 prefill WMMA tile.
-TEST_CASE("CUDA moe_grouped_gemm_bf16 prefill WMMA tile (BM=64) matches the per-expert reference") {
-  if (!HasCuda()) {
-    MESSAGE("no CUDA backend registered; skipping");
+TEST_CASE("GPU moe_grouped_gemm_bf16 prefill WMMA tile (BM=64) matches the per-expert reference") {
+  if (!HasDevice()) {
+    MESSAGE("requested GPU backend is unavailable; skipping");
     return;
   }
   RunGroupedBf16Case(/*e_count=*/9, /*t_rows=*/128, /*top_k=*/8, /*k_dim=*/96, /*n_cols=*/70,
@@ -287,9 +295,9 @@ TEST_CASE("CUDA moe_grouped_gemm_bf16 prefill WMMA tile (BM=64) matches the per-
 // n=130) and therefore still cover the W5 fallback tile. Here K=264 is a multiple
 // of 8 but NOT of BK=32 (partial last K-tile, exercising the cp.async `zfill`
 // tail) and N=200 is a multiple of 8 but NOT of BN=128 (partial last N-tile).
-TEST_CASE("CUDA moe_grouped_gemm_bf16 pipelined prefill tile matches the per-expert reference") {
-  if (!HasCuda()) {
-    MESSAGE("no CUDA backend registered; skipping");
+TEST_CASE("GPU moe_grouped_gemm_bf16 pipelined prefill tile matches the per-expert reference") {
+  if (!HasDevice()) {
+    MESSAGE("requested GPU backend is unavailable; skipping");
     return;
   }
   RunGroupedBf16Case(/*e_count=*/9, /*t_rows=*/128, /*top_k=*/8, /*k_dim=*/264, /*n_cols=*/200,
@@ -298,9 +306,9 @@ TEST_CASE("CUDA moe_grouped_gemm_bf16 pipelined prefill tile matches the per-exp
 
 // W6 PIPELINED decode tile (BM=16, BN=128, BK=32, 3-stage), aligned pitches, plus
 // the identity row-map + bf16-out (down-projection) call shape on the same tile.
-TEST_CASE("CUDA moe_grouped_gemm_bf16 pipelined decode tile matches the per-expert reference") {
-  if (!HasCuda()) {
-    MESSAGE("no CUDA backend registered; skipping");
+TEST_CASE("GPU moe_grouped_gemm_bf16 pipelined decode tile matches the per-expert reference") {
+  if (!HasDevice()) {
+    MESSAGE("requested GPU backend is unavailable; skipping");
     return;
   }
   RunGroupedBf16Case(/*e_count=*/7, /*t_rows=*/20, /*top_k=*/2, /*k_dim=*/264, /*n_cols=*/200,
@@ -314,9 +322,9 @@ TEST_CASE("CUDA moe_grouped_gemm_bf16 pipelined decode tile matches the per-expe
 // = 4 -> four f32 partials reduced in fixed ascending split order. Also asserts
 // the split reduction is RUN-TO-RUN BIT-REPRODUCIBLE (no atomicAdd), which the
 // greedy token-exact gate depends on.
-TEST_CASE("CUDA moe_grouped_gemm_bf16 split-K decode path matches the reference and is exact") {
-  if (!HasCuda()) {
-    MESSAGE("no CUDA backend registered; skipping");
+TEST_CASE("GPU moe_grouped_gemm_bf16 split-K decode path matches the reference and is exact") {
+  if (!HasDevice()) {
+    MESSAGE("requested GPU backend is unavailable; skipping");
     return;
   }
   RunGroupedBf16Case(/*e_count=*/5, /*t_rows=*/3, /*top_k=*/2, /*k_dim=*/1024, /*n_cols=*/8,
@@ -327,9 +335,9 @@ TEST_CASE("CUDA moe_grouped_gemm_bf16 split-K decode path matches the reference 
 
 // Identity routing (row_map == nullptr) + bf16 output — the DOWN projection's exact
 // call shape (act = the per-pair silu buffer, one act row per output row).
-TEST_CASE("CUDA moe_grouped_gemm_bf16 identity row-map + bf16 out matches the reference") {
-  if (!HasCuda()) {
-    MESSAGE("no CUDA backend registered; skipping");
+TEST_CASE("GPU moe_grouped_gemm_bf16 identity row-map + bf16 out matches the reference") {
+  if (!HasDevice()) {
+    MESSAGE("requested GPU backend is unavailable; skipping");
     return;
   }
   // Naive regime (P=12) and decode-tile regime (P=128), both bf16 out.

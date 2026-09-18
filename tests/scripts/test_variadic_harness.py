@@ -26,10 +26,13 @@ What each case pins:
   AcceptanceFromMetrics   the /metrics delta becomes an acceptance rate, and an
                           engine with no /metrics reports absent rather than 0
   CorpusIsDeterministic   the corpus is a function of (sources, seed, weights)
+  BinaryCacheRestores     job.sh restores a cached vllm-server from a share that
+                          carries no execute bit, instead of rebuilding it
 """
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import subprocess
@@ -646,6 +649,171 @@ class CorpusIsDeterministic(unittest.TestCase):
         med = {b: v["median"] for b, v in man["realised_chars"].items()}
         self.assertLess(med["S"], med["L"])
         self.assertLess(med["L"], med["XL"])
+
+
+class BinaryCacheRestores(unittest.TestCase):
+    """ISSUE-LOCAL-01M2CZX87ZB0WHRW2YZYPW7VRZ.
+
+    The rc share is CIFS mounted `file_mode=0664,nounix`, so no file on it is
+    executable. A cache guard that tests `-x` never holds there, and every
+    resume rebuilds the pinned engine from source. With an existence guard, a
+    cache that a crash, a full disk, or a failed `.so` copy left incomplete is
+    restored on every resume, dies at startup, and reads as a KV pool that does
+    not fit. So the restore verifies the bytes against an md5 manifest, and the
+    write commits the binary last, by rename.
+
+    These cases execute the real fragments of job.sh under bash: the setup
+    lines after `OURS TREE PIN`, the restore branch up to the build `else`
+    (whose body is replaced by a marker), and the cache write that follows the
+    build's `OURS binary ... md5=` line.
+    """
+
+    JOB = HARNESS / "job.sh"
+    PIN = "39d3af455866bc47d76b0e0bd27fc3693e9e6ff5"
+    ENGINE = b"cached-engine-bytes" * 64
+    LIB = b"shared-object-bytes" * 16
+
+    def _lines(self):
+        return self.JOB.read_text().splitlines()
+
+    def _setup_fragment(self):
+        lines = self._lines()
+        pin = [i for i, l in enumerate(lines) if 'res "OURS TREE PIN $PIN"' in l]
+        self.assertEqual(len(pin), 1)
+        end = lines.index('mkdir -p "$SCRATCH/bin"', pin[0])
+        return lines[pin[0] + 1:end + 1]
+
+    def _restore_fragment(self):
+        lines = self._lines()
+        start = lines.index('mkdir -p "$SCRATCH/bin"') + 1
+        end = lines.index("else", start)
+        return lines[start:end] + ["else", "    echo REBUILD", "fi"]
+
+    def _write_fragment(self):
+        lines = self._lines()
+        built = [i for i, l in enumerate(lines)
+                 if l.lstrip().startswith('res "OURS binary $BIN md5=')]
+        self.assertEqual(len(built), 1)
+        end = lines.index("fi", built[0])
+        return lines[built[0] + 1:end]
+
+    def _run(self, tmp, body):
+        script = "\n".join(
+            ["res() { echo \"RES $*\"; }",
+             f"W={tmp / 'share'}", f"PIN={self.PIN}",
+             f"SCRATCH={tmp / 'scratch'}"]
+            + self._setup_fragment() + body)
+        return subprocess.run(["bash", "-c", script], capture_output=True,
+                              text=True, check=True).stdout
+
+    def _cache(self, tmp, engine, manifest, lib=True):
+        d = tmp / "share" / "bin" / self.PIN
+        d.mkdir(parents=True)
+        (d / "vllm-server").write_bytes(engine)
+        (d / "vllm-server").chmod(0o664)       # what the CIFS mount reports
+        if lib:
+            (d / "libvt.so.1").write_bytes(self.LIB)
+        if manifest is not None:
+            (d / "MANIFEST.md5").write_text(manifest)
+        return d
+
+    def _manifest(self):
+        return (f"{hashlib.md5(self.ENGINE).hexdigest()}  vllm-server\n"
+                f"{hashlib.md5(self.LIB).hexdigest()}  libvt.so.1\n")
+
+    def test_c_a_verified_cache_without_an_execute_bit_is_restored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            self._cache(tmp, self.ENGINE, self._manifest())
+            out = self._run(tmp, self._restore_fragment())
+            self.assertNotIn("REBUILD", out)
+            self.assertIn("OURS binary restored from the share", out)
+            restored = tmp / "scratch" / "bin" / "vllm-server"
+            self.assertEqual(restored.read_bytes(), self.ENGINE)
+            self.assertEqual((tmp / "scratch" / "bin" / "libvt.so.1")
+                             .read_bytes(), self.LIB)
+            self.assertTrue(restored.stat().st_mode & 0o100,
+                            "the restored local copy must be executable")
+
+    def test_a_a_truncated_cached_binary_is_deleted_and_rebuilt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            d = self._cache(tmp, self.ENGINE[:100], self._manifest())
+            out = self._run(tmp, self._restore_fragment())
+            self.assertIn("REBUILD", out)
+            self.assertNotIn("OURS binary restored from the share", out)
+            self.assertIn("REJECTED", out)
+            self.assertFalse(d.exists(), "the bad cache must be removed")
+
+    def test_b_a_cached_binary_without_a_manifest_is_deleted_and_rebuilt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            d = self._cache(tmp, self.ENGINE, None)   # what the old writer left
+            out = self._run(tmp, self._restore_fragment())
+            self.assertIn("REBUILD", out)
+            self.assertIn("REJECTED", out)
+            self.assertFalse(d.exists(), "the unverifiable cache must be removed")
+
+    def test_a_cache_missing_a_listed_shared_object_is_rebuilt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            d = self._cache(tmp, self.ENGINE, self._manifest(), lib=False)
+            out = self._run(tmp, self._restore_fragment())
+            self.assertIn("REBUILD", out)
+            self.assertIn("REJECTED", out)
+            self.assertFalse(d.exists())
+
+    def test_an_absent_cached_binary_is_rebuilt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            out = self._run(tmp, self._restore_fragment())
+            self.assertIn("REBUILD", out)
+            self.assertNotIn("REJECTED", out)
+
+    def test_d_the_cache_write_leaves_a_manifest_that_verifies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            local = tmp / "scratch" / "bin"
+            local.mkdir(parents=True)
+            (local / "vllm-server").write_bytes(self.ENGINE)
+            (local / "libvt.so.1").write_bytes(self.LIB)
+            self._run(tmp, self._write_fragment())
+            d = tmp / "share" / "bin" / self.PIN
+            self.assertEqual(sorted(p.name for p in d.iterdir()),
+                             ["MANIFEST.md5", "libvt.so.1", "vllm-server"],
+                             "no .partial file may remain")
+            subprocess.run(["md5sum", "-c", "--strict", "MANIFEST.md5"],
+                           cwd=d, check=True, capture_output=True)
+            self.assertEqual(
+                sorted((d / "MANIFEST.md5").read_text().splitlines()),
+                sorted(self._manifest().splitlines()))
+            # The round trip: what the writer leaves, the restore accepts.
+            for p in local.iterdir():
+                p.unlink()
+            out = self._run(tmp, self._restore_fragment())
+            self.assertIn("OURS binary restored from the share", out)
+            self.assertEqual((local / "vllm-server").read_bytes(), self.ENGINE)
+
+
+    def test_a_failed_cache_write_leaves_no_binary_to_restore(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            local = tmp / "scratch" / "bin"
+            local.mkdir(parents=True)
+            (local / "vllm-server").write_bytes(self.ENGINE)
+            (local / "libvt.so.1").write_bytes(self.LIB)
+            d = tmp / "share" / "bin" / self.PIN
+            d.mkdir(parents=True)
+            d.chmod(0o555)                         # every copy into it fails
+            try:
+                out = self._run(tmp, self._write_fragment())
+            finally:
+                if d.exists():
+                    d.chmod(0o755)
+            self.assertIn("OURS binary cache write FAILED", out)
+            self.assertFalse((d / "vllm-server").exists())
+            out = self._run(tmp, self._restore_fragment())
+            self.assertIn("REBUILD", out)
 
 
 if __name__ == "__main__":

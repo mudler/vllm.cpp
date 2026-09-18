@@ -1,0 +1,48 @@
+{
+  "stock": {
+    "binary_sha256": "7b9a2e2d0dc95afbf592b5b1678bdc67e0fe2204529f1afe3b0b1f03566f28c2",
+    "symbols": [
+      "00000000003b5a80 T dequantize_row_mxfp4",
+      "00000000003c3330 T dequantize_row_q8_K",
+      "000000000035e960 T ggml_get_rows",
+      "000000000035eaa0 T ggml_get_rows_back",
+      "000000000028b1c0 T ggml_graph_compute_with_ctx"
+    ]
+  },
+  "fork": {
+    "binary_sha256": "cad537f239dc0c4ca70e5b80548f39f297117494269ca2b9b5de8191aa2f4bc1",
+    "symbols": [
+      "00000000003b9d50 T dequantize_row_iq1_xxxs",
+      "00000000003aaf60 T dequantize_row_mxfp4",
+      "00000000003bbfe0 T dequantize_row_q8_K",
+      "000000000034e440 T ggml_get_rows",
+      "000000000034e580 T ggml_get_rows_back",
+      "000000000027a0e0 T ggml_graph_compute_with_ctx"
+    ]
+  },
+  "gguf/gguf_kernel.hip": {
+    "sha256": "f714989ddbd4c97bdcd924d5ca3316c60efdebcdffa5c9c818a93579023e4d72",
+    "bytes": 22272,
+    "copy": "/home/vikash/.cache/rdna3-gather-oracle-review/generated-primary/gguf_kernel.hip"
+  },
+  "gguf/dequantize_hip.cuh": {
+    "sha256": "497842aca4744b903c7fd19b6069be33fa50da9d4bb893634eda46ab9cb35ddd",
+    "bytes": 22787,
+    "copy": "/home/vikash/.cache/rdna3-gather-oracle-review/generated-primary/dequantize_hip.cuh"
+  },
+  "gguf/ggml-common_hip.h": {
+    "sha256": "b7d415d0cb626afb330cc67867418943b1ebe39eb648988f637b4f29af8e8a41",
+    "bytes": 85590,
+    "copy": "/home/vikash/.cache/rdna3-gather-oracle-review/generated-primary/ggml-common_hip.h"
+  },
+  "dispatch_utils.h": {
+    "sha256": "7a17e8ac27b25426fbfd2921d2ebcad6410b703736204e55e832037fd9f250cc",
+    "bytes": 483,
+    "copy": "/home/vikash/.cache/rdna3-gather-oracle-review/generated-primary/dispatch_utils.h"
+  },
+  "torch_bindings.cpp": {
+    "sha256": "4fb80d903a1e860a080a04033b6a41eeb840b2bc68220fc509a0db5a5f1cafa7",
+    "bytes": 2363,
+    "copy": "/home/vikash/.cache/rdna3-gather-oracle-review/generated-primary/torch_bindings.cpp"
+  }
+}

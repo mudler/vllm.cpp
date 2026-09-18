@@ -227,11 +227,11 @@ def main() -> int:
                 "Aggregate throughput against concurrency",
                 "vllm.cpp rises with offered load while exllamav3 stays flat.")),
             (f"variadic-ttft-p95-{mode}.svg", line_chart(
-                cs, o_95, t_95, th, 50000, [0, 12500, 25000, 37500, 50000],
+                cs, o_95, t_95, th, 200000, [0, 50000, 100000, 150000, 200000],
                 "p95 time to first token (ms)",
                 "p95 time to first token against concurrency",
                 "exllamav3's p95 time to first token grows steeply with load; "
-                "vllm.cpp's stays nearly flat.",
+                "vllm.cpp's rises more slowly.",
                 fmt="{:.0f}")),
             (f"headtohead-throughput-{mode}.svg", bar_chart(
                 [("decode only", *verd[key_dec]), ("whole run", *verd[key_run])],

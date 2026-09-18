@@ -4626,9 +4626,18 @@ needs to claim bit-identity should compare bytes, not an aggregate.
     projections are unquantized bf16 by explicit construction. Owned by #2406.
   - **The merged HC down-plus-inject GEMM (verdict (b)).** Upstream stacks them
     into one padded `MergedColumnParallelLinear`; this tree runs three GEMMs. It
-    is a `vt::MergedGemmGroup` seam question and has NO issue yet.
+    is a `vt::MergedGemmGroup` seam question and IS NOW FILED, row-owned under
+    `.agents/issues/MODEL-MM-QWEN4-EXP/`. Its stable local ID is named in
+    [the ROCm grouped-norm spec](qwen4-exp-rocm-hc-norm.md) under
+    `## Adjacent work, filed and not built`, and NOT here: this heading is the
+    ROWLESS registry, and `scripts/check-agent-record.py` reads a row-owned
+    stable ID beneath it as an owed reference it cannot resolve.
   - **The deferred, norm-fused HC combine (verdict (b)).** Upstream reads the
-    residual once; this tree reads it twice. NO issue yet.
+    residual once; this tree reads it twice. ALSO FILED, row-owned, with its
+    stable ID in the same place and for the same reason. It is the LARGER of the
+    two hyper-connection levers, and the ROCm grouped-norm launch-shape fix does
+    NOT reach it: that one changes how the norm reads the stream, not how many
+    times the stream is read.
   - **The f32 QSA output gate (verdict (b)).** Upstream sigmoids a bf16 gate. It
     rides with #2477 because it is the same buffer.
   - **The single indexer side cache and the every-step re-pool (verdict (b)).**
@@ -4773,16 +4782,33 @@ needs to claim bit-identity should compare bytes, not an aggregate.
   route through `vt::MatmulBT` refuses or drains to the host on a CUDA queue —
   also another wave's, also owed. See `### W6-CUDA-B` below.
 
-- **TWO SPEED ITEMS THIS WAVE DECLINED, EACH WITH ITS CONDITION.** (1) The
-  gather's pass-2 dot is SEQUENTIAL on one lane, `|sel| * head_dim` dependent f32
-  operations, ~525k per (token, head) at the released config. A deterministic
-  tree reduction over `d` would preserve the gather-vs-dense bit-identity — the
-  order would depend on `head_dim` alone — while breaking the CPU-vs-CUDA
-  relation the sequential dot keeps. Take it after a red-first measurement that
-  shows this is the bottleneck, not before. (2) The mixer takes ONE `cudaMalloc`
-  per call for its four intermediates. A static cache would not be re-entrant;
-  the fix is a caller-supplied workspace, which changes the op signature and owes
-  its own spec.
+- **TWO SPEED ITEMS THIS WAVE DECLINED, EACH WITH ITS CONDITION. ITEM (1) IS
+  HALF DISCHARGED BY W9 AND ITEM (2) IS LIVE.** (1) The gather's pass-2 dot WAS
+  SEQUENTIAL ON ONE LANE, `|sel| * head_dim` dependent f32 operations, ~525k per
+  (token, head) at the released config. **W9 removed that cost WITHOUT taking the
+  tree reduction** (`7d0d74c2c`): pass 2's tile now goes ONE WHOLE DOT PER
+  THREAD, which reassociates nothing, because a dot's value does not depend on
+  which thread evaluates it. The red-first measurement this entry asked for is
+  the attribution the row's kernel-time issue carries — that lane measured 86.4%
+  and 88.8% of the kernel's wall time in two `thor:gpu0` runs — and the change
+  measured 6.52x at the released decode shape. (The issue is deliberately NOT
+  cited by ID here: `scripts/issue_records.py:518` refuses a row-owned issue that
+  a spec's `## Owed` names, because that is the shape reserved for a rowless
+  `_owed` record.)
+  **What remains owed is the lever itself, still declined:** a deterministic tree
+  reduction over `d` would preserve the gather-vs-dense bit-identity — the order
+  would depend on `head_dim` alone — while breaking the CPU-vs-CUDA relation the
+  sequential dot keeps. It is now a SECOND-ORDER item rather than the
+  bottleneck, and the condition is unchanged: take it only after a red-first
+  measurement that shows the per-thread dot is the bottleneck. The fold over `s`
+  that W9 preserved is no longer only argued: `test_qwen4_exp_cuda_reductions.cpp`
+  refolds the arm's own softmax weights ascending on the host and requires BIT
+  equality with the arm's denominator, which is red against a descending fold and
+  against the warp-shuffle tree. (2) The mixer takes ONE `cudaMalloc` per call
+  for its four intermediates. A static cache would not be re-entrant; the fix is
+  a caller-supplied workspace, which changes the op signature and owes its own
+  spec. **LIVE**, and tracked by its own row-owned issue under
+  `.agents/issues/MODEL-MM-QWEN4-EXP/`, unnamed here for the same reason.
 
 - **W8CONFIRM ISOLATED THE CAUSE TO W5r's TWO LINES, WHICH W5s ASSERTED BUT ITS
   EVIDENCE COULD NOT SEPARATE FROM W5p. ISSUE OWED.** W5s compares W7DIAG on
@@ -10190,3 +10216,1792 @@ with tiny random configs and need neither a checkpoint nor a GPU lease — and b
 inherit a config layer whose boundary is measured, so a golden that disagrees is a
 port defect and not a config question. W6b's mechanism is the unknown that decides
 whether the chosen arm is schedulable, and it should be spiked before W6 is planned.
+
+## The sojufx sparkDash measurement (developer-directed, 2026-09-12)
+
+The developer directed a speed comparison against
+[sojufx/sojufx-Qwen3.8-Flash-Next](https://github.com/MiaAII-Lab/sparkDash) on
+`dgx:gpu0` (NVIDIA GB10, `sm_121a`, aarch64, 128 GB unified memory). sojufx
+publishes numbers from [sparkDash](https://github.com/MiaAII-Lab/sparkDash)
+Decode Bench Structured: 400 output tokens, `temperature=0`, thinking off, at
+concurrency 1/2/4. The benchmark targets an OpenAI-compatible
+`/v1/chat/completions` endpoint with streaming.
+
+**Protocol, reverse-engineered from the sparkDash source.** The prompt is
+`"Count from 1 to 200. Output only the numbers, separated by spaces. No other
+text."` The request body is `max_tokens=400, temperature=0, top_p=1,
+stream=true, stream_options={include_usage: true}, min_tokens=400,
+ignore_eos=true, stop=[], chat_template_kwargs={enable_thinking: false,
+thinking: false, thinking_mode: "disabled"}`. Per-stream decode tok/s is
+`(completion_tokens - 1) / (tLast - tFirst) * 1000`; aggregate decode tok/s is
+`totalDecodeTokens / (max(tLast) - min(tFirst)) * 1000`.
+
+### What each side ran
+
+| | sojufx | vllm.cpp |
+|---|---|---|
+| Artifact | `Mia-AiLab/qwen3.8-Flash-Next-NVFP4` (~128 GB, NVFP4) | `unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S (~68 GB) |
+| Runtime | custom vLLM image, MTP speculative decoding (K=3), FP8 KV cache, 8-seq scheduler | `examples/vllm-server`, `--max-num-seqs 1`, no speculative decoding |
+| KV cache | FP8 | f16, 256 blocks x 32 tokens = 8192 max context (auto-fit down from 262144); prefix caching disabled, async scheduling enabled at `max_concurrent_batches=2`. NOT PASSED, RESOLVED: neither launcher passed any of it -- both passed `--max-num-seqs 1 --device cuda --no-enable-thinking --enable-force-include-usage` and nothing else -- and the engine prints all three at boot. Re-read on 2026-09-12 on the same artifact, so these are defaults this configuration reproduces, not a recipe another run would have to repeat |
+| Device | GB10 (`sm_121a`) | GB10 (`sm_121a`), same box |
+
+### Result
+
+| Concurrency | sojufx (tok/s) | vllm.cpp (tok/s) |
+|---|---|---|
+| C1 | 66.17 | 0.25 |
+| C2 | 109.70 (aggregate) | not measured |
+| C4 | 179.31 (aggregate) | not measured |
+
+vllm.cpp C1: 99 decode tokens in 393.7 s, TTFT 9059 ms, model load ~1000 s
+(~16.7 min) from the CIFS NAS. **The gap is ~264x at C1.** READ THE FIRST NUMBER
+AGAIN BEFORE USING THE RATIO: 400 tokens were requested and 99 arrived, so this
+is a truncated stream and not a completed benchmark, and the build it ran on was
+a bare `cmake -DVLLM_CPP_CUDA_ARCHITECTURES=121a` whose compiled feature set was
+never asserted. The ratio is quoted here as the thing that prompted the
+re-measurement, not as a result this row stands behind. This is directional,
+not a parity result: sojufx uses NVFP4 (~128 GB) with MTP speculative decoding
+and 8-seq scheduling, while vllm.cpp uses UD-IQ1_S (~68 GB) with single-seq
+decode. The comparison was published on the face as `TOKEN_GATE=FAIL` per the
+developer's 2026-09-04 direction, because the token gate does not pass on this
+architecture (3 of 6 disagreements vs llama.cpp free-running, per `## Owed`
+[#2999](https://github.com/mudler/vllm.cpp/issues/2999)).
+
+### The crash the benchmark found, and the fix that landed (#1958)
+
+The benchmark crashed the server under `min_tokens` + `ignore_eos` before the
+fix. `DeviceScratch` in `include/vllm/v1/sample/device_scratch.h` had a 0-copy
+path on unified-memory backends (CPU, GB10): it wrapped the caller's host
+pointer in-place. But `apply_min_tokens` and `apply_logit_bias` in
+`src/vllm/v1/sample/logits_processor/builtin.cpp` pass function-local
+`std::vector`s that are destroyed when the function returns, before the async
+CUDA kernel reads them. On GB10 this produced `illegal memory access`. On
+discrete GPUs the bug was masked because `~DeviceScratch` calls `cudaFree`,
+which synchronizes the queue before the memory becomes invalid.
+
+The fix (commit `1b2a49364`, landed on `main` 2026-09-12) removes the UMA
+0-copy branch: `DeviceScratch` always allocates and copies on every backend.
+The derived tensors are tiny (at most a few hundred int32s), so the copy is
+negligible. Issue
+[#1958](https://github.com/mudler/vllm.cpp/issues/1958) is closed; the fix is
+owned by row `SAMPLE-CORE` (spec: `.agents/specs/sampling-controls-c7.md`).
+
+### THE NEXT ROW, NAMED: keep the GDN projections quantized by permuting a vector (2026-09-14)
+
+The attribution found that **61% of decode weight traffic is a load-time bf16
+expansion**: the V-head reorder the released 16-vs-48 config forces cannot be
+applied to a k-quant block stream, so `attn_qkv`, `attn_gate`, `ssm_beta`,
+`ssm_alpha` and `ssm_out` of all 36 GDN layers are dequantized at load --
+**4.152 GB/step against 1.508 GB in the file**. `qwen4_exp_weights.cpp:292-302`
+states the cost against itself.
+
+**The fix that comment does not consider is to permute a VECTOR instead of the
+weight.** For a GEMV, a ROW permutation satisfies `(P W) x = P (W x)` (permute
+the output) and a COLUMN permutation satisfies `(W P) x = W (P x)` (permute the
+input). Both are exact re-indexings, so both are BIT-IDENTICAL, and both are O(n)
+on a vector of at most 10,240 elements against 115 MB of weight traffic per
+layer. **This covers `ssm_out`'s column reorder**, the case the comment calls
+unavailable -- because it only considered permuting the weight.
+
+| | bytes/step | floor at 273 GB/s | |
+|---|---|---|---|
+| today | 6.792 GB | 24.88 ms | ~40 tok/s |
+| ROW reorders only (73% of the expansion) | ~4.81 GB | 17.6 ms | ~57 tok/s |
+| **all five** | **4.148 GB** | **15.19 ms** | **~66 tok/s** |
+
+**THE ONE WAY THIS DISAPPOINTS, and it must be measured rather than assumed:**
+freeing the bytes moves these operands from cuBLAS bf16 GEMV, which achieves
+162.3 GB/s here, to our own `QuantDotGemm*` family, which achieves 93.4 GB/s. A
+1.7x lower achieved rate against a 2.75x lower byte count is still a win, but the
+margin is smaller than the byte ratio suggests and the trade is the thing to
+measure first.
+
+Scoped in `ISSUE-LOCAL-01M2ENTH6YA5FWEDY6CFHF4NAM`, which also lists the
+correctness risk that is the actual work: the reorder exists so every downstream
+consumer sees HF V-head order, and permuting vectors moves that obligation to the
+conv, the delta rule and the gate.
+
+### THE GAP IS A 13x MEMORY-EFFICIENCY DEFICIT, NOT A CEILING (2026-09-13)
+
+Derived from the model's config and this row's measured step, no GPU needed.
+**We sustain ~11.0 GB/s of GB10's ~273 GB/s: 4.0% of peak.** sojufx at 66.17
+tok/s sustains 140.1 GB/s (51.3%), and **this tree already sustains 220.8 GB/s
+(81%) on another model on this same box.**
+
+Active weights are 4.231 G params per token (48 layers x 88.15 M: MoE top-10 of
+512 at `moe_intermediate_size` 640 plus a shared expert, plus q/kv/o), which at
+IQ1_S is **~0.85 GB per step**. At 273 GB/s the floor is **3.1 ms per step,
+~320 tok/s**. The reference's 15.1 ms step is five times slower than the memory
+system permits, and at even 50% of peak we would be at ~161 tok/s -- 2.4x PAST
+the reference.
+
+**So the 5.08x gap is a defect, not a limit, and two of this row's own
+conclusions today are corrected by it.** The withdrawn "no combination of the
+identified kernel leads reaches 66" was wrong in a second and more basic way than
+its first retraction: it treated the distance as a shortfall to scrape together
+when there is ~20x of headroom. And the MTP finding
+(`ISSUE-LOCAL-01M2EG6R3MRCB9ENZB9840KAXX`), though true and unretracted, was
+OVER-WEIGHTED as "the blocker": speculation multiplies throughput at a given step
+cost and cannot explain running at 4% of bandwidth.
+
+Owed, and it is the next row: a per-kernel bandwidth attribution over the 68.9%
+that is GEMM, from shapes rather than from `ncu` (which refuses here). See
+`ISSUE-LOCAL-01M2EK69SESGH6ST1ESMFZC808`, which also records why the q/k/v merge
+is NOT the place to start.
+
+### THE PER-KERNEL BANDWIDTH ATTRIBUTION, and it FALSIFIES the 4%-of-peak figure above (2026-09-14)
+
+Derived from `tests/vllm/models/qwen4_exp_gguf_manifest.inc` (the committed
+header manifest of the released UD-IQ1_S artifact: every tensor's ggml type id
+and dims), the loader's residency rules, and the measured kernel table below.
+**No GPU, no lease and no `ncu`** -- which is the point, because `ncu` refuses on
+this fleet with `ERR_NVGPUCTRPERM`.
+
+**THE HEADLINE IS A CORRECTION, AND THE SECTION IT CORRECTS IS THE ONE DIRECTLY
+ABOVE.** That section says the step moves **~0.85 GB** and therefore sustains
+**11.0 GB/s, 4.0% of peak**. Read off the artifact's own type ids, the decode
+step moves **6.792 GB of GEMM weight operands**, which is **8.0x** its figure,
+and the step therefore sustains **88.3 GB/s against 76.9 ms of kernel time:
+32.4% of GB10's ~273 GB/s**. Nothing in the decode path is at 1-5% of peak. The
+lowest measured row is at 15%.
+
+#### Where the 0.85 GB went wrong, in four parts
+
+| | the section above | the manifest |
+|---|---|---|
+| active GEMM params/token | 4.231 G | **6.625 G** |
+| average width | IQ1_S, ~1.6 bit | **8.20 bit** |
+| bytes/step | ~0.85 GB | **6.792 GB** |
+
+1. **It priced the whole model at IQ1_S.** IQ1_S is 68 of the 96 routed expert
+   gate/up towers and NOTHING else. `ffn_down_exps` is IQ4_NL (4.5 bit), the
+   remaining 28 gate/up towers are IQ2_XXS, the shared experts are Q5_K/Q6_K/Q8_0,
+   the hyper-connections are Q8_0 (8.5 bit), and `output.weight` is Q4_K.
+   The artifact's whole type histogram, from the manifest, is **557 F32, 244 Q8_0,
+   212 Q5_K, 68 IQ1_S, 49 IQ4_NL, 40 Q6_K, 28 IQ2_XXS, 24 BF16, 2 Q4_K** over
+   1,224 tensors. There is **no Q5_0 in this file at all**, which is worth saying
+   because this row's briefing prose has described the expert towers as
+   "IQ4_NL/Q5_0": down is IQ4_NL, gate/up are IQ1_S and IQ2_XXS, and the 49th
+   IQ4_NL tensor is `per_layer_token_embd`.
+2. **It omitted whole stages.** The hyper-connections are **668.4 MB/step** (four
+   Q8_0 `[10240,320]`/`[320,10240]` projections in every one of 48 layers), the
+   `lm_head` is **357.6 MB**, and the MoE router is **125.8 MB**. None appears in
+   its arithmetic.
+3. **It gave all 48 layers the same attention.** 36 are Gated DeltaNet with much
+   wider projections and 12 are QSA.
+4. **AND THE LARGEST TERM IS NOT IN THE FILE AT ALL.** See the next subsection.
+
+#### 61% OF THE STEP'S TRAFFIC IS A LOAD-TIME bf16 EXPANSION
+
+`qwen4_exp_weights.cpp:277-395` reorders the V heads of every Gated DeltaNet
+projection from HF's grouped order into ggml's tiled order, and a k-quant
+superblock spans elements that permutation moves. So on the released
+`linear_num_key_heads` 16 vs `linear_num_value_heads` 48 config the reorder is
+ALWAYS on, and `attn_qkv`, `attn_gate` and `ssm_out` of all 36 linear layers
+**dequantize to bf16 at load** (`DequantAll` then `Bf16From`, three call sites,
+no keep-quant arm). The file's own comment at `:300-302` states this and is
+correct; what has never been written down is its size.
+
+```
+  36 layers x (52.43 + 31.46 + 31.46) MB bf16   =  4.152 GB / step
+  the same tensors in their file encoding        =  1.508 GB / step
+                                                    -------  2.75x
+```
+
+**That single loader property is 61% of every decode step's weight traffic**, and
+it is also why cuBLAS appears at all in a keep-quant model: an elementwise bf16
+weight leaves `vt::MatmulBT`'s block-quant branch (`src/vt/ops.cpp:192-195`) and
+lands in cuBLAS `gemvx`, while every block-quant weight goes to `QuantDotGemm*`.
+The 34.8%/34.1% split in the kernel table IS that dtype split.
+
+#### The attribution, ranked by achieved bandwidth ASCENDING
+
+Only four rows of the capture carry a committed average duration; see
+"What is NOT attributed" below.
+
+| kernel | call site | weight | K x N | dtype | MB/call | calls/step | measured avg | achieved | % of 273 |
+|---|---|---|---|---|---|---|---|---|---|
+| `QuantDotGemmGroupedKernel` | `qwen4_exp_moe.cpp:190` | `ffn_gate_exps`/`ffn_up_exps`, 10 of 512 | 2560x640 | IQ1_S | 3.200 | 68 | 77 us (1) | **41.6 GB/s** | **15.2%** |
+| `QuantDotGemmGrouped32Kernel` | `qwen4_exp_moe.cpp:190` | `ffn_down_exps`, 10 of 512 | 640x2560 | IQ4_NL | 9.216 | 48 | 163 us (1) | **56.5 GB/s** | **20.7%** |
+| cuBLAS `internal::gemvx::kernel` #1 | GDN in/out projections | two of `attn_qkv`/`attn_gate`/`ssm_out` | see (2) | bf16, EXPANDED | 31.46-41.94 | 71.9 | 244 us | **129-172 GB/s** | **47-63%** |
+| `QuantDotGemmKernel<WType 4, float>` | `qwen4_exp_registry.cpp:1032` | `output.weight` | 2560x248320 | Q4_K | 357.581 | 1.0 | 2.49 ms | **143.6 GB/s** | **52.6%** |
+
+(1) These two averages come from the **~1600-token capture** at `ee0644eab`, not
+from the 400/600-token capture the rest of this section uses. Instance counts are
+context-free (one grouped call per tower per layer) but the durations are not
+guaranteed to transfer. Treat them as indicative and re-read them from the
+retained `4e36bbae` capture.
+
+(2) 244 us x 71.9 calls = 17.53 ms, and the whole cuBLAS group is 26.76 ms for
+4.343 GB. **The small-weight readings are therefore impossible and are excluded
+by arithmetic, not by preference**: if row #1 were `ssm_alpha`+`ssm_beta`
+(72 calls, 0.246 MB each) the remaining 4.15 GB would have to move in 9.23 ms,
+i.e. at 450 GB/s, above the machine. Row #1 is two of the three large GDN
+projections. WHICH two the committed record does not say, so the row is given as
+a range: 31.46 MB/call if it is `attn_gate`+`ssm_out`, 41.94 MB/call if it pairs
+`attn_qkv` with one of them.
+
+#### Group level, which is where the answer actually is
+
+| family | bytes/step | measured | achieved | % of 273 |
+|---|---|---|---|---|
+| cuBLAS `gemvx` + `gemv2T` + `splitKreduce` (elementwise bf16) | 4.343 GB | 26.76 ms | **162.3 GB/s** | **59.5%** |
+| our `QuantDotGemm*` (block-quant) | 2.449 GB | 26.22 ms | **93.4 GB/s** | **34.2%** |
+| all GEMM/GEMV | 6.792 GB | 52.98 ms | 128.2 GB/s | 47.0% |
+| the whole step, kernel time | 6.792 GB | 76.9 ms | **88.3 GB/s** | **32.4%** |
+| the whole step, wall | 6.792 GB | 87.6 ms | 77.5 GB/s | 28.4% |
+
+**So the ranking the next row needs is the opposite of the one it was going to
+inherit.** cuBLAS is the larger half of the GEMM bill because it moves 1.8x the
+bytes, not because it is slow: at 59.5% of peak it is the MORE efficient half.
+Our own grouped k-quant kernels are the least efficient measured rows at 15-21%.
+
+#### THE FLOOR IS NOT 320 tok/s AND THE HEADROOM IS NOT 20x
+
+| | bytes/step | floor at 273 GB/s | implied ceiling |
+|---|---|---|---|
+| the section above | 0.85 GB | 3.1 ms | 320 tok/s |
+| **as this engine loads it today** | **6.792 GB** | **24.88 ms** | **40 tok/s** |
+| **with the GDN expansion removed** | **4.148 GB** | **15.19 ms** | **66 tok/s** |
+
+The middle row is the one that changes a plan: **at 6.792 GB per step the memory
+system cannot deliver 66 tok/s on this artifact at all**, so the GDN keep-quant
+repair is not an optimisation among others, it is the precondition for the target
+being reachable. And the bottom row lands on **66 tok/s**, against sojufx's
+measured 66.17. That is a coincidence of rounding and not a derivation of the
+reference's rate -- sojufx runs a ~4-bit NVFP4 checkpoint with a different active
+set -- but it does say the reference is operating AT the memory floor of an
+equivalently-sized artifact, and we are at 3.1x of ours rather than 20x.
+
+#### The full byte inventory, per call site, per step
+
+Every GEMM operand the decode path reads, from the manifest. `calls/step` is
+derived from the architecture (48 layers, 36 GDN + 12 QSA, MoE top-10 of 512 plus
+a shared expert) and cross-checks against the capture wherever the capture names
+an instance count.
+
+| call site | K x N | dtype | MB/call | calls/step | MB/step | served by |
+|---|---|---|---|---|---|---|
+| GDN `in_proj_qkv` (`attn_qkv`) | 2560x10240 | bf16 EXPANDED from Q5_K/Q6_K | 52.429 | 36 | **1887.4** | cuBLAS |
+| GDN `in_proj_z` (`attn_gate`) | 2560x6144 | bf16 EXPANDED | 31.457 | 36 | **1132.5** | cuBLAS |
+| GDN `out_proj` (`ssm_out`) | 6144x2560 | bf16 EXPANDED from Q6_K | 31.457 | 36 | **1132.5** | cuBLAS |
+| MoE `ffn_down_exps` x10 | 640x2560 | IQ4_NL | 9.216 | 48 | 442.4 | `QuantDotGemmGrouped32Kernel` |
+| `lm_head` `output.weight` | 2560x248320 | Q4_K | 357.581 | 1 | 357.6 | `QuantDotGemmKernel<4,float>` |
+| QSA q+gate (`attn_q`) | 2560x12288 | Q5_K | 21.627 | 12 | 259.5 | `QuantDotGemm*` Q5_K |
+| hyper-connection `hc_attn_down` | 10240x320 | Q8_0 | 3.482 | 48 | 167.1 | `QuantDotGemmQ8_0Kernel` |
+| hyper-connection `hc_attn_up` | 320x10240 | Q8_0 | 3.482 | 48 | 167.1 | `QuantDotGemmQ8_0Kernel` |
+| hyper-connection `hc_ffn_down` | 10240x320 | Q8_0 | 3.482 | 48 | 167.1 | `QuantDotGemmQ8_0Kernel` |
+| hyper-connection `hc_ffn_up` | 320x10240 | Q8_0 | 3.482 | 48 | 167.1 | `QuantDotGemmQ8_0Kernel` |
+| QSA `o_proj` (`attn_output`) | 6144x2560 | Q5_K | 10.813 | 12 | 129.8 | `QuantDotGemm*` Q5_K |
+| MoE router `ffn_gate_inp` | 2560x512 | bf16 EXPANDED from F32 | 2.621 | 48 | 125.8 | cuBLAS |
+| MoE `ffn_gate_exps` | 2560x640 | IQ1_S | 3.200 | 34 | 108.8 | `QuantDotGemmGroupedKernel` |
+| MoE `ffn_up_exps` | 2560x640 | IQ1_S | 3.200 | 34 | 108.8 | `QuantDotGemmGroupedKernel` |
+| shared-expert down | 640x2560 | Q8_0 | 1.741 | 48 | 83.6 | `QuantDotGemmQ8_0Kernel` |
+| MoE `ffn_gate_exps` | 2560x640 | IQ2_XXS | 4.224 | 14 | 59.1 | `QuantDotGemm*` IQ2_XXS |
+| MoE `ffn_up_exps` | 2560x640 | IQ2_XXS | 4.224 | 14 | 59.1 | `QuantDotGemm*` IQ2_XXS |
+| shared-expert gate | 2560x640 | Q5_K x34 / Q6_K x14 | 1.126-1.344 | 48 | 54.3 | `QuantDotGemm*` |
+| shared-expert up | 2560x640 | Q5_K x34 / Q6_K x14 | 1.126-1.344 | 48 | 54.3 | `QuantDotGemm*` |
+| QSA indexer `q_proj` | 2560x512 | BF16 in file | 2.621 | 12 | 31.5 | cuBLAS |
+| PLE `ple_key` | 2560x10240 | Q8_0 | 27.853 | 1 (3) | 27.9 | `QuantDotGemmQ8_0Kernel` |
+| GDN `in_proj_a`/`in_proj_b` | 2560x48 | bf16 EXPANDED from F32 | 0.246 | 72 | 17.7 | cuBLAS |
+| QSA `k_proj` + `v_proj` | 2560x512 | Q5_K | 0.901 | 24 | 21.6 | `QuantDotGemm*` Q5_K |
+| QSA indexer `k_proj` | 2560x128 | BF16 in file | 0.655 | 12 | 7.9 | cuBLAS |
+| PLE `ple_value` | 2560x2560 | Q8_0 | 6.963 | 1 (3) | 7.0 | `QuantDotGemmQ8_0Kernel` |
+| final `output_hc_down`/`_up` | 10240x320 | Q8_0 | 3.482 | 2 | 7.0 | `QuantDotGemmQ8_0Kernel` |
+| `hc_attn_inject`/`hc_ffn_inject` | 10240x4 | bf16 EXPANDED from F32 | 0.082 | 96 (4) | 7.9 | cuBLAS |
+| **TOTAL** | | | | | **6792** | |
+
+(3) `QuantDotGemmQ8_0Kernel`'s measured **242.0** calls/step is 192 hyper-connection
++ 48 shared-expert-down + the 2 final-block projections, with NO room for PLE's
+two Q8_0 GEMMs. So the count is evidence that **the PLE block does not run on a
+decode step**; if that reading is right the total is 6.757 GB and every ratio in
+this section moves by 0.5%. The rows are kept in the inventory because the
+alternative pairing (PLE in, final block out) also sums to 242 and the capture
+cannot separate them.
+(4) `hc_*_inject` IS a `LoadMatmul` operand (`qwen4_exp_weights.cpp:270-273`),
+N = `hc_count` 4, so it is a real GEMV. 0.12% of the total.
+
+#### THE COUNTS CROSS-CHECK, and that is what makes the mapping more than a guess
+
+Three instance counts in the capture are matched EXACTLY by the architecture, and
+none of the three was fitted:
+
+| capture | per step | architecture | matches |
+|---|---|---|---|
+| `QuantDotGemmQ8_0Kernel` 145,200 / 600 | **242.0** | 4 hc x 48 + shexp-down x 48 + 2 | **242** |
+| `gemvx` #1 43,128 / 600 | **71.9** | two of three GDN dense projections x 36 | **72** |
+| `QuantDotGemmGroupedKernel` 35,816 / 527 | **67.96** | IQ1_S gate/up towers, 34 layers x 2 | **68** |
+| `QuantDotGemmGrouped32Kernel` 25,277 / 527 | **47.96** | `ffn_down_exps`, one grouped call per layer | **48** |
+| `QuantDotGemmKernel<WType 4, float>` 600 / 600 | **1.0** | `output.weight`, the ONLY Q4_K GEMM operand | **1** |
+
+The 68 is the sharper one. 68 is not a divisor of 48, 36 or 12, and it is not a
+count of layers at all: it is the number of expert gate/up TOWERS whose file type
+is IQ1_S (34 layers x 2 towers), the other 28 being IQ2_XXS and landing in a
+different template instantiation. It also confirms, independently of any grep,
+that gate and up are issued as SEPARATE grouped calls -- this model does not use
+`layers::MlpGateUpMethodBase` or `vt::MergedGemmGroup`, exactly as the seam
+section above says.
+
+#### What is NOT attributed, and what would close it
+
+- **Ten of the roughly fourteen GEMM rows have no committed average duration.**
+  Only the group totals (26.76 ms and 26.22 ms) and four individual rows were
+  ever written down; the full 25-row `nsys stats` output was not committed. The
+  capture `4e36bbae` is retained, so re-running `nsys stats` on it closes this
+  with a two-minute lease and no model load, exactly as `fe5be663` did.
+- **Which two of the three large GDN projections form `gemvx` row #1**, hence the
+  129-172 GB/s range on that row.
+- **The two grouped-kernel durations are cross-capture** (note (1)).
+- **`QuantDotGemmQ8_0Kernel`'s 242 resolves two ways**: 192 hc + 48 shared-expert
+  down + the 2 final-block hc projections, or the same with PLE's 2 calls instead
+  of the final block's. The difference is 28 MB/step, 0.4%.
+- **Whether the PLE block runs on every decode step.** Note (3) argues from the
+  242 count that it does not. 34.9 MB/step, 0.5%, and it changes no conclusion.
+- **KV-cache traffic is excluded.** This is the weight budget only.
+  `QsaGatherAttentionKernel`'s 18.15 ms is not a weight read and is not in any
+  ratio above.
+- **Activation traffic is excluded**, which is correct at batch 1: the activation
+  is ~5 KB against tens of MB of weights per call, under 0.1%.
+
+#### What this row should do next, in this order
+
+1. **Keep the Gated DeltaNet projections quantized.** 2.644 GB/step, 39% of all
+   traffic, and the only item that moves the floor from 40 tok/s to 66. The
+   reorder is the obstacle; it is a V-head PERMUTATION of whole rows for
+   `attn_qkv` and `attn_gate`, which a block stream can express as a row
+   permutation, and a COLUMN permutation for `ssm_out`, which it cannot
+   (`qwen4_exp_weights.cpp:300-302` already says so). So two of the three are
+   probably recoverable and the third needs its own answer.
+2. **Then the grouped k-quant kernels at 15-21% of peak**, which is the only
+   genuinely low efficiency the attribution found, over 778 MB/step.
+3. **Do NOT start from the q/k/v merge**, for the reason the issue already gives
+   and which this attribution now quantifies: at batch 1 the activation is under
+   0.1% of the bytes a GEMV moves.
+
+### THE FULL DECODE KERNEL TABLE, and a retraction: the lead is GEMM, not QSA (2026-09-13)
+
+Read from the SAME self-validated capture as the allocator measurement
+(`rc` job `4e36bbae`, 1,594,621 `cudaLaunchKernel` calls, 113 MB), by re-running
+`nsys stats` on it in a 2-minute lease with no build and no model load
+(`rc` job `fe5be663`). Per step over the window's 600 decode steps, against
+76.9 ms of GPU kernel time:
+
+| group | share | per step |
+|---|---|---|
+| **GEMM / GEMV, ALL OF IT** | **68.9%** | **52.98 ms** |
+| -- cuBLAS `gemvx` family (4 rows) + `gemv2T` + `splitKreduce` | 34.8% | 26.76 ms |
+| -- our `QuantDotGemm*` kernels (8 rows) | 34.1% | 26.22 ms |
+| `QsaGatherAttentionKernel` | 23.6% | 18.15 ms |
+| everything else (18 rows) | 7.5% | 5.77 ms |
+
+Notable individual rows: `gemvx` #1 at 43,128 instances (71.9 a step) and 244 us
+each; `QuantDotGemmQ8_0Kernel` at 145,200 instances (242 a step); and
+`QuantDotGemmKernel<WType 4, float>` at exactly **600 instances -- one per step --
+costing 2.49 ms each**, which is the shape of an `lm_head` over a large vocab.
+
+#### RETRACTION
+
+This row stated twice, in the MTP section and in the session prose that preceded
+it, that **"no combination of the identified kernel leads reaches 66 on this
+artifact without speculation."** That sentence was written while only TWO of the
+twenty-five kernel rows had ever been printed -- `QsaGatherAttentionKernel` and
+the first `gemvx` -- with the other 41.2 ms of the step unattributed. **It is
+withdrawn as reasoning**, independently of how the measurement below turns out.
+The arithmetic it quoted (deleting the top two kernels leaves ~52 ms) is correct
+and is not withdrawn; what is withdrawn is the inference that those two WERE the
+leads, and the closure that followed from it.
+
+It also corrects this row's aim. W9 optimised QSA because the post-W7 re-rank put
+it first. **At the reference workload QSA is second, at a third of the GEMM
+bill.**
+
+#### THE UNTRIED LEVER THIS EXPOSES, and it is already measured on this box
+
+`.agents/` and this project's own records carry the finding, measured on
+`dgx:gpu0` at tree `ecf580ce9`: **every decode GEMM runs a `cutlass_80_*` --
+AMPERE -- tactic on a Blackwell `sm_121` part, with no `nvjet`, `sm120`, `sm121`
+or `tcgen05` kernel anywhere in the decode trace**, alongside the sibling finding
+that cuBLASLt enumerates no Blackwell algorithm for these descriptors and that
+the DESCRIPTOR is the lever. That applies to the 26.76 ms/step of cuBLAS GEMV
+above. The other 26.22 ms/step is OUR OWN hand-written quant GEMM kernels, which
+no such finding covers and which nothing has profiled at this workload.
+
+**WHAT IS NOT ESTABLISHED, and must not be assumed from the paragraph above.**
+The recorded Ampere-tactic finding was measured on a DIFFERENT model and tree,
+and on GEMM shapes; the rows here are `gemvx`, cuBLAS's GEMV path, which at
+batch 1 is a different regime and may be bandwidth- rather than tactic-bound.
+Whether a Blackwell tactic is reachable for THESE descriptors and these shapes,
+and what it would be worth, is unmeasured. `ncu` refuses on this container
+(`ERR_NVGPUCTRPERM`), so the achieved-bandwidth reading that would settle the
+regime question is not available by the obvious route.
+
+#### AND THE FIRST LEVER IS A SHARED SEAM THIS MODEL NEVER JOINED
+
+`AGENTS.md` "Shared seams" requires: *"Route model fusion through
+`vt::FusedChain`. Route mergeable multilayer perceptron (MLP) projections through
+`layers::MlpGateUpMethodBase` and `vt::MergedGemmGroup`."*
+
+**`qwen4_exp` uses none of the three.** Grepping every `qwen4_exp*.cpp/h` for
+`MergedGemmGroup`, `MlpGateUpMethodBase` and `FusedChain` returns nothing; the
+only users in the tree are `dots3_note_vision.h` and `glm5_next_bridge.h`.
+
+The consequence is visible in the block code and then in the profile.
+`qwen4_exp_qsa_block.cpp` issues the projections as SEPARATE `vt::MatmulBT`
+calls against the same `hidden`: the indexer's q and k at `:593` and `:612`, then
+`:692` (q gate), `:756` (`k_proj`) and `:764` (`v_proj`). Each one re-reads the
+same activation and launches its own GEMV. The capture counts roughly **275 GEMV
+launches per decode step** across the `gemvx`, `gemv2T` and `QuantDotGemm*`
+families.
+
+Merging q/k/v into one GEMM is the standard form of this: three launches become
+one, the activation is read once instead of three times, and the single larger
+GEMM has more work to hide latency behind -- which matters precisely because
+these are BATCH-1 GEMV shapes, where per-launch overhead and activation re-reads
+are a large fraction of a small kernel. This is a protocol requirement this model
+does not meet AND the largest structurally-obvious lever aimed at the 68.9%.
+
+**IT IS NOT SIZED HERE.** How much of the 52.98 ms/step a merge recovers depends
+on how much of each GEMV is activation traffic against weight traffic, which this
+capture does not separate. That is what the owed work measures.
+
+**Owed, in order:** (1) confirm the tactic names actually chosen for these
+descriptors at this workload, which `nsys` can report without `ncu` -- note the
+rows here are `internal::gemvx::kernel`, cuBLAS's GEMV path, NOT the
+`cutlass_80_*` GEMM tactics the recorded Blackwell finding measured, so that
+finding may not transfer; (2) size the q/k/v and gate/up merge against the seam
+`AGENTS.md` already mandates, which needs no new kernel and no new oracle; (3)
+separately profile our own `QuantDotGemm*` family, the same size as the cuBLAS
+half and carrying no prior finding at all. Do not scope a fix before (1) and (2)
+are measured, and do not assume the Blackwell record applies to a GEMV.
+
+### THE ALLOCATOR, MEASURED AT THE REFERENCE WORKLOAD: the count is right and the LEVER IS NOT (2026-09-13)
+
+`dgx:gpu0`, `rc` job `4e36bbae`, source `3eabd4dbd` (post-W9 `main`), released
+UD-IQ1_S, 600-token decode, `nsys` window opened and closed BY THE CLIENT around
+the measured request. **The window is self-validated**: it recorded **1,594,621**
+`cudaLaunchKernel` calls, and the job refuses to report numbers below 20,000
+because a load-shaped window reads exactly like a result. The capture is 113 MB
+against the 198 KB of the attempt that silently profiled model loading.
+
+#### The prediction held to 2.1%
+
+`ISSUE-LOCAL-01M2DQHP2FWXHH7GTHB17QX53Q` derived 97 `cudaFree` per step from
+three call sites -- `Qwen4ExpGatedResidual` twice per layer plus once after, at
+48 layers -- by reading the tree, and called it an arithmetic match needing a
+measurement.
+
+| | derived | measured |
+|---|---|---|
+| `cudaFree` per step | 97 | **99.0** (59,400 / 600) |
+| `cudaMalloc` per step | 97 | **99.0** (59,428), paired to **28 calls** across the window |
+| `cudaLaunchKernel` per step | ~2,560 | **2,658** |
+| QSA launches per step | 12 | **12.0** (7,200 / 600) -- exactly the 12 QSA layers |
+
+`cudaFree` is **80.0% of all CUDA API time**, mean **652.5 us**, i.e. **64.6 ms
+per step** against an **87.6 ms** step: **74% of the step, in host time.**
+
+#### AND IT IS WORTH ABOUT 14%, NOT 4x, BECAUSE THE GPU IS 88% BUSY
+
+This is the number the issue said would size the work, and it changes the answer.
+QSA is 23.6% of GPU kernel time at 10.895 s, so total kernel time in the window is
+46.16 s -- **76.9 ms of the 87.6 ms step. The GPU is BUSY 88% of the time and
+IDLE 10.6 ms per step.**
+
+So the 64.6 ms of `cudaFree` **overlaps GPU work almost entirely**. Removing it
+cannot remove work that was never on the critical path; it can only recover the
+idle:
+
+```
+  best case   87.6 ms -> 76.9 ms      11.4 -> 13.0 tok/s      +14%
+```
+
+**THE BOUND THIS ROW WROTE BEFORE MEASURING IS WHAT MAKES THAT LEGIBLE.** The
+issue said the recoverable time "is bounded above by how long the GPU is currently
+IDLE, and not by the host-side total", and that is exactly what happened. A
+reader given only "74% of the step is `cudaFree`" would have scoped a
+caller-supplied workspace redesign, with its signature change and its re-entrancy
+argument and its collision with `ISSUE-LOCAL-01M2DW8CXYEWWMJSZZ6GRH48SZ`'s
+retention finding, for a 14% return.
+
+**The fix is still worth doing and is still cheap** -- `cudaFreeAsync` sits in
+this very trace at **1,340 ns** against `cudaFree`'s **652,550 ns**, 487x -- but
+it is a 14% item competing with 20%+ items, not the top of the list.
+
+#### WHAT THE STEP IS ACTUALLY MADE OF, and it is GPU work
+
+| kernel | share of kernel time | per step |
+|---|---|---|
+| `QsaGatherAttentionKernel` | **23.6%** | **18.16 ms** |
+| cuBLAS `gemvx` (bf16) | **22.8%** | **17.53 ms** |
+
+**We are GPU-BOUND at 88%.** The path to the reference is LESS GPU WORK, not less
+host overhead, and that re-ranks this row for the third time today.
+
+**ONE NEW OBSERVATION, NOT YET A SCOPE.** QSA is still 20.7% of the step AFTER W9,
+at **1.513 ms per launch**. Against the pre-W9 profile's 2.545 ms at `|sel| ~
+1600`, a cost linear in `|sel|` would predict roughly 0.53 ms at this run's mean
+`|sel|` of about 335. It measures 1.513. **That implies a large per-launch cost
+that does not scale with context at all**, which every context-scaling argument in
+this row -- including the correction section above -- has been silently treating as
+zero. Twelve launches a step makes it the larger half of QSA's bill here. The
+owed instrument is a `|sel|` sweep at fixed shape on this box, which is the same
+head_dim-sweep method the W9 attribution already used and trusts.
+
+**THE SWEEP WAS ATTEMPTED TWICE AND BOTH RUNS DIED THE SAME WAY. Read this before
+taking a lease for it.** `rc` jobs `8ea56726` and `0cfb7294` extended the working
+single-window harness to two legs -- 120 tokens then 1200, one boot, one binary,
+`nsys start`/`stop` around each. In both runs the server came up, answered
+`/v1/models`, and SERVED THE WARMUP CORRECTLY (ttft 111.2 s and 73.1 s
+respectively, decode 12.01 tok/s), and then **both legs got
+`URLError: [Errno 111] Connection refused`** -- including the FIRST leg, before
+any second `nsys start`, so it is not the two-window structure. The server died
+between the warmup completing and the first capture. `nsys stop` still produced
+`.nsys-rep` files, and the self-validation correctly REFUSED both as not
+decode-shaped rather than reporting the empty windows as a result.
+
+The cause is not established and is not guessed here. It is in `$OUT/srv.log` on
+the worker, which needs a lease to read, and the two candidates worth separating
+are an OOM under tracing (the box holds a ~68 GiB model in 128 GiB unified memory,
+and this dev host OOM-killed an unrelated `agent-preflight` the same evening) and
+`dgx:gpu0` itself, which went unhealthy EIGHT times on 2026-09-13. **The next
+attempt should read that log FIRST**, and should print the server's tail on client
+failure the way the leg function now prints the client's.
+
+WHAT IS NOT OWED, because it is already measured: the single-window capture works
+(`4e36bbae`, 1,594,621 launches, 113 MB) and produced everything in this section.
+Only the second context point is missing.
+
+### THE REFERENCE MEASUREMENT, taken at last: 13.02 tok/s at 400 tokens, a 5.08x gap (2026-09-13)
+
+**This row has never before compared itself to sojufx on sojufx's workload.** Every
+figure it quoted -- 0.257, 8.50, 12.85 -- came from a 16-token decode, while the
+reference generates 400. The correction section above derives why that is not a
+comparison. This is the measurement that replaces the derivation.
+
+`dgx:gpu0` (GB10, sm_121a), `rc` job `4844371b`, source `abaa79c43`, built
+`-DVLLM_CPP_CUDA_ARCHITECTURES=121a`, released UD-IQ1_S staged locally,
+`--max-num-seqs 1 --device cuda --no-enable-thinking --enable-force-include-usage`.
+The request body is sparkDash's own (`max_tokens=400, min_tokens=400,
+ignore_eos, stop=[], temperature=0, top_p=1, stream, include_usage,
+chat_template_kwargs thinking disabled`) and the rate is sparkDash's own formula,
+`(completion_tokens - 1) / (tLast - tFirst)`. Prompt: "Count from 1 to 200.
+Output only the numbers, separated by spaces. No other text."
+
+| leg | tokens | tok/s | wall |
+|---|---|---|---|
+| `ref400_a` | 400 | **13.0215** | 31.63 s |
+| `ref400_b` | 400 | **13.0176** | 31.64 s |
+| `decode16`, SAME BOOT | 16 | 15.1305 | 2.19 s |
+
+Two 400-token runs **0.030% apart**. The 16-token leg ran on the same boot
+deliberately, so the comparison to this row's older numbers cannot be blamed on a
+boot.
+
+| | tok/s |
+|---|---|
+| sojufx sparkDash Decode Bench C1 | **66.17** |
+| vllm.cpp, same workload, same formula | **13.0195** |
+| **gap** | **5.08x** |
+
+**THE DERIVATION IT REPLACES WAS CLOSE, AND IS NOW RETIRED.** The correction
+section rescaled 12.85 tok/s to "~12.3 tok/s, a ~5.4x gap" by adding the QSA cost
+that 400 tokens of context carries and 16 does not. Measured: 13.02 and 5.08x.
+Quote the measurement, not the rescaling.
+
+**Cumulative, all on `dgx:gpu0`: 0.257 -> 13.02 tok/s at the reference workload,
+and the gap has gone 264x -> 5.08x.**
+
+**AND THE REFERENCE'S MAIN LEVER IS NOT AVAILABLE TO US ON THIS ARTIFACT.** sojufx
+runs MTP speculative decoding at K=3; the released UD-IQ1_S GGUF **carries no MTP
+head**. Measured from this repository's own committed manifest of the artifact's
+headers (`tests/vllm/models/qwen4_exp_gguf_manifest.inc`): 1,225 tensors, none
+named `mtp`/`nextn`/`draft`/`eh_proj`/`enorm`/`hnorm`, and blocks `blk.0` through
+`blk.47` with nothing higher -- exactly the 48 trunk layers and no folded 49th,
+which is how llama.cpp's converter would carry one (see
+`qwen3_5_gguf_weights.cpp:965-974`). The architecture defines the head and the
+engine implements the method; the BYTES ARE ABSENT.
+
+**AND NO GGUF WE COULD PRODUCE WOULD CARRY IT EITHER.** The pinned
+`llama-cpp-qwen4exp` converter (PR #27742, head `6c5afc86`) is the only llama.cpp
+that converts this architecture, and `conversion/qwen4exp.py:29-31` sets
+`supports_mtp_export = False` / `no_mtp = True` above the comment "the MTP block
+is a separate draft head; vLLM drops it too". The head's absence is the
+converter's design, not a conversion oversight, so "convert one ourselves" is not
+an available route without patching a second unmerged PR -- and that converter's
+own `:151` records the PLE table peaking "near 300 GB of RSS", above this fleet's
+largest box.
+
+The arithmetic any plan must clear: 66.17 tok/s is a **15.1 ms** step against our
+**87.6 ms** at 88% GPU-busy, i.e. **5.8x less step time**, while the two largest
+kernels are 18.16 ms and 17.53 ms -- deleting both entirely leaves ~52 ms, about
+19 tok/s. ~~**No combination of the identified kernel leads reaches 66 on this
+artifact without speculation.**~~ **WITHDRAWN the same day** -- that sentence was
+written knowing two of twenty-five kernel rows, with 41.2 ms of the step
+unattributed. The full table (see "### THE FULL DECODE KERNEL TABLE, and a
+retraction") puts **68.9% of kernel time in GEMM/GEMV**, splits it evenly between
+cuBLAS GEMV and our own `QuantDotGemm*` kernels, and puts QSA second. A recorded
+finding on this same box says every decode GEMM picks an AMPERE tactic on this
+Blackwell part. Whether that is worth anything at these GEMV shapes is
+unmeasured, but the closure was not earned and is retracted. This row's rule that
+an apparent limit is an untraced implementation difference stands, and here it
+bit the row that wrote it. See
+`ISSUE-LOCAL-01M2EG6R3MRCB9ENZB9840KAXX`, which lists the three routes and says
+which question to answer first.
+
+#### THE STEP GROWS 34% WITHIN ONE 400-TOKEN RUN, AND QSA EXPLAINS A THIRD OF IT
+
+The per-token deltas of `ref400_a` rise monotonically from **0.06630 s** at the
+first token to **0.08885 s** at the last -- 15.08 tok/s falling to 11.25 tok/s,
+**+22.6 ms, +34.0%** -- and `ref400_b` reproduces the shape. This is the
+context-scaling the correction section argued, observed directly rather than
+inferred from two runs.
+
+**But QSA cannot account for most of it.** `|sel| = min(kv_len, block_topk * CR)`
+gives 36 at the first token and 435 at the last, so against the profile's
+30.5 ms at `|sel| = 1600` the gather grows **0.69 ms -> 8.30 ms = 7.6 ms**.
+Measured growth is 22.6 ms. **~14.9 ms is something else that also scales with
+context**, and it is now the larger unexplained term at this workload.
+
+ONE CANDIDATE, NAMED AND NOT ASSERTED: the indexer scores EVERY complete block,
+`kv_len / CR`, and that count is NOT capped by `block_topk` -- 9 blocks at
+kv_len 36 against 108 at kv_len 435. The gather is capped and the scorer is not.
+**DO NOT SCOPE FROM THIS PARAGRAPH.** It is a hypothesis with the right shape and
+no measurement; the owed instrument is a per-kernel attribution at two context
+lengths in one run, which is the same instrument
+`ISSUE-LOCAL-01M2DQHP2FWXHH7GTHB17QX53Q` already owes for the `cudaFree`
+population.
+
+#### THE W9 SPEED CLAIM, MEASURED BY THE OPERATOR: at least 3.62x on the suite's own fixtures
+
+The review noted that the operator's correctness gate (`d80f84a7`) ran pass/fail
+only, so **6.52x was still an implementer report**. `rc` job `c4e4e2cb` on
+`thor:gpu0` measures it instead: one clone, `test_qwen4_exp_cuda_reductions`
+built and run under `nsys` at each arm, reading `QsaGatherAttentionKernel`'s own
+mean from `cuda_gpu_kern_sum`.
+
+| arm | HEAD | instances | total | mean |
+|---|---|---|---|---|
+| base | `6a47d4370` | 14 | 32,033,760 ns | 2.2881 ms |
+| fix | `7d0d74c2c` | 17 | 8,849,920 ns | 0.5206 ms |
+
+**THE MEANS ARE NOT COMPARABLE AND THE NAIVE 4.40x MUST NOT BE QUOTED.** The fix
+arm runs THREE MORE instances than the base arm -- the new `DH` 8/16/1 case -- and
+they are small shapes that drag its mean down. What the numbers support is a
+bound: the 14 shared instances cost at most the whole fix total, since the three
+new ones cost more than zero, so the shared mean is at most 0.6321 ms and the
+speedup is **at least 3.62x**.
+
+**3.62x IS A LOWER BOUND ON A DIFFERENT SHAPE MIX, NOT A REFUTATION OF 6.52x.**
+This suite's fixtures are mostly small, and its largest runs `DH = 32`; the
+implementer's 6.52x was measured at the RELEASED decode shape, `DH = 256` and
+`|sel| = 2048`, where the per-row dot is 8x longer and fixed overheads are a
+smaller share. Both can hold. What the operator has verified is that the kernel
+got at least 3.6x cheaper on fixtures the committed suite actually runs; the
+released-shape figure remains an implementer measurement, and a gate for it needs
+a released-shape harness this suite does not contain.
+
+#### What this run did NOT establish
+
+- **The `nsys` leg FAILED, and the cause is the profiler flag rather than the
+  server.** The profiled boot came up (`ready ~55s`), its first request returned
+  ZERO chunks, and the next got `Connection refused`; `nsys stats` then refused
+  the capture with "file does not contain StringIds table". **`nsys profile
+  --duration N` TERMINATES THE PROFILED APPLICATION when the window closes** --
+  the default `--kill` is a signal, not `none` -- so the 25 s window killed the
+  server mid-load and left a truncated capture. The retry needs `--kill none`,
+  and a window placed to open AFTER the server is serving rather than while it is
+  still loading. Recorded here because the failure looks like a dead server and
+  is not one. So the `cudaFree`-per-step count at the 400-token workload, and the
+  GPU-busy fraction that bounds the allocator fix, are STILL OWED. The unprofiled
+  legs above are unaffected -- they ran on a separate boot that served all 816
+  tokens.
+- **The 16-token rate moved and this run cannot say why.** It is 15.13 tok/s here
+  against the 12.85 tok/s recorded at `ee0644eab`. `a69470a7f` (W8's
+  device-resident k-quant MoE arm, default-ON) landed in between and is the
+  obvious candidate, but **this is not an A/B** -- one boot at one SHA against a
+  boot at another, weeks of commits apart in tree terms. Attributing it needs the
+  interleaved same-tree harness W6 and W7 used. Recorded as an observation, not a
+  result.
+- W9 is NOT in this binary. `abaa79c43` predates it.
+
+### The post-W7 profile on dgx, 2026-09-13: what W6 and W7 were worth, and what is next
+
+**W7 on the reference box.** Interleaved same-tree A/B, BASE `3b3ed716f` (W6 only)
+against FIX `ee0644eab` (W6+W7), one boot per arm, two rounds, released UD-IQ1_S
+staged locally, `--max-num-seqs 1 --device cuda`, 16-token decode, median
+inter-token:
+
+| arm | round 1 | round 2 |
+|---|---|---|
+| BASE (W6) | -- | 8.496 tok/s, 0.11769 s |
+| FIX (W6+W7) | 12.892 tok/s, 0.07751 s | 12.817 tok/s, 0.07798 s |
+
+**0.1177 -> 0.0778 s per token, 40 ms removed, 1.51x.** The W7 scope predicted,
+before the work started, "~42 ms per step removed, a step near 77 ms, and ~13
+tok/s". Measured: 40 ms, 77.8 ms, 12.85 tok/s. The prediction is met, not
+adjusted.
+
+**Cumulative, all on `dgx:gpu0` with the same harness:** 0.257 -> 8.50 -> 12.85
+tok/s, i.e. **50x across this campaign**, against the sojufx sparkDash C1
+reference of 66.17 tok/s -- a gap of 264x at the start and **5.2x now**.
+
+**The ranking has changed, and not toward what the pre-W6 trace predicted.**
+`nsys`, 60 s window inside a 3000-token decode (**527** steady-state steps at
+113.9 ms; the "~771" first written here was wrong, see the W9 correction section).
+**THIS TABLE RANKS A ~1600-TOKEN CONTEXT.** `QsaGatherAttentionKernel`'s cost is
+proportional to `|sel|`, so its rank does NOT transfer to the 400-token workload
+the sojufx gap is quoted on without rescaling:
+
+| kernel | share | instances | avg |
+|---|---|---|---|
+| `QsaGatherAttentionKernel` | **34.5%** | 6,319 | **2.545 ms** |
+| cuBLAS `gemvx` (bf16, shape A) | 19.6% | 37,914 | 242 us |
+| `QuantDotGemmGrouped32Kernel` | 8.8% | 25,277 | 163 us |
+| cuBLAS `gemvx` (shape B) | 6.8% | 56,872 | 55 us |
+| `QuantDotGemmGroupedKernel` W8 | 5.9% | 35,816 | 77 us |
+
+`HcGroupedNormKernel` does not appear in the top twelve. Before W7 it was 40.7%
+and rank 1; W7's effect is confirmed at the ranking level on the reference box,
+not only end to end.
+
+**TWO THINGS THIS OVERTURNS.** First, the next target was going to be the dense
+GEMV path on the strength of the pre-W6 trace (16 ms/step) and the recorded
+cuBLASLt descriptor lever. It is second, not first. `QsaGatherAttentionKernel` is
+the leader at ten times the next kernel's average, and it was INVISIBLE before:
+2.7% at 231 us in the pre-W6 trace, buried under the allocator. A stale ranking
+would have sent the next row to the wrong kernel.
+
+Second, and larger: **the allocator is still the top HOST cost.**
+
+| API | share | calls | avg |
+|---|---|---|---|
+| `cudaFree` | **63.0%** | 52,130 | 634 us |
+| `cudaMemcpyAsync` | 22.8% | 553,963 | 21.6 us |
+| `cudaLaunchKernel` | 12.4% | 1,349,118 | 4.8 us |
+| `cudaStreamSynchronize` | 0.5% | 198,000 | 1.3 us |
+
+Over ~771 steps that is ~68 `cudaFree` and ~43 ms per step, at 634 us per call. **THAT STEP COUNT IS WRONG AND WAS CORRECTED THE SAME DAY (2026-09-13): it is 527, the per-step figures are ~99 calls and ~63 ms, and this whole table describes a ~1600-token context rather than the 400-token workload the gap is quoted on. See "### W9: the two numbers this row kept dividing into each other".** The paragraph below is the retracted reasoning, kept because it was published. **IT IS NOW IN DOUBT (2026-09-13).** It was derived as 60 s / 77.8 ms. The QSA attribution counts 6,319 `QsaGatherAttentionKernel` instances in the same window and the tree has 12 of 48 layers on the QSA path (`qwen4_exp.h:29-33`), which implies **527** steps, not 771 -- a 1.46x disagreement. At 527 the same totals read ~99 calls and ~63 ms per step. Neither derivation is retracted, because neither has been checked against a step counter; the CONFIDENCE is. Resolve the step count by instrumenting it before scoping anything from these per-step figures (`ISSUE-LOCAL-01M2DJ8Y4DFQMDG9GMWEK93142`).
+W6 removed the per-step ADAPTER rebuild and its 378 allocations; something still
+frees ~68 objects per step. The candidates are the pooled `DBuf` lifetimes in the
+MoE and attention paths and any `ResidentWeight` whose `d_dev` still does not
+memoise. THIS IS NOT A CLAIM ABOUT WHICH -- it is the measurement that says the
+question is open, and it is the first thing the next row should resolve, because
+a 634 us free is itself anomalous.
+
+`cudaLaunchKernel` is 1,349,118 calls over **527** steps = **~2,560 per step** at
+4.8 us, so **~12.3 ms per step** of launch overhead. (The "~1,750 per step at
+~8.4 ms" first written here used the wrong step count; corrected 2026-09-13.) That is the number W8 exists to attack,
+and it is now ~11% of the step rather than 0.5% of it.
+
+**Owed.** A per-step attribution for the `cudaFree` population, before any row
+scopes a fix for it. Do not scope from this paragraph alone.
+
+### W9 scope: give the QSA pass-2 dot product more than one thread
+
+Owned by `.agents/issues/MODEL-MM-QWEN4-EXP/ISSUE-LOCAL-01M2DJ8Y4DFQMDG9GMWEK93142.md`,
+whose ATTRIBUTED section carries the measurement this scope is built on. That
+attribution is the precondition the issue itself demanded before a fix was
+scoped; do not scope further QSA work from this section without re-measuring.
+
+**What is wrong.** `QsaGatherAttentionKernel` (`src/vt/cuda/cuda_qwen4_exp_qsa.cu`)
+runs two passes over the gathered KV rows. Pass 1 (`:455-478`) computes, for every
+selected key `s`, the dot product `q . k_s` -- and it spreads those keys across the
+block, `for (s = threadIdx.x; s < selcount; s += blockDim.x)`, because the softmax
+max it feeds is associative and commutative and may be reduced in any order. Pass 2
+(`:503-540`) then walks the SAME keys again in tiles of `kSelTile = 32` and
+**recomputes the identical dot product inside `if (threadIdx.x == 0)`** -- on one
+lane of a 256-thread block -- because the softmax denominator it feeds must be
+accumulated in ascending `s`.
+
+Measured on `thor:gpu0` (sm_110) 2026-09-13: **86.4% and 88.8%, in two independent
+runs, of the whole kernel's time is those lines.** Every selected key is dotted
+twice, and the second time is serial.
+
+**Why the obvious objection does not apply.** The kernel's own comment at
+`:500-501` rejects splitting pass 2 across threads: "Thread 0 walks `s` in order
+and accumulates `denom` in order", and a tree reduction of `denom` would
+reassociate the sum and break the bit relation to the CPU arm that this row's
+goldens hold. That objection is about the SUM OVER `s`. It says nothing about the
+dot product over `d` INSIDE one `s`, which is a self-contained sequential
+ascending f32 accumulation whose value does not depend on which thread runs it.
+
+**The fix.** Distribute the tile's dot products one whole dot per thread, and
+leave the accumulation of `denom` exactly where it is.
+
+For each tile of `n <= kSelTile` entries:
+
+1. Thread `u`, for `u < n`, resolves `p` and `base` for `s = s0 + u` by the same
+   arithmetic the current thread-0 loop uses, walks `d` from 0 to `DH` in
+   ascending order with the same `__fmul_rn`/`__fadd_rn` pair, computes
+   `w = expf(__fsub_rn(__fmul_rn(dot, scale), m))`, and writes `s_wtile[u]` and
+   `s_ptile[u]`. The `base < 0` poison path keeps its current behaviour
+   (`s_bad = 1; s_wtile[u] = 0.0f; s_ptile[u] = -1;`).
+2. `__syncthreads()`.
+3. Thread 0 alone walks `u` from 0 to `n` ASCENDING and folds `s_wtile[u]` into
+   `s_denom` with `__fadd_rn` -- the same values, in the same order, into the same
+   accumulator. Nothing here reassociates.
+4. The value accumulation into `acc[d]` is untouched.
+
+**The barrier count does not change, and the implementer should not add one.**
+Today the tile body is: thread 0 writes `s_wtile`/`s_ptile`, `__syncthreads`, the
+block reads them for the value accumulation, `__syncthreads`. After the change it
+is: threads `u < n` write, `__syncthreads`, thread 0 folds `denom` (a READ of
+`s_wtile`) while the block does the value accumulation (also a read),
+`__syncthreads`. Two barriers before, two after. Concurrent reads of `s_wtile` are
+not a hazard; the trailing barrier is what keeps the next tile's writes off them,
+and it is already there.
+
+The `reads` counter moves from thread 0 to the thread that performs the read; the
+block reduction at the end of the kernel already sums per-thread counts, so the
+total is unchanged. `s_bad` is already written racily by pass 1 from many threads
+with the same value, so the new writers introduce no new shape.
+
+**This is a bit-identity-preserving change, and the spec asserts it as the bar.**
+Every float the kernel produces must be unchanged, bit for bit, on every fixture
+the existing suites carry -- not a tolerance. That is the whole argument for
+choosing this lever over the tree reduction the author already declined.
+
+**Why it will work, stated from something already measured rather than predicted.**
+Pass 1 performs exactly the same total dot-product work, with exactly the same
+per-thread memory pattern (each thread walking one whole `DH`-long key row), over
+exactly the same rows -- and pass 1 is inside the 11-14% remainder. The kernel
+therefore already contains a measurement of the proposed access pattern at full
+block width. The change makes pass 2 do what pass 1 demonstrably does cheaply.
+
+**Prediction, written before the work starts, in the W7 style.** With `kSelTile`
+unchanged at 32, the serial dot is spread over 32 threads. If pass-2 dot is 87% of
+the kernel and the remainder is 13%, the kernel goes to `87/32 + 13 = 15.7%` of its
+current cost, i.e. **~6.4x ON THE KERNEL**. Measure it on the kernel, at the
+released shape the attribution used (`T=1, HQ=24, HKV=2, DH=256, CR=4,
+block_topk=512`, `|sel| = 2048`), and record the measured value against ~6.4x
+without adjusting the prediction.
+
+**AND DO NOT TURN THAT INTO A STEP TIME BY DIVIDING IT INTO 77.8 ms.** An earlier
+revision of this section did, and it was wrong. See "### W9: the two numbers this
+row kept dividing into each other" below, which is the correction and is the part
+to read before quoting any QSA figure anywhere.
+
+**The step count is RESOLVED, and by arithmetic rather than by instrumenting
+it** -- see the correction section below. It is 527, the window's step was 113.9 ms
+and not 77.8 ms, and the 1.46x "disagreement" was two different context lengths.
+
+Raising `kSelTile` above 32 is IN SCOPE only if it is measured, and it is bounded
+by `blockDim.x` (`BlockWidthFor(DH)`), which is 256 at the released config but is
+`DH` rounded up to a warp in general -- a tile wider than the block leaves entries
+with no thread. `s_ptile` is a fixed `__shared__ int64_t[kSelTile]` and `s_wtile`
+comes out of the dynamic allocation sized at `:610-611`; both must move together
+with the constant. The default stays 32 unless a measurement on `thor:gpu0` says
+otherwise.
+
+### W9: the two numbers this row kept dividing into each other
+
+**The defect in this row's own prose, found 2026-09-13 while dispatching W9.**
+The QSA per-launch cost and the decode step time were measured on DIFFERENT
+WORKLOADS, and several paragraphs above -- including the first revision of the W9
+prediction and the post-W7 re-rank's per-step figures -- divided one into the
+other. Every quantity below is corrected here rather than edited in place, because
+the wrong readings were published and a reader who saw them needs to find the
+refutation, not a silently different number.
+
+**The two workloads.**
+
+| | the nsys profile | the A/B harness | the sojufx reference |
+|---|---|---|---|
+| generated | 3,000 tokens, window `[150 s, 210 s]` | **16 tokens** | 400 tokens |
+| context during measurement | ~1,300-1,900 | **~36** | ~20-420 |
+| what it produced | `2.545 ms` per QSA launch, the 34.5% rank | **`77.8 ms` step, 12.85 tok/s** | 66.17 tok/s |
+
+`QsaGatherAttentionKernel`'s cost is proportional to `|sel|`, which is
+`min(kv_len, block_topk * CR)` -- 2048 at the released config. So `|sel|` is ~1600
+in the profile window and **~36** in the A/B: the same kernel doing 44x less work.
+`12 x 2.545 ms = 30.5 ms` is therefore a share of the PROFILE's step, and nothing
+at all to do with the A/B's 77.8 ms.
+
+**Per decode step, by context:**
+
+| `\|sel\|` | workload | QSA per step |
+|---|---|---|
+| 1600 | nsys window | **30.5 ms** |
+| 220 | 400-token reference, mid-run | **4.2 ms** |
+| 36 | the 16-token A/B | **0.69 ms** |
+
+**THE STEP COUNT IS RESOLVED AT 527, AND THE OTHER FIGURE IS ARITHMETICALLY
+IMPOSSIBLE.** `ISSUE-LOCAL-01M2DJ8Y4DFQMDG9GMWEK93142` left it open between 527
+(from 6,319 instances / 12 QSA layers) and 771 (from `60 s / 77.8 ms`), and said
+to instrument it. Instrumenting it is no longer necessary:
+
+- QSA is 34.5% of GPU kernel time and 16.079 s of the window, so total GPU kernel
+  time in the window is `16.079 / 0.345 = 46.6 s`, i.e. 77.7% of the 60 s.
+- At 527 steps that is **88.5 ms of GPU kernel inside a 113.9 ms step** -- 77.7%
+  busy, consistent.
+- At 771 steps it would be 60.5 ms of kernel inside a 77.8 ms step, which also
+  reads as consistent -- **but 771 steps requires the window's step to BE 77.8 ms,
+  and 88.5 ms of measured kernel cannot fit inside 77.8 ms of wall.** The
+  derivation assumed the short-context step held at long context, and it does not.
+
+So the 1.46x disagreement was never an error in either count. It is the ratio
+between a 36-token context and a ~1600-token one, and the confidence that was
+retracted can be restored to the 527 reading specifically.
+
+**What this does and does not overturn.**
+
+- **W9's fix is untouched.** Pass 2 recomputing on one lane is 86-89% of that
+  kernel at any context; the head_dim-sweep attribution that established it never
+  used the step time. The ~6.4x prediction is a KERNEL prediction and stands.
+- **W9's end-to-end value is much smaller than the first revision claimed**, and
+  it depends on context. At the 400-token reference workload QSA is ~4.2 ms of the
+  step, so W9 is worth roughly 3.6 ms, a few percent -- not the ~26 ms and ~19
+  tok/s that were written here. On the 16-token A/B it is under 1 ms and will not
+  be visible above the noise. **A flat A/B result on that harness does not falsify
+  W9**, and W9 must not be gated on one.
+- **The post-W7 re-rank ranks the PROFILE's workload, not the reference's.** QSA
+  is #1 at ~1600 tokens of context. At 400 tokens it is ~4.2 ms of an ~81 ms step.
+  Nothing in that table transfers to the reference workload without rescaling by
+  `|sel|`, and the table should not be used to pick the next row until it is
+  re-measured at the workload the gap is quoted on.
+- **The `cudaFree` figures inherit the same correction, in the direction that
+  makes them larger per step.** At 527 steps the window's 52,130 calls are ~99 per
+  step at 634 us. Those are HOST costs that do not scale with context, so they are
+  ~99 per step at 400 tokens too -- against a step of ~81 ms. That makes the
+  allocator, not QSA, the leading candidate at the workload this row is judged on,
+  and it is what the next profile should be aimed at. **THIS IS NOT YET A CLAIM
+  THAT IT IS THE COST**: `cudaFree` is host API time which can overlap device
+  work, and the row still owes the per-step attribution `## Owed` already names.
+  It is the reason to measure there next, not a result. **AND IT IS NOT A REASON
+  TO ADD A CACHING ALLOCATOR**, which is what that sentence first invited: the
+  tree already has one. `DevicePool` (`device_pool.h:111-125`) never returns a
+  block to the driver, `qwen4_exp` routes its temporaries through it, and its own
+  `VT_POOL_BYPASS` lane is described as reinstating "the per-op
+  `cudaMalloc`/`cudaFree` sync storm this pool exists to remove". So ~99 frees a
+  step is not the cost of having no cache -- it is ~99 frees ESCAPING one, which
+  is a narrower and more surprising question.
+  **AND THE ESCAPE ROUTE IS NAMED, BY THIS ROW'S OWN `## Owed`.**
+  `vt::Qwen4ExpGatedResidual` takes a raw `cudaMalloc` per call
+  (`cuda_qwen4_exp.cu:496`, freed by the `FreeGuard` at `:504-506`), and
+  `qwen4_exp_forward.cpp` calls it unconditionally twice per layer (`:565`,
+  `:638`, both inside the loop at `:491`) plus once after (`:747`). At `L = 48`
+  that is **97 per step against 98.92 measured, a 1.9% residual** -- and at
+  634 us per free, **61.5 ms of the ~63 ms**. The same trace corroborates it from
+  the other side: `cudaMalloc` ran **52,143** times against `cudaFree`'s
+  **52,130** -- a strictly paired population differing by 13 over 60 s -- and the
+  whole cost is on the free: **633.69 us against 4.04 us, 157x**, because
+  `cudaFree` synchronises and `cudaMalloc` does not. **AND THAT NAMES A SMALLER
+  FIX THAN `## Owed` DOES:** the same trace has `cudaFreeAsync` at **1.30 us**
+  over 50,553 calls, so the stream-ordered pair is already carrying a comparable
+  population in this run at negligible cost, with no signature change and no
+  re-entrancy argument -- subject to TWO conditions, both already measured
+  elsewhere: the graph-capture interaction `cuda_mla_attn.cu:454` records, which
+  this row cares about because W8 exists to make capture possible; and
+  `ISSUE-LOCAL-01M2DW8CXYEWWMJSZZ6GRH48SZ` (`abaa79c43`), which measured
+  `DevicePool`'s uncapped retention driving `MemAvailable` from 58.2 to 13.8 GiB
+  in two minutes on GB10. **THOSE TWO FINDINGS PULL OPPOSITE WAYS** -- this one
+  says ~97 allocations a step should be in a pool and are not, that one says the
+  pool already retains more than the box can afford -- and the driver's
+  stream-ordered pool retains by default too, so "put it in a pool" is not on its
+  own an answer. THIS IS AN ARITHMETIC MATCH AND NOT A MEASUREMENT;
+  instrumenting the three call sites settles it in one run. See
+  `ISSUE-LOCAL-01M2DQHP2FWXHH7GTHB17QX53Q`, which also refutes a per-step `Drain`
+  as the source.
+
+**MEASURED 2026-09-13, AND THIS PARAGRAPH'S RESCALING IS RETIRED BY IT:** at the
+reference's own 400-token workload we run **13.0195 tok/s**, a **5.08x** gap, two
+runs 0.030% apart on `dgx:gpu0`. See "### THE REFERENCE MEASUREMENT, taken at
+last". The reasoning below is kept because it is why the measurement was taken;
+its ~12.3 tok/s and ~5.4x are a derivation and must not be quoted as a result.
+
+**AND THE COMPARISON TO sojufx IS ITSELF ON THE WRONG WORKLOAD.** The reference
+generates **400** tokens; this row's 12.85 tok/s was measured generating **16**.
+The two are not the same benchmark, and "5.2x" is a ratio between them. Rescaled to
+the reference's workload -- adding the ~4.2 ms of QSA that 400 tokens of context
+costs and that 16 tokens does not -- the step is ~81 ms and the rate is **~12.3
+tok/s, a ~5.4x gap**. That is a small correction to the number and a large one to
+the method: this row cannot keep quoting a 16-token rate against a 400-token
+reference. **THE 400-TOKEN RATE IS OWED AS A MEASUREMENT** and the rescaling above
+is a derivation, not a result. The harness already accepts the token count; the
+next dgx window should spend part of itself on `max_tokens=400` with the
+reference's own prompt, so the headline ratio is finally one benchmark against the
+same benchmark.
+
+**The rule this row now carries.** Never quote a per-launch kernel cost and a step
+time from different runs in the same sentence. Never quote a rate against a
+reference that generated a different number of tokens. For an attention kernel whose work
+is proportional to context, the workload is part of the measurement, and a profile
+taken at 1,600 tokens does not describe a benchmark run at 400.
+
+### W9 OUTCOME, as landed at `054a8910c` (operator, 2026-09-13)
+
+**What landed.** Pass 2's tile evaluates one whole dot product per thread; only
+the sum over `s` stays on thread 0, so no reduction was reassociated. Four
+commits: the kernel change, the fold gate the review demanded, and two records.
+
+**The operator's gate, rerun on the final head `af417e4ee` rather than on the
+implementer's report** (`rc` job on `thor:gpu0`, sm_110, fresh clone, selected
+case count asserted for every suite):
+
+| suite | cases | assertions |
+|---|---|---|
+| `test_qwen4_exp_cuda_reductions` | 20/20 | **19,678** |
+| `test_qwen4_exp_qsa` | 14/14 | 7,263 |
+| `test_qwen4_exp_qsa_device` | 12/12 | 4,697 |
+| `test_qwen4_exp_cuda` | 12/12 | 351 |
+| `test_qwen4_exp_qsa_block` | **12/13** | 7,438/7,439 |
+
+The assertion count on the first suite went 213 -> 19,678, and that IS the
+repair: the fold gate now exercises the property W9 rests on. The fifth suite's
+single failure predates W9 and is measured to (`ISSUE-LOCAL-01M2E18YDQ8M5Y5P5SPFXD1D99`).
+
+**Speed: at least 3.62x on the kernel, measured by the operator.** See the
+subsection above; the naive 4.40x mean ratio is invalid because the fix arm runs
+three more instances. The implementer's 6.52x at the released `DH = 256`,
+`|sel| = 2048` shape is not contradicted and is not gated.
+
+**THE ROCm ARM IS COMPILED BY NOTHING, AND THAT WAS FOUND HERE.** W9's repair
+needed the probe field in `include/vt/ops.h` and handling in all three arms, so it
+touched `src/vt/rocm/rocm_qwen4_exp_qsa.hip`. `check-tree-compiles` reports
+`src/vt/cuda/cuda_qwen4_exp_qsa.cu` as "in scope that no target in this
+configuration compiles" and does not see the `.hip` at all, and the operator's
+gate is CUDA. So a typo in that file would have reached `main` unbuilt.
+`hipcc -fsyntax-only --offload-arch=gfx1151` on `strix:gpu0`, both arms, `rc=0`
+each, with different `.hip` sha256 proving the file really differs. **This is a
+standing gap, not a W9 one**: any change touching a `.hip` has the same exposure.
+
+**What the review changed, and why the FAIL was right.** The code was correct
+throughout; what failed was that its central claim was enforced by nothing. Two
+reassociations -- a descending fold, and the warp-shuffle tree this kernel's own
+header declines -- passed all three committed suites while demonstrably moving the
+output. Merging on "the code is correct" would have left the declined lever free
+to be added later with every gate green.
+
+### Out of scope for W9
+
+The narrow decode grid (24 blocks on 48 SMs) recorded in the issue's structural
+paragraph. The attribution REFUTED it as the dominant cost, and widening the grid
+is a separate change that cannot be justified from these numbers.
+
+### W9 gates
+
+1. `test_qwen4_exp_cuda_reductions` and the QSA device suites, green on
+   `thor:gpu0`. A doctest filter that selects zero cases exits 0; assert the
+   selected case count, never the exit code alone.
+2. **Bit identity, proven as a difference and not asserted as prose, and NO
+   EXISTING CASE GATES IT.** `test_qwen4_exp_cuda_reductions.cpp:37-46` holds
+   `Qwen4ExpQsaGatherAttention`'s CUDA arm to its CPU arm by a DERIVED BOUND, not
+   by equality, because the two spell `exp` differently. That bound is wide
+   enough to swallow a reassociated denominator, so a green run of that suite is
+   NOT evidence for this change -- it is the trap this gate exists to avoid. The
+   required comparison is CUDA-BEFORE against CUDA-AFTER: capture the gather's
+   full output for every QSA fixture at BASE `7a9020304`, capture it again at FIX
+   with the same binary configuration, and require the bytes to compare equal.
+   (`Qwen4ExpQsaCompress` is untouched by this change and its existing byte
+   equality stays green; do not confuse the two ops' bounds.)
+3. Red-first: the smallest test that fails for the intended reason, captured red
+   before the change.
+4. `compute-sanitizer --tool racecheck` over the QSA suite, 0 hazards, with the
+   control that a deliberately deleted `__syncthreads()` between step 1 and step 3
+   above reports hazards. A racecheck run with no positive control proves nothing
+   about the new barrier.
+5. `scripts/agent-preflight.sh` green.
+
+### W9 evidence required
+
+- The red capture, the focused green, and the full gate.
+- The bit-identity comparison, as the two captured byte streams and the compare.
+- The racecheck run AND its positive control.
+- **The kernel-level before/after IS the gate for this row's speed claim**, not
+  interim evidence. Measure `QsaGatherAttentionKernel` itself on `thor:gpu0` at the
+  released shape the attribution used, and report it against ~6.4x.
+- **The 16-token A/B harness the W6 and W7 rows used DOES NOT APPLY HERE**, and
+  running it would be the mistake the correction section names: at `|sel| = 36`
+  this change moves under 1 ms of a 77.8 ms step. A flat result on that harness is
+  not a W9 result in either direction. Do not gate W9 on it and do not quote it.
+- An end-to-end number is owed at LONG CONTEXT -- the workload where the 2.545 ms
+  was measured -- on `dgx:gpu0` when the box is healthy. `dgx:gpu0` has been
+  unhealthy repeatedly this session; `thor:gpu0` (build `sm_110`, never `121a`) is
+  the development target.
+- A re-rank `nsys` after it lands. The last two rows each overturned what was
+  planned next; assume this one does too.
+
+### W9 stop conditions
+
+- Any float changes. The bar is bit identity; a drift means the change is not the
+  one this spec scoped, and the finding is a stop, not a tolerance to widen.
+- Racecheck reports a hazard the positive control does not explain.
+- The measured speedup is below 2x on the kernel. That would falsify the
+  attribution, not the fix, and the attribution is what would then need redoing.
+
+### W8 scope: a device-resident arm for the k-quant MoE block
+
+Owned by `.agents/issues/QUANT-CUDA-GATES/ISSUE-LOCAL-01M2AAACGC0SXYXFN2JQ3GFEAZ.md`.
+Scoped from the dgx trace that ranked W6 and W7; re-rank against the CURRENT step
+before accepting any number here.
+
+**What is wrong.** `MoeBlock` (`qwen3_5.cpp:7178`) has three arms: NVFP4 fused,
+bf16 fused, and a "reference path" for everything else. A GGUF k-quant
+checkpoint has neither fp4 nor bf16 experts, so EVERY GGUF MoE model this tree
+serves takes the third. That arm copies the hidden state to host and
+synchronizes once per layer, downloads the router top-k, and makes three
+`KqGrouped` calls (`:6133-6145`) that each upload an activation, launch ONE
+grouped GEMM and `Download` an f32 result -- a blocking drain -- with the SwiGLU
+in a host loop between them, and the routed output assembled in a host
+`std::vector` before being uploaded again for the combine.
+
+**Why it is worth doing now rather than earlier.** When the decode step was
+3.95 s this was 1 ms of it. The trace measured `cudaStreamSynchronize` at 367
+calls and 0.001 s per step against 2.25 s of `cudaMalloc`, which is why W6 came
+first and why this issue was explicitly recorded as a CAPTURABILITY defect
+rather than a speed one. W6 removed the allocator and W7 removed the norm, so
+the step is now dominated by what is left, and the same trace counted **2,534
+`cudaLaunchKernel` per step at ~20 ms** -- 0.5% of a 3.95 s step and a much
+larger share of a ~100 ms one. The tree states the consequence at `:7191-7193`:
+the fused arms are "capturable", the reference path is "not the capture target".
+While the MoE block leaves and re-enters the device every layer, CUDA graph
+capture is impossible for the whole model.
+
+**No new kernels are required, and that is what makes this tractable.**
+`vt::MatmulBTQuantGrouped` already runs the three grouped GEMMs on device for the
+encodings the shipped artifacts use (`IsCuda32BlockKeepQuantSupported` covers
+IQ4_NL / Q5_0 / Q4_0; `IsCudaKeepQuantSupported` covers the Q8_K family).
+`vt::OpId::kMoeSiluMul` is registered on CUDA (`cuda_moe.cu:941`) with the
+signature this needs, `(Queue&, Tensor& out, const Tensor& a, const Tensor& b)`.
+`MoeRouterTopK` and the combine are already device ops. What is missing is an arm
+that keeps the intermediates on device BETWEEN them.
+
+**Design, and it is the bf16 arm's shape rather than a new invention.** Add an
+arm selected exactly where `MoeBlockBf16Cuda` is, under the same shape of
+condition that arm uses: the required ops registered, and a default-ON
+environment gate (`VT_MOE_KQ_FAST`, with `=0` restoring the reference loop for a
+same-binary A/B and as the correctness oracle). That gate is the precedent at
+`MoeBf16FastEnabled()` (`:909`) and it is what makes this reviewable: the
+reference path stays, and the new arm is compared against it rather than
+replacing it unobserved.
+
+**WHAT LANDED DIFFERS FROM THE PARAGRAPH ABOVE IN TWO WAYS, AND THIS SECTION
+RECORDS THE LANDED SHAPE RATHER THAN THE SCOPED ONE.** The commit argues each
+deviation; the spec is corrected here so that a reader is not told a shape was
+built that was not.
+
+*The name is `MoeBlockKqDevice`, not `MoeBlockKqCuda`.* The scoped name says
+CUDA and the arm does not: it asks `vt::OpRegistered(..., d.q.device.type)` for
+each op it calls, which is what `check-device-leakage.py` requires of this
+device-agnostic layer and what the bf16 arm above it already does. A `Cuda`
+suffix on a predicate that never names CUDA would be the wrong name for the
+code. The consequence is that the arm is live on every backend the three ops are
+registered on — CPU, CUDA, ROCm and Tenstorrent — which is why the suite gates
+three of those four and why the fourth is filed
+(`.agents/issues/QUANT-CUDA-GATES/ISSUE-LOCAL-01M2D7X94RTPJ453QGHYKQZPY8.md`).
+
+*There are SEVEN conditions, not three, and none of them is a device term.*
+Counted at `qwen3_5.cpp:7411-7415`, the predicate is NINE `&&`-joined terms:
+`!fp4`, `!w.expert_gate_kq.Empty()`, `T == 1`, three `vt::OpRegistered` calls
+(`kMatmulBTQuantGrouped`, `kMoeSiluMul`, `kCastBf16`), `Qwen35GroupedMoeEnabled()`,
+`MoeSelFpCalls() == 0` and `MoeKqFastEnabled()` — seven conditions if the three
+op-table questions are read as the one condition "the arm's ops are registered
+here", which is how the prose below groups them. An earlier version of this
+paragraph said FIVE and that was simply a miscount. Two of the extra ones are the
+arm's own preconditions: a non-empty keep-quant tower set, and `T == 1`, which is
+the broadcast's scope (below). The other two refuse an INVISIBLE FALLBACK rather
+than a defect. `Qwen35GroupedMoeEnabled()` is the
+existing grouped-vs-per-expert route switch and is already false when expert
+streaming was asked for, so taking this arm anyway would silently do neither.
+`MoeSelFpCalls() == 0` is the `VT_MOE_SEL_FP` tap, which reads host buffers this
+arm never materialises — an operator who armed the tap would otherwise get the
+fast arm and a silently empty tap. That term is load-bearing and it is gated by
+its own ctest registration (`test_qwen35_moe_kq_device_sel_fp`), because the tap
+count is cached in a process-static and cannot be armed from inside a case.
+
+The broadcast the grouped kernel already implements (`Pa == 1 && P > 1`,
+`cuda_quant_dot.cu`) means the routed activation need not be gathered on host at
+all when `T == 1`: the hidden is one row and every routed pair reads it.
+
+**The bar this must clear, stated before the work starts.** PER-PAIR BIT
+IDENTITY with the reference arm, not a tolerance. The bf16 arm's own comment
+claims exactly that of itself ("the fused output is per-pair bit-identical to
+it"), and the k-quant path has the same property available because both arms
+reach the same `kMatmulBTQuant` core with the same `eids` slice. A tolerance
+here would hide a routing or ordering defect, which is the class of bug this
+seam has produced before (#2249 item 4, the rank-3 tower that "matched" by
+shape).
+
+**THE LANDED BAR IS THAT, EXCEPT AT THE SwiGLU, WHERE IT IS ONE bf16 ULP.** The
+reference computes `Silu()` with `std::exp` and the device op computes it with
+`expf`, so identity is not this arm's to claim. It is also not something the
+block comparison can measure: a 1-f32-ULP move in `silu(g)` changes
+`bf16(silu(g)*u)` in 1.44e-5 of N(0,3) samples (288 of 20,000,000, measured), so
+the block fixture's 96 SwiGLU elements would pass with probability ~0.9986
+against a kernel that disagreed on every input. The step is therefore gated AT
+THE OP, over 2^22 pairs per backend, against the reference arm's own host
+formula, with the observed disagreement count printed on the green run. The CPU
+sweep must be EXACTLY equal, because `cpu_ops.cpp:733` is that same formula.
+
+*The device `expf` IS THE ORACLE'S OWN SPELLING, and that — not a local
+precedent — is why this arm is default-ON.* An earlier version of this section
+justified the deviation by citing `cuda_moe.cu:823-827`, which calls it an
+ACCEPTED deviation. That is a fact about THIS tree and it is the wrong argument:
+a default-ON, token-visible change cannot rest on our own precedent. The oracle
+settles it. vLLM's `silu_kernel` is
+`return (T)(((float)x) / (1.0f + expf((float)-x * alpha)));`
+(`csrc/libtorch_stable/activation_kernels.cu:158`, anchored in this tree at
+`.agents/specs/vt-act-round-polarity.md:90`), and `expf` there is the CUDA
+device `expf` — the same function `vt::MoeSiluMul` calls
+(`src/vt/rocm/rocm_moe_router.hip:24`, `Silu(float x) { return x / (1.0f +
+expf(-x)); }`, whose own comment quotes that upstream line at `:44-45`). The
+host `std::exp` in the reference arm is OUR artifact, introduced by a host loop
+vLLM does not have. So this arm does not move AWAY from the oracle at the
+SwiGLU; it moves TOWARD it, and the one-ULP band is the distance between our
+host reference and the oracle rather than the distance between this arm and
+correctness.
+
+*The bf16 precedent is default-ON on a WEAKER claim than this one.*
+`MoeBlockBf16Cuda` ships default-ON behind `MoeBf16FastEnabled()`
+(`qwen3_5.cpp:909-915`) and its header states only that each output row "stays
+within the near-tie band of the reference path it replaces"
+(`qwen3_5.cpp:6883-6884`) — a band it measured nothing against. This arm makes
+the same trade with a measured bound and an oracle anchor, so default-ON here is
+strictly better supported than a default that already ships.
+
+**Tests.** A red-first case that fails for the intended reason: run one MoE
+block through both arms on the same inputs and assert byte equality of the
+routed output, with the new arm forced on and off by the gate. The red must come
+from the ARM SELECTION, not from a numerical bound -- a test that only checks
+tokens cannot see this, exactly as it could not see W6.
+
+**What landed is `tests/vllm/models/test_qwen35_moe_kq_device.cpp` plus four
+ctest registrations of it:** the default one, `..._ref` with `VT_MOE_KQ_FAST=0`,
+`..._sel_fp` with `VT_MOE_SEL_FP=4096`, and `test_rocm_qwen35_moe_kq_device`,
+which runs the same binary filtered to its ROCm cases. Arm selection is read
+through the `vllm::MoeKqDeviceCalls()` probe on CPU, CUDA and ROCm; the SwiGLU
+sweep above is in the same file on the same three; Tenstorrent is unreached and
+filed.
+
+*The fourth registration exists because the documented ROCm gate is a NAME
+filter.* `docs/ROCM.md:24` runs `ctest --test-dir build-hip -R
+'rocm|cross_device'`, and none of the first three names carries either token, so
+the ROCm cases never ran in the lane a ROCm operator is told to run — while the
+arm is DEFAULT-ON on ROCm and `strix:gpu0` (gfx1151) is a live fleet device. A
+doctest filter that selects nothing exits 0, so that registration also carries
+`FAIL_REGULAR_EXPRESSION "test cases: +0 [|]"`, which reddens a zero-selection
+run rather than letting a renamed case turn it into a green that measured
+nothing.
+
+*The SwiGLU sweep asserts a disagreement RATE as well as a magnitude.*
+`worst_ulp <= 1` bounds how far a disagreement goes and says nothing about how
+many elements disagree. MEASURED on `thor:gpu0`: with `MoeSiluMulKernel`
+multiplied by `1.001953125f` (1 + 2^-9, half a bf16 ULP) the CUDA sweep reports
+`disagreements=1510125 (3.600e-01) worst=1 bf16 ulp`, and the ULP bound PASSES
+while 36.0% of the op's outputs have moved. `kSweepMaxDiff` is therefore
+`kSweepN / 1024` (4,096 elements, 9.77e-04): ~455x above the measured 2.146e-06
+so that an unmeasured backend's `expf` has room, and ~369x below that 36.0%.
+Restored byte-for-byte afterwards (`cuda_moe.cu` back to
+`95930fec20051876525e951ade1b93e758f951f8357be608fa19b99ed04db2ba`), with the
+binary proved changed either side (`c766c68e…` mutant vs `16d1d4e3…` restored).
+
+**WHAT THE PER-ELEMENT RATE MEANS ON THE ARTIFACT THIS ARM SERVES.** The
+conversion above is onto the 96-element block fixture, which is the reassuring
+direction and not the production one. Qwen3.8-Flash-Next is 48 layers with a MoE
+block on every one, routed at top-10 into experts of `moe_intermediate_size =
+640` (this spec, `:18-20`, `:373`, `:1042`), so ONE decode token pushes
+`48 x 10 x 640 = 307,200` elements through `vt::MoeSiluMul`. At the measured
+2.146e-06 that is **0.66 perturbed elements per decode token**, each up to one
+bf16 ULP before the down GEMM's q8_0 activation quantizer; treating the sites as
+independent, about 48% of tokens carry at least one. This is a real, routine,
+per-token deviation from the reference arm and not a rounding curiosity — which
+is exactly why the sweep, and not the block fixture, is the instrument.
+
+**NOTHING IN THIS ROW GATES TOKENS.** The Gate below is ctest suites only; the
+arm has no token-exact run, on any artifact, on either arm of `VT_MOE_KQ_FAST`.
+The per-token figure above says what such a run would be measuring, and the row
+does not claim one. It is owed by
+`.agents/issues/QUANT-CUDA-GATES/ISSUE-LOCAL-01M2AAACGC0SXYXFN2JQ3GFEAZ.md`
+alongside the `nsys` A/B.
+
+**Gate.** `test_qwen4_exp_moe`, `test_qwen4_exp_moe_sel_fp` (the pair that pins
+the borrow identity, per the W6 review's M5), plus the qwen3_5 MoE suites, since
+`MoeBlock` is shared. The CUDA arm needs a lease; `test_qwen4_exp_hc_device` is
+NOT a device gate despite its name. These are ctest suites; see the paragraph
+above for what is NOT here.
+
+**Owed evidence.** An `nsys` A/B on `dgx:gpu0`, arms interleaved, reporting the
+per-step `cudaLaunchKernel` count and `cudaStreamSynchronize` count on both
+arms, not only tok/s. The launch count is the number that says whether graph
+capture became possible; tok/s alone would not distinguish this change from a
+kernel that merely got faster.
+
+**Out of scope.** CUDA graph capture itself -- this change makes it POSSIBLE and
+a separate row does it. The NVFP4 and bf16 arms. `KqResidentSlice` and the
+per-expert path, which stays as the `VT_QWEN35_GROUPED_MOE=0` fallback.
+
+### W7 scope: make the hyper-connection grouped norm fp32 and parallel
+
+Owned by `.agents/issues/MODEL-MM-QWEN4-EXP/ISSUE-LOCAL-01M2C8HBDD9VG6AJMPM9PTN80S.md`.
+Scoped AFTER W6 landed, against the 116.9 ms step W6 produced, never against the
+3.95 s one it retired.
+
+**Why this one next.** `nsys` ranks it: `HcGroupedNormKernel` is 40.7% of all GPU
+kernel time, 96 instances per decode step at ~435 us each, ~42 ms of a 101 ms
+kernel budget. With W6 landed the step is 116.9 ms, so this kernel is ~36% of a
+decode token.
+
+**The two defects, ANCHORED AT THE PARENT `49ffc61cf` because the fix has since
+landed and moved every line below.** `cuda_qwen4_exp.cu:258` launched ONE THREAD
+PER (token, hc stream), `GridFor(T * hc)` at `:402`. At `hc_count = 4` and decode `T = 1` that
+is FOUR threads on 48 SMs, each walking `H = 2560` twice, and the sum of squares
+accumulated in `double` (`:271-275`). Precision and parallelism are separable and
+both are in scope.
+
+**This is not a parity decision, and the spec says so rather than leaving it to
+the implementer.** `qwen4_exp_hc.h:99-104` already states the rule: the double is
+a HOST REFERENCE convention, "upstream runs the norm in fp32 and vLLM likewise",
+and "THE DEVICE ARM IS THE THING THAT MUST BE FP32-ACCUMULATE". The device arm is
+therefore the outlier, and moving it to fp32 moves it TOWARD the oracle.
+
+**The existing gates already admit the change, which is what makes it cheap.**
+The device arm is not held bit-exact against the CPU arm.
+`test_qwen4_exp_hc_device.cpp:76` gates the golden widths at `kTol = 1e-5`
+absolute; its model-width case at `:378` gates a RELATIVE `4e-5` (`:442`),
+documented
+there as "6.6x the sqrt(K)*u random-walk bound for K = 10240" -- a bound derived
+for FP32 unit roundoff, beside the sentence "because torch runs this in fp32
+too". A serial fp32 walk is ~sqrt(K)*u ~= 6e-6 relative; a block tree reduction
+is BETTER at ~sqrt(log K)*u. Both sit inside a bound this tree derived before W7
+existed. Do NOT widen either tolerance. If the change cannot meet them, that is a
+finding about the change, not about the bound.
+
+**WHICH FILE IS THE CUDA GATE, because an earlier draft of this section named the
+wrong one.** `test_qwen4_exp_hc_device.cpp` is the CPU ARMS' gate against the
+transformers goldens; its own head says "Nothing below runs on a device", so it
+executes none of this kernel and cannot hold it. The CUDA gate is
+`tests/vllm/models/test_qwen4_exp_cuda_reductions.cpp`. MEASURED on `thor:gpu0`
+(sm_110, CUDA 13.0.88): corrupting the `1 +` gamma fold in `HcGroupedNormKernel`
+reddens `test_qwen4_exp_cuda_reductions` at 7 of 18 cases, worst `max|diff|`
+0.868741 against its 1.95703e-06 bound (the grid-cap case), while
+`test_qwen4_exp_hc_device` stays SUCCESS at 11/11 cases over 516 assertions. The tolerances above still stand as the numerical
+contract; the file that enforces them on the device arm is the CUDA one. Run
+`test_qwen4_exp_hc_device` too -- as the CPU-arm gate that must not regress, not
+as evidence about the kernel.
+
+**Design.** One block per (token, hc) group; a block-wide reduction for the sum
+of squares in fp32; the normalize-and-write loop that follows is
+order-independent and parallelises across the block with no numerical question.
+The `1 +` gamma fold stays f32 and stays where it is (`49ffc61cf:288-290`, now
+`:357-363`) -- it is
+upstream's `1.0 + self.weight.float()` and #2218 records what dropping it looks
+like. `eps` stays INSIDE the rsqrt, added to the mean square, with the narrowing
+point unchanged.
+
+**Tests.** The red must come from the SHAPE rather than from the width: a case
+that fails because the kernel computed one group and broadcast it, or walked the
+wrong stride, is the one that discriminates a bad parallelisation. The CUDA cases
+live in `test_qwen4_exp_cuda_reductions.cpp` under the `CUDA W7:` names, and
+`test_qwen4_exp_hc_device.cpp` must stay green unmodified as the CPU arms' gate.
+
+**NO RED-FIRST WAS AVAILABLE, and this paragraph records why rather than letting
+the sentence above read as an unmet obligation.** The W7 fixture cannot be made
+to fail on the pre-change kernel. Both arms walk the group ASCENDING, the
+pre-change device arm accumulates in `double`, and at the fixture's synthetic
+inputs the pre-change kernel reproduces the CPU reference EXACTLY: an independent
+rebuild of the pre-change kernel against the new fixture measured `max|diff| = 0`
+on every case. A red-first case would therefore have to fail for the width, which
+is the one thing this change is allowed to move, and a case that fails on the
+correct kernel is not a gate.
+
+The discriminating evidence is a MUTATION BATTERY plus an in-gate separation
+probe instead. Four of the five kernel mutations redden
+`test_qwen4_exp_cuda_reductions`, and two of those four -- dropping the group
+grid stride and collapsing the cross-warp fold -- are invisible to every
+committed golden case, which is the property the new fixture exists for. The
+fifth (a trailing `__syncthreads()` on the group loop) is an EQUIVALENT MUTANT:
+the loop's two remaining barriers already order both cross-iteration shared
+accesses on a block-uniform trip count, `compute-sanitizer --tool racecheck` on
+the grid-cap case reports `0 hazards displayed` on the committed bytes, and
+adding the barrier back gives digit-for-digit identical output. The separation
+probe runs inside the gate and measures ONE defect, which is not a member of
+that battery and is not its floor either. It replays the model-width case with
+every group of token 0 forced to group 0's data, which is what a kernel that
+computed one group and broadcast the reciprocal `r` would produce
+(`test_qwen4_exp_cuda_reductions.cpp:1754-1783`), and it reports
+`ratio = 252555.5x` between THAT defect's signal and the case tolerance. So the
+discrimination band for a broadcast `r` is measured rather than asserted. It
+bounds no other defect, and nothing here makes it the smallest signal of the
+five mutations.
+
+**Owed evidence.** An `nsys` re-measurement on `dgx:gpu0`, same harness as the W6
+A/B (interleaved arms, one boot per arm, released UD-IQ1_S staged locally), giving
+the new per-step kernel share for this kernel and the new tok/s. The prediction to
+test, stated so it can be wrong: ~42 ms per step removed, a step near 77 ms, and
+~13 tok/s. Record what is measured, not this number.
+
+**Out of scope.** The CPU reference's double (it is the oracle these gates use),
+`vt::RmsNormGroup`, the PLE block's norms, and the cuBLAS `gemvx` path -- the
+latter is the NEXT item at 15.9% and gets its own row.
+
+### W7 measured on thor (sm_110), 2026-09-13: ~1.5x, and dgx came in later the same day
+
+**Harness.** An interleaved same-tree A/B on `thor:gpu0` (NVIDIA Thor, sm_110),
+one boot per arm, two rounds alternating BASE and FIX, the released
+`unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S staged to local disk, the server at
+`--max-num-seqs 1 --device cuda` with no other engine flag, a 16-token decode,
+and the median inter-token interval as the statistic.
+
+| arm | commit | round 1 tok/s | round 1 s/token | round 2 tok/s | round 2 s/token |
+|---|---|---|---|---|---|
+| BASE, the W7 parent | `49ffc61cf` | 4.6564 | 0.21372 | 4.9773 | 0.21430 |
+| FIX | `ac04275b8` | 7.3755 | 0.14542 | 7.2675 | 0.14629 |
+
+The median per-token interval goes 0.2140 s -> 0.1459 s. That is ~68 ms removed
+per token, about 1.5x. Peak resident memory is unchanged: `VmHWM` 77,361,940 kB
+on BASE against 77,355,492 kB on FIX. No arm printed `out of memory`,
+`bad_alloc`, or a CUDA error.
+
+**THE BYTES MEASURED ARE THE BYTES THAT LAND.** The A/B ran `ac04275b8`, which is
+an earlier revision of this same commit; the revision that carries this record is
+`d7e0e9cf2`. `git diff ac04275b8 d7e0e9cf2 -- src/` is EMPTY, and the only
+`tests/` difference is one comment block in
+`test_qwen4_exp_cuda_reductions.cpp`. Every later revision was prose and records.
+The rebase onto `43622bc37` then reproduced the commit's patch byte-for-byte:
+`git diff d7e0e9cf2^ d7e0e9cf2` and `git diff HEAD^ HEAD` are identical files.
+A measurement of `ac04275b8` is therefore a measurement of the executable bytes
+this row lands.
+
+**THIS WAS THOR, NOT DGX, AND THE DGX MEASUREMENT WAS OWED WHEN THIS WAS
+WRITTEN. IT WAS TAKEN LATER THE SAME DAY (`f97e8451a`) and the paragraphs below
+are kept as written rather than edited, because they were published.** On
+`dgx:gpu0`: 0.1177 -> 0.0778 s per token, 40 ms removed, **1.51x**, 8.50 -> 12.85
+tok/s. The prediction was met on all three axes. The owning issue
+(`ISSUE-LOCAL-01M2C8HBDD9VG6AJMPM9PTN80S`) is CLOSED (`685b856e0`). Read the
+"owed" and "OPEN" statements below as the state on the morning of 2026-09-13, not
+as the state of this row.
+
+Every other
+number in this row -- the 116.9 ms step, the 8.57 tok/s, the `nsys` kernel
+shares -- comes from `dgx:gpu0`, a GB10 at sm_121a. This one comes from
+`thor:gpu0` at sm_110, which is a slower box with a larger step. `dgx:gpu0` read
+`unhealthy (no contact)` across three separate outages on 2026-09-13, so the
+re-measurement against the 116.9 ms step could not be taken. Do NOT read the
+thor figure against the sojufx reference or against the W6 dgx numbers; they are
+different machines and the comparison is not defined.
+
+**THE 42 ms ATTRIBUTION IS NOT CONFIRMED BY THIS.** The `nsys` attribution that
+motivated W7 -- `HcGroupedNormKernel` at 40.7% of GPU kernel time, ~42 ms per
+step -- was measured on dgx. The 68 ms per token removed here was measured on
+thor, on a larger step. The direction and the rough magnitude agree. That is all
+they do. Nothing here confirms the 42 ms figure.
+
+**THE PREDICTION IS NOT RETIRED.** The W7 scope section above states the
+prediction so it can be wrong: ~42 ms per step removed, a step near 77 ms, and
+~13 tok/s. It was written for dgx and it has NOT been tested on dgx. On thor the
+step went 0.2140 s -> 0.1459 s. The prediction stands OWED a dgx measurement,
+and the owning issue stays OPEN for it.
+
+> **SUPERSEDED THE SAME DAY.** The dgx measurement was taken at `f97e8451a`:
+> 40 ms removed, a 77.8 ms step, 12.85 tok/s, against a prediction of ~42 ms,
+> ~77 ms and ~13 tok/s. The prediction is retired as MET, and the owning issue is
+> CLOSED. The paragraph above is the state before that run and is kept for
+> provenance.
+
+### W6 scope: hoist the MoE adapter onto the model
+
+Owned by `.agents/issues/MODEL-MM-QWEN4-EXP/ISSUE-LOCAL-01M2AA9C31GCSDV8NRW26GMEVS.md`.
+
+**Change.** `Qwen4ExpMoeBlockWeights` is composed inside the layer loop
+(`qwen4_exp_forward.cpp:673`). Build it ONCE per layer and hold it on the layer's
+weights, exactly as the GDN twin does at `:587` -- `if (!lw.gdn_block.has_value())
+lw.gdn_block.emplace(Qwen4ExpGdnBlockWeights(lw.gdn, p));`. Add the parallel
+`std::optional<MoeBlockWeights>` field beside `gdn_block` on
+`Qwen4ExpLayerWeights` and emplace it the same way. The seam, the config
+projection and `RunQwen4ExpMoeBlock` do not change.
+
+**Why it works.** `ResidentWeight` writes its residency memo (`d_dev`, and the
+host-alias decision) onto the handle it is given.
+`BorrowWholeOwnedTensor` carries every field EXCEPT `d_dev`, so a per-step
+adapter presents a null memo every step and every tower takes the
+`cudaMalloc`+copy arm again. A handle that outlives the step keeps the memo.
+
+**Three constraints the existing comments already state, and a reviewer must
+check each.** (1) `Qwen4ExpMoeBlockWeights` takes a NON-CONST reference and
+mutates it through `OwnedBytes::KeepAlive()`, so it is not a pure function of the
+layer and must not be re-evaluated per placement arm -- the existing code already
+builds it outside the placed body for this reason. (2) The pass-through must stay
+a BORROW. When the GDN adapter spelled the same thing as assignment,
+`OwnedTensor`'s implicit copy DEEP-COPIED ~115 MiB per linear layer per step and
+`ResidentWeight` then handed cuBLASLt a pointer into a buffer destroyed at the
+end of the layer -- `compute-sanitizer` reported it as `Warp illegal address`
+with every declared extent correct (#2476). (3) The hoisted handle must outlive
+every queued kernel that reads it, which holding it on the model satisfies and a
+function-local does not.
+
+**Reachability.** The call site is the production decode path
+(`ForwardQwen4ExpForConditionalGeneration` -> the layer loop), so the mutation
+the fresh reviewer owes is deleting the hoist's call site in a scratch copy and
+confirming the focused gate goes red.
+
+**Tests.** A red-first test that fails for the intended reason. The defect is
+"residency is re-established per step", so the test must observe the SECOND
+forward, not the first: assert that a second decode step over the same layer
+performs no new device staging. `vllm::load_stats::Snapshot().device_upload_bytes`
+is the counter that expresses it and `load_stats::Reset()` exists for tests.
+A test that only checks the output tokens CANNOT see this defect -- the tokens
+were always correct, which is why twelve waves of green gates never caught it.
+
+**Gate.** The row's C++ suite, plus the focused MoE and qwen4_exp tests. The
+speed claim is NOT a gate and must not be asserted from a unit test: it is
+re-measured on `dgx:gpu0` with the same harness as the profile above, by the
+operator, and recorded in `## Outcome`.
+
+**Out of scope.** `BorrowWholeOwnedTensor` itself. Carrying `d_dev` through the
+borrow would fix every caller at once and is the tempting change, but the memo
+records a DEVICE allocation whose lifetime is tied to the source handle, and
+copying that pointer into a second handle that can outlive it is how #2476's
+use-after-free was built. If a sweep of other per-step adapters is wanted it is
+its own row, with its own review.
+
+**Device residency changes, and that is the mechanism rather than a side
+effect.** The `d_dev` deleter that `ResidentWeight` installs
+(`include/vllm/model_executor/models/dense_attn_block.h:243`,
+`w.d_dev = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); })`) hangs off
+whichever handle was staged. Today that handle is the per-layer temporary, so
+the deleter runs at the end of each layer -- those are the 378 `cudaFree` calls
+per step the profile above measured. After the hoist the deleter hangs off a
+model-held handle, so every expert tower stays device-resident for the life of
+the model. Steady-state DEVICE footprint therefore moves from roughly one
+layer's towers to the whole set. That is exactly what makes the memo survive the
+step; it is not an incidental cost, and no correctness claim depends on it. The
+risk it creates is capacity, not tokens: on a unified-memory box a model whose
+host mapping and device allocations are both live could fail to fit, and such a
+failure would present as an allocation error rather than as a slow number. That
+risk was raised here before the fix was measured; the measurement below tested
+it and it did not materialise on this artifact.
+`AdoptDeviceBytesAsHost` is the lever that would collapse the host mirror onto
+the device block, and IT DOES NOT APPLY TO THIS ARTIFACT. Its first branch needs
+`w.mmap_src != nullptr && w.bytes.borrowed()`, and `OwnedTensor::mmap_src`
+(`include/vllm/model_executor/models/qwen3_5_weights.h:119`) has exactly one
+producer in the tree: `o.mmap_src = t.data;` at
+`src/vllm/model_executor/models/qwen3_5_weights.cpp:517`, inside
+`BorrowStTensorBytes` (`:491`), which takes an `StTensor` and is therefore the
+SAFETENSORS direct-upload path. `grep -rn '\.mmap_src\s*=' src/ include/`
+returns five hits and the other four are clears to `nullptr`. No GGUF path
+assigns it, which is what the tree comment at `:265-266` already states and what
+the header contract at `:112-118` turns on. The `MmapSrc(g, pol)` helper at
+`qwen4_exp_weights.cpp:123` is NOT that field: it returns a `const GgufFile*`
+whose only use inside `OwnGgufQuantBlocks` is `DropSpanResidency`, and the two
+share nothing but a name. So on a GGUF weight adoption returns early, the host
+mirror survives, and both copies are real.
+
+**The focused gate is NOT `test_qwen4_exp_layer_loop` alone.** It must include
+`test_qwen4_exp_moe` and `test_qwen4_exp_moe_sel_fp`. The reviewer's M5 mutation
+deep-copied all six expert-tower entries instead of borrowing them, and the new
+layer-loop file stayed fully green (470 of 470 assertions). The mutation was
+caught only by the pre-existing W5d-4 cases, whose assertion is the borrow
+identity itself -- `mw.expert_gate_kq.bytes.data() == s.w.gate_exps.bytes.data()`
+(`tests/vllm/models/test_qwen4_exp_moe.cpp:567`). The borrow guarantee with the
+largest blast radius, constraint (2) above and the whole of #2476, is pinned
+there and nowhere else.
+
+**The capacity risk was raised, measured, and did not materialise on this
+artifact.** The paragraph above predicted that the released UD-IQ1_S artifact
+would be held twice -- roughly 68 GiB of host mapping plus roughly 68 GiB of
+device allocations -- and that the failure would present as an allocation error
+rather than as a slow number. THAT PREDICTION IS FALSIFIED by the A/B below.
+Peak resident memory is unchanged within 0.006% on both boxes, steady-state
+resident memory is LOWER after the hoist, and no arm's server log contains
+`out of memory`, `bad_alloc` or `cudaErrorMemoryAllocation`. The mechanism is
+exactly as described -- the deleter moved from per-layer to model lifetime, and
+that is what makes the memo survive the step -- but the predicted consequence
+was wrong. What the measurement covers is ONE artifact (UD-IQ1_S, ~68 GiB) on
+TWO unified-memory boxes of 122-128 GB. It does not license a general claim
+that permanent device residency is free for every model and every checkpoint; a
+larger artifact, or a box with a discrete device memory pool rather than a
+unified one, is unmeasured and the axis stays open there.
+
+### W6 measured: 33.4x, on the nsys-predicted kernel floor (2026-09-13)
+
+Interleaved same-tree A/B. BASE is `3cafbcaf718816f8e60bde525d3c30bac1016a20`
+(the profile commit, no hoist); FIX is
+`72498897144afb4d7037e3c3f48a8c0f8b4f3223` (this change). Two rounds alternating
+BASE/FIX, one server boot per arm, released `unsloth/Qwen3.8-Flash-Next-GGUF`
+UD-IQ1_S staged to local disk, `--max-num-seqs 1 --device cuda` and no other
+engine flag, 16-token decode, median inter-token delta.
+
+| Box | Round | Arm | tok/s | s/token |
+|---|---|---|---|---|
+| `dgx:gpu0` (GB10, sm_121a) | 1 | BASE | 0.2570 | 3.88307 |
+| `dgx:gpu0` | 1 | FIX | 8.5655 | 0.11689 |
+| `dgx:gpu0` | 2 | BASE | 0.2570 | 3.88307 |
+| `dgx:gpu0` | 2 | FIX | 8.5816 | 0.11685 |
+| `thor:gpu0` (sm_110) | 1 | BASE | 0.2645 | - |
+| `thor:gpu0` | 2 | BASE | 0.3004 | - |
+| `thor:gpu0` | - | FIX | 4.9278 | - |
+
+**33.4x on `dgx:gpu0`, reproduced in both rounds.** TTFT falls from 9.0 s to
+1.23 s. The FIX arm's per-token spread across all 14 deltas is 0.1154-0.1180 s,
+so the two rounds are not averaging over a bimodal step. `thor:gpu0` confirms
+the direction on a second architecture; its BASE spreads 0.2645-0.3004 tok/s,
+which is why the ratio is quoted from `dgx:gpu0` only.
+
+**The measured step lands on the predicted floor, and THAT is what makes this a
+confirmed diagnosis rather than a lucky fix.** The nsys profile measured
+0.101 s of GPU kernel time per step against 3.69 s of allocator and copy time.
+If the allocator was the whole bill, removing it must leave a step at roughly
+0.10 s. The measured FIX step is 0.1169 s. The diagnosis, the fix and the trace
+agree, so the remaining 0.016 s is the host-side cost the allocator was hiding
+and is not an unexplained residue.
+
+**Memory, which is the axis the section above owed.** `VmHWM` is peak resident
+set size, read from `/proc/<pid>/status` of the server process.
+
+| Box | Arm | `VmHWM` (kB) | steady `VmRSS` (kB) |
+|---|---|---|---|
+| `dgx:gpu0` | BASE | 77,397,988 | 77,397,988 |
+| `dgx:gpu0` | FIX (round 1) | 77,402,288 | 43,977,844 |
+| `dgx:gpu0` | FIX (round 2) | 77,398,924 | 43,603,596 |
+| `thor:gpu0` | BASE | 77,304,396 | - |
+| `thor:gpu0` | FIX | 77,305,524 | - |
+
+Peak is identical within 0.006%, and steady-state resident set falls by roughly
+33.4 GB on `dgx:gpu0`. No arm logged `out of memory`, `bad_alloc` or
+`cudaErrorMemoryAllocation`. The predicted doubling is therefore not what this
+box does: the host mapping and the device block are not two independent 68 GiB
+charges against physical memory here, and the per-step staging BASE performed
+was itself resident cost that the hoist removes.
+
+### The decode-step profile, measured (2026-09-12, `dgx:gpu0`, `51c248190`)
+
+Everything in the section below this one was a hypothesis. This section is the
+measurement that ranks them, and it moves the answer off all of them.
+
+**Harness.** `dgx:gpu0` under an `rc` lease, GB10 `sm_121a`, the released
+`unsloth/Qwen3.8-Flash-Next-GGUF` UD-IQ1_S staged to LOCAL disk, server at
+`--max-num-seqs 1 --device cuda` and no other engine flag. Build: `Release`,
+`VLLM_CPP_CUDA_ARCHITECTURES=121a`, tests OFF. COMPILED FEATURE SET ASSERTED:
+`fa2` ENABLED for `[121a]` by the arch table but the FA2 manifest is `[]`,
+because CUTLASS headers are absent and the fetch is opt-in
+(`-DVLLM_CPP_CUTLASS_FETCH=ON`); `marlin-nvfp4` and `cutlass-nvfp4` resolve for
+`[121a]`. NONE OF THE THREE IS REACHABLE BY THIS MODEL: `qwen4_exp` registers
+only `kLinearAttention` (GDN) and `kQwenSparseAttention` (QSA), QSA has its own
+kernel (`cuda_qwen4_exp_qsa.cu`), FA2 lives behind `cuda_paged_attn.cu` /
+`cuda_ops.cu`, and Marlin/NVFP4 are fp4 paths while this artifact is GGUF
+k-quant. The trace confirms it: no FA2 and no NVFP4 kernel appears.
+
+**The speed, reproduced.** 0.25 tok/s, across four server boots and 150+ tokens:
+3.99, 4.00, 4.05, 3.95 s per token, every individual delta inside 3.81-4.23 s.
+The published 0.25 was not an artifact of a truncated stream; it is the steady
+state.
+
+**It is inside the forward.** `VT_ENGINE_STEP_LOG=1`: every token-producing step
+is `model_executed=1` with `elapsed_s` 3.81-4.01, and every other step returns
+in 0.000 s. 26 steps, 20 of which ran the model. Prefill of a 35-token prompt is
+ONE step of 8.9 s, which is the TTFT. No timer, no poll, no stall.
+
+**Where the forward goes.** `nsys`, 60 s window bracketing ~15.2 steady-state
+decode steps, report written to LOCAL disk (the sqlite export fails on the CIFS
+mount with "database is locked" and leaves a report with no `StringIds` table,
+which `nsys stats` then reports as SKIPPED -- a failed export that reads like a
+measurement of nothing):
+
+| | total in window | per step | share |
+|---|---|---|---|
+| `cudaMalloc` | 34.195 s / 5,740 calls | 378 calls, **2.25 s** | 60.5% |
+| `cudaMemcpyAsync` | 12.542 s / 19,878 calls | 1,308 calls, **0.82 s** | 22.2% |
+| `cudaFree` | 9.416 s / 5,741 calls | 378 calls, **0.62 s** | 16.7% |
+| `cudaLaunchKernel` | 0.297 s / 38,006 calls | 2,534 launches, 0.02 s | 0.5% |
+| `cudaStreamSynchronize` | 0.016 s / 5,577 calls | 367 syncs, 0.001 s | ~0.0% |
+| ALL GPU KERNELS | 1.540 s | **0.101 s** | **2.6%** |
+
+Host-to-device traffic is 593,892 MB in the window -- 38 GiB per step over 846
+copies, the largest 471.859 MB, which is exactly one `[512, 640, 2560]` IQ4_NL
+expert tower.
+
+**97% of a decode token is the CUDA allocator and the copies it feeds. 2.6% is
+compute.**
+
+**The 378 allocations per step account for themselves exactly.** 48 layers x
+(3 expert towers + 3 shared-expert weights + router + shared gate) = 384. That
+is `Qwen4ExpMoeBlockWeights`, rebuilt inside the layer loop
+(`qwen4_exp_forward.cpp:673`), handing `ResidentWeight` fresh borrowed views
+whose `d_dev` is null every step, so every tower is `cudaMalloc`ed, copied,
+used and `cudaFree`d per step. A ~470 MB `cudaMalloc` costs 5.96 ms on average
+here and up to 30 ms. `Backend::Alloc` on CUDA is a plain `cudaMalloc`; the
+pooled `cudaMallocAsync` appears separately at 1,424 calls and is not this.
+
+**The fix has a landed precedent twelve lines away.** GDN had the identical
+defect and it was repaired under
+[#2476](https://github.com/mudler/vllm.cpp/issues/2476): `lw.gdn_block` is an
+`optional` built once and held by the model, and the comment there names the
+failure -- a per-step adapter "re-established residency every step". The MoE
+adapter is that bug, unfixed, on the same row.
+
+**What this retires.** Launch overhead is 0.5% and the real count is 2,534, not
+the withdrawn "~1,400". The MoE host round-trip costs 1 ms per step and is a
+CAPTURABILITY defect, not a speed one. Copy bandwidth is 22%, not the bill.
+"Weight aliasing over UMA" has the direction backwards: the weights DECLINE the
+alias (the residency instrument reads `declined_borrow=96.958 GiB` against
+`aliased_in_place=0.014 GiB`, because a GGUF mmap borrow owns no anonymous pages
+and `MakeHostBytesDeviceAliasable` refuses it by name) and are therefore STAGED,
+which is the expensive arm rather than the cheap one.
+
+**Two experiments that measured nothing, recorded so they are not repeated.**
+`VT_QWEN35_GROUPED_MOE=0` came out flat (4.05 vs 4.00 s) and was read as
+refuting the tower-staging hypothesis. It cannot test it: the per-expert arm
+reaches `KqResidentSlice`, whose first line is
+`ResidentWeight(d, w)` over the WHOLE tower before the pointer arithmetic, so
+both arms stage identical bytes. Separately, two `nsys` runs produced empty
+reports -- one exported sqlite onto CIFS, one had its profiler SIGKILLed by the
+harness's own shutdown, which writes no report at all.
+
+**The floor this implies.** Kernel time is 101 ms per token, and the top kernel
+is `HcGroupedNormKernel` at 40.7% (96 instances per step, ~435 us each, ~42 ms
+per token). A memoised adapter puts the step in the neighbourhood of the kernel
+floor; the exact landing point is NOT projected here, because removing the
+allocator can expose host-side cost it currently hides. Re-measure, do not
+assume.
+
+### Candidate causes, and what is actually known about each
+
+CORRECTED 2026-09-12
+(`.agents/issues/MODEL-MM-QWEN4-EXP/ISSUE-LOCAL-01M2AAC4XK43PJMEVTQVVDDS54.md`).
+The three entries below landed as "known bottlenecks explaining the gap" and as
+"causes identified". Two of them were readings of other people's comments, and
+the third was a derivation. They are hypotheses, and this section now says so
+beside each one. Nothing here has a profile behind it yet; the trace that would
+rank them is owed.
+
+1. **The GGUF k-quant MoE arm is host-mediated, and therefore uncapturable.**
+   STRUCTURE READ FROM THE SOURCE, COST NOT MEASURED. `MoeBlock`
+   (`qwen3_5.cpp:7178`) has three arms: NVFP4 fused, bf16 fused, and a
+   "reference path" for everything else. A GGUF k-quant checkpoint has neither
+   fp4 nor bf16 experts, so it takes the third, which copies the hidden state
+   to host and synchronizes once per layer (`:7211-7213`), downloads the router
+   top-k (`:7225-7226`), and makes three `KqGrouped` calls (`:6133-6145`) that
+   each upload, launch one grouped GEMM and `Download` the f32 result, with the
+   SwiGLU in a host loop between them. The tree states the consequence at
+   `:7191-7193`: the fused arms are "capturable", the reference path is "not the
+   capture target". So the missing decode graph is not a `qwen4_exp` property —
+   it is a property of the whole GGUF MoE lane, and it is the corrected form of
+   what entry 2 below used to claim. Filed as
+   `.agents/issues/QUANT-CUDA-GATES/ISSUE-LOCAL-01M2AAACGC0SXYXFN2JQ3GFEAZ.md`.
+2. **The MoE weight adapter is rebuilt per layer per step, and the rebuild drops
+   the device-residency memo.** STRUCTURE READ FROM THE SOURCE, COST NOT
+   MEASURED, AND THE TWO POSSIBLE COSTS DIFFER BY ORDERS OF MAGNITUDE.
+   `qwen4_exp_forward.cpp:673` composes `Qwen4ExpMoeBlockWeights` inside the
+   layer loop, and `BorrowWholeOwnedTensor` (`qwen3_5_weights.cpp:340-368`)
+   carries every field except `d_dev`. Whether the resulting re-derivation costs
+   a cheap alias re-test or a full re-upload of the tower turns on a 256-byte
+   alignment test (`qwen3_5_weights.cpp:252`) that source inspection cannot
+   decide. Filed as
+   `.agents/issues/MODEL-MM-QWEN4-EXP/ISSUE-LOCAL-01M2AA9C31GCSDV8NRW26GMEVS.md`.
+   The `#2336` citation this section used to carry is wrong and is withdrawn:
+   #2336 is the PLE block, its gate op and the layer loop, and its one
+   `ResidentWeight::d_dev` remark is about the GDN adapter.
+3. **Weight residency over UMA.** DERIVED, NOT READ. "~136 GB working set" is
+   an inference from the ~68 GB artifact and a doubling, not a measurement of
+   this process; `DeviceStagingFits` is the predicate that decides whether the
+   weights stage or stay aliased, and nobody read its answer on this run.
+
+WITHDRAWN: "each decode step launches ~1,400 kernels, versus 1 for
+`Qwen3.5ForCausalLM`". Nobody counted this tree's launches. The number is a
+misreading of `qwen3_5.cpp:1096`, which says `ResidentWeight` "re-enters the
+alias branch about 1,361 times per decode step" — weight-residency calls, on a
+different checkpoint, in qwen3_5's host-alias instrument. A launch count needs a
+profiler and no trace was taken.
+
+None of these is a ceiling, and the first two are ordinary implementation
+defects with named fixes.

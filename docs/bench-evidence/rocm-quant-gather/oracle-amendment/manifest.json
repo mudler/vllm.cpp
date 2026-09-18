@@ -1,0 +1,139 @@
+{
+  "row": "BACKEND-ROCM-QUANT-GATHER",
+  "issue": 3093,
+  "files": [
+    {
+      "file": "v3-primary-model-v3-command.json",
+      "source": "/home/vikash/.cache/rdna3-gather-impl/primary-model-v3/primary-model-v3-command.json",
+      "bytes": 5350,
+      "sha256": "cd76a5f310854b53987785e0904c8c4292020895bf17ccf9802642698ef7ac24"
+    },
+    {
+      "file": "v3-operator-receipt.json",
+      "source": "/home/vikash/.cache/rdna3-gather-impl/primary-model-v3/operator-receipt.json",
+      "bytes": 5978,
+      "sha256": "86cfba400a657b43ca20f3475e86477ce6e0b0fc5be82ecb6216e98ae50ceb55"
+    },
+    {
+      "file": "v3-operator-run.log",
+      "source": "/home/vikash/.cache/rdna3-gather-impl/primary-model-v3/operator-run.log",
+      "bytes": 25773,
+      "sha256": "c86ac57fd7e6aeb51f8035430bb67cc9bf2e46981c9d55e71993a1fc2a3cc44f",
+      "archive": "../oracle-amendment-raw-captures.tar.gz",
+      "member": "v3-operator-run.log"
+    },
+    {
+      "file": "v3-report-p0-r0.json",
+      "source": "/home/vikash/.cache/rdna3-gather-impl/primary-model-v3/report-p0-r0.json",
+      "bytes": 3862,
+      "sha256": "d9a936fa8196fe117b2291b5cd275fb66c793da2176a7b7b3b93ea8175095eb4"
+    },
+    {
+      "file": "v3-driver.diff",
+      "source": "/home/vikash/.cache/rdna3-gather-impl/primary-model-v3/driver.diff",
+      "bytes": 1372,
+      "sha256": "de80d56a7cddd4d9e6d528a9870905b3bdd4bb953f5ed736e7e488cebdd5b03b",
+      "archive": "../oracle-amendment-raw-captures.tar.gz",
+      "member": "v3-driver.diff"
+    },
+    {
+      "file": "v3-preparation-manifest.json",
+      "source": "/home/vikash/.cache/rdna3-gather-impl/primary-model-v3/preparation-manifest.json",
+      "bytes": 1823,
+      "sha256": "c1608e55ae4caf123a7751eb322826e19574aa5d2b1b4af5721951c54568b297"
+    },
+    {
+      "file": "v4-primary-model-v4-command.json",
+      "source": "/home/vikash/.cache/rdna3-gather-impl/primary-model-v4/primary-model-v4-command.json",
+      "bytes": 5546,
+      "sha256": "1bba00a4b17f63f43ac5e194dd7b47e10a291daca8c74492980acbc4075e569e"
+    },
+    {
+      "file": "v4-operator-receipt.json",
+      "source": "/home/vikash/.cache/rdna3-gather-impl/primary-model-v4/operator-receipt.json",
+      "bytes": 6174,
+      "sha256": "2f912bbfdea21afccb379688254b2cae688d667707ae1b52e21ef64427920757"
+    },
+    {
+      "file": "v4-operator-run.log",
+      "source": "/home/vikash/.cache/rdna3-gather-impl/primary-model-v4/operator-run.log",
+      "bytes": 19635,
+      "sha256": "1e207fc76cb0bbeb91996e8f17bbf5d473ea3d8d0679a3c7c357aa740513525b",
+      "archive": "../oracle-amendment-raw-captures.tar.gz",
+      "member": "v4-operator-run.log"
+    },
+    {
+      "file": "v4-report-p0-r0.json",
+      "source": "/home/vikash/.cache/rdna3-gather-impl/primary-model-v4/report-p0-r0.json",
+      "bytes": 3963,
+      "sha256": "36e0aac4fe51dd4a7c8c83fc108c318dd3cceb8f474382f2d5c1ce822a837d7b"
+    },
+    {
+      "file": "v4-driver.diff",
+      "source": "/home/vikash/.cache/rdna3-gather-impl/primary-model-v4/driver.diff",
+      "bytes": 1346,
+      "sha256": "7051f78db7461150b006cd7c0f848561ff1ad0863fb232ab3cc874b411030348",
+      "archive": "../oracle-amendment-raw-captures.tar.gz",
+      "member": "v4-driver.diff"
+    },
+    {
+      "file": "v4-preparation-manifest.json",
+      "source": "/home/vikash/.cache/rdna3-gather-impl/primary-model-v4/preparation-manifest.json",
+      "bytes": 1823,
+      "sha256": "fe68b9440c39063253617d9f2f7cbb1ade30ea42c2e038525b4fe1dadcb98787"
+    },
+    {
+      "file": "v5-primary-model-v5-command.json",
+      "source": "/home/vikash/.cache/rdna3-gather-impl/primary-model-v5/primary-model-v5-command.json",
+      "bytes": 5953,
+      "sha256": "1b9e29f87824b0afbe7ee9c8b9b8ed3937ff921dc1b6842439a8846b6c790a5a"
+    },
+    {
+      "file": "v5-operator-receipt.json",
+      "source": "/home/vikash/.cache/rdna3-gather-impl/primary-model-v5/operator-receipt.json",
+      "bytes": 6601,
+      "sha256": "43233373d0197d1676c3ef7c43fdfeb921a72013015d4fd7d66e0769326cb3cf"
+    },
+    {
+      "file": "v5-operator-run.log",
+      "source": "/home/vikash/.cache/rdna3-gather-impl/primary-model-v5/operator-run.log",
+      "bytes": 17621,
+      "sha256": "23ee581a3ee5f256a94673cd7ab8cea13585735f85b746bd1a97d1033ec55319",
+      "archive": "../oracle-amendment-raw-captures.tar.gz",
+      "member": "v5-operator-run.log"
+    },
+    {
+      "file": "v5-report-p0-r0.json",
+      "source": "/home/vikash/.cache/rdna3-gather-impl/primary-model-v5/report-p0-r0.json",
+      "bytes": 2878,
+      "sha256": "eeb8de007b4695a44635026d6505d1a7558c399031add202624745d411a32990"
+    },
+    {
+      "file": "v5-driver.diff",
+      "source": "/home/vikash/.cache/rdna3-gather-impl/primary-model-v5/driver.diff",
+      "bytes": 2806,
+      "sha256": "1b6fdcd88a5079a86a78219270024454cd05ba9156fb1aa02037642e4a6c2973",
+      "archive": "../oracle-amendment-raw-captures.tar.gz",
+      "member": "v5-driver.diff"
+    },
+    {
+      "file": "v5-preparation-manifest.json",
+      "source": "/home/vikash/.cache/rdna3-gather-impl/primary-model-v5/preparation-manifest.json",
+      "bytes": 1823,
+      "sha256": "a0fe212d93036bdba3932296b02d40f43c67b244a517e10cda31987df648f25e"
+    },
+    {
+      "file": "rope-cpu-probe-result.json",
+      "source": "/home/vikash/.cache/rdna3-gather-impl/primary-model-v4/rope-cpu-probe-result.json",
+      "bytes": 830,
+      "sha256": "4efcafae067c2decf115e7df4ad119ebe5daa3a603e0bc20fb001598f57bbecb"
+    }
+  ],
+  "archives": [
+    {
+      "file": "../oracle-amendment-raw-captures.tar.gz",
+      "bytes": 10002,
+      "sha256": "823e5a2b2909cb6b7b845b818ac15db9ca8115073df646b8ae8a00cbd270de96"
+    }
+  ]
+}

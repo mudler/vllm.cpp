@@ -7190,6 +7190,48 @@ TEST_CASE("minimax_h3: the SHIPPED VAE config.json files parse into the decoders
   }
 }
 
+// The HuggingFace video_vae ships a wrapper config (vae_clip_length,
+// vae_token_drop, latent_channels, latents_mean/std) and a source config
+// (vit_decoder_kwargs with heads, dim_head, num_layers, rope_theta,
+// rope_dim_ratio, plus z_channels, out_ch, time_down). A real deployment
+// merges them. The parser must resolve values from BOTH the flat wrapper
+// keys and the nested vit_decoder_kwargs.
+TEST_CASE("minimax_h3: video VAE config parser handles HuggingFace merged nested format") {
+  const nlohmann::json merged_json =
+      nlohmann::json::parse(vllm_test::kH3VideoVaeMergedConfigJson);
+  vllm::MiniMaxH3LatentStats merged_stats;
+  const vllm::MiniMaxH3VideoVaeDecoderConfig merged =
+      vllm::ParseMiniMaxH3VideoVaeDecoderConfig(merged_json, &merged_stats);
+
+  // Decoder architecture from nested vit_decoder_kwargs.
+  CHECK(merged.num_layers == 36);
+  CHECK(merged.block.heads == 32);
+  CHECK(merged.block.dim_head == 64);
+  CHECK(merged.block.dim == 2048);
+  CHECK(merged.block.ff_inner == 2048 * 4);
+  CHECK(merged.rope_theta == doctest::Approx(100.0));
+  CHECK(merged.rope_apply_dim == 48);
+
+  // Channel counts from alternative key names.
+  CHECK(merged.in_channels == 24);   // latent_channels (wrapper) or z_channels (source)
+  CHECK(merged.out_channels == 3);   // out_ch
+
+  // Temporal chunking from alternative key names.
+  CHECK(merged.clip_length == 17);   // vae_clip_length
+  CHECK(merged.token_drop == 3);     // vae_token_drop
+  CHECK(merged.vae_ratio_t == 4);    // prod(time_down) = 1*2*2*1*1*1
+
+  // Stats from wrapper.
+  CHECK(merged_stats.mean.size() == 24);
+  CHECK(merged_stats.std_dev.size() == 24);
+
+  // The parsed geometry must produce non-zero shapes — this is the bug
+  // that crashed E2E: with the wrapper config alone, heads=0 and dim_head=0
+  // gave zero-sized weight shapes.
+  CHECK(merged.block.dim > 0);
+  CHECK(merged.block.ff_inner > 0);
+}
+
 TEST_CASE("minimax_h3: the encoder GGUF loads KEEP-QUANT and fuses on QUANTIZED bytes") {
   // The encoder is 32B, so f32 materialization (~128 GB) does not fit the box we
   // test on; keeping the ggml blocks holds it at ~14.6 GB. The interesting claim is

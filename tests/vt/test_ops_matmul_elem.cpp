@@ -363,3 +363,64 @@ TEST_CASE("elementwise CPU GEMM: the forced tier is the tier that actually ran")
   }
   CHECK(selected == std::string(forced));
 }
+
+// Issue #2908: the scalar tails in every tier cast the weight pointer to
+// `const uint16_t*` and dereference it directly. When the weight buffer begins
+// at an odd byte address (which ElemRepackWeight can produce), UBSan catches
+// the misaligned load and aborts. vt::LoadUnaligned (memcpy) makes it safe.
+//
+// Tensor::Contiguous copies the weight into an aligned buffer before the
+// kernel sees it, so the high-level MatmulBT path can never deliver an odd
+// pointer. This test calls the kernel FUNCTION POINTERS from the tier table
+// directly with a 1-byte-front-padded weight buffer, which is the only way to
+// reach the misaligned dereference without a loader that produces one.
+TEST_CASE("elementwise CPU GEMM: odd-byte weight through kernel fn ptr (UBSan misaligned-load regression, issue #2908)") {
+  const auto& tier = vt::cpu::ElemGemmTier();
+  const int64_t k = 9;  // ragged K forces the scalar tail
+  const int64_t n = vt::cpu::kElemLanes;
+
+  Rng rng(98765);
+  std::vector<float> af(k);
+  for (int64_t i = 0; i < k; ++i) af[i] = rng.Uniform();
+
+  for (auto kind : {vt::cpu::ElemKind::kF16, vt::cpu::ElemKind::kBF16}) {
+    const int kind_i = static_cast<int>(kind);
+    const int64_t esz = 2;  // f16 and bf16 are both uint16_t
+    DType bdt = (kind == vt::cpu::ElemKind::kF16) ? DType::kF16 : DType::kBF16;
+
+    // Weight buffer with 1-byte front pad so the base address is odd.
+    std::vector<uint8_t> storage(static_cast<size_t>(n * k) * esz + 1, 0);
+    uint8_t* odd = storage.data() + 1;
+
+    // Fill weight with known values and keep an f32 reference.
+    std::vector<float> wref(static_cast<size_t>(n * k));
+    for (int64_t i = 0; i < n * k; ++i) {
+      const float v = rng.Uniform();
+      const uint16_t h = (bdt == DType::kF16) ? vt::F32ToF16(v) : vt::F32ToBF16(v);
+      std::memcpy(odd + i * esz, &h, static_cast<size_t>(esz));
+      wref[i] = (bdt == DType::kF16) ? vt::F16ToF32(h) : vt::BF16ToF32(h);
+    }
+
+    // bt kernel: acc[l] = sum_p af[p] * B[l*k + p]  (weight is [N,K])
+    {
+      std::vector<float> acc(n, -1.0f);
+      tier.bt[kind_i](af.data(), odd, k, acc.data());
+      std::vector<float> ref_acc(n, 0.0f);
+      for (int64_t l = 0; l < n; ++l)
+        for (int64_t p = 0; p < k; ++p)
+          ref_acc[l] += af[p] * wref[l * k + p];
+      CHECK(std::memcmp(acc.data(), ref_acc.data(), n * sizeof(float)) == 0);
+    }
+
+    // nk kernel: acc[l] = sum_p af[p] * B[p*n + l]  (weight is [K,N])
+    {
+      std::vector<float> acc(n, -1.0f);
+      tier.nk[kind_i](af.data(), odd, k, n, acc.data());
+      std::vector<float> ref_acc(n, 0.0f);
+      for (int64_t l = 0; l < n; ++l)
+        for (int64_t p = 0; p < k; ++p)
+          ref_acc[l] += af[p] * wref[p * n + l];
+      CHECK(std::memcmp(acc.data(), ref_acc.data(), n * sizeof(float)) == 0);
+    }
+  }
+}

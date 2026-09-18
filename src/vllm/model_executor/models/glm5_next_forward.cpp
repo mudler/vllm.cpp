@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/models/glm5_next_device.h"
 #include "vllm/model_executor/models/glm5_next_diag.h"
 #include "vllm/model_executor/models/glm5_next_dsa.h"
 #include "vllm/model_executor/models/glm5_next_moe.h"
@@ -49,6 +50,24 @@ namespace {
 bool DeviceExpertsOptedIn() {
   static const bool on = [] {
     const char* e = std::getenv("VT_GLM5_NEXT_DEVICE_EXPERTS");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+  }();
+  return on;
+}
+
+// W9c-3 — the full device-resident compose forward. This is a SUPERSET of the
+// W9c-3a experts split: it moves embedding, RMSNorm, MoE combine, the k-pool
+// indexer and lm_head onto the device in addition to the routed-expert GEMM.
+// When this is on, the entire forward delegates to `Glm5NextDeviceForward` and
+// the W9c-3a per-arm split below is not reached.
+//
+// `1` and nothing else, matching the experts latch polarity: this enables a
+// path whose numerics diverge from the host reference on a CPU queue (float vs
+// double accumulation), so it does not get the tree's usual "any first character
+// but 0" polarity.
+bool DeviceForwardOptedIn() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_GLM5_NEXT_DEVICE");
     return e != nullptr && e[0] == '1' && e[1] == '\0';
   }();
   return on;
@@ -258,6 +277,19 @@ std::vector<float> Glm5NextHostForward(const Glm5NextWeights& weights,
     Fail("the resolved config has hidden_size " + std::to_string(H) +
          " and vocab_size " + std::to_string(V) + "; both must be > 0");
   }
+  // --- W9c-3: THE DEVICE COMPOSE FORWARD -------------------------------------
+  //
+  // When `VT_GLM5_NEXT_DEVICE=1` is set, the entire forward delegates to
+  // `Glm5NextDeviceForward`, which routes the device-capable arms through `vt::*`
+  // ops and keeps MLA attention and mHC sites as host-fallback islands (the
+  // kimi_linear_device.cpp single-queue pattern). The dense MLP is on device
+  // via `vt::MatmulBT` + `vt::ClampedSwiGLU` + `vt::MatmulBT`. The W9c-3a
+  // per-arm experts split below is not reached.
+  if (DeviceForwardOptedIn()) {
+    return Glm5NextDeviceForward(weights, token_ids, logits_indices, queue,
+                                 caches, lm_head_chunk_bytes);
+  }
+
   // --- W9c-3a: THE DEVICE SPLIT ---------------------------------------------
   //
   // This forward used to refuse a non-CPU queue outright, and the refusal was

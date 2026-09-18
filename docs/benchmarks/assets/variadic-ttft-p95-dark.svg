@@ -1,32 +1,38 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 300" width="640" height="300" role="img" aria-labelledby="t d">
-<title id="t">p95 time to first token against concurrency</title><desc id="d">exllamav3's p95 time to first token grows steeply with load; vllm.cpp's stays nearly flat.</desc>
+<title id="t">p95 time to first token against concurrency</title><desc id="d">exllamav3's p95 time to first token grows steeply with load; vllm.cpp's rises more slowly.</desc>
 <line x1="92" y1="226.0" x2="600" y2="226.0" stroke="#33404e" stroke-width="1"/>
 <text x="82.0" y="230.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="end">0</text>
 <line x1="92" y1="178.0" x2="600" y2="178.0" stroke="#33404e" stroke-width="1" stroke-dasharray="2 3"/>
-<text x="82.0" y="182.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="end">12500</text>
+<text x="82.0" y="182.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="end">50000</text>
 <line x1="92" y1="130.0" x2="600" y2="130.0" stroke="#33404e" stroke-width="1" stroke-dasharray="2 3"/>
-<text x="82.0" y="134.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="end">25000</text>
+<text x="82.0" y="134.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="end">100000</text>
 <line x1="92" y1="82.0" x2="600" y2="82.0" stroke="#33404e" stroke-width="1" stroke-dasharray="2 3"/>
-<text x="82.0" y="86.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="end">37500</text>
+<text x="82.0" y="86.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="end">150000</text>
 <line x1="92" y1="34.0" x2="600" y2="34.0" stroke="#33404e" stroke-width="1" stroke-dasharray="2 3"/>
-<text x="82.0" y="38.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="end">50000</text>
+<text x="82.0" y="38.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="end">200000</text>
 <text x="22" y="130" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" text-anchor="middle" transform="rotate(-90 22 130)">p95 time to first token (ms)</text>
-<polyline points="92.0,208.2 346.0,142.3 600.0,51.6" fill="none" stroke="#3d92c8" stroke-width="2" stroke-linejoin="round"/>
-<circle cx="92.0" cy="208.2" r="5" fill="#3d92c8"/>
-<circle cx="346.0" cy="142.3" r="5" fill="#3d92c8"/>
-<circle cx="600.0" cy="51.6" r="5" fill="#3d92c8"/>
-<text x="103.0" y="228.2" fill="#3d92c8" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="start">4641</text>
-<text x="600.0" y="71.6" fill="#3d92c8" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="middle">45418</text>
-<text x="600.0" y="85.6" fill="#3d92c8" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="middle">exllamav3</text>
-<polyline points="92.0,189.6 346.0,186.0 600.0,183.4" fill="none" stroke="#cf7a34" stroke-width="2" stroke-linejoin="round"/>
-<circle cx="92.0" cy="189.6" r="5" fill="#cf7a34"/>
-<circle cx="346.0" cy="186.0" r="5" fill="#cf7a34"/>
-<circle cx="600.0" cy="183.4" r="5" fill="#cf7a34"/>
-<text x="103.0" y="177.6" fill="#cf7a34" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="start">9473</text>
-<text x="600.0" y="171.4" fill="#cf7a34" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="middle">11092</text>
-<text x="600.0" y="157.4" fill="#cf7a34" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="middle">vllm.cpp</text>
+<polyline points="92.0,221.6 219.0,204.2 346.0,181.0 473.0,136.8 600.0,43.0" fill="none" stroke="#3d92c8" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="92.0" cy="221.6" r="5" fill="#3d92c8"/>
+<circle cx="219.0" cy="204.2" r="5" fill="#3d92c8"/>
+<circle cx="346.0" cy="181.0" r="5" fill="#3d92c8"/>
+<circle cx="473.0" cy="136.8" r="5" fill="#3d92c8"/>
+<circle cx="600.0" cy="43.0" r="5" fill="#3d92c8"/>
+<text x="103.0" y="241.6" fill="#3d92c8" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="start">4588</text>
+<text x="600.0" y="63.0" fill="#3d92c8" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="middle">190591</text>
+<text x="600.0" y="77.0" fill="#3d92c8" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="middle">exllamav3</text>
+<polyline points="92.0,216.9 219.0,216.0 346.0,215.4 473.0,211.8 600.0,182.8" fill="none" stroke="#cf7a34" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="92.0" cy="216.9" r="5" fill="#cf7a34"/>
+<circle cx="219.0" cy="216.0" r="5" fill="#cf7a34"/>
+<circle cx="346.0" cy="215.4" r="5" fill="#cf7a34"/>
+<circle cx="473.0" cy="211.8" r="5" fill="#cf7a34"/>
+<circle cx="600.0" cy="182.8" r="5" fill="#cf7a34"/>
+<text x="103.0" y="204.9" fill="#cf7a34" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="start">9473</text>
+<text x="600.0" y="170.8" fill="#cf7a34" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="middle">44951</text>
+<text x="600.0" y="156.8" fill="#cf7a34" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="middle">vllm.cpp</text>
 <text x="92.0" y="248.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="middle">1</text>
-<text x="346.0" y="248.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="middle">4</text>
-<text x="600.0" y="248.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="middle">8</text>
+<text x="219.0" y="248.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="middle">4</text>
+<text x="346.0" y="248.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="middle">8</text>
+<text x="473.0" y="248.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="middle">16</text>
+<text x="600.0" y="248.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="middle">32</text>
 <text x="346.0" y="270.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="middle">concurrent requests</text>
 </svg>

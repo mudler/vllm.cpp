@@ -1,0 +1,33 @@
+{
+  "argv": [
+    "flock",
+    "-n",
+    "-F",
+    "/home/vikash/gpu.lock",
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix/bin/rocprofv3",
+    "--hip-trace",
+    "--kernel-trace",
+    "--memory-allocation-trace",
+    "--output-format",
+    "csv",
+    "--output-file",
+    "trace_%pid%",
+    "--rocm-root",
+    "/home/vikash/vllm.cpp-rdna3-f16-impl/build-rocm-f16-evidence/g5-traces-v1/profiler-prefix",
+    "--output-directory",
+    "/home/vikash/.cache/rdna3-gather-impl/public-model-trace-v1/profiler",
+    "--",
+    "/home/vikash/.cache/rdna3-gather-impl/public-model-trace-v1/test_capi_rocm_embedding_quant"
+  ],
+  "cwd": "/home/vikash/.cache/rdna3-gather-impl/public-model-trace-v1",
+  "env": {
+    "HIP_VISIBLE_DEVICES": "0",
+    "ROCR_VISIBLE_DEVICES": "0",
+    "TMPDIR": "/home/vikash/.cache/rdna3-gather-impl/tmp",
+    "VT_ROCM_GATHER_PUBLIC_EVIDENCE": "/home/vikash/.cache/rdna3-gather-impl/public-model-trace-v1/public-captures"
+  },
+  "exit": 0,
+  "seconds": 8.711418390274048,
+  "log_sha256": "6bc27e9dc1f38e70b00c816f94a2c9b50c4c0c9d88b05a31bcfae76c740ea582",
+  "inputs_unchanged": true
+}

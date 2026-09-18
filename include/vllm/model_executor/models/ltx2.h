@@ -103,6 +103,7 @@
 #include "vt/device.h"
 #include "vt/dtype.h"
 #include "vt/tensor.h"
+#include "vllm/model_executor/models/dit_lora.h"
 
 namespace vllm {
 
@@ -366,7 +367,8 @@ struct Ltx2AdalnOut {
   std::vector<float> embedded;
 };
 Ltx2AdalnOut Ltx2AdaLayerNormSingle(vt::Device device, const Ltx2AdaLayerNormSingleWeights& w,
-                                    const float* timesteps, int64_t count, int64_t dim);
+                                    const float* timesteps, int64_t count, int64_t dim,
+                                    const DitRuntimeLoraLayer* mod_lora = nullptr);
 
 // FeedForward.forward (feed_forward.py:14-15): net.0.proj -> gelu(tanh) -> net.2.
 //
@@ -378,7 +380,9 @@ Ltx2AdalnOut Ltx2AdaLayerNormSingle(vt::Device device, const Ltx2AdaLayerNormSin
 // rounded once (measured 0 of 6144). Row LTX25-A24-CONNECTOR-BF16, issue #2720.
 std::vector<float> Ltx2FeedForward(vt::Device device, const Ltx2FeedForwardWeights& w,
                                    const float* x, int64_t rows, int64_t dim, int64_t inner,
-                                   vt::DType compute_dtype = vt::DType::kF32);
+                                   vt::DType compute_dtype = vt::DType::kF32,
+                                   const DitRuntimeLoraLayer* in_lora = nullptr,
+                                   const DitRuntimeLoraLayer* out_lora = nullptr);
 
 // The K/V half of Attention.forward, split out because a checkpoint that sets
 // `use_prompt_adaln_single=false` can CACHE it: the prompt modulation then
@@ -509,7 +513,12 @@ struct Ltx2AttentionArgs {
   vt::DType compute_dtype = vt::DType::kF32;
 };
 std::vector<float> Ltx2Attention(vt::Device device, const Ltx2AttentionWeights& w, const float* x,
-                                 const float* context, const Ltx2AttentionArgs& args);
+                                 const float* context, const Ltx2AttentionArgs& args,
+                                 const DitRuntimeLoraLayer* q_lora = nullptr,
+                                 const DitRuntimeLoraLayer* k_lora = nullptr,
+                                 const DitRuntimeLoraLayer* v_lora = nullptr,
+                                 const DitRuntimeLoraLayer* gate_lora = nullptr,
+                                 const DitRuntimeLoraLayer* out_lora = nullptr);
 
 // `torch.nn.functional.rms_norm` over the last dimension with an OPTIONAL
 // elementwise gain (utils.py:7-12; `torch.nn.RMSNorm`, attention.py:505-506).
@@ -681,7 +690,8 @@ Ltx2DitOutputs Ltx2DitForward(vt::Device device, const Ltx2DitParams& params,
                               const Ltx2DitWeights& weights, const Ltx2ModalityInput* video,
                               const Ltx2ModalityInput* audio, vt::DType compute_dtype,
                               Ltx2PromptKvCache* cache = nullptr,
-                              const Ltx2DitPerturbation* perturbations = nullptr);
+                              const Ltx2DitPerturbation* perturbations = nullptr,
+                              const DitRuntimeLoraState* lora_state = nullptr);
 
 // One BasicAVTransformerBlock (transformer.py:254-417), exposed so the block is
 // gateable on its own. `video_x` / `audio_x` are updated IN PLACE.
@@ -745,10 +755,12 @@ struct Ltx2BlockArgs {
   Ltx2CrossKv* video_prompt_kv = nullptr;  // non-null: use if `filled`, else fill
   Ltx2CrossKv* audio_prompt_kv = nullptr;
   bool prompt_kv_filled = false;
+  int64_t block_index = 0;
 };
 void Ltx2TransformerBlockForward(vt::Device device, const Ltx2DitParams& params,
                                  const Ltx2BlockWeights& weights, const Ltx2BlockArgs& args,
-                                 float* video_x, float* audio_x);
+                                 float* video_x, float* audio_x,
+                                 const DitRuntimeLoraState* lora_state = nullptr);
 
 // ---------------------------------------------------------------------------
 // Mask preparation (transformer_args.py:199-237)

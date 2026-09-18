@@ -379,8 +379,12 @@ from it.**
   §5's verdict is layer 0 only, which is the layer #2552 bracketed.
 - **Any magnitude, in either direction.** §7.
 - **A token gate.** No oracle decoded this prompt. vLLM cannot run this GGUF
-  artifact, and the llama.cpp arm aborts in `build_delta_net_chunking` before
-  loading a byte. Both arms are ours.
+  artifact, and the llama.cpp arm this wave had -- the STOCK `llama-cpp` pin
+  `b10451` -- aborts in `build_delta_net_chunking` before loading a byte. Both
+  arms are ours. (Scoped 2026-09-13: the SCOPED `llama-cpp-qwen4exp` oracle does
+  NOT abort and has since decoded this artifact on `gfx1151`. Read this bullet
+  as "no oracle decoded THIS prompt in THIS wave", which is what it measured,
+  and not as "no llama.cpp can".)
 - **A speed number.** The wall times in the log are liveness on n=1 legs. They are
   also not comparable across arms: A-CPU answered in 5 s, C-CPU2 in 6 s and
   B-CUDA in 112 s, and the job's own heartbeat records a load average of 6.15

@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/model_loader/gguf_keep_quant.h"
 #include "vllm/model_executor/models/deepseek_v4_moe.h"  // deepseek_v4::ClampedSwiGLU
 #include "vllm/model_executor/models/dense_attn_block.h"  // dense_attn::ResidentWeight
 #include "vllm/model_executor/models/dense_device_glue.h"  // dense_attn::Dev, DBuf
@@ -174,7 +175,7 @@ void WarnDeviceFallbackOnce(const char* why) {
 void MoeExpertsKeepQuant(const MoeDims& d, const MoeQuantBanks& b,
                          const std::vector<float>& hidden, const MoeRouting& r,
                          int64_t num_tokens, vt::Queue& queue,
-                         dense_attn::Dev* dev,
+                         dense_attn::Dev* dev, const std::string& expert_group,
                          std::vector<float>* expert_out) {
   const int64_t H = d.hidden_size;
   const int64_t I = d.moe_intermediate_size;
@@ -220,6 +221,17 @@ void MoeExpertsKeepQuant(const MoeDims& d, const MoeQuantBanks& b,
   // q.device` check passes because it is TRUE and not because it was made to
   // look true.
   if (dev != nullptr && b.HasSources() && DeviceBanksFit(b, *dev)) {
+    // ResidentWeight uploads the source bytes, not the cached host view.
+    // Check every bank before uploading any of them; down may use a different
+    // encoding from gate/up. Host and memory-fallback arms need no admission.
+    const OwnedTensor* sources[] = {b.gate_src, b.up_src, b.down_src};
+    const char* suffixes[] = {"_gate_exps.weight", "_up_exps.weight", "_down_exps.weight"};
+    for (size_t i = 0; i < 3; ++i) {
+      VT_CHECK(DeviceKeepQuantSupported(sources[i]->dtype, dev->q.device.type),
+               "glm5_next moe: " + expert_group + suffixes[i] + " uses " +
+                   vt::Name(sources[i]->dtype) + ", missing kept-expert device arm on " +
+                   vt::DeviceTypeName(dev->q.device.type));
+    }
     AnnounceDeviceArmOnce(dev->q.device);
     // `ResidentWeight` uploads `bytes` verbatim and keeps the block dtype, so
     // these stay Q2_K / IQ2_XS / IQ3_XXS / IQ4_XS on the device. The shapes are
@@ -359,18 +371,11 @@ std::vector<float> RouterLogits(const MoeDims& d, const std::vector<float>& hidd
 
 MoeRouting RouteTopk(const MoeDims& d, const MoeLayerWeights& w,
                      const std::vector<float>& hidden, int64_t num_tokens,
-                     vt::Queue& queue) {
+                     vt::Queue& queue, dense_attn::Dev* dev) {
   d.Validate();
   VT_CHECK(num_tokens > 0,
            "glm5_next moe: RouteTopk needs at least one token, got " +
                std::to_string(num_tokens));
-  // `vt::MoeRouterTopK` dispatches on the queue's device; handing it host
-  // pointers on a CUDA queue is a crash, not a fallback. The device arm of this
-  // block belongs to the assembled text forward.
-  VT_CHECK(queue.device.type == vt::DeviceType::kCPU,
-           "glm5_next moe: RouteTopk is the HOST reference and needs a CPU "
-           "queue; the device arm is the assembled text forward's "
-           "(.agents/specs/glm5-next-flash.md)");
   const bool has_bias = !w.e_score_correction_bias.empty();
   VT_CHECK(!has_bias || static_cast<int64_t>(w.e_score_correction_bias.size()) ==
                             d.n_routed_experts,
@@ -397,19 +402,48 @@ MoeRouting RouteTopk(const MoeDims& d, const MoeLayerWeights& w,
   // it, and the result is still smooth and still routes to the same experts.
   args.routed_scaling_factor = static_cast<float>(d.routed_scaling_factor);
 
-  const vt::Device dev = queue.device;
-  vt::Tensor t_w = MakeT(r.topk_weights.data(), vt::DType::kF32, dev,
-                         {num_tokens, d.num_experts_per_tok});
-  vt::Tensor t_i = MakeT(r.topk_ids.data(), vt::DType::kI32, dev,
-                         {num_tokens, d.num_experts_per_tok});
-  vt::Tensor t_l = MakeT(r.router_logits.data(), vt::DType::kF32, dev,
-                         {num_tokens, d.n_routed_experts});
-  vt::Tensor t_b;
-  if (has_bias) {
-    t_b = MakeT(const_cast<float*>(w.e_score_correction_bias.data()), vt::DType::kF32,
-                dev, {d.n_routed_experts});
+  if (dev != nullptr) {
+    // W9c-2 device arm. `RouterLogits` stays on the host (it is the reference
+    // matmul); the routing op dispatches on the device queue. The logits are
+    // uploaded, the routing outputs are downloaded, and the rest of `MoeForward`
+    // reads host vectors unchanged.
+    dense_attn::DBuf d_logits(*dev, vt::DType::kF32,
+                              {num_tokens, d.n_routed_experts},
+                              r.router_logits.data());
+    dense_attn::DBuf d_weights(*dev, vt::DType::kF32,
+                               {num_tokens, d.num_experts_per_tok});
+    dense_attn::DBuf d_ids(*dev, vt::DType::kI32,
+                           {num_tokens, d.num_experts_per_tok});
+    dense_attn::DBuf d_bias;
+    if (has_bias) {
+      d_bias = dense_attn::DBuf(*dev, vt::DType::kF32, {d.n_routed_experts},
+                                w.e_score_correction_bias.data());
+    }
+    vt::MoeRouterTopK(dev->q, d_weights.t(), d_ids.t(), d_logits.t(), args,
+                     has_bias ? &d_bias.t() : nullptr);
+    d_weights.Download(*dev, r.topk_weights.data());
+    d_ids.Download(*dev, r.topk_ids.data());
+  } else {
+    // Host arm. `vt::MoeRouterTopK` dispatches on the queue's device; handing it
+    // host pointers on a CUDA queue is a crash, not a fallback.
+    VT_CHECK(queue.device.type == vt::DeviceType::kCPU,
+             "glm5_next moe: RouteTopk's host arm needs a CPU queue; pass a "
+             "non-null `dev` for the device arm "
+             "(.agents/specs/glm5-next-flash.md)");
+    const vt::Device hdev = queue.device;
+    vt::Tensor t_w = MakeT(r.topk_weights.data(), vt::DType::kF32, hdev,
+                           {num_tokens, d.num_experts_per_tok});
+    vt::Tensor t_i = MakeT(r.topk_ids.data(), vt::DType::kI32, hdev,
+                           {num_tokens, d.num_experts_per_tok});
+    vt::Tensor t_l = MakeT(r.router_logits.data(), vt::DType::kF32, hdev,
+                           {num_tokens, d.n_routed_experts});
+    vt::Tensor t_b;
+    if (has_bias) {
+      t_b = MakeT(const_cast<float*>(w.e_score_correction_bias.data()),
+                 vt::DType::kF32, hdev, {d.n_routed_experts});
+    }
+    vt::MoeRouterTopK(queue, t_w, t_i, t_l, args, has_bias ? &t_b : nullptr);
   }
-  vt::MoeRouterTopK(queue, t_w, t_i, t_l, args, has_bias ? &t_b : nullptr);
   return r;
 }
 
@@ -478,6 +512,16 @@ std::vector<float> MoeForward(const MoeDims& d, const MoeLayerWeights& w,
                               const std::vector<float>& hidden, int64_t num_tokens,
                               vt::Queue& queue, dense_attn::Dev* dev) {
   d.Validate();
+  // Placement follows the loaded model, not the current process-global plan.
+  // The host arm already owns host activations and output, so CPU placement
+  // needs no transfer and must not enter the device-memory fallback.
+  if (w.compute_device == vt::DeviceType::kCPU) dev = nullptr;
+  if (dev != nullptr && w.compute_device.has_value()) {
+    VT_CHECK(*w.compute_device == dev->q.device.type,
+             "glm5_next moe: " + w.expert_group + " was loaded for " +
+                 vt::DeviceTypeName(*w.compute_device) + ", but forward uses " +
+                 vt::DeviceTypeName(dev->q.device.type));
+  }
   const int64_t H = d.hidden_size;
   const int64_t E = d.n_routed_experts;
   const int64_t I = d.moe_intermediate_size;
@@ -527,7 +571,7 @@ std::vector<float> MoeForward(const MoeDims& d, const MoeLayerWeights& w,
                  " floats, got " + std::to_string(w.expert_down.size()));
   }
 
-  const MoeRouting r = RouteTopk(d, w, hidden, num_tokens, queue);
+  const MoeRouting r = RouteTopk(d, w, hidden, num_tokens, queue, dev);
 
   // The per-slot expert MLP outputs, [T, K, H] — what `vt::MoeCombine` reduces.
   // Upstream loops over the HIT experts and `index_add_`s each one's tokens; the
@@ -546,7 +590,7 @@ std::vector<float> MoeForward(const MoeDims& d, const MoeLayerWeights& w,
   // fold: they are the operand the parity gate compares against, and deleting
   // them deletes the gate.
   if (w.has_quant_banks) {
-    MoeExpertsKeepQuant(d, w.quant_banks, hidden, r, num_tokens, queue, dev,
+    MoeExpertsKeepQuant(d, w.quant_banks, hidden, r, num_tokens, queue, dev, w.expert_group,
                         &expert_out);
   } else {
     std::vector<float> gate_up(static_cast<size_t>(2 * I));

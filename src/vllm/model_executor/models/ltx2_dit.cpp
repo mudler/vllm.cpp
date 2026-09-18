@@ -21,6 +21,7 @@
 
 #include "vt/backend.h"
 #include "vt/ops.h"
+#include "vllm/model_executor/models/dit_lora.h"
 
 namespace vllm {
 namespace {
@@ -179,7 +180,12 @@ void TextCrossAttention(vt::Device device, const Ltx2DitParams& params,
                         const float* context, const float* context_bias,
                         int64_t batch, int64_t tokens, int64_t context_tokens, int64_t width,
                         int64_t heads, int64_t dim_head, const Ltx2CrossKv* kv_in,
-                        Ltx2CrossKv* kv_out, float* x) {
+                        Ltx2CrossKv* kv_out, float* x,
+                        const DitRuntimeLoraLayer* q_lora = nullptr,
+                        const DitRuntimeLoraLayer* k_lora = nullptr,
+                        const DitRuntimeLoraLayer* v_lora = nullptr,
+                        const DitRuntimeLoraLayer* gate_lora = nullptr,
+                        const DitRuntimeLoraLayer* out_lora = nullptr) {
   const int64_t coefficient = params.adaln_embedding_coefficient();
   VT_CHECK(params.cross_attention_adaln,
            "ltx2: cross_attention_adaln=false is upstream's plain cross-attention path "
@@ -221,7 +227,9 @@ void TextCrossAttention(vt::Device device, const Ltx2DitParams& params,
   a.kv_in = kv_in;
   a.kv_out = kv_out;
   const std::vector<float> out =
-      Ltx2Attention(device, attn, attn_input.data(), kv_in != nullptr ? context : encoder.data(), a);
+      Ltx2Attention(device, attn, attn_input.data(),
+                     kv_in != nullptr ? context : encoder.data(), a,
+                     q_lora, k_lora, v_lora, gate_lora, out_lora);
 
   for (int64_t r = 0; r < batch * tokens; ++r) {
     float* dst = x + r * width;
@@ -235,7 +243,8 @@ void TextCrossAttention(vt::Device device, const Ltx2DitParams& params,
 
 void Ltx2TransformerBlockForward(vt::Device device, const Ltx2DitParams& params,
                                  const Ltx2BlockWeights& w, const Ltx2BlockArgs& args,
-                                 float* video_x, float* audio_x) {
+                                 float* video_x, float* audio_x,
+                                 const DitRuntimeLoraState* lora_state) {
   const int64_t batch = args.batch;
   const int64_t dim = params.inner_dim();
   const int64_t adim = params.audio_inner_dim();
@@ -243,6 +252,12 @@ void Ltx2TransformerBlockForward(vt::Device device, const Ltx2DitParams& params,
   const int64_t ta = args.audio_tokens;
   const int64_t coefficient = params.adaln_embedding_coefficient();
   const double eps = params.norm_eps;
+
+  const bool has_lora = lora_state != nullptr && !lora_state->empty();
+  const std::string bp = "transformer_blocks." + std::to_string(args.block_index);
+  auto lf = [&](const std::string& suffix) -> const DitRuntimeLoraLayer* {
+    return has_lora ? lora_state->Find(bp + "." + suffix + ".weight") : nullptr;
+  };
 
   // transformer.py:265-269.
   const bool run_vx = args.video_enabled && video_x != nullptr && tv > 0;
@@ -276,7 +291,10 @@ void Ltx2TransformerBlockForward(vt::Device device, const Ltx2DitParams& params,
     a.bias = args.video_self_bias;
     a.bias_rows = args.video_self_bias_rows;
     a.all_perturbed = args.video_self_attn_perturbed;
-    const std::vector<float> msa = Ltx2Attention(device, w.attn1, norm_vx.data(), nullptr, a);
+    const std::vector<float> msa =
+        Ltx2Attention(device, w.attn1, norm_vx.data(), nullptr, a,
+                      lf("attn1.to_q"), lf("attn1.to_k"), lf("attn1.to_v"),
+                      lf("attn1.to_gate_logits"), lf("attn1.to_out.0"));
     PostSelfAttention(video_x, msa.data(), gate, batch * tv, dim, eps, &vx_normed);
 
     TextCrossAttention(device, params, w.attn2, w.scale_shift_table, w.prompt_scale_shift_table,
@@ -285,7 +303,9 @@ void Ltx2TransformerBlockForward(vt::Device device, const Ltx2DitParams& params,
                        args.video_context_bias, batch, tv, args.video_context_tokens, dim,
                        params.num_attention_heads, params.attention_head_dim,
                        args.prompt_kv_filled ? args.video_prompt_kv : nullptr,
-                       args.prompt_kv_filled ? nullptr : args.video_prompt_kv, video_x);
+                       args.prompt_kv_filled ? nullptr : args.video_prompt_kv, video_x,
+                       lf("attn2.to_q"), lf("attn2.to_k"), lf("attn2.to_v"),
+                       lf("attn2.to_gate_logits"), lf("attn2.to_out.0"));
   }
 
   if (run_ax) {
@@ -314,7 +334,11 @@ void Ltx2TransformerBlockForward(vt::Device device, const Ltx2DitParams& params,
     a.bias = args.audio_self_bias;
     a.bias_rows = args.audio_self_bias_rows;
     a.all_perturbed = args.audio_self_attn_perturbed;
-    const std::vector<float> msa = Ltx2Attention(device, w.audio_attn1, norm_ax.data(), nullptr, a);
+    const std::vector<float> msa =
+        Ltx2Attention(device, w.audio_attn1, norm_ax.data(), nullptr, a,
+                      lf("audio_attn1.to_q"), lf("audio_attn1.to_k"),
+                      lf("audio_attn1.to_v"), lf("audio_attn1.to_gate_logits"),
+                      lf("audio_attn1.to_out.0"));
     PostSelfAttention(audio_x, msa.data(), gate, batch * ta, adim, eps, &ax_normed);
 
     TextCrossAttention(device, params, w.audio_attn2, w.audio_scale_shift_table,
@@ -324,7 +348,9 @@ void Ltx2TransformerBlockForward(vt::Device device, const Ltx2DitParams& params,
                        args.audio_context_tokens, adim, params.audio_num_attention_heads,
                        params.audio_attention_head_dim,
                        args.prompt_kv_filled ? args.audio_prompt_kv : nullptr,
-                       args.prompt_kv_filled ? nullptr : args.audio_prompt_kv, audio_x);
+                       args.prompt_kv_filled ? nullptr : args.audio_prompt_kv, audio_x,
+                       lf("audio_attn2.to_q"), lf("audio_attn2.to_k"), lf("audio_attn2.to_v"),
+                       lf("audio_attn2.to_gate_logits"), lf("audio_attn2.to_out.0"));
   }
 
   // Audio <-> video cross attention (transformer.py:329-397). Both directions
@@ -379,8 +405,11 @@ void Ltx2TransformerBlockForward(vt::Device device, const Ltx2DitParams& params,
       a.rope_type = params.rope_type;
       a.pe = args.video_cross_pe;
       a.k_pe = args.audio_cross_pe;
-      const std::vector<float> out =
-          Ltx2Attention(device, w.audio_to_video_attn, vq.data(), akv.data(), a);
+      const std::vector<float> out = Ltx2Attention(
+          device, w.audio_to_video_attn, vq.data(), akv.data(), a,
+          lf("audio_to_video_attn.to_q"), lf("audio_to_video_attn.to_k"),
+          lf("audio_to_video_attn.to_v"), lf("audio_to_video_attn.to_gate_logits"),
+          lf("audio_to_video_attn.to_out.0"));
       AddGatedBroadcast(video_x, out, gate, batch, tv, dim);
     }
 
@@ -408,8 +437,11 @@ void Ltx2TransformerBlockForward(vt::Device device, const Ltx2DitParams& params,
       a.rope_type = params.rope_type;
       a.pe = args.audio_cross_pe;
       a.k_pe = args.video_cross_pe;
-      const std::vector<float> out =
-          Ltx2Attention(device, w.video_to_audio_attn, aq.data(), vkv.data(), a);
+      const std::vector<float> out = Ltx2Attention(
+          device, w.video_to_audio_attn, aq.data(), vkv.data(), a,
+          lf("video_to_audio_attn.to_q"), lf("video_to_audio_attn.to_k"),
+          lf("video_to_audio_attn.to_v"), lf("video_to_audio_attn.to_gate_logits"),
+          lf("video_to_audio_attn.to_out.0"));
       AddGatedBroadcast(audio_x, out, gate, batch, ta, adim);
     }
   }
@@ -424,7 +456,8 @@ void Ltx2TransformerBlockForward(vt::Device device, const Ltx2DitParams& params,
         AdaValue(w.scale_shift_table, args.video_timestep_modulation, batch, tv, dim, coefficient, 5);
     const std::vector<float> scaled = AdaZero(video_x, scale, shift, batch * tv, dim, eps);
     const std::vector<float> ff =
-        Ltx2FeedForward(device, w.ff, scaled.data(), batch * tv, dim, 4 * dim);
+        Ltx2FeedForward(device, w.ff, scaled.data(), batch * tv, dim, 4 * dim,
+                        vt::DType::kF32, lf("ff.net.0.proj"), lf("ff.net.2"));
     for (int64_t r = 0; r < batch * tv; ++r) {
       float* dst = video_x + r * dim;
       for (int64_t c = 0; c < dim; ++c) {
@@ -445,7 +478,8 @@ void Ltx2TransformerBlockForward(vt::Device device, const Ltx2DitParams& params,
                                              coefficient, 5);
     const std::vector<float> scaled = AdaZero(audio_x, scale, shift, batch * ta, adim, eps);
     const std::vector<float> ff =
-        Ltx2FeedForward(device, w.audio_ff, scaled.data(), batch * ta, adim, 4 * adim);
+        Ltx2FeedForward(device, w.audio_ff, scaled.data(), batch * ta, adim, 4 * adim,
+                        vt::DType::kF32, lf("audio_ff.net.0.proj"), lf("audio_ff.net.2"));
     for (int64_t r = 0; r < batch * ta; ++r) {
       float* dst = audio_x + r * adim;
       for (int64_t c = 0; c < adim; ++c) {
@@ -479,11 +513,12 @@ struct PreparedStream {
 // _prepare_timestep (transformer_args.py:173-186) + AdaLayerNormSingle.
 void PrepareTimestep(vt::Device device, const Ltx2AdaLayerNormSingleWeights& adaln,
                      const float* timesteps, int64_t count, int64_t width, int64_t multiplier,
-                     std::vector<float>* modulation, std::vector<float>* embedded) {
+                     std::vector<float>* modulation, std::vector<float>* embedded,
+                     const DitRuntimeLoraLayer* mod_lora = nullptr) {
   std::vector<float> scaled(static_cast<size_t>(count));
   for (int64_t i = 0; i < count; ++i) scaled[static_cast<size_t>(i)] = timesteps[i] *
                                                                        static_cast<float>(multiplier);
-  Ltx2AdalnOut out = Ltx2AdaLayerNormSingle(device, adaln, scaled.data(), count, width);
+  Ltx2AdalnOut out = Ltx2AdaLayerNormSingle(device, adaln, scaled.data(), count, width, mod_lora);
   *modulation = std::move(out.modulation);
   *embedded = std::move(out.embedded);
 }
@@ -497,7 +532,9 @@ PreparedStream PrepareStream(vt::Device device, const Ltx2DitParams& params,
                              const vt::Tensor* keyframes_embedding,
                              const Ltx2ModalityInput& m, int64_t width, int64_t in_channels,
                              int64_t n_pos_dims, const std::vector<int64_t>& max_pos,
-                             int64_t heads, const Ltx2ModalityInput* cross) {
+                             int64_t heads, const Ltx2ModalityInput* cross,
+                             const DitRuntimeLoraLayer* patchify_lora,
+                             const DitRuntimeLoraLayer* adaln_mod_lora) {
   vt::Queue q{device, nullptr};
   PreparedStream out;
   const int64_t rows = m.batch * m.tokens;
@@ -516,6 +553,9 @@ PreparedStream PrepareStream(vt::Device device, const Ltx2DitParams& params,
     for (int64_t r = 0; r < rows; ++r) {
       float* dst = out.x.data() + r * width;
       for (int64_t c = 0; c < width; ++c) dst[c] += b[c];
+    }
+    if (patchify_lora != nullptr) {
+      DitApplyRuntimeLoraDelta(q, a, out.x.data(), rows, width, patchify_lora);
     }
   }
 
@@ -575,7 +615,7 @@ PreparedStream PrepareStream(vt::Device device, const Ltx2DitParams& params,
   }
 
   PrepareTimestep(device, adaln, m.timesteps, rows, width, params.timestep_scale_multiplier,
-                  &out.modulation, &out.embedded);
+                  &out.modulation, &out.embedded, adaln_mod_lora);
 
   // transformer_args.py:274-277 — the PROMPT-side AdaLN runs on this modality's
   // own SIGMA, [batch], not on its per-token `timesteps`. `_prepare_timestep`
@@ -641,7 +681,8 @@ PreparedStream PrepareStream(vt::Device device, const Ltx2DitParams& params,
 std::vector<float> ProcessOutput(vt::Device device, const vt::Tensor& table,
                                  const Ltx2LinearWeight& proj, const float* x,
                                  const std::vector<float>& embedded, int64_t rows, int64_t width,
-                                 int64_t out_channels, double eps) {
+                                 int64_t out_channels, double eps,
+                                 const DitRuntimeLoraLayer* proj_lora = nullptr) {
   vt::Queue q{device, nullptr};
   std::vector<float> normed(static_cast<size_t>(rows * width));
   LayerNormRows(x, normed.data(), rows, width, eps);
@@ -669,6 +710,9 @@ std::vector<float> ProcessOutput(vt::Device device, const vt::Tensor& table,
   for (int64_t r = 0; r < rows; ++r) {
     float* dst = out.data() + r * out_channels;
     for (int64_t c = 0; c < out_channels; ++c) dst[c] += b[c];
+  }
+  if (proj_lora != nullptr) {
+    DitApplyRuntimeLoraDelta(q, a, out.data(), rows, out_channels, proj_lora);
   }
   return out;
 }
@@ -762,7 +806,8 @@ Ltx2PromptIdentity Ltx2PromptIdentityOf(const Ltx2DitParams& params,
 Ltx2DitOutputs Ltx2DitForward(vt::Device device, const Ltx2DitParams& params,
                               const Ltx2DitWeights& weights, const Ltx2ModalityInput* video,
                               const Ltx2ModalityInput* audio, vt::DType compute_dtype,
-                              Ltx2PromptKvCache* cache, const Ltx2DitPerturbation* perturbations) {
+                              Ltx2PromptKvCache* cache, const Ltx2DitPerturbation* perturbations,
+                              const DitRuntimeLoraState* lora_state) {
   VT_CHECK(compute_dtype == vt::DType::kF32,
            "ltx2: phase L2 ships only the f32 parity forward; the bf16 / FP8 / NVFP4 stream "
            "dtypes are phase L6 and are refused rather than silently computed in f32");
@@ -802,6 +847,12 @@ Ltx2DitOutputs Ltx2DitForward(vt::Device device, const Ltx2DitParams& params,
   // upstream turns its absence into `prompt_timestep is None`.
   const bool prompt_adaln = params.cross_attention_adaln && params.use_prompt_adaln_single;
   const bool have_both = video != nullptr && audio != nullptr;
+
+  const bool has_lora = lora_state != nullptr && !lora_state->empty();
+  auto lora_find = [&](const std::string& target) -> const DitRuntimeLoraLayer* {
+    return has_lora ? lora_state->Find(target) : nullptr;
+  };
+
   PreparedStream vs, as;
   if (video != nullptr) {
     VT_CHECK(video->context_tokens == 0 || video->context != nullptr,
@@ -815,7 +866,9 @@ Ltx2DitOutputs Ltx2DitForward(vt::Device device, const Ltx2DitParams& params,
                            : nullptr,
                        *video, dim,
                        params.in_channels, 3, params.positional_embedding_max_pos,
-                       params.num_attention_heads, have_both ? audio : nullptr);
+                       params.num_attention_heads, have_both ? audio : nullptr,
+                       lora_find("patchify_proj.weight"),
+                       lora_find("adaln_single.linear.weight"));
   }
   if (audio != nullptr) {
     as = PrepareStream(device, params, weights.audio_patchify_proj, weights.audio_adaln_single,
@@ -827,7 +880,9 @@ Ltx2DitOutputs Ltx2DitForward(vt::Device device, const Ltx2DitParams& params,
                        /*keyframes_embedding=*/nullptr,
                        *audio, adim,
                        params.audio_in_channels, 1, params.audio_positional_embedding_max_pos,
-                       params.audio_num_attention_heads, have_both ? video : nullptr);
+                       params.audio_num_attention_heads, have_both ? video : nullptr,
+                       lora_find("audio_patchify_proj.weight"),
+                       lora_find("audio_adaln_single.linear.weight"));
   }
 
   // `perturbations` (model.py:493). A vector that is not exactly `num_layers`
@@ -909,9 +964,10 @@ Ltx2DitOutputs Ltx2DitForward(vt::Device device, const Ltx2DitParams& params,
       a.audio_prompt_kv = &cache->audio[static_cast<size_t>(i)];
       a.prompt_kv_filled = cache->valid;
     }
+    a.block_index = i;
     Ltx2TransformerBlockForward(device, params, weights.blocks[static_cast<size_t>(i)], a,
                                 video != nullptr ? vs.x.data() : nullptr,
-                                audio != nullptr ? as.x.data() : nullptr);
+                                audio != nullptr ? as.x.data() : nullptr, lora_state);
   }
   if (use_cache) cache->valid = true;
 
@@ -919,12 +975,13 @@ Ltx2DitOutputs Ltx2DitForward(vt::Device device, const Ltx2DitParams& params,
   if (video != nullptr) {
     out.video = ProcessOutput(device, weights.scale_shift_table, weights.proj_out, vs.x.data(),
                               vs.embedded, video->batch * video->tokens, dim, params.out_channels,
-                              params.norm_eps);
+                              params.norm_eps, lora_find("proj_out.weight"));
   }
   if (audio != nullptr) {
     out.audio = ProcessOutput(device, weights.audio_scale_shift_table, weights.audio_proj_out,
                               as.x.data(), as.embedded, audio->batch * audio->tokens, adim,
-                              params.audio_out_channels, params.norm_eps);
+                              params.audio_out_channels, params.norm_eps,
+                              lora_find("audio_proj_out.weight"));
   }
   return out;
 }

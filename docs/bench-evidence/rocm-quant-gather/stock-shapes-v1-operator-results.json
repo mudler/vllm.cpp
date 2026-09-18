@@ -1,0 +1,118 @@
+{
+  "manifest_sha256": "35448ef5b3fc457ff3738963de27bc11a312c3d92ceefb58ba91b51083c966a5",
+  "input_count": 11,
+  "runs": [
+    {
+      "name": "Q8_K-256-f32",
+      "argv": [
+        "/home/vikash/.cache/rdna3-gather-impl/llama-stock-build/rocm_gather_secondary",
+        "gather",
+        "15",
+        "5",
+        "256",
+        "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/inputs/Q8_K-256.packed",
+        "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/inputs/Q8_K-256.ids",
+        "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/operator/Q8_K-256-f32.bin"
+      ],
+      "exit_code": 0,
+      "seconds": 0.03152322769165039,
+      "log_sha256": "d4ee090db5ac6f6d11a19ca28a6655084d88b9254f9c6fa18433339f17a404c1",
+      "all_input_hashes_verified_before_after": true
+    },
+    {
+      "name": "MXFP4-256-f32",
+      "argv": [
+        "/home/vikash/.cache/rdna3-gather-impl/llama-stock-build/rocm_gather_secondary",
+        "gather",
+        "39",
+        "5",
+        "256",
+        "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/inputs/MXFP4-256.packed",
+        "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/inputs/MXFP4-256.ids",
+        "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/operator/MXFP4-256-f32.bin"
+      ],
+      "exit_code": 0,
+      "seconds": 0.0353548526763916,
+      "log_sha256": "6e6c539254bcb2836e72cf3e702ac5c6bb025e60f2e7bf64b8f18beddb3aa68c",
+      "all_input_hashes_verified_before_after": true
+    },
+    {
+      "name": "IQ1_XXXS-256-f32",
+      "argv": [
+        "/home/vikash/.cache/rdna3-gather-impl/llama-fork-build/rocm_gather_secondary",
+        "gather",
+        "66",
+        "5",
+        "256",
+        "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/inputs/IQ1_XXXS-256.packed",
+        "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/inputs/IQ1_XXXS-256.ids",
+        "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/operator/IQ1_XXXS-256-f32.bin"
+      ],
+      "exit_code": 0,
+      "seconds": 0.043924570083618164,
+      "log_sha256": "f8f8d7463ee1473288e775e37d905afbf35c43b7ff6443e3ed90ea6234376c7c",
+      "all_input_hashes_verified_before_after": true
+    },
+    {
+      "name": "native",
+      "argv": [
+        "flock",
+        "-n",
+        "-F",
+        "/home/vikash/gpu.lock",
+        "/home/vikash/.cache/rdna3-gather-impl/trace-v1/native-capture",
+        "capture",
+        "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/inputs/manifest.json",
+        "/home/vikash/.cache/rdna3-gather-impl/stock-shapes-v1/operator/native"
+      ],
+      "exit_code": 0,
+      "seconds": 0.3421025276184082,
+      "log_sha256": "7740d959f71ecb2717d160fa60769c2191ffa1d73e906b3a10e584d203f9c928",
+      "all_input_hashes_verified_before_after": true
+    }
+  ],
+  "comparison": [
+    {
+      "name": "Q8_K-256-f32.bin",
+      "native_sha256": "bc63b12de49c2573302b712ab0528c177ddb486f559d470a0aca9e7f16ba7996",
+      "upstream_f32_sha256": "bc63b12de49c2573302b712ab0528c177ddb486f559d470a0aca9e7f16ba7996",
+      "exact": true,
+      "adaptation": null
+    },
+    {
+      "name": "Q8_K-256-bf16.bin",
+      "native_sha256": "4da3baa7408806c94c0fef1baedbe59dcae9d85d00567880c8f689b951d7e683",
+      "upstream_f32_sha256": "bc63b12de49c2573302b712ab0528c177ddb486f559d470a0aca9e7f16ba7996",
+      "exact": true,
+      "adaptation": "F32 upstream rounded once to BF16 RNE"
+    },
+    {
+      "name": "MXFP4-256-f32.bin",
+      "native_sha256": "da5bd348b0562899e0be685b723f9a26d43b405a46e00d9667f22bd93c73a9b4",
+      "upstream_f32_sha256": "da5bd348b0562899e0be685b723f9a26d43b405a46e00d9667f22bd93c73a9b4",
+      "exact": true,
+      "adaptation": null
+    },
+    {
+      "name": "MXFP4-256-bf16.bin",
+      "native_sha256": "ef2052053825cf4308309213f6bc146915e499716bf44434cdc421957379b90c",
+      "upstream_f32_sha256": "da5bd348b0562899e0be685b723f9a26d43b405a46e00d9667f22bd93c73a9b4",
+      "exact": true,
+      "adaptation": "F32 upstream rounded once to BF16 RNE"
+    },
+    {
+      "name": "IQ1_XXXS-256-f32.bin",
+      "native_sha256": "bccfb71bc3b329ff21d4061d4352e0b34958640822a8248ee65045b6af762212",
+      "upstream_f32_sha256": "bccfb71bc3b329ff21d4061d4352e0b34958640822a8248ee65045b6af762212",
+      "exact": true,
+      "adaptation": null
+    },
+    {
+      "name": "IQ1_XXXS-256-bf16.bin",
+      "native_sha256": "813221d5039f686ec01be2513e48df24bd21a0a20466efe08407e65dc5837062",
+      "upstream_f32_sha256": "bccfb71bc3b329ff21d4061d4352e0b34958640822a8248ee65045b6af762212",
+      "exact": true,
+      "adaptation": "F32 upstream rounded once to BF16 RNE"
+    }
+  ]
+}

@@ -78,6 +78,7 @@
 #include "vt/dtype.h"
 #include "vt/op_provider.h"
 #include "vt/ops.h"
+#include "vt/cuda/cublas_lt_hgemm.h"
 #include "vt/cuda/cuda_device_caps.h"
 
 namespace vt::cuda {
@@ -492,6 +493,20 @@ __device__ inline void shuffle_had_f4x32(float& h0, float& h1, float& h2, float&
     h2 = __uint_as_float(i2) + ph2;
     h3 = __uint_as_float(i3) + ph3;
   }
+}
+
+// hadamard_inner.cuh:78-89. The half2 variant: five xor-partner shuffles with a
+// sign flip that XORs the fp16 sign bit in BOTH lanes (0x80008000). Used by the
+// fused reconstruct kernel's Hadamard butterfly (reconstruct.cu:269,300-301).
+__device__ inline half2 shuffle_had_h2x32(half2 v, int lane_id) {
+  for (int i = 1; i < 32; i <<= 1) {
+    half2 pv = __shfl_xor_sync(0xffffffff, v, i);
+    uint32_t* vi = reinterpret_cast<uint32_t*>(&v);
+    int32_t sfm = -static_cast<int16_t>(lane_id & i) >> 31;
+    *vi ^= static_cast<uint32_t>(sfm) & 0x80008000u;
+    v = __hadd2(v, pv);
+  }
+  return v;
 }
 
 // hadamard_inner.cuh:93-147. Half vector, half scales, half out.
@@ -2429,6 +2444,405 @@ void Exl3GemmKernelCuda(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
   Check(cudaGetLastError(), "exl3_gemm launch");
 }
 
+// ── the reconstruct kernels (reconstruct.cu:11-308) ─────────────────────────
+//
+// The EXL3 prefill path for M > 144 (AUTO_RECONSTRUCT_THRESHOLD, exl3.py:10).
+// Dequantizes the trellis to a full fp16 weight matrix, then runs cuBLAS fp16
+// GEMM. Two variants:
+//
+//   reconstruct_kernel     unfused: dequantizes a 16x128 tile to row-major fp16.
+//                          The caller applies the input/output Hadamards as
+//                          standalone launches (suh on input, svh on output).
+//
+//   reconstruct_had_kernel fused: dequantizes + applies BOTH Hadamards + sign
+//                          vectors inside the kernel, emitting original-basis
+//                          weights. The GEMM then runs on the raw input and no
+//                          standalone Hadamard launches are needed (~14% of
+//                          long-chunk prefill GPU time saved, exl3.py:171-175).
+//
+// Both kernels share `dq_dispatch` (line 451) and `shuffle_had_h2x32`
+// (line 499) with the cooperative GEMM kernel. The arm set is the same seven
+// pairs as `Exl3ArmInstantiated` above, because `dq_dispatch` static_asserts
+// bits 3..6 and the codebook set matches the GEMM's.
+
+// reconstruct.cu:11-84. Unfused reconstruct: dequantize one 16x128 tile and
+// store in row-major fp16.
+template <int K, int cb>
+__global__ __launch_bounds__(256)
+void reconstruct_kernel(half* __restrict__ g_unpacked,
+                        const uint16_t* __restrict__ g_packed,
+                        int packed_blocks_n, int packed_n_offset) {
+  constexpr int packed_size = 256 * K / 16;  // in uint16s
+
+  int t = threadIdx.x;
+  int lane_id = t % 32;
+  int warp_id = t / 32;
+  int k = blockIdx.y;
+  int n = blockIdx.x * 8;
+  int tiles_n = gridDim.x;
+  int out_blocks_n = tiles_n * 8;
+
+  // Load packed 16*128 tile
+  __shared__ uint32_t s_packed[8][packed_size / 2];
+  g_packed += (k * packed_blocks_n + packed_n_offset + n) * packed_size;
+  if (t < packed_size)
+    ((int4*)s_packed)[t] = ((int4*)g_packed)[t];
+  __syncthreads();
+
+  // Dequant
+  FragB frag[2];
+  dq_dispatch<K, cb>(s_packed[warp_id], lane_id * 8, frag[0], frag[1]);
+
+  // Shuffle from tensor core layout to row major tile
+  __shared__ half2 tile[16][8][8];
+
+  half2 n0 = __shfl_down_sync(0xFFFFFFFF, frag[0][0], 4, 32);
+  half2 n1 = __shfl_down_sync(0xFFFFFFFF, frag[0][1], 4, 32);
+  half2 n2 = __shfl_down_sync(0xFFFFFFFF, frag[1][0], 4, 32);
+  half2 n3 = __shfl_down_sync(0xFFFFFFFF, frag[1][1], 4, 32);
+
+  if (!(lane_id & 4)) {
+    half2 m0 = __halves2half2(__low2half(frag[0][0]), __low2half(n0));
+    half2 m1 = __halves2half2(__high2half(frag[0][0]), __high2half(n0));
+    half2 m2 = __halves2half2(__low2half(frag[0][1]), __low2half(n1));
+    half2 m3 = __halves2half2(__high2half(frag[0][1]), __high2half(n1));
+    half2 m4 = __halves2half2(__low2half(frag[1][0]), __low2half(n2));
+    half2 m5 = __halves2half2(__high2half(frag[1][0]), __high2half(n2));
+    half2 m6 = __halves2half2(__low2half(frag[1][1]), __low2half(n3));
+    half2 m7 = __halves2half2(__high2half(frag[1][1]), __high2half(n3));
+    int r0 = (lane_id % 4) * 2;
+    int r1 = r0 + 1;
+    int r2 = r0 + 8;
+    int r3 = r0 + 9;
+    int c0 = lane_id / 8;
+    int c1 = c0 + 4;
+    tile[r0][warp_id][c0] = m0;
+    tile[r1][warp_id][c0] = m1;
+    tile[r2][warp_id][c0] = m2;
+    tile[r3][warp_id][c0] = m3;
+    tile[r0][warp_id][c1] = m4;
+    tile[r1][warp_id][c1] = m5;
+    tile[r2][warp_id][c1] = m6;
+    tile[r3][warp_id][c1] = m7;
+  }
+  __syncthreads();
+
+  // Store unpacked tile
+  int r = t / 16;
+  int c = t % 16;
+  int4* tile_int4 = (reinterpret_cast<int4*>(tile));
+  int4* out_int4 = ((int4*)g_unpacked) + (k * 16 + r) * 2 * out_blocks_n + n * 2 + c;
+  *out_int4 = tile_int4[t];
+}
+
+// reconstruct.cu:147-308. Fused reconstruct + both-side Hadamard: emits
+// W = diag(suh) . H128 . W_hat . H128 . diag(svh) (per 128x128 tile, 1/sqrt(128)
+// per side), i.e. the ORIGINAL-basis weights, so the GEMM runs on raw input.
+//
+// The 128x128 tile lives in shared memory with an XOR swizzle on the half4
+// chunk index (chunk ^= (row >> 2) & 31) making all phases bank-conflict-free
+// except the 16-lane dequant scatter; both transforms reuse the natural-order
+// Sylvester butterfly (symmetric, so column-then-row order is H W H).
+template <int K, int cb>
+__global__ __launch_bounds__(256)
+void reconstruct_had_kernel(half* __restrict__ g_unpacked,
+                            const uint16_t* __restrict__ g_packed,
+                            const half* __restrict__ suh,
+                            const half* __restrict__ svh,
+                            int packed_blocks_n, int packed_n_offset) {
+  constexpr int packed_size = 256 * K / 16;
+  constexpr float r_scale = 0.08838834764831845f;
+
+  int t = threadIdx.x;
+  int lane_id = t % 32;
+  int warp_id = t / 32;
+  int kb = blockIdx.y;
+  int nb = blockIdx.x;
+  int n = nb * 8;
+  int row_len = gridDim.x * 128;
+
+  __shared__ uint32_t s_packed[8][8][packed_size / 2];
+  __shared__ half2 stile[128 * 64];
+
+  auto tix = [&](int R, int q, int p) {
+    return R * 64 + (q ^ ((R >> 2) & 31)) * 2 + p;
+  };
+
+  constexpr int j_int4 = packed_size / 8;
+  for (int u = t; u < 8 * 8 * j_int4; u += 256) {
+    int j = u / (8 * j_int4);
+    int r = u % (8 * j_int4);
+    const uint16_t* gp = g_packed +
+        ((size_t)((kb * 8 + j) * packed_blocks_n + packed_n_offset + n)) * packed_size;
+    ((int4*)s_packed[j])[r] = ((const int4*)gp)[r];
+  }
+  __syncthreads();
+
+  for (int jj = 0; jj < 8 * 8 / (256 / 32); ++jj) {
+    int j = (warp_id / 8) * (8 / (256 / 256)) + jj;
+    int wn = warp_id % 8;
+    FragB frag[2];
+    dq_dispatch<K, cb>(s_packed[j][wn], lane_id * 8, frag[0], frag[1]);
+
+    half2 n0 = __shfl_down_sync(0xFFFFFFFF, frag[0][0], 4, 32);
+    half2 n1 = __shfl_down_sync(0xFFFFFFFF, frag[0][1], 4, 32);
+    half2 n2 = __shfl_down_sync(0xFFFFFFFF, frag[1][0], 4, 32);
+    half2 n3 = __shfl_down_sync(0xFFFFFFFF, frag[1][1], 4, 32);
+
+    if (!(lane_id & 4)) {
+      half2 m0 = __halves2half2(__low2half(frag[0][0]), __low2half(n0));
+      half2 m1 = __halves2half2(__high2half(frag[0][0]), __high2half(n0));
+      half2 m2 = __halves2half2(__low2half(frag[0][1]), __low2half(n1));
+      half2 m3 = __halves2half2(__high2half(frag[0][1]), __high2half(n1));
+      half2 m4 = __halves2half2(__low2half(frag[1][0]), __low2half(n2));
+      half2 m5 = __halves2half2(__high2half(frag[1][0]), __high2half(n2));
+      half2 m6 = __halves2half2(__low2half(frag[1][1]), __low2half(n3));
+      half2 m7 = __halves2half2(__high2half(frag[1][1]), __high2half(n3));
+      int r0 = j * 16 + (lane_id % 4) * 2;
+      int r1 = r0 + 1;
+      int r2 = r0 + 8;
+      int r3 = r0 + 9;
+      int c0 = lane_id / 8;
+      int q0 = (wn * 8 + c0) >> 1, p0 = c0 & 1;
+      int q1 = (wn * 8 + c0 + 4) >> 1, p1 = c0 & 1;
+      stile[tix(r0, q0, p0)] = m0;
+      stile[tix(r1, q0, p0)] = m1;
+      stile[tix(r2, q0, p0)] = m2;
+      stile[tix(r3, q0, p0)] = m3;
+      stile[tix(r0, q1, p1)] = m4;
+      stile[tix(r1, q1, p1)] = m5;
+      stile[tix(r2, q1, p1)] = m6;
+      stile[tix(r3, q1, p1)] = m7;
+    }
+  }
+  __syncthreads();
+
+  const half2 rs2 = __float2half2_rn(r_scale);
+  constexpr int CHUNKS_PW = 32 / (256 / 32);
+#pragma unroll
+  for (int qq = 0; qq < CHUNKS_PW; ++qq) {
+    int q = warp_id * CHUNKS_PW + qq;
+    int qs = q ^ lane_id;
+    half2 a[4], b[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      half4 v = *((const half4*)(stile + (lane_id * 4 + i) * 64 + qs * 2));
+      a[i] = v.x;
+      b[i] = v.y;
+    }
+#pragma unroll
+    for (int x = 0; x < 2; ++x) {
+      half2* v = x == 0 ? a : b;
+      half2 s0 = __hadd2(v[0], v[1]), d0 = __hsub2(v[0], v[1]);
+      half2 s1 = __hadd2(v[2], v[3]), d1 = __hsub2(v[2], v[3]);
+      v[0] = __hmul2(__hadd2(s0, s1), rs2);
+      v[1] = __hmul2(__hadd2(d0, d1), rs2);
+      v[2] = __hmul2(__hsub2(s0, s1), rs2);
+      v[3] = __hmul2(__hsub2(d0, d1), rs2);
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+        v[i] = shuffle_had_h2x32(v[i], lane_id);
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      half4 v;
+      v.x = a[i];
+      v.y = b[i];
+      *((half4*)(stile + (lane_id * 4 + i) * 64 + qs * 2)) = v;
+    }
+  }
+  __syncthreads();
+
+  // Row transform fused with the store: after the lane butterfly, lane l holds
+  // the FINAL columns 4l..4l+3 of row R. Apply the sign scales in registers and
+  // write the coalesced 256-byte row directly.
+  constexpr int ROWS_PW = 128 / (256 / 32);
+  const half4 sv4 = ((const half4*)svh)[nb * 32 + lane_id];
+#pragma unroll
+  for (int rr = 0; rr < ROWS_PW; ++rr) {
+    int R = warp_id * ROWS_PW + rr;
+    int base = R * 64 + (lane_id ^ ((R >> 2) & 31)) * 2;
+    half2 v01 = stile[base];
+    half2 v23 = stile[base + 1];
+    float v0 = __low2float(v01), v1 = __high2float(v01);
+    float v2 = __low2float(v23), v3 = __high2float(v23);
+    float s0 = v0 + v1, d0 = v0 - v1;
+    float s1 = v2 + v3, d1 = v2 - v3;
+    half2 h01 = __hmul2(__floats2half2_rn(s0 + s1, d0 + d1), rs2);
+    half2 h23 = __hmul2(__floats2half2_rn(s0 - s1, d0 - d1), rs2);
+    h01 = shuffle_had_h2x32(h01, lane_id);
+    h23 = shuffle_had_h2x32(h23, lane_id);
+    half2 su2 = __half2half2(suh[kb * 128 + R]);
+    half4 v;
+    v.x = __hmul2(__hmul2(h01, su2), sv4.x);
+    v.y = __hmul2(__hmul2(h23, su2), sv4.y);
+    *((half4*)(g_unpacked + (size_t)(kb * 128 + R) * row_len + nb * 128 + lane_id * 4)) = v;
+  }
+}
+
+// ── the reconstruct launchers (reconstruct.cu:98-144, 324-373) ───────────────
+//
+// Same arm set as Exl3ArmInstantiated (the 7 pairs dq_dispatch admits), dispatched
+// with a switch rather than the reference's dense 24-entry array, matching the
+// GEMM's own sparse dispatch (GemmKernelForArm, line 2137).
+
+#define VT_RECONSTRUCT_DISPATCH(K, CB)                                     \
+  reconstruct_kernel<K, CB><<<grid_dim, block_dim, 0, stream>>>(           \
+      w_ptr, trellis_ptr_u16, packed_blocks_n, packed_n_offset);           \
+  return
+
+void ReconstructSlice(Queue& q, Tensor& w, const Tensor& trellis, int bits,
+                      int codebook, int64_t n_offset) {
+  const int rows = static_cast<int>(trellis.shape[0]);      // k/16
+  const int packed_blocks_n = static_cast<int>(trellis.shape[1]);  // n/16
+  if (rows == 0 || packed_blocks_n == 0) return;
+  const int cols = static_cast<int>(w.shape[1]) / 16;      // n_slice/16
+  const int packed_n_offset = static_cast<int>(n_offset / 16);
+  const dim3 block_dim(256);
+  const dim3 grid_dim(static_cast<unsigned>(cols / 8), static_cast<unsigned>(rows));
+  cudaStream_t stream = AsStream(q);
+  half* w_ptr = w.Ptr<half>();
+  const uint16_t* trellis_ptr_u16 = trellis.Ptr<uint16_t>();
+
+  if (bits == 3 && codebook == 0) { VT_RECONSTRUCT_DISPATCH(3, 0); }
+  if (bits == 3 && codebook == 1) { VT_RECONSTRUCT_DISPATCH(3, 1); }
+  if (bits == 6 && codebook == 0) { VT_RECONSTRUCT_DISPATCH(6, 0); }
+  if (bits == 3 && codebook == 2) { VT_RECONSTRUCT_DISPATCH(3, 2); }
+  if (bits == 4 && codebook == 2) { VT_RECONSTRUCT_DISPATCH(4, 2); }
+  if (bits == 5 && codebook == 2) { VT_RECONSTRUCT_DISPATCH(5, 2); }
+  if (bits == 6 && codebook == 2) { VT_RECONSTRUCT_DISPATCH(6, 2); }
+  throw std::runtime_error(
+      "vt cuda exl3: reconstruct is instantiated for (bits, codebook) in "
+      "{(3, 0), (3, 1), (6, 0), (3, 2), (4, 2), (5, 2), (6, 2)} only; got bits " +
+      std::to_string(bits) + " codebook " + std::to_string(codebook) +
+      ". The CPU arm decodes every width over all three codebooks.");
+}
+#undef VT_RECONSTRUCT_DISPATCH
+
+#define VT_RECONSTRUCT_HAD_DISPATCH(K, CB)                               \
+  reconstruct_had_kernel<K, CB><<<grid_dim, block_dim, 0, stream>>>(     \
+      w_ptr, trellis_ptr_u16, suh_ptr, svh_ptr, packed_blocks_n,         \
+      packed_n_offset);                                                  \
+  return
+
+void ReconstructHadSlice(Queue& q, Tensor& w, const Tensor& trellis,
+                         const Tensor& suh, const Tensor& svh, int bits,
+                         int codebook, int64_t n_offset) {
+  const int k_dim = static_cast<int>(w.shape[0]);       // k (full)
+  const int n_slice = static_cast<int>(w.shape[1]);     // n_slice
+  if (k_dim == 0 || n_slice == 0) return;
+  const int packed_blocks_n = static_cast<int>(trellis.shape[1]);  // n/16 (full)
+  const int packed_n_offset = static_cast<int>(n_offset / 16);
+  const dim3 block_dim(256);
+  const dim3 grid_dim(static_cast<unsigned>(n_slice / 128),
+                      static_cast<unsigned>(k_dim / 128));
+  cudaStream_t stream = AsStream(q);
+  half* w_ptr = w.Ptr<half>();
+  const uint16_t* trellis_ptr_u16 = trellis.Ptr<uint16_t>();
+  const half* suh_ptr = suh.Ptr<half>();
+  const half* svh_ptr = svh.Ptr<half>();
+
+  if (bits == 3 && codebook == 0) { VT_RECONSTRUCT_HAD_DISPATCH(3, 0); }
+  if (bits == 3 && codebook == 1) { VT_RECONSTRUCT_HAD_DISPATCH(3, 1); }
+  if (bits == 6 && codebook == 0) { VT_RECONSTRUCT_HAD_DISPATCH(6, 0); }
+  if (bits == 3 && codebook == 2) { VT_RECONSTRUCT_HAD_DISPATCH(3, 2); }
+  if (bits == 4 && codebook == 2) { VT_RECONSTRUCT_HAD_DISPATCH(4, 2); }
+  if (bits == 5 && codebook == 2) { VT_RECONSTRUCT_HAD_DISPATCH(5, 2); }
+  if (bits == 6 && codebook == 2) { VT_RECONSTRUCT_HAD_DISPATCH(6, 2); }
+  throw std::runtime_error(
+      "vt cuda exl3: reconstruct_had is instantiated for (bits, codebook) in "
+      "{(3, 0), (3, 1), (6, 0), (3, 2), (4, 2), (5, 2), (6, 2)} only; got bits " +
+      std::to_string(bits) + " codebook " + std::to_string(codebook) +
+      ". The CPU arm decodes every width over all three codebooks.");
+}
+#undef VT_RECONSTRUCT_HAD_DISPATCH
+
+// ── the reconstruct+cuBLAS launcher (exl3.py:161-218) ────────────────────────
+//
+// Mirrors exllamav3's `reconstruct_hgemm` dispatch: dequantize the trellis to
+// fp16, then cuBLAS fp16 GEMM. Two sub-paths:
+//   FUSED (M >= 1024, both dims 128-divisible): reconstruct_had_slice emits
+//     original-basis weights (both Hadamards + sign vectors folded in), so the
+//     GEMM runs on raw `a` with no standalone Hadamard launches.
+//   UNFUSED (M < 1024): reconstruct (plain dequant) + input Hadamard (suh) on
+//     `a` + cuBLAS + output Hadamard (svh) on `c` in-place.
+//
+// For N > 32768 (MAX_RECONSTRUCT_SLICE_N), the weight is reconstructed and
+// GEMMed in 32768-column slices (exl3.py:199-211).
+constexpr int kMaxReconstructSliceN = 32768;
+
+void Exl3ReconstructGemmKernelCuda(Queue& q, Tensor& c, const Tensor& a,
+                                    const Tensor& trellis, const Tensor& suh,
+                                    const Tensor& svh, Tensor& a_had,
+                                    Tensor& w_scratch, const Exl3GemmArgs& args) {
+  if (!Exl3ArmInstantiated(args.bits, args.codebook)) {
+    throw std::runtime_error(
+        "vt cuda exl3: reconstruct+cuBLAS is instantiated for (bits, codebook) "
+        "in {(3, 0), (3, 1), (6, 0), (3, 2), (4, 2), (5, 2), (6, 2)} only; got "
+        "bits " + std::to_string(args.bits) + " codebook " +
+        std::to_string(args.codebook) + ". The CPU arm decodes every width.");
+  }
+  const int size_m = static_cast<int>(a.shape[0]);
+  const int size_k = static_cast<int>(a.shape[1]);
+  const int size_n = static_cast<int>(c.shape[1]);
+  if (size_m == 0 || size_k == 0 || size_n == 0) return;
+
+  // exl3.py:176-184. Fused requires both dims 128-divisible (always true for
+  // EXL3 tensors, which are Hadamard-transformed at quant time) and M >= 1024.
+  const bool dims_128 = (size_k % 128 == 0) && (size_n % 128 == 0);
+  const bool use_fused = dims_128 && size_m >= 1024;
+
+  // exl3.py:186-190. Input Hadamard (unfused only).
+  Tensor* xh = const_cast<Tensor*>(&a);
+  if (!use_fused) {
+    Exl3HadArgs had_args;
+    had_args.pre_scale = const_cast<Tensor*>(&suh);
+    had_args.scale = 1.0f;
+    Exl3HadR128(q, a_had, a, had_args);
+    xh = &a_had;
+  }
+
+  // exl3.py:192-211. Reconstruct + GEMM, optionally sliced along N.
+  if (size_n <= kMaxReconstructSliceN) {
+    // Single slice: reconstruct the full weight, then GEMM.
+    if (use_fused) {
+      ReconstructHadSlice(q, w_scratch, trellis, suh, svh, args.bits, args.codebook, 0);
+    } else {
+      ReconstructSlice(q, w_scratch, trellis, args.bits, args.codebook, 0);
+    }
+    CublasLtHgemm(q, c, *xh, w_scratch);
+  } else {
+    // exl3.py:199-211. Reconstruct + GEMM in 32768-column slices, reusing
+    // w_scratch.
+    for (int n_start = 0; n_start < size_n; n_start += kMaxReconstructSliceN) {
+      const int n_end = EXL3_MIN(n_start + kMaxReconstructSliceN, size_n);
+      const int n_slice = n_end - n_start;
+      // Slice w_scratch to [k, n_slice] for this iteration.
+      Tensor w_slice = w_scratch.Slice(1, 0, n_slice);
+      if (use_fused) {
+        // svh must be pre-offset by the caller; slice it from n_start.
+        Tensor svh_slice = svh.Slice(0, n_start, n_end);
+        ReconstructHadSlice(q, w_slice, trellis, suh, svh_slice, args.bits,
+                            args.codebook, n_start);
+      } else {
+        ReconstructSlice(q, w_slice, trellis, args.bits, args.codebook, n_start);
+      }
+      // GEMM into the corresponding column slice of c.
+      Tensor c_slice = c.Slice(1, n_start, n_end);
+      CublasLtHgemm(q, c_slice, *xh, w_slice);
+    }
+  }
+
+  // exl3.py:213-214. Output Hadamard (unfused only), applied in-place on c.
+  // Safe: each 128-element block is processed independently.
+  if (!use_fused) {
+    Exl3HadArgs had_args;
+    had_args.post_scale = const_cast<Tensor*>(&svh);
+    had_args.scale = 1.0f;
+    Exl3HadR128(q, c, c, had_args);
+  }
+}
+
 // THE INSTANTIATED FUSED-MoE ARMS, which are NOT the GEMM's arms above.
 //
 // Upstream's table is `exl3_moe_kernel_instances[]` (`exl3_moe.cu:22-33`),
@@ -2664,6 +3078,9 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<Exl3GemmFn>(&Exl3GemmKernelCuda)));
     RegisterOp(OpId::kExl3MoeMlp, DeviceType::kCUDA,
                reinterpret_cast<void*>(static_cast<Exl3MoeMlpFn>(&Exl3MoeMlpKernelCuda)));
+    RegisterOp(OpId::kExl3ReconstructGemm, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<Exl3ReconstructGemmFn>(&Exl3ReconstructGemmKernelCuda)));
   }
 } registrar;
 

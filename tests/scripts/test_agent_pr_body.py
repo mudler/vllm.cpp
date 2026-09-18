@@ -98,6 +98,64 @@ class ToolHarness(unittest.TestCase):
         )
 
 
+class ClosingKeywordRecordTests(ToolHarness):
+    """`Closes #N` in a body closes the GitHub mirror the moment the squash lands.
+
+    Local files are the issue authority, so the branch must also carry
+    `ISSUE-GH-N.md` reading `State: CLOSED`. Three landed pull requests
+    (#3092, #3098 and five on #3096) said `Closes` while their own local record
+    still read OPEN, which leaves the authoritative half saying OPEN forever.
+    """
+
+    def test_closing_an_issue_with_no_local_record_warns_but_is_accepted(self) -> None:
+        """A missing record is migration debt, not a contradiction.
+
+        An authority that does not exist cannot disagree with the body. Measured
+        across the open queue this arm fired on 22 of 24 refusals and would have
+        blocked three pull requests that legitimately landed on 2026-09-11, so it
+        warns and the body still passes.
+        """
+
+        text = body(FILLED).replace(
+            "fix(ROW): the subject line of a body that will be squashed\n",
+            "fix(ROW): the subject line of a body that will be squashed\n\nCloses #999999.\n",
+        )
+        result = self.run_tool("--body-file", self.body_file(text))
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("WARNING", result.stderr)
+
+    def test_closing_an_issue_whose_record_reads_open_is_refused(self) -> None:
+        """The arm that earns the refusal: the two authorities actively disagree.
+
+        `.agents/issues/_owed/ISSUE-GH-1928.md` reads State: OPEN in this tree, so
+        a body closing it would close the mirror while the authoritative half still
+        says OPEN.
+        """
+
+        text = body(FILLED).replace(
+            "fix(ROW): the subject line of a body that will be squashed\n",
+            "fix(ROW): the subject line of a body that will be squashed\n\nCloses #1928.\n",
+        )
+        result = self.run_tool("--body-file", self.body_file(text))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("State: OPEN", result.stderr)
+
+    def test_a_bare_reference_without_a_closing_keyword_is_accepted(self) -> None:
+        """The gate is narrow ON PURPOSE: ordinary citations must not red a body.
+
+        Open pull requests carry six to ten bare `#N` citations each, most
+        without a local record. Failing those would fire the gate on ordinary
+        work, which AGENTS.md names as the defect rather than the discipline.
+        """
+
+        text = body(FILLED).replace(
+            "fix(ROW): the subject line of a body that will be squashed\n",
+            "fix(ROW): the subject line of a body that will be squashed\n\nRefs #999999.\n",
+        )
+        result = self.run_tool("--body-file", self.body_file(text))
+        self.assertEqual(result.returncode, 0)
+
+
 class OfflineContractTests(ToolHarness):
     def test_the_exact_landed_malformed_value_is_refused(self) -> None:
         """The bytes of 281b4bc76c0e, refused by a command an operator can run."""

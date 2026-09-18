@@ -97,7 +97,9 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "                      [--device cpu|cuda] [--dequant-bf16 | --keep-quant] "
       "[--fp4-resident]\n"
       "                      [--first-frame f.ppm] [--last-frame f.ppm] [--noise-aug A]\n"
-      "                      [--ref-image f.ppm] [--ref-video DIR] [--ref-audio f.wav]\n");
+      "                      [--ref-image f.ppm] [--ref-video DIR] [--ref-audio f.wav]\n"
+      "                      [--lora <adapter.safetensors> [STRENGTH]]  fused at load; 1.0\n"
+      "                      [--lora-dir DIR]  resolve <lora:name:strength> prompt tags\n");
   std::exit(code);
 }
 
@@ -107,6 +109,19 @@ int main(int argc, char** argv) {
   vllm_video_model_params mp = vllm_video_model_params_default();
   vllm_video_params vp = vllm_video_params_default();
   std::string workdir = "/tmp/minimax_h3_gen", out_path, ffmpeg = "ffmpeg", device = "cpu";
+
+  std::vector<std::string> extra_keys, extra_values;
+  int lora_count = 0;
+  auto SetExtra = [&](const std::string& key, std::string value) {
+    for (size_t i = 0; i < extra_keys.size(); ++i) {
+      if (extra_keys[i] == key) {
+        extra_values[i] = std::move(value);
+        return;
+      }
+    }
+    extra_keys.emplace_back(key);
+    extra_values.push_back(std::move(value));
+  };
 
   for (int i = 1; i < argc; ++i) {
     const std::string f = argv[i];
@@ -137,6 +152,15 @@ int main(int argc, char** argv) {
     else if (f == "--ref-video") vp.ref_video = Need(argc, argv, ++i, "--ref-video");
     else if (f == "--ref-audio") vp.ref_audio = Need(argc, argv, ++i, "--ref-audio");
     else if (f == "--noise-aug") vp.noise_aug = std::strtof(Need(argc, argv, ++i, "--noise-aug"), nullptr);
+    else if (f == "--lora") {
+      ++lora_count;
+      const std::string suffix = lora_count == 1 ? "" : "_" + std::to_string(lora_count);
+      SetExtra("lora_path" + suffix, Need(argc, argv, ++i, f.c_str()));
+      if (i + 1 < argc && argv[i + 1][0] != '-') {
+        SetExtra("lora_strength" + suffix, argv[++i]);
+      }
+    }
+    else if (f == "--lora-dir") SetExtra("lora_dir", Need(argc, argv, ++i, "--lora-dir"));
     else if (f == "--workdir") workdir = Need(argc, argv, ++i, "--workdir");
     else if (f == "--out") out_path = Need(argc, argv, ++i, "--out");
     else if (f == "--ffmpeg") ffmpeg = Need(argc, argv, ++i, "--ffmpeg");
@@ -146,6 +170,19 @@ int main(int argc, char** argv) {
       Usage(2);
     }
   }
+  std::vector<const char*> keys, values;
+  keys.reserve(extra_keys.size());
+  values.reserve(extra_values.size());
+  for (size_t i = 0; i < extra_keys.size(); ++i) {
+    keys.push_back(extra_keys[i].c_str());
+    values.push_back(extra_values[i].c_str());
+  }
+  if (!keys.empty()) {
+    mp.extra_keys = keys.data();
+    mp.extra_values = values.data();
+    mp.n_extras = static_cast<int32_t>(keys.size());
+  }
+
   if (mp.dit_path == nullptr) Usage(2);
   if (device == "cuda") mp.device = 1;
   else if (device != "cpu") {

@@ -134,10 +134,11 @@ OwnedTensor LoadMatmul(const GgufFile& g, const GgufLoadPolicy& pol,
   const GgufResidency r = pol.Route(t, GgufTensorRole::kMatmulWeight);
   if (r == GgufResidency::kKeepQuant)
     return OwnGgufQuantBlocks(t, n, k, /*row_offset=*/0, MmapSrc(g, pol),
-                              pol.quant_repack);
+                              pol.quant_repack, /*cuda_align=*/false,
+                              pol.prefault);
   if (r == GgufResidency::kKeepF16)
     return OwnGgufF16(t, n, k, /*row_offset=*/0, MmapSrc(g, pol), /*nk=*/true,
-                      pol.elem_kn_repack);
+                      pol.elem_kn_repack, pol.prefault);
   return ExpandBf16(g, name, {n, k}, /*nk=*/true);
 }
 
@@ -156,7 +157,8 @@ OwnedTensor LoadStackedExperts(const GgufFile& g, const GgufLoadPolicy& pol,
     // [E*N, K] and reshaped back. The bytes are identical either way; only the
     // recorded shape differs, and the consumer slices by expert.
     OwnedTensor o = OwnGgufQuantBlocks(t, e * n, k, /*row_offset=*/0,
-                                       MmapSrc(g, pol), pol.quant_repack);
+                                       MmapSrc(g, pol), pol.quant_repack,
+                                       /*cuda_align=*/false, pol.prefault);
     o.rank = 3;
     o.shape[0] = e;
     o.shape[1] = n;
@@ -722,14 +724,16 @@ Qwen4ExpWeights LoadQwen4ExpFromGguf(const GgufFile& gguf,
     if (r == GgufResidency::kKeepQuant) {
       w.ngram_table = OwnGgufQuantBlocks(t, rows, cols, /*row_offset=*/0,
                                          MmapSrc(gguf, pol),
-                                         /*repack=*/false);
+                                         /*repack=*/false,
+                                         /*cuda_align=*/false, pol.prefault);
       // A gather table is read row-wise, never dotted, so it must NOT carry the
       // matmul orientation flag: `nk` is what tells a consumer this is a
       // MatmulBT operand.
       w.ngram_table.nk = false;
     } else if (r == GgufResidency::kKeepF16) {
       w.ngram_table = OwnGgufF16(t, rows, cols, /*row_offset=*/0,
-                                 MmapSrc(gguf, pol), /*nk=*/false);
+                                 MmapSrc(gguf, pol), /*nk=*/false,
+                                 /*elem_kn_repack=*/false, pol.prefault);
     } else {
       w.ngram_table = ExpandBf16(gguf, nm, {rows, cols}, /*nk=*/false);
     }

@@ -463,6 +463,13 @@ def audit() -> list[dict]:
 # reachable on this fleet. The credit returns when the row reaches a gate-obliged
 # state, which its W2 does.
 RUNNABLE_BASELINE = frozenset({
+    # 2026-09-12: +QUANT-GGUF-IQ4_NL. GROWTH, and re-pinned in the change that
+    # caused it. The row is new (#3149) and its spec's `## Gates` section names
+    # a `ctest` invocation and the `strix:gpu0` ROCm suite, both of which can
+    # genuinely fail -- the section records this row's own RED run at
+    # `3c529c87e` (2 of 47 cases) before the arm existed. A row enters this
+    # population by what its Gates section can RUN, and these run.
+    "QUANT-GGUF-IQ4_NL",
     # 2026-09-05: +BACKEND-TENSTORRENT-KEEPQUANT. GROWTH, and re-pinned in the
     # same change that caused it. The row is new (#2959, W0 staging) and its
     # spec's `## Gates` section names `scripts/agent-preflight.sh` per wave,

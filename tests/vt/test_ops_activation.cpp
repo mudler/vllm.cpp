@@ -428,6 +428,82 @@ TEST_CASE("silu_and_mul leaves an f32 INPUT bit-identical (the target is x's dty
   CHECK(checked == T * D);
 }
 
+namespace {
+// DeepSeek-V4 ClampedSwiGLU reference (activation.py:197-201, alpha=1, beta=0):
+//   gate = min(g, limit)               (MAX only)
+//   up   = clamp(u, -limit, limit)     (BOTH sides)
+//   out  = silu(gate) * up
+float ClampedSwiGLURef(float g, float u, float limit) {
+  const float gate = std::min(g, limit);
+  const float up = std::min(std::max(u, -limit), limit);
+  return SiluRef(gate) * up;
+}
+}  // namespace
+
+TEST_CASE("clamped_swiglu golden: clamps gate max-only, up both sides") {
+  // x = [1, 5, 3, -4], D=2, limit=2.0
+  // gate=[1,5] -> clamped=[min(1,2), min(5,2)] = [1, 2]
+  // up  =[3,-4] -> clamped=[clamp(3,-2,2), clamp(-4,-2,2)] = [2, -2]
+  // out[0] = silu(1)*2  = 0.731059*2  =  1.462118
+  // out[1] = silu(2)*-2 = 1.761594*-2 = -3.523189
+  std::vector<float> x = {1.0f, 5.0f, 3.0f, -4.0f};
+  std::vector<float> out(2, 0.0f);
+  Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {1, 4});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {1, 2});
+  Queue q{Cpu(), nullptr};
+  vt::ClampedSwiGLU(q, to, tx, 2.0f);
+  CHECK(out[0] == doctest::Approx(1.462118f));
+  CHECK(out[1] == doctest::Approx(-3.523189f));
+}
+
+TEST_CASE("clamped_swiglu bit-exact vs reference at real dims (f32)") {
+  const int64_t T = 3, D = 512;
+  const float limit = 3.0f;
+  std::vector<float> x(static_cast<size_t>(T * 2 * D));
+  for (size_t n = 0; n < x.size(); ++n)
+    x[n] = std::sin(0.013f * static_cast<float>(n) + 0.5f) * 8.0f;  // spread beyond limit
+  std::vector<float> out(static_cast<size_t>(T * D), 0.0f);
+  Tensor tx = Tensor::Contiguous(x.data(), DType::kF32, Cpu(), {T, 2 * D});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kF32, Cpu(), {T, D});
+  Queue q{Cpu(), nullptr};
+  vt::ClampedSwiGLU(q, to, tx, limit);
+  int64_t checked = 0;
+  for (int64_t i = 0; i < T; ++i)
+    for (int64_t j = 0; j < D; ++j) {
+      const float g = x[static_cast<size_t>(i * 2 * D + j)];
+      const float u = x[static_cast<size_t>(i * 2 * D + D + j)];
+      CHECK(out[static_cast<size_t>(i * D + j)] == ClampedSwiGLURef(g, u, limit));  // exact
+      ++checked;
+    }
+  CHECK(checked == T * D);
+}
+
+TEST_CASE("clamped_swiglu narrows act(gate) to the bf16 INPUT dtype (upstream atol=rtol=0)") {
+  const int64_t T = 7, D = 512;
+  const float limit = 3.0f;
+  std::vector<uint16_t> x(static_cast<size_t>(T * 2 * D));
+  for (size_t n = 0; n < x.size(); ++n)
+    x[n] = vt::F32ToBF16(std::sin(0.0131f * static_cast<float>(n) + 0.37f) * 8.0f);
+  std::vector<uint16_t> out(static_cast<size_t>(T * D), 0);
+  Tensor tx = Tensor::Contiguous(x.data(), DType::kBF16, Cpu(), {T, 2 * D});
+  Tensor to = Tensor::Contiguous(out.data(), DType::kBF16, Cpu(), {T, D});
+  Queue q{Cpu(), nullptr};
+  vt::ClampedSwiGLU(q, to, tx, limit);
+  int64_t checked = 0;
+  for (int64_t i = 0; i < T; ++i)
+    for (int64_t j = 0; j < D; ++j) {
+      const float g = vt::BF16ToF32(x[static_cast<size_t>(i * 2 * D + j)]);
+      const float u = vt::BF16ToF32(x[static_cast<size_t>(i * 2 * D + D + j)]);
+      const float gate = std::min(g, limit);
+      const float up = std::min(std::max(u, -limit), limit);
+      // act(gate) narrowed to the input dtype, THEN multiplied, THEN stored.
+      const uint16_t want = vt::F32ToBF16(ThroughBf16(SiluRef(gate)) * up);
+      REQUIRE(out[static_cast<size_t>(i * D + j)] == want);  // exact, atol=rtol=0
+      ++checked;
+    }
+  CHECK(checked == T * D);
+}
+
 TEST_CASE("gelu_and_mul narrows act(gate) to the bf16 INPUT dtype (upstream atol=rtol=0)") {
   const int64_t T = 7, D = 512;
   std::vector<uint16_t> x(static_cast<size_t>(T * 2 * D));

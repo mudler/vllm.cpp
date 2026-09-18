@@ -11,22 +11,28 @@
 <line x1="92" y1="34.0" x2="600" y2="34.0" stroke="#33404e" stroke-width="1" stroke-dasharray="2 3"/>
 <text x="82.0" y="38.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="end">60.0</text>
 <text x="22" y="130" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" text-anchor="middle" transform="rotate(-90 22 130)">aggregate output tok/s</text>
-<polyline points="92.0,120.1 346.0,119.3 600.0,118.7" fill="none" stroke="#3d92c8" stroke-width="2" stroke-linejoin="round"/>
-<circle cx="92.0" cy="120.1" r="5" fill="#3d92c8"/>
-<circle cx="346.0" cy="119.3" r="5" fill="#3d92c8"/>
-<circle cx="600.0" cy="118.7" r="5" fill="#3d92c8"/>
-<text x="103.0" y="140.1" fill="#3d92c8" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="start">33.1</text>
-<text x="600.0" y="138.7" fill="#3d92c8" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="middle">33.5</text>
-<text x="600.0" y="152.7" fill="#3d92c8" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="middle">exllamav3</text>
-<polyline points="92.0,111.4 346.0,55.9 600.0,53.4" fill="none" stroke="#cf7a34" stroke-width="2" stroke-linejoin="round"/>
+<polyline points="92.0,120.0 219.0,120.2 346.0,120.9 473.0,120.8 600.0,123.8" fill="none" stroke="#3d92c8" stroke-width="2" stroke-linejoin="round"/>
+<circle cx="92.0" cy="120.0" r="5" fill="#3d92c8"/>
+<circle cx="219.0" cy="120.2" r="5" fill="#3d92c8"/>
+<circle cx="346.0" cy="120.9" r="5" fill="#3d92c8"/>
+<circle cx="473.0" cy="120.8" r="5" fill="#3d92c8"/>
+<circle cx="600.0" cy="123.8" r="5" fill="#3d92c8"/>
+<text x="103.0" y="140.0" fill="#3d92c8" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="start">33.1</text>
+<text x="600.0" y="143.8" fill="#3d92c8" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="middle">32.0</text>
+<text x="600.0" y="157.8" fill="#3d92c8" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="middle">exllamav3</text>
+<polyline points="92.0,111.4 219.0,55.9 346.0,53.4 473.0,54.7 600.0,64.0" fill="none" stroke="#cf7a34" stroke-width="2" stroke-linejoin="round"/>
 <circle cx="92.0" cy="111.4" r="5" fill="#cf7a34"/>
-<circle cx="346.0" cy="55.9" r="5" fill="#cf7a34"/>
-<circle cx="600.0" cy="53.4" r="5" fill="#cf7a34"/>
+<circle cx="219.0" cy="55.9" r="5" fill="#cf7a34"/>
+<circle cx="346.0" cy="53.4" r="5" fill="#cf7a34"/>
+<circle cx="473.0" cy="54.7" r="5" fill="#cf7a34"/>
+<circle cx="600.0" cy="64.0" r="5" fill="#cf7a34"/>
 <text x="103.0" y="99.4" fill="#cf7a34" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="start">35.8</text>
-<text x="600.0" y="41.4" fill="#cf7a34" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="middle">53.9</text>
-<text x="600.0" y="27.4" fill="#cf7a34" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="middle">vllm.cpp</text>
+<text x="600.0" y="52.0" fill="#cf7a34" font-size="11.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="middle">50.6</text>
+<text x="600.0" y="38.0" fill="#cf7a34" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="600" text-anchor="middle">vllm.cpp</text>
 <text x="92.0" y="248.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="middle">1</text>
-<text x="346.0" y="248.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="middle">4</text>
-<text x="600.0" y="248.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="middle">8</text>
+<text x="219.0" y="248.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="middle">4</text>
+<text x="346.0" y="248.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="middle">8</text>
+<text x="473.0" y="248.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="middle">16</text>
+<text x="600.0" y="248.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="middle">32</text>
 <text x="346.0" y="270.0" fill="#7b8997" font-size="11" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-weight="400" text-anchor="middle">concurrent requests</text>
 </svg>

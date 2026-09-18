@@ -1,0 +1,11 @@
+{
+  "target_base": "94ac5d1742c540fc5cbc2084d0fb74fdfd5dab41",
+  "target_complete_file_sha256": "8861de845d02df23e597a4c4ceaf5b4f053c5b5846e74bb836f95f9f2e7d04e0",
+  "result_sha256": "3d41b47f4aae184343d9f47389f3da91af9846b390ebd9a5b0913758c1f075ba",
+  "changed_key": "BACKEND-PLATFORM",
+  "old_citation": "[backend.h:22](../include/vt/backend.h#L22)",
+  "new_citation": "[backend.h:23](../include/vt/backend.h#L23)",
+  "all_other_bytes_unchanged": true,
+  "other_bytes_sha256": "802a366de63b9349333ed0bbfc86a3f10e86a9c6c62723fe7a301eed2142add0",
+  "change": "One citation label and line fragment corrected after residual_norm.h include moved Backend definition to line23"
+}

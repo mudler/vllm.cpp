@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <numeric>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -45,6 +46,7 @@
 #include "vt/quant.h"
 #include "vt/recipes.h"
 #include "vt/rocm/rocm_arch.h"
+#include "vt/rocm/rocm_pinned_h2d.h"
 #include "vt/rocm/rocm_runtime.h"
 
 namespace {
@@ -70,6 +72,39 @@ const char* DeviceName(DeviceType t) {
   }
   return "?";
 }
+
+// THE SAME NAME, AS A `std::string`, BECAUSE DOCTEST PRINTS THE `const char*`
+// AS `1`. `MESSAGE(a << b)` expands to `mb * a << b`, and `MessageBuilder`'s
+// chain stringifies through `doctest::toString`; `CAPTURE` takes the same path.
+// Both then record a measurement that cannot say which device produced it,
+// which is worse than recording nothing.
+//
+// Both halves were RUN against `third_party/doctest/doctest.h` 2.5.2 rather
+// than read: a standalone probe prints `raw=1` and `str=ROCM` for the same
+// name. The mechanism is ostream insertion in BOTH directions, not a pair of
+// `toString` overloads:
+//   - `const char*` satisfies `types::is_pointer` at :1114-1117, so
+//     `StringMaker` inherits `StringMakerBase<true>` and reaches
+//     `filldata<T*>::fill` at :1242, which forwards to
+//     `filldata<const volatile void*>::fill` at :8359. That does
+//     `*stream << in` on a `const volatile void*`, and `std::ostream` has an
+//     insertion for `const void*` but none for the volatile-qualified one, so
+//     the operand converts to `bool` and prints `1`. A null pointer escapes
+//     only because :8360 branches to the literal `"nullptr"`.
+//   - `std::string` satisfies `has_insertion_operator` at :1034, so the same
+//     `StringMakerBase<true>` reaches the GENERIC `filldata<T>::fill` at :1193
+//     and uses the real `operator<<(std::ostream&, const std::string&)`.
+// DO NOT "simplify" this helper away on the strength of a dedicated overload.
+// The two that would make it redundant are both compiled out on the clang/HIP
+// toolchain that runs this gate: `toString(const std::string&)` at :1158 sits
+// inside `#if DOCTEST_MSVC >= DOCTEST_COMPILER(19, 20, 0)` (:1156-1159), and
+// `toString(const char*)` at :1153 sits inside
+// `#ifdef DOCTEST_CONFIG_TREAT_CHAR_STAR_AS_STRING` (:1152-1154), which
+// nothing in this tree defines.
+//
+// Other sites in this file still pass the raw pointer and still print `1`;
+// see ISSUE-LOCAL-01M2A7P3C95W3PBAVT9SC6KKY5.
+std::string DeviceTag(DeviceType t) { return std::string(DeviceName(t)); }
 
 // Normalized mean squared error, the same statistic
 // tests/vt/test_ops_quant_dot.cpp gates on: sum((a-b)^2) / sum(a^2).
@@ -193,6 +228,139 @@ TEST_CASE("device Copy/Memset are BIT-EXACT against the host bytes") {
     dev.Free(p);
     dev.DestroyQueue(q);
   }
+}
+
+// --- The bounded pinned bounce ring (.agents/specs/rocm-chunked-pinned-h2d.md)
+//
+// THE REACHABILITY CONVICTION for that change, and the only one there can be.
+// The ring changes no byte: the model still loads, the tokens are still the
+// same, and only the HOST RESIDENCY of the transfer differs, which is a property
+// no byte-equality case in this file can see. So the instrument is asserted
+// beside the bytes, and the mutation that fails this case is deleting the staged
+// branch from RocmBackend::Copy in src/vt/rocm/rocm_backend.hip.
+//
+// It enters through `vt::Backend&`, the production seam every model loader
+// reaches — dense_attn::ResidentWeight, the qwen3_5.cpp twin, the MoE expert
+// towers, the EXL3 device loader — rather than through any test hook.
+//
+// TWO ARMS, and neither of them is a silent skip. On a board that takes the
+// plain hipMalloc branch the destination is device memory and the copy MUST take
+// the ring. On a board that takes the hipMallocManaged branch (gfx1103, or
+// VT_ROCM_MANAGED_ALLOC=1) the destination is already device-addressable and the
+// copy MUST NOT take it — the ring exists only to create a property managed
+// memory already has. Each arm asserts its own direction and says which it ran.
+TEST_CASE("a large pageable H2D takes the pinned bounce ring, and a small one does not") {
+  // One chunk short of three, so the last chunk is ragged and the count is not
+  // a number the loop could reach by accident.
+  const size_t kChunk = vt::rocm::kPinnedH2DChunkBytesDefault;
+  const size_t kBig = kChunk * 2 + (kChunk / 2);
+  const size_t kSmall = 4096;  // a norm weight: it must not pay a bounce
+
+  bool ran_on_a_board = false;
+  for (DeviceType dt : RegisteredDevices()) {
+    if (dt != DeviceType::kROCM) continue;
+    ran_on_a_board = true;
+    CAPTURE(DeviceTag(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+
+    // A PAGEABLE host source: an ordinary std::vector the HIP runtime knows
+    // nothing about. That is what a GGUF mmap view is, as far as this decision
+    // is concerned, and it is the only source kind the ring accepts.
+    std::vector<uint8_t> src(kBig);
+    {
+      uint32_t s = 20260913u;
+      for (size_t i = 0; i < kBig; ++i) {
+        s = s * 1664525u + 1013904223u;
+        src[i] = static_cast<uint8_t>(s >> 24);
+      }
+    }
+
+#if defined(VLLM_CPP_HIP)
+    const bool managed = vt::rocm::ManagedAllocActive(0);
+#else
+    const bool managed = false;
+#endif
+    const vt::rocm::PinnedH2DStats before = vt::rocm::PinnedH2DSnapshot();
+
+    void* p = dev.Alloc(kBig);
+    dev.Copy(q, p, src.data(), kBig);
+    dev.Synchronize(q);
+
+    const vt::rocm::PinnedH2DStats after_big = vt::rocm::PinnedH2DSnapshot();
+
+    // THE BYTES FIRST. The bar for a pure copy path in this file is
+    // bit-exactness, and a ring that reassembled the buffer wrongly would be a
+    // far worse defect than the residency it fixes.
+    std::vector<uint8_t> back(kBig, 0);
+    dev.Copy(q, back.data(), p, kBig);
+    dev.Synchronize(q);
+    CHECK(std::memcmp(src.data(), back.data(), kBig) == 0);
+
+    // A SMALL copy on the same backend, in the same case, so the threshold is
+    // gated beside the path it guards.
+    void* small = dev.Alloc(kSmall);
+    dev.Copy(q, small, src.data(), kSmall);
+    dev.Synchronize(q);
+    const vt::rocm::PinnedH2DStats after_small = vt::rocm::PinnedH2DSnapshot();
+
+    // ONE std::string, not a `const char*` chained with `<<`: doctest prints the
+    // literal as `1` (see the DeviceTag comment at the top of this file), which
+    // would turn the one line that says WHICH arm ran into noise.
+    const std::string note =
+        std::string("pinned H2D: managed_alloc=") + std::to_string(managed ? 1 : 0) +
+        " staged=" + std::to_string(after_small.staged_copies - before.staged_copies) +
+        " direct=" + std::to_string(after_small.direct_copies - before.direct_copies) +
+        " chunks=" + std::to_string(after_big.chunks - before.chunks) +
+        " max_chunk=" + std::to_string(after_big.max_chunk_bytes) +
+        " ring_bytes=" + std::to_string(after_big.ring_bytes);
+    MESSAGE(note);
+
+    if (managed) {
+      // The managed arm: device memory is host-addressable here, so the ring is
+      // deliberately not engaged and every copy is direct.
+      CHECK(after_small.staged_copies == before.staged_copies);
+      CHECK(after_small.direct_copies > before.direct_copies);
+      // AND NOT ONE PINNED BYTE IS ALLOCATED. A ring that is built and then
+      // never used is invisible to every other assertion here -- the bytes are
+      // right, the copies are direct, the case is green -- and it costs 256 MiB
+      // of PINNED HOST memory on exactly the boards that never stage. That is
+      // not free on this part: .agents/environment.md:95-100 measures gfx1151's
+      // managed ceiling as bounded by HOST RAM (27 GiB reached against 29.3 GiB
+      // available), so pinned host is the binding resource. The instrument
+      // printed ring_bytes=268435456 on this arm for a whole review cycle and
+      // nothing read it; this is the line that reads it.
+      CHECK(after_small.ring_bytes == before.ring_bytes);
+    } else {
+      // The staging arm. This is the assertion the whole change is for.
+      CHECK(after_big.staged_copies == before.staged_copies + 1);
+      CHECK(after_big.chunks == before.chunks + 3);
+      // BOUNDED HOST RESIDENCY, in the form this harness can actually make: no
+      // single pinned-to-device transfer ever exceeds one chunk, whatever the
+      // size of the copy. Mutating the chunk size to the whole buffer makes this
+      // one kBig-sized transfer and fails here.
+      CHECK(after_big.max_chunk_bytes <= kChunk);
+      // Read against the RESOLVED chunk, not the compile-time constant, so the
+      // case still measures something when VT_ROCM_PINNED_H2D_MIB is set for an
+      // A/B. A ring that was never allocated reports 0 and fails either way.
+      CHECK(after_big.ring_bytes ==
+            vt::rocm::kPinnedH2DBuffers * vt::rocm::PinnedH2DChunkBytes());
+      CHECK(after_big.ring_bytes > 0);
+      // The D2H readback and the 4 KiB upload both stayed on the single call.
+      CHECK(after_small.staged_copies == after_big.staged_copies);
+      CHECK(after_small.direct_copies >= after_big.direct_copies + 2);
+    }
+
+    dev.Free(small);
+    dev.Free(p);
+    dev.DestroyQueue(q);
+  }
+  // NOT an assertion: a CPU-only or CUDA-only build registers no ROCm backend
+  // and this case measures nothing, exactly like every other case in this file.
+  // It is printed so a green run says which of the two it was.
+  const std::string ran = std::string("pinned H2D case ran on a ROCm board: ") +
+                          std::to_string(ran_on_a_board ? 1 : 0);
+  MESSAGE(ran);
 }
 
 // The bf16<->f32 casts are a pure ELEMENTWISE CODEC: no reduction, no
@@ -1811,6 +1979,100 @@ TEST_CASE("GDN prefill/decode recurrence matches the CPU oracle within NMSE <= 5
 }
 
 
+TEST_CASE("KDA per-K-channel-decay recurrence matches the CPU oracle within NMSE <= 5e-4") {
+  // KDA is GDN with per-K-channel decay: the gate g is [T,Hv,Dk] (per-channel)
+  // not [T,Hv] (per-head). This is the load-bearing assertion — if the kernel
+  // reads g at the wrong stride, the per-channel decay is wrong and the output
+  // diverges. Three assertions per device (PR #3001 precedent): (1) NMSE on out
+  // AND state, (2) OpRegistered is the native-only probe, (3) reference-tier
+  // hits do not increase (the call did not fall through to the CPU tier).
+  const int64_t HK = 2, HV = 4, DK = 16, DV = 24;  // HV = ratio*HK
+  const float scale = 0.25f;
+  vt::GdnArgs ga;
+  ga.scale = scale;
+
+  // ---- prefill: two sequences, lens 4 and 1, fresh zero state.
+  const std::vector<int32_t> qsl = {0, 4, 5};
+  const int64_t N = 2, T = 5;
+  const size_t qkn = static_cast<size_t>(T * HK * DK), vn = static_cast<size_t>(T * HV * DV);
+  const size_t ggn = static_cast<size_t>(T * HV * DK), gbn = static_cast<size_t>(T * HV);
+  const size_t stn = static_cast<size_t>(N * HV * DV * DK);
+  const std::vector<float> qin = RandomVec(qkn, 871, -0.5f, 0.5f);
+  const std::vector<float> kin = RandomVec(qkn, 872, -0.5f, 0.5f);
+  const std::vector<float> vin = RandomVec(vn, 873, -0.5f, 0.5f);
+  const std::vector<float> gin = RandomVec(ggn, 874, -0.3f, -0.01f);  // log-decay < 0
+  const std::vector<float> bin = RandomVec(gbn, 875, 0.0f, 0.5f);
+
+  std::vector<float> ref_out(vn, 0.0f), ref_st(stn, 0.0f);
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> hq = qin, hk_ = kin, hv_ = vin, hg = gin, hb = bin;
+    std::vector<int32_t> cqsl = qsl;
+    Tensor tq = Tensor::Contiguous(hq.data(), DType::kF32, cd, {T, HK, DK});
+    Tensor tk = Tensor::Contiguous(hk_.data(), DType::kF32, cd, {T, HK, DK});
+    Tensor tv = Tensor::Contiguous(hv_.data(), DType::kF32, cd, {T, HV, DV});
+    Tensor tg = Tensor::Contiguous(hg.data(), DType::kF32, cd, {T, HV, DK});
+    Tensor tb = T2(hb.data(), cd, T, HV);
+    Tensor tst = Tensor::Contiguous(ref_st.data(), DType::kF32, cd, {N, HV, DV, DK});
+    Tensor tqsl = TI32(cqsl.data(), cd, N + 1);
+    Tensor tout = Tensor::Contiguous(ref_out.data(), DType::kF32, cd, {T, HV, DV});
+    vt::KdaGatedDeltaRule(cq, tout, tq, tk, tv, tg, tb, tst, tqsl, ga);
+    cpu.DestroyQueue(cq);
+  }
+
+  // ASSERTION 2, unconditional on a ROCm build and NOT `if (!OpAvailable)
+  // continue`. A missing registration is the defect under test: the portable
+  // reference tier computes the SAME answer as a native kernel, so assertion (1)
+  // alone is green with no kernel at all.
+  const bool rocm_built = [&] {
+    for (DeviceType dt : RegisteredDevices())
+      if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (rocm_built) {
+    CHECK(vt::OpRegistered(vt::OpId::kKdaGatedDeltaRule, DeviceType::kROCM));
+  }
+
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!OpAvailable(vt::OpId::kKdaGatedDeltaRule, dt)) continue;
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+    DevBuf dq(dev, q, qkn), dk(dev, q, qkn), dv(dev, q, vn), dg(dev, q, ggn),
+        db(dev, q, gbn), dout(dev, q, vn), dst(dev, q, stn);
+    DevBufI32 dqsl(dev, q, N + 1);
+    dq.Upload(qin);
+    dk.Upload(kin);
+    dv.Upload(vin);
+    dg.Upload(gin);
+    db.Upload(bin);
+    dst.Upload(std::vector<float>(stn, 0.0f));
+    dqsl.Upload(qsl);
+    Tensor tq = Tensor::Contiguous(dq.ptr(), DType::kF32, d, {T, HK, DK});
+    Tensor tk = Tensor::Contiguous(dk.ptr(), DType::kF32, d, {T, HK, DK});
+    Tensor tv = Tensor::Contiguous(dv.ptr(), DType::kF32, d, {T, HV, DV});
+    Tensor tg = Tensor::Contiguous(dg.ptr(), DType::kF32, d, {T, HV, DK});
+    Tensor tb = T2(db.ptr(), d, T, HV);
+    Tensor tst = Tensor::Contiguous(dst.ptr(), DType::kF32, d, {N, HV, DV, DK});
+    Tensor tqsl = TI32(dqsl.ptr(), d, N + 1);
+    Tensor tout = Tensor::Contiguous(dout.ptr(), DType::kF32, d, {T, HV, DV});
+    // ASSERTION 3. OpRegistered says a native provider EXISTS; this says the
+    // call did not fall through to the tier anyway.
+    const unsigned long long hits_before = vt::GetReferenceTierHits();
+    vt::KdaGatedDeltaRule(q, tout, tq, tk, tv, tg, tb, tst, tqsl, ga);
+    dev.Synchronize(q);
+    CHECK(vt::GetReferenceTierHits() == hits_before);
+    // ASSERTION 1. Green with no kernel at all — never read it alone.
+    CHECK(Nmse(ref_out, dout.Download()) <= kNmseTol);
+    CHECK(Nmse(ref_st, dst.Download()) <= kNmseTol);
+    dev.DestroyQueue(q);
+  }
+}
+
+
 TEST_CASE("RmsNormGated and SigmoidGate match the CPU oracle") {
   // §5. RmsNormGated: NMSE (rms reduction + gate activation), both gate
   // activations, and BOTH gate layouts — contiguous rank-2 and the padded-row
@@ -2461,6 +2723,11 @@ TEST_CASE("non-grouped keep-quant GEMM (Q8_0/Q4_K/Q5_K/Q6_K) matches the CPU ora
     {vt::DType::kQ4_K, 144, 0, 2, "q4_K"},
     {vt::DType::kQ6_K, 210, 208, -1, "q6_K"},
     {vt::DType::kQ5_K, 176, 0, 2, "q5_K"},
+    // IQ4_NL: 18-byte, 32-element block, and the ONLY entry here whose
+    // activation encoding is Q8_0 rather than Q8_K. It is what every published
+    // Qwen3.8-Flash-Next quant stores its ffn_down_exps and its n-gram table
+    // in, so a ROCm arm that lacks it cannot multiply those experts at all.
+    {vt::DType::kIQ4_NL, 18, 0, -1, "iq4_nl"},
   };
   const bool rocm_present = OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM);
   const bool any_rocm = [&] {
@@ -2475,7 +2742,8 @@ TEST_CASE("non-grouped keep-quant GEMM (Q8_0/Q4_K/Q5_K/Q6_K) matches the CPU ora
   }
   for (const Fmt& f : fmts) {
     CAPTURE(f.name);
-    const int64_t elems_per_block = (f.dt == vt::DType::kQ8_0) ? 32 : 256;
+    const int64_t elems_per_block =
+        (f.dt == vt::DType::kQ8_0 || f.dt == vt::DType::kIQ4_NL) ? 32 : 256;
     const int64_t blocks_per_row = K / elems_per_block;
     const size_t row_bytes = static_cast<size_t>(blocks_per_row) * f.block_bytes;
     const size_t wn = static_cast<size_t>(N) * row_bytes;
@@ -2523,6 +2791,113 @@ TEST_CASE("non-grouped keep-quant GEMM (Q8_0/Q4_K/Q5_K/Q6_K) matches the CPU ora
       CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
       dev.DestroyQueue(q);
     }
+  }
+}
+
+// QUANT-GGUF-IQ4_NL D1/R2: the IQ4_NL association order, pinned BIT-EXACTLY.
+//
+// `VecDotIQ4_NLQ8_0` and its two device ports form the scale product BEFORE the
+// integer sum is folded in -- `d * (sumi1 + sumi2)` -- which is the OPPOSITE
+// association from the neighbouring q4_0/Q8_0 kernels. The spec calls that
+// load-bearing. The NMSE gates above cannot see it: reassociating moves the
+// result by about 1e-7 relative, which is about 3.7 orders of magnitude inside
+// their 5e-4 band, and a fresh review duly mutated `DotIQ4_NL` to
+// `(d*sumi1) + (d*sumi2)` and watched 47 of 47 cases stay green.
+//
+// This case is built so the two orders DIFFER and so the correct one is
+// reproducible to the last bit:
+//
+//   * ONE block (K = 32), M = N = 1. With a single block the warp reduction
+//     adds only zeros to lane 0's value, so the device result is the dot itself
+//     rather than a reassociated sum of dots.
+//   * The activation is k/64 with max |k| = 127, so the Q8_0 quantizer is
+//     EXACT: amax/127 = 1/64 is representable in f16 and every `roundf` lands
+//     on the integer it started from. `qs` is therefore known here, not guessed.
+//   * The weight scale carries a FULL f16 mantissa (0x2123), written as raw
+//     bits. A scale with a short mantissa (a power of two, say) makes `d*sumi1`
+//     exact and the two orders agree -- which is exactly how a toy fixture
+//     silently stops discriminating.
+//
+// The REQUIRE below is the anti-degeneracy guard: if the two orders ever agree
+// on these operands the case FAILS rather than passing vacuously.
+TEST_CASE("IQ4_NL keeps upstream's association order d*(s1+s2), bit for bit") {
+  constexpr int64_t M = 1, N = 1, K = 32;
+  // kvalues_iq4nl, llama.cpp b10451 ggml/src/ggml-common.h:1120. Transcribed
+  // here rather than included, so the test holds the codebook INDEPENDENTLY of
+  // whatever the CPU and device kernels read.
+  static const int kValues[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
+                                  1,    13,   25,  38,  53,  69,  89,  113};
+  static const uint8_t kWeightQs[16] = {0xa8, 0x0f, 0xed, 0x48, 0x16, 0x2b,
+                                        0xd2, 0x4b, 0x68, 0x07, 0xa2, 0xb1,
+                                        0x5f, 0x4b, 0xd5, 0x2f};
+  // max |k| == 127 on lane 16, which pins amax and therefore the Q8_0 scale.
+  static const int kActQ[32] = {-18, -50, -71, -52,  63, -115, 126, 124,
+                                -81, -67,  93,  77, -58,  126, 118,   4,
+                                127,  64,  14,  -2,  82,   29, -29, -32,
+                                -19, 105, -84, -95, -56,  -81, -81, -95};
+  constexpr uint16_t kWeightDBits = 0x2123;  // f16, full mantissa
+  constexpr uint16_t kActDBits = 0x2400;     // f16 1/64, what the quantizer must emit
+
+  std::vector<uint8_t> wt(18);
+  std::memcpy(wt.data(), &kWeightDBits, 2);
+  std::memcpy(wt.data() + 2, kWeightQs, 16);
+
+  std::vector<float> act(K);
+  for (int64_t j = 0; j < K; ++j) act[j] = static_cast<float>(kActQ[j]) / 64.0f;
+
+  int32_t s1 = 0, s2 = 0;
+  for (int j = 0; j < 16; ++j) {
+    s1 += kActQ[j] * kValues[kWeightQs[j] & 0x0F];
+    s2 += kActQ[j + 16] * kValues[kWeightQs[j] >> 4];
+  }
+  // `act_d * weight_d`, in that order, because that is the order both kernels
+  // write and float multiplication is not associative across a rounding.
+  const float d = vt::F16ToF32(kActDBits) * vt::F16ToF32(kWeightDBits);
+  const float upstream_order = d * static_cast<float>(s1 + s2);
+  const float reassociated = d * static_cast<float>(s1) + d * static_cast<float>(s2);
+  auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+  CAPTURE(s1);
+  CAPTURE(s2);
+  REQUIRE_MESSAGE(bits(upstream_order) != bits(reassociated),
+                  "the fixture must be able to SEE a reassociation: these "
+                  "operands make the two orders differ by one ulp, and a "
+                  "fixture where they agree gates nothing");
+
+  // REQUIRE-proven registration on ROCm (never a silent skip -- review sweep
+  // on #523: an OpAvailable-guarded case passes green with the registration
+  // deleted). ROCm is the arm this row added, so a build that carries the
+  // backend and has lost the IQ4_NL admission must FAIL here rather than fall
+  // through to a pass that measured only the CPU.
+  const bool rocm_built = [&] {
+    for (DeviceType dt : RegisteredDevices()) if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (rocm_built) {
+    REQUIRE_MESSAGE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM),
+                    "kMatmulBTQuant must be registered on ROCm -- a missing "
+                    "registration is a failure, never a skip");
+  }
+
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!OpAvailable(vt::OpId::kMatmulBTQuant, dt)) continue;
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d_id{dt, 0};
+    DevBuf da(dev, q, static_cast<size_t>(K));
+    DevBufBytes dwt(dev, q, wt.size());
+    DevBuf dout(dev, q, static_cast<size_t>(M) * N);
+    da.Upload(act);
+    dwt.Upload(wt.data());
+    Tensor tact = T2(da.ptr(), d_id, M, K);
+    Tensor twt = Tensor::Contiguous(dwt.ptr(), vt::DType::kIQ4_NL, d_id, {N, K});
+    Tensor tout = T2(dout.ptr(), d_id, M, N);
+    vt::MatmulBTQuant(q, tout, tact, twt);
+    const std::vector<float> got = dout.Download();
+    REQUIRE(got.size() == 1u);
+    CHECK(bits(got[0]) == bits(upstream_order));
+    CHECK(bits(got[0]) != bits(reassociated));
+    dev.DestroyQueue(q);
   }
 }
 
@@ -3300,13 +3675,16 @@ TEST_CASE("ROCm Q6_K decode spreads one row's superblocks over several warps") {
   }
 }
 
-// KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4 (issue #2109), W1: the RDNA4 WMMA int8
-// tile arm of the Q6_K prefill GEMM. Runs ONLY on gfx1200/gfx1201 — every
-// other ROCm target keeps the scalar arm the case above already covers, so
-// this returns early rather than skip-reporting on hardware it does not
-// target (`GcnArchNameIsGfx12PrefillWmma` is the same host gate the kernel's
-// own dispatch decision uses, per `include/vt/rocm/rocm_arch.h`).
-TEST_CASE("keep-quant Q6_K WMMA tile arm matches the CPU oracle on RDNA4") {
+// Q4_K/Q6_K WMMA runs on physical gfx1100, gfx1200, and gfx1201.
+// Preserve the original RDNA4 fixtures, including six tiles in a four-wave
+// block and both output dtypes. Scalar controls run in a separate process.
+namespace {
+bool ExpectQuantWmma() {
+  const char* value = std::getenv("VT_ROCM_QUANT_WMMA");
+  return value == nullptr || std::strcmp(value, "0") != 0;
+}
+}  // namespace
+TEST_CASE("keep-quant Q6_K WMMA tile arm matches the CPU oracle on gfx1100 and RDNA4") {
   const bool rocm_registered = [] {
     for (DeviceType dt : RegisteredDevices())
       if (dt == DeviceType::kROCM) return true;
@@ -3316,7 +3694,10 @@ TEST_CASE("keep-quant Q6_K WMMA tile arm matches the CPU oracle on RDNA4") {
   REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM));
 
   const std::string actual_arch = vt::rocm::DeviceArchName(0);
-  if (!vt::rocm::GcnArchNameIsGfx12PrefillWmma(actual_arch)) return;
+  // Test admission is independent of the production policy: narrowing that
+  // policy must fail dispatch assertions instead of skipping this case.
+  const auto stem = actual_arch.substr(0, actual_arch.find(':'));
+  if (stem != "gfx1100" && stem != "gfx1200" && stem != "gfx1201") return;
 
   // Tile-aligned M and N (both multiples of 16, and not equal, so the grid
   // exercises a non-square m_tiles x n_tiles), K spanning more than one
@@ -3392,7 +3773,7 @@ TEST_CASE("keep-quant Q6_K WMMA tile arm matches the CPU oracle on RDNA4") {
     // site's call in a scratch copy leaves this counter flat and reds this
     // case, which the NMSE checks above cannot do on their own — the scalar
     // fallback would still pass them.
-    CHECK(wmma_after > wmma_before);
+    CHECK((wmma_after > wmma_before) == ExpectQuantWmma());
   }
   rocm.DestroyQueue(q);
 }
@@ -3402,7 +3783,7 @@ TEST_CASE("keep-quant Q6_K WMMA tile arm matches the CPU oracle on RDNA4") {
 // carries a second per-sub-block correction (`dmin * sumi`) Q6_K has no
 // equivalent of, so this is not just the Q6_K case with a different dtype —
 // it exercises a materially different code path in `KQuantGemmKWmmaQ4K`.
-TEST_CASE("keep-quant Q4_K WMMA tile arm matches the CPU oracle on RDNA4") {
+TEST_CASE("keep-quant Q4_K WMMA tile arm matches the CPU oracle on gfx1100 and RDNA4") {
   const bool rocm_registered = [] {
     for (DeviceType dt : RegisteredDevices())
       if (dt == DeviceType::kROCM) return true;
@@ -3412,7 +3793,10 @@ TEST_CASE("keep-quant Q4_K WMMA tile arm matches the CPU oracle on RDNA4") {
   REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM));
 
   const std::string actual_arch = vt::rocm::DeviceArchName(0);
-  if (!vt::rocm::GcnArchNameIsGfx12PrefillWmma(actual_arch)) return;
+  // Test admission is independent of the production policy: narrowing that
+  // policy must fail dispatch assertions instead of skipping this case.
+  const auto stem = actual_arch.substr(0, actual_arch.find(':'));
+  if (stem != "gfx1100" && stem != "gfx1200" && stem != "gfx1201") return;
 
   constexpr int64_t M = 32, N = 48, K = 512;
   constexpr int64_t kBlockBytes = 144;  // sizeof(BlockQ4_K)
@@ -3483,7 +3867,7 @@ TEST_CASE("keep-quant Q4_K WMMA tile arm matches the CPU oracle on RDNA4") {
       CHECK(Nmse(ref, gotf) <= kNmseTol);
     }
     const uint64_t wmma_after = vt::rocm::KQuantWmmaQ4KDispatchCount();
-    CHECK(wmma_after > wmma_before);
+    CHECK((wmma_after > wmma_before) == ExpectQuantWmma());
   }
   rocm.DestroyQueue(q);
 }
@@ -3506,7 +3890,10 @@ TEST_CASE("keep-quant GEMM matches the CPU oracle when M and N are not multiples
   REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM));
 
   const std::string actual_arch = vt::rocm::DeviceArchName(0);
-  if (!vt::rocm::GcnArchNameIsGfx12PrefillWmma(actual_arch)) return;
+  // Test admission is independent of the production policy: narrowing that
+  // policy must fail dispatch assertions instead of skipping this case.
+  const auto stem = actual_arch.substr(0, actual_arch.find(':'));
+  if (stem != "gfx1100" && stem != "gfx1200" && stem != "gfx1201") return;
 
   constexpr int64_t M = 37, N = 50, K = 512;
   struct Fmt {
@@ -3584,7 +3971,7 @@ TEST_CASE("keep-quant GEMM matches the CPU oracle when M and N are not multiples
     // silent full fallback to scalar would pass the NMSE check above just
     // as well, which is exactly why #2109's own real-model measurement
     // needed a hand-trimmed prompt before this fix.
-    CHECK(wmma_after > wmma_before);
+    CHECK((wmma_after > wmma_before) == ExpectQuantWmma());
     rocm.DestroyQueue(q);
   }
 }
@@ -3613,7 +4000,10 @@ TEST_CASE("keep-quant GEMM matches the CPU oracle when only one of M/N is misali
   REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM));
 
   const std::string actual_arch = vt::rocm::DeviceArchName(0);
-  if (!vt::rocm::GcnArchNameIsGfx12PrefillWmma(actual_arch)) return;
+  // Test admission is independent of the production policy: narrowing that
+  // policy must fail dispatch assertions instead of skipping this case.
+  const auto stem = actual_arch.substr(0, actual_arch.find(':'));
+  if (stem != "gfx1100" && stem != "gfx1200" && stem != "gfx1201") return;
 
   constexpr int64_t K = 512;
   struct Fmt {
@@ -3699,7 +4089,7 @@ TEST_CASE("keep-quant GEMM matches the CPU oracle when only one of M/N is misali
                                       : vt::rocm::KQuantWmmaQ4KDispatchCount();
       // Reachability: the WMMA arm must still fire for its aligned corner
       // even though one dimension is a remainder-only split.
-      CHECK(wmma_after > wmma_before);
+      CHECK((wmma_after > wmma_before) == ExpectQuantWmma());
       rocm.DestroyQueue(q);
     }
   }
@@ -3722,6 +4112,12 @@ TEST_CASE("grouped quant expert GEMM (Q8_0/Q4_K/Q6_K) matches the CPU oracle") {
     {vt::DType::kQ4_K, 144, 0, 2, "q4_K"},   // {d,dmin,sc,qs}     superblocks of 256
     {vt::DType::kQ6_K, 210, 208, -1, "q6_K"},// {ql,qh,scales,d}   superblocks of 256
     {vt::DType::kQ5_K, 176, 0, 2, "q5_K"},   // {d,dmin,sc,qh,qs}  superblocks of 256
+    // IQ4_NL {d; qs[16]} — 32-element block on a Q8_0 activation. THIS is the
+    // arm the shipped Qwen3.8-Flash-Next checkpoints need: all 48
+    // ffn_down_exps are IQ4_NL and an expert tower reaches the GROUPED
+    // provider, so the single-matrix arm alone would still throw at the first
+    // expert forward with the model already resident.
+    {vt::DType::kIQ4_NL, 18, 0, -1, "iq4_nl"},
   };
 
   // REQUIRE-proven registration on ROCm (never a silent skip — review sweep
@@ -3738,7 +4134,8 @@ TEST_CASE("grouped quant expert GEMM (Q8_0/Q4_K/Q6_K) matches the CPU oracle") {
   }
   for (const Fmt& f : fmts) {
     CAPTURE(f.name);
-    const int64_t elems_per_block = (f.dt == vt::DType::kQ8_0) ? 32 : 256;
+    const int64_t elems_per_block =
+        (f.dt == vt::DType::kQ8_0 || f.dt == vt::DType::kIQ4_NL) ? 32 : 256;
     const int64_t blocks_per_row = K / elems_per_block;
     const size_t row_bytes = static_cast<size_t>(blocks_per_row) * f.block_bytes;
     const size_t wn = static_cast<size_t>(E) * N * row_bytes;
@@ -3834,6 +4231,13 @@ TEST_CASE("fused MoE gate+up+SwiGLU grouped GEMM matches the CPU oracle and is N
     {vt::DType::kQ4_K, 144, 0, 2, "q4_K"},
     {vt::DType::kQ6_K, 210, 208, -1, "q6_K"},
     {vt::DType::kQ5_K, 176, 0, 2, "q5_K"},
+    // IQ4_NL {d; qs[16]} — 32-element block on a Q8_0 activation. The fused
+    // seam DOES serve it: `rocm_moe_gate_up_swiglu.hip` composes the epilogue
+    // over two `MatmulBTQuantGroupedKernelRocm` calls, which delegate IQ4_NL to
+    // `GroupedIQ4NLK`. Listing it here is what makes the `elems_per_block`
+    // branch below reachable — without the row the branch is dead code that
+    // reads like coverage.
+    {vt::DType::kIQ4_NL, 18, 0, -1, "iq4_nl"},
   };
 
   const bool rocm_built = [&] {
@@ -3861,7 +4265,8 @@ TEST_CASE("fused MoE gate+up+SwiGLU grouped GEMM matches the CPU oracle and is N
     // As std::string: doctest stringifies a bare `const char*` as `1`, so the
     // capture in the case above cannot name the format that failed.
     CAPTURE(std::string(f.name));
-    const int64_t elems_per_block = (f.dt == vt::DType::kQ8_0) ? 32 : 256;
+    const int64_t elems_per_block =
+        (f.dt == vt::DType::kQ8_0 || f.dt == vt::DType::kIQ4_NL) ? 32 : 256;
     const int64_t blocks_per_row = K / elems_per_block;
     const size_t row_bytes = static_cast<size_t>(blocks_per_row) * f.block_bytes;
     const size_t wn = static_cast<size_t>(E) * N * row_bytes;
@@ -4978,4 +5383,2311 @@ TEST_CASE("ROCm registers the two attention ops GLM-5.3 non-flash reaches (#2926
       " — a SPARSE GLM-5.3 step still refuses while the indexer pair is 0, and "
       "the speed axis stays VOID";
   MESSAGE(owed);
+}
+
+// ---------------------------------------------------------------------------
+// MODEL-MM-QWEN4-EXP W1 — the first three `qwen4_exp` ops to reach ROCm.
+// Spec `.agents/specs/qwen4-exp-rocm-ops.md`, issue
+// ISSUE-LOCAL-01M2A1DTCZQVAH7M193XT9PN2V.
+//
+// THE REGISTRATION ASSERTION IS THE POINT OF THESE THREE CASES, not the NMSE.
+// The header of this file and the two comments at the grouped-GEMM cases above
+// say why: assertion (1), oracle equality, is GREEN on a backend with no kernel
+// at all wherever the portable reference tier is live, so it can never tell a
+// native arm from the tier. `vt::OpRegistered` is the native-only probe
+// (`src/vt/op_provider.cpp:801-825`) and is the only assertion that can.
+//
+// On `gfx1151` — the only AMD fleet device — the tier is not installed at all
+// (spec D2: `ReferenceTierEligible` gates on `DeviceMemoryIsHostAddressable()`,
+// `RocmBackend` returns `unified_memory_`, and `ResolveMemoryPolicy` computes
+// that false on this board since #2511). So a missing arm there is a REFUSAL by
+// name, not a slow path, and a `qwen4_exp` forward cannot emit a token while
+// any of these three is unregistered. The registration assertion is therefore
+// `REQUIRE`d and not `CHECK`ed: a false here is not a degraded mode to keep
+// measuring past.
+// ---------------------------------------------------------------------------
+
+namespace {
+// Whether THIS build linked a ROCm backend at all. A CPU-only or CUDA-only
+// build asserts nothing about ROCm; a ROCm build asserts everything.
+bool RocmBuilt() {
+  for (DeviceType dt : RegisteredDevices()) {
+    if (dt == DeviceType::kROCM) return true;
+  }
+  return false;
+}
+}  // namespace
+
+TEST_CASE("qwen4_exp gated-residual write-back matches the CPU oracle and is NATIVE on ROCm") {
+  // hc_count = 3 ON PURPOSE. The op's arithmetic divides by `hc_count` in two
+  // places and 1/3 is inexact in binary, so a power-of-two hc would let a
+  // reciprocal-multiply port pass that the real config (hc_count = 4 at the
+  // released checkpoint, 3 in golden case B) would separate.
+  constexpr int64_t T = 5, kHc = 3, kH = 7;
+  constexpr int64_t kFlat = kHc * kH;
+  const size_t hn = static_cast<size_t>(T) * kFlat;
+  const size_t bn = static_cast<size_t>(T) * kH;
+  const size_t in = static_cast<size_t>(T) * kHc;
+
+  const std::vector<float> hyper0 = RandomVec(hn, 4401);
+  const std::vector<float> block = RandomVec(bn, 4402);
+  // Injection is `2*sigmoid(.)` upstream, so it lives in (0, 2) and never
+  // straddles zero. Feeding it a signed random vector would let a sign error in
+  // the broadcast average out across the fixture.
+  const std::vector<float> inj = RandomVec(in, 4403, 0.25f, 1.75f);
+
+  vt::Qwen4ExpGatedResidualArgs args;
+  args.hc_count = kHc;
+  args.hidden_size = kH;
+  args.lowrank = 4;      // read by neither arm of this op; set so the struct is valid
+  args.eps = 1e-6f;
+
+  if (RocmBuilt()) {
+    REQUIRE(vt::OpRegistered(vt::OpId::kQwen4ExpGatedResidualWriteBack, DeviceType::kROCM));
+  }
+
+  std::vector<float> ref = hyper0;  // IN PLACE: the oracle starts from the same bytes
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> cb = block, ci = inj;
+    Tensor th = T2(ref.data(), cd, T, kFlat);
+    Tensor tb = T2(cb.data(), cd, T, kH);
+    Tensor ti = T2(ci.data(), cd, T, kHc);
+    vt::Qwen4ExpGatedResidualWriteBack(cq, th, tb, ti, args);
+    cpu.DestroyQueue(cq);
+  }
+  // The op must actually MOVE the residual, or an arm that returned `hyper`
+  // untouched would read green against an oracle that also did nothing.
+  {
+    bool moved = false;
+    for (size_t i = 0; i < ref.size(); ++i) {
+      if (ref[i] != hyper0[i]) moved = true;
+    }
+    REQUIRE(moved);
+  }
+
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!OpAvailable(vt::OpId::kQwen4ExpGatedResidualWriteBack, dt)) continue;
+    CAPTURE(DeviceTag(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+    DevBuf dh(dev, q, hn);
+    DevBuf db(dev, q, bn);
+    DevBuf di(dev, q, in);
+    dh.Upload(hyper0);
+    db.Upload(block);
+    di.Upload(inj);
+    Tensor th = T2(dh.ptr(), d, T, kFlat);
+    Tensor tb = T2(db.ptr(), d, T, kH);
+    Tensor ti = T2(di.ptr(), d, T, kHc);
+    // `OpRegistered` says a native provider EXISTS; this says the call did not
+    // fall through to the portable tier anyway.
+    const unsigned long long hits_before = vt::GetReferenceTierHits();
+    vt::Qwen4ExpGatedResidualWriteBack(q, th, tb, ti, args);
+    dev.Synchronize(q);
+    CHECK(vt::GetReferenceTierHits() == hits_before);
+    // The measured value, not only the verdict. doctest prints an expression's
+    // operands only when it FAILS, so a passing gate records nothing about how
+    // much margin it had; a wave that reports "green" and cannot say how green
+    // has measured a bar and not an arm.
+    const double nmse = Nmse(ref, dh.Download());
+    MESSAGE("qwen4_exp write-back NMSE " << DeviceTag(dt) << " = " << nmse);
+    CHECK(nmse <= kNmseTol);
+    dev.DestroyQueue(q);
+  }
+}
+
+TEST_CASE("grouped RMS norm matches the CPU oracle and is NATIVE on ROCm") {
+  // group_size = 5 and 3 groups: neither the group extent nor the group count
+  // is a power of two, so a kernel that reduced over the whole row, or indexed
+  // the weight per group instead of flat, cannot coincide with the oracle.
+  constexpr int64_t kRows = 6, kGroup = 5, kGroups = 3;
+  constexpr int64_t kHidden = kGroup * kGroups;
+  const size_t n = static_cast<size_t>(kRows) * kHidden;
+  std::vector<float> x = RandomVec(n, 4411);
+  // TWO ROWS ARE RESCALED SO THE EPS PLACEMENT IS OBSERVABLE AT ALL. The kernel
+  // comment claims eps sits INSIDE the rsqrt and is added to the MEAN SQUARE;
+  // on O(1) data with eps = 1e-6 that claim is unmeasurable, and a fresh review
+  // showed both ways of breaking it surviving this case at NMSE 2.4e-12. Each
+  // row below makes one half of the claim move the output, and RMS norm returns
+  // every row to O(1) whatever its input scale, so neither row distorts the
+  // NMSE the other rows contribute to.
+  //
+  //   row 0, scaled 1e-3: mean square ~ 1.3e-6, the same order as eps. Adding
+  //     eps to the ROOT instead (`1/(sqrt(ms) + eps)`) then shifts the scale by
+  //     ~32%, where at unit scale it shifts it by ~1e-6.
+  //   row 1, scaled 1e6: sqrt(ms) ~ 1.2e6, so adding eps OUTSIDE the reciprocal
+  //     (`1/sqrt(ms) + eps`) more than doubles that row's output. At unit scale
+  //     that same edit is a 1e-6 relative change and reads as rounding.
+  for (int64_t j = 0; j < kHidden; ++j) {
+    x[static_cast<size_t>(j)] *= 1e-3f;
+    x[static_cast<size_t>(kHidden + j)] *= 1e6f;
+  }
+  // The gamma is RAW HuggingFace, centred on zero: every `qwen4_exp` consumer
+  // adds the 1 itself (#2218). A weight drawn around 1.0 would make a dropped
+  // `gemma` fold invisible.
+  const std::vector<float> w = RandomVec(kHidden, 4412, -0.25f, 0.25f);
+
+  if (RocmBuilt()) {
+    REQUIRE(vt::OpRegistered(vt::OpId::kRmsNormGroup, DeviceType::kROCM));
+  }
+
+  // BOTH polarities. With `gemma = false` the affine is `w` and with `true` it
+  // is `1 + w`; an arm that hard-coded either one passes the other's fixture
+  // only by accident, and the released checkpoint needs `true`.
+  std::vector<float> ref_gemma_false;
+  for (bool gemma : {false, true}) {
+    CAPTURE(gemma);
+    vt::RmsNormGroupArgs args;
+    args.eps = 1e-6f;
+    args.gemma = gemma;
+    args.group_size = kGroup;
+
+    std::vector<float> ref(n, 0.0f);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> cx = x, cw = w;
+      Tensor tout = T2(ref.data(), cd, kRows, kHidden);
+      Tensor tx = T2(cx.data(), cd, kRows, kHidden);
+      Tensor tw = T1(cw.data(), cd, kHidden);
+      vt::RmsNormGroup(cq, tout, tx, tw, args);
+      cpu.DestroyQueue(cq);
+    }
+    // The two polarities must produce DIFFERENT numbers, proved by difference
+    // rather than asserted, or the `gemma` arm is untested while reading green.
+    if (!gemma) {
+      ref_gemma_false = ref;
+    } else {
+      REQUIRE(ref_gemma_false.size() == ref.size());
+      bool fold_moved = false;
+      for (size_t i = 0; i < ref.size(); ++i) {
+        if (ref[i] != ref_gemma_false[i]) fold_moved = true;
+      }
+      REQUIRE(fold_moved);
+    }
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kRmsNormGroup, dt)) continue;
+      CAPTURE(DeviceTag(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBuf dx(dev, q, n);
+      DevBuf dw(dev, q, static_cast<size_t>(kHidden));
+      DevBuf dout(dev, q, n);
+      dx.Upload(x);
+      dw.Upload(w);
+      Tensor tx = T2(dx.ptr(), d, kRows, kHidden);
+      Tensor tw = T1(dw.ptr(), d, kHidden);
+      Tensor tout = T2(dout.ptr(), d, kRows, kHidden);
+      const unsigned long long hits_before = vt::GetReferenceTierHits();
+      vt::RmsNormGroup(q, tout, tx, tw, args);
+      dev.Synchronize(q);
+      CHECK(vt::GetReferenceTierHits() == hits_before);
+      const double nmse = Nmse(ref, dout.Download());
+      MESSAGE("rmsnorm_group NMSE " << DeviceTag(dt) << " gemma=" << gemma << " = " << nmse);
+      CHECK(nmse <= kNmseTol);
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+TEST_CASE("qwen4_exp gated-residual MIXER matches the CPU oracle and is NATIVE on ROCm") {
+  // The mixer is the one op of this wave whose gate is a TOLERANCE by
+  // construction and not by choice: its three projections go through
+  // `vt::MatmulBT`, and a device GEMM re-associates the K reduction, so no
+  // device arm can be bit-identical to the CPU sibling. That is the donor's own
+  // recorded consequence (`src/vt/cuda/cuda_qwen4_exp.cu`, the shared-seam
+  // paragraph), inherited here unchanged.
+  constexpr int64_t T = 4, kHc = 3, kH = 7, kR = 5;
+  constexpr int64_t kFlat = kHc * kH;
+  const size_t hn = static_cast<size_t>(T) * kFlat;
+  const size_t mn = static_cast<size_t>(T) * kH;
+  const size_t injn = static_cast<size_t>(T) * kHc;
+  const size_t dn = static_cast<size_t>(kR) * kFlat;
+  const size_t un = static_cast<size_t>(kFlat) * kR;
+  const size_t bin = static_cast<size_t>(kHc) * kFlat;
+
+  const std::vector<float> hyper = RandomVec(hn, 4421);
+  const std::vector<float> norm_w = RandomVec(kFlat, 4422, -0.25f, 0.25f);
+  // THE PROJECTION SCALES ARE CALIBRATED, AND A FRESH REVIEW PROVED THE FIRST
+  // CALIBRATION BLIND. At the original +/-0.2 on both mix projections, deleting
+  // DIVISION 1 inside the SiLU — the placement `src/vt/rocm/rocm_qwen4_exp.hip`
+  // calls load-bearing because SiLU is not homogeneous — measured NMSE
+  // 0.000490056 against this 5e-4 bar and PASSED with 2% of margin. The
+  // tolerance was not the defect. `down(normed)` landed at |a| ~ 0.5, inside
+  // SiLU's near-linear part, where `silu(a/hc)` and `silu(a)/hc` differ by
+  // little more than a scale; and `up()` at +/-0.2 then left `sigmoid(gate)`
+  // spanning only 0.488..0.512, so the whole low-rank branch was a
+  // near-constant 0.5 and could not move the output whatever it computed.
+  //
+  // `mix_down` at +/-2.0 puts the pre-activation at |a| ~ 5, inside SiLU's
+  // knee, and `mix_up` at +/-0.5 opens `sigmoid(gate)` to 0.27..0.81 — a live
+  // gate that is still nowhere near saturation, which is what the previous
+  // comment was right to protect against. The injection arm projects `normed`
+  // directly and never reads `low`, so `inj_w` stays where it was.
+  const std::vector<float> mix_d = RandomVec(dn, 4423, -2.0f, 2.0f);
+  const std::vector<float> mix_u = RandomVec(un, 4424, -0.5f, 0.5f);
+  const std::vector<float> inj_w = RandomVec(bin, 4425, -0.2f, 0.2f);
+
+  vt::Qwen4ExpGatedResidualArgs args;
+  args.hc_count = kHc;
+  args.hidden_size = kH;
+  args.lowrank = kR;
+  args.eps = 1e-6f;
+
+  if (RocmBuilt()) {
+    REQUIRE(vt::OpRegistered(vt::OpId::kQwen4ExpGatedResidual, DeviceType::kROCM));
+    // The GEMM this arm routes its three projections through. Asserted beside
+    // it because the mixer reads the PAIR, and half the pair is not half the
+    // capability: without `kMatmulBT` the arm registers and then throws at its
+    // first projection.
+    REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBT, DeviceType::kROCM));
+  }
+
+  // BOTH arms of the `use_combine` pair. With a null pair the op is upstream's
+  // terminal mixer and writes `mixed` alone; with a live pair it also writes
+  // `injection`. An arm that ignored the null case would fault on the terminal
+  // layer of every real forward.
+  for (bool combine : {false, true}) {
+    CAPTURE(combine);
+    std::vector<float> ref_mixed(mn, 0.0f);
+    std::vector<float> ref_inj(injn, 0.0f);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> ch = hyper, cw = norm_w, cd_ = mix_d, cu = mix_u, cb = inj_w;
+      Tensor tmixed = T2(ref_mixed.data(), cd, T, kH);
+      Tensor thyper = T2(ch.data(), cd, T, kFlat);
+      Tensor tw = T1(cw.data(), cd, kFlat);
+      Tensor tdown = T2(cd_.data(), cd, kR, kFlat);
+      Tensor tup = T2(cu.data(), cd, kFlat, kR);
+      Tensor tbi = T2(cb.data(), cd, kHc, kFlat);
+      Tensor tinj = T2(ref_inj.data(), cd, T, kHc);
+      vt::Qwen4ExpGatedResidual(cq, tmixed, combine ? &tinj : nullptr, thyper, tw, tdown, tup,
+                                combine ? &tbi : nullptr, args);
+      cpu.DestroyQueue(cq);
+    }
+    if (combine) {
+      // `injection` is `2*sigmoid(.)`, so every element must be inside (0, 2).
+      // A transposed or unwritten injection lands outside or stays zero, and
+      // NMSE alone would hide either behind the much larger `mixed`.
+      for (size_t i = 0; i < ref_inj.size(); ++i) {
+        REQUIRE(ref_inj[i] > 0.0f);
+        REQUIRE(ref_inj[i] < 2.0f);
+      }
+    }
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kQwen4ExpGatedResidual, dt)) continue;
+      CAPTURE(DeviceTag(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBuf dh(dev, q, hn);
+      DevBuf dw(dev, q, static_cast<size_t>(kFlat));
+      DevBuf dd(dev, q, dn);
+      DevBuf du(dev, q, un);
+      DevBuf dbi(dev, q, bin);
+      DevBuf dmixed(dev, q, mn);
+      DevBuf dinj(dev, q, injn);
+      dh.Upload(hyper);
+      dw.Upload(norm_w);
+      dd.Upload(mix_d);
+      du.Upload(mix_u);
+      dbi.Upload(inj_w);
+      Tensor thyper = T2(dh.ptr(), d, T, kFlat);
+      Tensor tw = T1(dw.ptr(), d, kFlat);
+      Tensor tdown = T2(dd.ptr(), d, kR, kFlat);
+      Tensor tup = T2(du.ptr(), d, kFlat, kR);
+      Tensor tbi = T2(dbi.ptr(), d, kHc, kFlat);
+      Tensor tmixed = T2(dmixed.ptr(), d, T, kH);
+      Tensor tinj = T2(dinj.ptr(), d, T, kHc);
+      const unsigned long long hits_before = vt::GetReferenceTierHits();
+      vt::Qwen4ExpGatedResidual(q, tmixed, combine ? &tinj : nullptr, thyper, tw, tdown, tup,
+                                combine ? &tbi : nullptr, args);
+      dev.Synchronize(q);
+      CHECK(vt::GetReferenceTierHits() == hits_before);
+      const double nmse_mixed = Nmse(ref_mixed, dmixed.Download());
+      MESSAGE("qwen4_exp mixer NMSE " << DeviceTag(dt) << " combine=" << combine
+                                      << " mixed = " << nmse_mixed);
+      CHECK(nmse_mixed <= kNmseTol);
+      if (combine) {
+        const double nmse_inj = Nmse(ref_inj, dinj.Download());
+        MESSAGE("qwen4_exp mixer NMSE " << DeviceTag(dt) << " injection = " << nmse_inj);
+        CHECK(nmse_inj <= kNmseTol);
+      }
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// W2 of `.agents/specs/qwen4-exp-rocm-ops.md`: the two ROW GATHER/SCATTER ops
+// the `qwen4_exp` forward reaches, `vt::IndexSelect` and `vt::IndexCopy`.
+// Row MODEL-MM-QWEN4-EXP, issue ISSUE-LOCAL-01M2A1DTCZQVAH7M193XT9PN2V.
+//
+// THE BAR HERE IS BYTE EQUALITY, NOT NMSE, and that is a property of the ops
+// rather than a stricter choice: neither one does any arithmetic. Every output
+// byte is a copy of an input byte, so the two arms cannot differ by rounding,
+// re-association or a libm, and a tolerance would only hide a defect. The NMSE
+// is still computed and printed beside it, because it is the statistic this
+// spec quotes every mutation margin in and `got == ref` cannot say HOW far a
+// broken arm landed from the oracle.
+//
+// WHAT THE FIXTURES HAVE TO BE ABLE TO SEE, each of which a plausible port gets
+// wrong and none of which a naive fixture can catch:
+//
+//  * THE INDEX. `idx` is non-monotonic, does not start at 0, reaches the LAST
+//    base row, and (for the gather) repeats one — which is not a contrived
+//    shape but the production one: the `hc` widen at
+//    `qwen4_exp_forward.cpp:434-447` gathers with `idx[i] = i / hc`, so every
+//    index appears `hc` times. An arm that ignored `idx` and copied row-for-row
+//    would read the identity, and the case asserts the index is NOT the
+//    identity so that stays impossible.
+//  * THE BASE-SIDE OUTER STRIDE. The op contract (`src/vt/ops.cpp:3310-3318`)
+//    lets the [N, D...] side carry an outer row stride LARGER than its packed
+//    row, and the QSA cache arm passes exactly that. Layouts 1 and 2 below set
+//    `stride[0] = 10` over a packed row of 6, so an arm that used the packed
+//    row as the stride addresses the wrong rows entirely.
+//  * THE RANK. `inner` is `Numel() / rows` and NOT `shape[1]`; layout 2 is
+//    rank 3 ([N, 2, 3]), where the two differ. A rank-2-only arm passes
+//    layouts 0 and 1 and fails this one.
+//  * THE DIRECTION. `IndexCopy` compares the WHOLE padded destination, so a
+//    swapped source/destination, a clobbered padding column and an overwritten
+//    untouched row are each visible.
+//
+// Registration is `REQUIRE`d on ROCm for the reason the three W1 cases above
+// give: on `gfx1151` the portable reference tier is not installed (spec D2), so
+// a missing arm is a refusal by name and not a slow path.
+//
+// PORT PROVENANCE, and it differs from W1's. These two ops are generic
+// gather/scatter helpers rather than `qwen4_exp` kernels, and vLLM's
+// `qwen4_exp/amd/` backend contains NO counterpart for either: upstream spells
+// both as `torch.index_select` / `Tensor.index_copy_` and ships no Triton
+// kernel to mirror. So the spec's D3 tie-break ("where they disagree, vLLM
+// wins") has nothing to arbitrate here, and the donor is this tree's own CUDA
+// arm (`src/vt/cuda/cuda_gdn.cu:432-527`) with the CPU arm
+// (`src/vt/cpu/cpu_ops.cpp:3048-3085`) as the contract and the oracle.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Widen a raw row buffer to f32 so ONE NMSE describes either dtype arm. The
+// bf16 widening is EXACT, so this compares the same numbers the byte
+// comparison beside it compares, never a rounded view of them.
+std::vector<float> WidenRows(const std::vector<uint8_t>& bytes, DType dt) {
+  const size_t esz = vt::SizeOf(dt);
+  const size_t n = bytes.size() / esz;
+  std::vector<float> out(n, 0.0f);
+  for (size_t i = 0; i < n; ++i) {
+    if (dt == DType::kF32) {
+      float v = 0.0f;
+      std::memcpy(&v, bytes.data() + i * esz, sizeof(float));
+      out[i] = v;
+    } else {
+      uint16_t b = 0;
+      std::memcpy(&b, bytes.data() + i * esz, sizeof(uint16_t));
+      out[i] = vt::BF16ToF32(b);
+    }
+  }
+  return out;
+}
+
+// f32 values -> the raw bytes of `dt`. The bf16 arm rounds through the CPU
+// backend's own cast op (`Bf16Bits`), so this never reimplements the codec.
+std::vector<uint8_t> PackRows(const std::vector<float>& v, DType dt) {
+  if (dt == DType::kF32) {
+    std::vector<uint8_t> out(v.size() * sizeof(float));
+    std::memcpy(out.data(), v.data(), out.size());
+    return out;
+  }
+  const std::vector<uint16_t> bits = Bf16Bits(v);
+  std::vector<uint8_t> out(bits.size() * sizeof(uint16_t));
+  std::memcpy(out.data(), bits.data(), out.size());
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("index_select gathers rows BIT-EXACTLY against the CPU oracle and is NATIVE on ROCm") {
+  constexpr int64_t kN = 11, kD = 6, kM = 7, kPad = 10;
+  // Non-monotonic, not starting at 0, reaching the last row, and REPEATING
+  // row 10 and row 3 — the production shape of the `hc` widen.
+  const std::vector<int32_t> idx = {7, 0, 10, 3, 3, 1, 10};
+  REQUIRE(static_cast<int64_t>(idx.size()) == kM);
+  // The fixture asserts its own strength rather than assuming it: an identity
+  // index would let an arm that ignored `idx` pass.
+  bool identity = true;
+  for (size_t i = 0; i < idx.size(); ++i)
+    if (idx[i] != static_cast<int32_t>(i)) identity = false;
+  REQUIRE_FALSE(identity);
+  REQUIRE(kPad > kD);  // layouts 1 and 2 are genuinely padded
+
+  if (RocmBuilt()) {
+    REQUIRE(vt::OpRegistered(vt::OpId::kIndexSelect, DeviceType::kROCM));
+  }
+
+  for (DType et : {DType::kF32, DType::kBF16}) {
+    const size_t esz = vt::SizeOf(et);
+    CAPTURE(esz);
+    for (int layout = 0; layout < 3; ++layout) {  // 0 packed, 1 padded, 2 padded rank-3
+      CAPTURE(layout);
+      const int64_t pad = layout == 0 ? kD : kPad;
+      const bool rank3 = layout == 2;
+
+      auto MakeBase = [&](void* p, Device d) {
+        Tensor t = rank3 ? Tensor::Contiguous(p, et, d, {kN, 2, 3})
+                         : Tensor::Contiguous(p, et, d, {kN, kD});
+        t.stride[0] = pad;  // the padded outer row stride the contract allows
+        return t;
+      };
+      auto MakeOut = [&](void* p, Device d) {
+        return rank3 ? Tensor::Contiguous(p, et, d, {kM, 2, 3})
+                     : Tensor::Contiguous(p, et, d, {kM, kD});
+      };
+
+      const size_t base_elems = static_cast<size_t>(kN) * static_cast<size_t>(pad);
+      const std::vector<float> base_f = RandomVec(base_elems, 5171 + static_cast<uint32_t>(layout));
+      const std::vector<uint8_t> base_bytes = PackRows(base_f, et);
+      const size_t out_bytes = static_cast<size_t>(kM) * static_cast<size_t>(kD) * esz;
+
+      std::vector<uint8_t> ref(out_bytes, 0xCD);
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<uint8_t> hb = base_bytes;
+        std::vector<int32_t> ci = idx;
+        Tensor tin = MakeBase(hb.data(), cd);
+        Tensor tout = MakeOut(ref.data(), cd);
+        Tensor tidx = TI32(ci.data(), cd, kM);
+        vt::IndexSelect(cq, tout, tin, tidx);
+        cpu.DestroyQueue(cq);
+      }
+      // THE ORACLE HALF, WHICH RUNS ON EVERY BUILD. The device loop below is
+      // empty on a CPU-only build, so without this the case would report a
+      // green having measured nothing. It also re-derives the answer from the
+      // index rather than trusting the op that produced it.
+      const size_t row_bytes = static_cast<size_t>(kD) * esz;
+      for (int64_t i = 0; i < kM; ++i) {
+        const size_t src = static_cast<size_t>(idx[static_cast<size_t>(i)]) *
+                           static_cast<size_t>(pad) * esz;
+        CHECK(std::memcmp(ref.data() + static_cast<size_t>(i) * row_bytes,
+                          base_bytes.data() + src, row_bytes) == 0);
+      }
+
+      for (DeviceType dt : RegisteredDevices()) {
+        if (!OpAvailable(vt::OpId::kIndexSelect, dt)) continue;
+        CAPTURE(DeviceTag(dt));
+        vt::Backend& dev = vt::GetBackend(dt);
+        Queue q = dev.CreateQueue();
+        const Device d{dt, 0};
+        DevBufBytes dbase(dev, q, base_bytes.size());
+        DevBufBytes dout(dev, q, out_bytes);
+        DevBufI32 didx(dev, q, static_cast<size_t>(kM));
+        dbase.Upload(base_bytes.data());
+        didx.Upload(idx);
+        // POISON THE DESTINATION. A kernel that launched nothing would
+        // otherwise be graded against whatever the allocator handed back.
+        const std::vector<uint8_t> poison(out_bytes, 0xA5);
+        dout.Upload(poison.data());
+        Tensor tin = MakeBase(dbase.ptr(), d);
+        Tensor tout = MakeOut(dout.ptr(), d);
+        Tensor tidx = TI32(didx.ptr(), d, kM);
+        const unsigned long long hits_before = vt::GetReferenceTierHits();
+        vt::IndexSelect(q, tout, tin, tidx);
+        dev.Synchronize(q);
+        CHECK(vt::GetReferenceTierHits() == hits_before);
+        std::vector<uint8_t> got(out_bytes, 0);
+        dout.Download(got.data());
+        CHECK(got == ref);
+        const double nmse = Nmse(WidenRows(ref, et), WidenRows(got, et));
+        MESSAGE("index_select NMSE " << DeviceTag(dt) << " esz=" << esz
+                                     << " layout=" << layout << " = " << nmse);
+        CHECK(nmse <= kNmseTol);
+        dev.DestroyQueue(q);
+      }
+    }
+  }
+}
+
+TEST_CASE("index_copy scatters rows BIT-EXACTLY against the CPU oracle and is NATIVE on ROCm") {
+  constexpr int64_t kN = 11, kD = 6, kM = 5, kPad = 10;
+  // DISTINCT, non-monotonic, not starting at 0, reaching the last row. Distinct
+  // because a repeated destination row is a write race whose winner no device
+  // defines; the gather case above carries the duplicate half.
+  const std::vector<int32_t> idx = {7, 0, 10, 3, 1};
+  REQUIRE(static_cast<int64_t>(idx.size()) == kM);
+  bool dup = false;
+  for (size_t a = 0; a < idx.size(); ++a)
+    for (size_t b = a + 1; b < idx.size(); ++b)
+      if (idx[a] == idx[b]) dup = true;
+  REQUIRE_FALSE(dup);
+  REQUIRE(kM < kN);  // there ARE untouched rows for the case to protect
+
+  if (RocmBuilt()) {
+    REQUIRE(vt::OpRegistered(vt::OpId::kIndexCopy, DeviceType::kROCM));
+  }
+
+  for (DType et : {DType::kF32, DType::kBF16}) {
+    const size_t esz = vt::SizeOf(et);
+    CAPTURE(esz);
+    for (int layout = 0; layout < 3; ++layout) {  // 0 packed, 1 padded, 2 padded rank-3
+      CAPTURE(layout);
+      const int64_t pad = layout == 0 ? kD : kPad;
+      const bool rank3 = layout == 2;
+
+      auto MakeBase = [&](void* p, Device d) {
+        Tensor t = rank3 ? Tensor::Contiguous(p, et, d, {kN, 2, 3})
+                         : Tensor::Contiguous(p, et, d, {kN, kD});
+        t.stride[0] = pad;
+        return t;
+      };
+      auto MakeIn = [&](void* p, Device d) {
+        return rank3 ? Tensor::Contiguous(p, et, d, {kM, 2, 3})
+                     : Tensor::Contiguous(p, et, d, {kM, kD});
+      };
+
+      const size_t base_elems = static_cast<size_t>(kN) * static_cast<size_t>(pad);
+      // The destination arrives PRE-FILLED, not zeroed: every untouched row and
+      // every padding column must survive the scatter byte for byte, and a
+      // zeroed destination could not tell "preserved" from "cleared".
+      const std::vector<float> dest_f = RandomVec(base_elems, 6271 + static_cast<uint32_t>(layout));
+      const std::vector<uint8_t> dest0 = PackRows(dest_f, et);
+      const std::vector<float> src_f =
+          RandomVec(static_cast<size_t>(kM) * static_cast<size_t>(kD),
+                    6371 + static_cast<uint32_t>(layout));
+      const std::vector<uint8_t> src_bytes = PackRows(src_f, et);
+
+      std::vector<uint8_t> ref = dest0;
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<uint8_t> hs = src_bytes;
+        std::vector<int32_t> ci = idx;
+        Tensor tout = MakeBase(ref.data(), cd);
+        Tensor tin = MakeIn(hs.data(), cd);
+        Tensor tidx = TI32(ci.data(), cd, kM);
+        vt::IndexCopy(cq, tout, tin, tidx);
+        cpu.DestroyQueue(cq);
+      }
+      // THE ORACLE HALF, RE-DERIVED: the addressed rows carry the source, and
+      // every other byte of the padded buffer — untouched rows AND padding
+      // columns — is unchanged.
+      const size_t row_bytes = static_cast<size_t>(kD) * esz;
+      const size_t pad_bytes = static_cast<size_t>(pad) * esz;
+      std::vector<bool> touched(static_cast<size_t>(kN), false);
+      for (int64_t i = 0; i < kM; ++i) {
+        const size_t dst = static_cast<size_t>(idx[static_cast<size_t>(i)]) * pad_bytes;
+        touched[static_cast<size_t>(idx[static_cast<size_t>(i)])] = true;
+        CHECK(std::memcmp(ref.data() + dst,
+                          src_bytes.data() + static_cast<size_t>(i) * row_bytes,
+                          row_bytes) == 0);
+        // the padding columns of a TOUCHED row are still the destination's
+        CHECK(std::memcmp(ref.data() + dst + row_bytes, dest0.data() + dst + row_bytes,
+                          pad_bytes - row_bytes) == 0);
+      }
+      for (int64_t r = 0; r < kN; ++r) {
+        if (touched[static_cast<size_t>(r)]) continue;
+        CHECK(std::memcmp(ref.data() + static_cast<size_t>(r) * pad_bytes,
+                          dest0.data() + static_cast<size_t>(r) * pad_bytes,
+                          pad_bytes) == 0);
+      }
+
+      for (DeviceType dt : RegisteredDevices()) {
+        if (!OpAvailable(vt::OpId::kIndexCopy, dt)) continue;
+        CAPTURE(DeviceTag(dt));
+        vt::Backend& dev = vt::GetBackend(dt);
+        Queue q = dev.CreateQueue();
+        const Device d{dt, 0};
+        DevBufBytes dbase(dev, q, dest0.size());
+        DevBufBytes dsrc(dev, q, src_bytes.size());
+        DevBufI32 didx(dev, q, static_cast<size_t>(kM));
+        dbase.Upload(dest0.data());
+        dsrc.Upload(src_bytes.data());
+        didx.Upload(idx);
+        Tensor tout = MakeBase(dbase.ptr(), d);
+        Tensor tin = MakeIn(dsrc.ptr(), d);
+        Tensor tidx = TI32(didx.ptr(), d, kM);
+        const unsigned long long hits_before = vt::GetReferenceTierHits();
+        vt::IndexCopy(q, tout, tin, tidx);
+        dev.Synchronize(q);
+        CHECK(vt::GetReferenceTierHits() == hits_before);
+        std::vector<uint8_t> got(dest0.size(), 0);
+        dbase.Download(got.data());
+        CHECK(got == ref);  // the WHOLE padded destination, not only the rows
+        const double nmse = Nmse(WidenRows(ref, et), WidenRows(got, et));
+        MESSAGE("index_copy NMSE " << DeviceTag(dt) << " esz=" << esz
+                                   << " layout=" << layout << " = " << nmse);
+        CHECK(nmse <= kNmseTol);
+        dev.DestroyQueue(q);
+      }
+    }
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// W3 of `.agents/specs/qwen4-exp-rocm-ops.md` — the qwen4_exp PLE pair,
+// `vt::Qwen4ExpPleConv` and `vt::Qwen4ExpPleGate`, row MODEL-MM-QWEN4-EXP,
+// issue ISSUE-LOCAL-01M2A1DTCZQVAH7M193XT9PN2V.
+//
+// THE THREE CASES BELOW ARE WRITTEN TO BE ABLE TO FAIL, which is the W1 lesson
+// this file already carries twice (spec D3b). A fixture whose data sits where
+// the guarantee has no leverage is indistinguishable from one that passes, and
+// W1 shipped exactly that: deleting a load-bearing stage measured 0.98x the bar.
+// Each fixture value below that exists to give a guarantee leverage says so
+// beside itself, and the spec's `## Now` records the measured margin for every
+// mutation these three cases are expected to catch.
+//
+// THREE OF THOSE GUARANTEES WERE ADDED AFTER A FRESH REVIEW FOUND THEM
+// UNMEASURED, and each is named where it is now measured rather than only here:
+// the f16/bf16 STORE branches of both kernels (every operand below runs at
+// `kF32` AND at `kBF16`, the shape the two W2 cases above already use), the
+// `isnan` guard in the gate's signed square root (the score pool carries a NaN
+// and the NaN outputs are checked as NaN, not averaged), and the conv's DOUBLE
+// four-tap accumulator (its own case, ported from the CUDA arm's). The first
+// mattered most: with every tensor at `kF32` the reviewer corrupted BOTH store
+// branches of both kernels, the binary changed, it compiled clean at `-Werror`,
+// and all four NMSE values stayed 0. bf16 is the PRODUCTION path —
+// `src/vllm/model_executor/models/qwen4_exp_ple_block.cpp:286-292` says "every
+// buffer below carries `hidden`'s dtype, so a bf16 model moves bf16 bytes
+// through all of it" — so an f32-only fixture gated the arm nobody runs.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("qwen4_exp PLE dilated causal conv matches the CPU oracle and is NATIVE on ROCm") {
+  // THE GEOMETRY IS THE RELEASED CONFIG'S, not a reduced one. `Qwen3.8-Flash-Next`
+  // has `conv_kernel_size = 4` and `conv_dilation = ngram_size = 3`, so the ring
+  // is `(K-1)*dilation = 9` columns wide and the four taps read lags
+  // {9, 6, 3, 0}. A REDUCED fixture is the trap here: at dilation 1 the taps are
+  // {3, 2, 1, 0} and a kernel that ignored `dilation` entirely would compute the
+  // same numbers, so the dilation axis would be UNMEASURABLE — the
+  // "reduced fixture degenerates the axis it claims to gate" failure.
+  constexpr int64_t kK = 4;
+  constexpr int64_t kD = 3;
+  constexpr int64_t kStateLen = (kK - 1) * kD;  // 9, and the wrapper checks it
+  // 5 channels: not a multiple of the 256-thread block and not a power of two,
+  // so a kernel that decomposed `idx` into (seq, channel) the other way round
+  // cannot pass by accident.
+  constexpr int64_t kC = 5;
+  constexpr int64_t kRows = 6;  // MORE cache rows than sequences — see below
+  constexpr int64_t kSeqs = 3;
+  constexpr int64_t T = 16;
+  // 12 / 3 / 1 tokens. THREE SEGMENT LENGTHS ON PURPOSE, because the write-back
+  // takes a different shape in each: 12 > 9 replaces the whole ring, 3 < 9 keeps
+  // the tail of the OLD state ahead of the new columns, and 1 is the decode
+  // shape the engine actually runs. A single-length fixture cannot see a
+  // write-back that shifted by the wrong amount.
+  const std::vector<int32_t> qsl = {0, 12, 15, 16};
+  // Shuffled and NOT the identity, so `conv_state_indices` is load-bearing: rows
+  // 0, 2 and 5 are never addressed and must come back byte-unchanged.
+  const std::vector<int32_t> rows_idx = {4, 1, 3};
+
+  const size_t xn = static_cast<size_t>(T) * kC;
+  const size_t wn = static_cast<size_t>(kC) * kK;
+  const size_t sn = static_cast<size_t>(kRows) * kC * kStateLen;
+
+  const std::vector<float> x = RandomVec(xn, 7701);
+  // +/-1 weights against +/-2 inputs put the four-tap accumulator in SiLU's
+  // KNEE rather than its near-linear part, which is what W1's mixer fixture got
+  // wrong (spec D3b): SiLU is not homogeneous, and a fixture that only ever
+  // evaluates it where it looks linear cannot separate a misplaced scale.
+  const std::vector<float> weight = RandomVec(wn, 7702, -1.0f, 1.0f);
+  const std::vector<float> state0 = RandomVec(sn, 7703);
+
+  vt::Qwen4ExpPleConvArgs args;
+  args.dilation = kD;
+
+  if (RocmBuilt()) {
+    REQUIRE(vt::OpRegistered(vt::OpId::kQwen4ExpPleConv, DeviceType::kROCM));
+  }
+
+  // BOTH DTYPE ARMS. `x`, `weight`, `out` AND the ring all carry the model dtype
+  // (ops.cpp admits f32 or bf16 for the ring and cites `cache_utils.py:1019-1023`
+  // for why), so a bf16 model moves bf16 bytes through all four and a device
+  // kernel's bf16 STORE branch is on the production path. With this loop absent
+  // that branch was dead weight nothing could falsify — the finding this arm was
+  // sent back for. The loop is the shape the `index_select` / `index_copy` cases
+  // above already use, not a new one.
+  for (DType et : {DType::kF32, DType::kBF16}) {
+    const size_t esz = vt::SizeOf(et);
+    CAPTURE(esz);
+    // Round ONCE, here, and feed both arms the same bytes: a fixture that
+    // rounded per arm would be comparing two different inputs.
+    const std::vector<uint8_t> xb = PackRows(x, et);
+    const std::vector<uint8_t> wb = PackRows(weight, et);
+    const std::vector<uint8_t> sb0 = PackRows(state0, et);
+
+    for (int use_indices = 1; use_indices >= 0; --use_indices) {
+      CAPTURE(use_indices);
+      std::vector<uint8_t> ref_out(xn * esz, 0);
+      std::vector<uint8_t> ref_state = sb0;  // IN PLACE: the ring is read AND written
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<uint8_t> cx = xb, cw = wb;
+        std::vector<int32_t> cq_sl = qsl, cr = rows_idx;
+        Tensor to = Tensor::Contiguous(ref_out.data(), et, cd, {T, kC});
+        Tensor tx = Tensor::Contiguous(cx.data(), et, cd, {T, kC});
+        Tensor tw = Tensor::Contiguous(cw.data(), et, cd, {kC, kK});
+        Tensor ts = Tensor::Contiguous(ref_state.data(), et, cd, {kRows, kC, kStateLen});
+        Tensor tq = TI32(cq_sl.data(), cd, kSeqs + 1);
+        Tensor tr = TI32(cr.data(), cd, kSeqs);
+        vt::Qwen4ExpPleConv(cq, to, tx, tw, ts, tq, use_indices ? &tr : nullptr, args);
+        cpu.DestroyQueue(cq);
+      }
+      const std::vector<float> ref_out_f = WidenRows(ref_out, et);
+
+      // FIXTURE HEALTH, asserted on the ORACLE rather than hoped for. Without
+      // these three an arm that wrote nothing, or wrote everywhere, would be
+      // compared against an oracle nobody checked had done anything either.
+      {
+        bool out_nonzero = false;
+        for (float v : ref_out_f) {
+          if (v != 0.0f) out_nonzero = true;
+        }
+        REQUIRE(out_nonzero);
+        const size_t row_bytes = static_cast<size_t>(kC * kStateLen) * esz;
+        // The addressed rows MOVED ...
+        for (int64_t s = 0; s < kSeqs; ++s) {
+          const int64_t row = use_indices ? rows_idx[static_cast<size_t>(s)] : s;
+          const size_t o = static_cast<size_t>(row) * row_bytes;
+          REQUIRE(std::memcmp(ref_state.data() + o, sb0.data() + o, row_bytes) != 0);
+        }
+        // ... and every row the index list does NOT name is byte-unchanged, which
+        // is the only thing that makes the row indirection falsifiable at all.
+        if (use_indices) {
+          for (int64_t row : {0, 2, 5}) {
+            const size_t o = static_cast<size_t>(row) * row_bytes;
+            CHECK(std::memcmp(ref_state.data() + o, sb0.data() + o, row_bytes) == 0);
+          }
+        }
+      }
+
+      for (DeviceType dt : RegisteredDevices()) {
+        if (!OpAvailable(vt::OpId::kQwen4ExpPleConv, dt)) continue;
+        CAPTURE(DeviceTag(dt));
+        vt::Backend& dev = vt::GetBackend(dt);
+        Queue q = dev.CreateQueue();
+        const Device d{dt, 0};
+        DevBufBytes dout(dev, q, xn * esz), dx(dev, q, xn * esz);
+        DevBufBytes dw(dev, q, wn * esz), ds(dev, q, sn * esz);
+        DevBufI32 dqsl(dev, q, qsl.size()), drows(dev, q, rows_idx.size());
+        // POISON THE DESTINATION. Every one of the 16 tokens is inside a
+        // segment, so the kernel owes a value for every element; graded against
+        // a zeroed buffer, a kernel that launched nothing would be graded
+        // against whatever the allocator handed back.
+        const std::vector<uint8_t> poison(xn * esz, 0xA5);
+        dout.Upload(poison.data());
+        dx.Upload(xb.data());
+        dw.Upload(wb.data());
+        ds.Upload(sb0.data());
+        dqsl.Upload(qsl);
+        drows.Upload(rows_idx);
+        Tensor to = Tensor::Contiguous(dout.ptr(), et, d, {T, kC});
+        Tensor tx = Tensor::Contiguous(dx.ptr(), et, d, {T, kC});
+        Tensor tw = Tensor::Contiguous(dw.ptr(), et, d, {kC, kK});
+        Tensor ts = Tensor::Contiguous(ds.ptr(), et, d, {kRows, kC, kStateLen});
+        Tensor tq = TI32(dqsl.ptr(), d, kSeqs + 1);
+        Tensor tr = TI32(drows.ptr(), d, kSeqs);
+        // `OpRegistered` says a native provider EXISTS; this says the call did not
+        // fall through to the portable tier anyway. On gfx1151 the tier cannot be
+        // installed at all (spec D2), so a non-zero delta here means the run is
+        // void rather than merely slow.
+        const unsigned long long hits_before = vt::GetReferenceTierHits();
+        vt::Qwen4ExpPleConv(q, to, tx, tw, ts, tq, use_indices ? &tr : nullptr, args);
+        dev.Synchronize(q);
+        CHECK(vt::GetReferenceTierHits() == hits_before);
+        std::vector<uint8_t> got_out(xn * esz, 0), got_state(sn * esz, 0);
+        dout.Download(got_out.data());
+        ds.Download(got_state.data());
+        const double nmse_out = Nmse(ref_out_f, WidenRows(got_out, et));
+        const double nmse_state =
+            Nmse(WidenRows(ref_state, et), WidenRows(got_state, et));
+        MESSAGE("qwen4_exp ple_conv NMSE " << DeviceTag(dt) << " esz=" << esz
+                                           << " idx=" << use_indices
+                                           << " out = " << nmse_out
+                                           << " state = " << nmse_state);
+        CHECK(nmse_out <= kNmseTol);
+        CHECK(nmse_state <= kNmseTol);
+        dev.DestroyQueue(q);
+      }
+    }
+  }
+}
+
+// The conv's four taps accumulate in DOUBLE, and until this case existed on the
+// device side nothing but CUDA measured it: narrowing `double acc` to `float
+// acc` in the HIP kernel left the cross-device gate green at NMSE 3.05e-15,
+// eleven orders under the bar. Spec D3d §2 spends a paragraph on WHY the width
+// is kept against vLLM's activation-dtype `F.conv1d`, and on a board whose fp64
+// rate is reduced a width nothing checks is a cost nobody can justify.
+//
+// PORTED FROM `tests/vllm/models/test_qwen4_exp_cuda.cpp:648` — "CUDA
+// vt::Qwen4ExpPleConv keeps the double tap accumulator" — fixture, reasoning and
+// the `silu(1.0)` target unchanged, re-expressed against this file's
+// cross-device harness so every registered backend is held to it.
+TEST_CASE("qwen4_exp PLE conv keeps the DOUBLE four-tap accumulator on ROCm too") {
+  // WELL-SCALED DATA CANNOT SEE THIS, and neither can magnitude-separated data
+  // laid out carelessly. The donor's first draft put `big + c` in one input
+  // element: at big = 2^40 an f32 ulp is 2^17, so `c` was lost ON THE STORE and
+  // both arms agreed trivially. Adjacent `+big, -big` does not work either,
+  // because a SEQUENTIAL f32 accumulator cancels them before the small term
+  // arrives and keeps it exactly.
+  //
+  // What separates the two widths is the small term arriving FIRST, ahead of a
+  // cancelling pair. Tap k reads `hist[t + k*dilation]`, so at dilation 3 the
+  // four taps of output 0 are hist[0], hist[3], hist[6], hist[9]. Set those to
+  // 1.0, 2^40, -2^40, 0 and the two accumulators disagree completely:
+  //
+  //   double: ((0 + 1) + 2^40) - 2^40 + 0  ==  1.0        -> silu(1) = 0.7310586
+  //   float:  1 + 2^40 rounds to 2^40, so  ==  0.0        -> silu(0) = 0.0
+  //
+  // The case is therefore held to the DOUBLE answer DIRECTLY as well as to the
+  // CPU arm, so it states what it is measuring and cannot be satisfied by two
+  // arms being wrong together.
+  constexpr int64_t kK = 4;
+  constexpr int64_t kD = 3;
+  constexpr int64_t kStateLen = (kK - 1) * kD;  // 9
+  constexpr int64_t kC = 3;
+  constexpr int64_t kTokens = 4;
+  constexpr int64_t kSeqs = 1;
+  // f32 ONLY, and that is the point rather than an omission: 2^40 and 1.0 are
+  // both exact in bf16, but `silu(1.0) = 0.731` rounds to bf16 with ~3e-3 of
+  // error, which is six times the 5e-4 band this file grades on. The dtype
+  // surface is gated by the case above; this one gates a WIDTH and needs the
+  // narrow answer and the wide one to stay apart after the store.
+  const float big = 1099511627776.0f;  // 2^40, exactly representable in f32
+  const std::vector<float> x(static_cast<size_t>(kTokens * kC), 0.0f);
+  const std::vector<float> weight(static_cast<size_t>(kC * kK), 1.0f);
+  std::vector<float> state0(static_cast<size_t>(kC * kStateLen), 0.0f);
+  for (int64_t c = 0; c < kC; ++c) {
+    state0[static_cast<size_t>(c * kStateLen + 0)] = 1.0f;
+    state0[static_cast<size_t>(c * kStateLen + 3)] = big;
+    state0[static_cast<size_t>(c * kStateLen + 6)] = -big;
+  }
+  const std::vector<int32_t> qsl = {0, static_cast<int32_t>(kTokens)};
+
+  vt::Qwen4ExpPleConvArgs args;
+  args.dilation = kD;
+
+  if (RocmBuilt()) {
+    REQUIRE(vt::OpRegistered(vt::OpId::kQwen4ExpPleConv, DeviceType::kROCM));
+  }
+
+  // silu(1.0) in double, which is what a double accumulator must produce.
+  const double want = 1.0 * (1.0 / (1.0 + std::exp(-1.0)));
+
+  const size_t xn = x.size();
+  const size_t wn = weight.size();
+  const size_t sn = state0.size();
+
+  std::vector<float> ref_out(xn, 0.0f);
+  std::vector<float> ref_state = state0;
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> cx = x, cw = weight;
+    std::vector<int32_t> cq_sl = qsl;
+    Tensor to = T2(ref_out.data(), cd, kTokens, kC);
+    Tensor tx = T2(cx.data(), cd, kTokens, kC);
+    Tensor tw = T2(cw.data(), cd, kC, kK);
+    Tensor ts = Tensor::Contiguous(ref_state.data(), DType::kF32, cd, {1, kC, kStateLen});
+    Tensor tq = TI32(cq_sl.data(), cd, kSeqs + 1);
+    vt::Qwen4ExpPleConv(cq, to, tx, tw, ts, tq, nullptr, args);
+    cpu.DestroyQueue(cq);
+  }
+  // THE ORACLE HALF, WHICH RUNS ON EVERY BUILD, and it is the whole point of
+  // the case: the CPU arm keeps the width too, so a reader on a CPU-only host
+  // still learns whether the reference answer is silu(1) or silu(0).
+  INFO("a float accumulator gives silu(0) = 0.0 here; a double one gives " << want);
+  for (int64_t c = 0; c < kC; ++c) {
+    CAPTURE(c);
+    CHECK(std::fabs(static_cast<double>(ref_out[static_cast<size_t>(c)]) - want) < 1.0e-6);
+  }
+
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!OpAvailable(vt::OpId::kQwen4ExpPleConv, dt)) continue;
+    CAPTURE(DeviceTag(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+    DevBuf dout(dev, q, xn), dx(dev, q, xn), dw(dev, q, wn), ds(dev, q, sn);
+    dout.Upload(std::vector<float>(xn, -1.0f));  // poison: silu never returns -1
+    dx.Upload(x);
+    dw.Upload(weight);
+    ds.Upload(state0);
+    std::vector<int32_t> hq = qsl;
+    DevBufI32 dqsl(dev, q, hq.size());
+    dqsl.Upload(hq);
+    Tensor to = T2(dout.ptr(), d, kTokens, kC);
+    Tensor tx = T2(dx.ptr(), d, kTokens, kC);
+    Tensor tw = T2(dw.ptr(), d, kC, kK);
+    Tensor ts = Tensor::Contiguous(ds.ptr(), DType::kF32, d, {1, kC, kStateLen});
+    Tensor tq = TI32(dqsl.ptr(), d, kSeqs + 1);
+    const unsigned long long hits_before = vt::GetReferenceTierHits();
+    vt::Qwen4ExpPleConv(q, to, tx, tw, ts, tq, nullptr, args);
+    dev.Synchronize(q);
+    CHECK(vt::GetReferenceTierHits() == hits_before);
+    const std::vector<float> got = dout.Download();
+    for (int64_t c = 0; c < kC; ++c) {
+      CAPTURE(c);
+      const double g = static_cast<double>(got[static_cast<size_t>(c)]);
+      MESSAGE("qwen4_exp ple_conv tap width " << DeviceTag(dt) << " c=" << c
+                                              << " got = " << g << " want = " << want);
+      CHECK(std::fabs(g - want) < 1.0e-6);
+    }
+    // And the two arms still agree with each other everywhere else in the block.
+    CHECK(Nmse(ref_out, got) <= kNmseTol);
+    CHECK(Nmse(ref_state, ds.Download()) <= kNmseTol);
+    dev.DestroyQueue(q);
+  }
+}
+
+TEST_CASE("qwen4_exp PLE signed-sqrt gate matches the CPU oracle and is NATIVE on ROCm") {
+  // hc = 3 and H = 7: neither is a power of two, so the flattened `[T, hc*H]`
+  // output index cannot be reconstructed by an accidental shift, and a kernel
+  // that flattened (H, hc) instead of (hc, H) produces a buffer of exactly the
+  // right size holding a transposed answer — which is the defect the op's own
+  // wrapper says it exists to catch.
+  constexpr int64_t T = 6, kHc = 3, kH = 7;
+  constexpr int64_t kFlat = kHc * kH;
+  const size_t sn = static_cast<size_t>(T) * kHc;
+  const size_t vn = static_cast<size_t>(T) * kH;
+  const size_t on = static_cast<size_t>(T) * kFlat;
+
+  // THE SCORES ARE WRITTEN OUT, NOT RANDOM, because five of this op's branches
+  // are reachable only from specific values and a uniform sample hits none of
+  // them: `torch.sign`'s ZERO arm (a fully masked row scores exactly 0), the
+  // negative branch that makes the root SIGNED, the clamp band, and the `isnan`
+  // guard. A random vector would exercise the two big branches only.
+  //
+  // THE NaN IS THE GUARD'S ONLY WITNESS, and it was added after a fresh review
+  // neutered `if (isnan(g)) return g;` in the HIP kernel and watched the gate
+  // stay green. `include/vt/ops.h` states the obligation — upstream propagates
+  // NaN because `sign(NaN) == 0` but `NaN * 0.0 == NaN`, while every comparison
+  // in a naive signed sqrt is false for NaN so the zero arm returns 0 and
+  // sigmoids to a perfectly plausible `0.5 * value`. The CUDA arm has a
+  // dedicated case for it; the HIP file's comment pointed at the CPU suite,
+  // which never runs on ROCm. Below, the NaN outputs are checked AS NaN and
+  // excluded from the NMSE, because an average over a poison value is not a
+  // measurement of anything.
+  const float kNaN = std::numeric_limits<float>::quiet_NaN();
+  std::vector<float> score(sn);
+  {
+    const std::vector<float> pool = {
+        3.5f,   -3.5f,  0.0f,    // big both ways, and the exact zero
+        -0.0f,  1e-4f,  -1e-4f,  // negative zero, and two values deep in the band
+        0.75f,  -1.25f, 2.0f,    //
+        -2.75f, 0.25f,  -0.5f,   //
+        1.5f,   -1.75f, 0.125f,  //
+        kNaN,   2.25f,  -2.25f};  // the guard's witness, in ONE (t, j) slot
+    REQUIRE(pool.size() == sn);
+    score = pool;
+  }
+  // +/-2 values, and NOT centred on zero: a value near 0 cannot show a wrong
+  // gate weight whatever the weight is.
+  const std::vector<float> value = RandomVec(vn, 7711, 0.5f, 2.5f);
+
+  // TWO ARGUMENT SETS, and the second one is the reason this case can see the
+  // clamp at all. At upstream's literal `clamp_min = 1e-6` the floor puts
+  // |root| at 1e-3 and `sigmoid(1e-3)` differs from `sigmoid(0)` in the fourth
+  // decimal, so EVERY way of breaking the clamp survives an NMSE bar of 5e-4 —
+  // the same blindness spec D3b found in W1's eps placement. `clamp_min = 4`
+  // floors the root at 2 and `sigmoid(2) = 0.881` against `sigmoid(1e-4)`, so
+  // the band values above move by ~43%. The production value is kept BESIDE it
+  // rather than replaced, because an arm gated only at an unused setting is an
+  // arm gated at nothing.
+  struct ArgCase {
+    float divisor;
+    float clamp_min;
+  };
+  const std::vector<ArgCase> arg_cases = {
+      {2.6457513f, 1e-6f},  // math.sqrt(7), upstream's literal clamp
+      {2.6457513f, 4.0f}};  // the separating clamp
+
+  if (RocmBuilt()) {
+    REQUIRE(vt::OpRegistered(vt::OpId::kQwen4ExpPleGate, DeviceType::kROCM));
+  }
+
+  // BOTH DTYPE ARMS for `out` and `value`. `score` is f32 by the op contract —
+  // it is the argument of a sigmoid AND of a square root — so it never varies.
+  // See the conv case above for why this loop exists.
+  for (DType et : {DType::kF32, DType::kBF16}) {
+    const size_t esz = vt::SizeOf(et);
+    CAPTURE(esz);
+    const std::vector<uint8_t> vb = PackRows(value, et);
+    // The ROUNDED values both arms actually see, so the health check below
+    // divides by the number the kernels multiplied and not by the pre-cast one.
+    const std::vector<float> value_f = WidenRows(vb, et);
+
+    for (const ArgCase& ac : arg_cases) {
+      CAPTURE(ac.clamp_min);
+      vt::Qwen4ExpPleGateArgs args;
+      args.gate_divisor = ac.divisor;
+      args.clamp_min = ac.clamp_min;
+
+      std::vector<uint8_t> ref(on * esz, 0);
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<float> cs = score;
+        std::vector<uint8_t> cv = vb;
+        Tensor to = Tensor::Contiguous(ref.data(), et, cd, {T, kFlat});
+        Tensor ts = T2(cs.data(), cd, T, kHc);
+        Tensor tv = Tensor::Contiguous(cv.data(), et, cd, {T, kH});
+        vt::Qwen4ExpPleGate(cq, to, ts, tv, args);
+        cpu.DestroyQueue(cq);
+      }
+      const std::vector<float> ref_f = WidenRows(ref, et);
+
+      // FIXTURE HEALTH. The gate weight is a sigmoid, so it lives in (0, 1) and a
+      // fixture whose weights all sat near 0.5 could not separate a broken sign,
+      // a dropped divisor or a missing sqrt from a correct arm. `out = w * value`
+      // and `value` is strictly positive here, so `out/value` IS the weight and
+      // the spread below is measured rather than assumed.
+      {
+        double w_lo = 2.0, w_hi = -1.0;
+        size_t ref_nans = 0;
+        for (int64_t t = 0; t < T; ++t) {
+          for (int64_t j = 0; j < kHc; ++j) {
+            for (int64_t h = 0; h < kH; ++h) {
+              const float r = ref_f[static_cast<size_t>(t * kFlat + j * kH + h)];
+              if (std::isnan(r)) {
+                ++ref_nans;
+                continue;
+              }
+              const double w = static_cast<double>(r) /
+                               static_cast<double>(value_f[static_cast<size_t>(t * kH + h)]);
+              if (w < w_lo) w_lo = w;
+              if (w > w_hi) w_hi = w;
+            }
+          }
+        }
+        CAPTURE(w_lo);
+        CAPTURE(w_hi);
+        REQUIRE(w_hi - w_lo > 0.5);
+        // The ORACLE propagates the NaN, and over exactly its own (t, j) row.
+        // Without this the device check below could pass vacuously against a
+        // reference that had already swallowed it.
+        REQUIRE(ref_nans == static_cast<size_t>(kH));
+      }
+
+      for (DeviceType dt : RegisteredDevices()) {
+        if (!OpAvailable(vt::OpId::kQwen4ExpPleGate, dt)) continue;
+        CAPTURE(DeviceTag(dt));
+        vt::Backend& dev = vt::GetBackend(dt);
+        Queue q = dev.CreateQueue();
+        const Device d{dt, 0};
+        DevBufBytes dout(dev, q, on * esz), dval(dev, q, vn * esz);
+        DevBuf dsc(dev, q, sn);
+        const std::vector<uint8_t> poison(on * esz, 0xA5);
+        dout.Upload(poison.data());
+        dsc.Upload(score);
+        dval.Upload(vb.data());
+        Tensor to = Tensor::Contiguous(dout.ptr(), et, d, {T, kFlat});
+        Tensor ts = T2(dsc.ptr(), d, T, kHc);
+        Tensor tv = Tensor::Contiguous(dval.ptr(), et, d, {T, kH});
+        const unsigned long long hits_before = vt::GetReferenceTierHits();
+        vt::Qwen4ExpPleGate(q, to, ts, tv, args);
+        dev.Synchronize(q);
+        CHECK(vt::GetReferenceTierHits() == hits_before);
+        std::vector<uint8_t> got(on * esz, 0);
+        dout.Download(got.data());
+        const std::vector<float> got_f = WidenRows(got, et);
+        // THE NaN HALF IS CHECKED, NOT AVERAGED. A missing `isnan` guard returns
+        // `sigmoid(0) * value` here — a finite, plausible number — so it has to
+        // be caught by an `isnan` assertion and can never be caught by a norm.
+        std::vector<float> ref_fin, got_fin;
+        size_t nan_seen = 0;
+        for (size_t i = 0; i < ref_f.size(); ++i) {
+          if (std::isnan(ref_f[i])) {
+            ++nan_seen;
+            CHECK(std::isnan(got_f[i]));
+            continue;
+          }
+          ref_fin.push_back(ref_f[i]);
+          got_fin.push_back(got_f[i]);
+        }
+        CHECK(nan_seen == static_cast<size_t>(kH));
+        const double nmse = Nmse(ref_fin, got_fin);
+        MESSAGE("qwen4_exp ple_gate NMSE " << DeviceTag(dt) << " esz=" << esz
+                                           << " clamp=" << ac.clamp_min << " = " << nmse);
+        CHECK(nmse <= kNmseTol);
+        dev.DestroyQueue(q);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MODEL-MM-QWEN4-EXP W4 (`.agents/specs/qwen4-exp-rocm-ops.md`) — the QSA pair,
+// `vt::Qwen4ExpQsaCompress` and `vt::Qwen4ExpQsaGatherAttention`, the LAST two
+// of the nine ops that had no ROCm arm. Donor `src/vt/cuda/cuda_qwen4_exp_qsa.cu`,
+// oracle `src/vt/cpu/cpu_qwen4_exp_qsa.cpp`, mirror-comparison in spec D3e.
+//
+// THE FIXTURE IS THE HARD PART OF THIS WAVE AND IT IS DESIGNED FIRST. Four
+// fixtures in this campaign shipped unable to see the defect they claimed to
+// gate (spec D3b, D3d §2, and the W3 re-gate), and QSA has a trap of its own
+// that `.agents/specs/qwen4-exp-flash-next.md:445-452` states in its own words:
+// "at context <= indexer_budget every candidate is selected and the only
+// remaining difference is the value pooling. Any QSA gate must therefore run
+// past 2048 tokens of context to be worth anything." So the gather case below
+// runs at kv_len 3002 with a 512-block budget out of 750 complete blocks, and it
+// PROVES rather than asserts that the length buys something: it computes a
+// POOLED-KEY approximation of its own fixture on the host and requires the two
+// answers to be orders apart, and it counts the key rows the kernel reads.
+// ---------------------------------------------------------------------------
+namespace {
+
+// The released indexer geometry. `compress_ratio` 4 and `indexer_budget` 2048
+// are `Qwen/Qwen3.8-Flash-Next`'s own config values; the head dims below are
+// reduced, and the reduction is argued rather than convenient — see each.
+constexpr int64_t kQsaCR = 4;
+
+}  // namespace
+
+TEST_CASE("qwen4_exp QSA compressor matches the CPU oracle and is NATIVE on ROCm") {
+  // `head_dim` 128 IS the released `indexer_head_dim`, and `rotary_dim` 64 is
+  // `int(head_dim * partial_rotary_factor)` at the released config. Neither is
+  // reduced, because the NoPE tail (`rot < d < D`) only exists when
+  // `rotary_dim < head_dim`: a fixture with `rot == D` cannot see a kernel that
+  // roped the trailing dims too.
+  constexpr int64_t kD = 128;
+  constexpr int64_t kRot = 64;
+  // 6 complete blocks, so `nb` is neither 1 (which cannot see a block-index
+  // decomposition error) nor a power of two.
+  constexpr int64_t kNb = 6;
+  constexpr int64_t kKeys = kNb * kQsaCR;  // 24
+
+  std::vector<float> raw = RandomVec(static_cast<size_t>(kKeys) * kD, 9101);
+  // THE ROW SCALES ARE SEPARATED ON PURPOSE, and this is the W1 lesson (spec
+  // D3b) applied before the fact rather than after a fresh review found it: with
+  // every row at O(1) and `eps = 1e-6`, BOTH ways of misplacing the epsilon
+  // survive at NMSE ~2.4e-12 and the guarantee the kernel comment states is
+  // unmeasurable. Block 0's keys are scaled to 1e-3, which puts its mean square
+  // at the same order as eps, and block 1's to 1e6, which puts `sqrt(ms)` at
+  // ~1e6. RMS NORM RETURNS EVERY ROW TO O(1) whatever its input scale, so
+  // neither block distorts what the others contribute to the NMSE.
+  for (int64_t i = 0; i < kQsaCR; ++i) {
+    for (int64_t d = 0; d < kD; ++d) {
+      raw[static_cast<size_t>(i * kD + d)] *= 1e-3f;
+      raw[static_cast<size_t>((kQsaCR + i) * kD + d)] *= 1e6f;
+    }
+  }
+  // The norm weight is the UPSTREAM polarity's operand: `(1.0 + weight)` with a
+  // weight initialised at zero, so small values around zero are the production
+  // shape and a kernel that dropped the `+ 1` returns something near zero.
+  const std::vector<float> nw = RandomVec(static_cast<size_t>(kD), 9102, -0.4f, 0.4f);
+  // The tables are read at the BLOCK-START position `CR * b`, so they must cover
+  // every key position, not just `nb` rows. Real rope tables, not random: a
+  // random "cos" would let a kernel that swapped cos and sin pass.
+  std::vector<float> cosv(static_cast<size_t>(kKeys) * kRot);
+  std::vector<float> sinv(static_cast<size_t>(kKeys) * kRot);
+  for (int64_t p = 0; p < kKeys; ++p) {
+    for (int64_t j = 0; j < kRot; ++j) {
+      const double inv = std::pow(10000.0, -2.0 * static_cast<double>(j % (kRot / 2)) /
+                                               static_cast<double>(kRot));
+      const double ang = static_cast<double>(p) * inv;
+      cosv[static_cast<size_t>(p * kRot + j)] = static_cast<float>(std::cos(ang));
+      sinv[static_cast<size_t>(p * kRot + j)] = static_cast<float>(std::sin(ang));
+    }
+  }
+
+  if (RocmBuilt()) {
+    REQUIRE(vt::OpRegistered(vt::OpId::kQwen4ExpQsaCompress, DeviceType::kROCM));
+  }
+
+  // BOTH DTYPE ARMS, the shape W2's and W3's cases use. `raw_keys`, `block_keys`
+  // and the norm weight all carry the model dtype, so a bf16 model moves bf16
+  // bytes through all three and the device kernel's bf16 STORE branch is on the
+  // production path. W3's re-gate found that a fixture which is f32 throughout
+  // leaves those branches unfalsifiable — corrupting BOTH narrow store branches
+  // left its NMSE at exactly 0.
+  for (DType et : {DType::kF32, DType::kBF16}) {
+    const size_t esz = vt::SizeOf(et);
+    CAPTURE(esz);
+    // Round ONCE and feed both arms the same bytes.
+    const std::vector<uint8_t> rawb = PackRows(raw, et);
+    const std::vector<uint8_t> nwb = PackRows(nw, et);
+
+    // BOTH `round_intermediates_to_bf16` ARMS. The flag is not decoration: it is
+    // upstream's per-operation rounding on a bf16 model path, and the op's own
+    // comment says mutation M9 measures it. An arm that ignored it would pass a
+    // one-polarity fixture.
+    for (int round = 0; round <= 1; ++round) {
+      CAPTURE(round);
+      vt::Qwen4ExpQsaCompressArgs args;
+      args.compress_ratio = kQsaCR;
+      args.rotary_dim = kRot;
+      args.eps = 1e-6f;
+      args.round_intermediates_to_bf16 = (round != 0);
+
+      std::vector<uint8_t> ref(static_cast<size_t>(kNb) * kD * esz, 0);
+      {
+        vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+        Queue cq = cpu.CreateQueue();
+        const Device cd{DeviceType::kCPU, 0};
+        std::vector<uint8_t> craw = rawb, cnw = nwb;
+        std::vector<float> ccos = cosv, csin = sinv;
+        Tensor tbk = Tensor::Contiguous(ref.data(), et, cd, {kNb, kD});
+        Tensor traw = Tensor::Contiguous(craw.data(), et, cd, {kKeys, kD});
+        Tensor tnw = Tensor::Contiguous(cnw.data(), et, cd, {kD});
+        Tensor tcos = T2(ccos.data(), cd, kKeys, kRot);
+        Tensor tsin = T2(csin.data(), cd, kKeys, kRot);
+        vt::Qwen4ExpQsaCompress(cq, tbk, traw, tnw, tcos, tsin, args);
+        cpu.DestroyQueue(cq);
+      }
+      const std::vector<float> ref_f = WidenRows(ref, et);
+
+      // FIXTURE HEALTH, asserted on the ORACLE. Without these the device arm
+      // would be compared against an oracle nobody checked had done anything.
+      {
+        bool nonzero = false;
+        bool finite = true;
+        for (float v : ref_f) {
+          if (v != 0.0f) nonzero = true;
+          if (!std::isfinite(v)) finite = false;
+        }
+        REQUIRE(nonzero);
+        REQUIRE(finite);
+        // THE SCALE SEPARATION SURVIVED THE NORM. Block 0 came in at 1e-3 and
+        // block 1 at 1e6, and RMS norm must return both to O(1): if it did not,
+        // the eps-placement axis this fixture exists to expose would be hidden
+        // behind a magnitude instead of measured.
+        for (int64_t b = 0; b < 2; ++b) {
+          double ms = 0.0;
+          for (int64_t d = 0; d < kD; ++d) {
+            const double v = ref_f[static_cast<size_t>(b * kD + d)];
+            ms += v * v;
+          }
+          ms /= static_cast<double>(kD);
+          CHECK(ms > 1e-3);
+          CHECK(ms < 1e3);
+        }
+      }
+
+      for (DeviceType dt : RegisteredDevices()) {
+        if (!OpAvailable(vt::OpId::kQwen4ExpQsaCompress, dt)) continue;
+        CAPTURE(DeviceTag(dt));
+        vt::Backend& dev = vt::GetBackend(dt);
+        Queue q = dev.CreateQueue();
+        const Device d{dt, 0};
+        DevBufBytes dbk(dev, q, static_cast<size_t>(kNb) * kD * esz);
+        DevBufBytes draw(dev, q, rawb.size());
+        DevBufBytes dnw(dev, q, nwb.size());
+        DevBuf dcos(dev, q, cosv.size()), dsin(dev, q, sinv.size());
+        // POISON THE DESTINATION: every element is owed a value, so a kernel
+        // that launched nothing must not be graded against a zeroed buffer.
+        const std::vector<uint8_t> poison(static_cast<size_t>(kNb) * kD * esz, 0xA5);
+        dbk.Upload(poison.data());
+        draw.Upload(rawb.data());
+        dnw.Upload(nwb.data());
+        dcos.Upload(cosv);
+        dsin.Upload(sinv);
+        Tensor tbk = Tensor::Contiguous(dbk.ptr(), et, d, {kNb, kD});
+        Tensor traw = Tensor::Contiguous(draw.ptr(), et, d, {kKeys, kD});
+        Tensor tnw = Tensor::Contiguous(dnw.ptr(), et, d, {kD});
+        Tensor tcos = T2(dcos.ptr(), d, kKeys, kRot);
+        Tensor tsin = T2(dsin.ptr(), d, kKeys, kRot);
+        // `OpRegistered` says a native provider EXISTS; this says the call did
+        // not fall through to the portable tier anyway. On gfx1151 the tier
+        // cannot be installed at all (spec D2), so a non-zero delta means the
+        // run is void rather than merely slow.
+        const unsigned long long hits_before = vt::GetReferenceTierHits();
+        vt::Qwen4ExpQsaCompress(q, tbk, traw, tnw, tcos, tsin, args);
+        dev.Synchronize(q);
+        CHECK(vt::GetReferenceTierHits() == hits_before);
+        std::vector<uint8_t> got(static_cast<size_t>(kNb) * kD * esz, 0);
+        dbk.Download(got.data());
+        const double nmse = Nmse(ref_f, WidenRows(got, et));
+        // THE COMPRESSOR CONTAINS NO TRANSCENDENTAL — its only inexact
+        // operations are `sqrtf` and the reciprocal over it, both correctly
+        // rounded by IEEE-754 on either side — so the differing-BYTE count is
+        // reported beside the NMSE rather than inferred from it. A number other
+        // than zero here is a real finding about the device's `sqrt`/`rcp` and
+        // not a tolerance question.
+        size_t diff_bytes = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+          if (got[i] != ref[i]) ++diff_bytes;
+        }
+        MESSAGE("qwen4_exp qsa_compress NMSE " << DeviceTag(dt) << " esz=" << esz
+                                               << " round=" << round << " = " << nmse
+                                               << " differing bytes " << diff_bytes << " of "
+                                               << got.size());
+        CHECK(nmse <= kNmseTol);
+        // AND THE BYTE COUNT IS AN ASSERTION, not only a MESSAGE, because the
+        // NMSE band alone CANNOT SEE this op's intermediate-rounding contract.
+        // MEASURED: dropping `MaybeBf16` from the rope's final add — the whole
+        // of what `round_intermediates_to_bf16` buys at that store — SURVIVED
+        // the 5e-4 band at NMSE 1.16317e-06, 0.0023x the bar, while changing
+        // 399 of 3072 bytes. Three of the four arms cannot see it at all: with
+        // `round=0` the helper is the identity, and on a bf16 tensor `StoreAt`
+        // has already rounded, so only the f32 `round=1` arm carries the axis
+        // and it carries it as BYTES. Widening the fixture is not available
+        // here — the difference IS one bf16 rounding — so the bar becomes the
+        // one this arm actually guarantees. It is not a tightening chosen to
+        // pass: the file's own header predicts bit-identity from the operand
+        // list (no transcendental, `sqrtf` and `__frcp_rn` correctly rounded by
+        // IEEE-754 on both sides, every reduction in the host's order), the
+        // CUDA sibling already gates the same op with a `memcmp`, and the
+        // unmutated arm measured 0 differing bytes in all four arms on
+        // gfx1151.
+        CHECK(diff_bytes == 0);
+        dev.DestroyQueue(q);
+      }
+    }
+  }
+}
+
+TEST_CASE("qwen4_exp QSA gather attention matches the CPU oracle and is NATIVE on ROCm") {
+  // ─── THE GEOMETRY, AND WHY EVERY NUMBER IS THE NUMBER IT IS ───────────────
+  // `kv_len` 3002 and a 512-block budget are the released indexer's own working
+  // point (`indexer_budget` 2048 = 512 blocks x compress_ratio 4). BELOW 2048
+  // THIS CASE WOULD MEASURE NOTHING IT CLAIMS TO: every complete block would be
+  // selected, the gather would visit the whole cache, and a port that attended
+  // POOLED keys or walked the cache densely under a mask would agree with a
+  // correct one. Token 2 is kept at kv_len 2051 AS THE CONTROL that shows this:
+  // its `keys_visited` equals its dense figure exactly, while tokens 0 and 1
+  // read 2050 of 3002 rows.
+  constexpr int64_t kKvLong = 3002;
+  constexpr int64_t kKvShort = 2051;
+  constexpr int64_t kBudgetBlocks = 512;
+  constexpr int64_t kTopk = 520;  // > budget, so the `-1` TERMINATOR is exercised
+  // A FOURTH TOKEN AT kv_len 7 IS NOT DECORATION AND IT IS NOT THE DECODE SHAPE
+  // EITHER, it is what makes the RAGGED TAIL measurable. MEASURED on the
+  // three-token fixture: deleting the tail from the selection count moved the
+  // NMSE to 0.000919392, only 1.84x the 5e-4 bar — because the tail is at most
+  // `compress_ratio - 1` = 3 rows by construction, and 2 rows out of 2050
+  // cannot move a softmax far. The fixture cannot be widened by making the tail
+  // bigger, so it is widened by giving one token a context the tail DOMINATES:
+  // at kv_len 7 the tail is 3 of 7 attended rows. The long tokens keep the
+  // sparsity axis; this one keeps the tail axis.
+  constexpr int64_t kKvTiny = 7;
+  constexpr int64_t T = 4;
+  // 4 query heads over 2 KV heads: `groups` is 2, so a kernel that used `h`
+  // where it needed `h / groups` reads the wrong KV head and cannot pass.
+  constexpr int64_t HQ = 4;
+  constexpr int64_t HKV = 2;
+  // 40, NOT a multiple of the 64-wide block this arm launches: the tail threads
+  // must sit out the value accumulation (`threadIdx.x < DH`) and a kernel that
+  // let them write would corrupt the row. A power-of-two head dim cannot see it.
+  constexpr int64_t DH = 40;
+  constexpr int64_t kPageSize = 16;          // divides kQsaCR, as the engine requires
+  constexpr int64_t kPagesNamed = 188;       // 188 * 16 = 3008 >= 3002
+  constexpr int64_t kPhysPages = 200;        // MORE physical pages than the table names
+  constexpr float kScale = 0.15811388f;      // head_dim ** -0.5 at DH = 40
+
+  const int64_t max_kv_contig = kKvLong;
+  const size_t kvn = static_cast<size_t>(max_kv_contig) * HKV * DH;
+  const std::vector<float> kf = RandomVec(kvn, 9201);
+  const std::vector<float> vf = RandomVec(kvn, 9202);
+  const std::vector<float> qf = RandomVec(static_cast<size_t>(T) * HQ * DH, 9203);
+
+  // THE SELECTIONS. Ascending and `-1`-terminated, which is what
+  // `vt::DsaTopkSelect` emits and what the CPU arm refuses anything else than.
+  // Tokens 0 and 1 select DIFFERENT 512-block sets, so a kernel that read row 0
+  // of `block_ids` for every token cannot pass; token 2 selects all 512 of its
+  // complete blocks, which is the sub-budget control.
+  std::vector<int32_t> ids(static_cast<size_t>(T) * kTopk, -1);
+  {
+    auto put = [&](int64_t t, const std::vector<int64_t>& blocks) {
+      REQUIRE(static_cast<int64_t>(blocks.size()) <= kTopk);
+      for (size_t j = 0; j < blocks.size(); ++j) {
+        ids[static_cast<size_t>(t) * kTopk + j] = static_cast<int32_t>(blocks[j]);
+      }
+    };
+    std::vector<int64_t> b0, b1, b2, b3;
+    for (int64_t b = 0; b < 256; ++b) b0.push_back(b);
+    for (int64_t b = 494; b < 750; ++b) b0.push_back(b);
+    for (int64_t b = 1; b < 257; ++b) b1.push_back(b);
+    for (int64_t b = 493; b < 749; ++b) b1.push_back(b);
+    for (int64_t b = 0; b < 512; ++b) b2.push_back(b);
+    b3.push_back(0);  // the tiny token's ONE complete block
+    REQUIRE(static_cast<int64_t>(b0.size()) == kBudgetBlocks);
+    REQUIRE(static_cast<int64_t>(b1.size()) == kBudgetBlocks);
+    REQUIRE(static_cast<int64_t>(b2.size()) == kBudgetBlocks);
+    put(0, b0);
+    put(1, b1);
+    put(2, b2);
+    put(3, b3);
+  }
+  const std::vector<int32_t> lens = {
+      static_cast<int32_t>(kKvLong), static_cast<int32_t>(kKvLong),
+      static_cast<int32_t>(kKvShort), static_cast<int32_t>(kKvTiny)};
+
+  // The expansion of one token's selection into RAW ROW indices, which the test
+  // needs for the pooled-key control and the NaN probe below. It is the same
+  // rule the op documents — block `b` IS tokens [CR*b, CR*b + CR) — written once
+  // here rather than three times.
+  auto rows_for = [&](int64_t t) {
+    std::vector<int64_t> rows;
+    const int64_t kv = lens[static_cast<size_t>(t)];
+    const int64_t complete = kv / kQsaCR;
+    for (int64_t j = 0; j < kTopk; ++j) {
+      const int32_t b = ids[static_cast<size_t>(t) * kTopk + j];
+      if (b < 0) break;
+      for (int64_t i = 0; i < kQsaCR; ++i) rows.push_back(b * kQsaCR + i);
+    }
+    for (int64_t p = complete * kQsaCR; p < kv; ++p) rows.push_back(p);
+    return rows;
+  };
+  // THE COUNTS ARE DERIVED FROM THE EXPANSION, not from the budget: the tokens
+  // no longer all select `kBudgetBlocks`, and a hand-written count would be a
+  // second implementation of the rule the op documents.
+  std::vector<int64_t> selcount(T, 0);
+  int64_t dense_reads = 0, honest_reads = 0;
+  for (int64_t t = 0; t < T; ++t) {
+    selcount[static_cast<size_t>(t)] = static_cast<int64_t>(rows_for(t).size());
+    dense_reads += lens[static_cast<size_t>(t)] * HQ * 2;  // two softmax passes
+    honest_reads += selcount[static_cast<size_t>(t)] * HQ * 2;
+  }
+  REQUIRE(honest_reads < dense_reads);
+  // Token 3's tail is 3 of its 7 attended rows, which is the point of it.
+  REQUIRE(selcount[3] == kKvTiny);  // one complete block expanded, plus the tail
+  REQUIRE(kKvTiny - (kKvTiny / kQsaCR) * kQsaCR == kQsaCR - 1);  // the WIDEST tail there is
+
+  vt::Qwen4ExpQsaAttnArgs args;
+  args.scale = kScale;
+  args.compress_ratio = kQsaCR;
+
+  if (RocmBuilt()) {
+    REQUIRE(vt::OpRegistered(vt::OpId::kQwen4ExpQsaGatherAttention, DeviceType::kROCM));
+  }
+
+  // ─── THE CPU ORACLE, f32, AND THE POOLED-KEY CONTROL BESIDE IT ────────────
+  const size_t outn = static_cast<size_t>(T) * HQ * DH;
+  std::vector<float> ref_f32(outn, 0.0f);
+  int64_t ref_visited = -1;
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> ck = kf, cv = vf, cq_in = qf;
+    std::vector<int32_t> cids = ids, clens = lens;
+    Tensor to = Tensor::Contiguous(ref_f32.data(), DType::kF32, cd, {T, HQ, DH});
+    Tensor tq = Tensor::Contiguous(cq_in.data(), DType::kF32, cd, {T, HQ, DH});
+    Tensor tk = Tensor::Contiguous(ck.data(), DType::kF32, cd, {max_kv_contig, HKV, DH});
+    Tensor tv = Tensor::Contiguous(cv.data(), DType::kF32, cd, {max_kv_contig, HKV, DH});
+    Tensor tids = Tensor::Contiguous(cids.data(), DType::kI32, cd, {T, kTopk});
+    Tensor tlens = TI32(clens.data(), cd, T);
+    vt::Qwen4ExpQsaAttnArgs a = args;
+    a.keys_visited = &ref_visited;
+    vt::Qwen4ExpQsaGatherAttention(cq, to, tq, tk, tv, tids, tlens, a);
+    cpu.DestroyQueue(cq);
+  }
+  // The oracle itself is a gather, and this is where that is measured rather
+  // than assumed: the read count is the honest figure and it is strictly under
+  // the dense one.
+  REQUIRE(ref_visited == honest_reads);
+  MESSAGE("qwen4_exp qsa_gather keys_visited CPU = " << ref_visited << " of a dense "
+                                                     << dense_reads << " ("
+                                                     << (100.0 * static_cast<double>(ref_visited) /
+                                                         static_cast<double>(dense_reads))
+                                                     << "%)");
+  {
+    bool finite = true, nonzero = false;
+    for (float v : ref_f32) {
+      if (!std::isfinite(v)) finite = false;
+      if (v != 0.0f) nonzero = true;
+    }
+    REQUIRE(finite);
+    REQUIRE(nonzero);
+  }
+
+  // ─── CAN THIS FIXTURE TELL A GATHER FROM A POOLED-KEY CONSUMER? MEASURED ──
+  // The trap `.agents/specs/qwen4-exp-flash-next.md:445-452` names is a port that
+  // wires QSA's top-k into a DeepSeek-V4 style sparse consumer and attends the
+  // COMPRESSED key and value — one pooled state per compress block — instead of
+  // the four real tokens. It produces plausible output. So the control is built
+  // rather than argued: the same softmax over the same selection, with each
+  // selected block replaced by the MEAN of its four K rows and its four V rows
+  // (the ragged tail is raw in both). The assertion below is what makes the
+  // fixture's length load-bearing, and it is an assertion about the FIXTURE, not
+  // about any kernel.
+  {
+    std::vector<float> pooled(outn, 0.0f);
+    for (int64_t t = 0; t < T; ++t) {
+      const int64_t kv = lens[static_cast<size_t>(t)];
+      const int64_t complete = kv / kQsaCR;
+      for (int64_t h = 0; h < HQ; ++h) {
+        const int64_t kvh = h / (HQ / HKV);
+        std::vector<std::vector<float>> ks, vs;
+        for (int64_t j = 0; j < kTopk; ++j) {
+          const int32_t b = ids[static_cast<size_t>(t) * kTopk + j];
+          if (b < 0) break;
+          std::vector<float> kk(static_cast<size_t>(DH), 0.0f), vv(static_cast<size_t>(DH), 0.0f);
+          for (int64_t i = 0; i < kQsaCR; ++i) {
+            const size_t base = static_cast<size_t>((b * kQsaCR + i) * HKV + kvh) * DH;
+            for (int64_t d = 0; d < DH; ++d) {
+              kk[static_cast<size_t>(d)] += kf[base + d] / static_cast<float>(kQsaCR);
+              vv[static_cast<size_t>(d)] += vf[base + d] / static_cast<float>(kQsaCR);
+            }
+          }
+          ks.push_back(kk);
+          vs.push_back(vv);
+        }
+        for (int64_t p = complete * kQsaCR; p < kv; ++p) {
+          const size_t base = static_cast<size_t>(p * HKV + kvh) * DH;
+          ks.emplace_back(kf.begin() + static_cast<long>(base),
+                          kf.begin() + static_cast<long>(base) + DH);
+          vs.emplace_back(vf.begin() + static_cast<long>(base),
+                          vf.begin() + static_cast<long>(base) + DH);
+        }
+        double mx = -std::numeric_limits<double>::infinity();
+        std::vector<double> logit(ks.size(), 0.0);
+        for (size_t s = 0; s < ks.size(); ++s) {
+          double dot = 0.0;
+          for (int64_t d = 0; d < DH; ++d) {
+            dot += static_cast<double>(qf[static_cast<size_t>((t * HQ + h) * DH + d)]) *
+                   static_cast<double>(ks[s][static_cast<size_t>(d)]);
+          }
+          logit[s] = dot * static_cast<double>(kScale);
+          mx = std::max(mx, logit[s]);
+        }
+        double den = 0.0;
+        std::vector<double> acc(static_cast<size_t>(DH), 0.0);
+        for (size_t s = 0; s < ks.size(); ++s) {
+          const double w = std::exp(logit[s] - mx);
+          den += w;
+          for (int64_t d = 0; d < DH; ++d) {
+            acc[static_cast<size_t>(d)] += w * static_cast<double>(vs[s][static_cast<size_t>(d)]);
+          }
+        }
+        for (int64_t d = 0; d < DH; ++d) {
+          pooled[static_cast<size_t>((t * HQ + h) * DH + d)] =
+              static_cast<float>(acc[static_cast<size_t>(d)] / den);
+        }
+      }
+    }
+    const double pooled_nmse = Nmse(ref_f32, pooled);
+    MESSAGE("qwen4_exp qsa_gather FIXTURE SEPARATION: a pooled-key consumer over the same "
+            "selection lands at NMSE "
+            << pooled_nmse << " against the gather, " << (pooled_nmse / kNmseTol)
+            << "x the 5e-4 bar");
+    // ORDERS, not percent. If this ever lands near the bar the FIXTURE is what
+    // must be widened, never the tolerance.
+    REQUIRE(pooled_nmse > 100.0 * kNmseTol);
+  }
+
+  // ─── THE DEVICE ARMS: BOTH DTYPES, BOTH ADDRESS MODES ─────────────────────
+  for (DType et : {DType::kF32, DType::kBF16}) {
+    const size_t esz = vt::SizeOf(et);
+    CAPTURE(esz);
+    const std::vector<uint8_t> kb = PackRows(kf, et);
+    const std::vector<uint8_t> vb = PackRows(vf, et);
+    const std::vector<uint8_t> qb = PackRows(qf, et);
+
+    // The dtype arm's own oracle: the bf16 arm must be graded against the CPU
+    // run on the SAME rounded bytes, never against the f32 reference.
+    std::vector<uint8_t> ref(outn * esz, 0);
+    int64_t ref_v = -1;
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<uint8_t> ck = kb, cv = vb, cq_in = qb;
+      std::vector<int32_t> cids = ids, clens = lens;
+      Tensor to = Tensor::Contiguous(ref.data(), et, cd, {T, HQ, DH});
+      Tensor tq = Tensor::Contiguous(cq_in.data(), et, cd, {T, HQ, DH});
+      Tensor tk = Tensor::Contiguous(ck.data(), et, cd, {max_kv_contig, HKV, DH});
+      Tensor tv = Tensor::Contiguous(cv.data(), et, cd, {max_kv_contig, HKV, DH});
+      Tensor tids = Tensor::Contiguous(cids.data(), DType::kI32, cd, {T, kTopk});
+      Tensor tlens = TI32(clens.data(), cd, T);
+      vt::Qwen4ExpQsaAttnArgs a = args;
+      a.keys_visited = &ref_v;
+      vt::Qwen4ExpQsaGatherAttention(cq, to, tq, tk, tv, tids, tlens, a);
+      cpu.DestroyQueue(cq);
+    }
+    REQUIRE(ref_v == honest_reads);
+    const std::vector<float> ref_e = WidenRows(ref, et);
+
+    // The PAGED staging: logical row `p` lives at
+    // `[table[p / page_size], p % page_size, kvh, :]`. The table is SHUFFLED and
+    // names 188 of 200 physical pages, so a kernel that ignored it and read the
+    // cache linearly cannot pass, and the 12 pages it never names stay poisoned.
+    std::vector<int32_t> table(static_cast<size_t>(kPagesNamed));
+    {
+      std::vector<int32_t> phys(static_cast<size_t>(kPhysPages));
+      for (int64_t i = 0; i < kPhysPages; ++i) phys[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+      std::mt19937 rng(9204);
+      std::shuffle(phys.begin(), phys.end(), rng);
+      for (int64_t i = 0; i < kPagesNamed; ++i) table[static_cast<size_t>(i)] = phys[static_cast<size_t>(i)];
+    }
+    const size_t paged_elems = static_cast<size_t>(kPhysPages) * kPageSize * HKV * DH;
+    std::vector<uint8_t> kpaged(paged_elems * esz, 0xA5), vpaged(paged_elems * esz, 0xA5);
+    for (int64_t p = 0; p < kKvLong; ++p) {
+      const int64_t page = table[static_cast<size_t>(p / kPageSize)];
+      const int64_t off = p % kPageSize;
+      for (int64_t g = 0; g < HKV; ++g) {
+        const size_t src = static_cast<size_t>(p * HKV + g) * DH * esz;
+        const size_t dst = (static_cast<size_t>(page) * kPageSize * HKV + static_cast<size_t>(off) * HKV +
+                            static_cast<size_t>(g)) * DH * esz;
+        std::memcpy(kpaged.data() + dst, kb.data() + src, static_cast<size_t>(DH) * esz);
+        std::memcpy(vpaged.data() + dst, vb.data() + src, static_cast<size_t>(DH) * esz);
+      }
+    }
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kQwen4ExpQsaGatherAttention, dt)) continue;
+      CAPTURE(DeviceTag(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBufBytes dq(dev, q, qb.size());
+      DevBufI32 dids(dev, q, ids.size()), dlens(dev, q, lens.size());
+      dq.Upload(qb.data());
+      dids.Upload(ids);
+      dlens.Upload(lens);
+      Tensor tq = Tensor::Contiguous(dq.ptr(), et, d, {T, HQ, DH});
+      Tensor tids = Tensor::Contiguous(dids.ptr(), DType::kI32, d, {T, kTopk});
+      Tensor tlens = TI32(dlens.ptr(), d, T);
+
+      for (int paged = 0; paged <= 1; ++paged) {
+        CAPTURE(paged);
+        DevBufBytes dout(dev, q, outn * esz);
+        const std::vector<uint8_t> poison(outn * esz, 0xA5);
+        dout.Upload(poison.data());
+        DevBufBytes dk(dev, q, paged ? kpaged.size() : kb.size());
+        DevBufBytes dv(dev, q, paged ? vpaged.size() : vb.size());
+        dk.Upload(paged ? kpaged.data() : kb.data());
+        dv.Upload(paged ? vpaged.data() : vb.data());
+        DevBufI32 dtable(dev, q, table.size());
+        dtable.Upload(table);
+        Tensor to = Tensor::Contiguous(dout.ptr(), et, d, {T, HQ, DH});
+        Tensor tk = paged ? Tensor::Contiguous(dk.ptr(), et, d, {kPhysPages, kPageSize, HKV, DH})
+                          : Tensor::Contiguous(dk.ptr(), et, d, {max_kv_contig, HKV, DH});
+        Tensor tv = paged ? Tensor::Contiguous(dv.ptr(), et, d, {kPhysPages, kPageSize, HKV, DH})
+                          : Tensor::Contiguous(dv.ptr(), et, d, {max_kv_contig, HKV, DH});
+        Tensor ttable = Tensor::Contiguous(dtable.ptr(), DType::kI32, d, {1, kPagesNamed});
+        vt::Qwen4ExpQsaAttnArgs a = args;
+        int64_t visited = -1;
+        a.keys_visited = &visited;
+        if (paged) {
+          a.kv_block_table = &ttable;
+          a.kv_block_size = kPageSize;
+        }
+        const unsigned long long hits_before = vt::GetReferenceTierHits();
+        vt::Qwen4ExpQsaGatherAttention(q, to, tq, tk, tv, tids, tlens, a);
+        dev.Synchronize(q);
+        CHECK(vt::GetReferenceTierHits() == hits_before);
+        std::vector<uint8_t> got(outn * esz, 0);
+        dout.Download(got.data());
+        const std::vector<float> got_f = WidenRows(got, et);
+        bool finite = true;
+        for (float v : got_f) {
+          if (!std::isfinite(v)) finite = false;
+        }
+        CHECK(finite);
+        const double nmse = Nmse(ref_e, got_f);
+        MESSAGE("qwen4_exp qsa_gather NMSE " << DeviceTag(dt) << " esz=" << esz
+                                             << " paged=" << paged << " = " << nmse
+                                             << " keys_visited " << visited << " of a dense "
+                                             << dense_reads);
+        CHECK(nmse <= kNmseTol);
+        // THE READ COUNT IS AN ASSERTION, not a MESSAGE. It is what separates a
+        // gather from a dense walk under a mask on the cost axis llama.cpp
+        // #27739 measures, and at this context length it is not trivially true:
+        // 49264 against a dense 64496.
+        CHECK(visited == honest_reads);
+      }
+
+      // ─── THE NaN PROBE: A MASK-SHAPED PORT CANNOT PASS THIS ───────────────
+      // The value comparison above cannot convict a dense walk under a `-inf`
+      // mask, because `exp(-inf - m)` is exactly +0 and the two agree to the
+      // bit; `keys_visited` cannot either, because a mask-shaped port changes
+      // the loop and its own counter together (the op's args comment spends a
+      // paragraph on exactly this, and W5b-4's mutation M11 measured it). What
+      // separates them is an observable of the WALK. This sub-run drops the
+      // sub-budget control token and poisons every K and V row that NEITHER
+      // remaining token's selection names: a gather never addresses them, and a
+      // mask multiplies them by a zero weight into `0.0f * NaN` = NaN.
+      {
+        std::vector<char> touched(static_cast<size_t>(kKvLong), 0);
+        for (int64_t t = 0; t < 2; ++t) {
+          for (int64_t p : rows_for(t)) touched[static_cast<size_t>(p)] = 1;
+        }
+        int64_t untouched = 0;
+        for (char c : touched) {
+          if (c == 0) ++untouched;
+        }
+        // THE PROBE ASSERTS THAT IT HAS SOMETHING TO POISON. With both tokens at
+        // the released budget, 944 of the 3002 cache rows are named by neither
+        // selection; at a sub-budget context that number is ZERO and this probe
+        // would be vacuous — the same reason the case runs past 2048 at all.
+        REQUIRE(untouched > 900);
+        std::vector<uint8_t> knan = kb, vnan = vb;
+        const float qnan = std::numeric_limits<float>::quiet_NaN();
+        const std::vector<uint8_t> nan_row = PackRows(std::vector<float>(static_cast<size_t>(DH), qnan), et);
+        for (int64_t p = 0; p < kKvLong; ++p) {
+          if (touched[static_cast<size_t>(p)]) continue;
+          for (int64_t g = 0; g < HKV; ++g) {
+            const size_t off = static_cast<size_t>(p * HKV + g) * DH * esz;
+            std::memcpy(knan.data() + off, nan_row.data(), nan_row.size());
+            std::memcpy(vnan.data() + off, nan_row.data(), nan_row.size());
+          }
+        }
+        const std::vector<int32_t> lens2 = {static_cast<int32_t>(kKvLong),
+                                            static_cast<int32_t>(kKvLong)};
+        const size_t out2 = static_cast<size_t>(2) * HQ * DH;
+        DevBufI32 dlens2(dev, q, lens2.size());
+        dlens2.Upload(lens2);
+        Tensor tlens2 = TI32(dlens2.ptr(), d, 2);
+        Tensor tq2 = Tensor::Contiguous(dq.ptr(), et, d, {2, HQ, DH});
+        Tensor tids2 = Tensor::Contiguous(dids.ptr(), DType::kI32, d, {2, kTopk});
+        std::vector<uint8_t> got_clean(out2 * esz, 0), got_nan(out2 * esz, 0);
+        for (int poisoned = 0; poisoned <= 1; ++poisoned) {
+          DevBufBytes dk(dev, q, kb.size()), dv(dev, q, vb.size());
+          dk.Upload(poisoned ? knan.data() : kb.data());
+          dv.Upload(poisoned ? vnan.data() : vb.data());
+          DevBufBytes dout(dev, q, out2 * esz);
+          const std::vector<uint8_t> poison(out2 * esz, 0xA5);
+          dout.Upload(poison.data());
+          Tensor to = Tensor::Contiguous(dout.ptr(), et, d, {2, HQ, DH});
+          Tensor tk = Tensor::Contiguous(dk.ptr(), et, d, {max_kv_contig, HKV, DH});
+          Tensor tv = Tensor::Contiguous(dv.ptr(), et, d, {max_kv_contig, HKV, DH});
+          vt::Qwen4ExpQsaGatherAttention(q, to, tq2, tk, tv, tids2, tlens2, args);
+          dev.Synchronize(q);
+          dout.Download((poisoned ? got_nan : got_clean).data());
+        }
+        bool nan_finite = true;
+        for (float v : WidenRows(got_nan, et)) {
+          if (!std::isfinite(v)) nan_finite = false;
+        }
+        CHECK(nan_finite);
+        // BIT-IDENTICAL, not merely close: the gather read exactly the same
+        // bytes in both runs, so anything else means it addressed a row its
+        // selection does not name.
+        CHECK(std::memcmp(got_nan.data(), got_clean.data(), got_nan.size()) == 0);
+        MESSAGE("qwen4_exp qsa_gather NaN probe " << DeviceTag(dt) << " esz=" << esz << ": "
+                                                  << untouched
+                                                  << " unselected cache rows poisoned, output "
+                                                  << std::string(nan_finite ? "FINITE"
+                                                                              : "NON-FINITE")
+                                                  << " and bit-identical to the clean run");
+      }
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MODEL-MM-QWEN4-EXP W5 (`.agents/specs/qwen4-exp-rocm-ops.md`) — the DSA
+// indexer pair, `vt::DsaIndexerLogits` and `vt::DsaTopkSelect`, the TENTH and
+// ELEVENTH ops the nine-op scope missed (spec D3f) and the ones the `qwen4_exp`
+// forward refuses at on gfx1151 after W4. Donor `src/vt/cuda/cuda_dsa_indexer.cu`,
+// oracle `src/vt/cpu/cpu_dsa_indexer.cpp`, mirror-comparison in spec D3g.
+// The same pair is `.agents/specs/rocm-mla-dsa-ops.md`'s W2 under `BACKEND-ROCM`
+// / #2715, and GLM-5.3's sparse step is its second consumer; one arm serves both.
+//
+// THE FIXTURE IS THE HARD PART AND IT IS DESIGNED FIRST, because FIVE fixtures
+// in this campaign shipped unable to see the defect they claimed to gate (spec
+// D3b, D3d §2, the W3 re-gate, and W4's two repaired axes). This wave's trap is
+// a different SHAPE from all five, and naming it is the point of this header:
+//
+//   **`vt::DsaTopkSelect` IS A DISCRETE SELECTOR AND NO TOLERANCE CAN GRADE IT.**
+//
+// Every output it produces is an INDEX. A wrong-but-adjacent pick moves no float
+// at all, so an NMSE over the selected indices — or over anything downstream of
+// them — is bimodal, not graded: it either flips a whole attended row or reads
+// exactly zero. Four failure modes are invisible to any value band and each one
+// gets a DISCRETE assertion below instead:
+//
+//   1. THE TIE-BREAK DIRECTION. The ReLU in `DsaIndexerLogits` makes an exact
+//      `0.0` an ordinary logit value, so ties are ordinary rather than exotic,
+//      and the op's contract breaks them toward the SMALLER key index. The rows
+//      below put a LONG EXACT-ZERO RUN across the top-k boundary on purpose, so
+//      the tie rule alone decides part of the selected set.
+//   2. AN OFF-BY-ONE IN `topk`. A row is run at n == topk and at n == topk + 1 —
+//      the two sides of the short-context branch, and the second is the shape
+//      where exactly ONE candidate is dropped.
+//   3. THE EMISSION ORDER. The contract is ASCENDING BY KEY, which is what makes
+//      a full selection reproduce dense attention bit for bit in
+//      `vt::MlaDecodeAttention`. This is also where vLLM's AMD backend diverges
+//      (spec D3g §2: it routes to `ops.top_k_per_row_decode`, a rank-ordered
+//      sort), so the order is asserted DIRECTLY as well as by equality.
+//   4. THE `n == 0` PATH, which runs UNCONDITIONALLY in production —
+//      `qwen4_exp_qsa_block.cpp:403` calls the op even at `nb == 0`, where the
+//      all-`-1`/zero-count selection it writes IS upstream's
+//      `num_complete_blocks == 0` branch.
+//
+// So the bar for the selector is EXACT INTEGER EQUALITY against the CPU oracle,
+// on indices and on counts, and the "margin" of a mutation here is a COUNT of
+// differing indices and not a ratio — a discrete gate has bimodal error, not a
+// tolerance.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The released indexer geometry: `index_head_dim` 128 and `index_n_heads` 64,
+// neither reduced. 64 is load-bearing for the bit-exactness bar below — the HIP
+// arm gives one head to one lane and folds in ascending lane order, which IS the
+// host's ascending head order only while `index_n_heads <= 64` — so the 96-head
+// arm beside it is what gates the STRIDED head loop, and it is gated on the NMSE
+// band instead. A fixture that ran only one of the two would leave half of the
+// kernel's head partition unexecuted.
+constexpr int64_t kDsaD = 128;
+
+// A device-resident i32 buffer, uploaded and downloaded through Backend::Copy
+// like DevBuf/DevBufBytes beside it.
+std::vector<int32_t> DsaDownloadI32(DevBufBytes& b, size_t n) {
+  std::vector<int32_t> out(n, 0);
+  b.Download(out.data());
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("DSA indexer logits match the CPU oracle and are NATIVE on ROCm") {
+  // 5 query rows, each carrying a DIFFERENT window shape, because the masked
+  // store is half of this op: `win_start`/`win_end` are clamped to [0, num_keys)
+  // and everything outside stays `-inf`.
+  constexpr int64_t kT = 5;
+  // NOT A MULTIPLE of the ROCm kernel's `kKeyRows = 4`
+  // (`src/vt/rocm/rocm_dsa_indexer.hip:217`), and that is the whole reason for
+  // the value. 41 keys is 11 grid.y tiles, so it is still more than one tile,
+  // and the LAST TILE IS RAGGED: three of its four key rows are past the end.
+  // Those three lanes are the only condition under which the kernel's two
+  // `s < num_keys` guards (`:240` and `:272`) ever execute. This case used 40,
+  // which 4 divides exactly, so both guards were DEAD: a fresh review deleted
+  // BOTH, proved the binary changed, and the focused suite still returned
+  // `2 passed / 0 failed`. Spec D3h, MINOR-1.
+  //
+  // A RAGGED TILE ON ITS OWN IS NOT ENOUGH, and that was MEASURED here rather
+  // than assumed: the stray lanes of rows 0..3 land in the first columns of the
+  // NEXT row, which their own block also writes, and the stray block wins no
+  // race because it skips the dot loop and finishes first. The guard band on
+  // the logits buffer below is the other half of this repair; the two work only
+  // together, because with a key count 4 divides there are no stray lanes for
+  // the band to catch.
+  //
+  // Of the kernel's two `s < num_keys` guards only the STORE one is
+  // load-bearing. The copy in `live` is redundant by construction —
+  // `hi = min(num_keys, win_end[t])`, so `s < hi` already implies
+  // `s < num_keys` — and deleting it alone is an EQUIVALENT MUTANT. Spec D3h
+  // carries that proof.
+  constexpr int64_t kS = 41;
+  const std::vector<int32_t> ws = {-3, 5, 12, 7, 0};
+  //                                ^   ^   ^   ^  ^
+  //  -3: clamps up to 0 | 5: mid-row start | 12..13: a SINGLE candidate
+  //  7..7: an EMPTY window, the whole row -inf | 0..50: clamps down to 41
+  const std::vector<int32_t> we = {17, 40, 13, 7, 50};
+  REQUIRE(static_cast<int64_t>(ws.size()) == kT);
+
+  if (RocmBuilt()) {
+    REQUIRE(vt::OpRegistered(vt::OpId::kDsaIndexerLogits, DeviceType::kROCM));
+  }
+
+  // BOTH HEAD COUNTS. 64 is the released config and the arm where the ROCm
+  // kernel's head fold is the host's exact order; 96 is not a multiple of the
+  // lane count, so lanes 0..31 carry TWO heads and lanes 32..63 carry one, which
+  // is the only way the strided head loop is executed at all.
+  for (int64_t kH : {static_cast<int64_t>(64), static_cast<int64_t>(96)}) {
+    CAPTURE(kH);
+    // BOTH DTYPE ARMS. q/k/weights share one float dtype by contract and the
+    // logits are f32 on both sides whatever it is, which is upstream's
+    // `input_precision="ieee"` accumulation.
+    for (DType et : {DType::kF32, DType::kBF16}) {
+      const size_t esz = vt::SizeOf(et);
+      CAPTURE(esz);
+      // ±2 operands over a 128-wide dot leave roughly HALF the per-head dots
+      // NEGATIVE, which is what makes the ReLU falsifiable: on data where every
+      // dot is positive, `max(dot, 0)` and `dot` are the same function.
+      const std::vector<float> qf = RandomVec(static_cast<size_t>(kT * kH * kDsaD), 5501);
+      const std::vector<float> kf = RandomVec(static_cast<size_t>(kS * kDsaD), 5502);
+      // The gate weights VARY IN SIGN AND MAGNITUDE across heads. A constant
+      // weight vector would let an arm that ignored `weights` pass.
+      const std::vector<float> wf = RandomVec(static_cast<size_t>(kT * kH), 5503);
+      // `q_scale` is the ONE member of the fold a selection could ever see (the
+      // other two are global positive constants), so BOTH its arms run: null is
+      // upstream's unquantized path and what the QSA consumer passes, non-null is
+      // the fp8 path. Kept strictly positive, as a quantization scale is.
+      const std::vector<float> qsf =
+          RandomVec(static_cast<size_t>(kT * kH), 5504, 0.25f, 3.0f);
+
+      const std::vector<uint8_t> qb = PackRows(qf, et);
+      const std::vector<uint8_t> kb = PackRows(kf, et);
+      const std::vector<uint8_t> wb = PackRows(wf, et);
+
+      for (int use_qs = 0; use_qs <= 1; ++use_qs) {
+        CAPTURE(use_qs);
+        std::vector<float> ref(static_cast<size_t>(kT * kS), 0.0f);
+        {
+          vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+          Queue cq = cpu.CreateQueue();
+          const Device cd{DeviceType::kCPU, 0};
+          std::vector<uint8_t> cq_b = qb, ck_b = kb, cw_b = wb;
+          std::vector<float> cqs = qsf;
+          std::vector<int32_t> cws = ws, cwe = we;
+          Tensor tlg = T2(ref.data(), cd, kT, kS);
+          Tensor tq = Tensor::Contiguous(cq_b.data(), et, cd, {kT, kH, kDsaD});
+          Tensor tk = Tensor::Contiguous(ck_b.data(), et, cd, {kS, kDsaD});
+          Tensor tw = Tensor::Contiguous(cw_b.data(), et, cd, {kT, kH});
+          Tensor tqs = T2(cqs.data(), cd, kT, kH);
+          Tensor tws = TI32(cws.data(), cd, kT);
+          Tensor twe = TI32(cwe.data(), cd, kT);
+          vt::DsaIndexerLogitsArgs a;
+          // The released DeepSeek values, BOTH != 1 on purpose: a fold that
+          // dropped either would otherwise be an identity here.
+          a.softmax_scale = 1.0f / std::sqrt(static_cast<float>(kDsaD));
+          a.n_head_scale = 1.0f / std::sqrt(static_cast<float>(kH));
+          a.q_scale = use_qs != 0 ? &tqs : nullptr;
+          vt::DsaIndexerLogits(cq, tlg, tq, tk, tw, tws, twe, a);
+          cpu.DestroyQueue(cq);
+        }
+
+        // FIXTURE HEALTH, ASSERTED ON THE ORACLE, because a device arm graded
+        // against an oracle nobody checked is a green that measured nothing.
+        {
+          size_t ninf = 0, nfinite = 0, nneg = 0;
+          for (int64_t t = 0; t < kT; ++t) {
+            for (int64_t s = 0; s < kS; ++s) {
+              const float v = ref[static_cast<size_t>(t * kS + s)];
+              if (std::isinf(v)) {
+                ++ninf;
+              } else {
+                ++nfinite;
+                if (v < 0.0f) ++nneg;
+              }
+            }
+          }
+          // The window shapes above leave 17 + 35 + 1 + 0 + 41 = 94 in-window
+          // columns of 205. Each term is one row's clamped window width:
+          // `[0,17)`, `[5,40)`, `[12,13)`, the empty `[7,7)` and `[0,41)` after
+          // `we[4] = 50` clamps to `num_keys`. If either number collapsed, the
+          // masked store and the arithmetic would stop being separable.
+          REQUIRE(nfinite == 94);
+          REQUIRE(ninf == 111);
+          // AND THE ReLU IS FALSIFIABLE ON THIS DATA. A sign-varying weight
+          // vector over ReLU'd (non-negative) per-head dots must produce both
+          // signs of logit; if every logit came out one sign, the fixture could
+          // not tell `max(dot,0)` from `dot`.
+          REQUIRE(nneg > 0);
+          REQUIRE(nneg < nfinite);
+        }
+
+        for (DeviceType dt : RegisteredDevices()) {
+          if (!OpAvailable(vt::OpId::kDsaIndexerLogits, dt)) continue;
+          CAPTURE(DeviceTag(dt));
+          vt::Backend& dev = vt::GetBackend(dt);
+          Queue q = dev.CreateQueue();
+          const Device d{dt, 0};
+          // A GUARD BAND PAST THE END OF THE LOGITS. The mask assertion below
+          // cannot convict a missing `s < num_keys` on the STORE, and that is
+          // measured rather than feared: with `kS = 41` the stray lanes of the
+          // last tile store `-inf` into the first columns of row `t + 1`, which
+          // is a RACE against that row's own block — and the stray block is the
+          // fast one (its lanes are out of window and skip the dot loop) while
+          // the victim block runs 64 dots of 128, so the correct value lands
+          // LAST and wins. Deleting the guard and re-running returned
+          // `2 passed / 0 failed` for exactly that reason (spec D3h).
+          //
+          // The LAST row has no `t + 1` to race with: its three stray lanes
+          // store past the end of the tensor, where nothing legitimate writes at
+          // all. Eight floats of poison behind the logits therefore make the
+          // defect DETERMINISTIC instead of scheduler-dependent. Eight because
+          // the overrun is at most `kKeyRows - 1 = 3` floats and a band wider
+          // than the overrun costs nothing.
+          constexpr int64_t kGuardFloats = 8;
+          constexpr float kPoison = -12345.0f;
+          DevBuf dlg(dev, q, static_cast<size_t>(kT * kS + kGuardFloats));
+          DevBufBytes dq(dev, q, qb.size()), dk(dev, q, kb.size()), dw(dev, q, wb.size());
+          DevBuf dqs(dev, q, qsf.size());
+          DevBufBytes dws(dev, q, sizeof(int32_t) * static_cast<size_t>(kT));
+          DevBufBytes dwe(dev, q, sizeof(int32_t) * static_cast<size_t>(kT));
+          // POISON THE DESTINATION with a finite, wrong value: every element of
+          // the row is owed a value — the in-window ones a logit and the rest an
+          // `-inf` — so a kernel that launched nothing must not be graded against
+          // a zeroed buffer, and a kernel that skipped the mask must not inherit
+          // an `-inf` it did not write.
+          dlg.Upload(std::vector<float>(static_cast<size_t>(kT * kS + kGuardFloats), kPoison));
+          dq.Upload(qb.data());
+          dk.Upload(kb.data());
+          dw.Upload(wb.data());
+          dqs.Upload(qsf);
+          dws.Upload(ws.data());
+          dwe.Upload(we.data());
+          Tensor tlg = T2(dlg.ptr(), d, kT, kS);
+          Tensor tq = Tensor::Contiguous(dq.ptr(), et, d, {kT, kH, kDsaD});
+          Tensor tk = Tensor::Contiguous(dk.ptr(), et, d, {kS, kDsaD});
+          Tensor tw = Tensor::Contiguous(dw.ptr(), et, d, {kT, kH});
+          Tensor tqs = T2(dqs.ptr(), d, kT, kH);
+          Tensor tws = TI32(dws.ptr(), d, kT);
+          Tensor twe = TI32(dwe.ptr(), d, kT);
+          vt::DsaIndexerLogitsArgs a;
+          a.softmax_scale = 1.0f / std::sqrt(static_cast<float>(kDsaD));
+          a.n_head_scale = 1.0f / std::sqrt(static_cast<float>(kH));
+          a.q_scale = use_qs != 0 ? &tqs : nullptr;
+          // `OpRegistered` says a native provider EXISTS; this says the call did
+          // not fall through to the portable tier anyway. On gfx1151 the tier
+          // cannot be installed at all (spec D2), so a non-zero delta means the
+          // run is void rather than merely slow.
+          const unsigned long long hits_before = vt::GetReferenceTierHits();
+          vt::DsaIndexerLogits(q, tlg, tq, tk, tw, tws, twe, a);
+          dev.Synchronize(q);
+          CHECK(vt::GetReferenceTierHits() == hits_before);
+          const std::vector<float> raw = dlg.Download();
+          const std::vector<float> got(raw.begin(),
+                                       raw.begin() + static_cast<std::ptrdiff_t>(kT * kS));
+
+          // 0. NOTHING WROTE PAST THE LAST ROW. This is the assertion that holds
+          //    the kernel's store guard, and it is discrete for the same reason
+          //    the mask is: an overrun writes a value nobody owns, so there is
+          //    no band to grade it against.
+          size_t guard_touched = 0;
+          for (size_t i = static_cast<size_t>(kT * kS); i < raw.size(); ++i) {
+            if (raw[i] != kPoison) ++guard_touched;
+          }
+          CHECK(guard_touched == 0);
+
+          // 1. THE MASK IS A DISCRETE ASSERTION, not a tolerance. `-inf` is a
+          //    SENTINEL: a window off-by-one either writes a logit where an
+          //    `-inf` belongs or the reverse, and no NMSE can grade that — the
+          //    difference is infinite in one direction and unbounded in the
+          //    other, so it would read as a crash rather than a measurement.
+          size_t mask_mismatch = 0;
+          for (size_t i = 0; i < got.size(); ++i) {
+            const bool ri = std::isinf(ref[i]) && ref[i] < 0.0f;
+            const bool gi = std::isinf(got[i]) && got[i] < 0.0f;
+            if (ri != gi) ++mask_mismatch;
+          }
+          CHECK(mask_mismatch == 0);
+
+          // 2. THE VALUES, over the FINITE columns only.
+          std::vector<float> rf, gf;
+          for (size_t i = 0; i < got.size(); ++i) {
+            if (std::isfinite(ref[i]) && std::isfinite(got[i])) {
+              rf.push_back(ref[i]);
+              gf.push_back(got[i]);
+            }
+          }
+          REQUIRE(rf.size() == 94);
+          const double nmse = Nmse(rf, gf);
+
+          // 3. AND THE BYTES, because this op CONTAINS NO TRANSCENDENTAL — every
+          //    operation is a multiply, an add, a `max` against zero and a
+          //    compare, the HIP build pins `-ffp-contract=off`, and both the dot
+          //    and (at kH <= 64) the head fold run in the host's ascending order.
+          //    So bit-identity is PREDICTED by the operand list and MEASURED
+          //    here rather than inferred from the NMSE, exactly as W4's
+          //    compressor case reports it.
+          size_t diff_bytes = 0;
+          for (size_t i = 0; i < got.size(); ++i) {
+            uint32_t rb = 0, gb = 0;
+            std::memcpy(&rb, &ref[i], sizeof(uint32_t));
+            std::memcpy(&gb, &got[i], sizeof(uint32_t));
+            for (int b = 0; b < 4; ++b) {
+              if (((rb >> (8 * b)) & 0xffu) != ((gb >> (8 * b)) & 0xffu)) ++diff_bytes;
+            }
+          }
+          MESSAGE("dsa_indexer_logits NMSE " << DeviceTag(dt) << " heads=" << kH
+                                             << " esz=" << esz << " qscale=" << use_qs << " = "
+                                             << nmse << " differing bytes " << diff_bytes
+                                             << " of " << (got.size() * 4));
+          CHECK(nmse <= kNmseTol);
+          if (kH <= 64) {
+            // ONLY THIS ARM. Above the lane count the fold groups head `h` with
+            // head `h + 64` before the others, which is a different ASSOCIATION
+            // of the same sum and so a different rounding; the `5e-4` band is the
+            // bar there and the byte count is reported but not asserted. That
+            // boundary is a property of the kernel's head partition and is
+            // stated in its header, not a tolerance chosen after a failure.
+            CHECK(diff_bytes == 0);
+          }
+          dev.DestroyQueue(q);
+        }
+      }
+    }
+  }
+}
+
+TEST_CASE("DSA top-k selection is INDEX-EXACT against the CPU oracle and NATIVE on ROCm") {
+  // NO TOLERANCE APPEARS IN THIS CASE. See the section header: every output is an
+  // index, so the bar is exact integer equality and the failure modes a value
+  // band cannot see get discrete assertions.
+  constexpr int64_t kT = 6;
+  constexpr int64_t kS = 37;  // not a power of two, and not a multiple of 256
+
+  if (RocmBuilt()) {
+    REQUIRE(vt::OpRegistered(vt::OpId::kDsaTopkSelect, DeviceType::kROCM));
+  }
+
+  for (int64_t topk : {static_cast<int64_t>(1), static_cast<int64_t>(5),
+                       static_cast<int64_t>(12)}) {
+    CAPTURE(topk);
+    // THE ROW WINDOWS ARE THE BRANCH MATRIX, and two of them are defined in terms
+    // of `topk` so the boundary is hit at EVERY topk rather than at one.
+    //   r0  n == 0        — the UNCONDITIONAL path: `qwen4_exp_qsa_block.cpp:403`
+    //                       calls this op even at `nb == 0`, and the all-`-1`,
+    //                       zero-count selection it must write IS upstream's
+    //                       `num_complete_blocks == 0` branch.
+    //   r1  n == topk     — the last row the short-context branch owns.
+    //   r2  n == topk + 1 — the FIRST row of the full branch, where exactly ONE
+    //                       candidate is dropped and an off-by-one in `k` or a
+    //                       flipped tie rule has nowhere to hide.
+    //   r3  the whole row — the full branch at its widest.
+    //   r4  clamped both ends (`win_start` < 0 and `win_end` > num_keys).
+    //   r5  a short tail near the end of the row.
+    const std::vector<int32_t> ws = {-5, 2, 2, 0, -3, 30};
+    const std::vector<int32_t> we = {0,
+                                     static_cast<int32_t>(2 + topk),
+                                     static_cast<int32_t>(2 + topk + 1),
+                                     static_cast<int32_t>(kS),
+                                     100,
+                                     static_cast<int32_t>(kS)};
+    REQUIRE(static_cast<int64_t>(ws.size()) == kT);
+
+    // THE LOGITS ARE BUILT BY HAND, NOT BY THE INDEXER, because the tie structure
+    // is the whole point and a random matrix has no exact ties in it. Each row
+    // gets THREE distinct positives at NON-MONOTONIC positions, a few distinct
+    // negatives, and EXACT `0.0` everywhere else — which is not a contrivance:
+    // `DsaIndexerLogits` ReLUs each head's dot, so a key whose every head dots
+    // negative scores EXACTLY 0.0 and a long zero run is the ORDINARY shape of
+    // this op's output. At topk 5 and 12 the selection boundary falls INSIDE that
+    // zero run, so the tie rule alone decides part of the answer.
+    std::vector<float> lg(static_cast<size_t>(kT * kS), 0.0f);
+    for (int64_t t = 0; t < kT; ++t) {
+      float* row = lg.data() + t * kS;
+      row[5] = 3.0f + static_cast<float>(t);
+      row[20] = 2.0f + static_cast<float>(t);
+      row[11] = 1.0f + static_cast<float>(t);
+      row[2] = -1.0f - static_cast<float>(t);
+      row[33] = -2.0f - static_cast<float>(t);
+      row[17] = -0.5f;
+    }
+    {
+      // THE FIXTURE ASSERTS ITS OWN TIE STRUCTURE. Without this the case could
+      // silently become a distinct-values fixture — the exact shape that cannot
+      // see a tie-break direction at all — if the values above were ever edited.
+      size_t zeros = 0;
+      for (int64_t s = 0; s < kS; ++s) {
+        if (lg[static_cast<size_t>(s)] == 0.0f) ++zeros;
+      }
+      REQUIRE(zeros == 31);
+      REQUIRE(static_cast<int64_t>(zeros) > topk);
+    }
+
+    std::vector<int32_t> ref_idx(static_cast<size_t>(kT * topk), 0);
+    std::vector<int32_t> ref_cnt(static_cast<size_t>(kT), 0);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> clg = lg;
+      std::vector<int32_t> cws = ws, cwe = we;
+      Tensor tidx = Tensor::Contiguous(ref_idx.data(), DType::kI32, cd, {kT, topk});
+      Tensor tcnt = Tensor::Contiguous(ref_cnt.data(), DType::kI32, cd, {kT});
+      Tensor tlg = T2(clg.data(), cd, kT, kS);
+      Tensor tws = TI32(cws.data(), cd, kT);
+      Tensor twe = TI32(cwe.data(), cd, kT);
+      vt::DsaTopkSelect(cq, tidx, tcnt, tlg, tws, twe);
+      cpu.DestroyQueue(cq);
+    }
+
+    // FIXTURE HEALTH ON THE ORACLE — every branch this matrix claims to reach is
+    // asserted REACHED, by its count, before any device is graded against it.
+    REQUIRE(ref_cnt[0] == 0);                            // n == 0
+    REQUIRE(ref_cnt[1] == static_cast<int32_t>(topk));   // n == topk, short branch
+    REQUIRE(ref_cnt[2] == static_cast<int32_t>(topk));   // n == topk+1, full branch
+    REQUIRE(ref_cnt[3] == static_cast<int32_t>(std::min<int64_t>(kS, topk)));
+    REQUIRE(ref_cnt[4] == static_cast<int32_t>(std::min<int64_t>(kS, topk)));
+    REQUIRE(ref_cnt[5] == static_cast<int32_t>(std::min<int64_t>(7, topk)));
+    // AND THE TIE RULE IS EXERCISED rather than assumed: at topk >= 5 row 3's
+    // selection must reach past the three positives into the exact-zero run, so
+    // at least one selected index carries a logit of exactly 0.0. If it did not,
+    // the tie-break mutation below could not red and this case would be grading
+    // only the distinct-value ordering.
+    if (topk >= 5) {
+      size_t tied = 0;
+      for (int64_t i = 0; i < topk; ++i) {
+        const int32_t s = ref_idx[static_cast<size_t>(3 * topk + i)];
+        if (s >= 0 && lg[static_cast<size_t>(3 * kS + s)] == 0.0f) ++tied;
+      }
+      REQUIRE(tied >= 2);
+    }
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kDsaTopkSelect, dt)) continue;
+      CAPTURE(DeviceTag(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBufBytes didx(dev, q, sizeof(int32_t) * static_cast<size_t>(kT * topk));
+      DevBufBytes dcnt(dev, q, sizeof(int32_t) * static_cast<size_t>(kT));
+      DevBuf dlg(dev, q, lg.size());
+      DevBufBytes dws(dev, q, sizeof(int32_t) * static_cast<size_t>(kT));
+      DevBufBytes dwe(dev, q, sizeof(int32_t) * static_cast<size_t>(kT));
+      // POISON BOTH OUTPUTS WITH A VALID-LOOKING INDEX, not with -1 and not with
+      // zero: -1 is this op's own "no token" sentinel and 0 is a legal key, so
+      // either would let a kernel that wrote nothing inherit a plausible answer.
+      // 0x7f7f7f7f is 2139062143, outside every window here.
+      const std::vector<int32_t> poison_i(static_cast<size_t>(kT * topk), 0x7f7f7f7f);
+      const std::vector<int32_t> poison_c(static_cast<size_t>(kT), 0x7f7f7f7f);
+      didx.Upload(poison_i.data());
+      dcnt.Upload(poison_c.data());
+      dlg.Upload(lg);
+      dws.Upload(ws.data());
+      dwe.Upload(we.data());
+      Tensor tidx = Tensor::Contiguous(didx.ptr(), DType::kI32, d, {kT, topk});
+      Tensor tcnt = Tensor::Contiguous(dcnt.ptr(), DType::kI32, d, {kT});
+      Tensor tlg = T2(dlg.ptr(), d, kT, kS);
+      Tensor tws = TI32(dws.ptr(), d, kT);
+      Tensor twe = TI32(dwe.ptr(), d, kT);
+      const unsigned long long hits_before = vt::GetReferenceTierHits();
+      vt::DsaTopkSelect(q, tidx, tcnt, tlg, tws, twe);
+      dev.Synchronize(q);
+      CHECK(vt::GetReferenceTierHits() == hits_before);
+      const std::vector<int32_t> got_idx =
+          DsaDownloadI32(didx, static_cast<size_t>(kT * topk));
+      const std::vector<int32_t> got_cnt = DsaDownloadI32(dcnt, static_cast<size_t>(kT));
+
+      // A. COUNTS, exactly.
+      size_t cnt_diff = 0;
+      for (size_t i = 0; i < got_cnt.size(); ++i) {
+        if (got_cnt[i] != ref_cnt[i]) ++cnt_diff;
+      }
+      CHECK(cnt_diff == 0);
+
+      // B. INDICES, exactly — including the `-1` tail, because a kernel that left
+      //    the tail unwritten is a kernel a downstream gather would read garbage
+      //    from.
+      size_t idx_diff = 0;
+      for (size_t i = 0; i < got_idx.size(); ++i) {
+        if (got_idx[i] != ref_idx[i]) ++idx_diff;
+      }
+      MESSAGE("dsa_topk_select " << DeviceTag(dt) << " topk=" << topk
+                                 << ": differing indices " << idx_diff << " of "
+                                 << got_idx.size() << ", differing counts " << cnt_diff);
+      CHECK(idx_diff == 0);
+
+      // C. THE EMISSION ORDER, ASSERTED DIRECTLY and not only through B, because
+      //    this is the one part of the contract vLLM's AMD backend does NOT share
+      //    (spec D3g §2 — `ops.top_k_per_row_decode` emits by RANK) and a reader
+      //    who later "mirrors" that route would break exactly this. Ascending and
+      //    STRICTLY so over the live prefix; `-1` from the count onward.
+      for (int64_t t = 0; t < kT; ++t) {
+        const int32_t c = got_cnt[static_cast<size_t>(t)];
+        REQUIRE(c >= 0);
+        REQUIRE(c <= static_cast<int32_t>(topk));
+        for (int64_t i = 1; i < c; ++i) {
+          CHECK(got_idx[static_cast<size_t>(t * topk + i)] >
+                got_idx[static_cast<size_t>(t * topk + i - 1)]);
+        }
+        for (int64_t i = c; i < topk; ++i) {
+          CHECK(got_idx[static_cast<size_t>(t * topk + i)] == -1);
+        }
+      }
+      dev.DestroyQueue(q);
+    }
+  }
 }

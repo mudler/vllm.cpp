@@ -673,6 +673,25 @@ void SiluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
   });
 }
 
+// ClampedSwiGLU (DeepSeek-V4 activation, activation.py:197-201): gate is
+// clamped MAX-ONLY, up is clamped BOTH sides, then silu(gate)*up. Same
+// narrowing polarity as SiluAndMulKernel: silu is rounded through the input
+// dtype before the multiply.
+void ClampedSwiGLUKernel(Queue&, Tensor& out, const Tensor& gate_up, float limit) {
+  const int64_t t = gate_up.shape[0], d = gate_up.shape[1] / 2;
+  const DType in_dt = gate_up.dtype;
+  ForRows(t, [&](int64_t r0, int64_t r1) {
+  for (int64_t i = r0; i < r1; ++i) {
+    for (int64_t j = 0; j < d; ++j) {
+      float gate = std::min(LoadF32(gate_up, i * 2 * d + j), limit);
+      float up = std::min(std::max(LoadF32(gate_up, i * 2 * d + d + j), -limit), limit);
+      float silu = RoundThrough(in_dt, gate / (1.0f + std::exp(-gate)));
+      StoreF32(out, i * d + j, silu * up);
+    }
+  }
+  });
+}
+
 // Gemma GeGLU: out = gelu_tanh(gate) * up. gelu_tanh(g) = 0.5*g*(1 + tanh(
 // sqrt(2/pi)*(g + 0.044715*g^3))) — the exact gelu_pytorch_tanh, computed in f32.
 void GeluAndMulKernel(Queue&, Tensor& out, const Tensor& x) {
@@ -4249,6 +4268,9 @@ struct Registrar {
                    static_cast<MatmulFp8BlockScaledFn>(&MatmulFp8BlockScaledKernel)));
     RegisterOp(OpId::kSiluAndMul, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<SiluAndMulFn>(&SiluAndMulKernel)));
+    RegisterOp(OpId::kClampedSwiGLU, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<ClampedSwiGLUFn>(&ClampedSwiGLUKernel)));
     RegisterOp(OpId::kGeluAndMul, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<GeluAndMulFn>(&GeluAndMulKernel)));
     RegisterOp(OpId::kMulScalar, DeviceType::kCPU,

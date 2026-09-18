@@ -1,0 +1,81 @@
+{
+  "files": {
+    "operator-red.log": {
+      "source": "/home/vikash/.cache/residual-norm-impl/green-freeze-2/test_ops_residual_rmsnorm-fusion-1-command-operator.log",
+      "bytes": 1849,
+      "sha256": "cab08e83302b93dcc9c9a0c76d8a5820e015cf67f0ad803575d3337914b4bc48"
+    },
+    "operator-red-command.json": {
+      "source": "/home/vikash/.cache/residual-norm-impl/green-freeze-2/test_ops_residual_rmsnorm-fusion-1-command.json",
+      "bytes": 541,
+      "sha256": "4b43060cc688ac367c69cd1da0f43dab2cfa91219563b9897cbeff3d907ac435"
+    },
+    "operator-red-receipts.json": {
+      "source": "/home/vikash/.cache/residual-norm-impl/green-freeze-2/operator-receipts.json",
+      "bytes": 1744,
+      "sha256": "be1011b01737eded6f7d1d6b7053111038c5401296ec677905884a3e19517618"
+    },
+    "upstream-export-receipt.json": {
+      "source": "/home/vikash/.cache/residual-norm-impl/upstream-freeze/operator-receipt.json",
+      "bytes": 272,
+      "sha256": "87de74edc117f00d47b46ca752d8ab2192363921bd2d019d90aa83153f8e90fb"
+    },
+    "upstream-export-checks.json": {
+      "source": "/home/vikash/.cache/residual-norm-impl/upstream-freeze/operator-output-checks.json",
+      "bytes": 276,
+      "sha256": "b1d711efd2e12f62d1507fd0e9b0271d27f6c22d5fd15cd13032d23a5aba1faf"
+    },
+    "upstream-native-receipt.json": {
+      "source": "/home/vikash/.cache/residual-norm-impl/upstream-native-v1/operator-receipt.json",
+      "bytes": 279,
+      "sha256": "4f5ce52487a123e00366c710bb070a7f573823f420a0aa6c3e8a2588dbee714d"
+    },
+    "upstream-native.log": {
+      "source": "/home/vikash/.cache/residual-norm-impl/upstream-native-v1/operator-upstream-native.log",
+      "bytes": 734,
+      "sha256": "d7385cb03119a5c7105a0f5e18a3abf5e42fea6e557d0e405ec8fde7d9d48eb7"
+    },
+    "record-red.log": {
+      "source": "/home/vikash/.cache/residual-norm-repair1/record-red.log",
+      "bytes": 3816,
+      "sha256": "f3836103cbabd70a0bcaa1c0f10325626cc4f6ea98df1b37c1bb419e8fe51a4c"
+    },
+    "record-green.log": {
+      "source": "/home/vikash/.cache/residual-norm-repair1/record-green.log",
+      "bytes": 82,
+      "sha256": "35b858d9cf328a42f8574ae545a929a3d29842d411228ff4fdc0fa63b74ee3c7"
+    },
+    "keyed-record-proof.json": {
+      "source": "/home/vikash/.cache/residual-norm-repair1/keyed-record-proof.json",
+      "bytes": 675,
+      "sha256": "7412c2472505c7706a5396e8dd218769de8ce5f4c0d2514725fb81e5a91d07a2"
+    },
+    "build-receipt.json": {
+      "source": "/home/vikash/.cache/residual-norm-repair1/build-receipt.json",
+      "bytes": 13700,
+      "sha256": "b677da932aa490238d362fb7b0f677bb96f9dfb1f9d36eee7765c3441622d66c"
+    },
+    "build-fixture.py": {
+      "source": "/home/vikash/.cache/residual-norm-repair1/build-fixture.py",
+      "bytes": 5482,
+      "sha256": "1405c1d937b954fb85d075c76970b2d84bd4490d1f8b26d53074a49eb6f94b19"
+    },
+    "cpu-focused.log": {
+      "source": "/home/vikash/.cache/residual-norm-repair1/cpu-focused.log",
+      "bytes": 736,
+      "sha256": "8e281532f0750b8bc3f214f640d3d3db76ef1cdc72de766c702b801339444d68"
+    },
+    "cpu-focused-receipt.json": {
+      "source": "/home/vikash/.cache/residual-norm-repair1/cpu-focused-receipt.json",
+      "bytes": 566,
+      "sha256": "475559bd1baad3907c39f4a90a413b456dca3ea63264daa85d3e5124b6a61e43"
+    },
+    "product-unchanged.json": {
+      "source": "/home/vikash/.cache/residual-norm-repair1/product-unchanged.json",
+      "bytes": 194,
+      "sha256": "9440d0e947460dc68dbda3c9164f296c90984b52a6c709f11236c4a5e9c7c007"
+    }
+  },
+  "product_source_unchanged": true,
+  "gpu_repair_and_mutation": "PENDING operator execution; frozen commands under /home/vikash/.cache/residual-norm-repair1/gpu-freeze-v1"
+}

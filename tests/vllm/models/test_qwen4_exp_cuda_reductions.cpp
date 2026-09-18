@@ -87,6 +87,7 @@
 #include <string>
 #include <vector>
 
+#include "qwen4_exp_hc_synth.h"
 #include "support/max_abs_diff.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -110,7 +111,14 @@ namespace {
 
 namespace g = qwen4_exp_qsa_goldens;
 
-constexpr double kAbsFloor = 1e-30;
+// `kAbsFloor`, `Agreement`, `Compare`, `CheckBitwise` and `CheckWithin` now live
+// in `qwen4_exp_hc_synth.h`, beside the fixture and the bound they report, so the
+// ROCm gate holds this kernel to the SAME derivation instead of a second copy.
+using q4hc::Agreement;
+using q4hc::CheckBitwise;
+using q4hc::CheckWithin;
+using q4hc::Compare;
+using q4hc::kAbsFloor;
 
 // ─── THE GATHER'S ARM-VS-ARM BOUND IS DERIVED, NOT FITTED ────────────────────
 //
@@ -291,56 +299,7 @@ double RelL2(const std::vector<float>& a, const float* b, int64_t n) {
   return std::sqrt(num) / std::max(std::sqrt(den), 1e-30);
 }
 
-// max|a-b| with `std::max`'s NaN blindness removed, plus the count of elements
-// that are not BITWISE equal. Both are reported, because "within one ulp" and
-// "identical" are different findings and this file claims the second wherever it
-// can get it.
-struct Agreement {
-  double worst = 0.0;
-  size_t not_bitwise_equal = 0;
-};
 
-Agreement Compare(const std::vector<float>& got, const std::vector<float>& want) {
-  REQUIRE(got.size() == want.size());
-  Agreement a;
-  // MaxAbsDiff returns +infinity on ANY non-finite operand and raises its own
-  // doctest failure, so an all-NaN device output cannot read as a perfect match
-  // here. That defect is issue #449 and this file must not re-introduce it by
-  // hand-rolling a reduction.
-  a.worst = MaxAbsDiff(got, want);
-  for (size_t i = 0; i < got.size(); ++i) {
-    if (std::memcmp(&got[i], &want[i], sizeof(float)) != 0) ++a.not_bitwise_equal;
-  }
-  return a;
-}
-
-// BOTH REPORTERS PRINT ON SUCCESS, not only on failure. doctest's INFO/CAPTURE
-// are emitted only when an assertion fails, so a passing run of a numeric gate
-// says nothing about HOW closely it passed. These numbers are the wave's
-// evidence and have to survive a green run.
-void CheckBitwise(const std::vector<float>& got, const std::vector<float>& want,
-                  const char* what) {
-  const Agreement a = Compare(got, want);
-  std::printf("[MEASURED] %-48s BYTE gate: %zu/%zu differ, max|diff| = %.9g\n", what,
-              a.not_bitwise_equal, want.size(), a.worst);
-  INFO(what << ": " << a.not_bitwise_equal << " of " << want.size()
-            << " elements differ; max|diff| = " << a.worst);
-  CHECK(a.not_bitwise_equal == 0);
-}
-
-void CheckWithin(const std::vector<float>& got, const std::vector<float>& want, double rel,
-                 const char* what) {
-  const Agreement a = Compare(got, want);
-  double scale = 0.0;
-  for (float v : want) scale = std::max(scale, static_cast<double>(std::fabs(v)));
-  const double bound = kAbsFloor + rel * scale;
-  std::printf("[MEASURED] %-48s max|diff| = %.9g  bound = %.9g  not-bitwise-equal = %zu/%zu\n",
-              what, a.worst, bound, a.not_bitwise_equal, want.size());
-  INFO(what << ": max|diff| = " << a.worst << " vs bound " << bound << "; "
-            << a.not_bitwise_equal << " of " << want.size()
-            << " elements not bitwise equal (0 means byte-identical)");
-  CHECK(a.worst <= bound);
-}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // vt::Qwen4ExpGatedResidual — the mixer
@@ -368,11 +327,7 @@ const HcCase kHcC{"C", 6, 4, 5, 2, 1e-6f, kC_norm_w_hf, kC_down, kC_up,
 const HcCase kHcD{"D", 6, 4, 5, 2, 1e-6f, kD_norm_w_hf, kD_down, kD_up,
                   kD_inject, kD_hyper, kD_mixed, kD_inj_w};
 
-struct MixerResult {
-  std::vector<float> mixed;
-  std::vector<float> injection;
-  std::vector<float> hyper_after;  // the stream must come back UNCHANGED
-};
+using q4hc::MixerResult;
 
 MixerResult RunMixer(DeviceType dev, const HcCase& c) {
   const int64_t flat = c.hc * c.hidden;
@@ -545,19 +500,33 @@ Selection RunIndexerCpu(const QsaCase& c) {
 struct GatherResult {
   std::vector<float> out;
   int64_t keys_visited = -1;
+  // The softmax-fold probe, filled only when `probe_stride > 0` was asked for.
+  std::vector<float> probe_w;      // [T*HQ, probe_stride], visit order
+  std::vector<float> probe_denom;  // [T*HQ]
 };
 
 // The gather, on either device, over a CONTIGUOUS [max_kv, Hkv, Dh] cache.
+// `probe_stride > 0` asks for the softmax-fold probe; 0 is the production path.
 GatherResult RunGather(DeviceType dev, const std::vector<float>& qa,
                        const std::vector<float>& ka, const std::vector<float>& va,
                        const Selection& sel, int64_t T, int64_t HQ, int64_t HKV, int64_t DH,
-                       int64_t max_kv, bool want_counter) {
+                       int64_t max_kv, bool want_counter, int64_t probe_stride = 0) {
   GatherResult r;
   r.out.assign(static_cast<size_t>(T * HQ * DH), 0.0f);
   Qwen4ExpQsaAttnArgs args;
   args.scale = 1.0f / std::sqrt(static_cast<float>(DH));
   args.compress_ratio = sel.CR;
   if (want_counter) args.keys_visited = &r.keys_visited;
+  if (probe_stride > 0) {
+    // A SENTINEL, not a zero. An arm that returns the buffer UNWRITTEN must be
+    // distinguishable from one that folded to zero, and the case below requires
+    // the sentinel to be gone.
+    r.probe_w.assign(static_cast<size_t>(T * HQ * probe_stride), -1.0f);
+    r.probe_denom.assign(static_cast<size_t>(T * HQ), -1.0f);
+    args.softmax_probe_weights = r.probe_w.data();
+    args.softmax_probe_denom = r.probe_denom.data();
+    args.softmax_probe_stride = probe_stride;
+  }
   std::vector<float> qc = qa, kc = ka, vc = va;
   std::vector<int32_t> ids = sel.block_ids, lens = sel.kv_lens;
   const int64_t topk = sel.topk;
@@ -720,6 +689,21 @@ Synth MakeSynth(int64_t T, int64_t HQ, int64_t HKV, int64_t DH, int64_t kv_len, 
   }
   return y;
 }
+
+
+// ─── THE W7 SYNTHETIC FIXTURE MOVED TO A HEADER ──────────────────────────────
+// `W7NormRel`, `SynthHc`, `MakeSynthHc` and `RunSynthMixer` are now
+// `qwen4_exp_hc_synth.h`, so the ROCm arm of this same kernel is held to the
+// same generator and the same DERIVED bound rather than to a copy of them. The
+// derivation is in that header beside `W7NormRel`; read it there.
+//
+// `RunSynthMixer` gained exactly one behaviour in the move: its device branch
+// takes the `DeviceType` from its argument instead of hard-coding `kCUDA`. The
+// cases below pass `DeviceType::kCUDA` and are otherwise unchanged.
+using q4hc::MakeSynthHc;
+using q4hc::RunSynthMixer;
+using q4hc::SynthHc;
+using q4hc::W7NormRel;
 
 }  // namespace
 
@@ -1192,6 +1176,197 @@ TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA: |sel| CROSSES the tile boundary"
   }
 }
 
+TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA W9: head_dim BELOW the tile width") {
+  if (SkipNoCuda("vt::Qwen4ExpQsaGatherAttention CUDA narrow head_dim")) return;
+  // THE CASE W9's MAPPING NEEDS AND THE COMMITTED SUITE DID NOT HAVE. Pass 2's
+  // tile is now evaluated ONE WHOLE DOT PER THREAD -- thread `u` owns tile entry
+  // `u` -- and that mapping is bounded by `blockDim.x`, NOT by `head_dim`.
+  // `BlockWidthFor` floors the block at 32 and `kSelTile` is 32, so every entry
+  // `u < n <= 32` has a thread even when `DH` is far below 32. Every gather
+  // fixture in this file before this one ran `DH >= 32`, where the two bounds
+  // coincide and a mapping wrongly written `threadIdx.x < n && threadIdx.x < DH`
+  // is indistinguishable from the correct one.
+  //
+  // The shapes below put `DH` under the tile width, so entries `u` in
+  // `[DH, n)` exist and are owned by threads that own no output dim. The COUNT
+  // is the sharp instrument: a mapping that loses those entries reads fewer
+  // keys, and `keys_visited` is derived here from the HOST expansion, not from
+  // the kernel.
+  constexpr int64_t kTileWidth = 32;   // `kSelTile`, and the `BlockWidthFor` floor
+  constexpr int64_t kReadsPerRowPerHead = 2;  // two softmax passes
+  struct Shape { const char* name; int64_t T, HQ, HKV, DH, kv, CR, topk; };
+  const Shape kShapes[] = {
+      // head_dim 8: a 32-wide block, 24 of whose threads own no output dim.
+      {"DH 8 / 200 rows / 7 tiles", 2, 4, 2, 8, 200, 4, 50},
+      // head_dim 16 with a 2-row ragged tail, so the last tile is partial too.
+      {"DH 16 / 66 rows / 3 tiles", 3, 4, 2, 16, 66, 4, 16},
+      // head_dim 1: the narrowest the op admits, one output dim for 32 threads.
+      {"DH 1 / 132 rows / 5 tiles", 1, 2, 1, 1, 132, 4, 33},
+  };
+  for (const Shape& sh : kShapes) {
+    CAPTURE(std::string(sh.name));
+    // The fixture must actually be narrower than the tile, or it is the old case.
+    REQUIRE(sh.DH < kTileWidth);
+    const Synth y = MakeSynth(sh.T, sh.HQ, sh.HKV, sh.DH, sh.kv, sh.CR, sh.topk, 5309u);
+    int64_t rows = 0;
+    for (int64_t t = 0; t < sh.T; ++t) {
+      rows += static_cast<int64_t>(ExpandHost(y.sel, t, sh.kv).size());
+    }
+    const int64_t tiles = (static_cast<int64_t>(ExpandHost(y.sel, 0, sh.kv).size()) +
+                           kTileWidth - 1) / kTileWidth;
+    CHECK(tiles > 1);  // one tile cannot show a carry, and cannot show a tail
+    // The tile beyond `DH` must be NON-EMPTY, or the mapping under test is not
+    // exercised: with `n` capped at `kSelTile`, that needs `|sel| > DH`.
+    REQUIRE(static_cast<int64_t>(ExpandHost(y.sel, 0, sh.kv).size()) > sh.DH);
+    const int64_t want_reads = rows * sh.HQ * kReadsPerRowPerHead;
+    const GatherResult gpu = RunGather(DeviceType::kCUDA, y.q, y.k, y.v, y.sel, sh.T, sh.HQ,
+                                       sh.HKV, sh.DH, y.max_kv, true);
+    const GatherResult cpu = RunGather(DeviceType::kCPU, y.q, y.k, y.v, y.sel, sh.T, sh.HQ,
+                                       sh.HKV, sh.DH, y.max_kv, false);
+    char nm[96];
+    std::snprintf(nm, sizeof nm, "qsa_gather %s", sh.name);
+    std::printf("[MEASURED] %-44s tiles = %lld  keys_visited = %lld  host-derived = %lld\n",
+                nm, static_cast<long long>(tiles),
+                static_cast<long long>(gpu.keys_visited),
+                static_cast<long long>(want_reads));
+    INFO("keys_visited ", gpu.keys_visited, " want ", want_reads);
+    // A tile entry with no thread is a key never read. This is the assertion
+    // that separates a `blockDim.x` bound from a `head_dim` one.
+    CHECK(gpu.keys_visited == want_reads);
+    CheckGatherDerived(gpu.out, cpu.out, y.v, y.sel, sh.T, sh.HQ, sh.HKV, sh.DH, nm);
+  }
+}
+
+TEST_CASE("vt::Qwen4ExpQsaGatherAttention W9: the DENOMINATOR is the ASCENDING fold, BITWISE") {
+  if (SkipNoCuda("vt::Qwen4ExpQsaGatherAttention softmax-fold order")) return;
+  // **THE PROPERTY W9 RESTS ITS WHOLE ARGUMENT ON, WHICH NOTHING MEASURED.**
+  // W9 moved pass 2's dot product off one lane and kept the SUM OVER `s` serial
+  // and ascending, because that order is what makes a sub-budget gather
+  // BIT-identical to dense attention. A fresh review reassociated that fold two
+  // ways on `thor:gpu0` -- a DESCENDING fold, and the WARP-SHUFFLE TREE the
+  // kernel's header explicitly declines -- and ALL THREE committed suites passed
+  // unmodified (19/19, 12/12, 14/14) while the outputs demonstrably moved.
+  //
+  // **A TIGHTER BOUND CANNOT BE THE REPAIR AND THAT IS MEASURED.** The
+  // reassociated denominator lands at 0.01-0.02% of the derived arm-vs-arm bound
+  // at these shapes (|diff| 5.2e-08 against 9.8e-04 at |sel| = 2050), and the
+  // WORST ratio on a CORRECT kernel (0.2041) is HIGHER than on a reassociated
+  // one (0.1136): no threshold separates them. The `kUlpTol` obituary at the top
+  // of this file is the same mistake one revision earlier.
+  //
+  // SO THE INVARIANT IS ASSERTED DIRECTLY, FROM THE ARM'S OWN WEIGHTS. The probe
+  // hands back the softmax weights the arm actually computed and the denominator
+  // it folded them into. This case refolds those exact floats ASCENDING on the
+  // host and requires BIT equality. Both sides consume the SAME `expf` outputs,
+  // so a toolkit that moves `exp` cannot make this red -- the fragility a stored
+  // device golden would have -- while any reassociation of the fold is red at
+  // once, because reassociation is the only thing the comparison can see.
+  //
+  // AND THE CASE VALIDATES ITS OWN INSTRUMENT. A fixture whose weights sum
+  // exactly under every order would pass while measuring nothing, so the two
+  // reassociations are ALSO computed on the host and the case REQUIRES them to
+  // differ from the ascending fold. That is the red the mutation would produce,
+  // proven on the fixture itself rather than assumed.
+  struct Shape { const char* name; int64_t T, HQ, HKV, DH, kv, CR, topk; };
+  const Shape kShapes[] = {
+      // 300 complete blocks -> |sel| = 1200 -> 38 tiles, so the carry across
+      // tiles is live and a tree over the tile has 32 leaves to disagree on.
+      {"1200 rows / 38 tiles", 2, 2, 1, 32, 1200, 4, 300},
+      // The RELEASED geometry's selection size at head_dim 64: 65 tiles.
+      {"2050 rows / 65 tiles", 1, 2, 1, 64, 2050, 4, 512},
+      // Two full tiles and a 2-row ragged tail: the partial tile folds too.
+      {"2 full tiles + a 2-row tail", 3, 4, 2, 32, 66, 4, 16},
+  };
+  auto bits = [](float f) {
+    uint32_t u = 0;
+    std::memcpy(&u, &f, sizeof u);
+    return u;
+  };
+  for (const Shape& sh : kShapes) {
+    CAPTURE(std::string(sh.name));
+    const Synth y = MakeSynth(sh.T, sh.HQ, sh.HKV, sh.DH, sh.kv, sh.CR, sh.topk, 909u);
+    int64_t stride = 0;
+    for (int64_t t = 0; t < sh.T; ++t) {
+      stride = std::max<int64_t>(stride,
+                                 static_cast<int64_t>(ExpandHost(y.sel, t, sh.kv).size()));
+    }
+    REQUIRE(stride > 32);  // one tile cannot show a cross-tile carry
+
+    const GatherResult gpu = RunGather(DeviceType::kCUDA, y.q, y.k, y.v, y.sel, sh.T, sh.HQ,
+                                       sh.HKV, sh.DH, y.max_kv, false, stride);
+    const GatherResult cpu = RunGather(DeviceType::kCPU, y.q, y.k, y.v, y.sel, sh.T, sh.HQ,
+                                       sh.HKV, sh.DH, y.max_kv, false, stride);
+    // THE INSTRUMENT MUST NOT PERTURB THE THING IT MEASURES. The same call with
+    // the probe unset must produce the SAME OUTPUT BYTES; W9's bar is bit
+    // identity and an instrument that moved a float would falsify it.
+    const GatherResult plain = RunGather(DeviceType::kCUDA, y.q, y.k, y.v, y.sel, sh.T,
+                                         sh.HQ, sh.HKV, sh.DH, y.max_kv, false, 0);
+    REQUIRE(gpu.out.size() == plain.out.size());
+    const bool probe_is_inert =
+        std::memcmp(gpu.out.data(), plain.out.data(), gpu.out.size() * sizeof(float)) == 0;
+    INFO("the probe changed the kernel's output bytes");
+    CHECK(probe_is_inert);
+
+    struct Arm { const char* name; const GatherResult* r; };
+    for (const Arm& arm : {Arm{"CUDA", &gpu}, Arm{"CPU", &cpu}}) {
+      CAPTURE(std::string(arm.name));
+      int64_t pairs_checked = 0, desc_differs = 0, tree_differs = 0, exact_mismatch = 0;
+      double worst_rel = 0.0;
+      for (int64_t t = 0; t < sh.T; ++t) {
+        const int64_t n = static_cast<int64_t>(ExpandHost(y.sel, t, sh.kv).size());
+        REQUIRE(n <= stride);
+        for (int64_t h = 0; h < sh.HQ; ++h) {
+          const int64_t pair = t * sh.HQ + h;
+          const float* w = arm.r->probe_w.data() + pair * stride;
+          // The sentinel must be GONE, or the arm returned the buffer unwritten
+          // and every fold below would agree on garbage.
+          for (int64_t s = 0; s < n; ++s) {
+            REQUIRE(w[s] >= 0.0f);  // -1.0f is the sentinel; `exp` is never negative
+          }
+          // THE ASCENDING FOLD, in the arm's own visit order, over the arm's own
+          // weights. A plain `float` accumulator in a plain loop: the host
+          // provider is pinned `-ffp-contract=off` and no compiler may
+          // reassociate IEEE float addition, so this IS the order written.
+          float asc = 0.0f;
+          for (int64_t s = 0; s < n; ++s) asc = asc + w[s];
+          // The two reassociations the review actually ran, on the host.
+          float desc = 0.0f;
+          for (int64_t s = n - 1; s >= 0; --s) desc = desc + w[s];
+          std::vector<float> tree(w, w + n);
+          for (size_t span = tree.size(); span > 1; span = (span + 1) / 2) {
+            for (size_t i = 0; i + 1 < span; i += 2) tree[i / 2] = tree[i] + tree[i + 1];
+            if (span % 2 == 1) tree[span / 2] = tree[span - 1];
+          }
+          const float got = arm.r->probe_denom[static_cast<size_t>(pair)];
+          REQUIRE(got > 0.0f);  // the sentinel again, and a fold of positives
+          if (bits(asc) != bits(got)) {
+            ++exact_mismatch;
+            worst_rel = std::max(worst_rel, std::fabs(static_cast<double>(asc - got)) /
+                                                std::fabs(static_cast<double>(asc)));
+          }
+          if (bits(desc) != bits(asc)) ++desc_differs;
+          if (bits(tree[0]) != bits(asc)) ++tree_differs;
+          ++pairs_checked;
+        }
+      }
+      std::printf("[MEASURED] qsa_gather %-28s %-4s fold: %lld pairs, %lld bit-mismatches "
+                  "(worst rel %.3g); a DESCENDING fold would move %lld, a TREE %lld\n",
+                  sh.name, arm.name, static_cast<long long>(pairs_checked),
+                  static_cast<long long>(exact_mismatch), worst_rel,
+                  static_cast<long long>(desc_differs),
+                  static_cast<long long>(tree_differs));
+      INFO("denominator is not the ascending fold of the arm's own weights");
+      CHECK(exact_mismatch == 0);
+      // THE INSTRUMENT'S OWN VALIDATION: this fixture can SEE a reassociation.
+      // Without these two, a fold that agreed under every order would pass while
+      // measuring nothing.
+      CHECK(pairs_checked == sh.T * sh.HQ);
+      CHECK(desc_differs > 0);
+      CHECK(tree_differs > 0);
+    }
+  }
+}
+
 TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA: the GRID STRIDE takes more than one trip") {
   if (SkipNoCuda("vt::Qwen4ExpQsaGatherAttention CUDA grid stride")) return;
   // The launcher caps the grid at 4096 blocks and the kernel walks
@@ -1494,4 +1669,135 @@ TEST_CASE("vt::Qwen4ExpQsaGatherAttention CUDA: a malformed selection POISONS th
     if (std::isnan(r.out[static_cast<size_t>(i)])) ++nan_elsewhere;
   }
   CHECK(nan_elsewhere == 0);
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// W7 — vt::Qwen4ExpGatedResidual: the grouped norm at shapes the goldens cannot
+// express. Each case names the structural property it alone can see.
+//
+// EVERY NAME BELOW CARRIES THE LITERAL `W7`, and that is load-bearing rather
+// than decorative: `-tc='*W7*'` is how a reviewer runs this fixture alone while
+// mutating the kernel. A first run of this battery used that filter against
+// names that did NOT contain it, and doctest reported `0 passed | 0 failed |
+// 18 skipped` with EXIT 0 — a green that measured nothing, on all five
+// mutations. Rename a case and that filter goes silent again.
+//
+// THAT TRAP NOW HAS A GUARD. Run a filtered mutation arm through
+// `scripts/run-doctest-selected.sh <binary> -tc='<filter>'`, which asks doctest
+// how many cases the filter selects and REFUSES with exit 3 when the answer is
+// zero, before it runs anything. The guard lives outside this file because the
+// failure is a filter that matches no case, which no case can observe.
+//
+// ─── THIS FILE IS THE CUDA GATE FOR THIS KERNEL ──────────────────────────────
+// `test_qwen4_exp_hc_device.cpp` is NOT, whatever the surrounding records used
+// to say: it states at its own head that "Nothing below runs on a device", and
+// it gates the CPU arms against the transformers goldens. MEASURED: corrupting
+// the `1 +` gamma fold in `HcGroupedNormKernel` reddens THIS binary -- 7 of 18
+// cases, worst `max|diff|` 0.868741 against its 1.95703e-06 bound (the grid-cap
+// case) -- while `test_qwen4_exp_hc_device` stays SUCCESS at 11/11 cases, 516
+// assertions.
+// A green run of that file says nothing about this kernel.
+//
+// ─── WHAT THIS FIXTURE DOES *NOT* CATCH, AND WHAT WAS MISCLASSIFIED ──────────
+// The IMP-MUTATE battery on `thor:gpu0` (sm_110, CUDA 13.0.88) reddened four of
+// five kernel mutations here, and two of those four are invisible to every
+// committed golden case -- the dropped group grid stride and the collapsed
+// cross-warp fold. THE FIFTH SURVIVED, and it survived because IT IS AN
+// EQUIVALENT MUTANT rather than because a race hid: M3 adds a `__syncthreads()`
+// at the end of the kernel's group loop, and the two barriers already inside the
+// loop body order both cross-iteration shared accesses on a trip count that is
+// block-uniform. The kernel records the ordering argument beside the loop. A
+// surviving mutation that changes no behaviour is not a gate hole, and this file
+// does not owe a case for it.
+//
+// THE RACE QUESTION IS GATED, just not by a value gate. `compute-sanitizer
+// --tool racecheck --racecheck-detect-level info` on the `MORE GROUPS THAN
+// BLOCKS` case below reports `0 hazards displayed` on the committed kernel, and
+// `2 hazards displayed` with tens of thousands of hazards when a barrier that IS
+// load-bearing is deleted instead. Run racecheck, not a bigger fixture, when you
+// change the shared-memory shape of that kernel.
+// ═════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("vt::Qwen4ExpGatedResidual CUDA W7: the grouped norm at MODEL WIDTH, many elements per thread") {
+  if (SkipNoCuda("W7 grouped norm at model width")) return;
+  // hidden_size 2560, hc_count 4, lowrank 320 — the released
+  // Qwen3.8-Flash-Next's own numbers (`qwen4_exp.h`). At a 256-thread block that
+  // is TEN elements per thread, so the per-thread strided walk and all eight
+  // warps are live; at the goldens' hidden 6 neither is.
+  const SynthHc c = MakeSynthHc("model_width", 2560, 4, 320, 3, 0x9E3779B97F4A7C15ULL);
+  const MixerResult gpu = RunSynthMixer(DeviceType::kCUDA, c);
+  const MixerResult cpu = RunSynthMixer(DeviceType::kCPU, c);
+  CheckWithin(gpu.mixed, cpu.mixed, W7NormRel(c.hidden),
+              "W7 model width mixed CUDA-vs-CPU");
+  // THE STREAM IS READ-ONLY, asserted at model width too: a normalize-in-place
+  // slip would double-normalize at the second site of every layer.
+  CheckBitwise(gpu.hyper_after, c.hyper, "W7 model width stream unchanged");
+}
+
+TEST_CASE("vt::Qwen4ExpGatedResidual CUDA W7: MORE GROUPS THAN BLOCKS, so the group grid stride runs") {
+  if (SkipNoCuda("W7 grouped norm past the grid cap")) return;
+  // `GridForGroups` caps the grid at 4096 blocks, so 4800 groups forces the
+  // kernel's group loop to take a SECOND trip — the only committed case that
+  // does. That second trip is what re-reads `s_part` and `s_r` after a block has
+  // already used them, so this is also the case to drive `compute-sanitizer
+  // --tool racecheck` at. The grid stride is dead at `T * hc <= 4096`, which is
+  // every other case in this file, and `test_qwen4_exp_hc_device.cpp` runs no
+  // device code at all.
+  const SynthHc c = MakeSynthHc("grid_cap", 512, 4, 32, 1200, 0xD1B54A32D192ED03ULL);
+  REQUIRE(c.T * c.hc > 4096);  // the property this case exists for, asserted
+  const MixerResult gpu = RunSynthMixer(DeviceType::kCUDA, c);
+  const MixerResult cpu = RunSynthMixer(DeviceType::kCPU, c);
+  CheckWithin(gpu.mixed, cpu.mixed, W7NormRel(c.hidden), "W7 grid cap mixed CUDA-vs-CPU");
+  CheckBitwise(gpu.hyper_after, c.hyper, "W7 grid cap stream unchanged");
+}
+
+TEST_CASE("vt::Qwen4ExpGatedResidual CUDA W7: groups SHORTER than a block, and not a multiple of a warp") {
+  if (SkipNoCuda("W7 grouped norm at ragged widths")) return;
+  // 100 is under the 256-thread block, so most warps contribute an exact zero
+  // and the cross-warp stage must not read a slot no warp wrote. 777 is neither
+  // a multiple of 32 nor of 256, so the last trip of the strided walk is ragged
+  // and the tail threads sit out. 3 streams keeps `hc` off a power of two.
+  for (int64_t H : {static_cast<int64_t>(100), static_cast<int64_t>(777)}) {
+    INFO("hidden ", H);
+    const SynthHc c = MakeSynthHc("ragged", H, 3, 16, 4,
+                                  0xBF58476D1CE4E5B9ULL + static_cast<uint64_t>(H));
+    const MixerResult gpu = RunSynthMixer(DeviceType::kCUDA, c);
+    const MixerResult cpu = RunSynthMixer(DeviceType::kCPU, c);
+    CheckWithin(gpu.mixed, cpu.mixed, W7NormRel(c.hidden),
+                ("W7 ragged hidden=" + std::to_string(H) + " mixed CUDA-vs-CPU").c_str());
+    CheckBitwise(gpu.hyper_after, c.hyper,
+                 ("W7 ragged hidden=" + std::to_string(H) + " stream unchanged").c_str());
+  }
+}
+
+TEST_CASE("vt::Qwen4ExpGatedResidual CUDA W7: the per-group scales SEPARATE, so a broadcast cannot hide") {
+  if (SkipNoCuda("W7 grouped norm separation probe")) return;
+  // A gate that passes says nothing unless the defects it is aimed at would have
+  // failed it by a visible margin. This probe MEASURES that margin instead of
+  // asserting it from prose: it replays the model-width case with every group of
+  // token 0 forced to group 0's data, which is precisely what a kernel that
+  // computed one group and broadcast it would produce, and reports the
+  // separation against the bound the case above uses.
+  const SynthHc c = MakeSynthHc("model_width", 2560, 4, 320, 3, 0x9E3779B97F4A7C15ULL);
+  SynthHc bcast = c;
+  const int64_t flat = c.hc * c.hidden;
+  for (int64_t j = 1; j < c.hc; ++j) {
+    std::copy(c.hyper.begin(), c.hyper.begin() + c.hidden,
+              bcast.hyper.begin() + j * c.hidden);
+  }
+  const MixerResult ok = RunSynthMixer(DeviceType::kCUDA, c);
+  const MixerResult bad = RunSynthMixer(DeviceType::kCUDA, bcast);
+  double sep = 0.0, scale = 0.0;
+  for (int64_t h = 0; h < c.hidden; ++h) {
+    sep = std::max(sep, std::fabs(static_cast<double>(ok.mixed[static_cast<size_t>(h)]) -
+                                  bad.mixed[static_cast<size_t>(h)]));
+    scale = std::max(scale, std::fabs(static_cast<double>(ok.mixed[static_cast<size_t>(h)])));
+  }
+  const double bound = kAbsFloor + W7NormRel(c.hidden) * scale;
+  std::printf("[MEASURED] W7 group separation max|diff| = %.9g  bound = %.9g  ratio = %.1fx\n",
+              sep, bound, sep / bound);
+  INFO("group separation " << sep << " against bound " << bound);
+  CHECK(sep > bound * 1000.0);  // the discrimination band, measured not assumed
+  CHECK(flat == 10240);
 }

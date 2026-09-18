@@ -1302,7 +1302,7 @@ class AgentRecordDiffRangeTests(unittest.TestCase):
     # The strict trailer walk moved to `commit-protocol-tag` (#863), which opts
     # out of the baseline lane at the job level and so has no in-step guard to
     # test here. `ConcurrencySemanticsTests` pins its placement and its base.
-    RANGE_SCOPED = ("check-role-discipline.py",)
+    RANGE_SCOPED = ()
     FAKE_BASE = "1" * 40
     FAKE_HEAD = "2" * 40
 
@@ -1335,8 +1335,9 @@ class AgentRecordDiffRangeTests(unittest.TestCase):
         while explaining why it is empty on this lane, and a comment consumes
         nothing.
         """
-        # Role discipline is the only diff-scoped call left in this job.
-        self.assertEqual(len(self.steps), 1)
+        # No diff-scoped calls remain in this job: check-role-discipline.py was
+        # removed, and agent-record no longer runs ci-walk-base.py either.
+        self.assertEqual(len(self.steps), 0)
         job_code = "\n".join(code_lines(self.job))
         accounted = "\n".join(
             "\n".join(code_lines("\n".join(step))) for step in self.steps
@@ -1346,7 +1347,7 @@ class AgentRecordDiffRangeTests(unittest.TestCase):
             accounted.count("github.event.before"),
             "an unaccounted github.event.before consumer in a diff-scoped job",
         )
-        self.assertEqual(accounted.count("github.event.before"), 1)
+        self.assertEqual(accounted.count("github.event.before"), 0)
 
     def test_the_baseline_lane_invokes_no_range_scoped_checker_and_exits_zero(self) -> None:
         for event in BASELINE_EVENTS:
@@ -1588,9 +1589,8 @@ class ConcurrencySemanticsTests(unittest.TestCase):
         before = subprocess.check_output(
             ["git", "-C", str(ROOT), "rev-parse", "HEAD~1"], text=True
         ).strip()
-        # `--floor ""` isolates the fallback. The floor's interaction with the
-        # base is the subject of tests/scripts/test_ci_walk_base.py; here the
-        # question is only what an empty LAST_GREEN degrades to.
+        # An empty LAST_GREEN isolates the fallback; here the question is only
+        # what an empty LAST_GREEN degrades to.
         resolved = subprocess.check_output(
             [
                 sys.executable,
@@ -1599,7 +1599,6 @@ class ConcurrencySemanticsTests(unittest.TestCase):
                 "--head", head,
                 "--push-base", before,
                 "--last-green", "",
-                "--floor", "",
                 "--repo", str(ROOT),
             ],
             text=True,

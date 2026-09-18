@@ -1,0 +1,13 @@
+clock-leg1.jsonl n=167 busy>0=117 busy>=50=29  sclk(busy>=50) min/med/max=1917/2827/2868 spread=33.64%
+clock-leg2.jsonl n=184 busy>0=147 busy>=50=30  sclk(busy>=50) min/med/max=1888/2783.0/2837 spread=34.1%
+clock-leg3.jsonl n=197 busy>0=146 busy>=50=30  sclk(busy>=50) min/med/max=1849/2801.5/2853 spread=35.838%
+clock-leg4.jsonl n=182 busy>0=143 busy>=50=30  sclk(busy>=50) min/med/max=1937/2793.5/2853 spread=32.79%
+clock-leg5.jsonl n=193 busy>0=156 busy>=50=31  sclk(busy>=50) min/med/max=1776/2801/2856 spread=38.558%
+clock-leg6.jsonl n=196 busy>0=152 busy>=50=31  sclk(busy>=50) min/med/max=1787/2778/2869 spread=38.949%
+clock-leg7.jsonl n=201 busy>0=157 busy>=50=30  sclk(busy>=50) min/med/max=1814/2796.0/2862 spread=37.482%
+clock-leg8.jsonl n=196 busy>0=153 busy>=50=30  sclk(busy>=50) min/med/max=1807/2800.5/2863 spread=37.708%
+clock-leg9.jsonl n=200 busy>0=156 busy>=50=31  sclk(busy>=50) min/med/max=1776/2771/2854 spread=38.903%
+clock-leg10.jsonl n=186 busy>0=148 busy>=50=31  sclk(busy>=50) min/med/max=1791/2813/2861 spread=38.038%
+clock-leg11.jsonl n=185 busy>0=146 busy>=50=30  sclk(busy>=50) min/med/max=2014/2810.0/2862 spread=30.178%
+clock-leg12.jsonl n=196 busy>0=151 busy>=50=30  sclk(busy>=50) min/med/max=1918/2788.0/2841 spread=33.106%
+POOLED busy>=50 samples=363 min=1776 median=2795 max=2869 spread=39.106%

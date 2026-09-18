@@ -1,0 +1,399 @@
+{
+  "version": 1,
+  "row": "BACKEND-ROCM-QUANT-GATHER",
+  "source_checks": {
+    "stock": {
+      "pin": "10bf611e533d81f739128304991c5e133c6aebd8",
+      "verified_archive_members": 3425,
+      "all_source_bytes_match_pin": true
+    },
+    "fork": {
+      "pin": "36fe8e1cc7f2b3b8c92fdda0ab07600141921786",
+      "verified_archive_members": 3317,
+      "all_source_bytes_match_pin": true
+    }
+  },
+  "cwd": "/home/vikash/vllm.cpp-rdna3-gather-impl",
+  "env": {
+    "HIP_VISIBLE_DEVICES": "-1",
+    "ROCR_VISIBLE_DEVICES": "-1"
+  },
+  "build_recipe": {
+    "source": "/home/vikash/vllm.cpp-rdna3-gather-impl/tools/rocm_quant_gather",
+    "configuration": "Release, CPU only, GGML_NATIVE=OFF, GGML_AVX2=ON, OpenMP=OFF, -j 4",
+    "stock_configure_log": "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-stock-configure.log",
+    "fork_configure_log": "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-fork-configure.log"
+  },
+  "files": {
+    "/home/vikash/.cache/rdna3-gather-impl/corpus/IQ1_XXXS-1024.ids": {
+      "bytes": 16,
+      "sha256": "519c1b2fc6da05a94eab0732b8b998418d87e1a465ca3560bd9e75b87c20aa15"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/corpus/IQ1_XXXS-1024.packed": {
+      "bytes": 19456,
+      "sha256": "ae8e061519977e2ba7a77ae9d30e21193b1a009b5ed38739974e945de09b94c6"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/corpus/IQ1_XXXS-256.ids": {
+      "bytes": 16,
+      "sha256": "519c1b2fc6da05a94eab0732b8b998418d87e1a465ca3560bd9e75b87c20aa15"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/corpus/IQ1_XXXS-256.packed": {
+      "bytes": 4864,
+      "sha256": "af0b5e336987746fd49cd33c790b99eb1479c26f64b6679fa6c685e5934ba0c4"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/corpus/MXFP4-1024.ids": {
+      "bytes": 16,
+      "sha256": "519c1b2fc6da05a94eab0732b8b998418d87e1a465ca3560bd9e75b87c20aa15"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/corpus/MXFP4-1024.packed": {
+      "bytes": 69632,
+      "sha256": "929ef7d789f210f60cede40156f689734aaf36519cd1f43a82d44d17ae0adfb4"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/corpus/MXFP4-256.ids": {
+      "bytes": 16,
+      "sha256": "519c1b2fc6da05a94eab0732b8b998418d87e1a465ca3560bd9e75b87c20aa15"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/corpus/MXFP4-256.packed": {
+      "bytes": 17408,
+      "sha256": "baa828a753cc6f496f356271dad644976cd57d1218517e3f641fe56b7ec8db4a"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/corpus/Q8_K-1024.ids": {
+      "bytes": 16,
+      "sha256": "519c1b2fc6da05a94eab0732b8b998418d87e1a465ca3560bd9e75b87c20aa15"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/corpus/Q8_K-1024.packed": {
+      "bytes": 149504,
+      "sha256": "78e39e7ef7317d842a6fd965b356ceb1959a5ce03da824fbc699689ea2ef4877"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/corpus/Q8_K-256.ids": {
+      "bytes": 16,
+      "sha256": "519c1b2fc6da05a94eab0732b8b998418d87e1a465ca3560bd9e75b87c20aa15"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/corpus/Q8_K-256.packed": {
+      "bytes": 37376,
+      "sha256": "bcf6f6691a787fe3f2a9bcc3d7923eeb4953862c30f904a6b10fc07410f8d657"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-IQ1_XXXS-1024-f32.bin": {
+      "bytes": 16384,
+      "sha256": "10b121b53bde30b8e24ea1fb6ef8bb4f3123952900c2c66886d2e09b40ee62c0"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-IQ1_XXXS-1024-gather.log": {
+      "bytes": 175,
+      "sha256": "599b4d6f937fed29361721ccf5c43f664bee63b25cd188bfdf516504f934ba8a"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-IQ1_XXXS-256-f32.bin": {
+      "bytes": 4096,
+      "sha256": "b4707ef68fb11c9d3720db82722924de4004e75c97d07cdbd0b24c08f3677fce"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-IQ1_XXXS-256-gather.log": {
+      "bytes": 172,
+      "sha256": "56e3aed3c87e44b47a9b7c10ae461147d8a773415fcf38934483d53118f1d1f7"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-MXFP4-1024-f32.bin": {
+      "bytes": 16384,
+      "sha256": "a2688e4f8d766f642b8fbdebcbfff7e4e2720ae9fc57409812eb0a21f4bb6fec"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-MXFP4-1024-gather.log": {
+      "bytes": 172,
+      "sha256": "c5b9d00254be3adbd6fc7e9edede85a276886b03e3bbc9b6a8b9ca39e0f61302"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-MXFP4-256-f32.bin": {
+      "bytes": 4096,
+      "sha256": "aca27b230e9675ea214c31723306036025295c570903f8804d4d767b4fb0bdb2"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-MXFP4-256-gather.log": {
+      "bytes": 170,
+      "sha256": "ba6cbc0912a63378027e30d26682fa8f735ecbd37b6a01dd20c2b0534ffebc9e"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-Q8_K-1024-f32.bin": {
+      "bytes": 16384,
+      "sha256": "bc4c56d33b3d53d928f21b39953ba08f191aec465ead263abb832820f6ccd29c"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-Q8_K-1024-gather.log": {
+      "bytes": 163,
+      "sha256": "dd9a8f230fb6110feb052fa69a8846c2b11abaf82fa71aaef44bcc91e0b18fd5"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-Q8_K-256-f32.bin": {
+      "bytes": 4096,
+      "sha256": "42d365370201b210a4c646cc5718a3bf7becff7ef20bb5f381a1736ba22850e6"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-Q8_K-256-gather.log": {
+      "bytes": 160,
+      "sha256": "45c7ce06e27dd83e7ddb03e8bc2183180162b8c964f3da43de1bb0fcb9ddc51b"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-fork-model-iq1xxxs-p0-r0.log": {
+      "bytes": 12874,
+      "sha256": "5a1d15aa6566013e50f6e7103aa3910669de04534875c31bfb97f4b02f5a4096"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-stock-model-mxfp4-p0-r0.log": {
+      "bytes": 13005,
+      "sha256": "189f067f48a023502aba88ffac394b07df6ba4bf3af0d228a728a834ea58d822"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/fixtures/IQ1_XXXS.gguf": {
+      "bytes": 930624,
+      "sha256": "3d16b36474ae4e4663f1bc4842d9bfe8e62843491d3e6f5724173c04495e2c72"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/fixtures/MXFP4.gguf": {
+      "bytes": 943168,
+      "sha256": "e60f444269c54001579cb5bd2ad652b00ac6070984f62ca4a88450e36e8260de"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-fork-build/oracle/ggml/src/libggml-base.a": {
+      "bytes": 1395314,
+      "sha256": "907d9cb9052e243f2024009355c927ad5ef70d6cbfdec7bbd9b061615ca26f48"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-fork-build/oracle/ggml/src/libggml-cpu.a": {
+      "bytes": 1495086,
+      "sha256": "4d6349f1557b0e6d46ca6a1ad4de2608fc60a584a62eaef836865ef86e4c5ba8"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-fork-build/oracle/ggml/src/libggml.a": {
+      "bytes": 61932,
+      "sha256": "713ed875969a0f4a38bf41cb916c88e2a49539949c29759164006a1bfcd664dc"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-fork-build/oracle/src/libllama.a": {
+      "bytes": 9770360,
+      "sha256": "1e02daf9bdf3c7b822181c1e3f3d1b8f7bdfaae68a9c72ab00a0bf3045693145"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-fork-build/rocm_gather_secondary": {
+      "bytes": 5715184,
+      "sha256": "cad537f239dc0c4ca70e5b80548f39f297117494269ca2b9b5de8191aa2f4bc1"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-fork-source/ggml/src/ggml-backend.cpp": {
+      "bytes": 96019,
+      "sha256": "507577061d22e673a4f002bb215c65aa9c63b88a4e6d1586f52c74ca0b98fa07"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-fork-source/ggml/src/ggml-cpu/ops.cpp": {
+      "bytes": 411897,
+      "sha256": "42f40dbddddef1cfee2c441b7a2522aa2b0f2e11d76037a4d8fc49364a13cb2b"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-fork-source/ggml/src/ggml-quants.c": {
+      "bytes": 243330,
+      "sha256": "f60b82ed4387ed73cc7a42ad57180cc084ea79f72a7211f9f6a2b861a710624b"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-fork-source/src/llama-graph.cpp": {
+      "bytes": 132879,
+      "sha256": "e7d4915cc66bc6187f42ad016f9b1288f8e1702e15da4e63d9862cf8afcb8267"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-fork-source/src/models/qwen35.cpp": {
+      "bytes": 28474,
+      "sha256": "b61c5813fc80c54269d45cbbdbbc34b090500e8017dc190483605b37249d007c"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-fork-source.tar": {
+      "bytes": 170752000,
+      "sha256": "be6761fc65927e10aa1cad664ca5a459fa0f3776c30230cd7acff564c981f93e"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-stock-build/oracle/ggml/src/libggml-base.a": {
+      "bytes": 1324458,
+      "sha256": "62f639da8b2865775065084f8a38134604b75416204d664cd0991d019f4faba1"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-stock-build/oracle/ggml/src/libggml-cpu.a": {
+      "bytes": 1476372,
+      "sha256": "4118662b842e15bf9d7ab2e018182012027a604ed97836a82a153e04a6d14fa0"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-stock-build/oracle/ggml/src/libggml.a": {
+      "bytes": 61932,
+      "sha256": "cef0c83e3f08e03fd19650f35d6bb39666eecf1ab88ade63aaa3ec2170a95b59"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-stock-build/oracle/src/libllama.a": {
+      "bytes": 10039328,
+      "sha256": "b3672ed0aae46e1c6cf2dfd500f6fcf3f37f1be7ca372a336a43583f4686f7f7"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-stock-build/rocm_gather_secondary": {
+      "bytes": 5736280,
+      "sha256": "7b9a2e2d0dc95afbf592b5b1678bdc67e0fe2204529f1afe3b0b1f03566f28c2"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-stock-source/ggml/src/ggml-backend.cpp": {
+      "bytes": 96019,
+      "sha256": "507577061d22e673a4f002bb215c65aa9c63b88a4e6d1586f52c74ca0b98fa07"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-stock-source/ggml/src/ggml-cpu/ops.cpp": {
+      "bytes": 411743,
+      "sha256": "740701e585872545650edfd08c9114619a9ad1e67dbab19f6b2060b6290fdf88"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-stock-source/ggml/src/ggml-quants.c": {
+      "bytes": 228250,
+      "sha256": "07143d7068936ae46b3c528b2f3d4bbb666e74d88992165716174d243573965d"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-stock-source/src/llama-graph.cpp": {
+      "bytes": 134601,
+      "sha256": "bc1c497c4da0951a4f98de50e397bcb632b2e40d4f24b8c58203c964d4d6183b"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-stock-source/src/models/qwen35.cpp": {
+      "bytes": 28474,
+      "sha256": "b61c5813fc80c54269d45cbbdbbc34b090500e8017dc190483605b37249d007c"
+    },
+    "/home/vikash/.cache/rdna3-gather-impl/llama-stock-source.tar": {
+      "bytes": 171663360,
+      "sha256": "0f43551d3da94ba0d2af80e202177008a91966de66dbabf87a2042377d16d133"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/tests/capi/rocm_quant_gather_fixture.h": {
+      "bytes": 8283,
+      "sha256": "339414f93e59e6be9a4ca545d5e762bb2816714343f466e218dbc2b69483bdfd"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/tools/rocm_quant_gather/CMakeLists.txt": {
+      "bytes": 1179,
+      "sha256": "c90a83b40ffd31db1228324827422eda62d4a8ab62907d9ba866dca4cc106104"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/tools/rocm_quant_gather/secondary.cpp": {
+      "bytes": 6817,
+      "sha256": "09773359f3db39d5c759d03e37e42f4e466f6e33cb063cd2eb9bbf1353b04dbb"
+    }
+  },
+  "cases": [
+    {
+      "name": "Q8_K-256",
+      "oracle": "stock",
+      "kind": "operation",
+      "argv": [
+        "/home/vikash/.cache/rdna3-gather-impl/llama-stock-build/rocm_gather_secondary",
+        "gather",
+        "15",
+        "128",
+        "256",
+        "/home/vikash/.cache/rdna3-gather-impl/corpus/Q8_K-256.packed",
+        "/home/vikash/.cache/rdna3-gather-impl/corpus/Q8_K-256.ids",
+        "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-Q8_K-256-f32.bin"
+      ],
+      "observed_exit": 0,
+      "expected": "Successful upstream graph or exact Q8_K decoder; identical output SHA256",
+      "operator_output_note": "Use a new output path to preserve implementer output bytes",
+      "log": "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-Q8_K-256-gather.log"
+    },
+    {
+      "name": "Q8_K-1024",
+      "oracle": "stock",
+      "kind": "operation",
+      "argv": [
+        "/home/vikash/.cache/rdna3-gather-impl/llama-stock-build/rocm_gather_secondary",
+        "gather",
+        "15",
+        "128",
+        "1024",
+        "/home/vikash/.cache/rdna3-gather-impl/corpus/Q8_K-1024.packed",
+        "/home/vikash/.cache/rdna3-gather-impl/corpus/Q8_K-1024.ids",
+        "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-Q8_K-1024-f32.bin"
+      ],
+      "observed_exit": 0,
+      "expected": "Successful upstream graph or exact Q8_K decoder; identical output SHA256",
+      "operator_output_note": "Use a new output path to preserve implementer output bytes",
+      "log": "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-Q8_K-1024-gather.log"
+    },
+    {
+      "name": "MXFP4-256",
+      "oracle": "stock",
+      "kind": "operation",
+      "argv": [
+        "/home/vikash/.cache/rdna3-gather-impl/llama-stock-build/rocm_gather_secondary",
+        "gather",
+        "39",
+        "128",
+        "256",
+        "/home/vikash/.cache/rdna3-gather-impl/corpus/MXFP4-256.packed",
+        "/home/vikash/.cache/rdna3-gather-impl/corpus/MXFP4-256.ids",
+        "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-MXFP4-256-f32.bin"
+      ],
+      "observed_exit": 0,
+      "expected": "Successful upstream graph or exact Q8_K decoder; identical output SHA256",
+      "operator_output_note": "Use a new output path to preserve implementer output bytes",
+      "log": "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-MXFP4-256-gather.log"
+    },
+    {
+      "name": "MXFP4-1024",
+      "oracle": "stock",
+      "kind": "operation",
+      "argv": [
+        "/home/vikash/.cache/rdna3-gather-impl/llama-stock-build/rocm_gather_secondary",
+        "gather",
+        "39",
+        "128",
+        "1024",
+        "/home/vikash/.cache/rdna3-gather-impl/corpus/MXFP4-1024.packed",
+        "/home/vikash/.cache/rdna3-gather-impl/corpus/MXFP4-1024.ids",
+        "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-MXFP4-1024-f32.bin"
+      ],
+      "observed_exit": 0,
+      "expected": "Successful upstream graph or exact Q8_K decoder; identical output SHA256",
+      "operator_output_note": "Use a new output path to preserve implementer output bytes",
+      "log": "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-MXFP4-1024-gather.log"
+    },
+    {
+      "name": "IQ1_XXXS-256",
+      "oracle": "fork",
+      "kind": "operation",
+      "argv": [
+        "/home/vikash/.cache/rdna3-gather-impl/llama-fork-build/rocm_gather_secondary",
+        "gather",
+        "66",
+        "128",
+        "256",
+        "/home/vikash/.cache/rdna3-gather-impl/corpus/IQ1_XXXS-256.packed",
+        "/home/vikash/.cache/rdna3-gather-impl/corpus/IQ1_XXXS-256.ids",
+        "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-IQ1_XXXS-256-f32.bin"
+      ],
+      "observed_exit": 0,
+      "expected": "Successful upstream graph or exact Q8_K decoder; identical output SHA256",
+      "operator_output_note": "Use a new output path to preserve implementer output bytes",
+      "log": "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-IQ1_XXXS-256-gather.log"
+    },
+    {
+      "name": "IQ1_XXXS-1024",
+      "oracle": "fork",
+      "kind": "operation",
+      "argv": [
+        "/home/vikash/.cache/rdna3-gather-impl/llama-fork-build/rocm_gather_secondary",
+        "gather",
+        "66",
+        "128",
+        "1024",
+        "/home/vikash/.cache/rdna3-gather-impl/corpus/IQ1_XXXS-1024.packed",
+        "/home/vikash/.cache/rdna3-gather-impl/corpus/IQ1_XXXS-1024.ids",
+        "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-IQ1_XXXS-1024-f32.bin"
+      ],
+      "observed_exit": 0,
+      "expected": "Successful upstream graph or exact Q8_K decoder; identical output SHA256",
+      "operator_output_note": "Use a new output path to preserve implementer output bytes",
+      "log": "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-IQ1_XXXS-1024-gather.log"
+    },
+    {
+      "name": "MXFP4-model-p0-r0",
+      "oracle": "stock",
+      "kind": "model",
+      "argv": [
+        "/home/vikash/.cache/rdna3-gather-impl/llama-stock-build/rocm_gather_secondary",
+        "model",
+        "/home/vikash/.cache/rdna3-gather-impl/fixtures/MXFP4.gguf",
+        "1",
+        "0",
+        "63",
+        "127",
+        "63"
+      ],
+      "observed_shell_exit": 134,
+      "observed_signal": 6,
+      "expected": "Model loads; first llama_decode aborts at ggml-backend.cpp:194 GGML_ASSERT(buffer)",
+      "inference": "Unallocated recurrent inp_rs->s_copy->buffer, reached by llm_graph_input_mem_hybrid::set_input; the full-attention graph does not consume this input",
+      "gate": "PENDING under #3093; no model token result",
+      "log": "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-stock-model-mxfp4-p0-r0.log"
+    },
+    {
+      "name": "IQ1_XXXS-model-p0-r0",
+      "oracle": "fork",
+      "kind": "model",
+      "argv": [
+        "/home/vikash/.cache/rdna3-gather-impl/llama-fork-build/rocm_gather_secondary",
+        "model",
+        "/home/vikash/.cache/rdna3-gather-impl/fixtures/IQ1_XXXS.gguf",
+        "1",
+        "0",
+        "63",
+        "127",
+        "63"
+      ],
+      "observed_shell_exit": 134,
+      "observed_signal": 6,
+      "expected": "Model loads; first llama_decode aborts at ggml-backend.cpp:194 GGML_ASSERT(buffer)",
+      "inference": "Unallocated recurrent inp_rs->s_copy->buffer, reached by llm_graph_input_mem_hybrid::set_input; the full-attention graph does not consume this input",
+      "gate": "PENDING under #3093; no model token result",
+      "log": "/home/vikash/.cache/rdna3-gather-impl/evidence/secondary-fork-model-iq1xxxs-p0-r0.log"
+    }
+  ]
+}

@@ -30,6 +30,7 @@
 #include "vt/dtype.h"
 #include "vt/fp8_kv.h"  // F32ToF8E4M3
 #include "vt/ops.h"
+#include "vt/unaligned.h"  // LoadUnaligned — borrowed bytes may start at an odd address
 
 namespace vllm {
 
@@ -364,7 +365,7 @@ Fp8BlockWeight Dots3NoteVisionBlockCastFp8(const OwnedTensor& w, int64_t n,
   const auto* src = reinterpret_cast<const uint16_t*>(w.bytes.data());
   // bf16 -> f32 is an exact widening: the 16 bits ARE the top half of the f32.
   const auto bf16 = [src](int64_t idx) {
-    uint32_t bits = static_cast<uint32_t>(src[idx]) << 16;
+    uint32_t bits = static_cast<uint32_t>(vt::LoadUnaligned<uint16_t>(src + idx)) << 16;
     float out = 0.0F;
     std::memcpy(&out, &bits, sizeof(out));
     return out;

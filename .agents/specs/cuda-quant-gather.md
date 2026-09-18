@@ -575,6 +575,9 @@ generalisation from ONE hidden issue and it is wrong.
   asserts a float table by name and none registers `kEmbeddingQuant`, so each
   answers false to the residency gate and keeps expand-bf16; the `qwen4_exp`
   loader refuses them by name.
+  The ROCm child is [BACKEND-ROCM-QUANT-GATHER](rocm-quant-gather.md),
+  tracked by [#3093](https://github.com/mudler/vllm.cpp/issues/3093).
+  Its implementation and native gates remain `PENDING`.
 - **Performance.** This wave gates CORRECTNESS only. The decoders read byte-wise
   for alignment safety and one thread decodes a whole block. No throughput number
   is claimed, measured or implied, and no benchmark ID moves.

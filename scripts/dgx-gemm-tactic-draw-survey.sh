@@ -166,6 +166,7 @@ SEED=0
 MAX_BATCHED=8192
 PHASE=all
 TACTIC_SET=full
+MODELOPT_W4A4=0
 SCORE_LEG=""
 LOCAL_ROOT=/tmp/gtds
 SMOKE=0
@@ -187,6 +188,7 @@ while [ $# -gt 0 ]; do
     --smoke)         SMOKE=1; shift ;;
     --phase)         PHASE=${2:?}; shift 2 ;;
     --tactic-set)    TACTIC_SET=${2:?}; shift 2 ;;
+    --modelopt-w4a4) MODELOPT_W4A4=${2:?}; shift 2 ;;
     --score-leg)     SCORE_LEG=${2:?}; shift 2 ;;
     --check-artefacts) CHECK_ART=${2:?}; shift 2 ;;
     --check-toolkit) CHECK_TK=${2:?}; shift 2 ;;
@@ -241,10 +243,18 @@ SMOKE_ARG=""; [ "$SMOKE" = 1 ] && SMOKE_ARG="--smoke"
 [ -n "$EV_SHARE" ] || die "$E_USAGE" "--evidence is required"
 [ -n "$MODEL" ] || die "$E_USAGE" "--model is required; this harness NEVER defaults a checkpoint path"
 case "$TACTIC_SET" in full|w1) ;; *) die "$E_USAGE" "--tactic-set must be full or w1, not '$TACTIC_SET'" ;; esac
+# THE ACTIVATION ARM. `1` consumes a ModelOpt checkpoint's `input_scale`, so
+# `IsTrueW4A4()` flips and the weights reach the CUTLASS fp4-activation GEMM
+# the tactic cache lives on. At `0` the same weights run the W4A16 Marlin arm,
+# which `dense_nvfp4_gemm.h` says carries NO tactic path -- the survey would
+# then tune nothing and report a clean run over zero draws. An ARM, not a
+# size, so it is NOT in SIZES_GIVEN and --smoke may be given beside it.
+case "$MODELOPT_W4A4" in 0|1) ;; *) die "$E_USAGE" "--modelopt-w4a4 must be 0 or 1, not '$MODELOPT_W4A4'" ;; esac
 # `full` is the SHIPPED default (Fp4FullTacticsEnabled is on unless the value
 # starts with '0'), so this mapping keeps the harness arm and the product arm
 # the same thing under one name.
 FULL_TACTICS=1; [ "$TACTIC_SET" = w1 ] && FULL_TACTICS=0
+W4A4_ARG=""; [ "$MODELOPT_W4A4" = 1 ] && W4A4_ARG="--modelopt-w4a4"
 
 # THE EVIDENCE LIVES TWICE, ON PURPOSE.
 # The engine publishes its cache document with mkstemp + fsync + atomic rename
@@ -392,6 +402,7 @@ if [ -n "$SCORE_LEG" ]; then
   VT_FP4_AUTOTUNE_CACHE_PATH="$CACHE" \
   VT_FP4_AUTOTUNE_CACHE_READONLY=1 \
   VT_FP4_FULL_TACTICS="$FULL_TACTICS" \
+  VT_MODELOPT_W4A4="$MODELOPT_W4A4" \
   VT_FP4_AUTOTUNE_VERBOSE=1 \
   LD_LIBRARY_PATH="$BIN:${LD_LIBRARY_PATH:-}" \
     "$BIN/vllm-bench" --model "$MODEL" \
@@ -472,7 +483,7 @@ PROV="$EV_LOCAL/PROVENANCE"
   echo "boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
   echo "model=$MODEL"
   echo "smoke=$SMOKE"
-  echo "draws=$DRAWS score_reps=$SCORE_REPS concurrency=$CONCURRENCY tactic_set=$TACTIC_SET"
+  echo "draws=$DRAWS score_reps=$SCORE_REPS concurrency=$CONCURRENCY tactic_set=$TACTIC_SET modelopt_w4a4=$MODELOPT_W4A4"
   echo "num_prompts=$NUM_PROMPTS input_len=$INPUT_LEN output_len=$OUTPUT_LEN seed=$SEED"
   echo "max_num_batched_tokens=$MAX_BATCHED"
   nvidia-smi --query-gpu=name,driver_version,persistence_mode,clocks.max.sm --format=csv,noheader 2>/dev/null
@@ -719,7 +730,7 @@ if [ "$PHASE" = all ] || [ "$PHASE" = draw ]; then
     ( cd "$SRC" && python3 "$SURVEY" draw --evidence "$EV_LOCAL" --bench "$BIN/vllm-bench" \
         --model "$MODEL" --draws 1 --num-prompts "$NUM_PROMPTS" --input-len "$INPUT_LEN" \
         --output-len "$OUTPUT_LEN" --concurrency "$CONCURRENCY" --seed "$SEED" \
-        --max-num-batched-tokens "$MAX_BATCHED" --tactic-set "$TACTIC_SET" $SMOKE_ARG \
+        --max-num-batched-tokens "$MAX_BATCHED" --tactic-set "$TACTIC_SET" $W4A4_ARG $SMOKE_ARG \
         --mirror "$EV_SHARE" )
     P=$?
     mirror_out
@@ -737,7 +748,7 @@ if [ "$PHASE" = all ] || [ "$PHASE" = draw ]; then
     ( cd "$SRC" && python3 "$SURVEY" draw --evidence "$EV_LOCAL" --bench "$BIN/vllm-bench" \
         --model "$MODEL" --draws "$DRAWS" --num-prompts "$NUM_PROMPTS" --input-len "$INPUT_LEN" \
         --output-len "$OUTPUT_LEN" --concurrency "$CONCURRENCY" --seed "$SEED" \
-        --max-num-batched-tokens "$MAX_BATCHED" --tactic-set "$TACTIC_SET" $SMOKE_ARG \
+        --max-num-batched-tokens "$MAX_BATCHED" --tactic-set "$TACTIC_SET" $W4A4_ARG $SMOKE_ARG \
         --mirror "$EV_SHARE" )
     G=$?
     mirror_out
@@ -769,7 +780,7 @@ if [ "$PHASE" = all ] || [ "$PHASE" = score ]; then
       $ARMS --legs-per-arm "$SCORE_REPS" \
       --metric total_token_throughput \
       --metric-regex 'Total token throughput \(tok/s\):\s+([0-9.]+)' \
-      --command "bash $SELF --score-leg {arm} --evidence $EV_SHARE --src '' --model $MODEL --local-root $LOCAL_ROOT --num-prompts $NUM_PROMPTS --input-len $INPUT_LEN --output-len $OUTPUT_LEN --concurrency $CONCURRENCY --seed $SEED --max-num-batched-tokens $MAX_BATCHED --tactic-set $TACTIC_SET" \
+      --command "bash $SELF --score-leg {arm} --evidence $EV_SHARE --src '' --model $MODEL --local-root $LOCAL_ROOT --num-prompts $NUM_PROMPTS --input-len $INPUT_LEN --output-len $OUTPUT_LEN --concurrency $CONCURRENCY --seed $SEED --max-num-batched-tokens $MAX_BATCHED --tactic-set $TACTIC_SET --modelopt-w4a4 $MODELOPT_W4A4" \
       > "$EV_LOCAL/score/leg-runner.log" 2>&1 )
   S=$?
   tail -40 "$EV_LOCAL/score/leg-runner.log"

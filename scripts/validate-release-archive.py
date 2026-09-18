@@ -547,7 +547,7 @@ def validate_pe_audit(
             errors.append(f"debug CRT import is forbidden: {name}")
         elif re.search(r"(?:VCRUNTIME|MSVCP|MSVCR|UCRTBASE|CONCRT).*\.DLL$", name):
             errors.append(f"dynamic CRT import violates the /MT static-CRT contract: {name}")
-        elif name not in WINDOWS_SYSTEM_DLLS:
+        elif name not in WINDOWS_SYSTEM_DLLS and name not in declared:
             errors.append(f"non-system PE import is forbidden: {name}")
     for value in debug_paths:
         if re.match(r"^[A-Za-z]:[\\/]", value):

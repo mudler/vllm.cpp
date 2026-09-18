@@ -1,0 +1,49 @@
+{
+  "model": {
+    "bytes": 944192,
+    "sha256": "663597e28852d64097f7a67542675e4575ee158d3c5e6e2143aadd1b4188f4af"
+  },
+  "config": {
+    "bytes": 974,
+    "sha256": "919812c5a2a3cfae586873cc965f0f4b33179a7ca96b8d8b1afcdac88afca71e"
+  },
+  "primary_pin": "e126687a9a828d513c01a07cd69f025f27d63280",
+  "plugin_pin": "d4c1f0d082fc7cd4350da56689109a01c1f29d6c",
+  "prompt": [
+    1,
+    0,
+    63,
+    127,
+    63
+  ],
+  "repeat": 0,
+  "tokens": [],
+  "requested": {
+    "model_dtype": "auto from bfloat16 config",
+    "block_size": 16,
+    "num_gpu_blocks_override": 4,
+    "max_model_len": 64,
+    "max_num_seqs": 1,
+    "kv_cache_dtype": "auto",
+    "seed": 1380926285,
+    "greedy": true,
+    "ignore_eos": true,
+    "max_tokens": 4,
+    "stop": [],
+    "stop_token_ids": []
+  },
+  "harness_adaptations": [
+    "pre-tokenized IDs with skip_tokenizer_init=True",
+    "explicit local HF text config mirrors GGUF geometry",
+    "no oracle patch or eager-mode override"
+  ],
+  "status": "PENDING: primary model refused before qualification",
+  "torch": "2.12.0+git6bbd260",
+  "torch_git": "6bbd26020da1c6dc198625dfcdd968b1e4e6b1c5",
+  "hip": "7.2.53211",
+  "vllm": "0.28.1rc1.dev132+ge126687a9",
+  "plugin": "0.0.5+d4c1f0d.gfx1100",
+  "exception_type": "ValidationError",
+  "exception": "1 validation error for ModelConfig\n  Value error, Model architectures ['Qwen3_5ForConditionalGeneration'] failed to be inspected. Please check the logs for more details. [type=value_error, input_value=ArgsKwargs((), {'model': ...nderer_num_workers': 1}), input_type=ArgsKwargs]\n    For further information visit https://errors.pydantic.dev/2.13/v/value_error",
+  "traceback": "Traceback (most recent call last):\n  File \"/home/vikash/.cache/rdna3-gather-impl/primary-model-v1/primary_model.py\", line 52, in main\n    model = LLM(model=str(args.model), hf_config_path=str(args.config),\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/entrypoints/llm.py\", line 343, in __init__\n    self.llm_engine = LLMEngine.from_engine_args(\n                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/v1/engine/llm_engine.py\", line 171, in from_engine_args\n    vllm_config = engine_args.create_engine_config(usage_context)\n                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/engine/arg_utils.py\", line 2001, in create_engine_config\n    model_config = self.create_model_config()\n                   ^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/quark/online_quantization/vllm/plugin.py\", line 193, in patched_create_model_config\n    return orig_create_model_config(self, *args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/vikash/.cache/rdna3-gather-impl/plugin-artifact/vllm_gguf_plugin/plugin.py\", line 76, in create_model_config\n    return original_create_model_config(self, *args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/engine/arg_utils.py\", line 1757, in create_model_config\n    return ModelConfig(\n           ^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/dist-packages/pydantic/_internal/_dataclasses.py\", line 121, in __init__\n    s.__pydantic_validator__.validate_python(ArgsKwargs(args, kwargs), self_instance=s)\npydantic_core._pydantic_core.ValidationError: 1 validation error for ModelConfig\n  Value error, Model architectures ['Qwen3_5ForConditionalGeneration'] failed to be inspected. Please check the logs for more details. [type=value_error, input_value=ArgsKwargs((), {'model': ...nderer_num_workers': 1}), input_type=ArgsKwargs]\n    For further information visit https://errors.pydantic.dev/2.13/v/value_error\n"
+}

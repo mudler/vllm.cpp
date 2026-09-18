@@ -225,6 +225,8 @@ box, and the real-hardware attempt that surfaced #1934.
 
 - **ISSUE-GH-1928** — the ROCm `kMoeGroupedGemmBf16` provider gap #1870's "related gap,
   same area" section names. Not fixed in flow; scoped out above.
+  Implementation handoff: [native BF16 grouped MoE](rocm-bf16-moe.md),
+  row `BACKEND-ROCM-BF16-MOE`, tracked by issue #3094.
 - **#1934** — `RocmPlatform::needs_weight_staging()` is stale-false, so this
   row's fix (and the refusal it corrects) never runs on ROCm. THE ACTUAL
   remaining blocker for #1870's reproduced crash. Not fixed in flow: it is a

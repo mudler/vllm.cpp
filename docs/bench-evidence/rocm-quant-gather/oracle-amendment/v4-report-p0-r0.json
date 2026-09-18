@@ -1,0 +1,51 @@
+{
+  "model": {
+    "bytes": 944192,
+    "sha256": "663597e28852d64097f7a67542675e4575ee158d3c5e6e2143aadd1b4188f4af"
+  },
+  "config": {
+    "bytes": 974,
+    "sha256": "919812c5a2a3cfae586873cc965f0f4b33179a7ca96b8d8b1afcdac88afca71e"
+  },
+  "primary_pin": "e126687a9a828d513c01a07cd69f025f27d63280",
+  "plugin_pin": "d4c1f0d082fc7cd4350da56689109a01c1f29d6c",
+  "prompt": [
+    1,
+    0,
+    63,
+    127,
+    63
+  ],
+  "repeat": 0,
+  "tokens": [],
+  "requested": {
+    "model_dtype": "auto from bfloat16 config",
+    "block_size": 16,
+    "num_gpu_blocks_override": 4,
+    "max_model_len": 64,
+    "max_num_seqs": 1,
+    "kv_cache_dtype": "auto",
+    "seed": 1380926285,
+    "greedy": true,
+    "ignore_eos": true,
+    "max_tokens": 4,
+    "stop": [],
+    "stop_token_ids": []
+  },
+  "harness_adaptations": [
+    "pre-tokenized IDs with skip_tokenizer_init=True",
+    "explicit local HF text config mirrors GGUF geometry",
+    "pinned model_class_overrides selects the registered text class for the plugin architecture key",
+    "top-level partial_rotary_factor=1.0 preserves the GGUF rotary width64 during HF normalization",
+    "no oracle patch or eager-mode override"
+  ],
+  "status": "PENDING: primary model refused before qualification",
+  "torch": "2.12.0+git6bbd260",
+  "torch_git": "6bbd26020da1c6dc198625dfcdd968b1e4e6b1c5",
+  "hip": "7.2.53211",
+  "vllm": "0.28.1rc1.dev132+ge126687a9",
+  "plugin": "0.0.5+d4c1f0d.gfx1100",
+  "exception_type": "RuntimeError",
+  "exception": "Engine core initialization failed. See root cause above. Failed core proc(s): {'EngineCore': 1}",
+  "traceback": "Traceback (most recent call last):\n  File \"/home/vikash/.cache/rdna3-gather-impl/primary-model-v4/primary_model.py\", line 54, in main\n    model = LLM(model=str(args.model), hf_config_path=str(args.config),\n            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/entrypoints/llm.py\", line 343, in __init__\n    self.llm_engine = LLMEngine.from_engine_args(\n                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/v1/engine/llm_engine.py\", line 179, in from_engine_args\n    return cls(\n           ^^^^\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/v1/engine/llm_engine.py\", line 105, in __init__\n    self.engine_core = EngineCoreClient.make_client(\n                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/v1/engine/core_client.py\", line 110, in make_client\n    return SyncMPClient(vllm_config, executor_class, log_stats)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/tracing/otel.py\", line 178, in sync_wrapper\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/v1/engine/core_client.py\", line 813, in __init__\n    super().__init__(\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/v1/engine/core_client.py\", line 609, in __init__\n    with launch_core_engines(\n         ^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.12/contextlib.py\", line 144, in __exit__\n    next(self.gen)\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/v1/engine/utils.py\", line 1240, in launch_core_engines\n    wait_for_engine_startup(\n  File \"/home/vikash/oracle/gfx1100-active-2773/runtime/lib/python3.12/site-packages/vllm/v1/engine/utils.py\", line 1320, in wait_for_engine_startup\n    raise RuntimeError(\nRuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {'EngineCore': 1}\n"
+}

@@ -16,930 +16,10 @@
 // stride-aware page write. PagedAttention uses the CPU-oracle f32 softmax over
 // the host-resident paged cache; mapping vLLM's block-table contract onto
 // ttnn::sdpa_decode is deferred. kQkvSplit is hybrid: device-slice when the
-// merged qkv already has a resident shadow (post MatmulBT), else host memcpy.
-#include "vt/backend.h"
-#include "vt/cpu/cpu_threadpool.h"
-#include "vt/dtype.h"
-#include "vt/ops.h"
-#include "vt/quant.h"
-// This OBJECT library is not the `vllm` target, so it does not inherit the
-// PUBLIC VLLM_CPP_TENSTORRENT define. Force the real declarations; the
-// header's inline no-ops are only for CPU/Vulkan/Windows TUs.
-#ifndef VLLM_CPP_TENSTORRENT
-#define VLLM_CPP_TENSTORRENT
-#endif
-#include "vt/tenstorrent/tenstorrent_device.h"
-
-#include <algorithm>
-#include <array>
-#include <atomic>
-#include <cmath>
-#include <cinttypes>
-#include <cstdint>
-#include <cstdlib>
-#include <cstring>
-#include <execinfo.h>
-#include <limits>
-#include <map>
-#include <mutex>
-#include <optional>
-#include <thread>
-#include <tuple>
-#include <utility>
-#include <vector>
-
-#if defined(__aarch64__)
-#include <arm_neon.h>
-#endif
-
-#include <ttnn/tensor/tensor.hpp>
-#include <ttnn/core.hpp>
-// W4 lever 1 (#2107): the bulk bf16 upload hands the master's own bytes to
-// ttnn::Tensor::from_span<bfloat16> — these two headers provide the element
-// type and the span view it takes.
-#include <tt-metalium/bfloat16.hpp>
-#include <tt_stl/span.hpp>
-// W5 (#2244): the persistent staging route re-uploads through tt-metal's
-// in-place H2D (ttnn::copy_to_device) instead of a fresh from_span creation.
-#include <tt-metalium/mesh_buffer.hpp>
-#include <tt-metalium/mesh_command_queue.hpp>
-#include <ttnn/tensor/tensor_ops.hpp>
-#include <ttnn/tensor/shape/shape.hpp>
-#include <ttnn/operations/matmul/matmul.hpp>
-#include <ttnn/operations/eltwise/binary/binary.hpp>
-#include <ttnn/operations/eltwise/ternary/ternary.hpp>
-#include <ttnn/operations/eltwise/unary/unary.hpp>
-#include <ttnn/operations/experimental/reshape/view.hpp>
-#include <ttnn/operations/embedding/embedding.hpp>
-#include <ttnn/operations/normalization/layernorm/layernorm.hpp>
-#include <ttnn/operations/normalization/rmsnorm/rmsnorm.hpp>
-#include <ttnn/operations/reduction/generic/generic_reductions.hpp>
-#include <ttnn/operations/data_movement/slice/slice.hpp>
-#include <ttnn/operations/data_movement/concat/concat.hpp>
-#include <ttnn/operations/data_movement/permute/permute.hpp>
-#include <ttnn/operations/data_movement/reshape_view/reshape.hpp>
-#include <ttnn/operations/experimental/reshape/view.hpp>
-#include <ttnn/operations/transformer/sdpa_decode/sdpa_decode.hpp>
-#include <ttnn/operations/transformer/sdpa_config.hpp>
-#include <ttnn/operations/trace.hpp>
-#include <ttnn/common/queue_id.hpp>
-// experimental/paged_cache pulls op_profiler which expects a 6-arg
-// ___tracy_alloc_srcloc (with color); the TracyC.h on this tree only has 5-arg.
-// Temporarily disable Tracy for this include chain so the op headers compile.
-#ifdef TRACY_ENABLE
-#undef TRACY_ENABLE
-#define VT_RESTORE_TRACY_ENABLE 1
-#endif
-#include <ttnn/operations/experimental/paged_cache/paged_cache.hpp>
-#include <ttnn/operations/experimental/plusone/plusone.hpp>
-#include <ttnn/operations/core/to_memory_config/to_memory_config_op.hpp>
-#include <ttnn/operations/copy/typecast/typecast.hpp>
-#include <ttnn/operations/data_movement/sharded/interleaved_to_sharded/interleaved_to_sharded.hpp>
-
-// Forward declare clone (header not in installed includes)
-namespace ttnn { Tensor clone(const Tensor&, const std::optional<DataType>&, const std::optional<MemoryConfig>&, const std::optional<DeviceComputeKernelConfig>&); }
-// chunked_scaled_dot_product_attention lives in sdpa.hpp and
-// ttnn::transformer::chunk_gated_delta_rule in its own op header, but neither
-// is in the installed TT-NN include set at our pin; both symbols are exported
-// by TTNN::TTNN's _ttnncpp.so. Forward-declare, link via TTNN (same doctrine
-// as clone above).
-namespace ttnn::transformer {
-ttnn::Tensor chunked_scaled_dot_product_attention(
-    const ttnn::Tensor& input_tensor_q, const ttnn::Tensor& input_tensor_k,
-    const ttnn::Tensor& input_tensor_v, const ttnn::Tensor& page_table_tensor,
-    int64_t chunk_start_idx, std::optional<float> scale = std::nullopt,
-    const std::optional<ttnn::MemoryConfig>& memory_config = std::nullopt,
-    std::optional<ttnn::operations::transformer::SDPAProgramConfig> program_config = std::nullopt,
-    std::optional<ttnn::DeviceComputeKernelConfig> compute_kernel_config = std::nullopt,
-    std::optional<ttnn::operations::transformer::PagedCacheGeometryOverride>
-        paged_cache_geometry = std::nullopt);
-// The GDN chunked scan (BACKEND-TENSTORRENT-GDN W1): the pinned source tree
-// carries ttnn/cpp/ttnn/operations/transformer/chunk_gated_delta_rule/
-// chunk_gated_delta_rule.hpp; the signature below mirrors it 1:1.
-std::tuple<ttnn::Tensor, std::optional<ttnn::Tensor>> chunk_gated_delta_rule(
-    const ttnn::Tensor& q, const ttnn::Tensor& k, const ttnn::Tensor& v,
-    const ttnn::Tensor& g, const ttnn::Tensor& beta,
-    std::optional<float> scale = std::nullopt,
-    const std::optional<ttnn::Tensor>& initial_state = std::nullopt,
-    bool output_final_state = false, uint32_t chunk_size = 64,
-    bool use_qk_l2norm = false, bool output_head_major = false,
-    const std::optional<ttnn::MemoryConfig>& memory_config = std::nullopt,
-    const std::optional<DeviceComputeKernelConfig>& compute_kernel_config = std::nullopt,
-    const std::optional<ttnn::Tensor>& eye = std::nullopt,
-    const std::optional<ttnn::Tensor>& tril = std::nullopt,
-    const std::optional<ttnn::Tensor>& ones = std::nullopt,
-    const std::optional<ttnn::Tensor>& masks = std::nullopt);
-}  // namespace ttnn::transformer
-#include <ttnn/operations/data_movement/copy/copy.hpp>
-#include <ttnn/operations/creation/creation.hpp>
-#include <ttnn/tensor/tensor_ops.hpp>  // create_device_tensor, copy_to_device
-#include <tt-metalium/core_coord.hpp>
-#include <tt-metalium/work_split.hpp>
-// W4b int8-dot (#3031): the raw below-ttnn device kernel path. The host API
-// (CreateProgram/CreateKernelFromString/CreateCircularBuffer/SetRuntimeArgs),
-// the program/workload types, the data-movement kernel config, the CB config,
-// and the mesh-aware TensorAccessorArgs — the last so the kernel reads the
-// staged PACKED words / ROW_MAJOR activation / f32 out through tt-metal's own
-// bank-interleave math instead of hand-rolled DRAM addressing.
-#include <tt-metalium/host_api.hpp>
-#include <tt-metalium/program.hpp>
-#include <tt-metalium/mesh_workload.hpp>
-#include <tt-metalium/distributed.hpp>
-#include <tt-metalium/kernel_types.hpp>
-#include <tt-metalium/circular_buffer.hpp>
-#include <tt-metalium/circular_buffer_config.hpp>
-#include <tt-metalium/tensor_accessor_args.hpp>
-#include <filesystem>
-#include <tt-metalium/experimental/tensor/spec/memory_config/memory_config.hpp>
-// Exact row gather/scatter for the GDN caches (BACKEND-TENSTORRENT-GDN W2):
-// ttnn::gather (data_movement/gather/gather.hpp) and ttnn::indexed_fill
-// (indexed_fill/indexed_fill.hpp) are not in the installed include set at our
-// pin; the declarations below mirror the source-tree signatures 1:1 (same
-// doctrine as the transformer declarations above — the symbols are exported
-// by _ttnncpp.so).
-namespace ttnn {
-Tensor gather(const Tensor& input_tensor, int8_t dim,
-              const Tensor& input_index_tensor, bool sparse_grad,
-              const std::optional<tt::tt_metal::MemoryConfig>& memory_config,
-              std::optional<Tensor> optional_output_tensor = std::nullopt,
-              const std::optional<tt::tt_metal::CoreRangeSet>& sub_core_grids =
-                  std::nullopt);
-Tensor indexed_fill(const Tensor& batch_id, const Tensor& input_tensor_a,
-                     const Tensor& input_tensor_b,
-                     const std::optional<tt::tt_metal::MemoryConfig>& memory_config =
-                         std::nullopt,
-                     int64_t dim = 0);
-// data_movement/transpose/transpose.hpp is also outside the include set.
-Tensor transpose(const Tensor& input_tensor, int64_t dim1, int64_t dim2,
-                 float pad_value = 0.0f);
-}  // namespace ttnn
-#ifdef VT_RESTORE_TRACY_ENABLE
-#define TRACY_ENABLE 1
-#undef VT_RESTORE_TRACY_ENABLE
-#endif
-
-#include <tt-metalium/experimental/tensor/spec/tensor_spec.hpp>
-#include <tt-metalium/experimental/tensor/spec/layout/tensor_layout.hpp>
-#include <tt-metalium/experimental/tensor/spec/layout/page_config.hpp>
-#include <tt-metalium/experimental/tensor/spec/memory_config/memory_config.hpp>
+#include "vt/tenstorrent/tenstorrent_internal.h"
 
 namespace vt::tenstorrent {
 namespace {
-
-// Bisection diagnostic: logs op entry during capture (VT_TT_TRACE_DEBUG).
-#define TT_OP_TRACE(name)                                          \
-  do {                                                             \
-    if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr &&             \
-        tt_capture_active())                                       \
-      std::fprintf(stderr, "[TT-OP] %s\n", name);                  \
-  } while (0)
-
-// ---- Host/device residency -------------------------------------------------
-// vt::Tensor.data is always a host pointer from Backend::Alloc. A shadow map
-// (Metal AllocMap shape) holds an optional device-resident ttnn::Tensor for
-// that host base so multi-op chains need not download after every matmul.
-
-// File-scope capture flag (flipped by TraceBeginCapture/TraceEndCapture) so the
-// residency helpers below can detect readbacks during capture (ttnn prohibits
-// them). Defined here, before the helpers that query it.
-namespace {
-bool& tt_capture_active() {
-  static bool b = false;
-  return b;
-}
-}  // namespace
-
-// KEEPQUANT W3 capture-safety probe (tenstorrent_device.h): staging writes the
-// keep-quant decode performed while a capture was active. The staged arm must
-// hold this at zero across a captured run (the W3 red-first test reads it).
-// The counter lives at internal linkage; the accessors below the file's
-// anonymous namespace give the parity/test TUs the external surface.
-namespace {
-std::atomic<int64_t>& KeepQuantCaptureStagingWritesCounter() {
-  static std::atomic<int64_t>* c = new std::atomic<int64_t>(0);  // never destroyed (#1486)
-  return *c;
-}
-
-// W4a wave-3a: the E=1 slice-decode chunk-rows override (0 = production
-// policy). Internal linkage; the ForTest setter below the anonymous
-// namespace is the external surface (the staging-counter pattern).
-std::atomic<int64_t>& KeepQuantChunkRowsOverride() {
-  static std::atomic<int64_t> v{0};
-  return v;
-}
-}  // namespace
-
-// ITEM 5 (rope): persistent device cos/sin (expanded per head), built OUTSIDE
-// capture and ttnn::copy'd in-region — the UploadRows in RopeApplyDeviceNeox
-// was the enqueue_write that killed capture at mid-layer-0. The cache is
-// keyed by (tokens*heads, half) + the exact host cos/sin CONTENT: if the
-// step's positions changed the table, we must NOT silently reuse a stale
-// cached tensor — during capture that is a hard error (the driver must warm
-// the new table first, the SizeSlot::Refresh pattern).
-namespace {
-std::mutex& RopeCSMutex() {
-  static std::mutex m;
-  return m;
-}
-struct RopeCSEntry {
-  ttnn::Tensor cos;
-  ttnn::Tensor sin;
-  std::vector<float> cos_host;  // content identity for the reuse check
-};
-std::map<std::string, RopeCSEntry>& RopeCSCache() {
-  // Every cache accessor in this file follows this shape: the singleton is
-  // HEAP-ALLOCATED and deliberately never destroyed (#1486). A static-storage
-  // ttnn::Tensor dies in a __run_exit_handlers destructor that unwinds AFTER
-  // tt-metal's own teardown — its deallocate reaches GraphTracker::is_enabled()
-  // on a torn-down tracker and the process SIGSEGVs after an all-green
-  // summary. The destructor registered at first use is always NEWER in the
-  // LIFO exit order than any drain we could register at load, so an exit hook
-  // cannot fix this; not destroying the cache does. The OS reclaims the pages;
-  // the device teardown frees the allocations it backs.
-  static std::map<std::string, RopeCSEntry>* c = new std::map<std::string, RopeCSEntry>();
-  return *c;
-}
-std::string RopeCSKey(uint32_t th, uint32_t half) {
-  return std::to_string(th) + "x" + std::to_string(half);
-}
-}  // namespace
-
-namespace {
-std::mutex& AttnCSMutex() {
-  static std::mutex m;
-  return m;
-}
-// kAttnQkNormRopeGate's per-step cos|sin table [T, rot] f32 TILE at a fixed
-// device address. Same doctrine as RopeCSCache above: content-keyed, and a
-// captured op must never see the tensor replaced under it — the refresh is an
-// in-place copy_to_device (WarmRopeCosSin's).
-struct AttnCSEntry {
-  ttnn::Tensor cs;
-  std::vector<float> cs_host;  // content identity for the reuse check
-};
-std::map<std::string, AttnCSEntry>& AttnCSCache() {
-  // Heap-allocated, never destroyed (#1486 — every cache accessor here).
-  static std::map<std::string, AttnCSEntry>* c =
-      new std::map<std::string, AttnCSEntry>();
-  return *c;
-}
-std::string AttnCSKey(uint32_t t, uint32_t rot) {
-  return std::to_string(t) + "x" + std::to_string(rot);
-}
-}  // namespace
-
-namespace {
-std::mutex& ZeroCacheMutex() {
-  static std::mutex m;
-  return m;
-}
-std::map<std::string, ttnn::Tensor>& ZeroCache() {
-  static std::map<std::string, ttnn::Tensor>* c = new std::map<std::string, ttnn::Tensor>(); // never destroyed (#1486)
-  return *c;
-}
-std::string ZeroCacheKey(const ttnn::Shape& shape, ttnn::DataType dt,
-                         ttnn::Layout lt) {
-  std::string k;
-  for (auto d : shape.view()) k += std::to_string(d) + "x";
-  k += std::to_string(static_cast<int>(dt)) + "x" +
-       std::to_string(static_cast<int>(lt));
-  return k;
-}
-}  // namespace
-
-ttnn::Tensor ZeroCacheGet(const ttnn::Shape& shape, ttnn::DataType dt,
-                          ttnn::Layout lt, MeshDevice& device) {
-  const std::string key = ZeroCacheKey(shape, dt, lt);
-  std::lock_guard<std::mutex> g(ZeroCacheMutex());
-  auto& c = ZeroCache();
-  auto it = c.find(key);
-  if (it == c.end()) {
-    VT_CHECK(!tt_capture_active(),
-             "tenstorrent: zero-cache miss during capture — warm the "
-             "host-free path eagerly (VT_TT_HOST_FREE_DECODE warmup) first");
-    it = c.emplace(key, ttnn::zeros(shape, dt, lt, std::ref(device))).first;
-  }
-  return it->second;
-}
-
-ttnn::Tensor ZeroCacheGet(const ttnn::Tensor& like, MeshDevice& device) {
-  return ZeroCacheGet(like.logical_shape(), like.dtype(), like.layout(),
-                      device);
-}
-
-void ZeroCachePrime(const ttnn::Shape& shape, ttnn::DataType dt,
-                    ttnn::Layout lt, MeshDevice& device) {
-  const std::string key = ZeroCacheKey(shape, dt, lt);
-  std::lock_guard<std::mutex> g(ZeroCacheMutex());
-  auto& c = ZeroCache();
-  if (c.find(key) == c.end()) {
-    c.emplace(key, ttnn::zeros(shape, dt, lt, std::ref(device)));
-  }
-}
-
-
-struct BufferSlot {
-  void* host = nullptr;
-  size_t bytes = 0;
-  std::optional<ttnn::Tensor> device;
-  uint32_t dev_rows = 0;
-  uint32_t dev_cols = 0;
-  bool host_current = true;    // host bytes match the latest value
-  bool device_current = false; // device tensor matches the latest value
-  // #2812: the gemma (w+1) F32 baked affine form, staged once and reused.
-  // Separate from `device` (the raw BF16 form EnsureAffine1D caches) so a
-  // non-gemma consumer of the same buffer never reads the +1 values. The
-  // per-call transient upload this replaces is a host write, which a trace
-  // capture forbids — the Qwen3.5 captured arm fatalled here on every norm.
-  std::optional<ttnn::Tensor> gemma_device;
-  // tenant (MarkScratchAcquired) and no producer has established its content
-  // yet. The resident allocation and the host bytes both hold the PREVIOUS
-  // tenant's bytes — undefined for the new tenant, whose pending device op
-  // overwrites the buffer it is served. EnsureDevice2D therefore stages
-  // NOTHING for a reserved slot: it serves the resident persistent buffer at
-  // the same geometry, or hands out an empty one at a new geometry. Restage
-  // semantics: the service ALIASES the slot's persistent buffer in place (W5)
-  // — no fresh snapshot is created. The shadow-installing transitions clear
-  // the flag (CommitHost, MarkHostWritten, the device commits, the staging
-  // commits, the memset/copy arms); paths that install content without
-  // spending it (the plain staging arm, the embed-table patch) are still safe
-  // because they set device_current, and the reserved arm refuses whenever
-  // device_current is set — a leaked flag can cost a restage but never
-  // discards a live shadow (the #2282 drift: a stale [5,1024] persistent
-  // served over a live [8,256] commit poisoned prompt 1's first token).
-  bool device_reserved = false;
-  // BACKEND-TENSTORRENT-GDN W2: the conv-state shadow is stored TIME-MAJOR
-  // ([sl+1, slots*C], one scratch row) because ttnn slice/concat are exact on
-  // dim 0 only at this pin (sub-tile last-dim slice/concat is broken — see
-  // the W2 evidence). When set, host materialization transposes back into
-  // the caller's [slots, C, sl] byte order. Cleared by every commit/host
-  // write that replaces the shadow with a different layout.
-  bool conv_transposed = false;
-  uint32_t conv_slots = 0, conv_c = 0, conv_sl = 0;
-  // BACKEND-TENSTORRENT-QWEN35 W5 (#2244): the slot's PERSISTENT staged-device
-  // buffer. Allocated once per (slot, staging geometry) by the bulk bf16 arm
-  // and rewritten IN PLACE through the mesh command queue on every later
-  // staging, so an identical-geometry upload no longer pays from_span's fresh
-  // MeshBuffer allocation / tensor creation path. `device` above remains the
-  // consumer-visible shadow (dropped by every host write, replaced by commits
-  // and reshapes); `persistent` survives those drops and holds the resident
-  // device allocation. Its content is only ever observed through a shadow
-  // that a full staging write has just refreshed, so a stale resident buffer
-  // is unreachable. The slot lives in the never-destroyed Slots() map
-  // (#1486), so the tensor is never destroyed after tt-metal teardown.
-  std::optional<ttnn::Tensor> persistent;
-  uint32_t persist_rows = 0, persist_cols = 0;
-};
-
-std::mutex& SlotMutex() {
-  static std::mutex m;
-  return m;
-}
-std::map<uintptr_t, BufferSlot>& Slots() {
-  static std::map<uintptr_t, BufferSlot>* m = new std::map<uintptr_t, BufferSlot>(); // never destroyed (#1486)
-  return *m;
-}
-
-// Base slot for `p` or any interior pointer into a registered allocation.
-BufferSlot* FindSlot(void* p) {
-  if (p == nullptr) return nullptr;
-  auto& m = Slots();
-  const uintptr_t key = reinterpret_cast<uintptr_t>(p);
-  auto it = m.upper_bound(key);
-  if (it == m.begin()) return nullptr;
-  --it;
-  BufferSlot& s = it->second;
-  const uintptr_t base = reinterpret_cast<uintptr_t>(s.host);
-  if (key < base || key >= base + s.bytes) return nullptr;
-  return &s;
-}
-
-tt::tt_metal::TensorSpec SpecOf(tt::tt_metal::Shape shape, ttnn::DataType dtype,
-                                ttnn::Layout layout) {
-  return tt::tt_metal::TensorSpec(
-      std::move(shape),
-      tt::tt_metal::TensorLayout(dtype, tt::tt_metal::PageConfig(layout),
-                                 tt::tt_metal::MemoryConfig{}));
-}
-
-tt::tt_metal::TensorSpec TileSpecOf(uint32_t rows, uint32_t cols) {
-  return SpecOf(tt::tt_metal::Shape({rows, cols}), ttnn::DataType::BFLOAT16,
-                ttnn::Layout::TILE);
-}
-
-// OPT-125m (and the rest of the dense path) runs BF16 weights/activations with
-// F32 logits. Host-stage every float dtype to f32 for from_vector, then round
-// back on download — ttnn already computes in BFLOAT16 tiles.
-float LoadElemF32(const Tensor& t, int64_t i) {
-  switch (t.dtype) {
-    case DType::kF32: return t.Ptr<float>()[i];
-    case DType::kBF16: return BF16ToF32(t.Ptr<uint16_t>()[i]);
-    case DType::kF16: return F16ToF32(t.Ptr<uint16_t>()[i]);
-    default: VT_CHECK(false, "tenstorrent: unsupported float dtype"); return 0.0f;
-  }
-}
-
-void StoreElemF32(Tensor& t, int64_t i, float v) {
-  switch (t.dtype) {
-    case DType::kF32: t.Ptr<float>()[i] = v; break;
-    case DType::kBF16: t.Ptr<uint16_t>()[i] = F32ToBF16(v); break;
-    default: VT_CHECK(false, "tenstorrent: unsupported out dtype (f32/bf16)");
-  }
-}
-
-bool IsFloatDType(DType d) {
-  return d == DType::kF32 || d == DType::kBF16 || d == DType::kF16;
-}
-
-namespace {
-std::string DevShapeStr(const ttnn::Tensor& t) {
-  const auto s = t.logical_shape();
-  std::string r;
-  for (uint32_t i = 0; i < s.rank(); ++i) {
-    if (i != 0) r += 'x';
-    r += std::to_string(s[i]);
-  }
-  r += " dt=" + std::to_string(static_cast<int>(t.dtype())) +
-       " lay=" + std::to_string(static_cast<int>(t.layout()));
-  return r;
-}
-}  // namespace
-
-void DownloadToHost(ttnn::Tensor& dev, Tensor& out, const char* ctx) {
-  if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr && tt_capture_active())
-    std::fprintf(stderr, "[TT-TRACE] to_vector readback DURING CAPTURE\n");
-  std::vector<float> result = dev.to_vector<float>();
-  if (result.size() != static_cast<size_t>(out.Numel())) {
-    void* bt[8];
-    const int nbt = ::backtrace(bt, 8);
-    char** sym = ::backtrace_symbols(bt, nbt);
-    std::fprintf(stderr, "[TT-SLOT] MISMATCH self=%p frames=%d\n",
-                 reinterpret_cast<const void*>(&DownloadToHost), nbt);
-    for (int i = 0; sym != nullptr && i < nbt; ++i)
-      std::fprintf(stderr, "[TT-SLOT]   bt[%d]=%p %s\n", i, bt[i], sym[i]);
-    std::fflush(stderr);
-    std::free(sym);
-  }
-  VT_CHECK(static_cast<int64_t>(result.size()) == out.Numel(),
-           std::string("tenstorrent: unexpected result size: got ") +
-               std::to_string(result.size()) + " want " +
-               std::to_string(out.Numel()) + " out_shape=" +
-               std::to_string(out.shape[0]) + "x" + std::to_string(out.shape[1]) +
-               "x" + std::to_string(out.shape[2]) + "x" + std::to_string(out.shape[3]) +
-               " rank=" + std::to_string(out.rank) +
-               " ctx=" + std::string(ctx) +
-               " dev[" + DevShapeStr(dev) + "]");
-  for (int64_t i = 0; i < out.Numel(); ++i)
-    StoreElemF32(out, i, result[static_cast<size_t>(i)]);
-}
-
-// Pull device → host if the host view is stale (required before host kernels).
-void EnsureHost(Tensor& t) {
-  std::lock_guard<std::mutex> g(SlotMutex());
-  BufferSlot* s = FindSlot(t.data);
-  if (s == nullptr || s->host_current) return;
-  VT_CHECK(s->device_current && s->device.has_value(),
-           "tenstorrent: EnsureHost with no current device or host copy");
-  if (std::getenv("VT_TT_SLOT_TRACE") != nullptr)
-    std::fprintf(stderr,
-                 "[TT-SLOT] ensure t=%p numel=%" PRId64
-                 " slot=%p bytes=%zu dev=%ux%u dt=%d ht=%d dc=%d ct=%d\n",
-                 static_cast<const void*>(t.data), t.Numel(),
-                 static_cast<void*>(s->host), s->bytes, s->dev_rows,
-                 s->dev_cols, static_cast<int>(s->device->dtype()),
-                 s->host_current, s->device_current, s->conv_transposed);
-  if (s->conv_transposed) {
-    std::vector<float> v = s->device->to_vector<float>();
-    for (int64_t i = 0; i < t.Numel(); ++i) {
-      // host[s*C*sl + c*sl + j] == device[j*R + s*C + c]
-      const int64_t j = i % s->conv_sl, rc = i / s->conv_sl;
-      const int64_t col = rc % s->conv_c, slot = rc / s->conv_c;
-      StoreElemF32(t, i, v[static_cast<size_t>(j * (s->conv_slots * s->conv_c) +
-                                               slot * s->conv_c + col)]);
-    }
-    s->host_current = true;
-    return;
-  }
-  DownloadToHost(*s->device, t, "EnsureHost");
-  s->host_current = true;
-}
-
-void EnsureHost(const Tensor& t) {
-  // const_cast: host bytes are filled in place; logical tensor is unchanged.
-  EnsureHost(const_cast<Tensor&>(t));
-}
-
-std::vector<float> ToHostF32(const Tensor& t) {
-  EnsureHost(t);
-  const int64_t n = t.Numel();
-  std::vector<float> host(static_cast<size_t>(n));
-  for (int64_t i = 0; i < n; ++i) host[static_cast<size_t>(i)] = LoadElemF32(t, i);
-  return host;
-}
-
-ttnn::Tensor UploadRows(const float* data, uint32_t rows, uint32_t cols, MeshDevice& device) {
-  if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr && tt_capture_active())
-    std::fprintf(stderr, "[TT-UP] UploadRows ptr=%p rows=%u cols=%u\n",
-                 static_cast<const void*>(data), rows, cols);
-  std::vector<float> host(data, data + static_cast<size_t>(rows) * cols);
-  if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr && tt_capture_active())
-    std::fprintf(stderr, "[TT-UP] UploadRows from_vector WRITE during capture\n");
-  return ttnn::Tensor::from_vector<float>(host, TileSpecOf(rows, cols), &device);
-}
-
-// ---- BACKEND-TENSTORRENT-QWEN35 W4 (#2107): bulk staging counters ----
-// Incremented by EnsureDevice2D's two staging routes; read through the
-// tenstorrent_device.h API (GetStagingStats below) so the W4 route pin is
-// evidence, not assumption. At vt::tenstorrent scope so both the staging
-// paths above and the readers below see them.
-std::atomic<uint64_t>& StagingBulkUploads() {
-  static std::atomic<uint64_t> v{0};
-  return v;
-}
-std::atomic<uint64_t>& StagingBulkBytes() {
-  static std::atomic<uint64_t> v{0};
-  return v;
-}
-std::atomic<uint64_t>& StagingF32Elems() {
-  static std::atomic<uint64_t> v{0};
-  return v;
-}
-// W5 (#2244): the persistent-route counters — in-place mesh CQ writes into
-// the per-slot buffer, the (re)allocations of that buffer, and the bytes
-// pushed through it. Read through GetStagingStats below.
-std::atomic<uint64_t>& StagingPersistentWrites() {
-  static std::atomic<uint64_t> v{0};
-  return v;
-}
-std::atomic<uint64_t>& StagingPersistentAllocs() {
-  static std::atomic<uint64_t> v{0};
-  return v;
-}
-std::atomic<uint64_t>& StagingPersistentBytes() {
-  static std::atomic<uint64_t> v{0};
-  return v;
-}
-// BACKEND-TENSTORRENT-QWEN35 W7 (#2282): staging writes the precise-residency
-// arms eliminate, one counter per class — reservation (EnsureDevice2D serving
-// a pool-acquired block from its resident allocation), device_memset
-// (MemsetDeviceFill keeping the shadow across an eager full-slot zero-fill),
-// device_copy (CopyDeviceDeviceIfResident skipping the download+restage pair).
-std::atomic<uint64_t>& StagingAvoidedReservation() {
-  static std::atomic<uint64_t> v{0};
-  return v;
-}
-std::atomic<uint64_t>& StagingAvoidedMemset() {
-  static std::atomic<uint64_t> v{0};
-  return v;
-}
-std::atomic<uint64_t>& StagingAvoidedDeviceCopy() {
-  static std::atomic<uint64_t> v{0};
-  return v;
-}
-
-// W4 lever 1 (#2107): bulk upload of a contiguous bf16 master. The host
-// bytes ARE the payload: one from_span over the tensor's own memory — no f32
-// intermediate, no per-element dtype dispatch, no extra vector copy, and no
-// bfloat16::from_float round-trip on the ttnn side. Bit-identical to the f32
-// path: bf16→f32 widening is exact, and packing a value whose low 16 mantissa
-// bits are zero back to bf16 returns the same bits under any rounding rule.
-//
-// W5 (#2244): the upload no longer pays tt-metal's per-upload creation path
-// on every step. A tracked base slot stages through its PERSISTENT device
-// buffer: the first staging for a geometry runs the full from_span creation
-// (and the buffer stays resident in the slot); every later staging packs the
-// host bytes with the SAME function from_span calls (tt-metal
-// host_tensor_from_span_with_pad_value, ttnn/core/tensor/tensor.cpp:170) and
-// writes them through tt-metal's in-place H2D — ttnn::copy_to_device into the
-// resident MeshTensor, which reaches MeshCommandQueue::enqueue_write /
-// enqueue_write_shards against the existing buffer. No fresh MeshBuffer, no
-// cluster/chip rediscovery, no new tensor attributes. The bytes on the device
-// are the same packed bytes from_span writes, into a buffer of the same
-// geometry, fully overwritten each time: bit-identical. Untracked pointers
-// and interior views keep the anonymous from_span arm (W2c: a view must
-// never store against the base slot).
-ttnn::Tensor UploadRowsBf16(const Tensor& t, uint32_t rows, uint32_t cols,
-                            MeshDevice& device) {
-  if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr && tt_capture_active())
-    std::fprintf(stderr, "[TT-UP] UploadRowsBf16 from_span WRITE during capture ptr=%p rows=%u cols=%u\n",
-                 (const void*)t.data, rows, cols);
-  const size_t n = static_cast<size_t>(rows) * static_cast<size_t>(cols);
-  // The bytes at t.Ptr are the window's own bf16 bits (bfloat16 is a 2-byte
-  // class wrapping the same uint16 pattern).
-  const bfloat16* src = reinterpret_cast<const bfloat16*>(t.Ptr<uint16_t>());
-  // Short locked probe: resolve the persistent buffer once. The CQ write runs
-  // OUTSIDE the lock — the same probe/upload/re-lock discipline EnsureDevice2D
-  // uses — and the copied handle (shared TensorAttributes) keeps the resident
-  // MeshBuffer alive even if the slot is unregistered mid-upload.
-  std::optional<ttnn::Tensor> persistent;
-  bool tracked_base = false;
-  {
-    std::lock_guard<std::mutex> g(SlotMutex());
-    BufferSlot* s = FindSlot(t.data);
-    tracked_base = (s != nullptr && t.data == s->host);
-    if (tracked_base && s->persistent.has_value() &&
-        s->persist_rows == rows && s->persist_cols == cols) {
-      persistent = s->persistent;
-    }
-  }
-  if (!tracked_base) {
-    // Untracked pointer or interior view (W2c): anonymous staging, no
-    // persistent buffer, no W5 counters — the caller's bulk counters still see it.
-    return ttnn::Tensor::from_span(ttsl::Span<const bfloat16>(src, n),
-                                   TileSpecOf(rows, cols), &device);
-  }
-  if (persistent.has_value()) {
-    // In-place arm. Host half: exactly the packing from_span performs
-    // (tt-metal ttnn/core/tensor/tensor.cpp:170 — same function, same spec,
-    // same pad), with no device argument so no device work happens. Device
-    // half: tt-metal's own in-place H2D (ttnn/core/tensor/tensor_ops.cpp:161
-    // copy_to_device → enqueue_write_tensor into the EXISTING MeshTensor,
-    // tt_metal/impl/tensor/tensor_apis.cpp:149) — the same write path
-    // from_span's to_device takes, minus the fresh MeshBuffer allocation and
-    // tensor creation. Bytes on the device are the same packed bytes, into a
-    // buffer of the same geometry, fully overwritten: bit-identical.
-    if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr && tt_capture_active())
-      std::fprintf(stderr, "[TT-UP] UploadRowsBf16 persistent enqueue_write during capture ptr=%p rows=%u cols=%u\n",
-                   (const void*)t.data, rows, cols);
-    ttnn::Tensor host = ttnn::Tensor::from_span(ttsl::Span<const bfloat16>(src, n),
-                                                TileSpecOf(rows, cols),
-                                                /*device=*/nullptr);
-    ttnn::copy_to_device(host, *persistent);
-    StagingPersistentWrites().fetch_add(1, std::memory_order_relaxed);
-    StagingPersistentBytes().fetch_add(static_cast<uint64_t>(n) * 2,
-                                       std::memory_order_relaxed);
-    return *persistent;
-  }
-  // Allocating arm (cold slot or staging-geometry change): the full W4
-  // creation path, and the returned tensor becomes the slot's persistent
-  // buffer. The stale resident buffer, if any, is released here.
-  ttnn::Tensor dev = ttnn::Tensor::from_span(ttsl::Span<const bfloat16>(src, n),
-                                             TileSpecOf(rows, cols), &device);
-  {
-    std::lock_guard<std::mutex> g(SlotMutex());
-    BufferSlot* s = FindSlot(t.data);
-    if (s != nullptr && t.data == s->host) {
-      s->persistent = dev;
-      s->persist_rows = rows;
-      s->persist_cols = cols;
-    }
-  }
-  StagingPersistentWrites().fetch_add(1, std::memory_order_relaxed);
-  StagingPersistentAllocs().fetch_add(1, std::memory_order_relaxed);
-  StagingPersistentBytes().fetch_add(static_cast<uint64_t>(n) * 2,
-                                     std::memory_order_relaxed);
-  return dev;
-}
-
-// ---- Persistent weight-view staging (TILE BF16 on device) ------------------
-ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device);
-// MatmulBT receives interior weight views: the packed GDN projections are
-// Slice'd per call (qwen3_5.cpp qkvz/z splits), and EnsureDevice2D refuses to
-// serve an interior view from the base's tracked staging (W2c: those are the
-// wrong offset's bytes). The view therefore re-staged anonymously on every
-// call — a per-call host write that trace capture forbids (#2812: the
-// Qwen3.5-0.8B captured battery fatalled in exactly this arm, fd_mesh_command_queue.cpp:760,
-// 2/2 deterministic) and a pure eager tax. Key the shadow by the VIEW's own
-// data pointer plus its geometry: a view's address is stable for the model's
-// lifetime (the parent host buffer outlives the step loop), and a recycled
-// address must also match rows x cols to collide. Weight windows are
-// immutable after load; if a mutable weight window ever appears, its parent's
-// MarkHostWritten must drop the views' shadows the way DropEmbedTableShadow
-// does for the vocab table.
-struct WeightViewShadow {
-  std::optional<ttnn::Tensor> device;
-  uint32_t rows = 0, cols = 0;
-};
-std::mutex& WeightViewMutex() {
-  static std::mutex m;
-  return m;
-}
-std::map<uintptr_t, WeightViewShadow>& WeightViewShadows() {
-  static std::map<uintptr_t, WeightViewShadow>* m =
-      new std::map<uintptr_t, WeightViewShadow>(); // never destroyed (#1486)
-  return *m;
-}
-
-// True iff `t` is a rank-2 contiguous tensor whose pointer is a tracked BASE
-// (EnsureDevice2D's fast-path condition). Views and untracked pointers are
-// the ones EnsureDevice2D stages anonymously.
-bool IsTrackedBase2D(const Tensor& t) {
-  if (t.rank != 2 || !t.IsContiguous()) return false;
-  std::lock_guard<std::mutex> g(SlotMutex());
-  BufferSlot* s = FindSlot(t.data);
-  return s != nullptr && t.data == s->host;
-}
-
-// Persistent device staging for an interior/untracked BF16 weight view.
-// Stages the window's own bytes once (the same from_span the anonymous arm
-// runs, so the packed device bytes are identical) and reuses the resident
-// tensor from then on — capture-safe and eager-cheap.
-ttnn::Tensor EnsureWeightViewDevice(const Tensor& t, MeshDevice& device) {
-  VT_CHECK(t.rank == 2 && t.IsContiguous() && t.dtype == DType::kBF16,
-           "tenstorrent EnsureWeightViewDevice: contiguous rank-2 bf16");
-  const uint32_t rows = static_cast<uint32_t>(t.shape[0]);
-  const uint32_t cols = static_cast<uint32_t>(t.shape[1]);
-  const uintptr_t key = reinterpret_cast<uintptr_t>(t.data);
-  {
-    std::lock_guard<std::mutex> g(WeightViewMutex());
-    auto it = WeightViewShadows().find(key);
-    if (it != WeightViewShadows().end() && it->second.device.has_value() &&
-        it->second.rows == rows && it->second.cols == cols) {
-      return *it->second.device;
-    }
-  }
-  EnsureHost(t);
-  const size_t n = static_cast<size_t>(rows) * static_cast<size_t>(cols);
-  if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr && tt_capture_active())
-    std::fprintf(stderr,
-                 "[TT-UP] EnsureWeightViewDevice from_span WRITE during "
-                 "capture ptr=%p rows=%u cols=%u\n",
-                 t.data, rows, cols);
-  ttnn::Tensor dev = ttnn::Tensor::from_span(
-      ttsl::Span<const bfloat16>(static_cast<const bfloat16*>(t.data), n),
-      TileSpecOf(rows, cols), &device);
-  // The view stage IS a bulk bf16 staging: report it through the same
-  // counters EnsureDevice2D's bf16 arm bumps, so the W4 contract ("each view
-  // stage is its own bulk upload") holds for the shadow arm too. Later calls
-  // serve the resident shadow and, like a resident serve there, count nothing.
-  StagingBulkUploads().fetch_add(1, std::memory_order_relaxed);
-  StagingBulkBytes().fetch_add(static_cast<uint64_t>(n) * 2,
-                               std::memory_order_relaxed);
-  std::lock_guard<std::mutex> g(WeightViewMutex());
-  WeightViewShadow& s = WeightViewShadows()[key];
-  s.device = dev;
-  s.rows = rows;
-  s.cols = cols;
-  return dev;
-}
-
-// MatmulBT's weight staging: tracked bases keep EnsureDevice2D's fast path;
-// interior views get the persistent shadow instead of the per-call anonymous
-// staging.
-ttnn::Tensor EnsureMatmulWeightDevice(const Tensor& b, MeshDevice& device) {
-  if (b.dtype == DType::kBF16 && !IsTrackedBase2D(b))
-    return EnsureWeightViewDevice(b, device);
-  return EnsureDevice2D(b, device);
-}
-
-// Return a TILE BFLOAT16 device tensor for rank-2 `t`, uploading only when the
-// device shadow is missing or stale. Same-numel reshape reuses a resident
-// shadow without host round-trip — needed so qk-RmsNorm on a [T*H, Dh] view
-// can consume QkvSplit's [T, H*Dh] device result.
-ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device) {
-  VT_CHECK(t.rank == 2 && t.IsContiguous(),
-           "tenstorrent: EnsureDevice2D expects contiguous rank-2");
-  const uint32_t rows = static_cast<uint32_t>(t.shape[0]);
-  const uint32_t cols = static_cast<uint32_t>(t.shape[1]);
-  // The per-slot cache describes the BASE allocation. An interior view
-  // (e.g. packed_weight.Slice(0, Hv, 2*Hv) fed to a matmul) resolves to the
-  // base slot but must NEVER hit nor store against it: the cached tensor is
-  // the BASE's staging, and returning it for a differently-offset view makes
-  // the consumer read another slice's bytes (Qwen3.5 BA: TT computed the `a`
-  // projection with the `b` weight rows — BACKEND-TENSTORRENT-QWEN35 W2c).
-  bool tracked_base = false;
-  bool need_host_refresh = false;
-  bool reserved_base = false;
-  {
-    // W4 lever 2 (#2107): ONE locked probe resolves everything this call
-    // needs — the tracked fast paths (exact-shape hit and same-numel
-    // reshape), the interior-view refusal, and whether the base's host
-    // master must be pulled back from the device before its bytes are read.
-    // The pre-W4 shape re-probed the slot map under the mutex up to four
-    // times per call.
-    std::lock_guard<std::mutex> g(SlotMutex());
-    BufferSlot* s = FindSlot(t.data);
-    tracked_base = (s != nullptr && t.data == s->host);
-    reserved_base = tracked_base && s->device_reserved;
-    if (tracked_base && s->device_current && s->device.has_value()) {
-      if (s->dev_rows == rows && s->dev_cols == cols) {
-        return *s->device;
-      }
-      const uint64_t have =
-          static_cast<uint64_t>(s->dev_rows) * static_cast<uint64_t>(s->dev_cols);
-      const uint64_t want = static_cast<uint64_t>(rows) * static_cast<uint64_t>(cols);
-      if (have == want) {
-        ttnn::Tensor reshaped =
-            ttnn::reshape(*s->device, ttnn::Shape({rows, cols}));
-        s->device = reshaped;
-        s->dev_rows = rows;
-        s->dev_cols = cols;
-        return *s->device;
-      }
-    }
-    // Interior view over a base whose host master is neither current nor
-    // device-refreshable would read stale bytes — refuse loudly, the same
-    // state the post-refresh check below the old probe observed.
-    need_host_refresh = (s != nullptr && s->device_current && !s->host_current);
-    VT_CHECK(tracked_base || s == nullptr || need_host_refresh || s->host_current,
-             "tenstorrent: EnsureDevice2D interior view of a device-current "
-             "base is unsupported (would read stale bytes); stage via the "
-             "base tensor");
-  }
-  // The reservation arm is bf16-only: it serves the slot's W5 persistent
-  // staging buffer (BFLOAT16/TILE) or a fresh BFLOAT16 empty, so a master of
-  // any other dtype taking the arm would receive a bf16 device tensor for its
-  // declared dtype. A non-bf16 master whose first device use lands on an
-  // acquired block falls through to the normal staging path below, whose f32
-  // arm keeps the declared dtype (the W7 invariant).
-  if (reserved_base && t.dtype == DType::kBF16) {
-    // W7 (#2282) reservation: see BufferSlot::device_reserved. The previous
-    // tenant's bytes sit on BOTH sides and the new tenant's pending device op
-    // overwrites the buffer it is served — stage NOTHING. Serve the resident
-    // persistent allocation at the same geometry, or hand out an empty one at
-    // a new geometry (no bytes move in either direction). Restage semantics:
-    // the service ALIASES the slot's persistent buffer in place (W5), it does
-    // not create a fresh snapshot. The re-check under the lock covers a host
-    // write that raced the probe: once the bytes are real, the upload
-    // contract applies again.
-    bool served = false;
-    ttnn::Tensor dev;
-    {
-      std::lock_guard<std::mutex> g(SlotMutex());
-      BufferSlot* s = FindSlot(t.data);
-      // The reservation describes a slot whose bytes are still the previous
-      // tenant's on both sides. A live shadow means some producer already
-      // established the content — serving the resident persistent buffer here
-      // would discard it and hand the consumer stale bytes (the W7 drift,
-      // #2282). Refuse: the normal paths below serve or restage the truth.
-      if (s != nullptr && t.data == s->host && s->device_reserved &&
-          !s->device_current) {
-        if (s->persistent.has_value() && s->persist_rows == rows &&
-            s->persist_cols == cols) {
-          dev = *s->persistent;
-        } else {
-          dev = ttnn::empty(ttnn::Shape({rows, cols}), ttnn::DataType::BFLOAT16,
-                            ttnn::Layout::TILE, &device, ttnn::MemoryConfig{});
-        }
-        s->device = dev;
-        s->dev_rows = rows;
-        s->dev_cols = cols;
-        s->device_current = true;
-        s->host_current = false;
-        s->device_reserved = false;
-        StagingAvoidedReservation().fetch_add(1, std::memory_order_relaxed);
-        served = true;
-      }
-    }
-    if (served) return dev;
-  }
-  if (need_host_refresh) EnsureHostBytes(t.data);
-  // HOST-FREE-FORWARD defect: this loop consumed HOST bytes without checking
-  // slot residency. Under host-free decode a producer commits device-only
-  // (host_current=false), so the next consumer staging through here uploaded
-  // pool-fresh zeros and then marked the slot host_current=true — corrupting
-  // both the value and the record. Refresh the host bytes from the device
-  // shadow before reading them.
-  EnsureHostBytes(t.data);
-  ttnn::Tensor dev;
-  if (t.dtype == DType::kBF16) {
-    // W4 lever 1 (#2107): contiguous bf16 masters skip the f32 intermediate
-    // entirely — the raw window bytes go to the device in one from_span.
-    dev = UploadRowsBf16(t, rows, cols, device);
-    StagingBulkUploads().fetch_add(1, std::memory_order_relaxed);
-    StagingBulkBytes().fetch_add(static_cast<uint64_t>(rows) * cols * 2,
-                                 std::memory_order_relaxed);
-  } else {
-    // f16/f32 masters keep the f32 reference arm (genuine conversion); the
-    // element count is hoisted — the old loop evaluated Numel() per element.
-    const int64_t n = t.Numel();
-    std::vector<float> host(static_cast<size_t>(n));
-    for (int64_t i = 0; i < n; ++i)
-      host[static_cast<size_t>(i)] = LoadElemF32(t, i);
-    dev = UploadRows(host.data(), rows, cols, device);
-    StagingF32Elems().fetch_add(static_cast<uint64_t>(n),
-                                std::memory_order_relaxed);
-  }
-  if (HostFreeDecodeEnabled()) {
-    // Prime the persistent-zero cache for this spec during the eager warmup
-    // (capture-safe zeroing replays ttnn::copy(zero, dst) — see MemsetDevice).
-    ZeroCachePrime(ttnn::Shape({rows, cols}), ttnn::DataType::BFLOAT16,
-                   ttnn::Layout::TILE, device);
-  }
-  std::lock_guard<std::mutex> g(SlotMutex());
-  BufferSlot* s = FindSlot(t.data);
-  if (s != nullptr && t.data == s->host) {
-    s->device = dev;
-    s->dev_rows = rows;
-    s->dev_cols = cols;
-    s->device_current = true;
-    s->host_current = true;
-  }
-  return dev;
-}
-
-// DEBUG (BACKEND-TENSTORRENT-QWEN35 W2c): ensure the tensor is staged on
-// device exactly as a consuming kernel would, then read the DEVICE copy back.
-// Comparing this against the host master exposes staging corruption that a
-// host-side dump cannot see.
-// True when `t` already has a device-resident shadow matching [rows, cols]
-// (exact shape). Used to pick device vs host kernels without forcing upload.
-bool DeviceShadowExact(const Tensor& t, uint32_t rows, uint32_t cols) {
-  std::lock_guard<std::mutex> g(SlotMutex());
-  BufferSlot* s = FindSlot(t.data);
-  return s != nullptr && s->device_current && s->device.has_value() &&
-         s->dev_rows == rows && s->dev_cols == cols;
-}
 
 // ---- Paged KV device shadows (ttnn layout) ---------------------------------
 // Host keeps vLLM NHD [nb, block, nkv, d] (LMCache/plane). Device PA needs
@@ -1664,6 +744,7 @@ ttnn::Tensor EnsureEmbedTableDevice(const Tensor& table, MeshDevice& device) {
   std::vector<float> host_table = ToHostF32(table);
   if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr && tt_capture_active())
     std::fprintf(stderr, "[TT-UP] EnsureEmbedTableDevice from_vector WRITE during capture\n");
+  AllocTraceSnapshot(device, "EnsureEmbedTableDevice/pre");
   ttnn::Tensor dev_table = ttnn::Tensor::from_vector<float>(
       host_table,
       SpecOf(tt::tt_metal::Shape({vocab, h}), ttnn::DataType::BFLOAT16, ttnn::Layout::ROW_MAJOR),
@@ -1673,6 +754,7 @@ ttnn::Tensor EnsureEmbedTableDevice(const Tensor& table, MeshDevice& device) {
   s.device = dev_table;
   s.vocab = vocab;
   s.h = h;
+  AllocTraceSnapshot(device, "EnsureEmbedTableDevice/post");
   return dev_table;
 }
 
@@ -1814,6 +896,10 @@ int KeepQuantWordsPerBlock(DType enc) {
     case DType::kQ5_K: return 48;
     case DType::kQ6_K: return 64;
     case DType::kQ8_0: return 16;
+    case DType::kIQ3_XXS: return 32;  // 98 B zero-padded to 128 B
+    case DType::kIQ2_XXS: return 32;  // 66 B zero-padded to 128 B
+    case DType::kIQ2_S: return 32;    // 82 B zero-padded to 128 B
+    case DType::kQ3_K: return 32;     // 110 B zero-padded to 128 B
     default: return 0;
   }
 }
@@ -1859,6 +945,7 @@ void DropKeepQuantWordShadow(void* host) {
 // immutable post-load, so a serve can never go stale while the master lives
 // (same assumption as the BufferSlot/WeightViewShadow resident shadows); the
 // UnregisterHostBuffer drop above covers the recycle case.
+void TTReclaimPlanes(MeshDevice& device, std::vector<ttnn::Tensor>& planes);
 ttnn::Tensor EnsureKeepQuantWords(const Tensor& packed, DType enc, int64_t rows,
                                   int64_t nb, MeshDevice& device) {
   VT_CHECK(packed.rank == 2 && packed.IsContiguous(),
@@ -1906,24 +993,89 @@ ttnn::Tensor EnsureKeepQuantWords(const Tensor& packed, DType enc, int64_t rows,
           (static_cast<uint32_t>(p[3]) << 24)));
     }
   }
+  AllocTraceSnapshot(device, "EnsureKeepQuantWords/pre");
   ttnn::Tensor staged = ttnn::Tensor::from_vector<int32_t>(
       std::move(words),
       SpecOf(tt::tt_metal::Shape({static_cast<uint32_t>(b64),
                                   static_cast<uint32_t>(wpb)}),
              ttnn::DataType::INT32, ttnn::Layout::ROW_MAJOR),
       &device);
-  std::lock_guard<std::mutex> g(KeepQuantWordMutex());
-  KeepQuantWordShadows()[packed.data] =
-      KeepQuantWordShadow{staged, rows, nb, wpb};
+  {
+    std::lock_guard<std::mutex> g(KeepQuantWordMutex());
+    KeepQuantWordShadows()[packed.data] =
+        KeepQuantWordShadow{staged, rows, nb, wpb};
+  }
+  AllocTraceSnapshot(device, "EnsureKeepQuantWords/post");
+  // W4d W3 (#3042): the weight's bf16 TILE staging is dead weight the moment
+  // its word shadow exists — the keep-quant matmul reads only the words, and
+  // a bf16-arm decline re-stages on demand from the slot's live host bytes.
+  // At 27B the staged bf16 form of every k-quant weight sat beside the words
+  // (attn_qkv alone: 97 x [10240,5120] bf16 = 9.7 GiB beside ~21 MiB q6_K
+  // each), filled the banks to 93 percent during the warm pass, and
+  // fragmented them into the init OOM. Release the slot's bf16 forms here;
+  // the word shadows, embed twin and persistent non-quant stagings stay.
+  // Scoped AFTER the KeepQuantWordMutex guard so the SlotMutex nesting order
+  // (Slot -> KeepQuant elsewhere, sequential here) is never inverted.
+  if (!tt_capture_active()) {
+    std::vector<ttnn::Tensor> dead;
+    {
+      std::lock_guard<std::mutex> g_slot(SlotMutex());
+      if (BufferSlot* s = FindSlot(packed.data);
+          s != nullptr && packed.data == s->host &&
+          (s->device.has_value() || s->persistent.has_value())) {
+        if (s->device) dead.push_back(*s->device);
+        if (s->persistent) dead.push_back(*s->persistent);
+        s->device.reset();
+        s->persistent.reset();
+        s->device_current = false;
+      }
+    }
+    if (!dead.empty()) TTReclaimPlanes(device, dead);
+  }
   return staged;
 }
+
+// W4d W2 (#3042): force-free consumed decode planes. A decode plane's
+// scope-exit free never runs: the eager dispatch copies the plane's
+// TensorAttributes into every op it records, so the refcount is still above
+// one when the C++ object dies and ~Tensor()'s use_count()==1 gate
+// (ttnn/core/tensor/tensor.cpp:120) skips the free — the plane is orphaned
+// for the process lifetime. The W1 vehicle trace booked 7.6 GB of orphans
+// across 4 wide-weight first decodes with alloc_per_bank never decreasing in
+// 600 transitions, and the focused red-first test books 4.3 GB on ONE
+// 2-chunk weight. Draining the queue alone does not release the refs (a
+// drain-only build leaked the same 4.3 GB), so every consumed plane is
+// deallocated by force at its last use: finish() first (the device must not
+// read a freed buffer), then ttnn::deallocate(force=true), which frees
+// regardless of the refcount (the MeshTensorHolder swaps its Allocated state
+// for a tombstone, so a repeated call on an aliased view is a no-op). Every
+// plane in a reclaim list is consumed BEFORE the call — no alias is read
+// afterwards — and no plane is a direct slice of the resident word shadow
+// (a slice materializes its own buffer; the shadow is untouched). Capture
+// skips the reclaim: finish() records a mesh event, which ttnn forbids
+// mid-capture (the int8-dot staging precedent); the recorded ops keep the
+// ordering and the replay's addresses.
+void TTReclaimPlanes(MeshDevice& device,
+                     std::initializer_list<ttnn::Tensor*> planes) {
+  if (tt_capture_active()) return;
+  device.mesh_command_queue().finish();
+  for (ttnn::Tensor* plane : planes)
+    ttnn::deallocate(*plane, /*force=*/true);
+}
+void TTReclaimPlanes(MeshDevice& device, std::vector<ttnn::Tensor>& planes) {
+  if (tt_capture_active()) return;
+  device.mesh_command_queue().finish();
+  for (ttnn::Tensor& plane : planes)
+    ttnn::deallocate(plane, /*force=*/true);
+}
+
 
 // Stream bytes [first, last) of the word-staged block as u8 {B, last-first}
 // (little-endian lanes). concat stacks the four lane tensors, so the
 // (lane, word)->(word, lane) permute restores stream order — the same trick
 // the Q4_K scale extraction uses, generalized to any byte range.
 ttnn::Tensor KeepQuantByteRange(const ttnn::Tensor& w, uint32_t B, int first,
-                                int last) {
+                                int last, MeshDevice& device) {
   const int w0 = first / 4;
   const int nwords = (last + 3) / 4 - w0;
   ttnn::Tensor sw = ttnn::slice(
@@ -1934,22 +1086,54 @@ ttnn::Tensor KeepQuantByteRange(const ttnn::Tensor& w, uint32_t B, int first,
   auto byte_lane = [](const ttnn::Tensor& t, int shift) {
     return ttnn::bitwise_and(ttnn::bitwise_right_shift(t, shift), 0xFF);
   };
-  ttnn::Tensor stream = ttnn::reshape(
-      ttnn::permute(
-          ttnn::reshape(
-              ttnn::concat(std::vector<ttnn::Tensor>{
-                  byte_lane(sw, 0), byte_lane(sw, 8), byte_lane(sw, 16),
-                  byte_lane(sw, 24)},
-                  /*dim=*/1),
-              ttnn::Shape({B, 4u, static_cast<uint32_t>(nwords)})),
-          ttsl::SmallVector<int64_t>{0, 2, 1}),
-      ttnn::Shape({B, static_cast<uint32_t>(4 * nwords)}));
+  // W4d W2 (#3042): the lane web is ~25 word-plane sizes for the 128-byte
+  // ql range — reclaimed below once the returned slice consumed the stream.
+  ttnn::Tensor bl0 = byte_lane(sw, 0);
+  ttnn::Tensor bl1 = byte_lane(sw, 8);
+  ttnn::Tensor bl2 = byte_lane(sw, 16);
+  ttnn::Tensor bl3 = byte_lane(sw, 24);
+  ttnn::Tensor lanes_cat = ttnn::concat(
+      std::vector<ttnn::Tensor>{bl0, bl1, bl2, bl3}, /*dim=*/1);
+  ttnn::Tensor lanes_pm = ttnn::permute(
+      ttnn::reshape(lanes_cat,
+                    ttnn::Shape({B, 4u, static_cast<uint32_t>(nwords)})),
+      ttsl::SmallVector<int64_t>{0, 2, 1});
+  ttnn::Tensor stream =
+      ttnn::reshape(lanes_pm,
+                    ttnn::Shape({B, static_cast<uint32_t>(4 * nwords)}));
   const int off = first - 4 * w0;
-  return ttnn::slice(
+  // W4d W2 (#3042): slice() returns its INPUT for a full-extent step-1
+  // window (tt-metal slice.cpp:182), and two identities hide here. sw is
+  // the word shadow itself when the range starts at word 0 and covers the
+  // whole row (Q8_0's qb: [2,34) over a 9-word row), and the tail slice is
+  // stream itself when off == 0 and the range is word-aligned (sb, ql, qh,
+  // sc all land there). A forced reclaim of either alias kills the plane
+  // out from under its owner — the resident shadow, or this frame's
+  // permute buffer handed to the caller — so the aliased tensor stays with
+  // its owner: sw dies with the frame (the view keeps the shadow alive),
+  // and the aligned tail returns stream, whose buffer the caller's own
+  // reclaim list frees at its last use.
+  const int wpb = static_cast<int>(w.logical_shape()[1]);
+  const bool sw_alias = w0 == 0 && nwords == wpb;
+  const bool out_alias = off == 0 && 4 * nwords == last - first;
+  if (out_alias) {
+    if (sw_alias)
+      TTReclaimPlanes(device, {&bl0, &bl1, &bl2, &bl3, &lanes_cat});
+    else
+      TTReclaimPlanes(device, {&sw, &bl0, &bl1, &bl2, &bl3, &lanes_cat});
+    return stream;
+  }
+  ttnn::Tensor out = ttnn::slice(
       stream, ttsl::SmallVector<uint32_t>{0u, static_cast<uint32_t>(off)},
       ttsl::SmallVector<uint32_t>{B,
                                   static_cast<uint32_t>(off + last - first)},
       ttsl::SmallVector<uint32_t>{1u, 1u});
+  if (sw_alias)
+    TTReclaimPlanes(device, {&bl0, &bl1, &bl2, &bl3, &lanes_cat, &lanes_pm});
+  else
+    TTReclaimPlanes(device,
+                    {&sw, &bl0, &bl1, &bl2, &bl3, &lanes_cat, &lanes_pm});
+  return out;
 }
 
 // The -0.0f signed-zero repair constant, one cached device tensor per shape.
@@ -2000,41 +1184,65 @@ ttnn::Tensor DecodeKeepQuantWordsF32(const ttnn::Tensor& w, DType enc,
                                      int64_t slice_rows, int64_t nb,
                                      MeshDevice& device) {
   const uint32_t B = static_cast<uint32_t>(slice_rows * nb);
+  {  // W4d W0 (#3042) attribution: label carries the slice size.
+    char lbl[64];
+    std::snprintf(lbl, sizeof(lbl), "kq-decode/rows=%lld/nb=%lld",
+                  (long long)slice_rows, (long long)nb);
+    AllocTraceSnapshot(device, lbl);
+  }
+
+  // W4d W2 (#3042): every plane this decode builds is reclaimed by force at
+  // its last use — TTReclaimPlanes above (the W1 trace booked 7.6 GB of
+  // orphans here; a drain-only build leaked the same 4.3 GB as the red test,
+  // so the refs must be dropped, not waited on). The per-case batches below
+  // each list planes consumed before the call; the helpers repair,
+  // sign_bit_f32, zero_mask_f32, signed_byte_f32 and f16_bits_to_f32
+  // reclaim their own webs internally. neg0 is the cached -0 constant and is
+  // never listed.
 
   // f16 bit pattern (held in INT32) -> f32 value, the integer chain of
-  auto f16_bits_to_f32 = [](ttnn::Tensor t) {
+  auto f16_bits_to_f32 = [&](ttnn::Tensor t) {
     t = ttnn::to_layout(t, ttnn::Layout::TILE);
-    const ttnn::Tensor sign_b = ttnn::bitwise_left_shift(
+    ttnn::Tensor sign_b = ttnn::bitwise_left_shift(
         ttnn::bitwise_and(ttnn::bitwise_right_shift(t, 15), 1), 31);
-    const ttnn::Tensor mant = ttnn::bitwise_and(t, 0x3FF);
-    const ttnn::Tensor exp =
+    ttnn::Tensor mant = ttnn::bitwise_and(t, 0x3FF);
+    ttnn::Tensor exp =
         ttnn::bitwise_and(ttnn::bitwise_right_shift(t, 10), 0x1F);
-    const ttnn::Tensor normal_bits = ttnn::bitwise_or(
+    ttnn::Tensor normal_bits = ttnn::bitwise_or(
         sign_b,
         ttnn::bitwise_or(ttnn::bitwise_left_shift(ttnn::add(exp, 112), 23),
                          ttnn::bitwise_left_shift(mant, 13)));
-    const ttnn::Tensor denorm_val =
+    ttnn::Tensor denorm_val =
         ttnn::multiply(ttnn::typecast(mant, ttnn::DataType::FLOAT32),
                        std::ldexp(1.0f, -24));
-    const ttnn::Tensor denorm_bits =
+    ttnn::Tensor denorm_bits =
         ttnn::bitwise_or(sign_b, ttnn::bitcast(denorm_val, ttnn::DataType::INT32));
-    const ttnn::Tensor sub_bits =
+    ttnn::Tensor sub_bits =
         ttnn::where(ttnn::gt(mant, 0), denorm_bits, sign_b);  // +/- zero
-    const ttnn::Tensor out_bits =
+    ttnn::Tensor out_bits =
         ttnn::where(ttnn::gt(exp, 0), normal_bits, sub_bits);
-    return ttnn::to_layout(ttnn::bitcast(out_bits, ttnn::DataType::FLOAT32),
-                           ttnn::Layout::ROW_MAJOR);
+    const ttnn::Tensor out_f = ttnn::to_layout(
+        ttnn::bitcast(out_bits, ttnn::DataType::FLOAT32),
+        ttnn::Layout::ROW_MAJOR);
+    // W4d W2 (#3042): the whole web is consumed by out_f — reclaim it,
+    // including the TILE copy the to_layout above rebound into `t` (the
+    // caller's bits tensor keeps its own buffer and is reclaimed by the
+    // caller at its own last use).
+    TTReclaimPlanes(device, {&t, &sign_b, &mant, &exp, &normal_bits,
+                             &denorm_val, &denorm_bits, &sub_bits, &out_bits});
+    return out_f;
   };
   // u8 byte -> SIGNED i8 value as exact f32: v - 256*bit7 (the int8 sign
   // extension; every operand and step is exact in the integer domain).
   // Q6_K's scales and Q8_0's qs are the signed-byte consumers.
-  auto signed_byte_f32 = [](const ttnn::Tensor& v) {
-    const ttnn::Tensor u = ttnn::bitwise_and(v, 0xFF);
-    const ttnn::Tensor bit7 = ttnn::bitwise_right_shift(u, 7);
-    return ttnn::subtract(
-        ttnn::typecast(u, ttnn::DataType::FLOAT32),
-        ttnn::multiply(ttnn::typecast(bit7, ttnn::DataType::FLOAT32),
-                       256.0f));
+  auto signed_byte_f32 = [&](const ttnn::Tensor& v) {
+    ttnn::Tensor u = ttnn::bitwise_and(v, 0xFF);
+    ttnn::Tensor bit7 = ttnn::bitwise_right_shift(u, 7);
+    ttnn::Tensor u_f = ttnn::typecast(u, ttnn::DataType::FLOAT32);
+    ttnn::Tensor b7_f = ttnn::typecast(bit7, ttnn::DataType::FLOAT32);
+    ttnn::Tensor out = ttnn::subtract(u_f, ttnn::multiply(b7_f, 256.0f));
+    TTReclaimPlanes(device, {&u, &bit7, &u_f, &b7_f});
+    return out;
   };
   // Signed-zero repair, third mechanism, after two device-falsified drafts.
   // Draft one selected a -0 constant through where() over an arithmetic-f32
@@ -2052,37 +1260,56 @@ ttnn::Tensor DecodeKeepQuantWordsF32(const ttnn::Tensor& w, DType enc,
   //     one predicate form the f16 decode exercises (its two where() calls);
   //   - the {0,1} masks are broadcast f32 arithmetic over sign bits
   //     typecast OUT of born-int patterns (the proven direction).
-  auto neg0_full = [&device](const ttnn::Shape& shape) {
-    return Neg0CacheGet(shape, device);
+  // W4d W2 (#3042): the constant is a {1,1,1} broadcast scalar. where()
+  // broadcasts it, so ONE tiny cached tensor serves every repair shape; the
+  // per-shape cache materialized a TILE-padded constant per distinct shape
+  // ({B,8,32} pads to {B,32,32} — 2 GiB each at the test shape, and a fresh
+  // 2 GiB entry per layer width at 27B). The cached entry is never
+  // reclaimed.
+  auto neg0_scalar = [&device]() {
+    return Neg0CacheGet(ttnn::Shape({1u, 1u, 1u}), device);
   };
   // {0,1} f32 masks, built in ROW_MAJOR elementwise ops end to end: the
   // sign bit travels as an integer (shift/and over the BIT pattern — never
   // a device float, whose zero sign is already canonicalized), and the
   // zero test is a float compare. Callers combine masks with broadcast f32
   // arithmetic and reshape ROW_MAJOR only.
-  auto sign_bit_f32 = [](const ttnn::Tensor& bits, int shift) {
-    return ttnn::typecast(
-        ttnn::bitwise_and(ttnn::bitwise_right_shift(bits, shift), 1),
-        ttnn::DataType::FLOAT32);
+  auto sign_bit_f32 = [&](const ttnn::Tensor& bits, int shift) {
+    ttnn::Tensor s = ttnn::bitwise_right_shift(bits, shift);
+    ttnn::Tensor a = ttnn::bitwise_and(s, 1);
+    ttnn::Tensor f = ttnn::typecast(a, ttnn::DataType::FLOAT32);
+    TTReclaimPlanes(device, {&s, &a});
+    return f;
   };
-  auto zero_mask_f32 = [](const ttnn::Tensor& v) {
-    return ttnn::typecast(
-        ttnn::to_layout(ttnn::eq(v, 0.0f), ttnn::Layout::ROW_MAJOR),
-        ttnn::DataType::FLOAT32);
+  auto zero_mask_f32 = [&](const ttnn::Tensor& v) {
+    ttnn::Tensor eq = ttnn::eq(v, 0.0f);
+    ttnn::Tensor eqr = ttnn::to_layout(eq, ttnn::Layout::ROW_MAJOR);
+    ttnn::Tensor f = ttnn::typecast(eqr, ttnn::DataType::FLOAT32);
+    TTReclaimPlanes(device, {&eq, &eqr});
+    return f;
   };
   // The repair itself: where(gt(mask, 0), -0, value), every input TILE (a
   // TILE predicate mixed with ROW_MAJOR branches wrote only its first 16
   // output elements once already). Callers pass the value BY VALUE (a
   // shared-handle copy): moving it in beside an argument expression that
   // still reads it is unspecified-order evaluation, and the moved-from read
-  // segfaults inside to_layout.
-  auto repair = [](ttnn::Tensor value, const ttnn::Tensor& mask_f32,
-                   const ttnn::Tensor& neg0) {
-    return ttnn::to_layout(
-        ttnn::where(ttnn::to_layout(ttnn::gt(mask_f32, 0.0f),
-                                    ttnn::Layout::TILE),
-                    neg0, ttnn::to_layout(value, ttnn::Layout::TILE)),
-        ttnn::Layout::ROW_MAJOR);
+  // segfaults inside to_layout. W4d W2 (#3042): the repair owns its
+  // operands' last reads, so it reclaims the incoming value and mask (the
+  // caller passes fresh expression results and reassigns the value target
+  // from the return), its own TILE copies and the where output. neg0 is the
+  // cached -0 constant — never reclaimed.
+  auto repair = [&](ttnn::Tensor value, ttnn::Tensor mask_f32,
+                    const ttnn::Tensor& neg0) {
+    AllocTraceSnapshot(device, "kq-decode/repair");
+    ttnn::Tensor pred = ttnn::to_layout(ttnn::gt(mask_f32, 0.0f),
+                                        ttnn::Layout::TILE);
+    ttnn::Tensor value_t = ttnn::to_layout(value, ttnn::Layout::TILE);
+    ttnn::Tensor where_out = ttnn::where(pred, neg0, value_t);
+    ttnn::Tensor out =
+        ttnn::to_layout(where_out, ttnn::Layout::ROW_MAJOR);
+    TTReclaimPlanes(device,
+                    {&value, &mask_f32, &pred, &value_t, &where_out});
+    return out;
   };
 
   switch (enc) {
@@ -2103,7 +1330,7 @@ ttnn::Tensor DecodeKeepQuantWordsF32(const ttnn::Tensor& w, DType enc,
       ttnn::Tensor d = f16_bits_to_f32(d_bits);
       ttnn::Tensor dmin = f16_bits_to_f32(dmin_bits);
 
-      ttnn::Tensor sb = KeepQuantByteRange(w, B, 4, 16);  // scales[12]
+      ttnn::Tensor sb = KeepQuantByteRange(w, B, 4, 16, device);  // scales[12]
       // GetScaleMinK4(is, scales) for is = 0..7, group-major: is<4 low pair from
       // scales[is]/scales[is+4]; is>=4 high pair from scales[is+4] low bits and
       // scales[is-4]/scales[is] top bits.
@@ -2134,6 +1361,9 @@ ttnn::Tensor DecodeKeepQuantWordsF32(const ttnn::Tensor& w, DType enc,
               ttnn::bitwise_or(ttnn::bitwise_right_shift(sc, 4), top6l4(sm))},
               /*dim=*/1),
           ttnn::DataType::FLOAT32);  // {B, 8}, values <= 63: exact
+      // W4d W2 (#3042): the scale web is consumed — w0 by the d/dmin bit
+      // extractions, sb/sa/sm/sc by the sc_f/mm_f concats above.
+      TTReclaimPlanes(device, {&w0, &sb, &sa, &sm, &sc});
 
       // Nibbles: 32 words are qs[128]; 8 nibble-lane shifts -> {B,256} with
       // idx = 8*lane + word. Flat idx = 16l + 8h + 8q + r over (byte lane l,
@@ -2148,38 +1378,51 @@ ttnn::Tensor DecodeKeepQuantWordsF32(const ttnn::Tensor& w, DType enc,
       auto nib = [](const ttnn::Tensor& t, int shift) {
         return ttnn::bitwise_and(ttnn::bitwise_right_shift(t, shift), 0xF);
       };
+      // W4d W2 (#3042): the eight nibble lanes and their concat/permute
+      // chain are ~12 word-plane sizes — named so they can be reclaimed once
+      // the typecast lands x5 (the reshapes are contiguous views, so the
+      // concat and permute bases carry the memory).
+      std::vector<ttnn::Tensor> lanes{nib(qw, 0), nib(qw, 4), nib(qw, 8),
+                                      nib(qw, 12), nib(qw, 16), nib(qw, 20),
+                                      nib(qw, 24), nib(qw, 28)};
+      ttnn::Tensor lanes_cat = ttnn::concat(lanes, /*dim=*/1);
+      ttnn::Tensor lanes_pm = ttnn::permute(
+          ttnn::reshape(lanes_cat, ttnn::Shape({B, 4u, 2u, 4u, 8u})),
+          ttsl::SmallVector<int64_t>{0, 3, 2, 4, 1});
       ttnn::Tensor x5 = ttnn::typecast(
-          ttnn::reshape(
-              ttnn::permute(
-                  ttnn::reshape(
-                      ttnn::concat(std::vector<ttnn::Tensor>{
-                          nib(qw, 0), nib(qw, 4), nib(qw, 8), nib(qw, 12),
-                          nib(qw, 16), nib(qw, 20), nib(qw, 24), nib(qw, 28)},
-                          /*dim=*/1),
-                      ttnn::Shape({B, 4u, 2u, 4u, 8u})),
-                  ttsl::SmallVector<int64_t>{0, 3, 2, 4, 1}),
-              ttnn::Shape({B, 8u, 32u})),
+          ttnn::reshape(lanes_pm, ttnn::Shape({B, 8u, 32u})),
           ttnn::DataType::FLOAT32);  // {B, 8, 32}, values <= 15: exact
+      {
+        std::vector<ttnn::Tensor> dead{qw, lanes_cat, lanes_pm};
+        dead.insert(dead.end(), lanes.begin(), lanes.end());
+        TTReclaimPlanes(device, dead);
+      }
       if (q5) {
         // The 5th bit: output col c reads bit c/32 — the group index g — of
         // qh[c%32] (host u1 = 1<<2q for the low plane and u2 = 2<<2q for the
         // high plane of quarter q; g = 2q+h is exactly that bit). qh bytes
         // broadcast {B,1,32} against one shift per group; +16*bit is exact.
-        ttnn::Tensor qh = KeepQuantByteRange(w, B, 16, 48);  // qh[32]
+        ttnn::Tensor qh = KeepQuantByteRange(w, B, 16, 48, device);  // qh[32]
         ttnn::Tensor qh3 = ttnn::reshape(qh, ttnn::Shape({B, 1u, 32u}));
         std::vector<ttnn::Tensor> planes;
         planes.reserve(8);
         for (int g = 0; g < 8; ++g)
           planes.push_back(
               ttnn::bitwise_and(ttnn::bitwise_right_shift(qh3, g), 1));
-        x5 = ttnn::add(
-            x5,
-            ttnn::multiply(
-                ttnn::typecast(
-                    ttnn::reshape(ttnn::concat(std::move(planes), /*dim=*/1),
-                                  ttnn::Shape({B, 8u, 32u})),
-                    ttnn::DataType::FLOAT32),
-                16.0f));  // values <= 31: exact
+        ttnn::Tensor q5_cat = ttnn::concat(planes, /*dim=*/1);
+        ttnn::Tensor q5_f = ttnn::typecast(
+            ttnn::reshape(q5_cat, ttnn::Shape({B, 8u, 32u})),
+            ttnn::DataType::FLOAT32);
+        // values <= 31: exact
+        ttnn::Tensor x5b =
+            ttnn::add(x5, ttnn::multiply(q5_f, 16.0f));
+        // W4d W2 (#3042): the bit-plane web and the pre-add x5 are consumed.
+        {
+          std::vector<ttnn::Tensor> dead{qh3, q5_cat, q5_f, qh, x5};
+          dead.insert(dead.end(), planes.begin(), planes.end());
+          TTReclaimPlanes(device, dead);
+        }
+        x5 = std::move(x5b);
       }
 
       // y = (d*sc)*x - (dmin*mm): the host's exact f32 order, as separate ops,
@@ -2196,7 +1439,7 @@ ttnn::Tensor DecodeKeepQuantWordsF32(const ttnn::Tensor& w, DType enc,
       // -0). All three masks are broadcast f32 arithmetic on {0,1} values
       // read from the f16 BIT patterns — never from a device float, whose
       // zero sign is already canonicalized.
-      // Signed-zero repair (repair/neg0_full above): the device multiply AND
+      // Signed-zero repair (repair/neg0_scalar above): the device multiply AND
       // subtract canonicalize a zero result's sign, while the host chain is
       // IEEE-exact — prod keeps d's sign through a zero product and m1 keeps
       // dmin's through a zero product (mm and x are unsigned, so the IEEE
@@ -2209,7 +1452,10 @@ ttnn::Tensor DecodeKeepQuantWordsF32(const ttnn::Tensor& w, DType enc,
                                        ttnn::Shape({B, 8u, 1u})),
                          x5);
       prod = repair(prod, ttnn::multiply(dsign, zero_mask_f32(prod)),
-                    neg0_full(ttnn::Shape({B, 8u, 32u})));
+                    neg0_scalar());
+      // W4d W2 (#3042): d, sc_f, x5 and d_bits are consumed; the pre-repair
+      // prod buffer was freed inside repair (the by-value value operand).
+      TTReclaimPlanes(device, {&d, &sc_f, &x5, &d_bits});
       ttnn::Tensor dminsign =
           ttnn::reshape(sign_bit_f32(dmin_bits, 15), ttnn::Shape({B, 1u, 1u}));
       // Repair m1 at its FINAL {B,8,1} shape: the subtract must consume the
@@ -2219,8 +1465,10 @@ ttnn::Tensor DecodeKeepQuantWordsF32(const ttnn::Tensor& w, DType enc,
       ttnn::Tensor m1 = ttnn::reshape(ttnn::multiply(dmin, mm_f),
                                       ttnn::Shape({B, 8u, 1u}));
       m1 = repair(m1, ttnn::multiply(dminsign, zero_mask_f32(m1)),
-                  neg0_full(ttnn::Shape({B, 8u, 1u})));
+                  neg0_scalar());
+      TTReclaimPlanes(device, {&dmin, &mm_f, &dmin_bits});
       ttnn::Tensor y = ttnn::subtract(prod, m1);
+      TTReclaimPlanes(device, {&prod, &m1});
       y = repair(
           y,
           ttnn::multiply(
@@ -2228,7 +1476,8 @@ ttnn::Tensor DecodeKeepQuantWordsF32(const ttnn::Tensor& w, DType enc,
                                            ttnn::multiply(dsign, dminsign)),
                             ttnn::Shape({B, 1u, 1u})),
               zero_mask_f32(y)),
-          neg0_full(ttnn::Shape({B, 8u, 32u})));
+          neg0_scalar());
+      TTReclaimPlanes(device, {&dsign, &dminsign});
       return ttnn::reshape(
           std::move(y),
           ttnn::Shape({static_cast<uint32_t>(slice_rows),
@@ -2250,9 +1499,9 @@ ttnn::Tensor DecodeKeepQuantWordsF32(const ttnn::Tensor& w, DType enc,
       ttnn::Tensor d_bits = ttnn::bitwise_and(w52, 0xFFFF);
       ttnn::Tensor d3 = ttnn::reshape(f16_bits_to_f32(d_bits),
                                       ttnn::Shape({B, 1u, 1u}));
-      ttnn::Tensor ql = KeepQuantByteRange(w, B, 0, 128);
-      ttnn::Tensor qh = KeepQuantByteRange(w, B, 128, 192);
-      ttnn::Tensor sc_bytes = KeepQuantByteRange(w, B, 192, 208);
+      ttnn::Tensor ql = KeepQuantByteRange(w, B, 0, 128, device);
+      ttnn::Tensor qh = KeepQuantByteRange(w, B, 128, 192, device);
+      ttnn::Tensor sc_bytes = KeepQuantByteRange(w, B, 192, 208, device);
       ttnn::Tensor sc_f = signed_byte_f32(sc_bytes);  // {B,16}: exact ints
       ttnn::Tensor sc_sign = ttnn::typecast(
           ttnn::bitwise_and(ttnn::bitwise_right_shift(sc_bytes, 7), 1),
@@ -2266,6 +1515,10 @@ ttnn::Tensor DecodeKeepQuantWordsF32(const ttnn::Tensor& w, DType enc,
         runs.reserve(4);
         std::vector<ttnn::Tensor> sign_runs;
         sign_runs.reserve(4);
+        // W4d W2 (#3042): every read plane of a run dies after its two
+        // pushes — batched per half so the reclaim is one finish() per half.
+        std::vector<ttnn::Tensor> run_dead;
+        run_dead.reserve(4 * 7 + 8);
         for (int r = 0; r < 4; ++r) {
           const int qoff = 64 * h + 32 * (r % 2);
           ttnn::Tensor qb = ttnn::slice(
@@ -2311,16 +1564,28 @@ ttnn::Tensor DecodeKeepQuantWordsF32(const ttnn::Tensor& w, DType enc,
               ttnn::reshape(ttnn::typecast(ttnn::lt(nib6, 32),
                                            ttnn::DataType::FLOAT32),
                             ttnn::Shape({B, 2u, 16u})));
+          for (ttnn::Tensor* dead_plane :
+               {&qb, &hb, &nib, &hi2, &nib6, &q6, &s2})
+            run_dead.push_back(*dead_plane);
         }
-        halves.push_back(ttnn::concat(std::move(runs), /*dim=*/1));
+        halves.push_back(ttnn::concat(runs, /*dim=*/1));
         sign_halves.push_back(
-            ttnn::concat(std::move(sign_runs), /*dim=*/1));
+            ttnn::concat(sign_runs, /*dim=*/1));
+        run_dead.insert(run_dead.end(), runs.begin(), runs.end());
+        run_dead.insert(run_dead.end(), sign_runs.begin(), sign_runs.end());
+        TTReclaimPlanes(device, run_dead);
       }
+      // W4d W2 (#3042): the per-half pieces are consumed by these concats;
+      // the reshapes are contiguous views over them.
+      ttnn::Tensor halves_cat = ttnn::concat(halves, /*dim=*/1);
+      ttnn::Tensor signs_cat = ttnn::concat(sign_halves, /*dim=*/1);
+      TTReclaimPlanes(device, halves);
+      TTReclaimPlanes(device, sign_halves);
       ttnn::Tensor prod = ttnn::reshape(
-          ttnn::concat(std::move(halves), /*dim=*/1),
+          halves_cat,
           ttnn::Shape({B, 16u, 16u}));  // [s][i] with s = 8h + 2r + l/16
       ttnn::Tensor qsign = ttnn::reshape(
-          ttnn::concat(std::move(sign_halves), /*dim=*/1),
+          signs_cat,
           ttnn::Shape({B, 16u, 16u}));
       // Zero-product sign: the IEEE sign of (d*sc)*q is the XOR of all
       // three operand signs — d's f16 bit, sc's i8 bit7, and sign(q) above
@@ -2341,7 +1606,12 @@ ttnn::Tensor DecodeKeepQuantWordsF32(const ttnn::Tensor& w, DType enc,
                                    ttnn::multiply(pairs, 2.0f)),
                     ttnn::multiply(quad, 4.0f));
       prod = repair(prod, ttnn::multiply(pred, zero_mask_f32(prod)),
-                    neg0_full(ttnn::Shape({B, 16u, 16u})));
+                    neg0_scalar());
+      // W4d W2 (#3042): the sign-algebra planes and the concat bases are
+      // consumed; the word ranges and d/sc planes were consumed in the runs.
+      TTReclaimPlanes(device, {&ds, &ss, &ds_ss, &pairs, &quad, &pred, &qsign,
+                               &halves_cat, &signs_cat});
+      TTReclaimPlanes(device, {&w52, &d_bits, &d3, &ql, &qh, &sc_bytes, &sc_f});
       return ttnn::reshape(
           prod,
           ttnn::Shape({static_cast<uint32_t>(slice_rows),
@@ -2357,7 +1627,7 @@ ttnn::Tensor DecodeKeepQuantWordsF32(const ttnn::Tensor& w, DType enc,
           ttsl::SmallVector<uint32_t>{1u, 1u});
       ttnn::Tensor d_bits = ttnn::bitwise_and(w0, 0xFFFF);
       ttnn::Tensor d = f16_bits_to_f32(d_bits);  // {B,1}
-      ttnn::Tensor qb = KeepQuantByteRange(w, B, 2, 34);  // {B,32} raw bytes
+      ttnn::Tensor qb = KeepQuantByteRange(w, B, 2, 34, device);  // {B,32} raw bytes
       ttnn::Tensor qf = signed_byte_f32(qb);
       ttnn::Tensor prod = ttnn::multiply(d, qf);  // {B,32}
       // Zero-product sign: the IEEE product's sign is sign(d) XOR sign(q) —
@@ -2371,7 +1641,11 @@ ttnn::Tensor DecodeKeepQuantWordsF32(const ttnn::Tensor& w, DType enc,
           ttnn::add(dsign, qsign),
           ttnn::multiply(ttnn::multiply(dsign, qsign), 2.0f));
       prod = repair(prod, ttnn::multiply(pred, zero_mask_f32(prod)),
-                    neg0_full(ttnn::Shape({B, 32u})));
+                    neg0_scalar());
+      // W4d W2 (#3042): the whole web is consumed — d/dsign by prod, qb/qf
+      // by prod and qsign, the sign algebra by the repair mask.
+      TTReclaimPlanes(device, {&w0, &d_bits, &d, &qb, &qf, &dsign, &qsign,
+                               &pred});
       return ttnn::reshape(
           prod,
           ttnn::Shape({static_cast<uint32_t>(slice_rows),
@@ -2457,15 +1731,24 @@ void MatmulBTQuantKernel(Queue& q, Tensor& out, const Tensor& a, const Tensor& b
       std::string("k") + static_cast<char>(enc_lower[0] - 'a' + 'A') +
       enc_lower.substr(1);
   VT_CHECK(enc == DType::kQ4_K || enc == DType::kQ5_K || enc == DType::kQ6_K ||
-               enc == DType::kQ8_0,
+               enc == DType::kQ8_0 || enc == DType::kIQ3_XXS ||
+               enc == DType::kIQ2_XXS || enc == DType::kIQ2_S ||
+               enc == DType::kQ3_K,
            std::string("tenstorrent kMatmulBTQuant: ") + enc_name +
                " has no keep-quant decode on TENSTORRENT; the registered set "
-               "is kQ4_K/kQ5_K/kQ6_K/kQ8_0 (BACKEND-TENSTORRENT-KEEPQUANT)");
+               "is kQ4_K/kQ5_K/kQ6_K/kQ8_0/kIQ3_XXS/kIQ2_XXS/kIQ2_S/kQ3_K "
+               "(BACKEND-TENSTORRENT-KEEPQUANT, QUANT-GGUF-IQ-TENSTORRENT)");
   const int64_t elems = BlockElems(enc);
   VT_CHECK(b.shape[1] % elems == 0,
            std::string("tenstorrent kMatmulBTQuant: K must be a whole number "
                        "of ") +
                Name(enc) + " blocks (" + std::to_string(elems) + " elems)");
+  {  // W4d W0 (#3042) attribution: which matmul weight is being staged.
+    char lbl[64];
+    std::snprintf(lbl, sizeof(lbl), "matmulbtq/N=%lld/K=%lld",
+                  (long long)b.shape[0], (long long)b.shape[1]);
+    AllocTraceSnapshot(SharedMeshDevice(), lbl);
+  }
   VT_CHECK(IsFloatDType(a.dtype) &&
                (out.dtype == DType::kF32 || out.dtype == DType::kBF16),
            "tenstorrent kMatmulBTQuant: float activation, f32/bf16 out");
@@ -2501,13 +1784,29 @@ void MatmulBTQuantKernel(Queue& q, Tensor& out, const Tensor& a, const Tensor& b
   // ROW_MAJOR chained leg's NaN signature: the vehicle's mid-layer bf16
   // keep-quant matmul fed a down-projection whose activation read the
   // poisoned slot).
-  if (out.dtype == DType::kF32) {
-    if (const char* int8dot_env = std::getenv("VT_TT_KEEPQUANT_INT8DOT");
-        int8dot_env != nullptr && int8dot_env[0] != '\0' &&
-        std::strcmp(int8dot_env, "0") != 0) {
-      MatmulBTQuantInt8DotKernel(q, out, a, b);
-      return;
-    }
+  // W4d W6: int8-dot serves BOTH out dtypes when opted in — one captured
+  // launch per matmul replaces the per-chunk E=1 chain, whose capture-time
+  // transients pinned 3.8 GiB into the trace region at 27B
+  // (tenstorrent-27b-int8dot-capture.md). bf16-out carries an explicit
+  // f32->bf16 cast before the commit (the W4b store-geometry bug, fixed).
+  // QUANT-GGUF-IQ-TENSTORRENT wave 1: IQ3_XXS has NO W4a grouped arm (the
+  // grouped decode set is the four W3 encodings), so its only serve is the
+  // int8-dot kernel — dispatch it there REGARDLESS of the env, which makes
+  // the capability reachable on the default configuration. The other four
+  // encodings keep the env-gated lever exactly as W4d left it. Wave 3
+  // (QUANT-GGUF-IQ-TENSTORRENT): kQ3_K (enc_sel 7) joins the unconditional
+  // set the same way — the grouped arm has no Q3_K decode to fall through
+  // to either.
+  if (enc == DType::kIQ3_XXS || enc == DType::kIQ2_XXS ||
+      enc == DType::kIQ2_S || enc == DType::kQ3_K) {
+    MatmulBTQuantInt8DotKernel(q, out, a, b);
+    return;
+  }
+  if (const char* int8dot_env = std::getenv("VT_TT_KEEPQUANT_INT8DOT");
+      int8dot_env != nullptr && int8dot_env[0] != '\0' &&
+      std::strcmp(int8dot_env, "0") != 0) {
+    MatmulBTQuantInt8DotKernel(q, out, a, b);
+    return;
   }
   // W4a wave-3b-1 (#3030): the bf16-out dispatch. P = M output rows against
   // expert 0; the ids are statically all zero and the E=1 arm never reads
@@ -2634,6 +1933,12 @@ void MatmulBTQuantGroupedKernel(Queue&, Tensor& out, const Tensor& act,
   if (P == 0 || N == 0) return;
 
   MeshDevice& device = SharedMeshDevice();
+  {  // W4d W0 (#3042) attribution: grouped arm shape.
+    char lbl[80];
+    std::snprintf(lbl, sizeof(lbl), "matmulbtq-grouped/E=%lld/N=%lld/K=%lld",
+                  (long long)E, (long long)N, (long long)K);
+    AllocTraceSnapshot(device, lbl);
+  }
 
   // Stage the PACKED tower once — the resident i32 word shadow keyed by the
   // host weight pointer, served forever after (the dense arm's pattern). The
@@ -2724,39 +2029,99 @@ void MatmulBTQuantGroupedKernel(Queue&, Tensor& out, const Tensor& act,
     // trade VT_TT_TRACE_REGION_MB records on its axis.
     if (plane_env_set)
       chunk = std::min(chunk, std::max<int64_t>(plane_bytes / (K * 4), 1));
+    // The repair lambda (DecodeKeepQuantWordsF32) tiles the {B,16,16}
+    // product planes to {B,32,32} — 4x the f32 plane the budget above
+    // counts, the 27B-head OOM (ISSUE-LOCAL-01M2N8DKVKM2J03FCVBSKYVHXK:
+    // 2.5 GB demanded, 238 MB largest free block). Cap eager chunks at the
+    // tiled plane — plane_bytes/(K*16) reproduces the proven 3,276-row
+    // chunk on the head.
+    //
+    // The policy is STICKY PER WEIGHT, not per call: a captured replay must
+    // hash-match the eager warm-up's stream, and a per-call capture flag
+    // makes warm-up and capture diverge (the slice extent differs, the
+    // capture-time SliceDeviceOperation misses the program cache, and every
+    // later test poisons — the suite regression this replaced). The first
+    // decode of a weight is always eager — a capture-time arrival with a
+    // cold shadow refuses at EnsureKeepQuantWords — so the flag is recorded
+    // eagerly and replayed verbatim under capture.
+    bool tile_cap;
+    {
+      std::lock_guard<std::mutex> g(KeepQuantWordMutex());
+      static auto* tile_cap_policy =
+          new std::unordered_map<intptr_t, bool>();
+      auto key = reinterpret_cast<intptr_t>(weight.data);
+      auto it = tile_cap_policy->find(key);
+      if (it != tile_cap_policy->end()) {
+        tile_cap = it->second;
+      } else {
+        tile_cap = !tt_capture_active();
+        tile_cap_policy->emplace(key, tile_cap);
+      }
+    }
+    if (tile_cap)
+      chunk = std::min(chunk, std::max<int64_t>(plane_bytes / (K * 16), 1));
+    AllocTraceSnapshot(device, "KQuantGrouped/chunk-loop/pre");
     std::vector<ttnn::Tensor> partials;
     partials.reserve(static_cast<size_t>((N + chunk - 1) / chunk));
     for (int64_t c0 = 0; c0 < N; c0 += chunk) {
       const int64_t c1 = std::min(N, c0 + chunk);
-      const ttnn::Tensor sl = ttnn::slice(
+      ttnn::Tensor sl = ttnn::slice(
           words,
           ttsl::SmallVector<uint32_t>{static_cast<uint32_t>(c0 * nb), 0u},
           ttsl::SmallVector<uint32_t>{static_cast<uint32_t>(c1 * nb), wpb},
           ttsl::SmallVector<uint32_t>{1u, 1u});
       ttnn::Tensor wf = DecodeKeepQuantWordsF32(sl, enc, c1 - c0, nb, device);
-      ttnn::Tensor wb = ttnn::to_layout(
-          ttnn::typecast(std::move(wf), ttnn::DataType::BFLOAT16),
-          ttnn::Layout::TILE);
+      // W4d W2 (#3042): the chunk's staged slice and decode output are
+      // consumed by the typecast/to_layout chain below — reclaimed as soon
+      // as each is read. A slice materializes its own buffer EXCEPT the
+      // full-extent one: slice() returns its input for a whole-tensor
+      // window (tt-metal slice.cpp:182), so the single-chunk case
+      // (c0 == 0 && c1 == N) makes sl the resident word shadow, and the
+      // forced reclaim would kill the cache entry for every later call
+      // (the full-suite regression: a dead shadow came back as an
+      // unallocated tensor inside slice). Leave sl to the shadow there.
+      const bool sl_alias = c0 == 0 && c1 == N;
+      ttnn::Tensor wbf = ttnn::typecast(wf, ttnn::DataType::BFLOAT16);
+      ttnn::Tensor wb = ttnn::to_layout(wbf, ttnn::Layout::TILE);
+      if (sl_alias)
+        TTReclaimPlanes(device, {&wf, &wbf});
+      else
+        TTReclaimPlanes(device, {&sl, &wf, &wbf});
       ttnn::Tensor part = ttnn::operations::matmul::matmul(
-          dev_a, std::move(wb), /*transpose_a=*/false, /*transpose_b=*/true);
-      partials.push_back(ttnn::to_layout(
-          ttnn::typecast(std::move(part), ttnn::DataType::FLOAT32),
-          ttnn::Layout::ROW_MAJOR));
+          dev_a, wb, /*transpose_a=*/false, /*transpose_b=*/true);
+      TTReclaimPlanes(device, {&wb});
+      ttnn::Tensor partf = ttnn::typecast(part, ttnn::DataType::FLOAT32);
+      ttnn::Tensor partl = ttnn::to_layout(partf, ttnn::Layout::ROW_MAJOR);
+      TTReclaimPlanes(device, {&part, &partf});
+      partials.push_back(std::move(partl));
     }
+    AllocTraceSnapshot(device, "KQuantGrouped/chunk-loop/post");
     ttnn::Tensor assembled =
         partials.size() == 1
             ? std::move(partials[0])
-            : ttnn::concat(std::move(partials), /*dim=*/1);
+            : ttnn::concat(partials, /*dim=*/1);
+    // W4d W2 (#3042): the concat read every partial — reclaim them. The
+    // single-partial form moved the only entry into assembled; its buffer
+    // IS the output and is never freed here.
+    if (partials.size() > 1) TTReclaimPlanes(device, partials);
     if (Pa == 1 && P > 1) {
       // Broadcast contract: every output row is the SAME [1, K] activation
       // against expert 0 — replicate the assembled row. Bit-identical to the
       // wave-2 per-group decode (identical operands, identical programs).
       std::vector<ttnn::Tensor> rows(static_cast<size_t>(P), assembled);
-      assembled = ttnn::concat(std::move(rows), /*dim=*/0);
+      ttnn::Tensor bred = ttnn::concat(rows, /*dim=*/0);
+      // The replicate inputs share assembled's buffer (handle copies); one
+      // forced free removes it for every alias (the holder tombstone makes
+      // the repeats no-ops).
+      TTReclaimPlanes(device, {&assembled});
+      TTReclaimPlanes(device, rows);
+      assembled = std::move(bred);
     }
-    if (out.dtype == DType::kBF16)
-      assembled =
-          ttnn::typecast(std::move(assembled), ttnn::DataType::BFLOAT16);
+    if (out.dtype == DType::kBF16) {
+      ttnn::Tensor abf = ttnn::typecast(assembled, ttnn::DataType::BFLOAT16);
+      TTReclaimPlanes(device, {&assembled});
+      assembled = std::move(abf);
+    }
     // Commit form: TILE — the layout the twin path's matmul output carried.
     // The ROW_MAJOR assembly above is an internal concat domain only. A
     // ROW_MAJOR commit leaves a ROW_MAJOR slot for the next consumer, and
@@ -2764,10 +2129,16 @@ void MatmulBTQuantGroupedKernel(Queue&, Tensor& out, const Tensor& act,
     // (the vehicle's rope -> paged-KV RAC reshape view exceeded the buffer:
     // mesh_tensor_impl.hpp packed-size fatal on the replay step). Values are
     // unchanged; only the committed slot's layout lands as the twin's did.
-    if (assembled.layout() != ttnn::Layout::TILE)
-      assembled = ttnn::to_layout(std::move(assembled), ttnn::Layout::TILE);
+    if (assembled.layout() != ttnn::Layout::TILE) {
+      ttnn::Tensor atl = ttnn::to_layout(assembled, ttnn::Layout::TILE);
+      TTReclaimPlanes(device, {&assembled});
+      assembled = std::move(atl);
+    }
     CommitDeviceLogical2D(out, std::move(assembled), static_cast<uint32_t>(P),
                           static_cast<uint32_t>(N));
+    // The committed slot owns assembled's buffer through the moved handle
+    // (the W1 trace books the committed slots as the legit residency), so
+    // nothing is reclaimed past the commit.
     return;
   }
 
@@ -2792,9 +2163,26 @@ void MatmulBTQuantGroupedKernel(Queue&, Tensor& out, const Tensor& act,
         ttsl::SmallVector<uint32_t>{static_cast<uint32_t>(w0 + N * nb), wpb},
         ttsl::SmallVector<uint32_t>{1u, 1u});
     ttnn::Tensor wf = DecodeKeepQuantWordsF32(sl, enc, N, nb, device);
-    return ttnn::to_layout(
-        ttnn::typecast(std::move(wf), ttnn::DataType::BFLOAT16),
-        ttnn::Layout::TILE);
+    // W4d W2 (#3042): the same reclaim as the chunk loop — the staged slice
+    // and decode output die into the typecast/to_layout chain. The sl_alias
+    // guard below is DEFENSIVE ONLY: this lambda runs in the E > 1 arm,
+    // where the word shadow always holds E*N*nb rows, so the identity's
+    // second term — words.logical_shape()[0] == N*nb, the full-extent window
+    // where slice() returns its input — can never hold (it would demand
+    // E == 1, and the E == 1 arm returned long before this lambda). The
+    // reclaim never actually skips sl today; the guard stays so the shadow
+    // is checked, not assumed, if this lambda is ever shared with the
+    // single-expert arm.
+    const bool sl_alias =
+        w0 == 0 &&
+        static_cast<int64_t>(words.logical_shape()[0]) == N * nb;
+    ttnn::Tensor wbf = ttnn::typecast(wf, ttnn::DataType::BFLOAT16);
+    ttnn::Tensor out_t = ttnn::to_layout(wbf, ttnn::Layout::TILE);
+    if (sl_alias)
+      TTReclaimPlanes(device, {&wf, &wbf});
+    else
+      TTReclaimPlanes(device, {&sl, &wf, &wbf});
+    return out_t;
   };
 
   std::vector<ttnn::Tensor> outs;
@@ -2892,7 +2280,7 @@ constexpr uint32_t ARG_ROW0 = 6;      // first weight column of this core (4*gro
 constexpr uint32_t ARG_ROWC = 7;      // real columns this core dots (0: idle)
 constexpr uint32_t ARG_MTILE = 8;     // activation rows per quantize tile
 constexpr uint32_t ARG_QB_PAD = 9;    // 16B-aligned activation-quant row bytes
-constexpr uint32_t ARG_ENC = 10;      // 0/1/2/3 = Q4_K/Q5_K/Q6_K/Q8_0
+constexpr uint32_t ARG_ENC = 10;      // 0/1/2/3/4 = Q4_K/Q5_K/Q6_K/Q8_0/IQ3_XXS
 constexpr uint32_t ARG_TCOLS = 11;    // padded tile width (uniform): groups_per_core*4
 
 // CB scratch (self-cycled: reserve -> use -> push -> pop; no consumer core).
@@ -3000,8 +2388,18 @@ void kernel_main() {
           v = kq_vec_dot_q5_K_q8_K(xw, word_bytes, yq, nb);
         else if (enc == 2)
           v = kq_vec_dot_q6_K_q8_K(xw, word_bytes, yq, nb);
-        else
+        else if (enc == 3)
           v = kq_vec_dot_q8_0_q8_0(xw, word_bytes, yq, nb);
+        else if (enc == 4)
+          v = kq_vec_dot_iq3_xxs_q8_K(xw, word_bytes, yq, nb);
+        else if (enc == 5)
+          v = kq_vec_dot_iq2_xxs_q8_K(xw, word_bytes, yq, nb);
+        else if (enc == 6)
+          v = kq_vec_dot_iq2_s_q8_K(xw, word_bytes, yq, nb);
+        else if (enc == 7)
+          v = kq_vec_dot_q3_k_q8_K(xw, word_bytes, yq, nb);
+        else
+          v = kq_vec_dot_iq2_s_q8_K(xw, word_bytes, yq, nb);
         out_tile[r * tcols + n] = v;
       }
     }
@@ -3078,6 +2476,7 @@ std::map<std::string, Int8DotWorkloadEntry>& Int8DotWorkloadCache() {
 }
 
 }  // namespace
+
 // kMatmulBTQuant's W4b body: out[M,N] = a[M,K] @ b[N,K]^T with b PACKED
 // keep-quant blocks, computed entirely by the device kernel above. M, N, K,
 // nb, wpb and the per-core row split are launch arguments; the activation is
@@ -3197,7 +2596,12 @@ void MatmulBTQuantInt8DotKernel(Queue& q, Tensor& out, const Tensor& a,
   const uint32_t enc_sel = enc == DType::kQ4_K    ? 0
                            : enc == DType::kQ5_K  ? 1
                            : enc == DType::kQ6_K  ? 2
-                                                  : 3;
+                           : enc == DType::kQ8_0  ? 3
+                           : enc == DType::kIQ3_XXS ? 4
+                           : enc == DType::kIQ2_XXS ? 5
+                           : enc == DType::kIQ2_S   ? 6
+                           : enc == DType::kQ3_K    ? 7
+                                                  : 0;
   const uint32_t wpb = static_cast<uint32_t>(KeepQuantWordsPerBlock(enc));
   const uint32_t act_f32 = a.dtype == DType::kF32 ? 1u : 0u;
   const std::string workload_key =
@@ -3378,6 +2782,15 @@ void MatmulBTQuantInt8DotKernel(Queue& q, Tensor& out, const Tensor& a,
   // slot the next consumer's tile view can overflow, the wave-3b lesson).
   ttnn::Tensor committed =
       ttnn::to_layout(std::move(dev_out), ttnn::Layout::TILE);
+  // W4d W6: a BF16-OUT call takes an explicit f32->bf16 cast BEFORE the
+  // commit. Committing the f32 dev_out into a bf16 slot left the slot
+  // holding f32 bytes at an f32 page geometry — the next bf16 reader got
+  // word-halved garbage (the ROW_MAJOR chained leg's NaN signature, the
+  // W4b landing decision). One recorded typecast launch: capture-safe.
+  if (out.dtype == DType::kBF16)
+    committed = ttnn::typecast(std::move(committed),
+                               ttnn::DataType::BFLOAT16);
+
   CommitDeviceLogical2D(out, std::move(committed), static_cast<uint32_t>(M),
                         static_cast<uint32_t>(N));
 }
@@ -3733,8 +3146,11 @@ void CastBf16Kernel(Queue&, Tensor& out, const Tensor& in) {
   ttnn::Tensor dev_in;
   if (ServeDeviceShadowRaw(in, 1, n, dev_in)) {
     ttnn::Tensor dev = NormalizeDevF32Tile(std::move(dev_in), 1, n);
+    // Commit the SERVED geometry (#2282): a rank-2 shadow keeps its native
+    // logical shape, and the record must name the geometry actually stored.
+    const auto dls = dev.logical_shape();
     CommitDeviceLogical2D(out, ttnn::typecast(dev, ttnn::DataType::BFLOAT16),
-                          1, n);
+                          dls[dls.rank() - 2], dls[dls.rank() - 1]);
     return;
   }
   {
@@ -3770,8 +3186,11 @@ void CastF32Kernel(Queue&, Tensor& out, const Tensor& in) {
   const uint32_t nf = static_cast<uint32_t>(in.Numel());
   ttnn::Tensor dev_in;
   if (ServeDeviceShadowRaw(in, 1, nf, dev_in)) {
-    CommitDeviceLogical2D(out, NormalizeDevF32Tile(std::move(dev_in), 1, nf),
-                          1, nf);
+    ttnn::Tensor dev = NormalizeDevF32Tile(std::move(dev_in), 1, nf);
+    // SERVED geometry, as in kCastBf16 above.
+    const auto dls = dev.logical_shape();
+    CommitDeviceLogical2D(out, std::move(dev), dls[dls.rank() - 2],
+                          dls[dls.rank() - 1]);
     return;
   }
   {
@@ -4166,6 +3585,16 @@ void AttnQkNormRopeGateKernel(Queue&, Tensor& q_out, Tensor& k_out,
       dev_k = NormalizeDevF32Tile(std::move(kf_shadow),
                                   static_cast<uint32_t>(t * hkv),
                                   static_cast<uint32_t>(dh));
+      // NormalizeDevF32Tile preserves the shadow's native [t, hkv*dh] geometry
+      // (PR #3206 L1 fix). Reshape to the intended [t*hkv, dh] — safe on TILE
+      // (view_device guard at tensor_ops.cpp:398: layout != ROW_MAJOR
+      // short-circuits before the page_size rebuild that corrupts ROW_MAJOR).
+      {
+        const auto k_target = ttnn::Shape({static_cast<uint32_t>(t * hkv),
+                                            static_cast<uint32_t>(dh)});
+        if (dev_k.logical_shape() != k_target)
+          dev_k = CaptureSafeReshape(dev_k, k_target);
+      }
     } else {
       VT_CHECK(!tt_capture_active(),
                "tenstorrent kAttnQkNormRopeGate: qgate/kf arrived without a "
@@ -5301,11 +4730,21 @@ bool TryPagedAttentionDeviceDecode(Tensor& out, const Tensor& query, const Tenso
         {
           Tensor q_flat = query.View({total_q * hq, d});
           ttnn::Tensor dev_q_2d = EnsureDevice2D(q_flat, device);
-          const uint32_t hu_pad = ((hu + 31u) / 32u) * 32u;
+          // The 4D view's H dimension must NOT be tile-padded per batch:
+          // the 2D tensor [B*H, D] packs heads contiguously (B*H rows in
+          // one tile column), but padding H→32 per batch element would
+          // require B*32 rows (2× the buffer for H=16, B=2). Instead,
+          // use the 2D tensor's padded [rows, D] as a 4D padded shape
+          // [1, 1, rows, D] — the total padded volume is the same
+          // (rows*D = B*H*D), the last two dims are tile-aligned (rows
+          // is B*H padded to 32, D is already aligned), and the buffer
+          // is large enough. The logical [1, B, H, D] reinterprets the
+          // same flat data; sdpa_decode reads per-batch head slices.
+          const auto ps2d = dev_q_2d.padded_shape();
           dev_q = ttnn::multiply(
               ttnn::experimental::view(
                   dev_q_2d, ttnn::Shape({1u, Bu, hu, du}),
-                  ttnn::Shape({1u, Bu, hu_pad, du})),
+                  ttnn::Shape({1u, 1u, ps2d[0], ps2d[1]})),
               1.0f);
         }
         // sdpa_decode requires bf16 (the host arm below builds bf16 too).
@@ -5564,7 +5003,7 @@ bool TryPagedAttentionDeviceDecode(Tensor& out, const Tensor& query, const Tenso
     if (identity_order && total_q == num_reqs) {
       try {
         const uint32_t flat_cols = static_cast<uint32_t>(hq * d);
-        ttnn::Tensor flat = ttnn::reshape(dev_out,
+        ttnn::Tensor flat = CaptureSafeReshape(dev_out,
             ttnn::Shape({Bu, flat_cols}));
         CommitDeviceLogical2D(out, std::move(flat), Bu, flat_cols);
         // Verify the committed output matches the PA output
@@ -6141,8 +5580,13 @@ ttnn::Tensor DeviceRows(const Tensor& t, uint32_t rows, uint32_t cols,
     if (s != nullptr && s->device_current && s->device.has_value() &&
         static_cast<uint64_t>(s->dev_rows) * s->dev_cols ==
             static_cast<uint64_t>(rows) * cols) {
-      ttnn::Tensor reshaped =
-          ttnn::reshape(*s->device, ttnn::Shape({rows, cols}));
+      // Same re-layout discipline as EnsureDevice2D's exact hit: round-trip
+      // ROW_MAJOR so a non-tile-aligned row count cannot reinterpret the
+      // owner's padded tile rows.
+      ttnn::Tensor reshaped = ttnn::to_layout(
+          ttnn::reshape(ttnn::to_layout(*s->device, ttnn::Layout::ROW_MAJOR),
+                        ttnn::Shape({rows, cols})),
+          s->device->layout());
       s->device = reshaped;
       s->dev_rows = rows;
       s->dev_cols = cols;
@@ -6249,6 +5693,30 @@ void RmsNormGatedKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& gate
   }
   ttnn::Tensor act =
       args.sigmoid_gate ? ttnn::sigmoid(dev_g) : ttnn::silu(dev_g);
+  // Reshape act to [rows, d] to match rms_norm(dev_x) output. The gate
+  // shadow's native geometry (e.g. [256, 6144] for APEX's gated-norm
+  // activation) is preserved by NormalizeDevF32Tile (the L1 overflow fix:
+  // a free reshape to [1, n] overflows L1, and view_device on ROW_MAJOR
+  // with a changed last dim corrupts data). act is TILE layout here
+  // (NormalizeDevF32Tile's final to_layout(TILE), preserved by the
+  // elementwise sigmoid/silu), so CaptureSafeReshape's member view_device
+  // takes the TILE safe path (tensor_ops.cpp:398: layout != ROW_MAJOR
+  // short-circuits before the page_size rebuild that corrupts ROW_MAJOR).
+  // Same numel (256*6144 == 12288*128), same tile count (1536), so the
+  // reshape is a pure metadata view — no bytes move, no device program.
+  {
+    const auto target_shape = ttnn::Shape({rows, d});
+    if (act.logical_shape() != target_shape) {
+      act = CaptureSafeReshape(act, target_shape);
+    }
+  }
+  if (std::getenv("VT_TT_SLOT_TRACE") != nullptr) {
+    std::fprintf(stderr,
+                 "[TT-RNG] rows=%u d=%u x=%s g=%s act=%s\n", rows, d,
+                 DevShapeStr(dev_x).c_str(), DevShapeStr(dev_g).c_str(),
+                 DevShapeStr(act).c_str());
+    std::fflush(stderr);
+  }
   ttnn::Tensor dev_y = ttnn::multiply(ttnn::rms_norm(dev_x, args.eps, dev_w), act);
   CommitDeviceLogical2D(out, std::move(dev_y), rows, d);
 }
@@ -6577,11 +6045,13 @@ ttnn::Tensor EnsureGdnCacheDevice(const Tensor& t, int64_t rows, int64_t cols,
             static_cast<uint64_t>(rows) * cols) {
       if (s->dev_rows == rows && s->dev_cols == cols) return *s->device;
       // Same buffer re-served at new logical dims: reshape to the NEW dims'
-      // split geometry (equal volume — a pure data-movement program whose
-      // circular buffers are per-tile).
-      ttnn::Tensor reshaped =
-          ttnn::reshape(*s->device, ttnn::Shape({static_cast<uint32_t>(rows) * sf,
-                                                  ublk}));
+      // split geometry (equal volume). Always use the member reshape (pure
+      // view) to produce the same padded shape in both eager and capture,
+      // so downstream ops (untilize in ScatterRowsDevice) see the same input
+      // and hit the program cache.
+      const auto old_padded = s->device->padded_shape();
+      ttnn::Tensor reshaped = s->device->reshape(
+          ttnn::Shape({static_cast<uint32_t>(rows) * sf, ublk}), old_padded);
       s->device = reshaped;
       s->dev_rows = static_cast<uint32_t>(rows);
       s->dev_cols = static_cast<uint32_t>(cols);
@@ -6979,14 +6449,30 @@ ttnn::Tensor ServeActF32(const Tensor& t, uint32_t rows, uint32_t cols,
   ttnn::Tensor raw;
   if (ServeDeviceShadowRaw(t, rows, cols, raw)) {
     const auto ls = raw.logical_shape();
-    if (ls.rank() != 2 || ls[0] != rows || ls[1] != cols)
-      raw = ttnn::reshape(raw, ttnn::Shape({rows, cols}));
+    if (ls.rank() != 2 || ls[0] != rows || ls[1] != cols) {
+      if (tt_capture_active() && ls.rank() == 2 &&
+          ls[0] * ls[1] == static_cast<uint32_t>(rows) * cols) {
+        // CaptureSafeReshape: member reshape (pure view, no device program)
+        raw = CaptureSafeReshape(raw, ttnn::Shape({rows, cols}));
+      } else {
+        raw = CaptureSafeReshape(raw, ttnn::Shape({rows, cols}));
+      }
+    }
     if (raw.dtype() != ttnn::DataType::FLOAT32)
       raw = ttnn::typecast(raw, ttnn::DataType::FLOAT32);
     if (raw.layout() != ttnn::Layout::TILE)
       raw = ttnn::to_layout(raw, ttnn::Layout::TILE);
     return raw;
   }
+  // The exact-shadow serve demands owner-numel equality, so an interior
+  // window of a packed producer output (the q/k expand row views at a batch
+  // the owner padded wider) falls through here. ServeDeviceWindow splits the
+  // interior pointer offset into the owner's row/column geometry and rides a
+  // device column slice — the same serve ServePostConvAB takes. Without it
+  // the host fallback ran EnsureHost on the OWNER slot and downloaded the
+  // whole plane against the window's numel (ISSUE-LOCAL-01M2E5F69CMWDERKXG32YY9P8N:
+  // EnsureHost 1x16x128 vs dev 1024x128, vllm-bench chunked decode).
+  if (ServeDeviceWindow(t, rows, cols, raw)) return raw;
   VT_CHECK(!tt_capture_active(),
            std::string("tenstorrent gdn_decode: ") + what +
                " arrived without a current device shadow during trace "
@@ -7007,13 +6493,30 @@ ttnn::Tensor ServeActF32(const Tensor& t, uint32_t rows, uint32_t cols,
 // of a TILE owner keeps the owner's tile padding — every one of those feeds
 // a downstream elementwise op a misaligned physical layout (the prefill
 // "Invalid subtile broadcast type" fatal). Materializing in ROW_MAJOR gives
-// a fresh contiguous buffer, the reshape on it is a pure metadata view,
-// and the final to_layout(TILE) rebuilds the padding from the true shape.
+// a fresh contiguous buffer; the elementwise chain on it is shape-agnostic,
+// and the final to_layout(TILE) rebuilds the padding from the tensor's own
+// (served) geometry. A rank-2 shadow keeps its native logical shape — the
+// callers commit that served geometry (see NormalizeDevF32Tile's comment).
 ttnn::Tensor NormalizeDevF32Tile(ttnn::Tensor x, uint32_t rows, uint32_t cols) {
   x = ttnn::to_layout(x, ttnn::Layout::ROW_MAJOR);
   const auto ls = x.logical_shape();
-  if (ls.rank() != 2 || ls[0] != rows || ls[1] != cols)
-    x = ttnn::reshape(x, ttnn::Shape({rows, cols}));
+  if (ls.rank() != 2 || ls[0] != rows || ls[1] != cols) {
+    // ISSUE-LOCAL-01M2K8WWA0X09VJF55NTS16VTV: a producer shadow natively
+    // shaped [T, W] (the APEX gated-norm activation [128, 6144]) must not
+    // take the free ttnn::reshape to (1, n) — reshape_rm's statically
+    // allocated staging CBs scale with the row width, and the 3,145,728 B
+    // f32 row is 2x the L1 cap (fatal at program allocation). The
+    // metadata view cannot serve it either: view_device on ROW_MAJOR with
+    // a CHANGED last dim rebuilds the buffer page mapping and the data
+    // comes back wrong (the focused cast test's bit-exact memcmp caught
+    // it) — which is why upstream routes this case through reshape_rm.
+    // The elementwise ops below (typecast, to_layout(TILE)) are
+    // shape-agnostic on the contiguous buffer, so a rank-2 shadow runs at
+    // its native geometry and the CALLER commits the served geometry (the
+    // #2282 served-geometry doctrine). The free reshape stays for the
+    // non-rank-2 cases the elementwise chain cannot carry as-is.
+    if (ls.rank() != 2) x = ttnn::reshape(x, ttnn::Shape({rows, cols}));
+  }
   if (x.dtype() != ttnn::DataType::FLOAT32)
     x = ttnn::typecast(x, ttnn::DataType::FLOAT32);
   return ttnn::to_layout(x, ttnn::Layout::TILE);
@@ -7044,14 +6547,37 @@ bool ServeDeviceWindow(const Tensor& t, uint32_t rows, uint32_t cols,
     return false;
   const int64_t elem_bytes =
       s->device->dtype() == ttnn::DataType::FLOAT32 ? 4 : 2;
+  // The window's own geometry: rank-2 views stride [dev_cols, 1] by
+  // construction; higher-rank views are accepted only when CONTIGUOUS
+  // row-major (every stride the product of the inner extents), which makes
+  // them a plain flattened [rows*cols] span — the v/g/beta expands of the
+  // decode step arrive as rank-3 [1, bh, ud] views of the packed producer
+  // output (the vllm-bench chunked path; ISSUE-LOCAL-01M2E5F69CMWDERKXG32YY9P8N).
+  // A non-contiguous multi-rank view is not served.
+  const int64_t dev_cols = static_cast<int64_t>(s->dev_cols);
+  if (t.rank == 2) {
+    if (t.stride[0] != dev_cols || t.stride[1] != 1) return false;
+  } else {
+    if (t.shape[t.rank - 1] != cols) return false;
+    int64_t expect = 1;
+    for (int i = t.rank - 1; i >= 0; --i) {
+      if (t.shape[i] != 0 && t.stride[i] != expect) return false;
+      expect *= t.shape[i];
+    }
+    if (rows * cols != expect) return false;
+  }
   const int64_t delta = static_cast<const char*>(t.data) -
                         static_cast<const char*>(s->host);
   if (delta < 0 || delta % elem_bytes != 0) return false;
   const int64_t off = delta / elem_bytes;
-  const int64_t dev_cols = static_cast<int64_t>(s->dev_cols);
+  // The slot's registered allocation must COVER the whole window (the slot
+  // map is never erased, #1486 — a freed tensor's range can host a later,
+  // unrelated allocation; the vllm-bench prefill buffers hit exactly that).
+  if (delta + rows * cols * elem_bytes >
+      static_cast<int64_t>(s->bytes))
+    return false;
   const int64_t off_row = off / dev_cols, off_col = off % dev_cols;
-  if (t.stride[0] != dev_cols || t.stride[1] != 1 ||
-      off_row + rows > s->dev_rows || off_col + cols > dev_cols)
+  if (off_row + rows > s->dev_rows || off_col + cols > dev_cols)
     return false;
   ttnn::Tensor win = ttnn::slice(
       *s->device, ttsl::SmallVector<uint32_t>{static_cast<uint32_t>(off_row),
@@ -7059,6 +6585,12 @@ bool ServeDeviceWindow(const Tensor& t, uint32_t rows, uint32_t cols,
       ttsl::SmallVector<uint32_t>{static_cast<uint32_t>(off_row + rows),
                                   static_cast<uint32_t>(off_col + cols)},
       ttsl::SmallVector<uint32_t>{1, 1});
+  if (std::getenv("VT_TT_SLOT_TRACE") != nullptr) {
+    std::fprintf(stderr, "[TT-WINSERVE] serve %ux%u off=%" PRId64
+                         " owner=%s\n",
+                 rows, cols, off, DevShapeStr(*s->device).c_str());
+    std::fflush(stderr);
+  }
   out = NormalizeDevF32Tile(std::move(win), rows, cols);
   return true;
 }
@@ -7166,20 +6698,6 @@ ttnn::Tensor CachedRepeatIdx(uint64_t t, uint64_t heads, uint64_t half,
 
 namespace {
 
-ttnn::Tensor CachedScratchRowId(uint32_t usl, MeshDevice& device) {
-  const std::array<uint64_t, 4> key{0, 1, usl, 0};
-  std::lock_guard<std::mutex> g(ConvTileCacheMutex());
-  auto it = ConvTileCacheMap().find(key);
-  if (it != ConvTileCacheMap().end()) return it->second.dev;
-  VT_CHECK(!tt_capture_active(),
-           "tenstorrent causal_conv1d_update: scratch-row id not warmed — the "
-           "cold step must build it before the captured region");
-  ConvTileEntry e;
-  e.dev = UploadIdxU32(std::vector<uint32_t>{usl}, ttnn::Shape({1}),
-                       ttnn::Layout::ROW_MAJOR, device);
-  ConvTileCacheMap().emplace(key, std::move(e));
-  return ConvTileCacheMap()[key].dev;
-}
 ttnn::Tensor CachedAccBase(uint32_t R, MeshDevice& device) {
   const std::array<uint64_t, 4> key{0, 2, R, 0};
   std::lock_guard<std::mutex> g(ConvTileCacheMutex());
@@ -7547,13 +7065,28 @@ void CausalConv1dUpdateKernel(Queue&, Tensor& out, const Tensor& x, const Tensor
                         ttnn::DataType::FLOAT32, ttnn::Layout::TILE, device);
     }
   }
-  ttnn::Tensor bid = CachedScratchRowId(usl, device);
-  T = ttnn::reshape(
-      ttnn::indexed_fill(
-          bid,
-          ttnn::reshape(T, ttnn::Shape({usl + 1, R, 1, 1})),
-          ttnn::reshape(xT, ttnn::Shape({1, R, 1, 1})), std::nullopt, /*dim=*/0),
-      ttnn::Shape({usl + 1, R}));
+  // The scratch row is the LAST state row (index usl), and the fill never
+  // reads its old content — "write x's row into the scratch row" is therefore
+  // exactly concat(history rows, xT), rank-2 TILE end to end. The rank-4
+  // indexed_fill this replaces was the W4d 27B wall twice over: a rank-4 view
+  // on the TILE state re-pads the trailing 1-dims to 32x32 per element (the
+  // x1024 blowup — ~1.6 GB per decode step at R = 102400), and the ROW_MAJOR
+  // rescue dies inside tt-metal's all-RM indexed_fill at op scale (conv
+  // oracle max_abs 0.17 under every view/reshape variant, against a bit-clean
+  // baseline). concat touches only {usl+1, R} planes — 13 MB at 27B — and
+  // reinterprets nothing.
+  if (xT.dtype() != T.dtype()) xT = ttnn::typecast(std::move(xT), T.dtype());
+  T = usl == 0
+          ? xT
+          : ttnn::concat(
+                std::vector<ttnn::Tensor>{
+                    ttnn::slice(T, ttsl::SmallVector<uint32_t>{0u, 0u},
+                                ttsl::SmallVector<uint32_t>{
+                                    static_cast<uint32_t>(usl),
+                                    static_cast<uint32_t>(R)},
+                                ttsl::SmallVector<uint32_t>{1u, 1u}),
+                    xT},
+                /*dim=*/0);
 
   // MAC source: rows [0..width-1, scratch sl] — constant per geometry.
   std::vector<uint32_t> mac_rows;
@@ -7692,6 +7225,10 @@ DecodeStepResult GdnDecodeStepComposed(const ttnn::Tensor& S, const ttnn::Tensor
                                        const ttnn::Tensor& dev_k, const ttnn::Tensor& dev_v,
                                        const ttnn::Tensor& dev_g, const ttnn::Tensor& dev_b,
                                        float scale, uint32_t bh, uint32_t dk, uint32_t dv) {
+  // During capture, use the free ttnn::reshape: the program IS cached from
+  // the eager warmup (GdnDecodeStepComposed runs the same reshapes in both
+  // passes). create_program_artifacts only runs on cache miss, so the cache
+  // hit path doesn't call to_device.
   ttnn::Tensor decay = ttnn::exp(ttnn::reshape(dev_g, ttnn::Shape({bh, 1, 1})));
   ttnn::Tensor Sd = ttnn::multiply(S, decay);
   ttnn::Tensor kcol = ttnn::reshape(dev_k, ttnn::Shape({bh, dk, 1}));
@@ -7789,10 +7326,10 @@ void GdnDecodeKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k,
     // recapture cadence's, and the VT_CHECK inside names it).
     sentry = GdnSsmIdxEntry(idxv, slots, sf, device);
     oh = sentry.oh;
-    S = ttnn::reshape(ttnn::matmul(*oh, cache2d),
+    S = CaptureSafeReshape(ttnn::matmul(*oh, cache2d),
                       ttnn::Shape({bh, udv, udk}));
   } else {
-    S = ttnn::reshape(cache2d, ttnn::Shape({bh, udv, udk}));
+    S = CaptureSafeReshape(cache2d, ttnn::Shape({bh, udv, udk}));
   }
 
   const char* mode = std::getenv("VT_TT_GDN_DECODE");
@@ -7881,13 +7418,13 @@ void GdnDecodeKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k,
 
   CommitDeviceLogical2D(
       out,
-      ttnn::reshape(o, ttnn::Shape({ub, uhv, udv})),
+      CaptureSafeReshape(o, ttnn::Shape({ub, uhv, udv})),
       static_cast<uint32_t>(batch * hv), udv);
 
   // rows2d in the SPLIT shadow geometry ([B*F, blk]) — same flat bytes as
   // [B, Hv*Dv*Dk]; the regroup across the head boundary is one exact
   // data-movement program with per-tile circular buffers (only when F > 1).
-  ttnn::Tensor rows2d = ttnn::reshape(
+  ttnn::Tensor rows2d = CaptureSafeReshape(
       S_new, ttnn::Shape({static_cast<uint32_t>(ub * sf),
                           static_cast<uint32_t>((uhv * udv * udk) / sf)}));
   // bf16 STORAGE semantics (SupportsCompressedGdnState, cuda_backend.cu): a
@@ -7911,12 +7448,13 @@ void GdnDecodeKernel(Queue&, Tensor& out, const Tensor& q_in, const Tensor& k,
     // content match plus the NULL refusal above make it the all-live form
     // ScatterRowsExact would build); eager keeps the per-call path, NULL
     // compaction included.
+    // Use ScatterRowsDevice for BOTH eager and capture: the committed state
+    // must have the same properties in both passes, so EnsureGdnCacheDevice
+    // takes the same branch in the next layer. The eager warmup warms the
+    // untilize/indexed_fill programs that capture needs.
     ttnn::Tensor newc =
-        tt_capture_active()
-            ? ScatterRowsDevice(cache2d, sentry.scatter_bid, rows2d, slots,
-                                hv * dv * dk, sf)
-            : ScatterRowsExact(cache2d, idxv, rows2d, slots, hv * dv * dk, sf,
-                               device);
+        ScatterRowsDevice(cache2d, sentry.scatter_bid, rows2d, slots,
+                            hv * dv * dk, sf);
     CommitDeviceLogical2D(state, std::move(newc), static_cast<uint32_t>(slots),
                           static_cast<uint32_t>(hv * dv * dk));
   } else {
@@ -8457,6 +7995,201 @@ void EmbedDeviceIdsInto(void* out_host, int64_t rows, int64_t cols,
 }
 
 // ---- Called from TenstorrentBackend::Alloc/Free/Copy (no ttnn in that TU). ----
+
+// ---- W4d W0 (#3042): device-side allocation trace ---------------------------
+// Interleaves get_memory_view snapshots between ops to attribute the 27B OOM.
+// Gated by VT_TT_ALLOC_TRACE. Logs free/allocated bytes per DRAM bank to stderr
+// with a running delta; the max negative delta (largest single allocation) is
+// the red-first test observable.
+namespace {
+bool AllocTraceEnabled() {
+  return std::getenv("VT_TT_ALLOC_TRACE") != nullptr;
+}
+struct AllocTraceState {
+  std::mutex mtx;
+  int64_t snapshot_count = 0;
+  int64_t prev_free_total = -1;  // -1 = no previous snapshot
+  int64_t max_alloc_delta = 0;   // largest single allocation (bytes)
+};
+AllocTraceState& AllocTraceSt() {
+  static AllocTraceState* s = new AllocTraceState();  // never destroyed (#1486)
+  return *s;
+}
+}  // namespace
+
+void AllocTraceSnapshot(MeshDevice& device, const char* label) {
+  if (!AllocTraceEnabled()) return;
+  const auto view = tt::tt_metal::detail::GetMemoryView(
+      &device, tt::tt_metal::BufferType::DRAM);
+  const int64_t num_banks = static_cast<int64_t>(view.num_banks);
+  const int64_t free_per_bank =
+      static_cast<int64_t>(view.total_bytes_free_per_bank);
+  const int64_t alloc_per_bank =
+      static_cast<int64_t>(view.total_bytes_allocated_per_bank);
+  const int64_t largest_free =
+      static_cast<int64_t>(view.largest_contiguous_bytes_free_per_bank);
+  const int64_t total_free = num_banks * free_per_bank;
+
+  std::lock_guard<std::mutex> g(AllocTraceSt().mtx);
+  int64_t delta = 0;
+  if (AllocTraceSt().prev_free_total >= 0)
+    delta = total_free - AllocTraceSt().prev_free_total;  // negative = allocated
+  if (delta < 0 && -delta > AllocTraceSt().max_alloc_delta)
+    AllocTraceSt().max_alloc_delta = -delta;
+  AllocTraceSt().prev_free_total = total_free;
+  AllocTraceSt().snapshot_count++;
+
+  std::fprintf(stderr,
+      "[TT-ALLOC] #%lld label=%s banks=%lld free_per_bank=%lld "
+      "largest_free=%lld alloc_per_bank=%lld total_free=%lld delta=%lld\n",
+      (long long)AllocTraceSt().snapshot_count, label,
+      (long long)num_banks, (long long)free_per_bank,
+      (long long)largest_free, (long long)alloc_per_bank,
+      (long long)total_free, (long long)delta);
+}
+
+int64_t AllocTraceSnapshotCountForTest() {
+  std::lock_guard<std::mutex> g(AllocTraceSt().mtx);
+  return AllocTraceSt().snapshot_count;
+}
+int64_t AllocTraceMaxDeltaForTest() {
+  std::lock_guard<std::mutex> g(AllocTraceSt().mtx);
+  return AllocTraceSt().max_alloc_delta;
+}
+void StageWeightBf16ForTest(const Tensor& t, MeshDevice& device) {
+  (void)EnsureDevice2D(t, device);
+}
+
+// W4d W3 (ISSUE-LOCAL-01M2AA4ZVD9EWJG5NNQD5DWZXS): after the ctor's cold
+// pre-warm (which runs at the full batched shape) and the capture, every
+// warm activation it committed via CommitDeviceLogical2D is garbage — the
+// captured decode only reads step-shaped buffers — yet the slots hold it
+// forever (~14 GiB at 27B: banks at 93 percent before the first decode, and
+// the repair chain's contiguity ask fragments against it). Release slots
+// whose consumer shadow has EXACTLY the warm forward's row count; word
+// shadows, persistent weight stagings and the embed twin live in other
+// holders and are untouched. Recipe-gated via VT_TT_RELEASE_WARM_ROWS.
+void ReleaseWarmShapeSlots(uint32_t rows) {
+  std::vector<ttnn::Tensor> dead;
+  {
+    std::lock_guard<std::mutex> g(SlotMutex());
+    for (auto& kv : Slots()) {
+      BufferSlot& s = kv.second;
+      if (!s.device) continue;
+      const auto ls = s.device->logical_shape();
+      if (ls.rank() >= 1 && ls[0] == rows) {
+        dead.push_back(*s.device);
+        s.device.reset();
+      }
+    }
+  }
+  if (!dead.empty()) {
+    std::fprintf(stderr,
+                 "[TT-WARM-RELEASE] rows=%u: released %zu warm slot(s)\n",
+                 rows, dead.size());
+    TTReclaimPlanes(SharedMeshDevice(), dead);
+  }
+}
+
+// W4d W6: stage the keep-quant word shadow for ONE block-quant weight at
+// LOAD time (the residency pre-pass). A lazy first-matmul stage at 27B
+// asked the head's 1 GiB words against a fragmented, 95-percent-full bank
+// set and died; staged here — immediately after the weight's own resident
+// upload, while the banks are unfragmented — the words land contiguously
+// and the warm's EnsureKeepQuantWords hits the cache (same key: the
+// ResidentWeight device view's pointer). No-op for non-block dtypes.
+void StageKeepQuantWordsFor(const Tensor& packed) {
+  if (!vt::IsBlockQuant(packed.dtype)) return;
+  const int64_t nb =
+      static_cast<int64_t>(packed.shape[1]) /
+      static_cast<int64_t>(BlockElems(packed.dtype));
+  (void)EnsureKeepQuantWords(packed, packed.dtype,
+                             static_cast<int64_t>(packed.shape[0]), nb,
+                             SharedMeshDevice());
+}
+
+int64_t FreeDeviceDramBytesForTest() {
+  MeshDevice& device = SharedMeshDevice();
+  const auto view = tt::tt_metal::detail::GetMemoryView(
+      &device, tt::tt_metal::BufferType::DRAM);
+  return static_cast<int64_t>(view.num_banks) *
+         static_cast<int64_t>(view.total_bytes_free_per_bank);
+}
+
+// Total DRAM across banks — the number the placement fit needs as the
+// platform's probed total (ISSUE-LOCAL-01M2ACXRJYFW7R7BP2ABQS3VY2: without
+// it the budget is UNKNOWN and the MoE fit refuses, landing the model on
+// CPU). Same view the free-bytes helper reads; capacity, not free.
+int64_t DeviceDramTotalBytes() {
+  MeshDevice& device = SharedMeshDevice();
+  const auto view = tt::tt_metal::detail::GetMemoryView(
+      &device, tt::tt_metal::BufferType::DRAM);
+  return static_cast<int64_t>(view.num_banks) *
+         static_cast<int64_t>(view.total_bytes_per_bank);
+}
+
+// Attribution (W4d W3, ISSUE-LOCAL-01M2AA4ZVD9EWJG5NNQD5DWZXS): walk the
+// slot table and dump resident device bytes by holder — the consumer shadow
+// (`device`), the persistent staged buffer (`persistent`), the gemma affine
+// form — plus the top holders by volume. The 27B warm pass leaves ~14 GiB
+// of slot residency; this census names which slots hold it.
+void DumpSlotCensus(const char* label) {
+  std::lock_guard<std::mutex> g(SlotMutex());
+  auto bytes_of = [](const ttnn::Tensor& t) -> size_t {
+    size_t esz = 4;
+    switch (t.dtype()) {
+      case ttnn::DataType::BFLOAT16: esz = 2; break;
+      case ttnn::DataType::UINT8: esz = 1; break;
+      default: esz = 4; break;
+    }
+    size_t n = 1;
+    for (uint32_t d : t.logical_shape()) n *= d;
+    return n * esz;
+  };
+  size_t dev_bytes = 0, pers_bytes = 0, gemma_bytes = 0;
+  size_t n_dev = 0, n_pers = 0;
+  std::map<std::string, std::pair<size_t, size_t>> dev_hist;  // shape -> bytes, slots
+  std::map<std::string, std::pair<size_t, size_t>> pers_hist;
+  for (auto& kv : Slots()) {
+    BufferSlot& s = kv.second;
+    if (s.device) {
+      const size_t b = bytes_of(*s.device);
+      dev_bytes += b;
+      ++n_dev;
+      auto& e = dev_hist[std::to_string(s.dev_rows) + "x" +
+                         std::to_string(s.dev_cols)];
+      e.first += b;
+      e.second += 1;
+    }
+    if (s.persistent) {
+      const size_t b = bytes_of(*s.persistent);
+      pers_bytes += b;
+      ++n_pers;
+      auto& e = pers_hist[std::to_string(s.persist_rows) + "x" +
+                          std::to_string(s.persist_cols)];
+      e.first += b;
+      e.second += 1;
+    }
+    if (s.gemma_device) gemma_bytes += bytes_of(*s.gemma_device);
+  }
+  std::fprintf(stderr,
+               "[TT-SLOT-CENSUS] %s: dev=%zu B in %zu slots, "
+               "pers=%zu B in %zu slots, gemma=%zu B\n",
+               label, dev_bytes, n_dev, pers_bytes, n_pers, gemma_bytes);
+  for (auto& [shape, e] : dev_hist)
+    std::fprintf(stderr, "[TT-SLOT-CENSUS]   dev %s: %zu B in %zu slots\n",
+                 shape.c_str(), e.first, e.second);
+  for (auto& [shape, e] : pers_hist)
+    std::fprintf(stderr, "[TT-SLOT-CENSUS]   pers %s: %zu B in %zu slots\n",
+                 shape.c_str(), e.first, e.second);
+}
+void ResetAllocTraceForTest() {
+  std::lock_guard<std::mutex> g(AllocTraceSt().mtx);
+  AllocTraceSt().snapshot_count = 0;
+  AllocTraceSt().prev_free_total = -1;
+  AllocTraceSt().max_alloc_delta = 0;
+}
+
 void RegisterHostBuffer(void* host, size_t bytes) {
   if (host == nullptr) return;
   std::lock_guard<std::mutex> g(SlotMutex());
@@ -8790,7 +8523,31 @@ bool MemsetDeviceIfCapture(void* p, int value, size_t bytes) {
     // EnsureDevice2D restage primed the zero at this exact spec
     // (ZeroCachePrime) and the copy program is warm from the eager copy
     // lane — ZeroCacheGet refuses a capture-time miss by design.
-    if (!tt_capture_active()) return false;
+    if (!tt_capture_active()) {
+      // Prime the zero-cache AND warm the copy program for this spec during
+      // eager warmup: the capture-time lane runs ttnn::copy(zero_src, *fresh)
+      // whose CopyDeviceOperation hash is shape-specific, so a copy never
+      // executed during warmup is not in the program cache and trace capture
+      // fatals on the missing binary. Also prime ZeroCacheGet for the
+      // [1, cols] bf16 TILE spec — a fresh-slot memset whose geometry never
+      // staged (the 27B bench: a 20480-B res.Zero → [1,10240] bf16 TILE)
+      // would miss mid-capture.
+      if (bytes > 0 && (bytes % 2) == 0) {
+        uint32_t cols = static_cast<uint32_t>(bytes / 2);
+        MeshDevice& md = SharedMeshDevice();
+        md.enable_program_cache();
+        auto shape = ttnn::Shape({1u, cols});
+        ZeroCachePrime(shape, ttnn::DataType::BFLOAT16,
+                       ttnn::Layout::TILE, md);
+        ttnn::Tensor zero_src = ZeroCacheGet(
+            shape, ttnn::DataType::BFLOAT16, ttnn::Layout::TILE, md);
+        ttnn::Tensor tmp = ttnn::empty(shape, ttnn::DataType::BFLOAT16,
+                                       ttnn::Layout::TILE, &md,
+                                       ttnn::MemoryConfig{});
+        ttnn::copy(zero_src, tmp);
+      }
+      return false;
+    }
     MeshDevice& device_fresh = SharedMeshDevice();
     device_fresh.enable_program_cache();
     uint32_t cols = 0;
@@ -9123,6 +8880,57 @@ bool ConvShadowServeable(const void* conv_state_data, int64_t slots,
          s->device->layout() == ttnn::Layout::TILE &&
          s->device->logical_shape()[0] == usl + 1 &&
          s->device->logical_shape()[1] == uslots * uc;
+}
+
+namespace {
+
+struct GdnShadowData {
+  std::optional<ttnn::Tensor> device;
+  uint32_t dev_rows = 0, dev_cols = 0;
+  bool device_current = false, conv_transposed = false;
+};
+
+}  // namespace
+
+std::vector<GdnStateShadowSnapshot> SnapshotGdnStateShadows(
+    const std::vector<const void*>& ptrs) {
+  std::vector<GdnStateShadowSnapshot> out;
+  out.reserve(ptrs.size());
+  std::lock_guard<std::mutex> g(SlotMutex());
+  for (const void* p : ptrs) {
+    GdnShadowData data;
+    BufferSlot* s = FindSlot(const_cast<void*>(p));
+    if (s != nullptr) {
+      data.device = s->device;
+      data.dev_rows = s->dev_rows;
+      data.dev_cols = s->dev_cols;
+      data.device_current = s->device_current;
+      data.conv_transposed = s->conv_transposed;
+    }
+    GdnStateShadowSnapshot snap;
+    static_assert(sizeof(GdnShadowData) <= sizeof(snap.storage),
+                  "GdnStateShadowSnapshot storage too small");
+    new (snap.storage) GdnShadowData(std::move(data));
+    out.push_back(snap);
+  }
+  return out;
+}
+
+void RestoreGdnStateShadows(
+    const std::vector<const void*>& ptrs,
+    const std::vector<GdnStateShadowSnapshot>& snapshots) {
+  std::lock_guard<std::mutex> g(SlotMutex());
+  for (size_t i = 0; i < ptrs.size() && i < snapshots.size(); ++i) {
+    auto* data = reinterpret_cast<GdnShadowData*>(
+        const_cast<char*>(snapshots[i].storage));
+    BufferSlot* s = FindSlot(const_cast<void*>(ptrs[i]));
+    if (s == nullptr) continue;
+    s->device = data->device;
+    s->dev_rows = data->dev_rows;
+    s->dev_cols = data->dev_cols;
+    s->device_current = data->device_current;
+    s->conv_transposed = data->conv_transposed;
+  }
 }
 
 void WarmPagedKvShadow(void* k_cache_data, void* v_cache_data,

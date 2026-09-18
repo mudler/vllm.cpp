@@ -202,6 +202,34 @@ struct Qwen4ExpLayerWeights {
   // `GdnLayerWeights` is only meaningful on a linear-attention layer and an
   // empty one there would be indistinguishable from a half-built load.
   std::optional<GdnLayerWeights> gdn_block;
+
+  // The shared-seam view of `moe`, built ONCE and reused by every step, for the
+  // same reason and with the same lifetime as `gdn_block` above
+  // (`ISSUE-LOCAL-01M2AA9C31GCSDV8NRW26GMEVS`). It is the MoE half of the memo
+  // the field above is the Gated DeltaNet half of.
+  //
+  // `BorrowWholeOwnedTensor` carries dtype, rank, shape, `nk` and every layout
+  // marker and does NOT carry `d_dev`, so a `MoeBlockWeights` composed inside
+  // the layer loop presents a NULL residency memo on every step and every
+  // expert tower takes `ResidentWeight`'s staging arm again. Measured on
+  // `dgx:gpu0` (2026-09-12, `51c248190`, GB10, released UD-IQ1_S): 378
+  // `cudaMalloc` calls per decode step against the 384 this composition asks
+  // for, 2.25 s of the step in the allocator against 0.101 s in all GPU
+  // kernels. Holding one adapter for the model's life is what makes the memo
+  // mean anything.
+  //
+  // IT IS NOT A COPY OF THE WEIGHTS. Every tower and every shared-expert
+  // projection in it is a BORROW of `moe`'s bytes with a keep-alive, and the
+  // router and the shared gate are the two small bf16 re-roundings
+  // `Qwen4ExpMoeBlockWeights` has always made. Spelling any of them as
+  // assignment would deep-copy `OwnedTensor`'s owned buffer, which is #2476
+  // next door.
+  //
+  // `std::optional` and not a populated-by-default member, because
+  // `Qwen4ExpMoeBlockWeights` VALIDATES the geometry and refuses a malformed
+  // layer, so an empty one here is a load that has not run a forward yet and
+  // not a half-built load.
+  std::optional<MoeBlockWeights> moe_block;
 };
 
 struct Qwen4ExpWeights {

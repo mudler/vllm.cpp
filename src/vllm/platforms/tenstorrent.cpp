@@ -39,11 +39,17 @@ class TenstorrentPlatform final : public Platform {
     return {DType::kBF16, DType::kF32};
   }
 
-  // Discrete PCIe device (tenstorrent_backend.cpp UnifiedMemory()==false); no
-  // host-weight-release/pool-cap policy has been worked out for it yet, so the
-  // default (empty) ResidencyPolicy is the honest answer — same non-decision
-  // Vulkan's early skeleton made for the same reason.
-  ResidencyPolicy residency_policy() const override { return {}; }
+  // Discrete PCIe device (tenstorrent_backend.cpp UnifiedMemory()==false).
+  // The residency policy carries the probed DRAM total (banks x capacity):
+  // without it the MoE fit sees budget UNKNOWN and refuses, silently landing
+  // the model on CPU (ISSUE-LOCAL-01M2ACXRJYFW7R7BP2ABQS3VY2) — the empty
+  // policy was the honest answer only while no probe existed.
+  ResidencyPolicy residency_policy() const override {
+    ResidencyPolicy policy;
+    policy.device_memory_total_bytes =
+        static_cast<size_t>(vt::tenstorrent::DeviceDramTotalBytes());
+    return policy;
+  }
 
   // Explicit allow-list of architectures whose full op set is registered for
   // kTENSTORRENT (mirrors MetalPlatform::supports_model_architecture). OPT-125m

@@ -14,8 +14,9 @@ Issue [#2970](https://github.com/mudler/vllm.cpp/issues/2970).
 |---|---|
 | `job-as-run.sh` | the job as submitted to `rc`, byte-identical to `benchmarks/variadic/job.sh` at the measured commit |
 | `results.txt` | the job's own `RESULT` lines: device, boot id, lease, checkpoint sha256 values, `G-BYTES`, `G-RESOLVED`, the build recipe, the paged-route decision, and each leg's client return code |
-| `report.md` | the report as `benchmarks/variadic/report.py` printed it over the nine completed legs |
-| `corpus-manifest.json` | the prompt corpus: every source sha256, the seed, the band weights, the realised character lengths, and the corpus's own sha256 |
+| `report.md` | the report as `benchmarks/variadic/report.py` printed it over the twenty-one completed legs |
+| `corpus-manifest.json` | the 144-prompt corpus used for c=1,4,8: every source sha256, the seed, the band weights, the realised character lengths, and the corpus's own sha256 |
+| `corpus-manifest-192.json` | the 192-prompt corpus used for c=16,32: same sources, seed, and weights, with 48 additional prompts so c32 has enough requests for warmup plus measured output. The first 144 prompts are identical to `corpus-manifest.json` (deterministic seed) |
 | `corpus-token-histogram.md` | the corpus measured with the target checkpoint's own tokenizer, before the lease |
 | `*.clientlog` | one per leg, the client's own stdout including its `CLIENT_RESULT` line |
 | `mutation-controls.txt` | both rounds of mutations run against `tests/scripts/test_variadic_harness.py`, and what each one broke |

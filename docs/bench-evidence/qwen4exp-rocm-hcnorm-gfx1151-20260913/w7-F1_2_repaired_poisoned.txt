@@ -1,0 +1,19 @@
+selected=1
+[doctest] doctest version is "2.5.2"
+[doctest] run with "--help" for options
+===============================================================================
+/tmp/vllmcpp-hcnorm-w7-48174/tests/vllm/models/test_qwen4_exp_rocm_reductions.cpp:229:
+TEST CASE:  vt::Qwen4ExpGatedResidual ROCM W7: MAGNITUDE-SEPARATED data, where the ACCUMULATOR WIDTH shows
+
+/tmp/vllmcpp-hcnorm-w7-48174/tests/support/max_abs_diff.h:100: ERROR: max|diff|: NON-FINITE operand at index 0 (got = nan, want = 6.3341). A NaN here used to reduce to 0.0 and PASS — see issue #449.
+
+[MEASURED] ROCM W7 magnitude-separated: max|diff| = inf  scale = 6.33523417  bound = 1e-05  (serial-f32 walk from hc_device.cpp:504, SCALE-NORMALISED to this fixture: 0.000129073535)
+/tmp/vllmcpp-hcnorm-w7-48174/tests/vllm/models/test_qwen4_exp_rocm_reductions.cpp:290: ERROR: CHECK( worst < kAccumBound ) is NOT correct!
+  values: CHECK( inf <  1e-05 )
+  logged: ROCm f32 tree vs CPU double reference on magnitude-separated data: max|diff| = inf against the CPU case's own bound 1e-05
+
+[MEASURED] ROCM W7 magnitude stream unchanged               BYTE gate: 0/10240 differ, max|diff| = 0
+===============================================================================
+[doctest] test cases:  1 |  0 passed | 1 failed | 4 skipped
+[doctest] assertions: 13 | 11 passed | 2 failed |
+[doctest] Status: FAILURE!

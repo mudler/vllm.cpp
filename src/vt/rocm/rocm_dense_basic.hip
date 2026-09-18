@@ -334,6 +334,35 @@ void SiluAndMulKernelRocm(Queue& q, Tensor& out, const Tensor& x) {
   Check(hipGetLastError(), "silu_and_mul");
 }
 
+// ClampedSwiGLU (DeepSeek-V4 activation): gate clamped MAX-ONLY, up clamped
+// BOTH sides, then silu(gate)*up at alpha=1, beta=0. Same kernel structure as
+// SiluMulK with per-element clamping. NarrowTo<Tin> matches SiluMulK's polarity.
+template <typename Tin, typename Tout>
+__global__ void ClampedSwiGLUK(Tout* out, const Tin* x, int64_t n, int64_t d, float limit) {
+  for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n;
+       idx += gridDim.x * blockDim.x) {
+    const int64_t i = idx / d, j = idx - i * d;
+    const float g = fminf(Ld(x, i * 2 * d + j), limit);
+    const float up = fminf(fmaxf(Ld(x, i * 2 * d + d + j), -limit), limit);
+    St(out, idx, NarrowTo<Tin>(g / (1.0f + expf(-g))) * up);
+  }
+}
+
+void ClampedSwiGLUKernelRocm(Queue& q, Tensor& out, const Tensor& gate_up, float limit) {
+  const int64_t d = gate_up.shape[1] / 2, n = gate_up.shape[0] * d;
+  if (n == 0) return;
+  hipStream_t st = AsStream(q);
+  if (gate_up.dtype == DType::kBF16)
+    ClampedSwiGLUK<__hip_bfloat16, __hip_bfloat16><<<GridFor(n), kBlock, 0, st>>>(
+        out.Ptr<__hip_bfloat16>(), gate_up.Ptr<__hip_bfloat16>(), n, d, limit);
+  else if (gate_up.dtype == DType::kF32)
+    ClampedSwiGLUK<float, float>
+        <<<GridFor(n), kBlock, 0, st>>>(out.Ptr<float>(), gate_up.Ptr<float>(), n, d, limit);
+  else
+    VT_CHECK(false, "rocm clamped_swiglu dtype");
+  Check(hipGetLastError(), "clamped_swiglu");
+}
+
 // MatmulKernelRocm / MatmulBTKernelRocm live in rocm_matmul_hipblaslt.hip
 
 void RopeCosSinCacheKernelRocm(Queue& q, Tensor& cos_sin, const Tensor& pos,
@@ -354,6 +383,82 @@ void RopeCosSinCacheKernelRocm(Queue& q, Tensor& cos_sin, const Tensor& pos,
   Check(hipGetLastError(), "rope_cos_sin_cache");
 }
 
+// ── T14 (GFX1100-TG200): row-split argmax (VT_ARGMAX_SPLIT=1) ───────────────
+// The donor launches ONE block per row: at batch-1 decode a single 256-thread
+// block stride-walks the whole vocab (248,320 elems = 970 serial
+// load+compare iterations per lane) behind a nine-sync shared tree — 154us
+// measured against a ~2-3us memory floor. This arm splits each row across
+// ARGMAX_SPLIT_BLOCKS blocks (phase A: per-block (value, lowest-index)
+// partials to a scratch pair-array) and finishes with a one-block reduce
+// (phase B). The comparator "higher value wins; on equal value the LOWER
+// index wins" is associative under any pairing, so results are BIT-IDENTICAL
+// to the donor for every input, ties included. Scratch is a grow-only cached
+// allocation (hipMallocAsync, stream-ordered — legal inside graph capture).
+namespace {
+constexpr int kArgmaxSplitBlocks = 128;
+
+__global__ void ArgmaxSplitPhaseAK(int64_t* __restrict__ part_arg,
+                                   float* __restrict__ part_val,
+                                   const float* __restrict__ logits,
+                                   int64_t rows, int64_t cols, int blocks_per_row) {
+  constexpr int NWARPS = kBlock / 32;
+  const int64_t gitem = static_cast<int64_t>(blockIdx.x) * NWARPS + (threadIdx.x >> 5);
+  const int64_t total = rows * blocks_per_row;
+  if (gitem >= total) return;
+  const int64_t r = gitem / blocks_per_row;
+  const int part = static_cast<int>(gitem % blocks_per_row);
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int64_t slab = (cols + blocks_per_row - 1) / blocks_per_row;
+  const int64_t lo = part * slab;
+  const int64_t hi = lo + slab < cols ? lo + slab : cols;
+  float best = -INFINITY;
+  int arg = 0x7fffffff;
+  for (int64_t j = lo + lane; j < hi; j += 32) {
+    const float v = Ld(logits, r * cols + j);
+    if (v > best || (v == best && static_cast<int>(j) < arg)) {
+      best = v; arg = static_cast<int>(j);
+    }
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    const float ov = __shfl_down(best, off);
+    const int oi = __shfl_down(arg, off);
+    if (ov > best || (ov == best && oi < arg)) { best = ov; arg = oi; }
+  }
+  if (lane == 0) {
+    part_arg[gitem] = arg;
+    part_val[gitem] = best;
+  }
+}
+
+__global__ void ArgmaxSplitPhaseBK(int64_t* __restrict__ out,
+                                   const int64_t* __restrict__ part_arg,
+                                   const float* __restrict__ part_val,
+                                   int blocks_per_row) {
+  const int64_t r = blockIdx.x;
+  const int tid = static_cast<int>(threadIdx.x);
+  __shared__ float bv[kBlock];
+  __shared__ int bi[kBlock];
+  float best = -INFINITY;
+  int arg = 0x7fffffff;
+  if (tid < blocks_per_row) {
+    best = part_val[r * blocks_per_row + tid];
+    arg = static_cast<int>(part_arg[r * blocks_per_row + tid]);
+  }
+  bv[tid] = best; bi[tid] = arg;
+  __syncthreads();
+  for (int s2 = kBlock / 2; s2 > 0; s2 /= 2) {
+    if (tid < s2) {
+      if (bv[tid + s2] > bv[tid] || (bv[tid + s2] == bv[tid] && bi[tid + s2] < bi[tid])) {
+        bv[tid] = bv[tid + s2]; bi[tid] = bi[tid + s2];
+      }
+    }
+    __syncthreads();
+  }
+  if (tid == 0) out[r] = static_cast<int64_t>(bi[0]);
+}
+}  // namespace
+
 void GreedyArgmaxKernelRocm(Queue& q, Tensor& out, const Tensor& logits) {
   const int64_t rows = logits.shape[0], cols = logits.shape[1];
   if (rows == 0) return;
@@ -362,10 +467,39 @@ void GreedyArgmaxKernelRocm(Queue& q, Tensor& out, const Tensor& logits) {
   hipStream_t st = AsStream(q);
   // Engine + cross-device tests use i64 token ids.
   if (out.dtype == DType::kI64) {
-    if (logits.dtype == DType::kF32)
+    if (logits.dtype == DType::kF32) {
+      // T14 opt-in, read PER CALL like the CUDA sibling's convention so a
+      // test process can flip the flag between legs and a captured decode
+      // graph picks the arm up at launch/capture time. A once-per-process
+      // static made the byte-identity test's flag-ON leg silently reuse the
+      // serial reduction — the arm under test never ran.
+      const bool argmax_split = [] {
+        const char* e = std::getenv("VT_ARGMAX_SPLIT");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+      }();
+      if (argmax_split && cols >= 4096 && rows <= 64) {
+        constexpr int kBpr = kArgmaxSplitBlocks;
+        static int64_t* part_arg = nullptr;
+        static float* part_val = nullptr;
+        static int64_t part_rows = 0;
+        if (part_rows < rows) {
+          Check(hipMallocAsync(reinterpret_cast<void**>(&part_arg),
+                               static_cast<size_t>(rows) * kBpr * sizeof(int64_t), st),
+                "argmax_split scratch");
+          Check(hipMallocAsync(reinterpret_cast<void**>(&part_val),
+                               static_cast<size_t>(rows) * kBpr * sizeof(float), st),
+                "argmax_split scratch");
+          part_rows = rows;
+        }
+        ArgmaxSplitPhaseAK<<<rows * kBpr, kBlock, 0, st>>>(
+            part_arg, part_val, logits.Ptr<float>(), rows, cols, kBpr);
+        ArgmaxSplitPhaseBK<<<static_cast<unsigned>(rows), kBlock, 0, st>>>(
+            out.Ptr<int64_t>(), part_arg, part_val, kBpr);
+        return;
+      }
       ArgmaxK<float><<<static_cast<unsigned>(rows), kBlock, 0, st>>>(
           out.Ptr<int64_t>(), logits.Ptr<float>(), rows, cols);
-    else if (logits.dtype == DType::kBF16)
+    } else if (logits.dtype == DType::kBF16)
       ArgmaxK<__hip_bfloat16><<<static_cast<unsigned>(rows), kBlock, 0, st>>>(
           out.Ptr<int64_t>(), logits.Ptr<__hip_bfloat16>(), rows, cols);
     else

@@ -158,14 +158,16 @@ measures the build again at the new object, and this section's reason for
 
 ## Gateability
 
-**Both halves have now been attempted on the arm the gate will use, and the
-build half is measured on CUDA as well as CPU.** The 27 August record below
-stands as the CPU-only measurement; the 29 August rows are the GB10 arm.
+**Both halves have now been attempted on every arm the gate will use, and the
+build half is measured on CUDA and on HIP as well as on CPU.** The 27 August
+record below stands as the CPU-only measurement; the 29 August rows are the GB10
+arm; the 13 September rows are the `gfx1151` arm.
 
-| Half | 27 Aug, CPU, x86_64 dev host | 29 Aug, CUDA, `dgx:gpu0` GB10 |
-|---|---|---|
-| BUILDS | yes, fresh `git archive`, 247 translation units, 228 `qwen4exp` strings in `libllama.so` | **yes**, fresh `--depth 1` fetch by SHA into an empty directory, `git rev-parse HEAD` asserted equal to the pin, `git status --porcelain` **0 bytes**, `nvcc` 13.0.88, 142 `.cu.o` and **142 `sm_121a`** cubins with 142 objects scanned, 68 `qwen4exp` strings in `libllama.so` |
-| RUNS | not attempted, no artifact | **yes**: `llama-server` loaded `Qwen3.8-Flash-Next-UD-IQ1_S` and answered `/v1/completions` with 64 coherent greedy tokens |
+| Half | 27 Aug, CPU, x86_64 dev host | 29 Aug, CUDA, `dgx:gpu0` GB10 | 13 Sep, HIP, `strix:gpu0` gfx1151 |
+|---|---|---|---|
+| BUILDS | yes, fresh `git archive`, 247 translation units, 228 `qwen4exp` strings in `libllama.so` | **yes**, fresh `--depth 1` fetch by SHA into an empty directory, `git rev-parse HEAD` asserted equal to the pin, `git status --porcelain` **0 bytes**, `nvcc` 13.0.88, 142 `.cu.o` and **142 `sm_121a`** cubins with 142 objects scanned, 68 `qwen4exp` strings in `libllama.so` | **yes, unpatched**, same fetch-by-SHA and same two assertions, ROCm 7.2.4 / HIP `7.2.53211`, `-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1151`, **270** `gfx1151` strings in `libggml-hip.so`, 76 `qwen4exp` strings in `libllama.so`, `ldd` resolving `libamdhip64.so.7` |
+| RUNS | not attempted, no artifact | **yes**: `llama-server` loaded `Qwen3.8-Flash-Next-UD-IQ1_S` and answered `/v1/completions` with 64 coherent greedy tokens | **yes**: same artifact, `/health` in 40 s from a LOCAL copy, `/v1/completions` answered " Paris.", and **31 `llama-bench` processes across four leases with 0 failures** |
+| MEASURES | no | no number worth quoting, by that record's own statement | **yes — the first quotable figure from this oracle**, `25.877 tok/s`, median of 12 legs, spread 1.734% |
 
 Configure prints `Replacing 121 in CMAKE_CUDA_ARCHITECTURES with 121a`, and the
 cubin histogram independently agrees: every one of the 142 ELF names in
@@ -206,7 +208,35 @@ is discharged.
 about any number, and this run deliberately produced none worth quoting: one
 prompt, one repetition, five prompt tokens, a 4,096-token context, one slot, no
 clock window and no contention control. Do not promote a timing out of that
-evidence file. Every llama.cpp floor in this tree is still owed by
+evidence file.
+
+**That sentence still governs the 29 August CUDA evidence file, and it no longer
+governs this oracle as a whole.** A denominator WAS taken on `gfx1151` on
+13 September 2026 — 12 legs of `llama-bench -p 0 -n 64 -ngl 99 -r 3`, a 6-leg
+predecessor population in a separate lease agreeing to 0.743%, every binary
+sha256 asserted before it ran, and the tensor placement read out of the loader
+rather than assumed — in
+[the gfx1151 denominator file](../../docs/bench-evidence/qwen4exp-llamacpp-denominator-gfx1151-20260913.md).
+Two things that record carries are load-bearing for anyone reaching for it.
+**Its SM-clock window does not meet the 5% ceiling** (39.1% pooled), because a
+lease cannot pin an AMD clock and the window is not decode-only, so a delta
+below about 10% is not established by that figure alone. And **`-ngl 99` on this
+board leaves 27,465.95 MiB of weights in a CPU buffer while reporting
+`49/49 layers offloaded`**; forcing full `ROCm0` residency with `-ot .*=ROCm0`
+was measured at 1.95 tok/s, 13x slower, so the hybrid split is this oracle's
+production configuration on `gfx1151` and not a fallback to be corrected.
+
+**A number from this oracle is still not a RATIO.** `MODEL-MM-QWEN4-EXP` has no
+declared token-exact gate on ROCm. **The clause that followed used to read "and no
+primary oracle that could define one", and it is FALSE.** vLLM implements
+`qwen4_exp` in full at the active parity pin `e126687a9a` — `vllm/models/qwen4_exp/`,
+both an `nvidia/` and an `amd/` backend, with `Qwen4ExpForConditionalGeneration`
+registered at `vllm/model_executor/models/registry.py:580` — and the row's spec
+reconciled onto it on 2026-09-01
+([`../specs/qwen4-exp-flash-next.md`](../specs/qwen4-exp-flash-next.md) `:85`).
+The primary oracle can define token-exact; what it has not done on this fleet is
+RUN, for the three reasons the owning issue now names. The gap is owned by
+[`ISSUE-LOCAL-01M2D6MV5RNSSM2GZVZKCZA4EG`](../issues/MODEL-MM-QWEN4-EXP/ISSUE-LOCAL-01M2D6MV5RNSSM2GZVZKCZA4EG.md). Every llama.cpp floor in this tree is still owed by
 [#1003](https://github.com/mudler/vllm.cpp/issues/1003), and the
 `MODEL-MM-QWEN4-EXP` ladder itself has not run.
 

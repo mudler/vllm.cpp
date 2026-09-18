@@ -20,6 +20,7 @@
 // set of tensors in the file.
 #pragma once
 
+#include <optional>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -104,8 +105,9 @@ using GgufRoutingAudit =
 // writing its vt block dtype to `*out`. The rule is `HasQuantDotKernel`, not a
 // list: the encoding needs a keep-quant `vec_dot` and its activation encoding
 // needs a `from_float`. False for the unquantized types, for Q8_K
-// (activation-only, never a file weight type, and upstream gives it no `vec_dot`
-// row at all) and for every unported encoding. The list used to be spelled out
+// (the K-quants' activation encoding: a file type only the decode-only gather
+// arm takes, and one upstream gives no `vec_dot` row at all) and for every
+// unported encoding. The list used to be spelled out
 // here and went stale six encodings ago, so it deliberately is not any more.
 bool KeepQuantDType(uint32_t ggml_type, vt::DType* out);
 
@@ -116,6 +118,10 @@ bool KeepQuantDType(uint32_t ggml_type, vt::DType* out);
 // encoding. Using the GEMM predicate here would expand a perfectly gatherable
 // table for want of a kernel nothing calls.
 bool KeepQuantGatherDType(uint32_t ggml_type, vt::DType* out);
+
+// Whether the device's quantized GEMM supports this kept block encoding.
+// Shared by load-time residency selection and pre-upload expert admission.
+bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev);
 
 // True when the running device can gather from a BLOCK-QUANTIZED table. Same
 // shape and same reason as `DeviceKeepQuantSupported` for the GEMM arm: a
@@ -164,7 +170,8 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
                               bool cpu_ref, GgufTensorRole role,
                               uint32_t ggml_type,
                               const std::vector<int64_t>& shape,
-                              vt::DeviceType dev);
+                              vt::DeviceType dev,
+                              std::optional<vt::DType> weight_value_dtype = std::nullopt);
 
 // True when the device this process will actually run the forward on can
 // execute `OpId::kMatmulBTQuant` — i.e. when a block-typed weight has a
@@ -210,6 +217,34 @@ bool GgufNvfp4ComputeAvailable(vt::DeviceType dev);
 // for.
 bool QuantRepackForDevice(bool keep_quant, bool cpu_ref,
                           bool host_repack_active, vt::DeviceType dev);
+
+// Whether a BORROWED span should be PREFAULTED at load, for a load the engine
+// resolved onto `dev`.
+//
+// The prefault (`PrefaultBorrowedSpan`, qwen3_5_gguf_weights.cpp) faults a
+// borrowed span in at load with `madvise(MADV_WILLNEED)` plus a synchronous
+// one-byte-per-page read, so the page traps land off the timed prefill instead
+// of inside it. That is worth paying for exactly when the borrowed pages are
+// what the FORWARD reads -- the CPU tier, and a device whose kernels can
+// dereference host storage.
+//
+// On a device that STAGES, they are not. `ResidentWeight` copies the weight to
+// the device once and the host pages are never read again, so the prefault
+// reads the whole model off disk into pages one `memcpy` then consumes. On
+// gfx1151 that is 65.488 GiB of resident file pages on a 31 GiB host, and the
+// load wedges in `svm_range_set_attr`
+// (.agents/specs/rocm-host-residency-after-upload.md).
+//
+// THIS DECIDES THE DEFAULT ONLY. `VT_GGUF_PREFAULT` and
+// `vllm_cpp.mmap.prefault` still win, because the A/B they exist for has to
+// stay available in the same binary on the very device this narrows.
+// `ResolveGgufPrefault` remains the sole reader of that variable; this asks
+// `GgufPrefaultIsExplicit()` whether it was set at all.
+//
+// `dev` is a PARAMETER for the same reason `QuantRepackForDevice`'s is: a
+// decision that takes its inputs can be checked from a host that is not the one
+// it decides for.
+bool GgufPrefaultForDevice(vt::DeviceType dev);
 
 // Loader-wide residency policy.
 struct GgufLoadPolicy {
@@ -336,6 +371,15 @@ struct GgufLoadPolicy {
   // until then a wrong default would be a silent correctness bug, not a slow
   // path.
   bool elem_kn_repack = false;
+  // Whether a BORROWED span is PREFAULTED at load. `FromEnv` resolves it through
+  // `GgufPrefaultForDevice(dev)` above, exactly as `quant_repack` is resolved
+  // through `QuantRepackForDevice(..., dev)`, so the decision carries the
+  // ENGINE's device rather than being a literal at each call site.
+  //
+  // The STRUCT default is `true`, which is what every call site passed before
+  // this field existed, so a hand-built policy and a caller that still passes
+  // the argument itself are both unchanged.
+  bool prefault = true;
   // Optional observer; null in production.
   GgufRoutingAudit audit;
 
@@ -376,7 +420,11 @@ struct GgufLoadPolicy {
   // is the probe/resolution mismatch this parameter exists to remove; a
   // defaulted overload would restore it silently. See
   // `.agents/specs/gguf-residency-resolved-device.md`.
-  static GgufLoadPolicy FromEnv(vt::DeviceType dev);
+  // Only an accepting loader supplies the actual forward dtype. Unwired ROCm
+  // loaders retain their previous BF16 expansion.
+  std::optional<vt::DType> weight_value_dtype;
+  static GgufLoadPolicy FromEnv(
+      vt::DeviceType dev, std::optional<vt::DType> model_dtype = std::nullopt);
 
   // Route one tensor and notify `audit`. This is the ONLY entry point the
   // loader uses, so every routed tensor is observable.

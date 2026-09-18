@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "row": "BACKEND-ROCM-QUANT-GATHER",
+  "base_head": "4fc300f93cfb075c0afddccdd476a552fa900cdb",
+  "uncommitted_native_implementation": true,
+  "files": {
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/CMakeLists.txt": {
+      "bytes": 175502,
+      "sha256": "e5bea1baa842ac0257fb29d61cb6ef37977d975d6ac0478f81d6e677fe85ce32"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/tests/CMakeLists.txt": {
+      "bytes": 275052,
+      "sha256": "efb00054342fdaec87e9181495ffdf5abd55257d8545b829b69f13ff8dbc93dc"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/libvllm.a": {
+      "bytes": 95078500,
+      "sha256": "acbf7ceb5c2efa04ff56189e04de549ebe760ba70f3d7967f684f2e7709431cb"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/src/vt/rocm/rocm_embedding_quant.hip": {
+      "bytes": 7556,
+      "sha256": "5934d1727c96ec8e76f4e7dc3805e15d271fb528b7c0ad6c3a5d2863a179686b"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/src/vt/rocm/rocm_quant_iq_tables.h": {
+      "bytes": 110865,
+      "sha256": "d267d25ff1dd3f67749c251f87047f4b70c9650a99d04b524ff6c3313596a349"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/src/vt/rocm/rocm_embedding_quant.h": {
+      "bytes": 554,
+      "sha256": "1b2b31617d660b64f622e692089423ce1657df102322558a4ab731f521952bc5"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/src/vt/rocm/rocm_quant_dequant.h": {
+      "bytes": 25507,
+      "sha256": "413dc138254cc72f8dccbc87268581217c93dec8f8acaea159f3f39569c37e62"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/src/vt/rocm/rocm_ops.hip": {
+      "bytes": 22703,
+      "sha256": "650a7d033b3ce3fc7a6c9a2e6bcfa80963c172ad5ef58421e2956892aac80935"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/tests/capi/rocm_quant_gather_fixture.h": {
+      "bytes": 8283,
+      "sha256": "339414f93e59e6be9a4ca545d5e762bb2816714343f466e218dbc2b69483bdfd"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/tests/capi/test_rocm_embedding_quant.cpp": {
+      "bytes": 6592,
+      "sha256": "334164dbb5c767dd0c67fa554931b41465385f41ab3c522f21f669b34a4884aa"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/tests/vt/test_rocm_embedding_quant.cpp": {
+      "bytes": 14781,
+      "sha256": "cb8bad70113bc1730ae1f9aafba4fd26b84601ff28f3c33f979be2d9d964b367"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/tests/vllm/test_gguf_keep_quant.cpp": {
+      "bytes": 132629,
+      "sha256": "5168816c430f1a07dcf7e0790dc5b6ab2cf4a1498c61383b6b693411578bc5f7"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/tests/test_rocm_embedding_quant": {
+      "bytes": 30942784,
+      "sha256": "76420ee7836c7265d2709ab7910c1ed3b4abf94f44c28b3a1da747caf39f9134"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/tests/test_capi_rocm_embedding_quant": {
+      "bytes": 30929264,
+      "sha256": "49e47dae389dc4b3f150837ab743eea3c8e74d815dfaf341e43ec083ae0a2ce4"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/tests/test_gguf_keep_quant": {
+      "bytes": 31321648,
+      "sha256": "cc70d1a966c32d6127c043e5cb2417c4852b4c5197399e75edf80339ea6921d6"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/tests/test_ops_embedding_quant": {
+      "bytes": 30845880,
+      "sha256": "550044a9cd421c872770e6fd84b44d0fb9b749297a58baf5c598d7f244642585"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/tests/test_gguf_dequant": {
+      "bytes": 30962624,
+      "sha256": "7fc76b76f5984314b707fa9256b4cfba82bab3bc0473d3df052734597cc09bd1"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/tests/test_backend_cross_device": {
+      "bytes": 31469712,
+      "sha256": "c6b1500af691d1c021ea7a642df838c03b03cc1da2c7bbb0a0f393ea74b64615"
+    },
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather/tests/rocm_quant_gather_capture": {
+      "bytes": 30693800,
+      "sha256": "af71f0a1583a1e970f6a9c5b6ff39e1c2d39424770dd8700911a9ff00b48d411"
+    }
+  },
+  "cwd": "/home/vikash/vllm.cpp-rdna3-gather-impl",
+  "env": {
+    "HIP_VISIBLE_DEVICES": "0",
+    "ROCR_VISIBLE_DEVICES": "0",
+    "TMPDIR": "/home/vikash/.cache/rdna3-gather-impl/tmp"
+  },
+  "argv": [
+    "ctest",
+    "--test-dir",
+    "/home/vikash/vllm.cpp-rdna3-gather-impl/build-rocm-quant-gather",
+    "--output-on-failure",
+    "-R",
+    "^(test_rocm_embedding_quant|test_capi_rocm_embedding_quant|test_gguf_keep_quant|test_ops_embedding_quant|test_gguf_dequant|test_backend_cross_device)$"
+  ],
+  "log": "/home/vikash/.cache/rdna3-gather-impl/evidence/native-focused-v1.log",
+  "authority": "Operator alone executes under the recorded GPU 0 mutex",
+  "expected": "All six targets execute and pass. No exit-77 skip satisfies the native acceptance run."
+}

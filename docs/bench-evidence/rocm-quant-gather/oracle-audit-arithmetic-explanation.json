@@ -1,0 +1,235 @@
+{
+  "kind": "Diagnostic transcription of source expressions only. The actual GPU output files remain the evidence.",
+  "native_source_hashes": {
+    "rocm_quant_dequant.h": "56b14d63308a6c3d8c19a6619217470fac88dd58599f95b4d9bf919f854f732d",
+    "rocm_quant_iq_tables.h": "d267d25ff1dd3f67749c251f87047f4b70c9650a99d04b524ff6c3313596a349"
+  },
+  "source_provenance": "Current source snapshot after author comment corrections, not the native-v2 source seal. Comparison uses frozen native-v2 runtime outputs.",
+  "iq3_s_table_entries_with_difference": 146,
+  "iq3_s_table_byte_differences": 150,
+  "iq3_s_only_difference": {
+    "plugin_raw": 62,
+    "plugin_effective": 15.5,
+    "native": 15
+  },
+  "cases": [
+    {
+      "name": "Q6_K-256",
+      "elements": 1024,
+      "arms": {
+        "native": {
+          "f32_source_expression_byte_exact": true,
+          "bf16_source_expression_byte_exact": true
+        },
+        "primary": {
+          "f32_source_expression_byte_exact": true,
+          "bf16_source_expression_byte_exact": true
+        }
+      },
+      "f32_difference_examples": [
+        {
+          "row": 0,
+          "col": 36,
+          "d": 0.00048828125,
+          "scale": 115,
+          "q": -19,
+          "integer_product": -2185,
+          "rounded_half_integer_product": -2184.0,
+          "native": -1.06689453125,
+          "primary": -1.06640625,
+          "absolute_difference": 0.00048828125
+        },
+        {
+          "row": 0,
+          "col": 38,
+          "d": 0.00048828125,
+          "scale": 115,
+          "q": -19,
+          "integer_product": -2185,
+          "rounded_half_integer_product": -2184.0,
+          "native": -1.06689453125,
+          "primary": -1.06640625,
+          "absolute_difference": 0.00048828125
+        },
+        {
+          "row": 0,
+          "col": 46,
+          "d": 0.00048828125,
+          "scale": 115,
+          "q": 23,
+          "integer_product": 2645,
+          "rounded_half_integer_product": 2644.0,
+          "native": 1.29150390625,
+          "primary": 1.291015625,
+          "absolute_difference": 0.00048828125
+        }
+      ],
+      "f32_different_elements": 34
+    },
+    {
+      "name": "Q6_K-1024",
+      "elements": 4096,
+      "arms": {
+        "native": {
+          "f32_source_expression_byte_exact": true,
+          "bf16_source_expression_byte_exact": true
+        },
+        "primary": {
+          "f32_source_expression_byte_exact": true,
+          "bf16_source_expression_byte_exact": true
+        }
+      },
+      "f32_difference_examples": [
+        {
+          "row": 0,
+          "col": 36,
+          "d": 0.00048828125,
+          "scale": 115,
+          "q": -19,
+          "integer_product": -2185,
+          "rounded_half_integer_product": -2184.0,
+          "native": -1.06689453125,
+          "primary": -1.06640625,
+          "absolute_difference": 0.00048828125
+        },
+        {
+          "row": 0,
+          "col": 38,
+          "d": 0.00048828125,
+          "scale": 115,
+          "q": -19,
+          "integer_product": -2185,
+          "rounded_half_integer_product": -2184.0,
+          "native": -1.06689453125,
+          "primary": -1.06640625,
+          "absolute_difference": 0.00048828125
+        },
+        {
+          "row": 0,
+          "col": 46,
+          "d": 0.00048828125,
+          "scale": 115,
+          "q": 23,
+          "integer_product": 2645,
+          "rounded_half_integer_product": 2644.0,
+          "native": 1.29150390625,
+          "primary": 1.291015625,
+          "absolute_difference": 0.00048828125
+        }
+      ],
+      "f32_different_elements": 153
+    },
+    {
+      "name": "IQ3_S-256",
+      "elements": 1024,
+      "arms": {
+        "native": {
+          "f32_source_expression_byte_exact": true,
+          "bf16_source_expression_byte_exact": true
+        },
+        "primary": {
+          "f32_source_expression_byte_exact": true,
+          "bf16_source_expression_byte_exact": true
+        }
+      },
+      "f32_difference_examples": [
+        {
+          "row": 0,
+          "col": 6,
+          "d": 0.0078125,
+          "scale_nibble": 1,
+          "index": 101,
+          "grid_byte": 2,
+          "plugin_grid_value": 62,
+          "native_grid_value": 15,
+          "native": -0.3515625,
+          "primary": -0.36328125,
+          "absolute_difference": 0.01171875
+        },
+        {
+          "row": 0,
+          "col": 28,
+          "d": 0.0078125,
+          "scale_nibble": 1,
+          "index": 265,
+          "grid_byte": 0,
+          "plugin_grid_value": 62,
+          "native_grid_value": 15,
+          "native": 0.3515625,
+          "primary": 0.36328125,
+          "absolute_difference": 0.01171875
+        },
+        {
+          "row": 0,
+          "col": 39,
+          "d": 0.0078125,
+          "scale_nibble": 6,
+          "index": 509,
+          "grid_byte": 3,
+          "plugin_grid_value": 62,
+          "native_grid_value": 15,
+          "native": -1.5234375,
+          "primary": -1.57421875,
+          "absolute_difference": 0.05078125
+        }
+      ],
+      "f32_different_elements": 62
+    },
+    {
+      "name": "IQ3_S-1024",
+      "elements": 4096,
+      "arms": {
+        "native": {
+          "f32_source_expression_byte_exact": true,
+          "bf16_source_expression_byte_exact": true
+        },
+        "primary": {
+          "f32_source_expression_byte_exact": true,
+          "bf16_source_expression_byte_exact": true
+        }
+      },
+      "f32_difference_examples": [
+        {
+          "row": 0,
+          "col": 6,
+          "d": 0.0078125,
+          "scale_nibble": 1,
+          "index": 101,
+          "grid_byte": 2,
+          "plugin_grid_value": 62,
+          "native_grid_value": 15,
+          "native": -0.3515625,
+          "primary": -0.36328125,
+          "absolute_difference": 0.01171875
+        },
+        {
+          "row": 0,
+          "col": 28,
+          "d": 0.0078125,
+          "scale_nibble": 1,
+          "index": 265,
+          "grid_byte": 0,
+          "plugin_grid_value": 62,
+          "native_grid_value": 15,
+          "native": 0.3515625,
+          "primary": 0.36328125,
+          "absolute_difference": 0.01171875
+        },
+        {
+          "row": 0,
+          "col": 39,
+          "d": 0.0078125,
+          "scale_nibble": 6,
+          "index": 509,
+          "grid_byte": 3,
+          "plugin_grid_value": 62,
+          "native_grid_value": 15,
+          "native": -1.5234375,
+          "primary": -1.57421875,
+          "absolute_difference": 0.05078125
+        }
+      ],
+      "f32_different_elements": 303
+    }
+  ]
+}

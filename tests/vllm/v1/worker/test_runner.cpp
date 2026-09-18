@@ -1920,21 +1920,44 @@ TEST_CASE("runner: full-attention-only step skips GDN metadata build (no OOB)") 
   SchedulerOutput s1 =
       NewStep({MakeFaNewReq("A", prompt, 0, {0, 1}, Greedy())}, {{"A", P}});
 
-  // Pre-generalization, execute_model called gather_block_table(gdn_group_id_ ==
-  // -1) → input_batch_.block_table[-1] (out-of-bounds → crash) BEFORE reaching
-  // the model forward. Post-generalization the whole GDN metadata build is gated
-  // on gdn_group_id_ >= 0, so a full-attention-only step builds a default-empty
-  // gdn_meta and reaches the model forward WITHOUT any out-of-bounds.
-  //
-  // The forward it reaches here is the BORROWED 27B *dense* forward, which
-  // carries its OWN hybrid assumption (gdn_meta must describe every token —
-  // qwen3_5.cpp:5463). That is a FORWARD-side seam gap, NOT a runner one:
-  // Qwen3ForCausalLM's own dense forward (W3) will not assume a GDN group. So we
-  // assert only that control reached the forward via a clean, CATCHABLE throw
-  // (not an uncatchable OOB), which proves the runner's GDN path was skipped.
-  CHECK_THROWS_WITH_AS(runner.execute_model(s1),
-                       doctest::Contains("qwen3_5 dense paged forward"),
-                       std::runtime_error);
+  REQUIRE(runner.attn_kv().size() == static_cast<size_t>(c.num_hidden_layers));
+  std::vector<std::vector<uint8_t>> kv_before;
+  for (const PagedKvCache& kv : runner.attn_kv()) {
+    const size_t block_bytes = static_cast<size_t>(
+        2 * kv.block_size * kv.num_kv_heads * kv.head_size) * vt::SizeOf(kv.dtype);
+    const auto* bytes = static_cast<const uint8_t*>(kv.data);
+    kv_before.emplace_back(bytes, bytes + block_bytes);
+  }
+
+  // #3098 removes the borrowed dense forward's former GDN requirement. The
+  // unchanged full-attention fixture must now finish with real attention state
+  // and sampled-token feedback, while the runner leaves GDN metadata empty.
+  REQUIRE_FALSE(runner.execute_model(s1).has_value());
+  CHECK(runner.gdn_group_id() == -1);
+  CHECK(runner.gdn_state().empty());
+  CHECK(runner.last_gdn_meta().num_actual_tokens == 0);
+  CHECK(runner.last_step().input_token_ids == prompt);
+  CHECK(runner.last_forward_rows() == 1);
+  CHECK(runner.last_forward_num_actual_tokens() == P);
+  CHECK(runner.last_forward_num_reqs() == 1);
+  for (size_t layer = 0; layer < runner.attn_kv().size(); ++layer) {
+    CAPTURE(layer);
+    const auto* bytes = static_cast<const uint8_t*>(runner.attn_kv()[layer].data);
+    const std::vector<uint8_t> kv_after(bytes, bytes + kv_before[layer].size());
+    CHECK(kv_after != kv_before[layer]);
+  }
+
+  const ModelRunnerOutput output = runner.sample_tokens(std::nullopt);
+  REQUIRE(output.req_ids == std::vector<std::string>{"A"});
+  REQUIRE(output.sampled_token_ids.size() == 1);
+  REQUIRE(output.sampled_token_ids[0].size() == 1);
+  const int32_t token = output.sampled_token_ids[0][0];
+  CHECK(token >= 0);
+  CHECK(token < c.vocab_size);
+  const auto& batch = runner.input_batch();
+  const int row = batch.req_id_to_index.at("A");
+  CHECK(batch.num_tokens_no_spec[static_cast<size_t>(row)] == P + 1);
+  CHECK(batch.token_id(row, P) == token);
 }
 
 // ─── M3: THE BLOCK-SIZE CONTRACT AT ITS PRODUCTION CALL SITE ─────────────────

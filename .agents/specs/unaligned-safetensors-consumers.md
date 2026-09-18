@@ -236,6 +236,13 @@ this row.
   of work #2540 and #2558 describe, and each wants its own model suite green
   beside it. Filed rather than swept, and named here so the debt is visible.
 
+* [#3146](https://github.com/mudler/vllm.cpp/issues/3146). `dots3_note_vision.cpp:367`
+  reads a borrowed bf16 weight through `src[idx]` where `src` is a
+  `reinterpret_cast<const uint16_t*>(w.bytes.data())`. The file was not in the
+  tree at the #2579 base SHA (`aedad724c`), so the grep did not enumerate it.
+  Found by the `sanitize-cpu (address,undefined)` lane. Fixed in the same flow
+  with `vt::LoadUnaligned<uint16_t>`, the same seam this row and #3138 use.
+
 * [#2597](https://github.com/mudler/vllm.cpp/issues/2597). Making the trellis a
   byte cursor widened five weight-side operands from `const uint16_t*` to
   `const void*` (`Exl3TileCodeword`, `Exl3DecodeTile`, `Exl3ReconstructInner`,

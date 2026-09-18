@@ -292,6 +292,8 @@ const char* OpNameImpl(OpId op) {
       return "Matmul";
     case OpId::kRmsNorm:
       return "RmsNorm";
+    case OpId::kResidualRmsNorm:
+      return "ResidualRmsNorm";
     case OpId::kSiluAndMul:
       return "SiluAndMul";
     case OpId::kRopeNeox:
@@ -414,6 +416,8 @@ const char* OpNameImpl(OpId op) {
       return "MoeSiluMul";
     case OpId::kMoeRelu2:
       return "MoeRelu2";
+    case OpId::kClampedSwiGLU:
+      return "ClampedSwiGLU";
     case OpId::kCastBf16:
       return "CastBf16";
     case OpId::kCastF16:
@@ -522,6 +526,12 @@ const char* OpNameImpl(OpId op) {
       return "FusedNormRope";
     case OpId::kMoeGroupedGemmBf16GateUpSilu:
       return "MoeGroupedGemmBf16GateUpSilu";
+    case OpId::kMoeGroupedGemmBf16GateUpSiluNative:
+      return "MoeGroupedGemmBf16GateUpSiluNative";
+    case OpId::kMoeGroupedGemmBf16Weighted:
+      return "MoeGroupedGemmBf16Weighted";
+    case OpId::kMoeCombinePreweighted:
+      return "MoeCombinePreweighted";
     case OpId::kLaguna:
       return "Laguna";
     case OpId::kMarlinDenseGemm:
@@ -583,6 +593,8 @@ const char* OpNameImpl(OpId op) {
       return "Exl3HadR128";
     case OpId::kExl3Gemm:
       return "Exl3Gemm";
+    case OpId::kExl3ReconstructGemm:
+      return "Exl3ReconstructGemm";
     case OpId::kExl3MoeMlp:
       return "Exl3MoeMlp";
     case OpId::kKeepQuantDecode:

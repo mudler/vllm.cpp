@@ -1,0 +1,12 @@
+{
+  "results": [
+    {
+      "name": "upstream-native",
+      "exit_code": 0,
+      "expected_exit": 0,
+      "seconds": 77.10780900088139,
+      "log_sha256": "d7385cb03119a5c7105a0f5e18a3abf5e42fea6e557d0e405ec8fde7d9d48eb7"
+    }
+  ],
+  "inputs_verified_before_after": 4025
+}

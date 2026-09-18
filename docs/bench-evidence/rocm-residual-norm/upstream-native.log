@@ -1,0 +1,12 @@
+[doctest] doctest version is "2.5.2"
+[doctest] run with "--help" for options
+===============================================================================
+/home/vikash/vllm.cpp-residual-norm-impl/tests/vt/test_ops_residual_rmsnorm.cpp:179:
+TEST CASE:  residual RMS norm matches the complete pinned upstream BF16 fixture grid
+
+/home/vikash/vllm.cpp-residual-norm-impl/tests/vt/test_ops_residual_rmsnorm.cpp:255: MESSAGE: Executed pinned upstream normalization cases across native/reference devices: 528
+
+===============================================================================
+[doctest] test cases:     1 |     1 passed | 0 failed | 7 skipped
+[doctest] assertions: 22576 | 22576 passed | 0 failed |
+[doctest] Status: SUCCESS!

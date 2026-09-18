@@ -206,6 +206,37 @@ adapters is the distilled one. Supply one adapter to those pipelines, or use
 `dfr`, which composes the user adapters and the distilled one onto the single
 stage both its phases share.
 
+## Runtime LoRA (per-request, no weight fusion)
+
+`--lora` fuses adapters into the weights at load time and cannot vary per
+request. `--lora-dir` enables per-request activation instead: the base weights
+stay resident and untouched, and the LoRA delta is applied at forward time.
+
+Pass `--lora-dir /path/to/loras/` so the engine knows where to find adapter
+files, then tag the prompt:
+
+```sh
+build/examples/ltx2-gen \
+  --dit diffusion_model.safetensors --video-vae vae.safetensors \
+  --encoder text_encoder.safetensors \
+  --prompt "a drone shot of a canyon at sunset <lora:my_style:0.8>" \
+  --lora-dir /path/to/loras \
+  --pipeline-kind ti2vid_two_stage \
+  --lora distilled-lora-450.safetensors \
+  --device cuda --workdir /tmp/ltx
+```
+
+The engine resolves `my_style` to `/path/to/loras/my_style.safetensors`,
+loads the A and B factors, and strips the tag from the prompt. Multiple tags
+stack: `<lora:style_a:0.8> <lora:style_b:0.5>`. An omitted strength defaults to
+1.0. Runtime LoRAs are separate from load-time fusion: a `--lora` adapter
+fuses into the weights, and `--lora-dir` adapters apply an additive delta on
+top. The two can coexist in the same render.
+
+Through the C ABI and the OpenAI server, pass `lora_dir` as a model-level
+extra (`--video-extra lora_dir=/path/to/loras`) and include the
+`<lora:name:strength>` tag in the prompt text.
+
 Pass `--steps N` to set the denoise step count (#2130). Omit it, or pass a value
 of 0 or less, and the resolved recipe decides: `one_stage` on model version 2.5
 runs 30. The flag reaches `vllm_video_params.steps`, which the C ABI has always
@@ -375,8 +406,10 @@ the reference path. It also refuses `num_generated_keyframes`; DFR creates its
 own keyframe grid. Other supported pipelines accept generated keyframe slots,
 but reject a negative count or a target shorter than `N + 2` frames.
 
-The server does not forward a per-generation LoRA path. Load the adapter when
-you load the engine. `--negative-prompt-embeds` and
+The server does not forward a per-generation load-time LoRA path. Load the
+adapter when you load the engine, or use `--lora-dir` with prompt tags for
+per-request runtime LoRA (see [Runtime LoRA](#runtime-lora-per-request-no-weight-fusion)
+above). `--negative-prompt-embeds` and
 `--negative-audio-prompt-embeds` apply to the embeds path only.
 
 The `one_stage` pipeline exposes video and audio CFG, STG, rescale, skip-step,

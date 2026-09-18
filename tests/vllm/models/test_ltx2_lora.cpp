@@ -158,7 +158,7 @@ std::vector<float> FuseBf16(const std::vector<vllm::Ltx2LoraAdapter>& adapters,
                             const std::vector<float>& weight, bool* out_fused = nullptr) {
   std::vector<uint16_t> buffer(weight.size());
   for (size_t i = 0; i < weight.size(); ++i) buffer[i] = vt::F32ToBF16(weight[i]);
-  const bool fused = vllm::Ltx2FuseLoraIntoTensor(
+  const bool fused = vllm::DitFuseLoraIntoTensor(
       adapters, target, vt::DType::kBF16, rows, cols,
       reinterpret_cast<uint8_t*>(buffer.data()), buffer.size() * sizeof(uint16_t));
   if (out_fused != nullptr) *out_fused = fused;
@@ -179,27 +179,28 @@ TEST_CASE("ltx2 lora: a factor key resolves onto the contract name") {
 
   // LTXV_LORA_COMFY_RENAMING_MAP strips `diffusion_model.` (sd_ops.py:136), and
   // `_affected_weight_keys` rewrites the suffix (fuse_loras.py:185-186).
-  CHECK(vllm::Ltx2LoraContractName("diffusion_model." + std::string(kModule) +
-                                       ".lora_A.weight",
-                                   &target, &is_a));
+  static const std::vector<std::string> kPrefixes = {"diffusion_model."};
+  CHECK(vllm::DitLoraContractName("diffusion_model." + std::string(kModule) +
+                                      ".lora_A.weight",
+                                  kPrefixes, &target, &is_a));
   CHECK(target == kTarget);
   CHECK(is_a);
 
-  CHECK(vllm::Ltx2LoraContractName("diffusion_model." + std::string(kModule) +
-                                       ".lora_B.weight",
-                                   &target, &is_a));
+  CHECK(vllm::DitLoraContractName("diffusion_model." + std::string(kModule) +
+                                      ".lora_B.weight",
+                                  kPrefixes, &target, &is_a));
   CHECK(target == kTarget);
   CHECK_FALSE(is_a);
 
   // The prefix is OPTIONAL: a PEFT-style adapter without it resolves the same.
-  CHECK(vllm::Ltx2LoraContractName(std::string(kModule) + ".lora_A.weight", &target, &is_a));
+  CHECK(vllm::DitLoraContractName(std::string(kModule) + ".lora_A.weight", kPrefixes, &target, &is_a));
   CHECK(target == kTarget);
 
   // Anything that is not a factor is not one. `.weight` alone is the TARGET, and
   // reading it as a factor would fuse a weight into itself.
-  CHECK_FALSE(vllm::Ltx2LoraContractName(kTarget, &target, &is_a));
-  CHECK_FALSE(vllm::Ltx2LoraContractName("diffusion_model.x.lora_A.bias", &target, &is_a));
-  CHECK_FALSE(vllm::Ltx2LoraContractName("", &target, &is_a));
+  CHECK_FALSE(vllm::DitLoraContractName(kTarget, kPrefixes, &target, &is_a));
+  CHECK_FALSE(vllm::DitLoraContractName("diffusion_model.x.lora_A.bias", kPrefixes, &target, &is_a));
+  CHECK_FALSE(vllm::DitLoraContractName("", kPrefixes, &target, &is_a));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -223,7 +224,7 @@ TEST_CASE("ltx2 lora: the fused weight is W + (B * strength) @ A") {
     spec.path = path;
     spec.strength = 1.0;
     std::vector<vllm::Ltx2LoraAdapter> adapters;
-    adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)));
+    adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget), {"diffusion_model."}));
 
     bool fused = false;
     const std::vector<float> got = FuseBf16(adapters, kTarget, 2, 2, w, &fused);
@@ -241,7 +242,7 @@ TEST_CASE("ltx2 lora: the fused weight is W + (B * strength) @ A") {
     spec.path = path;
     spec.strength = 0.5;
     std::vector<vllm::Ltx2LoraAdapter> adapters;
-    adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)));
+    adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget), {"diffusion_model."}));
 
     const std::vector<float> got = FuseBf16(adapters, kTarget, 2, 2, w);
     // Half the delta, all of the weight. A strength that scaled the sum would
@@ -259,7 +260,7 @@ TEST_CASE("ltx2 lora: the fused weight is W + (B * strength) @ A") {
     spec.path = path;
     spec.strength = 0.0;
     std::vector<vllm::Ltx2LoraAdapter> adapters;
-    adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)));
+    adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget), {"diffusion_model."}));
 
     bool fused = false;
     const std::vector<float> got = FuseBf16(adapters, kTarget, 2, 2, w, &fused);
@@ -278,7 +279,7 @@ TEST_CASE("ltx2 lora: a tensor no adapter targets is left alone") {
   vllm::Ltx2LoraSpec spec;
   spec.path = path;
   std::vector<vllm::Ltx2LoraAdapter> adapters;
-  adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)));
+  adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget), {"diffusion_model."}));
 
   const std::vector<float> w = {10, 20, 30, 40};
   bool fused = true;
@@ -327,7 +328,7 @@ TEST_CASE("ltx2 lora: the delta accumulates in BF16, not f32") {
   spec.path = path;
   spec.strength = strength;
   std::vector<vllm::Ltx2LoraAdapter> adapters;
-  adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)));
+  adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget), {"diffusion_model."}));
 
   const std::vector<float> got = FuseBf16(adapters, kTarget, 1, 1, {0.0F});
 
@@ -347,8 +348,8 @@ TEST_CASE("ltx2 lora: the reference factors come from the adapter's metadata") {
     vllm::Ltx2LoraSpec spec;
     spec.path = path;
     std::vector<vllm::Ltx2LoraAdapter> adapters;
-    adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)));
-    const vllm::Ltx2LoraReferenceFactors f = vllm::Ltx2ResolveLoraReferenceFactors(adapters);
+    adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget), {"diffusion_model."}));
+    const vllm::Ltx2LoraReferenceFactors f = vllm::DitResolveLoraReferenceFactors(adapters);
     CHECK(f.downscale == 1);
     CHECK(f.temporal == 1);
     std::remove(path.c_str());
@@ -362,8 +363,8 @@ TEST_CASE("ltx2 lora: the reference factors come from the adapter's metadata") {
     vllm::Ltx2LoraSpec spec;
     spec.path = path;
     std::vector<vllm::Ltx2LoraAdapter> adapters;
-    adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)));
-    const vllm::Ltx2LoraReferenceFactors f = vllm::Ltx2ResolveLoraReferenceFactors(adapters);
+    adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget), {"diffusion_model."}));
+    const vllm::Ltx2LoraReferenceFactors f = vllm::DitResolveLoraReferenceFactors(adapters);
     // These are the two numbers the reference refusal named as unreadable.
     CHECK(f.downscale == 2);
     CHECK(f.temporal == 4);
@@ -381,9 +382,9 @@ TEST_CASE("ltx2 lora: the reference factors come from the adapter's metadata") {
       vllm::Ltx2LoraSpec spec;
       spec.path = path;
       std::vector<vllm::Ltx2LoraAdapter> adapters;
-      adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)));
+      adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget), {"diffusion_model."}));
       const std::string err =
-          Caught([&] { (void)vllm::Ltx2ResolveLoraReferenceFactors(adapters); });
+          Caught([&] { (void)vllm::DitResolveLoraReferenceFactors(adapters); });
       INFO("value = '", bad, "' error = ", err);
       CHECK(Mentions(err, "reference_downscale_factor"));
       CHECK(Mentions(err, "not a positive integer"));
@@ -405,7 +406,7 @@ TEST_CASE("ltx2 lora: an adapter naming a module the contract lacks refuses BY N
   vllm::Ltx2LoraSpec spec;
   spec.path = path;
   const std::string err = Caught([&] {
-    (void)vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget));
+    (void)vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget), {"diffusion_model."});
   });
   INFO("error = ", err);
   // BY NAME: the offending target is in the message, not just "a key".
@@ -423,7 +424,7 @@ TEST_CASE("ltx2 lora: a file that is not an adapter refuses rather than loading 
   vllm::Ltx2LoraSpec spec;
   spec.path = path;
   const std::string err =
-      Caught([&] { (void)vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)); });
+      Caught([&] { (void)vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget), {"diffusion_model."}); });
   INFO("error = ", err);
   CHECK(Mentions(err, "no `.lora_A.weight`"));
   std::remove(path.c_str());
@@ -437,7 +438,7 @@ TEST_CASE("ltx2 lora: a half pair refuses, naming the side that is missing") {
     vllm::Ltx2LoraSpec spec;
     spec.path = path;
     const std::string err =
-        Caught([&] { (void)vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)); });
+        Caught([&] { (void)vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget), {"diffusion_model."}); });
     INFO("error = ", err);
     CHECK(Mentions(err, "no matching B factor"));
     std::remove(path.c_str());
@@ -449,7 +450,7 @@ TEST_CASE("ltx2 lora: a half pair refuses, naming the side that is missing") {
     vllm::Ltx2LoraSpec spec;
     spec.path = path;
     const std::string err =
-        Caught([&] { (void)vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)); });
+        Caught([&] { (void)vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget), {"diffusion_model."}); });
     INFO("error = ", err);
     CHECK(Mentions(err, "no matching A factor"));
     std::remove(path.c_str());
@@ -464,11 +465,11 @@ TEST_CASE("ltx2 lora: a delta whose shape disagrees with the target refuses") {
   vllm::Ltx2LoraSpec spec;
   spec.path = path;
   std::vector<vllm::Ltx2LoraAdapter> adapters;
-  adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)));
+  adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget), {"diffusion_model."}));
 
   std::vector<uint16_t> buffer(16, 0);
   const std::string err = Caught([&] {
-    (void)vllm::Ltx2FuseLoraIntoTensor(adapters, kTarget, vt::DType::kBF16, 4, 4,
+    (void)vllm::DitFuseLoraIntoTensor(adapters, kTarget, vt::DType::kBF16, 4, 4,
                                        reinterpret_cast<uint8_t*>(buffer.data()),
                                        buffer.size() * sizeof(uint16_t));
   });
@@ -491,7 +492,7 @@ std::vector<vllm::Ltx2LoraAdapter> OpenAll(
     paths->push_back(path);
     vllm::Ltx2LoraSpec spec;
     spec.path = path;
-    adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)));
+    adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget), {"diffusion_model."}));
   }
   return adapters;
 }
@@ -512,7 +513,7 @@ TEST_CASE("ltx2 lora: N adapters resolve their reference factors TOGETHER") {
   SUBCASE("two adapters declaring nothing resolve to upstream's 1/1") {
     std::vector<std::string> paths;
     const std::vector<vllm::Ltx2LoraAdapter> adapters = OpenAll({{}, {}}, &paths);
-    const vllm::Ltx2LoraReferenceFactors f = vllm::Ltx2ResolveLoraReferenceFactors(adapters);
+    const vllm::Ltx2LoraReferenceFactors f = vllm::DitResolveLoraReferenceFactors(adapters);
     CHECK(f.downscale == 1);
     CHECK(f.temporal == 1);
     RemoveAll(paths);
@@ -531,7 +532,7 @@ TEST_CASE("ltx2 lora: N adapters resolve their reference factors TOGETHER") {
       const std::vector<vllm::Ltx2LoraAdapter> adapters =
           declared_first ? OpenAll({declares, {}}, &paths) : OpenAll({{}, declares}, &paths);
       const vllm::Ltx2LoraReferenceFactors f =
-          vllm::Ltx2ResolveLoraReferenceFactors(adapters);
+          vllm::DitResolveLoraReferenceFactors(adapters);
       INFO("declared_first = ", declared_first);
       CHECK(f.downscale == 2);
       CHECK(f.temporal == 4);
@@ -547,7 +548,7 @@ TEST_CASE("ltx2 lora: N adapters resolve their reference factors TOGETHER") {
     const std::vector<vllm::Ltx2LoraAdapter> adapters =
         OpenAll({{{"reference_downscale_factor", "2"}}, {{"reference_downscale_factor", "2"}}},
                 &paths);
-    const vllm::Ltx2LoraReferenceFactors f = vllm::Ltx2ResolveLoraReferenceFactors(adapters);
+    const vllm::Ltx2LoraReferenceFactors f = vllm::DitResolveLoraReferenceFactors(adapters);
     CHECK(f.downscale == 2);
     RemoveAll(paths);
   }
@@ -559,7 +560,7 @@ TEST_CASE("ltx2 lora: N adapters resolve their reference factors TOGETHER") {
         OpenAll({{{"reference_downscale_factor", "2"}}, {{"reference_downscale_factor", "3"}}},
                 &paths);
     const std::string err =
-        Caught([&] { (void)vllm::Ltx2ResolveLoraReferenceFactors(adapters); });
+        Caught([&] { (void)vllm::DitResolveLoraReferenceFactors(adapters); });
     INFO("error = ", err);
     CHECK(Mentions(err, "conflicting reference_downscale_factor"));
     CHECK(Mentions(err, "already have 2"));
@@ -577,7 +578,7 @@ TEST_CASE("ltx2 lora: N adapters resolve their reference factors TOGETHER") {
          {{"reference_downscale_factor", "2"}, {"reference_temporal_scale_factor", "8"}}},
         &paths);
     const std::string err =
-        Caught([&] { (void)vllm::Ltx2ResolveLoraReferenceFactors(adapters); });
+        Caught([&] { (void)vllm::DitResolveLoraReferenceFactors(adapters); });
     INFO("error = ", err);
     CHECK(Mentions(err, "conflicting reference_temporal_scale_factor"));
     CHECK(Mentions(err, "already have 4"));
@@ -604,7 +605,7 @@ TEST_CASE("ltx2 lora: an unreadable factor dtype refuses, naming the RIGHT facto
     vllm::Ltx2LoraSpec spec;
     spec.path = path;
     const std::string err =
-        Caught([&] { (void)vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)); });
+        Caught([&] { (void)vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget), {"diffusion_model."}); });
     INFO("error = ", err);
     CHECK(Mentions(err, "U8"));
     CHECK(Mentions(err, "BF16 or F32"));
@@ -623,7 +624,7 @@ TEST_CASE("ltx2 lora: an unreadable factor dtype refuses, naming the RIGHT facto
     vllm::Ltx2LoraSpec spec;
     spec.path = path;
     const std::string err =
-        Caught([&] { (void)vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)); });
+        Caught([&] { (void)vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget), {"diffusion_model."}); });
     INFO("error = ", err);
     CHECK(Mentions(err, "U8"));
     CHECK(Mentions(err, ".lora_B.weight"));
@@ -660,7 +661,7 @@ TEST_CASE("ltx2 lora: an F32 adapter is NARROWED to bf16, not kept f32") {
   spec.path = path;
   spec.strength = 1.0;
   std::vector<vllm::Ltx2LoraAdapter> adapters;
-  adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)));
+  adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget), {"diffusion_model."}));
 
   const std::vector<float> got = FuseBf16(adapters, kTarget, 1, 1, {0.0F});
   CHECK(vt::F32ToBF16(got[0]) == vt::F32ToBF16(192.0F));
@@ -705,7 +706,7 @@ TEST_CASE("ltx2 lora: the matmul RESULT is rounded to bf16 before the weight is 
   spec.path = path;
   spec.strength = 1.0;
   std::vector<vllm::Ltx2LoraAdapter> adapters;
-  adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)));
+  adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget), {"diffusion_model."}));
 
   const std::vector<float> got = FuseBf16(adapters, kTarget, 1, 1, {kQuarterStep});
   CHECK(vt::F32ToBF16(got[0]) == vt::F32ToBF16(1.0F));
@@ -725,14 +726,14 @@ TEST_CASE("ltx2 lora: the f32 target branch rounds through the bf16 accumulator"
   vllm::Ltx2LoraSpec spec;
   spec.path = path;
   std::vector<vllm::Ltx2LoraAdapter> adapters;
-  adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)));
+  adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget), {"diffusion_model."}));
 
   // 1 + 2^-9 in f32; adding a delta of 1.0 gives 2.001953125, which bf16 cannot
   // hold and rounds to 2.0.
   float weight = 1.0F + 1.0F / 512.0F;
   std::vector<uint8_t> buffer(sizeof(float));
   std::memcpy(buffer.data(), &weight, sizeof(float));
-  const bool fused = vllm::Ltx2FuseLoraIntoTensor(adapters, kTarget, vt::DType::kF32, 1, 1,
+  const bool fused = vllm::DitFuseLoraIntoTensor(adapters, kTarget, vt::DType::kF32, 1, 1,
                                                   buffer.data(), buffer.size());
   CHECK(fused);
   float got = 0.0F;
@@ -808,7 +809,7 @@ std::vector<uint16_t> FuseBf16Bits(const std::vector<vllm::Ltx2LoraAdapter>& ada
                                    const std::vector<float>& weight) {
   std::vector<uint16_t> buffer(weight.size());
   for (size_t i = 0; i < weight.size(); ++i) buffer[i] = vt::F32ToBF16(weight[i]);
-  REQUIRE(vllm::Ltx2FuseLoraIntoTensor(adapters, target, vt::DType::kBF16, rows, cols,
+  REQUIRE(vllm::DitFuseLoraIntoTensor(adapters, target, vt::DType::kBF16, rows, cols,
                                        reinterpret_cast<uint8_t*>(buffer.data()),
                                        buffer.size() * sizeof(uint16_t)));
   return buffer;
@@ -866,7 +867,7 @@ TEST_CASE("ltx2 lora: the delta product runs on the shared vt::Matmul seam") {
     spec.path = path;
     spec.strength = kStrength;
     std::vector<vllm::Ltx2LoraAdapter> adapters;
-    adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)));
+    adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget), {"diffusion_model."}));
 
     const std::vector<uint16_t> got = FuseBf16Bits(adapters, kTarget, s.rows, s.cols, w);
     ++fused_tensors;
@@ -1002,7 +1003,7 @@ TEST_CASE("ltx2 lora: N adapters aggregate through upstream's SECOND product for
     vllm::Ltx2LoraSpec spec;
     spec.path = path;
     spec.strength = r.strength;
-    adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)));
+    adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget), {"diffusion_model."}));
   }
 
   const std::vector<uint16_t> got = FuseBf16Bits(adapters, kTarget, kGoldRows, kGoldCols, w);
@@ -1036,7 +1037,7 @@ TEST_CASE("ltx2 lora: N adapters aggregate through upstream's SECOND product for
     vllm::Ltx2LoraSpec spec;
     spec.path = paths[0];
     spec.strength = kThree[0].strength;
-    only_first.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget)));
+    only_first.push_back(vllm::Ltx2LoraAdapter::Open(spec, ContractWith(kTarget), {"diffusion_model."}));
   }
   const std::vector<uint16_t> one =
       FuseBf16Bits(only_first, kTarget, kGoldRows, kGoldCols, w);
@@ -1083,7 +1084,7 @@ TEST_CASE("ltx2 lora: an adapter that does not target a tensor is SKIPPED, not r
     vllm::Ltx2LoraSpec spec;
     spec.path = path;
     spec.strength = 2.0;
-    adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, {kTarget, kOther}));
+    adapters.push_back(vllm::Ltx2LoraAdapter::Open(spec, {kTarget, kOther}, {"diffusion_model."}));
   }
 
   // Each tensor sees exactly ONE product, and it is the first form: `W + 2*B@A`.

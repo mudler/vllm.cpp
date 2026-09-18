@@ -254,7 +254,8 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseT2va(vt::Device device, const MiniMaxH3T2
                                             const std::vector<float>& initial_video_rows,
                                             const std::vector<float>& initial_audio_rows,
                                             vt::DType compute_dtype,
-                                            const MiniMaxH3DitDeviceWeights* prestaged) {
+                                            const MiniMaxH3DitDeviceWeights* prestaged,
+                                            const DitRuntimeLoraState* lora_state) {
   VT_CHECK(request.text_len > 0, "minimax_h3 t2va: text_len must be positive");
   VT_CHECK(request.num_steps >= 1, "minimax_h3 t2va: num_steps must be >= 1");
   VT_CHECK(static_cast<int64_t>(prompt_embeds.size()) == request.text_len * dit_params.text_dim,
@@ -362,7 +363,7 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseT2va(vt::Device device, const MiniMaxH3T2
   // put instead of being denoised away.
   return MiniMaxH3DenoiseLoop(device, dit_params, dit_weights, branch, video_rows, audio_rows,
                               request.keyframe_cond_rows, request.audio_ref_rows, sigmas_video,
-                              sigmas_audio, compute_dtype, prestaged);
+                              sigmas_audio, compute_dtype, prestaged, lora_state);
 }
 
 MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2vaRequest& request,
@@ -376,7 +377,8 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
                                           const std::vector<float>& initial_video_rows,
                                           const std::vector<float>& initial_audio_rows,
                                           vt::DType compute_dtype,
-                                          const MiniMaxH3DitDeviceWeights* prestaged) {
+                                          const MiniMaxH3DitDeviceWeights* prestaged,
+                                          const DitRuntimeLoraState* lora_state) {
   // The task/partition guard — the raise half of `_resolve_task`
   // (pipeline_minimax_h3.py:374-391), which the #70/#74 white render bypassed by
   // running t2va on the Ref2VA NVFP4 checkpoint. The task is what the request
@@ -388,7 +390,8 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
 
   const MiniMaxH3DenoiseResult denoised =
       MiniMaxH3DenoiseT2va(device, request, dit_params, dit_weights, prompt_embeds,
-                           initial_video_rows, initial_audio_rows, compute_dtype, prestaged);
+                           initial_video_rows, initial_audio_rows, compute_dtype, prestaged,
+                           lora_state);
 
   // --- 4. rows -> latents ---
   // ref2va PREPENDS pinned reference rows (encoded image/video/audio) to the

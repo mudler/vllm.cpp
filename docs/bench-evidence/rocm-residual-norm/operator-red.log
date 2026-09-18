@@ -1,0 +1,32 @@
+
+
+============================ ROCm System Management Interface ============================
+=================================== % time GPU is busy ===================================
+GPU[0]		: GPU use (%): 0
+GPU[1]		: GPU use (%): 0
+GPU[2]		: GPU use (%): 0
+GPU[3]		: GPU use (%): 0
+==========================================================================================
+===================================== KFD Processes ======================================
+No KFD PIDs currently running
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+[doctest] doctest version is "2.5.2"
+[doctest] run with "--help" for options
+===============================================================================
+/home/vikash/vllm.cpp-residual-norm-impl/tests/vt/test_ops_residual_rmsnorm.cpp:179:
+TEST CASE:  residual RMS norm matches the complete pinned upstream BF16 fixture grid
+
+/home/vikash/vllm.cpp-residual-norm-impl/tests/vt/test_ops_residual_rmsnorm.cpp:183: MESSAGE: Upstream fixture gate not executed: set VT_RESIDUAL_NORM_UPSTREAM to the complete pinned export
+
+===============================================================================
+/home/vikash/vllm.cpp-residual-norm-impl/tests/vt/test_ops_residual_rmsnorm.cpp:356:
+TEST CASE:  ROCm residual RMS norm cannot run ahead of a blocked nondefault stream
+
+/home/vikash/vllm.cpp-residual-norm-impl/tests/vt/test_ops_residual_rmsnorm.cpp:363: FATAL ERROR: REQUIRE( (flags & 0x01) != 0 ) is NOT correct!
+  values: REQUIRE( 0 != 0 )
+
+===============================================================================
+[doctest] test cases:     8 |     7 passed | 1 failed | 0 skipped
+[doctest] assertions: 11200 | 11199 passed | 1 failed |
+[doctest] Status: FAILURE!

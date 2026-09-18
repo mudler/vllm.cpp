@@ -62,21 +62,40 @@ TEST_CASE("gemma4 rocm fp8 seams: recipe env knobs parse inert defaults") {
     EnvRestorer b("VT_ATTN_DECODE_KV_SPLITS");
     EnvRestorer c("VT_ATTN_DECODE_SLIDE_SPLITS");
     EnvRestorer d("VT_ATTN_DECODE_SPLIT_WARPS");
+    EnvRestorer e("VT_ATTN_DECODE_SLIDE_WARPS");
+    EnvRestorer f("VT_ATTN_DECODE_SPLIT_KV");
     ::unsetenv("VT_GEMMA4_FP8_HW_CVT");
     ::unsetenv("VT_ATTN_DECODE_KV_SPLITS");
     ::unsetenv("VT_ATTN_DECODE_SLIDE_SPLITS");
     ::unsetenv("VT_ATTN_DECODE_SPLIT_WARPS");
+    ::unsetenv("VT_ATTN_DECODE_SLIDE_WARPS");
+    ::unsetenv("VT_ATTN_DECODE_SPLIT_KV");
     // Unset → code defaults are env-read at runtime inside HIP; here we only
     // document the *recipe* integers the lab pins (not process-wide defaults).
     CHECK(EnvInt("VT_GEMMA4_FP8_HW_CVT", 1) == 1);
     CHECK(EnvInt("VT_ATTN_DECODE_KV_SPLITS", 16) == 16);
     CHECK(EnvInt("VT_ATTN_DECODE_SLIDE_SPLITS", 8) == 8);
     CHECK(EnvInt("VT_ATTN_DECODE_SPLIT_WARPS", 12) == 12);
+    CHECK(EnvInt("VT_ATTN_DECODE_SLIDE_WARPS", 16) == 16);
+    // Split-KV gate defaults OFF (opt-in for correctness validation)
+    CHECK(EnvInt("VT_ATTN_DECODE_SPLIT_KV", 0) == 0);
   }
   {
     EnvRestorer a("VT_GEMMA4_FP8_HW_CVT");
     ::setenv("VT_GEMMA4_FP8_HW_CVT", "0", 1);
     CHECK(EnvInt("VT_GEMMA4_FP8_HW_CVT", 1) == 0);
+  }
+  // Test split-KV gate can be enabled
+  {
+    EnvRestorer gate("VT_ATTN_DECODE_SPLIT_KV");
+    ::setenv("VT_ATTN_DECODE_SPLIT_KV", "1", 1);
+    CHECK(EnvInt("VT_ATTN_DECODE_SPLIT_KV", 0) == 1);
+  }
+  // Test custom split counts
+  {
+    EnvRestorer splits("VT_ATTN_DECODE_KV_SPLITS");
+    ::setenv("VT_ATTN_DECODE_KV_SPLITS", "32", 1);
+    CHECK(EnvInt("VT_ATTN_DECODE_KV_SPLITS", 16) == 32);
   }
 }
 

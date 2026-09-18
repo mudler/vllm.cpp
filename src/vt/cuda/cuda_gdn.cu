@@ -222,6 +222,19 @@ void Check(cudaError_t err, const char* what) {
 // cudaGetDriverEntryPoint so no explicit libcuda link is needed (CUTLASS's own
 // runtime-linked path). Mirrors the CuTe-DSL kernel_h _make_bf16_tma_args
 // (gdn_chunk_cutedsl/kernel_h.py:56-75): 128 K-dim, num_stages ring, bf16 tile.
+// Compatibility shim: cudaGetDriverEntryPointByVersion was introduced in CUDA 12.2.
+// On CUDA 12.0 (e.g. Ubuntu nvidia-cuda-toolkit on aarch64), fall back to
+// cudaGetDriverEntryPoint which is available since 12.0 and accepts the same
+// flags. The version parameter is ignored in the fallback path.
+#if CUDART_VERSION < 12020
+static inline cudaError_t cudaGetDriverEntryPointByVersion(
+    const char* symbol, void** funcPtr, int /*version*/,
+    unsigned long long flags,
+    cudaDriverEntryPointQueryResult* driverStatus) {
+  return cudaGetDriverEntryPoint(symbol, funcPtr, flags, driverStatus);
+}
+#endif
+
 using PfnTmaEncode = PFN_cuTensorMapEncodeTiled_v12000;
 inline PfnTmaEncode GdnTmaEncodeFn() {
   static PfnTmaEncode fn = [] {

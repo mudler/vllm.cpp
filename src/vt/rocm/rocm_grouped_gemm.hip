@@ -15,11 +15,9 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
-// rocWMMA int8 tile arm (KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4, issue #2109),
-// gfx1200/gfx1201 (RDNA4) only — same gate rocm_paged_attn.hip already uses
-// for its own WMMA arm, and the same reason: a fat build also emits other
-// gfx12 targets (for example gfx1036) that must not see this include.
-#if defined(__gfx1200__) || defined(__gfx1201__)
+// The quantized fragment API supports measured gfx1100 and gfx1200/gfx1201.
+// Keep this device guard independent of the attention WMMA architecture gate.
+#if defined(__gfx1100__) || defined(__gfx1200__) || defined(__gfx1201__)
 #include <rocwmma/rocwmma.hpp>
 #define VT_ROCM_QUANT_WMMA_OK 1
 #endif
@@ -38,12 +36,12 @@
 #include "vt/grow_only_stream_scratch.h"
 #include "vt/ops.h"
 #include "vt/rocm/rocm_act_quant.h"
-#include "vt/rocm/rocm_arch.h"
 #include "vt/rocm/rocm_device_bind.h"
 #include "vt/rocm/rocm_f16_codec.h"
 #include "vt/rocm/rocm_mmvq_policy.h"
 #include "vt/rocm/rocm_norm_quant_bridge.h"
 #include "vt/rocm/rocm_quant_iq_tables.h"
+#include "vt/rocm/rocm_quant_wmma_arch.h"
 #include "vt/rocm/rocm_runtime.h"
 
 // Block layouts — the single source of truth (ggml-common.h mirrors).
@@ -80,11 +78,23 @@ __device__ __forceinline__ int GetIntB2(const int8_t* qs, int i32) {
 // int8 multiplies + 4 adds. Bit-identical: signed int8×int8→int32 dot
 // product is exact either way (the HW instruction and the scalar expansion
 // compute the same integer result).
+// Fallback to scalar expansion when __ockl_sdot4 is unavailable (older ROCm).
 __device__ __forceinline__ int Dp4a(int a, int b, int acc) {
   using char4_native = char __attribute__((ext_vector_type(4)));
   char4_native va = *reinterpret_cast<const char4_native*>(&a);
   char4_native vb = *reinterpret_cast<const char4_native*>(&b);
+#if defined(__has_builtin)
+#if __has_builtin(__ockl_sdot4)
   return __ockl_sdot4(va, vb, acc, false);
+#endif
+#endif
+  // Fallback: scalar expansion (bit-identical, ~1.4x slower on gfx1100)
+  int result = acc;
+  #pragma unroll
+  for (int i = 0; i < 4; i++) {
+    result += va[i] * vb[i];
+  }
+  return result;
 }
 
 // ---- activation quantizers ----
@@ -461,12 +471,8 @@ __global__ void KQuantGemmKWmmaQ6K(OutT* __restrict__ out, const uint8_t* __rest
                                    const BlockQ8_K* __restrict__ act, int64_t m, int64_t n,
                                    int64_t nsb, int64_t n_tiles) {
 #if !defined(VT_ROCM_QUANT_WMMA_OK)
-  // Compiled for a target other than gfx1200/gfx1201, or for the host pass:
-  // never launched there (`Gfx12QuantWmmaHostOk` gates every launch site
-  // below on the actual device's runtime gcnArchName, not on this macro —
-  // the macro is only visible to a device compilation pass for gfx1200/
-  // gfx1201 itself, exactly the trap issue #785 already found and fixed for
-  // `rocm_paged_attn.hip`'s own WMMA arm).
+  // Non-admitted device and host passes retain a stub. QuantWmmaHostOk
+  // checks the actual device architecture before any launch of this body.
   (void)out; (void)weight; (void)act; (void)m; (void)n; (void)nsb; (void)n_tiles;
   return;
 #else
@@ -761,17 +767,9 @@ __global__ void KQuantGemmKWmmaQ4K(OutT* __restrict__ out, const uint8_t* __rest
 #endif  // VT_ROCM_QUANT_WMMA_OK
 }
 
-// Per-device, once: launch the Q6_K WMMA tile only when this device's
-// gcnArchName is gfx1200/gfx1201 (prefix match). NEVER gated by
-// VT_ROCM_QUANT_WMMA_OK at a host call site — that macro is defined only on
-// the device compilation pass for gfx1200/gfx1201 itself, so a host-side
-// `#if` on it always compiles away the launch (issue #785's exact trap,
-// documented in `.agents/specs/rocm-sharedk-wmma-host-dispatch.md`). Reuses
-// the same HIP-free, unit-tested prefix check `rocm_paged_attn.hip`'s own
-// WMMA dispatch already established (`vt::rocm::GcnArchNameIsGfx12PrefillWmma`,
-// `include/vt/rocm/rocm_arch.h`); the name is attention-flavored but the test
-// it names is pure architecture matching, shared rather than duplicated here.
-bool Gfx12QuantWmmaHostOk(int device_index) {
+// Cache each device's quant-specific runtime admission. The compile guard is
+// device-only, so testing it on the host would compile away every launch.
+bool QuantWmmaHostOk(int device_index) {
   struct Slot {
     std::once_flag once;
     bool ok = false;
@@ -785,7 +783,7 @@ bool Gfx12QuantWmmaHostOk(int device_index) {
       return;
     }
     slots[static_cast<unsigned>(device_index)].ok =
-        vt::rocm::GcnArchNameIsGfx12PrefillWmma(prop.gcnArchName);
+        vt::rocm::GcnArchNameHasQuantWmma(prop.gcnArchName);
   });
   return slots[static_cast<unsigned>(device_index)].ok;
 }
@@ -1441,7 +1439,7 @@ std::atomic<uint64_t> g_kq_wmma_dispatches{0};
 // site is reached independently, not infer Q4_K's from Q6_K's.
 std::atomic<uint64_t> g_kq_wmma_q4k_dispatches{0};
 
-// VT_ROCM_QUANT_WMMA=0 forces the scalar arm even on gfx1200/gfx1201 — the
+// VT_ROCM_QUANT_WMMA=0 forces the scalar arm even on admitted WMMA devices — the
 // A/B escape hatch every WMMA arm in this tree ships with
 // (VT_ATTN_PREFILL_SHAREDK_WMMA is the paged-attention precedent). Default
 // on: the gate below still requires the runtime architecture match and
@@ -1803,7 +1801,7 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
 
     g_mmvq_route_baseline.fetch_add(1, std::memory_order_relaxed);
     const int64_t grid = (m * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
-    // RDNA4 WMMA tile arm: Q6_K and Q4_K prefill only (m > 1, since
+    // Quantized WMMA tile arm: Q6_K and Q4_K prefill only (m > 1, since
     // KQuantDecodeCoopWarps above already owns m == 1). Q5_K is `## Owed` —
     // same 32-wide scale/min shape as Q4_K plus a high-bit plane, not yet
     // ported. Every other format and every other architecture falls through
@@ -1829,7 +1827,7 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
     // much as the whole GEMM to fill a typically thin remainder strip, for
     // a large aligned corner and wide N.
     const bool wmma_ok = (fmt == 2 || fmt == 0) && m >= 16 && n >= 16 &&
-                        QuantWmmaEnabled() && Gfx12QuantWmmaHostOk(q.device.index);
+                        QuantWmmaEnabled() && QuantWmmaHostOk(q.device.index);
     auto launch = [&](auto ot) {
       using OutT = decltype(ot);
       auto* o = static_cast<OutT*>(out.data);

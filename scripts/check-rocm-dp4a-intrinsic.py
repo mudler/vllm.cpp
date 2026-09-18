@@ -2,7 +2,8 @@
 """Fail if the ROCm Dp4a function does not use the hardware dot-product intrinsic.
 
 The `Dp4a` function in `src/vt/rocm/rocm_grouped_gemm.hip` must call
-`__ockl_sdot4` (which emits the `v_dot4_i32_i8` instruction on gfx1100).
+`__ockl_sdot4` (which emits the `v_dot4_i32_i8` instruction on gfx1100)
+OR have a conditional fallback with `#if __has_builtin(__ockl_sdot4)`.
 The scalar expansion — four int8 multiplies plus four adds — is bit-identical
 but ~1.4x slower on the KQuantGemmK prefill path.  A CPU-only `ctest` gate
 stays green with either form, because the ROCm kernel is not compiled on the
@@ -67,11 +68,16 @@ def check(root: Path = REPO) -> list[str]:
     body = _extract_dp4a(text)
     if body is None:
         return ["Dp4a function not found in rocm_grouped_gemm.hip"]
-    if INTRINSIC not in body:
+    
+    # Check for intrinsic OR conditional fallback
+    has_intrinsic = INTRINSIC in body
+    has_conditional_fallback = "__has_builtin(__ockl_sdot4)" in body
+    
+    if not has_intrinsic and not has_conditional_fallback:
         return [
             "Dp4a does not use the hardware dot-product intrinsic "
-            f"({INTRINSIC}). The scalar expansion is bit-identical but "
-            "~1.4x slower on the KQuantGemmK prefill path."
+            f"({INTRINSIC}) or a conditional fallback. The scalar expansion "
+            "is bit-identical but ~1.4x slower on the KQuantGemmK prefill path."
         ]
     return []
 

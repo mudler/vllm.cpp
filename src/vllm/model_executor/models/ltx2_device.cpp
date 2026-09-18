@@ -65,6 +65,7 @@
 #include "vllm/model_executor/models/dense_device_glue.h"
 #include "vt/backend.h"
 #include "vt/ops.h"
+#include "vllm/model_executor/models/dit_lora.h"
 
 namespace vllm {
 namespace {
@@ -182,13 +183,26 @@ struct Ctx {
   const ltx2::Ltx2DeviceKernels* k;
   const Ltx2DitParams* p;
   OnesCache* ones;
+  const DitRuntimeLoraState* lora = nullptr;
 };
+
+// Cast between dtypes on the device (f32<->bf16); same-dtype is a copy.
+void CastTo(Dev d, Tensor& out, const Tensor& in) {
+  if (out.dtype == in.dtype) {
+    vt::GetBackend(d.q.device.type).Copy(d.q, out.data, in.data, in.Bytes());
+  } else if (out.dtype == DType::kBF16) {
+    vt::CastBf16(d.q, out, in);
+  } else {
+    vt::CastF32(d.q, out, in);
+  }
+}
 
 // vt::MatmulBT + optional rank-1 bias — the device twin of ltx2.cpp's `Linear`.
 // `weight` is [out_features, in_features], torch's own nn.Linear layout, so
 // y = x @ W^T + b reads straight off the module.
 void LinearDev(Ctx& c, const Tensor& in, int64_t rows, int64_t in_features,
-               const Ltx2LinearWeight& w, Tensor& out) {
+               const Ltx2LinearWeight& w, Tensor& out,
+               const DitRuntimeLoraLayer* lora = nullptr) {
   VT_CHECK(w.weight.rank == 2 && w.weight.shape[1] == in_features,
            "ltx2 device linear: weight shape does not match input width");
   VT_CHECK(w.weight.dtype == c.s,
@@ -200,6 +214,21 @@ void LinearDev(Ctx& c, const Tensor& in, int64_t rows, int64_t in_features,
   vt::MatmulBT(c.d.q, o, a, w.weight);
   if (w.bias.data != nullptr) {
     vt::Add(c.d.q, o, o, w.bias);  // rank-1 row-broadcast == a nn.Linear bias term
+  }
+  if (lora != nullptr) {
+    const int64_t rank = lora->lora_a.shape[0];
+    const int64_t out_features = w.weight.shape[0];
+    // LoRA factors are f32; compute the delta in f32 and cast back, so
+    // MatmulBT always sees (f32,f32)->f32 regardless of the stream dtype.
+    DBuf a_f32(c.d, DType::kF32, {rows, in_features});
+    CastTo(c.d, a_f32.t(), a);
+    DBuf tmp(c.d, DType::kF32, {rows, rank});
+    vt::MatmulBT(c.d.q, tmp.t(), a_f32.t(), lora->lora_a);
+    DBuf delta_f32(c.d, DType::kF32, {rows, out_features});
+    vt::MatmulBT(c.d.q, delta_f32.t(), tmp.t(), lora->lora_b);
+    DBuf delta(c.d, c.s, {rows, out_features});
+    CastTo(c.d, delta.t(), delta_f32.t());
+    vt::Add(c.d.q, o, o, delta.t());
   }
 }
 
@@ -328,7 +357,8 @@ struct AttnArgsDev {
 // pass that skipped `to_out` returns a tensor of the right shape in the wrong
 // width-space, the block would add it to the residual, and it would render.
 DBuf AttentionEpilogueDev(Ctx& c, const Ltx2AttentionWeights& w, const Tensor& x, DBuf attn,
-                          const AttnArgsDev& a) {
+                          const AttnArgsDev& a, const DitRuntimeLoraLayer* gate_lora = nullptr,
+                          const DitRuntimeLoraLayer* out_lora = nullptr) {
   const int64_t batch = a.batch, tq = a.tokens;
   const int64_t heads = a.heads, dim_head = a.dim_head;
   const int64_t inner = heads * dim_head;
@@ -337,19 +367,23 @@ DBuf AttentionEpilogueDev(Ctx& c, const Ltx2AttentionWeights& w, const Tensor& x
   // `to_out` (attention.py:576-579) and driven by the RAW input `x`.
   if (w.to_gate_logits.weight.data != nullptr) {
     DBuf logits(c.d, c.s, {batch * tq, heads});
-    LinearDev(c, x, batch * tq, a.query_dim, w.to_gate_logits, logits.t());
+    LinearDev(c, x, batch * tq, a.query_dim, w.to_gate_logits, logits.t(), gate_lora);
     c.k->gate_heads(c.d.q, attn.t().data, logits.t().data, batch * tq, heads, dim_head, c.s);
   }
 
   DBuf out(c.d, c.s, {batch * tq, a.query_dim});
-  LinearDev(c, attn.t(), batch * tq, inner, w.to_out, out.t());
+  LinearDev(c, attn.t(), batch * tq, inner, w.to_out, out.t(), out_lora);
   return out;
 }
 
 // Attention.forward (attention.py:520-579). `context` is null for self-attention
 // (upstream's `context = x if context is None else context`).
 DBuf AttentionDev(Ctx& c, const Ltx2AttentionWeights& w, const Tensor& x, const Tensor* context,
-                  const AttnArgsDev& a) {
+                  const AttnArgsDev& a, const DitRuntimeLoraLayer* q_lora = nullptr,
+                  const DitRuntimeLoraLayer* k_lora = nullptr,
+                  const DitRuntimeLoraLayer* v_lora = nullptr,
+                  const DitRuntimeLoraLayer* gate_lora = nullptr,
+                  const DitRuntimeLoraLayer* out_lora = nullptr) {
   const int64_t batch = a.batch, tq = a.tokens;
   const int64_t heads = a.heads, dim_head = a.dim_head;
   const int64_t inner = heads * dim_head;
@@ -359,7 +393,7 @@ DBuf AttentionDev(Ctx& c, const Ltx2AttentionWeights& w, const Tensor& x, const 
 
   // attention.py:559-565: v first, then q and k.
   DBuf v(c.d, c.s, {batch * s, inner});
-  LinearDev(c, ctx, batch * s, ctx_dim, w.to_v, v.t());
+  LinearDev(c, ctx, batch * s, ctx_dim, w.to_v, v.t(), v_lora);
 
   // attention.py:557 / :561-562 — `use_attention = not all_perturbed`, and when
   // it is false `out = v`. The STG arm computes `to_v` and NOTHING else of the
@@ -385,18 +419,18 @@ DBuf AttentionDev(Ctx& c, const Ltx2AttentionWeights& w, const Tensor& x, const 
     // reads. Asserted rather than assumed: a future cross caller that slipped
     // past the check above would otherwise run `to_out` over the wrong row count.
     VT_CHECK(s == tq, "ltx2 attention (device): a perturbed pass must be square");
-    return AttentionEpilogueDev(c, w, x, std::move(v), a);
+    return AttentionEpilogueDev(c, w, x, std::move(v), a, gate_lora, out_lora);
   }
 
   DBuf qb(c.d, c.s, {batch * tq, inner});
-  LinearDev(c, x, batch * tq, a.query_dim, w.to_q, qb.t());
+  LinearDev(c, x, batch * tq, a.query_dim, w.to_q, qb.t(), q_lora);
 
   // PytorchPreAttention (ops.py:22-37): the q/k RMSNorm runs over the FULL inner
   // width, before the head split, and RoPE follows it.
   DBuf qn(c.d, c.s, {batch * tq, inner});
   RmsNormWeighted(c, qn.t(), qb.t(), w.q_norm, batch * tq, inner);
   DBuf kb(c.d, c.s, {batch * s, inner});
-  LinearDev(c, ctx, batch * s, ctx_dim, w.to_k, kb.t());
+  LinearDev(c, ctx, batch * s, ctx_dim, w.to_k, kb.t(), k_lora);
   DBuf kn(c.d, c.s, {batch * s, inner});
   RmsNormWeighted(c, kn.t(), kb.t(), w.k_norm, batch * s, inner);
 
@@ -571,7 +605,7 @@ DBuf AttentionDev(Ctx& c, const Ltx2AttentionWeights& w, const Tensor& x, const 
     }
   }
 
-  return AttentionEpilogueDev(c, w, x, std::move(attn), a);
+  return AttentionEpilogueDev(c, w, x, std::move(attn), a, gate_lora, out_lora);
 }
 
 // ---------------------------------------------------------------------------
@@ -580,13 +614,14 @@ DBuf AttentionDev(Ctx& c, const Ltx2AttentionWeights& w, const Tensor& x, const 
 
 // Ltx2FeedForward (ltx2.cpp:782-789): net.0.proj -> gelu(tanh) -> net.2.
 DBuf FeedForwardDev(Ctx& c, const Ltx2FeedForwardWeights& w, const Tensor& x, int64_t rows,
-                    int64_t dim, int64_t inner) {
+                    int64_t dim, int64_t inner, const DitRuntimeLoraLayer* in_lora = nullptr,
+                    const DitRuntimeLoraLayer* out_lora = nullptr) {
   DBuf hidden(c.d, c.s, {rows, inner});
-  LinearDev(c, x, rows, dim, w.proj_in, hidden.t());
+  LinearDev(c, x, rows, dim, w.proj_in, hidden.t(), in_lora);
   Tensor h = Reshape(hidden.t(), {rows, inner});
   vt::GeluTanh(c.d.q, h, h);
   DBuf out(c.d, c.s, {rows, dim});
-  LinearDev(c, hidden.t(), rows, inner, w.proj_out, out.t());
+  LinearDev(c, hidden.t(), rows, inner, w.proj_out, out.t(), out_lora);
   return out;
 }
 
@@ -599,7 +634,8 @@ struct AdalnOutDev {
 // projection is built on the HOST (one [count, 256] table per stream per
 // forward); everything after it is a device GEMM or a device elementwise pass.
 AdalnOutDev AdaLayerNormSingleDev(Ctx& c, const Ltx2AdaLayerNormSingleWeights& w,
-                                  const float* timesteps, int64_t count, int64_t dim) {
+                                  const float* timesteps, int64_t count, int64_t dim,
+                                  const DitRuntimeLoraLayer* mod_lora = nullptr) {
   // get_timestep_embedding (timestep_embedding.py:6-54) with num_channels=256,
   // flip_sin_to_cos=True, downscale_freq_shift=0, scale=1, max_period=10000, so
   // the row is [cos(...) | sin(...)].
@@ -632,7 +668,7 @@ AdalnOutDev AdaLayerNormSingleDev(Ctx& c, const Ltx2AdaLayerNormSingleWeights& w
   c.k->silu(c.d.q, activated.t().data, count * dim, c.s);
   const int64_t coefficient_dim = w.linear.weight.shape[0];
   out.modulation.emplace(c.d, c.s, std::vector<int64_t>{count, coefficient_dim});
-  LinearDev(c, activated.t(), count, dim, w.linear, out.modulation->t());
+  LinearDev(c, activated.t(), count, dim, w.linear, out.modulation->t(), mod_lora);
   return out;
 }
 
@@ -678,6 +714,7 @@ struct BlockArgsDev {
   // audio->video direction.
   bool video_cross_attn_skip_all = false;
   bool audio_cross_attn_skip_all = false;
+  int64_t block_index = 0;
 };
 
 // One stream's text cross-attention (transformer.py:223-252 + :420-447), the
@@ -688,7 +725,12 @@ void TextCrossAttentionDev(Ctx& c, const Ltx2AttentionWeights& attn, const Tenso
                            const Tensor& x_normed, const Tensor& context,
                            const Tensor* context_bias, int64_t batch, int64_t tokens,
                            int64_t context_tokens, int64_t width, int64_t heads,
-                           int64_t dim_head, Tensor& x) {
+                           int64_t dim_head, Tensor& x,
+                           const DitRuntimeLoraLayer* q_lora = nullptr,
+                           const DitRuntimeLoraLayer* k_lora = nullptr,
+                           const DitRuntimeLoraLayer* v_lora = nullptr,
+                           const DitRuntimeLoraLayer* gate_lora = nullptr,
+                           const DitRuntimeLoraLayer* out_lora = nullptr) {
   const int64_t coefficient = c.p->adaln_embedding_coefficient();
   VT_CHECK(c.p->cross_attention_adaln,
            "ltx2: cross_attention_adaln=false is upstream's plain cross-attention path "
@@ -755,7 +797,8 @@ void TextCrossAttentionDev(Ctx& c, const Ltx2AttentionWeights& attn, const Tenso
   a.dim_head = dim_head;
   a.bias = context_bias;
   a.bias_rows = context_bias != nullptr ? 1 : 0;
-  DBuf out = AttentionDev(c, attn, attn_input.t(), &encoder.t(), a);
+  DBuf out = AttentionDev(c, attn, attn_input.t(), &encoder.t(), a,
+                           q_lora, k_lora, v_lora, gate_lora, out_lora);
   c.k->add_gated(c.d.q, x.data, out.t().data, gate.t().data, rows, width, 1, c.s);
 }
 
@@ -767,6 +810,12 @@ void BlockForwardDev(Ctx& c, const Ltx2BlockWeights& w, const BlockArgsDev& args
   const int64_t tv = args.video_tokens;
   const int64_t ta = args.audio_tokens;
   const int64_t coefficient = c.p->adaln_embedding_coefficient();
+
+  const bool has_lora = c.lora != nullptr && !c.lora->empty();
+  const std::string bp = "transformer_blocks." + std::to_string(args.block_index);
+  auto lf = [&](const std::string& suffix) -> const DitRuntimeLoraLayer* {
+    return has_lora ? c.lora->Find(bp + "." + suffix + ".weight") : nullptr;
+  };
 
   // transformer.py:265-269.
   const bool run_vx = args.video_enabled && video_x != nullptr && tv > 0;
@@ -799,7 +848,9 @@ void BlockForwardDev(Ctx& c, const Ltx2BlockWeights& w, const BlockArgsDev& args
     a.bias = args.video_self_bias;
     a.bias_rows = args.video_self_bias_rows;
     a.all_perturbed = args.video_self_attn_perturbed;
-    DBuf msa = AttentionDev(c, w.attn1, norm_vx.t(), nullptr, a);
+    DBuf msa = AttentionDev(c, w.attn1, norm_vx.t(), nullptr, a,
+                             lf("attn1.to_q"), lf("attn1.to_k"), lf("attn1.to_v"),
+                             lf("attn1.to_gate_logits"), lf("attn1.to_out.0"));
 
     // PytorchPostSAFunction (ops.py:72-82): x + y * gate, then rms_norm of that sum.
     c.k->add_gated(c.d.q, video_x->data, msa.t().data, gate.t().data, rows, dim, 1, c.s);
@@ -810,7 +861,9 @@ void BlockForwardDev(Ctx& c, const Ltx2BlockWeights& w, const BlockArgsDev& args
                           *args.video_timestep_modulation, args.video_prompt_modulation,
                           vx_normed->t(), *args.video_context,
                           args.video_context_bias, batch, tv, args.video_context_tokens, dim,
-                          c.p->num_attention_heads, c.p->attention_head_dim, *video_x);
+                          c.p->num_attention_heads, c.p->attention_head_dim, *video_x,
+                          lf("attn2.to_q"), lf("attn2.to_k"), lf("attn2.to_v"),
+                          lf("attn2.to_gate_logits"), lf("attn2.to_out.0"));
   }
 
   if (run_ax) {
@@ -835,7 +888,9 @@ void BlockForwardDev(Ctx& c, const Ltx2BlockWeights& w, const BlockArgsDev& args
     a.bias = args.audio_self_bias;
     a.bias_rows = args.audio_self_bias_rows;
     a.all_perturbed = args.audio_self_attn_perturbed;
-    DBuf msa = AttentionDev(c, w.audio_attn1, norm_ax.t(), nullptr, a);
+    DBuf msa = AttentionDev(c, w.audio_attn1, norm_ax.t(), nullptr, a,
+                             lf("audio_attn1.to_q"), lf("audio_attn1.to_k"), lf("audio_attn1.to_v"),
+                             lf("audio_attn1.to_gate_logits"), lf("audio_attn1.to_out.0"));
 
     c.k->add_gated(c.d.q, audio_x->data, msa.t().data, gate.t().data, rows, adim, 1, c.s);
     ax_normed.emplace(c.d, c.s, std::vector<int64_t>{rows, adim});
@@ -846,7 +901,9 @@ void BlockForwardDev(Ctx& c, const Ltx2BlockWeights& w, const BlockArgsDev& args
                           args.audio_prompt_modulation,
                           ax_normed->t(), *args.audio_context, args.audio_context_bias, batch, ta,
                           args.audio_context_tokens, adim, c.p->audio_num_attention_heads,
-                          c.p->audio_attention_head_dim, *audio_x);
+                          c.p->audio_attention_head_dim, *audio_x,
+                          lf("audio_attn2.to_q"), lf("audio_attn2.to_k"), lf("audio_attn2.to_v"),
+                          lf("audio_attn2.to_gate_logits"), lf("audio_attn2.to_out.0"));
   }
 
   // Audio <-> video cross attention (transformer.py:329-397). Both directions
@@ -905,7 +962,10 @@ void BlockForwardDev(Ctx& c, const Ltx2BlockWeights& w, const BlockArgsDev& args
       a.dim_head = c.p->audio_attention_head_dim;
       a.pe = args.video_cross_pe;
       a.k_pe = args.audio_cross_pe;
-      DBuf out = AttentionDev(c, w.audio_to_video_attn, vq.t(), &akv.t(), a);
+      DBuf out = AttentionDev(c, w.audio_to_video_attn, vq.t(), &akv.t(), a,
+                               lf("audio_to_video_attn.to_q"), lf("audio_to_video_attn.to_k"),
+                               lf("audio_to_video_attn.to_v"), lf("audio_to_video_attn.to_gate_logits"),
+                               lf("audio_to_video_attn.to_out.0"));
       c.k->add_gated(c.d.q, video_x->data, out.t().data, gate.t().data, batch * tv, dim, tv, c.s);
     }
 
@@ -933,7 +993,10 @@ void BlockForwardDev(Ctx& c, const Ltx2BlockWeights& w, const BlockArgsDev& args
       a.dim_head = c.p->audio_attention_head_dim;
       a.pe = args.audio_cross_pe;
       a.k_pe = args.video_cross_pe;
-      DBuf out = AttentionDev(c, w.video_to_audio_attn, aq.t(), &vkv.t(), a);
+      DBuf out = AttentionDev(c, w.video_to_audio_attn, aq.t(), &vkv.t(), a,
+                               lf("video_to_audio_attn.to_q"), lf("video_to_audio_attn.to_k"),
+                               lf("video_to_audio_attn.to_v"), lf("video_to_audio_attn.to_gate_logits"),
+                               lf("video_to_audio_attn.to_out.0"));
       c.k->add_gated(c.d.q, audio_x->data, out.t().data, gate.t().data, batch * ta, adim, ta, c.s);
     }
   }
@@ -948,7 +1011,8 @@ void BlockForwardDev(Ctx& c, const Ltx2BlockWeights& w, const BlockArgsDev& args
     DBuf gate = AdaValueDev(c, w.scale_shift_table, *args.video_timestep_modulation, rows, dim,
                             coefficient, 5);
     DBuf scaled = AdaZeroDev(c, *video_x, scale, shift, rows, dim);
-    DBuf ff = FeedForwardDev(c, w.ff, scaled.t(), rows, dim, 4 * dim);
+    DBuf ff = FeedForwardDev(c, w.ff, scaled.t(), rows, dim, 4 * dim,
+                             lf("ff.net.0.proj"), lf("ff.net.2"));
     c.k->add_gated(c.d.q, video_x->data, ff.t().data, gate.t().data, rows, dim, 1, c.s);
   }
 
@@ -961,7 +1025,8 @@ void BlockForwardDev(Ctx& c, const Ltx2BlockWeights& w, const BlockArgsDev& args
     DBuf gate = AdaValueDev(c, w.audio_scale_shift_table, *args.audio_timestep_modulation, rows,
                             adim, coefficient, 5);
     DBuf scaled = AdaZeroDev(c, *audio_x, scale, shift, rows, adim);
-    DBuf ff = FeedForwardDev(c, w.audio_ff, scaled.t(), rows, adim, 4 * adim);
+    DBuf ff = FeedForwardDev(c, w.audio_ff, scaled.t(), rows, adim, 4 * adim,
+                             lf("audio_ff.net.0.proj"), lf("audio_ff.net.2"));
     c.k->add_gated(c.d.q, audio_x->data, ff.t().data, gate.t().data, rows, adim, 1, c.s);
   }
 }
@@ -990,12 +1055,13 @@ struct PreparedStreamDev {
 // _prepare_timestep (transformer_args.py:173-186) + AdaLayerNormSingle.
 AdalnOutDev PrepareTimestepDev(Ctx& c, const Ltx2AdaLayerNormSingleWeights& adaln,
                                const float* timesteps, int64_t count, int64_t width,
-                               int64_t multiplier) {
+                               int64_t multiplier,
+                               const DitRuntimeLoraLayer* mod_lora = nullptr) {
   std::vector<float> scaled(static_cast<size_t>(count));
   for (int64_t i = 0; i < count; ++i) {
     scaled[static_cast<size_t>(i)] = timesteps[i] * static_cast<float>(multiplier);
   }
-  return AdaLayerNormSingleDev(c, adaln, scaled.data(), count, width);
+  return AdaLayerNormSingleDev(c, adaln, scaled.data(), count, width, mod_lora);
 }
 
 PreparedStreamDev PrepareStreamDev(Ctx& c, const Ltx2LinearWeight& patchify,
@@ -1007,14 +1073,16 @@ PreparedStreamDev PrepareStreamDev(Ctx& c, const Ltx2LinearWeight& patchify,
                                    const Ltx2ModalityInput& m, int64_t width, int64_t in_channels,
                                    int64_t n_pos_dims, const std::vector<int64_t>& max_pos,
                                    int64_t heads, const Ltx2ModalityInput* cross,
-                                   int64_t context_dim) {
+                                   int64_t context_dim,
+                                   const DitRuntimeLoraLayer* patchify_lora = nullptr,
+                                   const DitRuntimeLoraLayer* adaln_mod_lora = nullptr) {
   PreparedStreamDev out;
   const int64_t rows = m.batch * m.tokens;
 
   // transformer_args.py:268 — x = patchify_proj(latent).
   DBuf latent = UploadStream(c.d, c.s, m.latent, {rows, in_channels});
   out.x.emplace(c.d, c.s, std::vector<int64_t>{rows, width});
-  LinearDev(c, latent.t(), rows, in_channels, patchify, out.x->t());
+  LinearDev(c, latent.t(), rows, in_channels, patchify, out.x->t(), patchify_lora);
 
   // transformer_args.py:269 — `apply_keyframes_absolute_embedding`, in the same
   // place and with the same polarity the host forward uses. Not a second rule:
@@ -1064,7 +1132,8 @@ PreparedStreamDev PrepareStreamDev(Ctx& c, const Ltx2LinearWeight& patchify,
   }
 
   AdalnOutDev ada =
-      PrepareTimestepDev(c, adaln, m.timesteps, rows, width, c.p->timestep_scale_multiplier);
+      PrepareTimestepDev(c, adaln, m.timesteps, rows, width, c.p->timestep_scale_multiplier,
+                         adaln_mod_lora);
   out.modulation = std::move(ada.modulation);
   out.embedded = std::move(ada.embedded);
 
@@ -1142,7 +1211,8 @@ PreparedStreamDev PrepareStreamDev(Ctx& c, const Ltx2LinearWeight& patchify,
 // _process_output (model.py:472-490).
 std::vector<float> ProcessOutputDev(Ctx& c, const Tensor& table, const Ltx2LinearWeight& proj,
                                     const Tensor& x, const DBuf& embedded, int64_t rows,
-                                    int64_t width, int64_t out_channels) {
+                                    int64_t width, int64_t out_channels,
+                                    const DitRuntimeLoraLayer* proj_lora = nullptr) {
   CheckTableF32(table, "the output scale-shift table");
   DBuf normed(c.d, c.s, {rows, width});
   vt::LayerNormArgs args;
@@ -1154,7 +1224,7 @@ std::vector<float> ProcessOutputDev(Ctx& c, const Tensor& table, const Ltx2Linea
   c.k->output_modulate(c.d.q, normed.t().data, table.Ptr<float>(), embedded.t().data, rows, width,
                        c.s);
   DBuf out(c.d, c.s, {rows, out_channels});
-  LinearDev(c, normed.t(), rows, width, proj, out.t());
+  LinearDev(c, normed.t(), rows, width, proj, out.t(), proj_lora);
   return DownloadF32(c.d, out, rows * out_channels);
 }
 
@@ -1323,7 +1393,8 @@ Ltx2DitOutputs Ltx2DitForwardDevice(vt::Queue& queue, const Ltx2DitParams& param
                                     const Ltx2ModalityInput* video,
                                     const Ltx2ModalityInput* audio, vt::DType compute_dtype,
                                     Ltx2PromptKvCache* cache,
-                                    const Ltx2DitPerturbation* perturbations) {
+                                    const Ltx2DitPerturbation* perturbations,
+                                    const DitRuntimeLoraState* lora_state) {
   VT_CHECK(compute_dtype == vt::DType::kF32 || compute_dtype == vt::DType::kBF16,
            "ltx2: the device forward computes in bf16 (the production stream, which is what "
            "Ltx2StreamDitToDevice puts on the device) or f32 (the L2 parity arm)");
@@ -1369,7 +1440,12 @@ Ltx2DitOutputs Ltx2DitForwardDevice(vt::Queue& queue, const Ltx2DitParams& param
   vt::Backend& backend = vt::GetBackend(queue.device.type);
   Dev d{backend, queue};
   OnesCache ones(d);
-  Ctx c{d, compute_dtype, Glue(d), &params, &ones};
+  Ctx c{d, compute_dtype, Glue(d), &params, &ones, lora_state};
+
+  const bool has_lora = lora_state != nullptr && !lora_state->empty();
+  auto lora_find = [&](const std::string& target) -> const DitRuntimeLoraLayer* {
+    return has_lora ? lora_state->Find(target) : nullptr;
+  };
 
   // model.py:222-226 / :252-256 — the module exists only when BOTH flags hold.
   const bool prompt_adaln = params.cross_attention_adaln && params.use_prompt_adaln_single;
@@ -1381,7 +1457,8 @@ Ltx2DitOutputs Ltx2DitForwardDevice(vt::Queue& queue, const Ltx2DitParams& param
       *video, dim,
       params.in_channels, 3,
       params.positional_embedding_max_pos, params.num_attention_heads, audio,
-      params.cross_attention_dim);
+      params.cross_attention_dim,
+      lora_find("patchify_proj.weight"), lora_find("adaln_single.linear.weight"));
   PreparedStreamDev as = PrepareStreamDev(
       c, weights.audio_patchify_proj, weights.audio_adaln_single, weights.av_ca_audio_scale_shift,
       weights.av_ca_v2a_gate, prompt_adaln ? &weights.audio_prompt_adaln_single : nullptr,
@@ -1390,7 +1467,8 @@ Ltx2DitOutputs Ltx2DitForwardDevice(vt::Queue& queue, const Ltx2DitParams& param
       *audio,
       adim, params.audio_in_channels, 1,
       params.audio_positional_embedding_max_pos, params.audio_num_attention_heads, video,
-      params.audio_cross_attention_dim);
+      params.audio_cross_attention_dim,
+      lora_find("audio_patchify_proj.weight"), lora_find("audio_adaln_single.linear.weight"));
 
   for (int64_t i = 0; i < params.num_layers; ++i) {
     BlockArgsDev a;
@@ -1421,6 +1499,7 @@ Ltx2DitOutputs Ltx2DitForwardDevice(vt::Queue& queue, const Ltx2DitParams& param
     a.audio_pe = &as.pe;
     a.video_cross_pe = &vs.cross_pe;
     a.audio_cross_pe = &as.cross_pe;
+    a.block_index = i;
     // `_process_transformer_blocks` (model.py:442-458): the SELF types are per
     // block and the CROSS types ride whole. An EMPTY vector is "no block", which
     // is what `PerturbationConfig.empty()` reaches the forward as.
@@ -1438,10 +1517,10 @@ Ltx2DitOutputs Ltx2DitForwardDevice(vt::Queue& queue, const Ltx2DitParams& param
   Ltx2DitOutputs out;
   out.video = ProcessOutputDev(c, weights.scale_shift_table, weights.proj_out, vs.x->t(),
                                *vs.embedded, video->batch * video->tokens, dim,
-                               params.out_channels);
+                               params.out_channels, lora_find("proj_out.weight"));
   out.audio = ProcessOutputDev(c, weights.audio_scale_shift_table, weights.audio_proj_out,
                                as.x->t(), *as.embedded, audio->batch * audio->tokens, adim,
-                               params.audio_out_channels);
+                               params.audio_out_channels, lora_find("audio_proj_out.weight"));
   return out;
 }
 

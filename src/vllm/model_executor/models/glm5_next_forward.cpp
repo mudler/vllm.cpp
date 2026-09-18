@@ -281,8 +281,9 @@ std::vector<float> Glm5NextHostForward(const Glm5NextWeights& weights,
   //
   // When `VT_GLM5_NEXT_DEVICE=1` is set, the entire forward delegates to
   // `Glm5NextDeviceForward`, which routes the device-capable arms through `vt::*`
-  // ops and keeps MLA attention, mHC sites and the dense MLP as host-fallback
-  // islands (the kimi_linear_device.cpp single-queue pattern). The W9c-3a
+  // ops and keeps MLA attention and mHC sites as host-fallback islands (the
+  // kimi_linear_device.cpp single-queue pattern). The dense MLP is on device
+  // via `vt::MatmulBT` + `vt::ClampedSwiGLU` + `vt::MatmulBT`. The W9c-3a
   // per-arm experts split below is not reached.
   if (DeviceForwardOptedIn()) {
     return Glm5NextDeviceForward(weights, token_ids, logits_indices, queue,

@@ -334,9 +334,10 @@ TEST_CASE("keep-quant routing on TENSTORRENT admits exactly the registered decod
   // histogram: token_embd Q6_K, attn_qkv/ssm_out Q5_K, ssm_alpha/ssm_beta
   // Q8_0) and the arm widens to exactly those four IN THE SAME CHANGE — the
   // routing test still reds any widening PAST the registered set: kQ4_0 has
-  // no TT arm at all, and kQ2_K/kQ3_K stay owed. QUANT-GGUF-IQ-TENSTORRENT
+  // no TT arm at all, and kQ2_K stays owed. QUANT-GGUF-IQ-TENSTORRENT
   // wave 1 adds kIQ3_XXS (the int8-dot arm's enc_sel 4) in the same change as
-  // its kernel. Admitting an encoding
+  // its kernel; wave 2 adds kIQ2_XXS/kIQ2_S (enc_sel 5/6); wave 3 adds kQ3_K
+  // (enc_sel 7). Admitting an encoding
   // without its kernel throws at first forward with the model resident, the
   // exact failure this predicate exists to prevent.
   const std::vector<int64_t> shape = {4, 256};  // [out, in]: whole blocks
@@ -357,7 +358,11 @@ TEST_CASE("keep-quant routing on TENSTORRENT admits exactly the registered decod
   CHECK(route(kIQ2_S) == GgufResidency::kKeepQuant);
   CHECK(route(kQ4_0) == GgufResidency::kExpandBf16);  // no TT arm at all
   CHECK(route(kQ2_K) == GgufResidency::kExpandBf16);
-  CHECK(route(kQ3_K) == GgufResidency::kExpandBf16);
+  // QUANT-GGUF-IQ-TENSTORRENT wave 3: Q3_K (enc_sel 7, the min-term
+  // K-quant) joins the int8-dot set in the same change as its kernel
+  // kq_vec_dot_q3_k_q8_K — this check flipped FROM kExpandBf16 and redded
+  // before the predicate widened.
+  CHECK(route(kQ3_K) == GgufResidency::kKeepQuant);
   // The loader boolean flips only when the op is registered, so a host with a
   // P150 resolves keep-quant on by default; without the card the default arm
   // stays false and the load is unchanged.

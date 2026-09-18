@@ -244,14 +244,29 @@ std::vector<MiniMaxH3TensorSpec> EnumerateMiniMaxH3ShardedTensors(
   return out;
 }
 
-MiniMaxH3GgufDit LoadMiniMaxH3DitFromShards(const MiniMaxH3ShardedCheckpoint& ckpt) {
+MiniMaxH3GgufDit LoadMiniMaxH3DitFromShards(const MiniMaxH3ShardedCheckpoint& ckpt,
+                                          const MiniMaxH3DitLoadOptions& options) {
   MiniMaxH3GgufDit out;
   const std::vector<MiniMaxH3TensorSpec> manifest = EnumerateMiniMaxH3ShardedTensors(ckpt);
   out.params = ParseMiniMaxH3DitParamsFromGgufManifest(manifest);
+
+  std::vector<std::string> contract_names;
+  contract_names.reserve(manifest.size());
+  for (const MiniMaxH3TensorSpec& spec : manifest) contract_names.push_back(spec.name);
+  const std::vector<DitLoraAdapter> loras = DitOpenLoras(
+      options.loras, contract_names, {"model.diffusion_model.", "diffusion_model."});
+  int64_t fused = 0;
+
   for (const MiniMaxH3TensorSpec& spec : manifest) {
     out.storage[spec.name] = MiniMaxH3ReadSafetensorF32(ckpt.Get(spec.name));
     out.shapes[spec.name] = spec.shape;
+    if (DitFuseLorasIntoBuffer(loras, spec.name, spec.shape, vt::DType::kF32,
+        reinterpret_cast<uint8_t*>(out.storage[spec.name].data()),
+        out.storage[spec.name].size() * sizeof(float))) {
+      ++fused;
+    }
   }
+  DitCheckLorasWereApplied(loras, fused);
   BindMiniMaxH3DitViews(&out);
   return out;
 }

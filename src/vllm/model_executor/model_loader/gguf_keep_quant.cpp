@@ -181,7 +181,8 @@ bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
       // (the q4km artifact: token_embd Q6_K, attn_qkv/ssm_out Q5_K,
       // ssm_alpha/ssm_beta Q8_0) is what pulled Q5_K/Q6_K/Q8_0 from W4 into
       // W3 — kernels and predicate widened IN THE SAME CHANGE. kQ4_0 has no
-      // TT arm at all and kQ2_K/kQ3_K stay owed; admitting an encoding
+      // TT arm at all and kQ2_K stays owed (Q3_K joined in
+      // QUANT-GGUF-IQ-TENSTORRENT wave 3); admitting an encoding
       // without its kernel throws at first forward with the model resident,
       // the exact failure this predicate exists to prevent.
       // QUANT-GGUF-IQ-TENSTORRENT wave 1: kIQ3_XXS joins the set — its
@@ -200,10 +201,15 @@ bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
       // shadow (32 words = 66 B / 82 B zero-padded to 128 B), dispatched on
       // the DEFAULT path. The APEX I-Nano vehicle's 44 IQ2_XXS + 89 IQ2_S
       // tensors are the artifacts this admits.
+      // QUANT-GGUF-IQ-TENSTORRENT wave 3: kQ3_K (enc_sel 7) closes the
+      // census — kq_vec_dot_q3_k_q8_K (keepquant_kernel_code.h), 32 words
+      // = 110 B zero-padded to 128 B, dispatched on the DEFAULT path. The
+      // vehicle's 78 Q3_K tensors are the artifact this admits, and no
+      // named missing arm remains in the census.
       return dt == vt::DType::kQ4_K || dt == vt::DType::kQ5_K ||
              dt == vt::DType::kQ6_K || dt == vt::DType::kQ8_0 ||
              dt == vt::DType::kIQ3_XXS || dt == vt::DType::kIQ2_XXS ||
-             dt == vt::DType::kIQ2_S;
+             dt == vt::DType::kIQ2_S || dt == vt::DType::kQ3_K;
     default:
       // CUDA falls back to the CPU kernel for anything it lacks
       // (cuda_quant_dot.cu:1841-1846); the CPU list IS the CPU capability.

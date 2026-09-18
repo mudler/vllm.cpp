@@ -16,6 +16,7 @@
 //   vec_dot_iq3_xxs_q8_K   cpu_quant_dot.cpp:622 (quants.c:999)
 //   vec_dot_iq2_xxs_q8_K   cpu_quant_dot.cpp:577 (quants.c:855)
 //   vec_dot_iq2_s_q8_K     cpu_quant_dot.cpp:899 (quants.c:947)
+//   vec_dot_q3_K_q8_K      cpu_quant_dot.cpp:202 (quants.c:566)
 //
 // The accumulation ORDER inside every routine is the ported order, because
 // the whole point of the lever is bit-exactness against it: per block 8
@@ -602,4 +603,101 @@ static inline float kq_vec_dot_iq2_s_q8_K(const uint8_t* xblock,
   sumf = sumf + d * static_cast<float>(bsum);
   }
   return 0.125f * sumf;
+}
+
+// cpu_quant_dot.cpp:202 (quants.c:566 — ggml_vec_dot_q3_K_q8_K_generic).
+// Q3_K block: {u8 hmask[32]; u8 qs[64]; u8 scales[12]; f16 d} = 110B,
+// zero-padded to 128B in the staged words — hmask/qs/scales/d sit at their
+// true block offsets (0/32/96/108) inside the padded stride. Q3_K is NOT
+// the codebook family: a min-term K-quant — two bits per element pulled
+// from qs over four 32-lane passes per 128, minus 4 wherever the matching
+// hmask bit is CLEAR (`? 0 : 4` — the polarity trap), the 32 sub-block
+// scales spliced from the 12 scale bytes with the inline kmask1/kmask2
+// constants and consumed as (scales[j] - 32). No codebook, no divisions,
+// NO new tables — the only constants are the two inline masks. Statement-
+// for-statement with the CPU port, including the aux8[256] local, the
+// aux32/sums 8-lane split and the final ascending-lane fold.
+static inline float kq_vec_dot_q3_k_q8_K(const uint8_t* xblock,
+                                         uint32_t block_word_bytes,
+                                         const uint8_t* yrow, uint32_t nb) {
+  const uint32_t kmask1 = 0x03030303u;
+  const uint32_t kmask2 = 0x0f0f0f0fu;
+  int8_t aux8[256];
+  int16_t aux16[8];
+  float sums[8];
+  int32_t aux32[8];
+  for (uint32_t l = 0; l < 8; ++l) sums[l] = 0.0f;
+  uint32_t auxs[4];
+  const int8_t* scales = reinterpret_cast<const int8_t*>(auxs);
+  float sumf = 0.0f;
+  for (uint32_t i = 0; i < nb; ++i, xblock += block_word_bytes, yrow += 292) {
+    const uint8_t* q3 = xblock + 32;  // qs
+    const uint8_t* hm = xblock;       // hmask
+    const int8_t* q8 = reinterpret_cast<const int8_t*>(yrow + 4);
+    for (uint32_t l = 0; l < 8; ++l) aux32[l] = 0;
+    int8_t* a = aux8;
+    uint8_t m = 1;
+    for (uint32_t j = 0; j < 256; j += 128) {
+      for (uint32_t l = 0; l < 32; ++l)
+        a[l] = static_cast<int8_t>(q3[l] & 3);
+      for (uint32_t l = 0; l < 32; ++l)
+        a[l] = static_cast<int8_t>(a[l] - ((hm[l] & m) ? 0 : 4));
+      a += 32;
+      m = static_cast<uint8_t>(m << 1);
+      for (uint32_t l = 0; l < 32; ++l)
+        a[l] = static_cast<int8_t>((q3[l] >> 2) & 3);
+      for (uint32_t l = 0; l < 32; ++l)
+        a[l] = static_cast<int8_t>(a[l] - ((hm[l] & m) ? 0 : 4));
+      a += 32;
+      m = static_cast<uint8_t>(m << 1);
+      for (uint32_t l = 0; l < 32; ++l)
+        a[l] = static_cast<int8_t>((q3[l] >> 4) & 3);
+      for (uint32_t l = 0; l < 32; ++l)
+        a[l] = static_cast<int8_t>(a[l] - ((hm[l] & m) ? 0 : 4));
+      a += 32;
+      m = static_cast<uint8_t>(m << 1);
+      for (uint32_t l = 0; l < 32; ++l)
+        a[l] = static_cast<int8_t>((q3[l] >> 6) & 3);
+      for (uint32_t l = 0; l < 32; ++l)
+        a[l] = static_cast<int8_t>(a[l] - ((hm[l] & m) ? 0 : 4));
+      a += 32;
+      m = static_cast<uint8_t>(m << 1);
+      q3 += 32;
+    }
+    a = aux8;
+    // The 12-byte scale splice, statement-for-statement with
+    // cpu_quant_dot.cpp:261-266 (auxs[3] is never read before the splice
+    // writes it — the CPU memcpy leaves it uninitialized too).
+    auxs[0] = kq_load32(xblock + 96);
+    auxs[1] = kq_load32(xblock + 100);
+    auxs[2] = kq_load32(xblock + 104);
+    uint32_t tmp = auxs[2];
+    auxs[2] = ((auxs[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    auxs[3] = ((auxs[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    auxs[0] = (auxs[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    auxs[1] = (auxs[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    for (uint32_t j = 0; j < 16; ++j) {
+      for (uint32_t l = 0; l < 8; ++l)
+        aux16[l] = static_cast<int16_t>(q8[l] * a[l]);
+      for (uint32_t l = 0; l < 8; ++l)
+        aux32[l] += (scales[j] - 32) * aux16[l];
+      q8 += 8;
+      a += 8;
+      for (uint32_t l = 0; l < 8; ++l)
+        aux16[l] = static_cast<int16_t>(q8[l] * a[l]);
+      for (uint32_t l = 0; l < 8; ++l)
+        aux32[l] += (scales[j] - 32) * aux16[l];
+      q8 += 8;
+      a += 8;
+    }
+    const float yd = __builtin_bit_cast(float, kq_load32(yrow));
+    const float d = kq_f16_bits_to_f32(kq_load16(xblock + 108)) * yd;
+    for (uint32_t l = 0; l < 8; ++l) {
+      const float prod = d * static_cast<float>(aux32[l]);
+      sums[l] = sums[l] + prod;
+    }
+  }
+  float s = sumf;
+  for (uint32_t l = 0; l < 8; ++l) s = s + sums[l];
+  return s;
 }

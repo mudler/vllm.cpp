@@ -38,6 +38,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -276,6 +277,56 @@ class RocmBackend final : public Backend {
     return ResidualNormPolicy::kCompiledExpression;
   }
 
+  // T13 (GFX1100-TG200): REAL event primitives. The base-class defaults are
+  // NO-OPS (only CudaBackend overrode them), which made the async sampled-id
+  // delivery read its pinned host buffer BEFORE the D2H copy completed —
+  // batch-1 greedy decode degenerated to token-0 garbage (the R9700
+  // incident's root cause, now fixed at the source). Bodies mirror
+  // CudaBackend one-to-one via hipEvent*.
+  Event CreateEvent(bool blocking = false) override {
+    hipEvent_t ev = nullptr;
+    const unsigned flags =
+        hipEventDisableTiming | (blocking ? hipEventBlockingSync : 0u);
+    Check(hipEventCreateWithFlags(&ev, flags), "hipEventCreateWithFlags");
+    return Event{Device{DeviceType::kROCM, device_}, reinterpret_cast<void*>(ev)};
+  }
+  void DestroyEvent(Event& e) override {
+    if (e.handle == nullptr) return;
+    Check(hipEventDestroy(reinterpret_cast<hipEvent_t>(e.handle)),
+          "hipEventDestroy");
+    e.handle = nullptr;
+  }
+  void RecordEvent(Event& e, Queue& q) override {
+    Check(hipEventRecord(reinterpret_cast<hipEvent_t>(e.handle), AsStream(q)),
+          "hipEventRecord");
+  }
+  void SynchronizeEvent(Event& e) override {
+    Check(hipEventSynchronize(reinterpret_cast<hipEvent_t>(e.handle)),
+          "hipEventSynchronize");
+  }
+  bool QueryEvent(Event& e) override {
+    const hipError_t status = hipEventQuery(reinterpret_cast<hipEvent_t>(e.handle));
+    if (status == hipErrorNotReady) {
+      (void)hipGetLastError();
+      return false;
+    }
+    Check(status, "hipEventQuery");
+    return true;
+  }
+  void QueueWaitEvent(Queue& q, Event& e) override {
+    Check(hipStreamWaitEvent(AsStream(q),
+                             reinterpret_cast<hipEvent_t>(e.handle), 0),
+          "hipStreamWaitEvent");
+  }
+
+  // T13 (GFX1100-TG200): TRUE. Attempt 1 flipped this while the event
+  // primitives above were still base-class NO-OPS — the async output read
+  // its pinned buffer before the D2H landed (token-0 loops, ~2.5x slowdown
+  // from host spinning). The primitives are now real (this file), so the
+  // delivery contract pinned-slot -> copy queue -> ready event -> host read
+  // holds end to end, matching CudaBackend call for call.
+  bool SupportsAsyncSampledTokenReadback() const override { return true; }
+
   // Both branches satisfy the >= 64B contract Backend::Alloc owes StepArena:
   // hipMalloc aligns to at least 256 bytes as cudaMalloc does, and managed
   // allocations are at least page-granular.
@@ -407,6 +458,8 @@ class RocmBackend final : public Backend {
   // an illegal op during capture a loud failure on THIS thread rather than a
   // process-wide mode change.
   bool SupportsGraphCapture() const override { return true; }
+  int64_t GraphsCaptured() const override { return graphs_captured_.load(std::memory_order_relaxed); }
+  int64_t GraphReplays() const override { return graph_replays_.load(std::memory_order_relaxed); }
   void BeginCapture(Queue& q) override {
     ResetF16ScratchCapture(q);
     Check(hipStreamBeginCapture(AsStream(q), hipStreamCaptureModeThreadLocal),
@@ -437,6 +490,7 @@ class RocmBackend final : public Backend {
     CaptureScratch cleanup{q};
     hipGraph_t graph = nullptr;
     Check(hipStreamEndCapture(AsStream(q), &graph), "hipStreamEndCapture");
+    graphs_captured_.fetch_add(1, std::memory_order_relaxed);
     // ENG-CUDAGRAPH-DEDUP (#1162), the same wiring as the CUDA leg against the same
     // shared registry and the same shared ops table: with VT_CUDA_GRAPH_DEDUP set, the
     // RAW graph is retained and keyed by topology so compatible captures share one
@@ -460,6 +514,7 @@ class RocmBackend final : public Backend {
   // cudaProfilerStart/Stop around a chosen replay. A rocprofiler equivalent is
   // later work and deliberately out of W1's scope (spec §2).
   void ReplayGraph(Queue& q, void* graph) override {
+    graph_replays_.fetch_add(1, std::memory_order_relaxed);
     if (dedup_ != nullptr && dedup_->Owns(graph)) {
       dedup_->Replay(graph, reinterpret_cast<void*>(AsStream(q)));
       return;
@@ -694,6 +749,10 @@ class RocmBackend final : public Backend {
   // ENG-CUDAGRAPH-DEDUP (#1162): built on the first capture, and only when
   // VT_CUDA_GRAPH_DEDUP asked for it, so an unset environment allocates nothing.
   std::unique_ptr<vt::GraphDedupRegistry> dedup_;
+  // T2b instrumentation: completed captures and launched replays (see
+  // Backend::GraphsCaptured).
+  std::atomic<int64_t> graphs_captured_{0};
+  std::atomic<int64_t> graph_replays_{0};
   // 0 = not tried, 1 = ready, 2 = unavailable (tried once and failed).
   int h2d_state_ = 0;
   // Serialises the SHARED ring, not the copy: two threads staging at once would

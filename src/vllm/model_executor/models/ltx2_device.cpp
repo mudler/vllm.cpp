@@ -186,6 +186,17 @@ struct Ctx {
   const DitRuntimeLoraState* lora = nullptr;
 };
 
+// Cast between dtypes on the device (f32<->bf16); same-dtype is a copy.
+void CastTo(Dev d, Tensor& out, const Tensor& in) {
+  if (out.dtype == in.dtype) {
+    vt::GetBackend(d.q.device.type).Copy(d.q, out.data, in.data, in.Bytes());
+  } else if (out.dtype == DType::kBF16) {
+    vt::CastBf16(d.q, out, in);
+  } else {
+    vt::CastF32(d.q, out, in);
+  }
+}
+
 // vt::MatmulBT + optional rank-1 bias — the device twin of ltx2.cpp's `Linear`.
 // `weight` is [out_features, in_features], torch's own nn.Linear layout, so
 // y = x @ W^T + b reads straight off the module.
@@ -207,10 +218,16 @@ void LinearDev(Ctx& c, const Tensor& in, int64_t rows, int64_t in_features,
   if (lora != nullptr) {
     const int64_t rank = lora->lora_a.shape[0];
     const int64_t out_features = w.weight.shape[0];
-    DBuf tmp(c.d, c.s, {rows, rank});
-    vt::MatmulBT(c.d.q, tmp.t(), a, lora->lora_a);
+    // LoRA factors are f32; compute the delta in f32 and cast back, so
+    // MatmulBT always sees (f32,f32)->f32 regardless of the stream dtype.
+    DBuf a_f32(c.d, DType::kF32, {rows, in_features});
+    CastTo(c.d, a_f32.t(), a);
+    DBuf tmp(c.d, DType::kF32, {rows, rank});
+    vt::MatmulBT(c.d.q, tmp.t(), a_f32.t(), lora->lora_a);
+    DBuf delta_f32(c.d, DType::kF32, {rows, out_features});
+    vt::MatmulBT(c.d.q, delta_f32.t(), tmp.t(), lora->lora_b);
     DBuf delta(c.d, c.s, {rows, out_features});
-    vt::MatmulBT(c.d.q, delta.t(), tmp.t(), lora->lora_b);
+    CastTo(c.d, delta.t(), delta_f32.t());
     vt::Add(c.d.q, o, o, delta.t());
   }
 }

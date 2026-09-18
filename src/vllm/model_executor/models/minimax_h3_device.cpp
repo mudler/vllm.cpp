@@ -184,10 +184,16 @@ void LinearDev(Dev d, const Tensor& in, int64_t rows, int64_t in_features, const
   if (lora != nullptr) {
     const int64_t rank = lora->lora_a.shape[0];
     const int64_t out_features = weight.shape[0];
-    DBuf tmp(d, o.dtype, {rows, rank});
-    vt::MatmulBT(d.q, tmp.t(), a, lora->lora_a);
+    // LoRA factors are f32; compute the delta in f32 and cast back, so
+    // MatmulBT always sees (f32,f32)->f32 regardless of the stream dtype.
+    DBuf a_f32(d, DType::kF32, {rows, in_features});
+    CastTo(d, a_f32.t(), a);
+    DBuf tmp(d, DType::kF32, {rows, rank});
+    vt::MatmulBT(d.q, tmp.t(), a_f32.t(), lora->lora_a);
+    DBuf delta_f32(d, DType::kF32, {rows, out_features});
+    vt::MatmulBT(d.q, delta_f32.t(), tmp.t(), lora->lora_b);
     DBuf delta(d, o.dtype, {rows, out_features});
-    vt::MatmulBT(d.q, delta.t(), tmp.t(), lora->lora_b);
+    CastTo(d, delta.t(), delta_f32.t());
     vt::Add(d.q, o, o, delta.t());
   }
 }

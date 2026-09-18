@@ -47,17 +47,10 @@ matches the record, the agent reconciles that state instead of duplicating it.
 ## Landing a pull request
 
 Squash-merge it: `gh pr merge --squash`. The merge method is not cosmetic,
-because two gates read the commits a push actually lands on `main`, and both
-fail *after* the merge, on `main`, not on your PR.
+because one gate reads the commits a push actually lands on `main`, and fails
+*after* the merge, on `main`, not on your PR.
 
-`scripts/check-role-discipline.py` inspects every commit in the pushed range and
-requires each to name either its `row/<ROW-ID>` branch or its PR as `(#N)`
-(`POL-PR-REQUIRED`). A squash-merge writes `(#N)` into the subject for free. A
-`--merge` landing does not: the content commit keeps the subject it had on the
-branch, which names neither, so the gate reports `reached main without a
-reviewed row/* PR` even though a reviewed row PR is exactly where it came from.
-
-`scripts/check-commit-trailers.py` reads the same range, so the landed message
+`scripts/check-commit-trailers.py` reads the landed range, so the landed message
 must itself carry the `FOLLOWING_AGENTS_PROTOCOL` paragraph and the trailers
 (`POL-COMMIT-TRAILERS`, `POL-AI-ATTRIBUTION`). Squash bodies are built from the
 branch's commit messages, so a correctly trailered commit carries them through;
@@ -65,7 +58,7 @@ confirm the composed message in the merge dialog before confirming. A `--merge`
 landing fails this too, because GitHub's generated `Merge pull request #N
 from ...` message has no marker and no trailers.
 
-Neither failure is repairable afterwards. Both gates are scoped over
+This failure is not repairable afterwards. The gate is scoped over
 `github.event.before..github.sha`, and each run's `before` is the previous run's
 `sha`, so no later run re-covers a range that already went red. The remedies are
 rewriting published history or an explicit waiver; getting the merge method

@@ -59,6 +59,7 @@ target_compile_definitions(test_version PRIVATE
 vllm_cpp_add_test(test_sampling_params vllm/test_sampling_params.cpp)
 vllm_cpp_add_test(test_punica_cpu vllm/lora/test_punica_cpu.cpp)
 vllm_cpp_add_test(test_lora_layers vllm/lora/test_lora_layers.cpp)
+vllm_cpp_add_test(test_lora_mapping vllm/lora/test_lora_mapping.cpp)
 vllm_cpp_add_test(test_plugin_system
   vllm/plugins/test_plugin_system.cpp
   vllm/plugins/toy_model_plugin.cpp)
@@ -186,6 +187,11 @@ vllm_cpp_add_test(test_minimax_h3 vllm/models/test_minimax_h3.cpp)
 # VT-CONV1D-MODEL-BLOCK (#1684): the time-block case reads `Conv1dTimeBlock` so
 # it asserts the geometry it claims. Same reach as test_vocoder1d.
 target_include_directories(test_minimax_h3 PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# ROAD-V1-DIT-LORA: H3-specific contract name rewriting (model.diffusion_model.
+# prefix) and load-time fusion through the shared dit_lora seam.
+vllm_cpp_add_test(test_h3_lora vllm/models/test_h3_lora.cpp)
+# ROAD-V1-LORA-RUNTIME: prompt tag parsing and name resolution for runtime LoRA.
+vllm_cpp_add_test(test_dit_runtime_lora vllm/models/test_dit_runtime_lora.cpp)
 # MiniMax-Music3 W1 (#672): the six-component diffusers-arm loader, gated against
 # the REAL checkpoint's headers (minimax_music3_manifest.inc, 1012 tensors, no
 # weight bytes) so CI never needs the 28.5 GB asset.
@@ -927,6 +933,13 @@ target_include_directories(test_deepseek_v4_mtp PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # kernels match the references. NOT a real-checkpoint token gate (W8, multi-Spark).
 vllm_cpp_add_test(test_cuda_deepseek_v4 vllm/models/test_cuda_deepseek_v4.cpp)
 target_include_directories(test_cuda_deepseek_v4 PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# O34: the ROCm/HIP arm of the DeepSeek-V4 MHC device-kernel family. A 1:1 mirror
+# of the CUDA MHC cases above, run against the ROCm provider registered in
+# rocm_deepseek_v4.hip. The device cases SKIP on a build without a ROCm backend
+# (exit 77 — "assertions: 0 ... SUCCESS!" is not a pass, tests/CMakeLists.txt:30-38).
+vllm_cpp_add_test(test_rocm_deepseek_v4_mhc vt/test_rocm_deepseek_v4_mhc.cpp)
+target_include_directories(test_rocm_deepseek_v4_mhc PRIVATE ${CMAKE_SOURCE_DIR}/src)
+set_tests_properties(test_rocm_deepseek_v4_mhc PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 # KIMI-K3 W2/W5 SCAFFOLDING (KimiK3ForConditionalGeneration) — the DERIVE-AND-SHIP
 # structural gate: registry-resolve + nested-config descent + text-backbone
 # enumeration + REFUSE-by-name forward + MXFP4-refuse loader. No checkpoint / GPU;
@@ -2864,6 +2877,14 @@ else()
     vllm::vllm vllm_test_main)
 endif()
 vllm_cpp_set_warnings(test_ops_paged_attn_sharedk_wmma_p1_gpu)
+# GFX1100-TG200-T2b: ROCm decode-graph capture through ModelRegistry::Forward.
+# Self-skips without a ROCm device (vt::rocm::DeviceAvailable()) and on non-
+# gfx1100 arches (per-arch opt-in keeps the path eager). On gfx1100 it enters
+# the production forward and exercises the captured decode-graph path.
+vllm_cpp_add_test(test_rocm_decode_graph_forward
+  vllm/models/test_rocm_decode_graph_forward.cpp)
+target_include_directories(test_rocm_decode_graph_forward PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
 endif()
 if(VLLM_CPP_METAL)
   vllm_cpp_add_test(test_metal_backend vt/test_metal_backend.cpp)
@@ -3058,6 +3079,8 @@ vllm_cpp_add_test(test_cuda_embedding_quant vt/test_cuda_embedding_quant.cpp)
 target_include_directories(test_cuda_embedding_quant PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # BACKEND-ROCM-QUANT-GATHER: the production gate starts at the public loader.
 vllm_cpp_add_test(test_capi_rocm_embedding_quant capi/test_rocm_embedding_quant.cpp)
+# Quantized WMMA reaches both formats through the public completion API.
+vllm_cpp_add_test(test_capi_rocm_quant_wmma capi/test_rocm_quant_wmma.cpp)
 vllm_cpp_add_test(test_rocm_embedding_quant vt/test_rocm_embedding_quant.cpp)
 target_include_directories(test_rocm_embedding_quant PRIVATE ${CMAKE_SOURCE_DIR}/src)
 if(VLLM_CPP_HIP)
@@ -3069,6 +3092,8 @@ endif()
 add_executable(rocm_quant_gather_capture ../tools/rocm_quant_gather/capture.cpp)
 target_link_libraries(rocm_quant_gather_capture PRIVATE vllm)
 target_include_directories(rocm_quant_gather_capture PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
+add_executable(rocm_quant_wmma_capture ../tools/rocm_quant_wmma/capture.cpp)
+target_link_libraries(rocm_quant_wmma_capture PRIVATE vllm)
 # CPU-ELEM-GEMM: the specialized + SIMD elementwise (bf16/f16/f32) GEMM. The
 # gate is BYTE-IDENTITY against an independent scalar reference across every
 # dtype combination, both weight orientations, ragged K/N, row-strided

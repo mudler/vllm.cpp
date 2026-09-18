@@ -416,6 +416,8 @@ const char* OpNameImpl(OpId op) {
       return "MoeSiluMul";
     case OpId::kMoeRelu2:
       return "MoeRelu2";
+    case OpId::kClampedSwiGLU:
+      return "ClampedSwiGLU";
     case OpId::kCastBf16:
       return "CastBf16";
     case OpId::kCastF16:

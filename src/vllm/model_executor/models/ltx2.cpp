@@ -61,7 +61,8 @@ const float* AsF32(const Tensor& t, std::vector<float>& scratch) {
 }
 
 void Linear(vt::Queue& q, const float* in, int64_t rows, int64_t in_features,
-            const Ltx2LinearWeight& w, float* out, DType compute_dtype = DType::kF32) {
+            const Ltx2LinearWeight& w, float* out, DType compute_dtype = DType::kF32,
+            const DitRuntimeLoraLayer* lora = nullptr) {
   VT_CHECK(w.weight.rank == 2 && w.weight.shape[1] == in_features,
            "ltx2 linear: weight shape does not match input width");
   // A24 wave 2 (#2720) NARROWS this refusal; it does not remove it. bf16 is
@@ -88,6 +89,9 @@ void Linear(vt::Queue& q, const float* in, int64_t rows, int64_t in_features,
       float* dst = out + r * out_features;
       for (int64_t i = 0; i < out_features; ++i) dst[i] += b[i];
     }
+  }
+  if (lora != nullptr) {
+    DitApplyRuntimeLoraDelta(q, a, out, rows, out_features, lora);
   }
   NarrowTo(compute_dtype, out, static_cast<size_t>(rows * out_features));
 }
@@ -859,7 +863,8 @@ std::vector<float> Ltx2PrepareSelfAttentionMask(const float* mask, int64_t count
 // ---------------------------------------------------------------------------
 
 Ltx2AdalnOut Ltx2AdaLayerNormSingle(vt::Device device, const Ltx2AdaLayerNormSingleWeights& w,
-                                    const float* timesteps, int64_t count, int64_t dim) {
+                                    const float* timesteps, int64_t count, int64_t dim,
+                                    const DitRuntimeLoraLayer* mod_lora) {
   vt::Queue q{device, nullptr};
   // get_timestep_embedding (timestep_embedding.py:6-54) with num_channels=256,
   // flip_sin_to_cos=True, downscale_freq_shift=0, scale=1, max_period=10000
@@ -889,16 +894,17 @@ Ltx2AdalnOut Ltx2AdaLayerNormSingle(vt::Device device, const Ltx2AdaLayerNormSin
   for (size_t i = 0; i < activated.size(); ++i) activated[i] = Silu(out.embedded[i]);
   const int64_t coefficient_dim = w.linear.weight.shape[0];
   out.modulation.resize(static_cast<size_t>(count * coefficient_dim));
-  Linear(q, activated.data(), count, dim, w.linear, out.modulation.data());
+  Linear(q, activated.data(), count, dim, w.linear, out.modulation.data(), DType::kF32, mod_lora);
   return out;
 }
 
 std::vector<float> Ltx2FeedForward(vt::Device device, const Ltx2FeedForwardWeights& w,
                                    const float* x, int64_t rows, int64_t dim, int64_t inner,
-                                   DType compute_dtype) {
+                                   DType compute_dtype, const DitRuntimeLoraLayer* in_lora,
+                                   const DitRuntimeLoraLayer* out_lora) {
   vt::Queue q{device, nullptr};
   std::vector<float> hidden(static_cast<size_t>(rows * inner));
-  Linear(q, x, rows, dim, w.proj_in, hidden.data(), compute_dtype);
+  Linear(q, x, rows, dim, w.proj_in, hidden.data(), compute_dtype, in_lora);
   // `F.gelu(self.proj(x), approximate="tanh")` (gelu_approx.py:10) on a bf16
   // input is the f32 tanh formula applied to the bf16 Linear output and rounded
   // ONCE — measured bit-exact on 6144 of 6144 values. The tanh itself is
@@ -906,7 +912,7 @@ std::vector<float> Ltx2FeedForward(vt::Device device, const Ltx2FeedForwardWeigh
   for (float& v : hidden) v = GeluTanh(v);
   NarrowTo(compute_dtype, hidden.data(), hidden.size());
   std::vector<float> out(static_cast<size_t>(rows * dim));
-  Linear(q, hidden.data(), rows, inner, w.proj_out, out.data(), compute_dtype);
+  Linear(q, hidden.data(), rows, inner, w.proj_out, out.data(), compute_dtype, out_lora);
   return out;
 }
 
@@ -918,7 +924,9 @@ std::vector<float> Ltx2FeedForward(vt::Device device, const Ltx2FeedForwardWeigh
 static std::vector<float> Ltx2AttentionEpilogue(vt::Queue& q, const Ltx2AttentionWeights& w,
                                                 const float* x, std::vector<float> attn,
                                                 const Ltx2AttentionArgs& args,
-                                                vt::Device /*device*/) {
+                                                vt::Device /*device*/,
+                                                const DitRuntimeLoraLayer* gate_lora,
+                                                const DitRuntimeLoraLayer* out_lora) {
   const int64_t batch = args.batch;
   const int64_t tq = args.tokens;
   const int64_t heads = args.heads;
@@ -931,7 +939,7 @@ static std::vector<float> Ltx2AttentionEpilogue(vt::Queue& q, const Ltx2Attentio
   if (w.to_gate_logits.weight.data != nullptr) {
     std::vector<float> logits(static_cast<size_t>(batch * tq * heads));
     Linear(q, x, batch * tq, args.query_dim, w.to_gate_logits, logits.data(),
-           args.compute_dtype);
+           args.compute_dtype, gate_lora);
     const bool bf16 = args.compute_dtype == DType::kBF16;
     for (int64_t r = 0; r < batch * tq; ++r) {
       for (int64_t h = 0; h < heads; ++h) {
@@ -953,12 +961,18 @@ static std::vector<float> Ltx2AttentionEpilogue(vt::Queue& q, const Ltx2Attentio
   }
 
   std::vector<float> out(static_cast<size_t>(batch * tq * args.query_dim));
-  Linear(q, attn.data(), batch * tq, inner, w.to_out, out.data(), args.compute_dtype);
+  Linear(q, attn.data(), batch * tq, inner, w.to_out, out.data(), args.compute_dtype,
+         out_lora);
   return out;
 }
 
 std::vector<float> Ltx2Attention(vt::Device device, const Ltx2AttentionWeights& w, const float* x,
-                                 const float* context, const Ltx2AttentionArgs& args) {
+                                 const float* context, const Ltx2AttentionArgs& args,
+                                 const DitRuntimeLoraLayer* q_lora,
+                                 const DitRuntimeLoraLayer* k_lora,
+                                 const DitRuntimeLoraLayer* v_lora,
+                                 const DitRuntimeLoraLayer* gate_lora,
+                                 const DitRuntimeLoraLayer* out_lora) {
   vt::Queue q{device, nullptr};
   const int64_t batch = args.batch;
   const int64_t tq = args.tokens;
@@ -988,8 +1002,8 @@ std::vector<float> Ltx2Attention(vt::Device device, const Ltx2AttentionWeights& 
              "ltx2 attention: a perturbed pass computes no K, so it can neither fill nor read a "
              "prompt K/V cache");
     std::vector<float> vp(static_cast<size_t>(batch * tq * inner));
-    Linear(q, ctx, batch * s, ctx_dim, w.to_v, vp.data(), args.compute_dtype);
-    return Ltx2AttentionEpilogue(q, w, x, std::move(vp), args, device);
+    Linear(q, ctx, batch * s, ctx_dim, w.to_v, vp.data(), args.compute_dtype, v_lora);
+    return Ltx2AttentionEpilogue(q, w, x, std::move(vp), args, device, gate_lora, out_lora);
   }
 
   // attention.py:559-565: v first, then q and k. The K/V half is exactly what the
@@ -1005,10 +1019,10 @@ std::vector<float> Ltx2Attention(vt::Device device, const Ltx2AttentionWeights& 
     kn = args.kv_in->k;
   } else {
     v.resize(static_cast<size_t>(batch * s * inner));
-    Linear(q, ctx, batch * s, ctx_dim, w.to_v, v.data(), args.compute_dtype);
+    Linear(q, ctx, batch * s, ctx_dim, w.to_v, v.data(), args.compute_dtype, v_lora);
   }
   std::vector<float> qb(static_cast<size_t>(batch * tq * inner));
-  Linear(q, x, batch * tq, args.query_dim, w.to_q, qb.data(), args.compute_dtype);
+  Linear(q, x, batch * tq, args.query_dim, w.to_q, qb.data(), args.compute_dtype, q_lora);
 
   // PytorchPreAttention (ops.py:22-37): the q/k RMSNorm runs over the FULL inner
   // width, before the head split, and RoPE follows it.
@@ -1020,7 +1034,7 @@ std::vector<float> Ltx2Attention(vt::Device device, const Ltx2AttentionWeights& 
                   args.norm_eps, args.compute_dtype);
   if (!reuse_kv) {
     std::vector<float> kb(static_cast<size_t>(batch * s * inner));
-    Linear(q, ctx, batch * s, ctx_dim, w.to_k, kb.data(), args.compute_dtype);
+    Linear(q, ctx, batch * s, ctx_dim, w.to_k, kb.data(), args.compute_dtype, k_lora);
     kn.resize(kb.size());
     Ltx2RmsNormRows(kb.data(), AsF32(w.k_norm, knorm_scratch), kn.data(), batch * s, inner,
                     args.norm_eps, args.compute_dtype);
@@ -1091,7 +1105,7 @@ std::vector<float> Ltx2Attention(vt::Device device, const Ltx2AttentionWeights& 
   // that do round them were measured and differ on 140, 180 and 195 of 384.
   NarrowTo(args.compute_dtype, attn.data(), attn.size());
 
-  return Ltx2AttentionEpilogue(q, w, x, std::move(attn), args, device);
+  return Ltx2AttentionEpilogue(q, w, x, std::move(attn), args, device, gate_lora, out_lora);
 }
 
 }  // namespace vllm

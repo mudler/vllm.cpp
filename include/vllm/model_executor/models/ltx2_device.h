@@ -61,6 +61,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/models/dit_lora.h"  // DitRuntimeLoraState (runtime LoRA)
 #include "vllm/model_executor/models/ltx2.h"
 #include "vllm/model_executor/models/ltx2_kernels.h"
 #include "vt/backend.h"
@@ -151,6 +152,7 @@ Ltx2DitOutputs Ltx2DitForwardDevice(vt::Queue& queue, const Ltx2DitParams& param
                                     const Ltx2ModalityInput* video,
                                     const Ltx2ModalityInput* audio, vt::DType compute_dtype,
                                     Ltx2PromptKvCache* cache = nullptr,
-                                    const Ltx2DitPerturbation* perturbations = nullptr);
+                                    const Ltx2DitPerturbation* perturbations = nullptr,
+                                    const DitRuntimeLoraState* lora_state = nullptr);
 
 }  // namespace vllm

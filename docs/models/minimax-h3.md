@@ -416,4 +416,40 @@ feeds straight back in as `--ref-video` and clips chain. Convert anything else w
 Worked reference renders, all on the **Ref2VA** checkpoint (`--partition ref2va`); the flags
 below replace `--ref-image` in the command above:
 
+## LoRA adapters
+
+Two mechanisms, and they are separate:
+
+**Load-time fusion** bakes one or more adapters into the base weights when the
+engine loads. Pass `--lora path.safetensors` (repeatable, with an optional
+strength). The fusion is permanent: every request from that engine carries the
+adapter, and you cannot swap it without reloading.
+
+**Runtime activation** leaves the base weights untouched and applies the LoRA
+delta per request, so two requests on the same engine can use different adapters
+(or none). Pass `--lora-dir /path/to/loras/` so the engine knows where to find
+adapter files, then tag the prompt:
+
 ```sh
+build/examples/minimax-h3-gen \
+  --dit MiniMax-H3-FL2VA-Q4_K_M.gguf --partition fl2va \
+  --encoder qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf --tokenizer tokenizer.json \
+  --prompt "a cat playing piano <lora:my_style:1.0>" \
+  --lora-dir /path/to/loras \
+  --video-vae video_vae.safetensors --video-vae-config video_vae_config.json \
+  --audio-vae audio_vae.safetensors --audio-vae-config audio_vae_config.json \
+  --frames 8 --height 256 --width 256 --steps 4 \
+  --device cuda --workdir /tmp/h3
+```
+
+The engine resolves `my_style` to `/path/to/loras/my_style.safetensors`, loads
+the A and B factors, and strips the tag from the prompt before conditioning.
+Multiple tags stack: `<lora:style_a:0.8> <lora:style_b:0.5>`. An omitted
+strength defaults to 1.0. The adapter applies an additive delta
+`(x @ A^T) @ B^T * strength` to each targeted linear projection at forward
+time, never touching the resident weights.
+
+Through the C ABI and the OpenAI server, pass `lora_dir` as a model-level extra
+(`--video-extra lora_dir=/path/to/loras`) and include the `<lora:name:strength>`
+tag in the prompt text. The `lora_dir` extra is read once at load; the prompt
+tags are parsed per request.

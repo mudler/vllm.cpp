@@ -33,6 +33,7 @@
 #include "vt/dtype.h"
 #include "vt/backend.h"
 #include "vt/ops.h"
+#include "vllm/model_executor/models/dit_lora.h"
 
 namespace vllm {
 namespace {
@@ -93,7 +94,8 @@ struct StreamDtype {
 // vt::MatmulBT + optional bias. Weight is [out_features, in_features], matching
 // every {Column,Row,QKV,MergedColumn}ParallelLinear at TP=1.
 void Linear(vt::Queue& q, const float* in, int64_t rows, int64_t in_features,
-            const Tensor& weight, const Tensor* bias, float* out) {
+            const Tensor& weight, const Tensor* bias, float* out,
+            const DitRuntimeLoraLayer* lora = nullptr) {
   const int64_t out_features = weight.shape[0];
   VT_CHECK(weight.rank == 2 && weight.shape[1] == in_features,
            "minimax_h3 linear: weight shape does not match input width");
@@ -108,6 +110,9 @@ void Linear(vt::Queue& q, const float* in, int64_t rows, int64_t in_features,
       float* dst = out + r * out_features;
       for (int64_t i = 0; i < out_features; ++i) dst[i] += b[i];
     }
+  }
+  if (lora != nullptr) {
+    DitApplyRuntimeLoraDelta(q, a, out, rows, out_features, lora);
   }
 }
 
@@ -185,7 +190,8 @@ void ModulateGate(float* residual, int64_t rows, int64_t width, const float* gat
 // (comfy/ldm/minimax/model.py:197, with apply_silu = not use_adaln_curves at :421).
 std::vector<float> AdalnProject(vt::Queue& q, const float* t_emb, int64_t m, int64_t time_embed_dim,
                                 const Tensor& weight, const Tensor& bias, const StreamDtype& dt,
-                                bool apply_silu) {
+                                bool apply_silu,
+                                const DitRuntimeLoraLayer* lora = nullptr) {
   std::vector<float> activated(static_cast<size_t>(m * time_embed_dim));
   for (int64_t i = 0; i < m * time_embed_dim; ++i) {
     activated[static_cast<size_t>(i)] = apply_silu ? Silu(t_emb[i]) : t_emb[i];
@@ -194,7 +200,7 @@ std::vector<float> AdalnProject(vt::Queue& q, const float* t_emb, int64_t m, int
   // silu(t_emb) is fp32, then cast to the BF16 linear's dtype before the GEMM.
   dt.Apply(activated);
   std::vector<float> out(static_cast<size_t>(m * out_features));
-  Linear(q, activated.data(), m, time_embed_dim, weight, &bias, out.data());
+  Linear(q, activated.data(), m, time_embed_dim, weight, &bias, out.data(), lora);
   dt.Apply(out);
   return out;
 }
@@ -225,14 +231,16 @@ struct AttentionBlockWeights {
 void AttentionForward(vt::Queue& q, const MiniMaxH3DitParams& params,
                       const AttentionBlockWeights& w, const float* in, int64_t rows,
                       const float* rope_freqs, const int32_t* cu_seqlens, int num_reqs,
-                      const StreamDtype& dt, float* out) {
+                      const StreamDtype& dt, float* out,
+                      const DitRuntimeLoraLayer* qkv_lora = nullptr,
+                      const DitRuntimeLoraLayer* out_lora = nullptr) {
   const int64_t heads = params.num_attention_heads;
   const int64_t head_dim = params.attention_head_dim;
   const int64_t inner = heads * head_dim;
   const int64_t hidden = params.hidden_size;
 
   std::vector<float> qkv(static_cast<size_t>(rows * 3 * inner));
-  Linear(q, in, rows, hidden, *w.qkv, nullptr, qkv.data());
+  Linear(q, in, rows, hidden, *w.qkv, nullptr, qkv.data(), qkv_lora);
   dt.Apply(qkv);
 
   std::vector<float> qbuf(static_cast<size_t>(rows * inner));
@@ -278,17 +286,18 @@ void AttentionForward(vt::Queue& q, const MiniMaxH3DitParams& params,
   vt::DFlashBlockAttention(q, ta, tq, tk, tv, args);
   dt.Apply(attn);
 
-  Linear(q, attn.data(), rows, inner, *w.out_proj, nullptr, out);
+  Linear(q, attn.data(), rows, inner, *w.out_proj, nullptr, out, out_lora);
   dt.Apply(out, rows * hidden);
 }
 
 // MiniMaxH3MLP.forward (minimax_h3_transformer.py:512-517): silu(gate) * up.
 void MlpForward(vt::Queue& q, const MiniMaxH3DitParams& params, const Tensor& fc1,
                 const Tensor& fc2, const float* in, int64_t rows, const StreamDtype& dt,
-                float* out) {
+                float* out, const DitRuntimeLoraLayer* fc1_lora = nullptr,
+                const DitRuntimeLoraLayer* fc2_lora = nullptr) {
   const int64_t ffn = params.ffn_hidden_size;
   std::vector<float> hidden(static_cast<size_t>(rows * 2 * ffn));
-  Linear(q, in, rows, params.hidden_size, fc1, nullptr, hidden.data());
+  Linear(q, in, rows, params.hidden_size, fc1, nullptr, hidden.data(), fc1_lora);
   dt.Apply(hidden);
   std::vector<float> act(static_cast<size_t>(rows * ffn));
   for (int64_t r = 0; r < rows; ++r) {
@@ -297,7 +306,7 @@ void MlpForward(vt::Queue& q, const MiniMaxH3DitParams& params, const Tensor& fc
     for (int64_t i = 0; i < ffn; ++i) dst[i] = Silu(src[i]) * src[ffn + i];
   }
   dt.Apply(act);
-  Linear(q, act.data(), rows, ffn, fc2, nullptr, out);
+  Linear(q, act.data(), rows, ffn, fc2, nullptr, out, fc2_lora);
   dt.Apply(out, rows * params.hidden_size);
 }
 
@@ -525,7 +534,8 @@ std::vector<float> MiniMaxH3ReorderGroupedQkv(const std::vector<float>& weight,
 
 MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitParams& params,
                                         const MiniMaxH3DitWeights& weights,
-                                        const MiniMaxH3DitInputs& inputs, DType compute_dtype) {
+                                        const MiniMaxH3DitInputs& inputs, DType compute_dtype,
+                                        const DitRuntimeLoraState* lora_state) {
   VT_CHECK(device.type == vt::DeviceType::kCPU,
            "minimax_h3: the reference DiT forward is CPU-only; the device-resident "
            "forward is brick H3-2b (.agents/specs/minimax-h3.md)");
@@ -542,6 +552,11 @@ MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitPar
   VT_CHECK(static_cast<int64_t>(weights.refiner.size()) == params.token_refiner_num_layers,
            "minimax_h3: refiner weight count does not match token_refiner_num_layers");
   VT_CHECK(inputs.num_cu_seqlens >= 2, "minimax_h3: packed_seq_params.cu_seqlens is required");
+
+  const bool has_lora = lora_state != nullptr && !lora_state->empty();
+  auto lora_find = [&](const std::string& target) -> const DitRuntimeLoraLayer* {
+    return has_lora ? lora_state->Find(target) : nullptr;
+  };
 
   vt::Queue q{device, nullptr};
   const int64_t seq_len = inputs.seq_len;
@@ -563,7 +578,8 @@ MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitPar
   }
   std::vector<float> video_embed(static_cast<size_t>(inputs.num_img_pos * hidden));
   Linear(q, video_rows.data(), inputs.num_img_pos, video_width, weights.video_patch_proj_w,
-         &weights.video_patch_proj_b, video_embed.data());
+         &weights.video_patch_proj_b, video_embed.data(),
+         lora_find("video_patch_proj.weight"));
 
   const int64_t audio_width = params.audio_latents_dim;
   std::vector<float> audio_rows(static_cast<size_t>(inputs.num_audio_pos * audio_width));
@@ -574,7 +590,8 @@ MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitPar
   }
   std::vector<float> audio_embed(static_cast<size_t>(inputs.num_audio_pos * hidden));
   Linear(q, audio_rows.data(), inputs.num_audio_pos, audio_width, weights.audio_patch_proj_w,
-         &weights.audio_patch_proj_b, audio_embed.data());
+         &weights.audio_patch_proj_b, audio_embed.data(),
+         lora_find("audio_patch_proj.weight"));
 
   std::vector<float> text_embed(static_cast<size_t>(inputs.num_text_pos * hidden));
   {
@@ -583,7 +600,8 @@ MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitPar
                                  inputs.prompt_embeds + inputs.num_text_pos * params.text_dim);
     dt.Apply(text_rows);
     Linear(q, text_rows.data(), inputs.num_text_pos, params.text_dim, weights.condition_proj_w,
-           &weights.condition_proj_b, text_embed.data());
+           &weights.condition_proj_b, text_embed.data(),
+           lora_find("condition_proj.weight"));
     dt.Apply(text_embed);
   }
 
@@ -593,18 +611,24 @@ MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitPar
   {
     const int64_t rows = inputs.num_text_pos;
     std::vector<float> normed(text_embed.size()), tmp(text_embed.size());
-    for (const MiniMaxH3DitBlockWeights& block : weights.refiner) {
+    for (size_t ri = 0; ri < weights.refiner.size(); ++ri) {
+      const MiniMaxH3DitBlockWeights& block = weights.refiner[ri];
+      const std::string rp = "token_refiner.blocks." + std::to_string(ri);
       RmsNormRows(text_embed.data(), block.norm1.Ptr<float>(), normed.data(), rows, hidden,
                   params.norm_eps);
       dt.Apply(normed.data(), rows * hidden);
       AttentionForward(q, params, AttnOf(block), normed.data(), rows, nullptr,
                        inputs.refiner_cu_seqlens,
-                       static_cast<int>(inputs.num_refiner_cu_seqlens - 1), dt, tmp.data());
+                       static_cast<int>(inputs.num_refiner_cu_seqlens - 1), dt, tmp.data(),
+                       lora_find(rp + ".attn.qkv_proj.weight"),
+                       lora_find(rp + ".attn.out_proj.weight"));
       for (size_t i = 0; i < text_embed.size(); ++i) text_embed[i] = dt(text_embed[i] + tmp[i]);
       RmsNormRows(text_embed.data(), block.norm2.Ptr<float>(), normed.data(), rows, hidden,
                   params.norm_eps);
       dt.Apply(normed.data(), rows * hidden);
-      MlpForward(q, params, block.fc1, block.fc2, normed.data(), rows, dt, tmp.data());
+      MlpForward(q, params, block.fc1, block.fc2, normed.data(), rows, dt, tmp.data(),
+                 lora_find(rp + ".mlp.fc1.weight"),
+                 lora_find(rp + ".mlp.fc2.weight"));
       for (size_t i = 0; i < text_embed.size(); ++i) text_embed[i] = dt(text_embed[i] + tmp[i]);
     }
     std::vector<float> final_normed(text_embed.size());
@@ -660,10 +684,13 @@ MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitPar
   // --- the DiT block stack (minimax_h3_transformer.py:645-688) ---
   const int num_reqs = static_cast<int>(inputs.num_cu_seqlens - 1);
   std::vector<float> normed(stream.size()), tmp(stream.size());
-  for (const MiniMaxH3DitBlockWeights& block : weights.blocks) {
+  for (size_t bi = 0; bi < weights.blocks.size(); ++bi) {
+    const MiniMaxH3DitBlockWeights& block = weights.blocks[bi];
+    const std::string bp = "blocks." + std::to_string(bi);
     const std::vector<float> projected =
         AdalnProject(q, t_emb.data(), m, params.time_embed_dim, block.adaln_w, block.adaln_b, dt,
-                     !params.use_adaln_curves());
+                     !params.use_adaln_curves(),
+                     lora_find(bp + ".adaln_proj.linear.weight"));
     const std::vector<float> shift_msa =
         AdalnChunk(projected, m, kMiniMaxH3AdalnModalityNum, hidden, 6, 0);
     const std::vector<float> scale_msa =
@@ -684,7 +711,9 @@ MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitPar
                        combined.data());
     dt.Apply(normed);  // _modulate_scale_shift casts its result to the stream dtype
     AttentionForward(q, params, AttnOf(block), normed.data(), seq_len, freqs.data(),
-                     inputs.cu_seqlens, num_reqs, dt, tmp.data());
+                     inputs.cu_seqlens, num_reqs, dt, tmp.data(),
+                     lora_find(bp + ".attn.qkv_proj.weight"),
+                     lora_find(bp + ".attn.out_proj.weight"));
     ModulateGate(stream.data(), seq_len, hidden, gate_msa.data(), tmp.data(), combined.data());
     dt.Apply(stream);
 
@@ -694,7 +723,9 @@ MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitPar
     ModulateScaleShift(normed.data(), seq_len, hidden, shift_mlp.data(), scale_mlp.data(),
                        combined.data());
     dt.Apply(normed);
-    MlpForward(q, params, block.fc1, block.fc2, normed.data(), seq_len, dt, tmp.data());
+    MlpForward(q, params, block.fc1, block.fc2, normed.data(), seq_len, dt, tmp.data(),
+               lora_find(bp + ".mlp.fc1.weight"),
+               lora_find(bp + ".mlp.fc2.weight"));
     ModulateGate(stream.data(), seq_len, hidden, gate_mlp.data(), tmp.data(), combined.data());
     dt.Apply(stream);
   }
@@ -702,7 +733,8 @@ MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitPar
   // --- final layer (minimax_h3_transformer.py:724-743) ---
   const std::vector<float> final_projected =
       AdalnProject(q, t_emb.data(), m, params.time_embed_dim, weights.final_adaln_w,
-                   weights.final_adaln_b, dt, !params.use_adaln_curves());
+                   weights.final_adaln_b, dt, !params.use_adaln_curves(),
+                   lora_find("final_layer.adaln_proj.linear.weight"));
   const std::vector<float> final_shift = AdalnChunk(final_projected, m, 1, hidden, 2, 0);
   const std::vector<float> final_scale = AdalnChunk(final_projected, m, 1, hidden, 2, 1);
   RmsNormRows(stream.data(), weights.final_norm.Ptr<float>(), normed.data(), seq_len, hidden,
@@ -717,10 +749,10 @@ MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitPar
 
   std::vector<float> video_all(static_cast<size_t>(seq_len * video_width));
   Linear(q, normed.data(), seq_len, hidden, weights.video_out_w, &weights.video_out_b,
-         video_all.data());
+         video_all.data(), lora_find("final_layer.video_out.weight"));
   std::vector<float> audio_all(static_cast<size_t>(seq_len * audio_width));
   Linear(q, normed.data(), seq_len, hidden, weights.audio_out_w, &weights.audio_out_b,
-         audio_all.data());
+         audio_all.data(), lora_find("final_layer.audio_out.weight"));
 
   // Select the inference-output rows, then zero the pinned condition rows
   // (minimax_h3_transformer.py:1087-1101).
@@ -763,7 +795,8 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseLoop(
     const std::vector<float>& initial_audio_rows, const std::vector<float>& keyframe_cond_rows,
     const std::vector<float>& audio_ref_rows, const std::vector<double>& sigmas_video,
     const std::vector<double>& sigmas_audio, DType compute_dtype,
-    const MiniMaxH3DitDeviceWeights* prestaged) {
+    const MiniMaxH3DitDeviceWeights* prestaged,
+    const DitRuntimeLoraState* lora_state) {
   VT_CHECK(sigmas_video.size() == sigmas_audio.size(),
            "minimax_h3 denoise: video/audio sigma schedules must have equal length");
   VT_CHECK(sigmas_video.size() >= 2, "minimax_h3 denoise: sigma schedules need at least 2 entries");
@@ -1035,8 +1068,8 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseLoop(
         on_device ? MiniMaxH3DitForwardDevice(
                         device_queue, params,
                         prestaged != nullptr ? prestaged->weights : staged.weights, in,
-                        compute_dtype)
-                  : MiniMaxH3DitForward(device, params, weights, in, compute_dtype);
+                        compute_dtype, lora_state)
+                  : MiniMaxH3DitForward(device, params, weights, in, compute_dtype, lora_state);
     if (trace) {
       std::fprintf(stderr, "[h3] step %d/%d forward %.2f s (seq_len=%lld)\n",
                    static_cast<int>(step + 1), static_cast<int>(sigmas_video.size() - 1),

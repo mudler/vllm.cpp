@@ -1,14 +1,14 @@
 ID: ISSUE-LOCAL-01M2EK69SESGH6ST1ESMFZC808
 Title: qwen4_exp decode sustains ~4% of GB10 memory bandwidth while this tree sustains 81% on another model, so the reference gap is an efficiency deficit and not a ceiling
 Row: MODEL-MM-QWEN4-EXP
-State: OPEN
+State: CLOSED
 Kind: bug
 GitHub: -
 Mirror: PENDING
 Availability: FULL
 Created: 2026-09-13
-Updated: 2026-09-13
-Closed: -
+Updated: 2026-09-14
+Closed: 2026-09-14
 
 ## Problem
 
@@ -97,4 +97,69 @@ ms/step). Neither has a per-kernel bandwidth attribution.
 
 ## Resolution
 
--
+**ATTRIBUTED 2026-09-14, and the attribution FALSIFIES this issue's own
+headline.** The per-kernel work item above is done, from
+`tests/vllm/models/qwen4_exp_gguf_manifest.inc`, the loader's residency rules and
+the committed kernel table, with no GPU, no lease and no `ncu`. The full section
+is `.agents/specs/qwen4-exp-flash-next.md`, "### THE PER-KERNEL BANDWIDTH
+ATTRIBUTION".
+
+**The stop condition fired.** This issue derives ~0.85 GB per step. The manifest
+gives **6.792 GB**, an **8.0x** disagreement, so both derivations are stated
+rather than one being preferred:
+
+| | this issue | the manifest |
+|---|---|---|
+| active GEMM params/token | 4.231 G | 6.625 G |
+| average width | IQ1_S, ~1.6 bit | 8.20 bit |
+| bytes/step | ~0.85 GB | **6.792 GB** |
+| achieved | 11.0 GB/s, 4.0% of peak | **88.3 GB/s, 32.4% of peak** |
+| floor | 3.1 ms, ~320 tok/s | **24.88 ms, ~40 tok/s** |
+
+This issue's derivation priced the entire model at IQ1_S, which is in fact only
+68 of the 96 routed expert gate/up towers; omitted the hyper-connections
+(668.4 MB/step), the `lm_head` (357.6 MB) and the MoE router (125.8 MB); and gave
+all 48 layers one attention shape when 36 are Gated DeltaNet and 12 are QSA. Its
+LARGEST omission is not a pricing error at all: `attn_qkv`, `attn_gate` and
+`ssm_out` of all 36 linear layers **dequantize to bf16 at load**, because the
+V-head reorder the released 16-vs-48 config forces cannot be applied to a k-quant
+block stream (`qwen4_exp_weights.cpp:277-395`, and its own comment at `:300-302`).
+That is 4.152 GB/step against 1.508 GB in the file: **2.75x, and 61% of all
+decode weight traffic.**
+
+**What was attributed.** Four kernel rows carry a committed average duration, and
+ranked by achieved bandwidth ascending they are: `QuantDotGemmGroupedKernel`
+(IQ1_S expert gate/up, 68 calls/step, 3.200 MB) at **41.6 GB/s, 15.2%**;
+`QuantDotGemmGrouped32Kernel` (IQ4_NL `ffn_down_exps`, 48 calls, 9.216 MB) at
+**56.5 GB/s, 20.7%**; cuBLAS `gemvx` #1 (71.9 calls, two of the three large GDN
+projections) at **129-172 GB/s, 47-63%**; and
+`QuantDotGemmKernel<WType 4, float>` (the Q4_K `lm_head`, 357.581 MB, 2.49 ms) at
+**143.6 GB/s, 52.6%**. At group level the cuBLAS family runs **4.343 GB in
+26.76 ms = 162.3 GB/s (59.5%)** and our own `QuantDotGemm*` family **2.449 GB in
+26.22 ms = 93.4 GB/s (34.2%)**. A full per-call-site byte inventory covering all
+6.792 GB is in the spec section.
+
+**So the separation this issue asked for exists, but not where it expected.**
+Nothing is at 1-5% of peak. cuBLAS is the larger half of the GEMM bill because it
+moves 1.8x the bytes, not because it is slow, and it is the MORE efficient half.
+The one genuinely low band is our own grouped k-quant kernels at 15-21% over
+778 MB/step. And item 2 of this issue is also corrected: the `lm_head` is not
+"roughly 19% of peak", it is **52.6%**, because it is Q4_K and not IQ1_S.
+
+**What could NOT be attributed**, all recorded in the spec section: ten of the
+roughly fourteen GEMM rows have no committed average duration, because the full
+25-row `nsys stats` output was never committed (the capture `4e36bbae` is
+retained, so re-running `nsys stats` on it closes this with no model load); which
+two of the three large GDN projections form `gemvx` row #1, hence that row's
+range; the two grouped-kernel durations, which come from the ~1600-token capture
+at `ee0644eab` rather than from `4e36bbae`; `QuantDotGemmQ8_0Kernel`'s 242
+calls/step, which resolves two ways 28 MB apart; and whether the PLE block runs
+on every decode step (34.9 MB, 0.5%).
+
+**Item 3 of this issue stands and is now quantified.** Do not start from the
+q/k/v merge: at batch 1 the activation is under 0.1% of the bytes a GEMV moves.
+Start with the Gated DeltaNet keep-quant repair, which is 2.644 GB/step and the
+only item that moves the floor from ~40 tok/s to ~66 tok/s -- that is, the only
+item without which the reference's rate is not reachable on this artifact at all.
+
+Resolved by row `MODEL-MM-QWEN4-EXP`, branch `row/MODEL-MM-QWEN4-EXP-bwattrib`.

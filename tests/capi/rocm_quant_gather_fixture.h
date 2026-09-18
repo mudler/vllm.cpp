@@ -119,7 +119,9 @@ inline std::string DenseEmbedding(const Format& format,
   return dense;
 }
 
-inline std::string BuildModel(const Format& format, bool dense_embedding) {
+inline std::string BuildModel(const Format& format, bool dense_embedding,
+                              const Format* gate_up_format = nullptr,
+                              const Format* down_format = nullptr) {
   using namespace gguf_test;
   GgufModelBuilder builder;
   builder.AddKv(StrKv("general.architecture", "qwen35"));
@@ -166,7 +168,14 @@ inline std::string BuildModel(const Format& format, bool dense_embedding) {
                     dense_embedding ? 30 : format.ggml,
                     dense_embedding ? DenseEmbedding(format, packed) : packed);
   std::mt19937 rng(kSeed);
-  const auto projection = [&](const char* name, uint64_t input, uint64_t output) {
+  const auto projection = [&](const char* name, uint64_t input, uint64_t output,
+                              const Format* quant = nullptr) {
+    if (quant != nullptr) {
+      builder.AddTensor(name, {input, output}, quant->ggml,
+                        PackedTable(*quant, static_cast<int64_t>(output),
+                                    static_cast<int64_t>(input)));
+      return;
+    }
     std::string bytes;
     bytes.reserve(static_cast<size_t>(input * output * 2));
     for (uint64_t i = 0; i < input * output; ++i) {
@@ -188,9 +197,9 @@ inline std::string BuildModel(const Format& format, bool dense_embedding) {
   projection("blk.0.attn_k.weight", 256, 64);
   projection("blk.0.attn_v.weight", 256, 64);
   projection("blk.0.attn_output.weight", 256, 256);
-  projection("blk.0.ffn_gate.weight", 256, 256);
-  projection("blk.0.ffn_up.weight", 256, 256);
-  projection("blk.0.ffn_down.weight", 256, 256);
+  projection("blk.0.ffn_gate.weight", 256, 256, gate_up_format);
+  projection("blk.0.ffn_up.weight", 256, 256, gate_up_format);
+  projection("blk.0.ffn_down.weight", 256, 256, down_format);
   norm("output_norm.weight", 256);
   norm("blk.0.attn_norm.weight", 256);
   norm("blk.0.post_attention_norm.weight", 256);

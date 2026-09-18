@@ -60,7 +60,8 @@ void MiniMaxH3Nvfp4SwapNibbles(const uint8_t* src, size_t n, uint8_t* dst) {
   }
 }
 
-MiniMaxH3GgufDit LoadMiniMaxH3DitFromNvfp4(const SafetensorsFile& file) {
+MiniMaxH3GgufDit LoadMiniMaxH3DitFromNvfp4(const SafetensorsFile& file,
+                                          const MiniMaxH3DitLoadOptions& options) {
   MiniMaxH3GgufDit out;
 
   // --- pass 1: materialize every tensor to f32 ---
@@ -114,6 +115,27 @@ MiniMaxH3GgufDit LoadMiniMaxH3DitFromNvfp4(const SafetensorsFile& file) {
     for (size_t i = 0; i < bf16.size(); ++i) values[i] = Bf16ToF32(bf16[i]);
     out.storage[name] = std::move(values);
     out.shapes[name] = {out_dim, in_dim};
+  }
+
+  // --- pass 1b: fuse LoRA deltas into the materialized f32 buffers ---
+  if (!options.loras.empty()) {
+    std::vector<std::string> contract_names;
+    contract_names.reserve(out.shapes.size());
+    for (const auto& kv : out.shapes) contract_names.push_back(kv.first);
+    const std::vector<DitLoraAdapter> loras = DitOpenLoras(
+        options.loras, contract_names, {"model.diffusion_model.", "diffusion_model."});
+    int64_t fused = 0;
+    for (const auto& kv : out.shapes) {
+      const std::string& name = kv.first;
+      auto it = out.storage.find(name);
+      if (it == out.storage.end()) continue;
+      if (DitFuseLorasIntoBuffer(loras, name, kv.second, vt::DType::kF32,
+          reinterpret_cast<uint8_t*>(it->second.data()),
+          it->second.size() * sizeof(float))) {
+        ++fused;
+      }
+    }
+    DitCheckLorasWereApplied(loras, fused);
   }
 
   // --- pass 2: geometry from the materialized shapes, then bind the views ---

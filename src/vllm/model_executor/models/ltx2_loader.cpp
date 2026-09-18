@@ -559,44 +559,20 @@ std::vector<Ltx2LoraAdapter> OpenDitLoras(const Ltx2DitLoadOptions& options,
   std::vector<std::string> names;
   names.reserve(contract.size());
   for (const Ltx2TensorSpec& spec : contract) names.push_back(spec.name);
-
-  std::vector<Ltx2LoraAdapter> out;
-  out.reserve(options.loras.size());
-  for (const Ltx2LoraSpec& spec : options.loras) {
-    out.push_back(Ltx2LoraAdapter::Open(spec, names));
-  }
-  // The caller resolves the reference factors immediately, and that call is what
-  // refuses conflicting metadata across the adapters — before any tensor is
-  // materialized.
-  return out;
+  return DitOpenLoras(options.loras, names, {"diffusion_model."});
 }
 
 bool FuseLorasInto(const std::vector<Ltx2LoraAdapter>& loras, const Ltx2TensorSpec& spec,
                    vt::DType dtype, std::vector<uint8_t>& buffer) {
-  if (loras.empty()) return false;
-  // A LoRA factor pair is rank 2 and so is its target. A contract tensor of any
-  // other rank cannot be a LoRA target, and `Ltx2LoraAdapter::Open` has already
-  // refused a pair naming a name outside the contract, so this is a shape
-  // filter rather than a silent skip of a possible target.
-  if (spec.shape.size() != 2) return false;
-  return Ltx2FuseLoraIntoTensor(loras, spec.name, dtype, spec.shape[0], spec.shape[1],
-                                buffer.data(), buffer.size());
+  return DitFuseLorasIntoBuffer(loras, spec.name, spec.shape, dtype,
+                                 buffer.data(), buffer.size());
 }
 
 // A LoRA that fused into NOTHING loads green and renders identically to no LoRA
 // at all. That is a user error — a wrong file, or one trained against another
 // model — and it must not read as success.
 void CheckLorasWereApplied(const std::vector<Ltx2LoraAdapter>& loras, int64_t fused) {
-  if (loras.empty() || fused > 0) return;
-  std::string paths;
-  for (const Ltx2LoraAdapter& lora : loras) {
-    paths += std::string(paths.empty() ? "" : ", ") + "'" + lora.path() + "'";
-  }
-  Fail("the adapter(s) " + paths +
-       " fused into ZERO tensors of this checkpoint. Every A/B pair named a tensor the "
-       "contract binds, so the delta was computed for none of them — which means the "
-       "render would be byte-identical to loading no adapter, while reporting success. "
-       "Refusing instead.");
+  DitCheckLorasWereApplied(loras, fused);
 }
 
 // The families the file carries and NOTHING IN THIS PORT reads.
@@ -716,7 +692,7 @@ Ltx2DitCheckpoint Ltx2LoadDitFromSafetensors(const SafetensorsFile& file,
   }
 
   const std::vector<Ltx2LoraAdapter> loras = OpenDitLoras(options, contract);
-  out.lora_reference = Ltx2ResolveLoraReferenceFactors(loras);
+  out.lora_reference = DitResolveLoraReferenceFactors(loras);
   int64_t fused = 0;
   for (const Ltx2TensorSpec& spec : contract) {
     auto buffer = std::make_shared<Ltx2HostBuffer>();
@@ -777,7 +753,7 @@ Ltx2DitCheckpoint Ltx2StreamDitToDevice(vt::Queue& queue, const SafetensorsFile&
   }
 
   const std::vector<Ltx2LoraAdapter> loras = OpenDitLoras(options, contract);
-  out.lora_reference = Ltx2ResolveLoraReferenceFactors(loras);
+  out.lora_reference = DitResolveLoraReferenceFactors(loras);
   int64_t fused = 0;
   vt::Backend& backend = vt::GetBackend(queue.device.type);
   for (const Ltx2TensorSpec& spec : contract) {

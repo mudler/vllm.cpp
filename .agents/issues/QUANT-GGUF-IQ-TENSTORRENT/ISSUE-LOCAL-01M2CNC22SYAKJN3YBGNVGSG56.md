@@ -7,7 +7,7 @@ GitHub: -
 Mirror: PENDING
 Availability: FULL
 Created: 2026-09-13
-Updated: 2026-09-13
+Updated: 2026-09-14
 Closed: -
 
 ## Problem
@@ -16,4 +16,16 @@ Ettore's mudler/Qwen3.8-27B-APEX-I-Nano.gguf (10.7 GB) packs the 27B into the P1
 
 ## Resolution
 
--
+- 2026-09-14 wave 1 (IQ3_XXS): the on-core IQ3_XXS×q8_K int8-dot decode
+  landed bit-exact vs the CPU `VecDotIQ3_XXSQ8_K` oracle (116-assertion
+  device sweep), route admission widened with its pin test, default-path
+  dispatch pinned by a dedicated env-unset leg (review mutation verified),
+  backend suite 74/74 (524,455 assertions). `docs/USAGE.md` records the
+  artifact (repo@rev, size, sha256, refused arms named).
+- 2026-09-14 the APEX e2e generation gate is recorded OOM/owed: the
+  pre-existing Q4_K grouped `kq-decode/repair` plane asks 1.117 GB with
+  APEX's residency profile (133 refused-arm tensors expanded to bf16),
+  fatal 960 MB alloc, 108 MB largest free block — keep-quant W4 residency
+  territory, NOT an IQ3_XXS defect (`/tmp/row-tt-iq-evidence/
+  apex-alloc-trace.log`). Issue stays OPEN on the remaining waves
+  (IQ2_S/IQ2_XXS/Q3_K, W4a grouped arm, the e2e gate).

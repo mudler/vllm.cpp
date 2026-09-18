@@ -33,6 +33,7 @@
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/device_pool.h"  // ActivePool(b)/DevicePool::Drain
+#include "vllm/model_executor/models/dit_lora.h"
 #include "vllm/model_executor/models/ltx2.h"
 #include "vllm/model_executor/models/ltx2_audio_input.h"
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
@@ -385,59 +386,6 @@ double ExtraDouble(const std::map<std::string, std::string>& extras, const std::
   }
 }
 
-// The IC-LoRA strength (utils/args.py:600-611). Upstream's `LoraAction` parses
-// it as a plain float and applies no range clamp, so neither does this: a
-// negative or >1 strength is a legitimate, if unusual, request that upstream
-// honours, and refusing it here would diverge. What IS refused is a value that
-// is not a number at all, which upstream's `float()` would raise on too.
-//
-// Not `ExtraDouble` above, and deliberately: that one reports "not a finite
-// number of SECONDS", which is the wrong noun for a strength, and it defaults a
-// missing key while this one is only ever called on a key that is present.
-double ParseLoraStrength(const std::string& key, const std::string& raw) {
-  try {
-    size_t consumed = 0;
-    const double value = std::stod(raw, &consumed);
-    if (consumed != raw.size()) throw std::invalid_argument("trailing");
-    if (!std::isfinite(value)) throw std::invalid_argument("non-finite");
-    return value;
-  } catch (const std::exception&) {
-    Fail("the extra '" + key + "' is '" + raw + "', which is not a finite number");
-  }
-}
-
-// The suffix that names adapter `index` in the load extras: adapter 1 is the
-// unindexed `lora_path` / `lora_strength` every existing caller already writes.
-std::string LoraIndexSuffix(int64_t index) {
-  return index == 1 ? std::string() : "_" + std::to_string(index);
-}
-
-// `lora_path_<n>` or `lora_strength_<n>` with n >= 2 — the indexed spelling of
-// upstream's REPEATABLE `--lora`. False for everything else, `..._1` included:
-// the first adapter is spelled without an index, and admitting a second
-// spelling for it would let `lora_path` and `lora_path_1` disagree with no
-// defensible winner. `CheckKnownExtras` refuses `..._1` by name for that reason
-// rather than as an unknown key.
-bool LoraExtraIndex(const std::string& key, int64_t* out_index) {
-  for (const char* base : {kLtx2LoraPathExtra, kLtx2LoraStrengthExtra}) {
-    const std::string prefix = std::string(base) + "_";
-    if (key.size() <= prefix.size()) continue;
-    if (key.compare(0, prefix.size(), prefix) != 0) continue;
-    const std::string digits = key.substr(prefix.size());
-    // A leading zero, a non-digit or a length no `int64_t` needs is not an
-    // index. Bounded before `stoll` so this cannot throw on a hostile key.
-    if (digits[0] == '0' || digits.size() > 6) return false;
-    for (const char c : digits) {
-      if (c < '0' || c > '9') return false;
-    }
-    const int64_t index = std::stoll(digits);
-    if (index < 2) return false;
-    if (out_index != nullptr) *out_index = index;
-    return true;
-  }
-  return false;
-}
-
 // `lora_path_1` / `lora_strength_1` refuse BY NAME rather than as unknown keys.
 // The caller has understood the indexed family and mis-spelled its first member,
 // and the generic message would send them hunting for a typo in a key they got
@@ -497,7 +445,7 @@ constexpr char kLtx2AutoDurationExtra[] = "auto_duration";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 695 697 1339 1435 1531 1547 1682 1686 1844 1880 2032 2150 2192 2234 2236
+// 648 649 1266 1362 1458 1474 1609 1613 1771 1807 1959 2077 2119 2161 2163
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -508,6 +456,7 @@ const char* const kKnownLoadExtras[] = {
     kLtx2LoraPathExtra,          kLtx2LoraStrengthExtra,
     kLtx2NegativePromptEmbedsExtra, kLtx2NegativeAudioPromptEmbedsExtra,
     kLtx2CheckpointClassExtra,
+    kDitLoraDirExtra,
 };
 
 // FNV-1a over the raw bytes of a float buffer — the `Ltx2ConditioningTrace`
@@ -615,7 +564,7 @@ void CheckKnownExtras(const std::map<std::string, std::string>& extras) {
     // The indexed IC-LoRA family (row LTX25-LORA-FUSION). It is a PATTERN and
     // not a listable set because upstream's `--lora` has no arity bound
     // (`utils/args.py:600-611`), so the enumerated array above cannot hold it.
-    if (!known && LoraExtraIndex(kv.first, nullptr)) known = true;
+    if (!known && IsDitLoraIndexedExtra(kv.first)) known = true;
     if (!known) {
       RefuseLoraIndexOne(kv.first);
       std::string listing;
@@ -690,41 +639,19 @@ Ltx2AutoDuration ParseAutoDuration(const std::map<std::string, std::string>& ext
 // no `lora_path_2` believes three adapters are being fused; sliding the third
 // into the second slot would fuse two and report success.
 std::vector<Ltx2LoraSpec> ResolveLoraSpecs(const std::map<std::string, std::string>& extras) {
-  std::vector<Ltx2LoraSpec> out;
-  for (int64_t index = 1;; ++index) {
-    const std::string path_key = std::string(kLtx2LoraPathExtra) + LoraIndexSuffix(index);
-    const std::string strength_key =
-        std::string(kLtx2LoraStrengthExtra) + LoraIndexSuffix(index);
-    const std::string path = VideoExtra(extras, path_key);
-    const std::string strength = VideoExtra(extras, strength_key);
-    if (path.empty()) {
-      // The same refusal the one-adapter arm has always carried, now per index.
-      if (!strength.empty()) {
-        Fail("'" + strength_key + "' was given without '" + path_key +
-             "'. A strength with no adapter fuses nothing, and silently doing nothing is "
-             "what this refusal exists to prevent.");
-      }
-      break;
-    }
-    Ltx2LoraSpec spec;
-    spec.path = path;
-    // Absent is DEFAULT_LORA_STRENGTH, per adapter, exactly as upstream's
-    // `--lora PATH` with no second word is (`utils/args.py:607-608`).
-    if (!strength.empty()) spec.strength = ParseLoraStrength(strength_key, strength);
-    out.push_back(std::move(spec));
-  }
-  const int64_t next = static_cast<int64_t>(out.size()) + 1;
-  for (const auto& kv : extras) {
-    int64_t index = 0;
-    if (!LoraExtraIndex(kv.first, &index) || index <= next) continue;
-    Fail("the load carries '" + kv.first + "' but no '" + std::string(kLtx2LoraPathExtra) +
-         LoraIndexSuffix(next) + "', so the adapters are not numbered 1..N with no gaps. " +
-         std::to_string(out.size()) +
-         " adapter(s) would be fused and the rest silently dropped. Number them from 1 — the "
-         "first is '" +
-         std::string(kLtx2LoraPathExtra) + "' with no index — or drop '" + kv.first + "'.");
-  }
-  return out;
+  // Delegates to the shared DiT LoRA resolution (row ROAD-V1-DIT-LORA). The
+  // indexed-key transport, gap refusal, and strength-without-path refusal all
+  // live in `ResolveDitLoraSpecs` now, so every DiT family shares one
+  // implementation. `Ltx2LoraSpec` is an alias for `DitLoraSpec`.
+  //
+  // The shared seam reads `kDitLoraPathExtra` / `kDitLoraStrengthExtra`, which
+  // are the same string literals this family declares as `kLtx2LoraPathExtra`
+  // / `kLtx2LoraStrengthExtra`. The asserts prove the alias so a future rename
+  // of either side is caught at compile time, and they are the readers that
+  // keep both keys in `kKnownLoadExtras[]` served.
+  static_assert(std::string_view(kLtx2LoraPathExtra) == kDitLoraPathExtra);
+  static_assert(std::string_view(kLtx2LoraStrengthExtra) == kDitLoraStrengthExtra);
+  return ResolveDitLoraSpecs(extras);
 }
 
 // `detect_model_version` normalizes the separator before parsing
@@ -2627,6 +2554,32 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   Impl& im = *impl_;
   std::lock_guard<std::mutex> guard(im.mutex);
 
+  // ── runtime LoRA (ROAD-V1-LORA-RUNTIME phase 5) ─────────────────────────
+  //
+  // Parse `<lora:name:strength>` tags from the prompt and load the referenced
+  // adapters. The cleaned prompt (tags stripped) is used for text conditioning,
+  // so the tags never reach the text encoder. Mirrors sd.cpp's
+  // `parse_loras_from_prompt` (gosd.cpp:174-330). `lora_dir` is a model-load
+  // extra (VideoModelParams::extras); when absent, no parsing happens and the
+  // prompt is used verbatim.
+  const auto lora_dir_it = im.params.extras.find(kDitLoraDirExtra);
+  const std::string lora_dir =
+      lora_dir_it != im.params.extras.end() ? lora_dir_it->second : "";
+  const DitParseLoraResult lora_parsed =
+      lora_dir.empty() ? DitParseLoraResult{{}, gen.prompt}
+                       : DitParseLoraTags(gen.prompt, lora_dir);
+  const std::string& prompt = lora_parsed.clean_prompt;
+
+  DitRuntimeLoraState lora_state;
+  if (!lora_parsed.loras.empty()) {
+    const std::vector<Ltx2TensorSpec> contract = EnumerateLtx2DitTensors(im.dit.params);
+    std::vector<std::string> names;
+    names.reserve(contract.size());
+    for (const Ltx2TensorSpec& spec : contract) names.push_back(spec.name);
+    lora_state = DitLoadRuntimeLoras(lora_parsed.loras, names, {"diffusion_model."},
+                                     im.on_device ? im.device : vt::Device{vt::DeviceType::kCPU, 0});
+  }
+
   // ── W0: this render's slice of the timeline (#1010) ───────────────────────
   //
   // The counter is a process static rather than a member: the table is a PROCESS
@@ -2979,13 +2932,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     }
   }
 
-  if (!gen.prompt.empty() && !im.has_encoder) {
+  if (!prompt.empty() && !im.has_encoder) {
     Fail(
         "a prompt was supplied but no text tower is loaded, so it cannot condition this "
         "render. Rendering the prompt-embeds conditioning INSTEAD would silently ignore the "
         "request's own prompt. Load with encoder_path to condition on the prompt.");
   }
-  if (gen.prompt.empty() && im.video_prompt_embeds.empty()) {
+  if (prompt.empty() && im.video_prompt_embeds.empty()) {
     if (im.has_encoder) {
       Fail(
           "this request carries no prompt, and no prompt-embeds conditioning was loaded "
@@ -3078,7 +3031,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         static_cast<int64_t>(im.duration_head_weights.Bytes());
   }
 
-  if (!gen.prompt.empty()) {
+  if (!prompt.empty()) {
     // W0: the phase #1269 and W4 are about. Split into the TOWER and the
     // CONNECTOR because they are different work on different weights, and the
     // spike's 39-100% bound could not tell them apart.
@@ -3087,7 +3040,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     phase::Scope tower_phase("conditioning.tower");
     const Ltx2PromptConditioning encoded = Ltx2EncodePromptToConditioning(
         *im.tower, *im.tokenizer, im.gemma_ids, im.caption_projections, im.feature_cfg,
-        gen.prompt, text_queue);
+        prompt, text_queue);
     tower_phase.Close();
     prompt_video = encoded.conditioning.video;
     prompt_audio = encoded.conditioning.audio;
@@ -3135,7 +3088,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     video_context = prompt_video.data();
     audio_context = prompt_audio.data();
     im.trace.from_prompt = true;
-    im.trace.prompt = gen.prompt;
+    im.trace.prompt = prompt;
   }
 
   {
@@ -3818,7 +3771,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   const float* negative_video_context = nullptr;
   const float* negative_audio_context = nullptr;
   if (wants_negative) {
-    if (!im.negative_video_prompt_embeds.empty() && gen.prompt.empty()) {
+    if (!im.negative_video_prompt_embeds.empty() && prompt.empty()) {
       // The embeds fallback's own second half. Taken only when the request
       // carries no prompt, which is the same polarity the POSITIVE fallback has
       // above: a typed prompt encodes both halves through the tower.
@@ -5371,9 +5324,11 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         }
         const Ltx2DitOutputs velocity =
             im.on_device ? Ltx2DitForwardDevice(*im.queue, im.dit.params, im.dit.weights, v, a,
-                                                im.compute_dtype, /*cache=*/nullptr, p)
+                                                im.compute_dtype, /*cache=*/nullptr, p,
+                                                lora_state.empty() ? nullptr : &lora_state)
                          : Ltx2DitForward(im.device, im.dit.params, im.dit.weights, v, a,
-                                          im.compute_dtype, /*cache=*/nullptr, p);
+                                          im.compute_dtype, /*cache=*/nullptr, p,
+                                          lora_state.empty() ? nullptr : &lora_state);
         // EVERY ACTUAL DiT FORWARD IS COUNTED HERE, and that is a different
         // number from `dit_evaluations` one level up. One denoiser evaluation is
         // one to four forwards (cond, uncond, ptb, mod — denoisers.py:100-137),

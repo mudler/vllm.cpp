@@ -49,6 +49,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "vllm/model_executor/models/dit_lora.h"  // DitLoraSpec (load-time LoRA fusion)
 #include "vllm/model_executor/models/qwen3_5_weights.h"  // Nvfp4Weight (fp4 arm)
 #include "vllm/model_executor/models/qwen3_vl_vision.h"  // encoder vision tower reuse
 #include "vt/device.h"
@@ -435,6 +436,13 @@ struct MiniMaxH3TensorSpec {
 };
 
 std::vector<MiniMaxH3TensorSpec> EnumerateMiniMaxH3DitTensors(const MiniMaxH3DitParams& params);
+
+// Load-time LoRA options, mirroring LTX2.5's `Ltx2DitLoadOptions::loras`. The
+// adapters are fused into the DiT weights at materialization (load-time fusion,
+// not runtime punica). An empty `loras` vector means no fusion — the default.
+struct MiniMaxH3DitLoadOptions {
+  std::vector<DitLoraSpec> loras;
+};
 
 // --- GGUF arm (minimax_h3_gguf.cpp) ---
 // The ComfyUI-format H3 GGUFs keep the checkpoint's own parameter names, so the
@@ -1388,7 +1396,8 @@ struct MiniMaxH3GgufDit {
 // This is the arm that makes a quantized H3 run cheap on hardware WITHOUT fp4
 // tensor cores: the block-quant GEMM carries no arch gate (cuda_quant_dot.cu has
 // no #if at all), unlike every cutlass/marlin/fp4 path.
-MiniMaxH3GgufDit LoadMiniMaxH3DitFromGguf(const GgufFile& file, bool keep_quant = false);
+MiniMaxH3GgufDit LoadMiniMaxH3DitFromGguf(const GgufFile& file, bool keep_quant = false,
+                                           const MiniMaxH3DitLoadOptions& options = {});
 
 // Load the DiT dequantized straight to BF16 — never materializing f32.
 //
@@ -1400,7 +1409,8 @@ MiniMaxH3GgufDit LoadMiniMaxH3DitFromGguf(const GgufFile& file, bool keep_quant 
 // It is also the only way this fits: keeping blocks leaves the AdaLN projections
 // ineligible (K=2688 is not a whole number of 256-element Q3_K blocks) and they
 // dequantize to ~52 GB of f32. Straight to bf16 the whole DiT is ~33 GB.
-MiniMaxH3GgufDit LoadMiniMaxH3DitFromGgufBf16(const GgufFile& file);
+MiniMaxH3GgufDit LoadMiniMaxH3DitFromGgufBf16(const GgufFile& file,
+                                             const MiniMaxH3DitLoadOptions& options = {});
 // Bind the forward's views onto a MiniMaxH3GgufDit's owned buffers. Shared by the
 // GGUF and NVFP4 arms: both land on the SAME weight contract.
 void BindMiniMaxH3DitViews(MiniMaxH3GgufDit* out);
@@ -1410,7 +1420,8 @@ class SafetensorsFile;
 // carry the compressed-tensors triple (U8 packed FP4 + E4M3 group-16
 // `weight_scale` + F32 scalar `weight_scale_2`) and are dequantized through the
 // project's existing NVFP4 path; the fp32/bf16 islands are read as-is.
-MiniMaxH3GgufDit LoadMiniMaxH3DitFromNvfp4(const SafetensorsFile& file);
+MiniMaxH3GgufDit LoadMiniMaxH3DitFromNvfp4(const SafetensorsFile& file,
+                                          const MiniMaxH3DitLoadOptions& options = {});
 
 // The community `lilcheaty/MiniMax-H3-NVFP4` checkpoints (metadata converted_by
 // "Star Ultimate Model Converter Pro") pack the two fp4 elements per byte in the
@@ -1480,7 +1491,8 @@ std::vector<float> MiniMaxH3SinusoidalTimeEmbed(vt::Device device, const MiniMax
 MiniMaxH3DitOutputs MiniMaxH3DitForward(vt::Device device, const MiniMaxH3DitParams& params,
                                         const MiniMaxH3DitWeights& weights,
                                         const MiniMaxH3DitInputs& inputs,
-                                        vt::DType compute_dtype);
+                                        vt::DType compute_dtype,
+                                        const DitRuntimeLoraState* lora_state = nullptr);
 
 // --- device-resident forward (brick H3-2b, minimax_h3_device.cpp) -----------
 // Owned device copies of every DiT weight, plus the views the device forward
@@ -1521,7 +1533,8 @@ struct MiniMaxH3DitDeviceWeights {
 //
 // `params` is recovered from the manifest exactly as the loaders do.
 MiniMaxH3DitDeviceWeights StreamMiniMaxH3DitToDeviceBf16(vt::Queue& queue, const GgufFile& file,
-                                                         MiniMaxH3DitParams* out_params);
+                                                         MiniMaxH3DitParams* out_params,
+                                                         const MiniMaxH3DitLoadOptions& options = {});
 
 // The NVFP4 twin of the above. The non-streaming LoadMiniMaxH3DitFromNvfp4
 // materializes every weight as host f32 (~132 GB for this checkpoint) and is an
@@ -1529,7 +1542,8 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3DitToDeviceBf16(vt::Queue& queue, const
 // is what a real run uses.
 MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceBf16(vt::Queue& queue,
                                                            const SafetensorsFile& file,
-                                                           MiniMaxH3DitParams* out_params = nullptr);
+                                                           MiniMaxH3DitParams* out_params = nullptr,
+                                                           const MiniMaxH3DitLoadOptions& options = {});
 
 // W-FP4a — the fp4 SPEED twin of the streamer above. Instead of dequantizing each
 // U8 projection to bf16 and running vt::MatmulBT, this keeps the compressed-tensors
@@ -1546,7 +1560,8 @@ MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceBf16(vt::Queue& queue,
 // test_linear_method; this arm is a loader+dispatch wiring, adding NO quant code.
 MiniMaxH3DitDeviceWeights StreamMiniMaxH3Nvfp4ToDeviceFp4(vt::Queue& queue,
                                                           const SafetensorsFile& file,
-                                                          MiniMaxH3DitParams* out_params = nullptr);
+                                                          MiniMaxH3DitParams* out_params = nullptr,
+                                                          const MiniMaxH3DitLoadOptions& options = {});
 
 // ---------------------------------------------------------------------------
 // The ORIGINAL bf16 release: 13 safetensors shards, 66.3 GB
@@ -1627,7 +1642,8 @@ std::vector<MiniMaxH3TensorSpec> EnumerateMiniMaxH3ShardedTensors(
 // is gated against and the CPU path for small checkpoints; on the REAL 66.3 GB
 // release it would need ~132 GB of host f32 and must not be used — that is what
 // StreamMiniMaxH3ShardedToDeviceBf16 exists for.
-MiniMaxH3GgufDit LoadMiniMaxH3DitFromShards(const MiniMaxH3ShardedCheckpoint& ckpt);
+MiniMaxH3GgufDit LoadMiniMaxH3DitFromShards(const MiniMaxH3ShardedCheckpoint& ckpt,
+                                          const MiniMaxH3DitLoadOptions& options = {});
 
 // ★ Stream the ORIGINAL bf16 DiT from its shards STRAIGHT ONTO THE DEVICE, one
 // tensor at a time — the multi-shard twin of StreamMiniMaxH3Nvfp4ToDeviceBf16.
@@ -1646,7 +1662,8 @@ MiniMaxH3GgufDit LoadMiniMaxH3DitFromShards(const MiniMaxH3ShardedCheckpoint& ck
 // staged bf16. `rope.inv_freq` stays HOST-resident on the returned struct.
 MiniMaxH3DitDeviceWeights StreamMiniMaxH3ShardedToDeviceBf16(
     vt::Queue& queue, const MiniMaxH3ShardedCheckpoint& ckpt,
-    MiniMaxH3DitParams* out_params = nullptr);
+    MiniMaxH3DitParams* out_params = nullptr,
+    const MiniMaxH3DitLoadOptions& options = {});
 
 // --- "this loader actually RAN" counters -----------------------------------
 // A green suite over a path that silently fell back to another loader is a
@@ -1710,7 +1727,8 @@ MiniMaxH3DitOutputs MiniMaxH3DitForwardDevice(vt::Queue& queue,
                                               const MiniMaxH3DitParams& params,
                                               const MiniMaxH3DitWeights& weights,
                                               const MiniMaxH3DitInputs& inputs,
-                                              vt::DType compute_dtype);
+                                              vt::DType compute_dtype,
+                                              const DitRuntimeLoraState* lora_state = nullptr);
 
 
 // ---------------------------------------------------------------------------
@@ -1738,7 +1756,8 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseLoop(
     const std::vector<float>& initial_audio_rows, const std::vector<float>& keyframe_cond_rows,
     const std::vector<float>& audio_ref_rows, const std::vector<double>& sigmas_video,
     const std::vector<double>& sigmas_audio, vt::DType compute_dtype,
-    const MiniMaxH3DitDeviceWeights* prestaged = nullptr);
+    const MiniMaxH3DitDeviceWeights* prestaged = nullptr,
+    const DitRuntimeLoraState* lora_state = nullptr);
 
 
 // ---------------------------------------------------------------------------
@@ -1859,7 +1878,8 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
                                           // costs tens of seconds, so a driver or server stages
                                           // ONCE and passes it here rather than per generation.
                                           // Null stages internally, as before.
-                                          const MiniMaxH3DitDeviceWeights* prestaged = nullptr);
+                                          const MiniMaxH3DitDeviceWeights* prestaged = nullptr,
+                                          const DitRuntimeLoraState* lora_state = nullptr);
 
 // The DENOISE half of `MiniMaxH3GenerateT2va` on its own: packed layout, the two
 // sigma schedules, and the step loop, stopping before the VAEs.
@@ -1926,6 +1946,7 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseT2va(vt::Device device, const MiniMaxH3T2
                                             const std::vector<float>& initial_video_rows,
                                             const std::vector<float>& initial_audio_rows,
                                             vt::DType compute_dtype,
-                                            const MiniMaxH3DitDeviceWeights* prestaged = nullptr);
+                                            const MiniMaxH3DitDeviceWeights* prestaged = nullptr,
+                                            const DitRuntimeLoraState* lora_state = nullptr);
 
 }  // namespace vllm

@@ -43,6 +43,7 @@
 
 #include "ltx2_video_fixture.h"
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
+#include "vllm/model_executor/models/dit_lora.h"
 #include "vllm/model_executor/models/ltx2_loader.h"
 #include "vllm/model_executor/models/ltx2_pipeline.h"
 #include "vllm/model_executor/models/ltx2_text_encoder.h"
@@ -1293,6 +1294,10 @@ TEST_CASE("ltx2 video: every accepted load extra is READ by something") {
       // `Ltx2LoraSpec` per adapter, so both names are SERVED and not refused.
       "lora_path_<n>",
       "lora_strength_<n> (n >= 2)",
+      // Row ROAD-V1-LORA-RUNTIME: the prompt-tag runtime LoRA directory.
+      // Read by `Generate()` which resolves `<lora:name:strength>` tags in the
+      // prompt against safetensors files under this directory.
+      vllm::kDitLoraDirExtra,
   };
   // The keys the family defines and does NOT serve. Growing this list is a
   // deliberate act; growing it silently is the defect this case exists to catch.

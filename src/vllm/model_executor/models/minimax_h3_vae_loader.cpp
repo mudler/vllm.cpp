@@ -519,47 +519,88 @@ MiniMaxH3AudioVaeConfig ParseMiniMaxH3AudioVaeConfig(const nlohmann::json& confi
 MiniMaxH3VideoVaeDecoderConfig ParseMiniMaxH3VideoVaeDecoderConfig(const nlohmann::json& config,
                                                                    MiniMaxH3LatentStats* stats) {
   MiniMaxH3VideoVaeDecoderConfig out;
+
+  // The HuggingFace video_vae config ships in two layers: a wrapper config
+  // (vae_clip_length, vae_token_drop, latent_channels, latents_mean/std) and a
+  // nested source config whose vit_decoder_kwargs holds the ViT decoder
+  // architecture (heads, dim_head, num_layers, rope_dim_ratio, rope_theta).
+  // The flat "decoder_*" keys are the form the test fixtures use. Resolve all
+  // three: check the flat key, then the nested vit_decoder_kwargs key, then the
+  // HuggingFace source-config alternative name.
+  const auto& vit = config.contains("vit_decoder_kwargs")
+                        ? config.at("vit_decoder_kwargs")
+                        : config;
+
   if (config.contains("decoder_num_layers")) {
     out.num_layers = config.at("decoder_num_layers").get<int64_t>();
+  } else if (vit.contains("num_layers")) {
+    out.num_layers = vit.at("num_layers").get<int64_t>();
   }
   if (config.contains("latent_channels")) {
     out.in_channels = config.at("latent_channels").get<int64_t>();
+  } else if (config.contains("z_channels")) {
+    out.in_channels = config.at("z_channels").get<int64_t>();
   }
-  if (config.contains("out_channels")) out.out_channels = config.at("out_channels").get<int64_t>();
+  if (config.contains("out_channels")) {
+    out.out_channels = config.at("out_channels").get<int64_t>();
+  } else if (config.contains("out_ch")) {
+    out.out_channels = config.at("out_ch").get<int64_t>();
+  }
   if (config.contains("decoder_num_register_tokens")) {
     out.num_register_tokens = config.at("decoder_num_register_tokens").get<int64_t>();
+  } else if (vit.contains("num_register_tokens")) {
+    out.num_register_tokens = vit.at("num_register_tokens").get<int64_t>();
   }
   if (config.contains("decoder_rope_theta")) {
     out.rope_theta = config.at("decoder_rope_theta").get<double>();
+  } else if (vit.contains("rope_theta")) {
+    out.rope_theta = vit.at("rope_theta").get<double>();
   }
   const int64_t heads = config.contains("decoder_num_attention_heads")
                             ? config.at("decoder_num_attention_heads").get<int64_t>()
-                            : out.block.heads;
+                            : (vit.contains("heads")
+                                   ? vit.at("heads").get<int64_t>()
+                                   : out.block.heads);
   const int64_t dim_head = config.contains("decoder_attention_head_dim")
                                ? config.at("decoder_attention_head_dim").get<int64_t>()
-                               : out.block.dim_head;
+                               : (vit.contains("dim_head")
+                                      ? vit.at("dim_head").get<int64_t>()
+                                      : out.block.dim_head);
   out.block.heads = heads;
   out.block.dim_head = dim_head;
   out.block.dim = heads * dim_head;
   const int64_t ffn_mult = config.contains("decoder_ffn_mult")
                                ? config.at("decoder_ffn_mult").get<int64_t>()
-                               : 4;
+                               : (vit.contains("ffn_mult")
+                                      ? vit.at("ffn_mult").get<int64_t>()
+                                      : 4);
   out.block.ff_inner = out.block.dim * ffn_mult;
-  if (config.contains("clip_length")) out.clip_length = config.at("clip_length").get<int64_t>();
-  if (config.contains("token_drop")) out.token_drop = config.at("token_drop").get<int64_t>();
-  if (config.contains("temporal_downsample_factors")) {
-    // vae_ratio_t = prod(time_down) (klvae.py:1148).
+  if (config.contains("clip_length")) {
+    out.clip_length = config.at("clip_length").get<int64_t>();
+  } else if (config.contains("vae_clip_length")) {
+    out.clip_length = config.at("vae_clip_length").get<int64_t>();
+  }
+  if (config.contains("token_drop")) {
+    out.token_drop = config.at("token_drop").get<int64_t>();
+  } else if (config.contains("vae_token_drop")) {
+    out.token_drop = config.at("vae_token_drop").get<int64_t>();
+  }
+  if (config.contains("temporal_downsample_factors") || config.contains("time_down")) {
+    const auto& arr = config.contains("temporal_downsample_factors")
+                          ? config.at("temporal_downsample_factors")
+                          : config.at("time_down");
     int64_t prod = 1;
-    for (const auto& v : config.at("temporal_downsample_factors")) prod *= v.get<int64_t>();
+    for (const auto& v : arr) prod *= v.get<int64_t>();
     if (prod > 0) out.vae_ratio_t = prod;
   }
   if (config.contains("decoder_norm_eps")) {
     out.block.eps = config.at("decoder_norm_eps").get<double>();
   }
-  // rope_apply_dim = int(dim_head * rope_dim_ratio), the checkpoint's own formula.
   const double ratio = config.contains("decoder_rope_dim_ratio")
                            ? config.at("decoder_rope_dim_ratio").get<double>()
-                           : 0.75;
+                           : (vit.contains("rope_dim_ratio")
+                                  ? vit.at("rope_dim_ratio").get<double>()
+                                  : 0.75);
   out.rope_apply_dim = static_cast<int64_t>(static_cast<double>(dim_head) * ratio);
   ReadStats(config, stats);
   return out;

@@ -3675,13 +3675,16 @@ TEST_CASE("ROCm Q6_K decode spreads one row's superblocks over several warps") {
   }
 }
 
-// KERNEL-QUANT-CIQ-GEMM-ROCM-RDNA4 (issue #2109), W1: the RDNA4 WMMA int8
-// tile arm of the Q6_K prefill GEMM. Runs ONLY on gfx1200/gfx1201 — every
-// other ROCm target keeps the scalar arm the case above already covers, so
-// this returns early rather than skip-reporting on hardware it does not
-// target (`GcnArchNameIsGfx12PrefillWmma` is the same host gate the kernel's
-// own dispatch decision uses, per `include/vt/rocm/rocm_arch.h`).
-TEST_CASE("keep-quant Q6_K WMMA tile arm matches the CPU oracle on RDNA4") {
+// Q4_K/Q6_K WMMA runs on physical gfx1100, gfx1200, and gfx1201.
+// Preserve the original RDNA4 fixtures, including six tiles in a four-wave
+// block and both output dtypes. Scalar controls run in a separate process.
+namespace {
+bool ExpectQuantWmma() {
+  const char* value = std::getenv("VT_ROCM_QUANT_WMMA");
+  return value == nullptr || std::strcmp(value, "0") != 0;
+}
+}  // namespace
+TEST_CASE("keep-quant Q6_K WMMA tile arm matches the CPU oracle on gfx1100 and RDNA4") {
   const bool rocm_registered = [] {
     for (DeviceType dt : RegisteredDevices())
       if (dt == DeviceType::kROCM) return true;
@@ -3691,7 +3694,10 @@ TEST_CASE("keep-quant Q6_K WMMA tile arm matches the CPU oracle on RDNA4") {
   REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM));
 
   const std::string actual_arch = vt::rocm::DeviceArchName(0);
-  if (!vt::rocm::GcnArchNameIsGfx12PrefillWmma(actual_arch)) return;
+  // Test admission is independent of the production policy: narrowing that
+  // policy must fail dispatch assertions instead of skipping this case.
+  const auto stem = actual_arch.substr(0, actual_arch.find(':'));
+  if (stem != "gfx1100" && stem != "gfx1200" && stem != "gfx1201") return;
 
   // Tile-aligned M and N (both multiples of 16, and not equal, so the grid
   // exercises a non-square m_tiles x n_tiles), K spanning more than one
@@ -3767,7 +3773,7 @@ TEST_CASE("keep-quant Q6_K WMMA tile arm matches the CPU oracle on RDNA4") {
     // site's call in a scratch copy leaves this counter flat and reds this
     // case, which the NMSE checks above cannot do on their own — the scalar
     // fallback would still pass them.
-    CHECK(wmma_after > wmma_before);
+    CHECK((wmma_after > wmma_before) == ExpectQuantWmma());
   }
   rocm.DestroyQueue(q);
 }
@@ -3777,7 +3783,7 @@ TEST_CASE("keep-quant Q6_K WMMA tile arm matches the CPU oracle on RDNA4") {
 // carries a second per-sub-block correction (`dmin * sumi`) Q6_K has no
 // equivalent of, so this is not just the Q6_K case with a different dtype —
 // it exercises a materially different code path in `KQuantGemmKWmmaQ4K`.
-TEST_CASE("keep-quant Q4_K WMMA tile arm matches the CPU oracle on RDNA4") {
+TEST_CASE("keep-quant Q4_K WMMA tile arm matches the CPU oracle on gfx1100 and RDNA4") {
   const bool rocm_registered = [] {
     for (DeviceType dt : RegisteredDevices())
       if (dt == DeviceType::kROCM) return true;
@@ -3787,7 +3793,10 @@ TEST_CASE("keep-quant Q4_K WMMA tile arm matches the CPU oracle on RDNA4") {
   REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM));
 
   const std::string actual_arch = vt::rocm::DeviceArchName(0);
-  if (!vt::rocm::GcnArchNameIsGfx12PrefillWmma(actual_arch)) return;
+  // Test admission is independent of the production policy: narrowing that
+  // policy must fail dispatch assertions instead of skipping this case.
+  const auto stem = actual_arch.substr(0, actual_arch.find(':'));
+  if (stem != "gfx1100" && stem != "gfx1200" && stem != "gfx1201") return;
 
   constexpr int64_t M = 32, N = 48, K = 512;
   constexpr int64_t kBlockBytes = 144;  // sizeof(BlockQ4_K)
@@ -3858,7 +3867,7 @@ TEST_CASE("keep-quant Q4_K WMMA tile arm matches the CPU oracle on RDNA4") {
       CHECK(Nmse(ref, gotf) <= kNmseTol);
     }
     const uint64_t wmma_after = vt::rocm::KQuantWmmaQ4KDispatchCount();
-    CHECK(wmma_after > wmma_before);
+    CHECK((wmma_after > wmma_before) == ExpectQuantWmma());
   }
   rocm.DestroyQueue(q);
 }
@@ -3881,7 +3890,10 @@ TEST_CASE("keep-quant GEMM matches the CPU oracle when M and N are not multiples
   REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM));
 
   const std::string actual_arch = vt::rocm::DeviceArchName(0);
-  if (!vt::rocm::GcnArchNameIsGfx12PrefillWmma(actual_arch)) return;
+  // Test admission is independent of the production policy: narrowing that
+  // policy must fail dispatch assertions instead of skipping this case.
+  const auto stem = actual_arch.substr(0, actual_arch.find(':'));
+  if (stem != "gfx1100" && stem != "gfx1200" && stem != "gfx1201") return;
 
   constexpr int64_t M = 37, N = 50, K = 512;
   struct Fmt {
@@ -3959,7 +3971,7 @@ TEST_CASE("keep-quant GEMM matches the CPU oracle when M and N are not multiples
     // silent full fallback to scalar would pass the NMSE check above just
     // as well, which is exactly why #2109's own real-model measurement
     // needed a hand-trimmed prompt before this fix.
-    CHECK(wmma_after > wmma_before);
+    CHECK((wmma_after > wmma_before) == ExpectQuantWmma());
     rocm.DestroyQueue(q);
   }
 }
@@ -3988,7 +4000,10 @@ TEST_CASE("keep-quant GEMM matches the CPU oracle when only one of M/N is misali
   REQUIRE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM));
 
   const std::string actual_arch = vt::rocm::DeviceArchName(0);
-  if (!vt::rocm::GcnArchNameIsGfx12PrefillWmma(actual_arch)) return;
+  // Test admission is independent of the production policy: narrowing that
+  // policy must fail dispatch assertions instead of skipping this case.
+  const auto stem = actual_arch.substr(0, actual_arch.find(':'));
+  if (stem != "gfx1100" && stem != "gfx1200" && stem != "gfx1201") return;
 
   constexpr int64_t K = 512;
   struct Fmt {
@@ -4074,7 +4089,7 @@ TEST_CASE("keep-quant GEMM matches the CPU oracle when only one of M/N is misali
                                       : vt::rocm::KQuantWmmaQ4KDispatchCount();
       // Reachability: the WMMA arm must still fire for its aligned corner
       // even though one dimension is a remainder-only split.
-      CHECK(wmma_after > wmma_before);
+      CHECK((wmma_after > wmma_before) == ExpectQuantWmma());
       rocm.DestroyQueue(q);
     }
   }

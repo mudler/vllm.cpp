@@ -37,6 +37,10 @@
 
 ## News
 
+- **2026-09** **Quantized Qwen completes smoke runs on Tenstorrent.** Qwen3.8-27B and
+  Qwen3.5-0.8B Q4_K_M completed two prompts each on a Blackhole P150 with
+  `VT_TT_KEEPQUANT_INT8DOT=1`. These runs establish completion only.
+  See the [measurements and limits](docs/benchmarks/tt-keepquant-27b-decode.md).
 - **2026-09** **C ABI 26 exposes more engine controls.** Applications can select the KV cache
   dtype, read speculative acceptance counters, and disable the model-level sliding window.
   See the [C API reference](docs/reference/c-api.md#recent-abi-additions) for defaults and limits.
@@ -360,7 +364,7 @@ hardware-blocked and why, is linked from [Project status](#project-status).
 | **Metal** | Apple Silicon | Two models end to end, 18 of 75 ops native. Prefill ahead of MLX-LM, warm total 97.6% with the MLX provider |
 | **Vulkan** | Portable GPU | `opt-125m` STRICT token-exact; Qwen3.6-27B decode **matches llama.cpp Vulkan** (4.36 vs 4.35, denominator SUPERSEDED, #1003) |
 | **ROCm** | AMD GPUs | Native EXL3 generation on gfx1151, matching the CPU reference. Discrete GPU correctness and competitive performance remain unverified ([evidence](.agents/specs/backend-rocm-exl3.md)) |
-| **Tenstorrent** | Blackhole | OPT-125m strict 6/6; Qwen3 gate wired, full rerun pending |
+| **Tenstorrent** | Blackhole P150 | OPT-125m strict 6/6. Quantized Qwen smoke completion with an opt-in path ([build and limits](docs/BUILD.md#tenstorrent-build-blackhole)) |
 | **Intel XPU / ANE** | Intel, Apple NPU | Spiked or roadmap |
 
 Per-arch build flags, per-op coverage, and the quantization format table:

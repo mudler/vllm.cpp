@@ -141,7 +141,30 @@ cmake --build build-tenstorrent -j
 The Blackhole lane is correctness-focused. OPT-125m passes its strict 6/6
 end-to-end gate. Qwen3-0.6B is selected by the platform and has a device-aware
 near-tie gate plus committed goldens, but the full 16x16 rerun is still pending.
-There is no binding speed result.
+The [capture A/B](benchmarks/tt-capture-default-decode.md) measures Qwen3-0.6B
+against this engine's capture-disabled path. It does not compare reference engines.
+
+### Quantized Qwen smoke runs
+
+Qwen3.8-27B and Qwen3.5-0.8B Q4_K_M completed two prompts each on a Blackhole
+P150. These runs use the opt-in int8-dot path, which computes from compressed
+weights. Set `VT_TT_KEEPQUANT_INT8DOT=1` to select it. An unset, empty, or `0`
+value leaves that path disabled.
+
+After configuring the TT-Metal runtime environment, run this smoke workload
+with a local checkpoint:
+
+```sh
+VT_TT_KEEPQUANT_INT8DOT=1 build-tenstorrent/examples/vllm-bench \
+  --model /path/to/Qwen3.8-27B-Q4_K_M.gguf \
+  --num-prompts 2 --input-len 128 --output-len 32 --concurrency 2 \
+  --num-blocks 64 --max-num-batched-tokens 64 --seed 0
+```
+
+The [smoke measurements](benchmarks/tt-keepquant-27b-decode.md) establish
+completion only, without a token comparison or reference-engine speed result.
+The [keep-quant record](../.agents/specs/tenstorrent-keepquant.md) describes the
+separate correctness gates and remaining work.
 
 ## ROCm build (AMD GPUs)
 

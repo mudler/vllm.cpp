@@ -291,7 +291,33 @@ inline bool ConvShadowServeable(const void*, int64_t, int64_t, int64_t) {
 }
 #endif
 
-// ITEM 5 (RAC): stage the persistent device update-idx / page-table tensors
+// Snapshot/restore the device shadow state for a set of GDN state buffers.
+// The decode graph warmup modifies the GDN state in place; the capture step
+// then reads the modified state, which has a different shape than the eager
+// warmup saw. Saving before the warmup and restoring before the capture
+// ensures both passes see the same initial state.
+#ifdef VLLM_CPP_TENSTORRENT
+// Opaque snapshot: the implementation stores the ttnn::Tensor and slot
+// fields internally; the header only exposes the struct size for stack
+// allocation. The model code passes the snapshot through without
+// inspecting it.
+struct GdnStateShadowSnapshot {
+  // Opaque storage for ttnn::Tensor + uint32 + bool fields.
+  alignas(16) char storage[64];
+};
+std::vector<GdnStateShadowSnapshot> SnapshotGdnStateShadows(
+    const std::vector<const void*>& ptrs);
+void RestoreGdnStateShadows(
+    const std::vector<const void*>& ptrs,
+    const std::vector<GdnStateShadowSnapshot>& snapshots);
+#else
+struct GdnStateShadowSnapshot {};
+inline std::vector<GdnStateShadowSnapshot> SnapshotGdnStateShadows(
+    const std::vector<const void*>&) { return {}; }
+inline void RestoreGdnStateShadows(
+    const std::vector<const void*>&,
+    const std::vector<GdnStateShadowSnapshot>&) {}
+#endif
 // for THIS slot mapping, outside capture (driver Refresh slot). No-op unless
 // VT_TT_HOST_FREE_DECODE. slot_mapping_owner is the host buffer the captured
 // ReshapeAndCache will see as its slot_mapping (keyed identity). page_table is

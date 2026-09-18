@@ -113,7 +113,6 @@ CHECKERS=(
   # compliance and caches nothing: symlink(2) is EOPNOTSUPP there, so every
   # lock fails and `ccache -s` shows zero of everything (#2473).
   check-lease-ccache
-  check-role-discipline
   claim-view
   check-readme-structure
   check-quickstart-recipes

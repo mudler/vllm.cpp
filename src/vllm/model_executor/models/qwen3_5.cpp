@@ -12285,10 +12285,23 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   // used). (Re)allocate the persistent hidden buffer to this size.
   s.hidden = std::make_unique<DBuf>(d, DType::kBF16, std::vector<int64_t>{S, H});
   DenseEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
+  // Snapshot the GDN state device shadows before the warmup modifies them.
+  // The warmup runs a real decode step that commits new state shapes; the
+  // capture step must see the SAME initial state as the warmup did, so the
+  // program cache hits (same shapes → same hashes).
+  std::vector<const void*> gdn_ptrs;
+  for (const auto& gs : gdn_state) {
+    gdn_ptrs.push_back(gs.ssm_state.data);
+    gdn_ptrs.push_back(gs.conv_state.data);
+  }
+  auto gdn_snapshot = vt::tenstorrent::SnapshotGdnStateShadows(gdn_ptrs);
   DBuf lg = DenseForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
                                s.gdn_meta, attn_kv, gdn_state, impl_->weights,
                                impl_->config, {}, nullptr, nullptr, aux_ids_arg,
                                aux_out_arg);
+  // Restore the GDN state device shadows so the capture step sees the
+  // same initial state as the warmup did.
+  vt::tenstorrent::RestoreGdnStateShadows(gdn_ptrs, gdn_snapshot);
   s.warm = true;
   // #1380: the cold step is the ONE eager run of this exact forward at this exact
   // shape, so it is where the capture's allocation demand is measurable. Recorded

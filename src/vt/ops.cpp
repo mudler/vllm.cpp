@@ -1625,6 +1625,20 @@ void SiluAndMul(Queue& q, Tensor& out, const Tensor& x) {
   reinterpret_cast<SiluAndMulFn>(GetOp(OpId::kSiluAndMul, q.device.type))(q, out, x);
 }
 
+void ClampedSwiGLU(Queue& q, Tensor& out, const Tensor& gate_up, float limit) {
+  VT_CHECK(gate_up.rank == 2 && out.rank == 2, "clamped_swiglu: rank-2 required");
+  VT_CHECK(gate_up.shape[1] % 2 == 0, "clamped_swiglu: inner dim must be even");
+  VT_CHECK(out.shape[0] == gate_up.shape[0] && out.shape[1] == gate_up.shape[1] / 2,
+           "clamped_swiglu: output shape mismatch");
+  VT_CHECK(IsFloat(gate_up.dtype) && IsOutFloat(out.dtype),
+           "clamped_swiglu: float in, f32/bf16 out");
+  VT_CHECK(gate_up.IsContiguous() && out.IsContiguous(), "clamped_swiglu: contiguous required");
+  VT_CHECK(gate_up.device == out.device && gate_up.device == q.device,
+           "clamped_swiglu: device mismatch");
+  reinterpret_cast<ClampedSwiGLUFn>(GetOp(OpId::kClampedSwiGLU, q.device.type))(
+      q, out, gate_up, limit);
+}
+
 void GeluAndMul(Queue& q, Tensor& out, const Tensor& x) {
   VT_CHECK(x.rank == 2 && out.rank == 2, "gelu_and_mul: rank-2 required");
   VT_CHECK(x.shape[1] % 2 == 0, "gelu_and_mul: inner dim must be even");

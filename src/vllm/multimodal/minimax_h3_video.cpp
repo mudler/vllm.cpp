@@ -372,26 +372,35 @@ std::unique_ptr<MiniMaxH3VideoEngine> MiniMaxH3VideoEngine::Load(
   }
   const bool cuda = im.device.type != vt::DeviceType::kCPU;
   bool have_streamed = false;
+
+  // Resolve load-time LoRA adapters from the extras seam (row ROAD-V1-DIT-LORA).
+  // The extras carry indexed `lora_path` / `lora_strength` pairs, the same
+  // convention LTX2.5 uses. An empty result means no fusion.
+  MiniMaxH3DitLoadOptions dit_options;
+  for (DitLoraSpec& spec : ResolveDitLoraSpecs(params.extras)) {
+    dit_options.loras.push_back(std::move(spec));
+  }
+
   if (EndsWith(params.dit_path, ".gguf")) {
     const GgufFile f = GgufFile::Open(params.dit_path);
     if (params.dequant_bf16 != 0 && cuda) {
       // STREAM straight onto the device: dequantize + upload one tensor at a
       // time so the host copy never accumulates (peak kills unified memory).
-      im.streamed = StreamMiniMaxH3DitToDeviceBf16(stream_queue, f, &im.dit.params);
+      im.streamed = StreamMiniMaxH3DitToDeviceBf16(stream_queue, f, &im.dit.params, dit_options);
       have_streamed = true;
     } else if (params.dequant_bf16 != 0) {
-      im.dit = LoadMiniMaxH3DitFromGgufBf16(f);
+      im.dit = LoadMiniMaxH3DitFromGgufBf16(f, dit_options);
     } else {
-      im.dit = LoadMiniMaxH3DitFromGguf(f, /*keep_quant=*/true);
+      im.dit = LoadMiniMaxH3DitFromGguf(f, /*keep_quant=*/true, dit_options);
     }
   } else if (MiniMaxH3ShardedCheckpoint::IsShardedDir(params.dit_path)) {
     const MiniMaxH3ShardedCheckpoint ckpt = MiniMaxH3ShardedCheckpoint::Open(params.dit_path);
     if (cuda) {
-      im.streamed = StreamMiniMaxH3ShardedToDeviceBf16(stream_queue, ckpt, &im.dit.params);
+      im.streamed = StreamMiniMaxH3ShardedToDeviceBf16(stream_queue, ckpt, &im.dit.params, dit_options);
       have_streamed = true;
     } else {
       // Host f32 reference path — usable only on a reduced checkpoint.
-      im.dit = LoadMiniMaxH3DitFromShards(ckpt);
+      im.dit = LoadMiniMaxH3DitFromShards(ckpt, dit_options);
     }
   } else {
     const SafetensorsFile f = SafetensorsFile::Open(params.dit_path);
@@ -400,11 +409,11 @@ std::unique_ptr<MiniMaxH3VideoEngine> MiniMaxH3VideoEngine::Load(
       // and routes quantized projections through the Marlin W4A16 GEMM; the
       // default bf16 stream dequantizes on the way up.
       im.streamed = params.fp4_resident != 0
-                        ? StreamMiniMaxH3Nvfp4ToDeviceFp4(stream_queue, f, &im.dit.params)
-                        : StreamMiniMaxH3Nvfp4ToDeviceBf16(stream_queue, f, &im.dit.params);
+                        ? StreamMiniMaxH3Nvfp4ToDeviceFp4(stream_queue, f, &im.dit.params, dit_options)
+                        : StreamMiniMaxH3Nvfp4ToDeviceBf16(stream_queue, f, &im.dit.params, dit_options);
       have_streamed = true;
     } else {
-      im.dit = LoadMiniMaxH3DitFromNvfp4(f);
+      im.dit = LoadMiniMaxH3DitFromNvfp4(f, dit_options);
     }
   }
 
@@ -537,10 +546,34 @@ MiniMaxH3VideoResult MiniMaxH3VideoEngine::Generate(const MiniMaxH3VideoGenParam
     throw std::runtime_error("minimax_h3 video: output_dir is required");
   }
 
+  // Parse `<lora:name:strength>` tags from the prompt and load the referenced
+  // adapters. The cleaned prompt (tags stripped) is used for text conditioning,
+  // so the tags never reach the text encoder. Mirrors sd.cpp's
+  // `parse_loras_from_prompt` (gosd.cpp:174-330). `lora_dir` is a model-load
+  // extra (MiniMaxH3VideoModelParams::extras); when absent, no parsing happens
+  // and the prompt is used verbatim.
+  const auto lora_dir_it = im.params.extras.find(kDitLoraDirExtra);
+  const std::string lora_dir =
+      lora_dir_it != im.params.extras.end() ? lora_dir_it->second : "";
+  const DitParseLoraResult lora_parsed =
+      lora_dir.empty() ? DitParseLoraResult{{}, gen.prompt}
+                        : DitParseLoraTags(gen.prompt, lora_dir);
+  const std::string& prompt = lora_parsed.clean_prompt;
+
+  DitRuntimeLoraState lora_state;
+  if (!lora_parsed.loras.empty()) {
+    const std::vector<MiniMaxH3TensorSpec> contract = EnumerateMiniMaxH3DitTensors(p);
+    std::vector<std::string> names;
+    names.reserve(contract.size());
+    for (const MiniMaxH3TensorSpec& spec : contract) names.push_back(spec.name);
+    lora_state = DitLoadRuntimeLoras(lora_parsed.loras, names,
+                                     {"model.diffusion_model.", "diffusion_model."}, im.device);
+  }
+
   // ── conditioning ───────────────────────────────────────────────────────────
   std::vector<float> conditioning;
-  if (im.has_encoder && !gen.prompt.empty()) {
-    conditioning = im.EncodePrompt(gen.prompt);
+  if (im.has_encoder && !prompt.empty()) {
+    conditioning = im.EncodePrompt(prompt);
   } else if (!im.prompt_embeds.empty()) {
     conditioning = im.prompt_embeds;
   } else {
@@ -715,7 +748,8 @@ MiniMaxH3VideoResult MiniMaxH3VideoEngine::Generate(const MiniMaxH3VideoGenParam
   // ── generate ───────────────────────────────────────────────────────────────
   const MiniMaxH3T2vaResult out = MiniMaxH3GenerateT2va(
       im.device, request, p, im.dit.weights, im.video_cfg, im.video_weights, im.audio_cfg,
-      im.audio_weights, conditioning, noise_video, noise_audio, vt::DType::kBF16, im.prestaged);
+      im.audio_weights, conditioning, noise_video, noise_audio, vt::DType::kBF16, im.prestaged,
+      lora_state.empty() ? nullptr : &lora_state);
 
   // ── artifacts (the library WRITES these, spawns nothing) ───────────────────
   std::error_code ec;
@@ -785,6 +819,14 @@ MiniMaxH3VideoModelParams MiniMaxH3VideoModelParamsFromGeneric(const VideoModelP
   mp.dequant_bf16 = params.dequant_bf16;
   mp.fp4_resident = params.fp4_resident;
   mp.encoder_max_layers = params.encoder_max_layers;
+  // Pass through LoRA-related extras (row ROAD-V1-DIT-LORA). `partition` is
+  // already extracted above; every other known key is a LoRA index or the
+  // runtime LoRA directory (ROAD-V1-LORA-RUNTIME).
+  for (const auto& [key, val] : params.extras) {
+    if (key != "partition" && (IsDitLoraExtra(key) || key == kDitLoraDirExtra)) {
+      mp.extras[key] = val;
+    }
+  }
   return mp;
 }
 
@@ -806,6 +848,9 @@ VideoModelParams MiniMaxH3VideoModelParamsToGeneric(const MiniMaxH3VideoModelPar
   // Only set the key when there is something to say: an empty value would read
   // as "declared as the empty partition" to a caller inspecting the map.
   if (!params.partition.empty()) out.extras["partition"] = params.partition;
+  for (const auto& [key, val] : params.extras) {
+    out.extras[key] = val;
+  }
   return out;
 }
 

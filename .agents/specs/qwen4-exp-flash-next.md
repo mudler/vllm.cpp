@@ -10286,6 +10286,41 @@ negligible. Issue
 [#1958](https://github.com/mudler/vllm.cpp/issues/1958) is closed; the fix is
 owned by row `SAMPLE-CORE` (spec: `.agents/specs/sampling-controls-c7.md`).
 
+### THE NEXT ROW, NAMED: keep the GDN projections quantized by permuting a vector (2026-09-14)
+
+The attribution found that **61% of decode weight traffic is a load-time bf16
+expansion**: the V-head reorder the released 16-vs-48 config forces cannot be
+applied to a k-quant block stream, so `attn_qkv`, `attn_gate`, `ssm_beta`,
+`ssm_alpha` and `ssm_out` of all 36 GDN layers are dequantized at load --
+**4.152 GB/step against 1.508 GB in the file**. `qwen4_exp_weights.cpp:292-302`
+states the cost against itself.
+
+**The fix that comment does not consider is to permute a VECTOR instead of the
+weight.** For a GEMV, a ROW permutation satisfies `(P W) x = P (W x)` (permute
+the output) and a COLUMN permutation satisfies `(W P) x = W (P x)` (permute the
+input). Both are exact re-indexings, so both are BIT-IDENTICAL, and both are O(n)
+on a vector of at most 10,240 elements against 115 MB of weight traffic per
+layer. **This covers `ssm_out`'s column reorder**, the case the comment calls
+unavailable -- because it only considered permuting the weight.
+
+| | bytes/step | floor at 273 GB/s | |
+|---|---|---|---|
+| today | 6.792 GB | 24.88 ms | ~40 tok/s |
+| ROW reorders only (73% of the expansion) | ~4.81 GB | 17.6 ms | ~57 tok/s |
+| **all five** | **4.148 GB** | **15.19 ms** | **~66 tok/s** |
+
+**THE ONE WAY THIS DISAPPOINTS, and it must be measured rather than assumed:**
+freeing the bytes moves these operands from cuBLAS bf16 GEMV, which achieves
+162.3 GB/s here, to our own `QuantDotGemm*` family, which achieves 93.4 GB/s. A
+1.7x lower achieved rate against a 2.75x lower byte count is still a win, but the
+margin is smaller than the byte ratio suggests and the trade is the thing to
+measure first.
+
+Scoped in `ISSUE-LOCAL-01M2ENTH6YA5FWEDY6CFHF4NAM`, which also lists the
+correctness risk that is the actual work: the reorder exists so every downstream
+consumer sees HF V-head order, and permuting vectors moves that obligation to the
+conv, the delta rule and the gate.
+
 ### THE GAP IS A 13x MEMORY-EFFICIENCY DEFICIT, NOT A CEILING (2026-09-13)
 
 Derived from the model's config and this row's measured step, no GPU needed.
@@ -10313,6 +10348,235 @@ Owed, and it is the next row: a per-kernel bandwidth attribution over the 68.9%
 that is GEMM, from shapes rather than from `ncu` (which refuses here). See
 `ISSUE-LOCAL-01M2EK69SESGH6ST1ESMFZC808`, which also records why the q/k/v merge
 is NOT the place to start.
+
+### THE PER-KERNEL BANDWIDTH ATTRIBUTION, and it FALSIFIES the 4%-of-peak figure above (2026-09-14)
+
+Derived from `tests/vllm/models/qwen4_exp_gguf_manifest.inc` (the committed
+header manifest of the released UD-IQ1_S artifact: every tensor's ggml type id
+and dims), the loader's residency rules, and the measured kernel table below.
+**No GPU, no lease and no `ncu`** -- which is the point, because `ncu` refuses on
+this fleet with `ERR_NVGPUCTRPERM`.
+
+**THE HEADLINE IS A CORRECTION, AND THE SECTION IT CORRECTS IS THE ONE DIRECTLY
+ABOVE.** That section says the step moves **~0.85 GB** and therefore sustains
+**11.0 GB/s, 4.0% of peak**. Read off the artifact's own type ids, the decode
+step moves **6.792 GB of GEMM weight operands**, which is **8.0x** its figure,
+and the step therefore sustains **88.3 GB/s against 76.9 ms of kernel time:
+32.4% of GB10's ~273 GB/s**. Nothing in the decode path is at 1-5% of peak. The
+lowest measured row is at 15%.
+
+#### Where the 0.85 GB went wrong, in four parts
+
+| | the section above | the manifest |
+|---|---|---|
+| active GEMM params/token | 4.231 G | **6.625 G** |
+| average width | IQ1_S, ~1.6 bit | **8.20 bit** |
+| bytes/step | ~0.85 GB | **6.792 GB** |
+
+1. **It priced the whole model at IQ1_S.** IQ1_S is 68 of the 96 routed expert
+   gate/up towers and NOTHING else. `ffn_down_exps` is IQ4_NL (4.5 bit), the
+   remaining 28 gate/up towers are IQ2_XXS, the shared experts are Q5_K/Q6_K/Q8_0,
+   the hyper-connections are Q8_0 (8.5 bit), and `output.weight` is Q4_K.
+   The artifact's whole type histogram, from the manifest, is **557 F32, 244 Q8_0,
+   212 Q5_K, 68 IQ1_S, 49 IQ4_NL, 40 Q6_K, 28 IQ2_XXS, 24 BF16, 2 Q4_K** over
+   1,224 tensors. There is **no Q5_0 in this file at all**, which is worth saying
+   because this row's briefing prose has described the expert towers as
+   "IQ4_NL/Q5_0": down is IQ4_NL, gate/up are IQ1_S and IQ2_XXS, and the 49th
+   IQ4_NL tensor is `per_layer_token_embd`.
+2. **It omitted whole stages.** The hyper-connections are **668.4 MB/step** (four
+   Q8_0 `[10240,320]`/`[320,10240]` projections in every one of 48 layers), the
+   `lm_head` is **357.6 MB**, and the MoE router is **125.8 MB**. None appears in
+   its arithmetic.
+3. **It gave all 48 layers the same attention.** 36 are Gated DeltaNet with much
+   wider projections and 12 are QSA.
+4. **AND THE LARGEST TERM IS NOT IN THE FILE AT ALL.** See the next subsection.
+
+#### 61% OF THE STEP'S TRAFFIC IS A LOAD-TIME bf16 EXPANSION
+
+`qwen4_exp_weights.cpp:277-395` reorders the V heads of every Gated DeltaNet
+projection from HF's grouped order into ggml's tiled order, and a k-quant
+superblock spans elements that permutation moves. So on the released
+`linear_num_key_heads` 16 vs `linear_num_value_heads` 48 config the reorder is
+ALWAYS on, and `attn_qkv`, `attn_gate` and `ssm_out` of all 36 linear layers
+**dequantize to bf16 at load** (`DequantAll` then `Bf16From`, three call sites,
+no keep-quant arm). The file's own comment at `:300-302` states this and is
+correct; what has never been written down is its size.
+
+```
+  36 layers x (52.43 + 31.46 + 31.46) MB bf16   =  4.152 GB / step
+  the same tensors in their file encoding        =  1.508 GB / step
+                                                    -------  2.75x
+```
+
+**That single loader property is 61% of every decode step's weight traffic**, and
+it is also why cuBLAS appears at all in a keep-quant model: an elementwise bf16
+weight leaves `vt::MatmulBT`'s block-quant branch (`src/vt/ops.cpp:192-195`) and
+lands in cuBLAS `gemvx`, while every block-quant weight goes to `QuantDotGemm*`.
+The 34.8%/34.1% split in the kernel table IS that dtype split.
+
+#### The attribution, ranked by achieved bandwidth ASCENDING
+
+Only four rows of the capture carry a committed average duration; see
+"What is NOT attributed" below.
+
+| kernel | call site | weight | K x N | dtype | MB/call | calls/step | measured avg | achieved | % of 273 |
+|---|---|---|---|---|---|---|---|---|---|
+| `QuantDotGemmGroupedKernel` | `qwen4_exp_moe.cpp:190` | `ffn_gate_exps`/`ffn_up_exps`, 10 of 512 | 2560x640 | IQ1_S | 3.200 | 68 | 77 us (1) | **41.6 GB/s** | **15.2%** |
+| `QuantDotGemmGrouped32Kernel` | `qwen4_exp_moe.cpp:190` | `ffn_down_exps`, 10 of 512 | 640x2560 | IQ4_NL | 9.216 | 48 | 163 us (1) | **56.5 GB/s** | **20.7%** |
+| cuBLAS `internal::gemvx::kernel` #1 | GDN in/out projections | two of `attn_qkv`/`attn_gate`/`ssm_out` | see (2) | bf16, EXPANDED | 31.46-41.94 | 71.9 | 244 us | **129-172 GB/s** | **47-63%** |
+| `QuantDotGemmKernel<WType 4, float>` | `qwen4_exp_registry.cpp:1032` | `output.weight` | 2560x248320 | Q4_K | 357.581 | 1.0 | 2.49 ms | **143.6 GB/s** | **52.6%** |
+
+(1) These two averages come from the **~1600-token capture** at `ee0644eab`, not
+from the 400/600-token capture the rest of this section uses. Instance counts are
+context-free (one grouped call per tower per layer) but the durations are not
+guaranteed to transfer. Treat them as indicative and re-read them from the
+retained `4e36bbae` capture.
+
+(2) 244 us x 71.9 calls = 17.53 ms, and the whole cuBLAS group is 26.76 ms for
+4.343 GB. **The small-weight readings are therefore impossible and are excluded
+by arithmetic, not by preference**: if row #1 were `ssm_alpha`+`ssm_beta`
+(72 calls, 0.246 MB each) the remaining 4.15 GB would have to move in 9.23 ms,
+i.e. at 450 GB/s, above the machine. Row #1 is two of the three large GDN
+projections. WHICH two the committed record does not say, so the row is given as
+a range: 31.46 MB/call if it is `attn_gate`+`ssm_out`, 41.94 MB/call if it pairs
+`attn_qkv` with one of them.
+
+#### Group level, which is where the answer actually is
+
+| family | bytes/step | measured | achieved | % of 273 |
+|---|---|---|---|---|
+| cuBLAS `gemvx` + `gemv2T` + `splitKreduce` (elementwise bf16) | 4.343 GB | 26.76 ms | **162.3 GB/s** | **59.5%** |
+| our `QuantDotGemm*` (block-quant) | 2.449 GB | 26.22 ms | **93.4 GB/s** | **34.2%** |
+| all GEMM/GEMV | 6.792 GB | 52.98 ms | 128.2 GB/s | 47.0% |
+| the whole step, kernel time | 6.792 GB | 76.9 ms | **88.3 GB/s** | **32.4%** |
+| the whole step, wall | 6.792 GB | 87.6 ms | 77.5 GB/s | 28.4% |
+
+**So the ranking the next row needs is the opposite of the one it was going to
+inherit.** cuBLAS is the larger half of the GEMM bill because it moves 1.8x the
+bytes, not because it is slow: at 59.5% of peak it is the MORE efficient half.
+Our own grouped k-quant kernels are the least efficient measured rows at 15-21%.
+
+#### THE FLOOR IS NOT 320 tok/s AND THE HEADROOM IS NOT 20x
+
+| | bytes/step | floor at 273 GB/s | implied ceiling |
+|---|---|---|---|
+| the section above | 0.85 GB | 3.1 ms | 320 tok/s |
+| **as this engine loads it today** | **6.792 GB** | **24.88 ms** | **40 tok/s** |
+| **with the GDN expansion removed** | **4.148 GB** | **15.19 ms** | **66 tok/s** |
+
+The middle row is the one that changes a plan: **at 6.792 GB per step the memory
+system cannot deliver 66 tok/s on this artifact at all**, so the GDN keep-quant
+repair is not an optimisation among others, it is the precondition for the target
+being reachable. And the bottom row lands on **66 tok/s**, against sojufx's
+measured 66.17. That is a coincidence of rounding and not a derivation of the
+reference's rate -- sojufx runs a ~4-bit NVFP4 checkpoint with a different active
+set -- but it does say the reference is operating AT the memory floor of an
+equivalently-sized artifact, and we are at 3.1x of ours rather than 20x.
+
+#### The full byte inventory, per call site, per step
+
+Every GEMM operand the decode path reads, from the manifest. `calls/step` is
+derived from the architecture (48 layers, 36 GDN + 12 QSA, MoE top-10 of 512 plus
+a shared expert) and cross-checks against the capture wherever the capture names
+an instance count.
+
+| call site | K x N | dtype | MB/call | calls/step | MB/step | served by |
+|---|---|---|---|---|---|---|
+| GDN `in_proj_qkv` (`attn_qkv`) | 2560x10240 | bf16 EXPANDED from Q5_K/Q6_K | 52.429 | 36 | **1887.4** | cuBLAS |
+| GDN `in_proj_z` (`attn_gate`) | 2560x6144 | bf16 EXPANDED | 31.457 | 36 | **1132.5** | cuBLAS |
+| GDN `out_proj` (`ssm_out`) | 6144x2560 | bf16 EXPANDED from Q6_K | 31.457 | 36 | **1132.5** | cuBLAS |
+| MoE `ffn_down_exps` x10 | 640x2560 | IQ4_NL | 9.216 | 48 | 442.4 | `QuantDotGemmGrouped32Kernel` |
+| `lm_head` `output.weight` | 2560x248320 | Q4_K | 357.581 | 1 | 357.6 | `QuantDotGemmKernel<4,float>` |
+| QSA q+gate (`attn_q`) | 2560x12288 | Q5_K | 21.627 | 12 | 259.5 | `QuantDotGemm*` Q5_K |
+| hyper-connection `hc_attn_down` | 10240x320 | Q8_0 | 3.482 | 48 | 167.1 | `QuantDotGemmQ8_0Kernel` |
+| hyper-connection `hc_attn_up` | 320x10240 | Q8_0 | 3.482 | 48 | 167.1 | `QuantDotGemmQ8_0Kernel` |
+| hyper-connection `hc_ffn_down` | 10240x320 | Q8_0 | 3.482 | 48 | 167.1 | `QuantDotGemmQ8_0Kernel` |
+| hyper-connection `hc_ffn_up` | 320x10240 | Q8_0 | 3.482 | 48 | 167.1 | `QuantDotGemmQ8_0Kernel` |
+| QSA `o_proj` (`attn_output`) | 6144x2560 | Q5_K | 10.813 | 12 | 129.8 | `QuantDotGemm*` Q5_K |
+| MoE router `ffn_gate_inp` | 2560x512 | bf16 EXPANDED from F32 | 2.621 | 48 | 125.8 | cuBLAS |
+| MoE `ffn_gate_exps` | 2560x640 | IQ1_S | 3.200 | 34 | 108.8 | `QuantDotGemmGroupedKernel` |
+| MoE `ffn_up_exps` | 2560x640 | IQ1_S | 3.200 | 34 | 108.8 | `QuantDotGemmGroupedKernel` |
+| shared-expert down | 640x2560 | Q8_0 | 1.741 | 48 | 83.6 | `QuantDotGemmQ8_0Kernel` |
+| MoE `ffn_gate_exps` | 2560x640 | IQ2_XXS | 4.224 | 14 | 59.1 | `QuantDotGemm*` IQ2_XXS |
+| MoE `ffn_up_exps` | 2560x640 | IQ2_XXS | 4.224 | 14 | 59.1 | `QuantDotGemm*` IQ2_XXS |
+| shared-expert gate | 2560x640 | Q5_K x34 / Q6_K x14 | 1.126-1.344 | 48 | 54.3 | `QuantDotGemm*` |
+| shared-expert up | 2560x640 | Q5_K x34 / Q6_K x14 | 1.126-1.344 | 48 | 54.3 | `QuantDotGemm*` |
+| QSA indexer `q_proj` | 2560x512 | BF16 in file | 2.621 | 12 | 31.5 | cuBLAS |
+| PLE `ple_key` | 2560x10240 | Q8_0 | 27.853 | 1 (3) | 27.9 | `QuantDotGemmQ8_0Kernel` |
+| GDN `in_proj_a`/`in_proj_b` | 2560x48 | bf16 EXPANDED from F32 | 0.246 | 72 | 17.7 | cuBLAS |
+| QSA `k_proj` + `v_proj` | 2560x512 | Q5_K | 0.901 | 24 | 21.6 | `QuantDotGemm*` Q5_K |
+| QSA indexer `k_proj` | 2560x128 | BF16 in file | 0.655 | 12 | 7.9 | cuBLAS |
+| PLE `ple_value` | 2560x2560 | Q8_0 | 6.963 | 1 (3) | 7.0 | `QuantDotGemmQ8_0Kernel` |
+| final `output_hc_down`/`_up` | 10240x320 | Q8_0 | 3.482 | 2 | 7.0 | `QuantDotGemmQ8_0Kernel` |
+| `hc_attn_inject`/`hc_ffn_inject` | 10240x4 | bf16 EXPANDED from F32 | 0.082 | 96 (4) | 7.9 | cuBLAS |
+| **TOTAL** | | | | | **6792** | |
+
+(3) `QuantDotGemmQ8_0Kernel`'s measured **242.0** calls/step is 192 hyper-connection
++ 48 shared-expert-down + the 2 final-block projections, with NO room for PLE's
+two Q8_0 GEMMs. So the count is evidence that **the PLE block does not run on a
+decode step**; if that reading is right the total is 6.757 GB and every ratio in
+this section moves by 0.5%. The rows are kept in the inventory because the
+alternative pairing (PLE in, final block out) also sums to 242 and the capture
+cannot separate them.
+(4) `hc_*_inject` IS a `LoadMatmul` operand (`qwen4_exp_weights.cpp:270-273`),
+N = `hc_count` 4, so it is a real GEMV. 0.12% of the total.
+
+#### THE COUNTS CROSS-CHECK, and that is what makes the mapping more than a guess
+
+Three instance counts in the capture are matched EXACTLY by the architecture, and
+none of the three was fitted:
+
+| capture | per step | architecture | matches |
+|---|---|---|---|
+| `QuantDotGemmQ8_0Kernel` 145,200 / 600 | **242.0** | 4 hc x 48 + shexp-down x 48 + 2 | **242** |
+| `gemvx` #1 43,128 / 600 | **71.9** | two of three GDN dense projections x 36 | **72** |
+| `QuantDotGemmGroupedKernel` 35,816 / 527 | **67.96** | IQ1_S gate/up towers, 34 layers x 2 | **68** |
+| `QuantDotGemmGrouped32Kernel` 25,277 / 527 | **47.96** | `ffn_down_exps`, one grouped call per layer | **48** |
+| `QuantDotGemmKernel<WType 4, float>` 600 / 600 | **1.0** | `output.weight`, the ONLY Q4_K GEMM operand | **1** |
+
+The 68 is the sharper one. 68 is not a divisor of 48, 36 or 12, and it is not a
+count of layers at all: it is the number of expert gate/up TOWERS whose file type
+is IQ1_S (34 layers x 2 towers), the other 28 being IQ2_XXS and landing in a
+different template instantiation. It also confirms, independently of any grep,
+that gate and up are issued as SEPARATE grouped calls -- this model does not use
+`layers::MlpGateUpMethodBase` or `vt::MergedGemmGroup`, exactly as the seam
+section above says.
+
+#### What is NOT attributed, and what would close it
+
+- **Ten of the roughly fourteen GEMM rows have no committed average duration.**
+  Only the group totals (26.76 ms and 26.22 ms) and four individual rows were
+  ever written down; the full 25-row `nsys stats` output was not committed. The
+  capture `4e36bbae` is retained, so re-running `nsys stats` on it closes this
+  with a two-minute lease and no model load, exactly as `fe5be663` did.
+- **Which two of the three large GDN projections form `gemvx` row #1**, hence the
+  129-172 GB/s range on that row.
+- **The two grouped-kernel durations are cross-capture** (note (1)).
+- **`QuantDotGemmQ8_0Kernel`'s 242 resolves two ways**: 192 hc + 48 shared-expert
+  down + the 2 final-block hc projections, or the same with PLE's 2 calls instead
+  of the final block's. The difference is 28 MB/step, 0.4%.
+- **Whether the PLE block runs on every decode step.** Note (3) argues from the
+  242 count that it does not. 34.9 MB/step, 0.5%, and it changes no conclusion.
+- **KV-cache traffic is excluded.** This is the weight budget only.
+  `QsaGatherAttentionKernel`'s 18.15 ms is not a weight read and is not in any
+  ratio above.
+- **Activation traffic is excluded**, which is correct at batch 1: the activation
+  is ~5 KB against tens of MB of weights per call, under 0.1%.
+
+#### What this row should do next, in this order
+
+1. **Keep the Gated DeltaNet projections quantized.** 2.644 GB/step, 39% of all
+   traffic, and the only item that moves the floor from 40 tok/s to 66. The
+   reorder is the obstacle; it is a V-head PERMUTATION of whole rows for
+   `attn_qkv` and `attn_gate`, which a block stream can express as a row
+   permutation, and a COLUMN permutation for `ssm_out`, which it cannot
+   (`qwen4_exp_weights.cpp:300-302` already says so). So two of the three are
+   probably recoverable and the third needs its own answer.
+2. **Then the grouped k-quant kernels at 15-21% of peak**, which is the only
+   genuinely low efficiency the attribution found, over 778 MB/step.
+3. **Do NOT start from the q/k/v merge**, for the reason the issue already gives
+   and which this attribution now quantifies: at batch 1 the activation is under
+   0.1% of the bytes a GEMV moves.
 
 ### THE FULL DECODE KERNEL TABLE, and a retraction: the lead is GEMM, not QSA (2026-09-13)
 

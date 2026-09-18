@@ -25,6 +25,32 @@
 // correct permutation from no permutation or from the permutation run
 // backwards. 2-by-3 is neither, and it is the released model's own ratio
 // (16 key heads to 48 value heads).
+//
+// ─── WHAT THIS SUITE DOES NOT REACH, STATED SO IT IS NOT READ AS COVERAGE ────
+//
+// (a) THE WIDTH AND THE OPERAND. Every case below runs `value_dim` 96 through
+//     the bf16 CPU `Matmul`, on an `out_proj` built `[value_dim, H]` with `nk`
+//     UNSET. The released path is `value_dim` 6144 on an `[H, value_dim]`
+//     `nk = true` Q6_K operand through `QuantDotGemm*`. The `bad == 0` reading
+//     below is therefore a measurement of THIS fixture, not a property of the
+//     released reduction; `test_qwen4_exp_layer_loop.cpp`'s deferred subcase is
+//     the one that runs the released `[H, value_dim]` `nk = true` orientation.
+//
+// (b) TWO OF THE FIVE PERMUTE SITES. `GdnBlockPagedForTest` enters
+//     `GdnBlockPaged` only, so the out-projection permutation in `GdnBlock`
+//     (`qwen3_5.cpp:4741`) and in `GdnBlockPagedMixedSpec` (`:5251`) is
+//     UNTESTED here. It is also unreached: `GdnBlock` is called only from
+//     qwen3_5's own non-paged layer loop, whose loaders all leave
+//     `v_head_perm_key_heads == 0`, and `GdnBlockPagedMixedSpec` is reached
+//     from `GdnBlockPaged` only under an active speculator at concurrency > 1,
+//     which `qwen4_exp_forward.cpp` does not configure. Both carry the site so
+//     that a future speculator or a non-paged qwen4exp arm cannot silently drop
+//     it; testing them today would mean testing an unreachable path.
+//
+// (c) THE COST AXIS. The permutation is O(T * N) per layer per forward, so it
+//     is net-negative per DECODE step and net-positive for one large prefill
+//     step in isolation (breakeven T ~= 817). Nothing here measures either side
+//     — see `LoadGdn` for the arithmetic and `## Owed` for the measurement.
 
 #include <doctest/doctest.h>
 
@@ -176,8 +202,12 @@ GdnLayerWeights MakeGroupedWeights(const Dims& d) {
 // that is the loader's rule and it is what confines the run-time permutation to
 // the projection boundary.
 //
-// `flip` inverts the direction on one tensor and is the RED-FIRST: a vector
-// permuted the wrong way must be visible in the output.
+// `which_flipped` inverts the direction on EXACTLY ONE tensor and is the
+// RED-FIRST: a vector permuted the wrong way must be visible in the output.
+// The five indices are 0 `in_proj_qkv`, 1 `in_proj_z`, 2 `in_proj_b`,
+// 3 `in_proj_a`, 4 `out_proj`. `b` and `a` used to share index 2 and flip
+// TOGETHER, so neither was ever convicted on its own: a block that permuted
+// only one of them reddened anyway on the other's contribution.
 GdnLayerWeights MakeTiledWeights(const Dims& d, const GdnLayerWeights& ref,
                                  int which_flipped = -1) {
   GdnLayerWeights w = ref;
@@ -197,15 +227,19 @@ GdnLayerWeights MakeTiledWeights(const Dims& d, const GdnLayerWeights& ref,
   auto r2 = (which_flipped == 2) ? kk : rr;
   StoreBf16(w.in_proj_b, PermuteBf16Blocks(ref.in_proj_b, d.h, d.hv(), 0,
                                            d.hv(), 1, k2, r2));
-  StoreBf16(w.in_proj_a, PermuteBf16Blocks(ref.in_proj_a, d.h, d.hv(), 0,
-                                           d.hv(), 1, k2, r2));
-  // `out_proj` is [value_dim, H]: the permuted axis is the INPUT one, so one
-  // head is Dv whole rows of H elements.
   auto k3 = (which_flipped == 3) ? rr : kk;
   auto r3 = (which_flipped == 3) ? kk : rr;
+  StoreBf16(w.in_proj_a, PermuteBf16Blocks(ref.in_proj_a, d.h, d.hv(), 0,
+                                           d.hv(), 1, k3, r3));
+  // `out_proj` is [value_dim, H]: the permuted axis is the INPUT one, so one
+  // head is Dv whole rows of H elements. NOTE the orientation — `nk` is unset
+  // and the head axis is FIRST here, while the released loader produces
+  // `[H, value_dim]` with `nk = true`, head axis LAST. See header note (a).
+  auto k4 = (which_flipped == 4) ? rr : kk;
+  auto r4 = (which_flipped == 4) ? kk : rr;
   StoreBf16(w.out_proj,
             PermuteBf16Blocks(ref.out_proj, 1, d.value_dim() * d.h, 0, d.hv(),
-                              d.dv * d.h, k3, r3));
+                              d.dv * d.h, k4, r4));
   w.v_head_perm_key_heads = kk;
   return w;
 }
@@ -226,12 +260,26 @@ GDNAttentionMetadata DecodeMeta(int64_t T) {
 
 vt::Queue Q(vt::DeviceType dev) { return vt::Queue{vt::Device{dev, 0}, nullptr}; }
 
-std::vector<float> RunLayer(vt::DeviceType dev, const GdnLayerWeights& w,
-                            const HfConfig& c, const Dims& d,
-                            const std::vector<float>& h, int64_t T,
-                            std::vector<float> ssm, std::vector<float> conv) {
-  return vllm::GdnBlockPagedForTest(Q(dev), w, c, h, DecodeMeta(T), ssm, conv,
-                                    /*slots=*/T, d.kw - 1, T);
+// The block MUTATES `ssm` and `conv` in place and `GdnBlockPagedForTest` copies
+// them back. Taking them by value and dropping them on return left the WRITE
+// side of both persistent caches unasserted, which is exactly where the spec's
+// "both persistent state caches see the grouped order they have always seen"
+// claim lives. They are returned beside the output now, and the equality case
+// compares all three.
+struct LayerRun {
+  std::vector<float> out, ssm, conv;
+};
+
+LayerRun RunLayer(vt::DeviceType dev, const GdnLayerWeights& w,
+                  const HfConfig& c, const Dims& d,
+                  const std::vector<float>& h, int64_t T,
+                  std::vector<float> ssm, std::vector<float> conv) {
+  LayerRun r;
+  r.out = vllm::GdnBlockPagedForTest(Q(dev), w, c, h, DecodeMeta(T), ssm, conv,
+                                     /*slots=*/T, d.kw - 1, T);
+  r.ssm = std::move(ssm);
+  r.conv = std::move(conv);
+  return r;
 }
 
 size_t BitDiffs(const std::vector<float>& a, const std::vector<float>& b) {
@@ -347,9 +395,9 @@ TEST_CASE("GDN deferred V-head permutation == the load-time one (CPU)") {
   REQUIRE(grouped.v_head_perm_key_heads == 0);
   REQUIRE(tiled.v_head_perm_key_heads == d.hk);
 
-  const std::vector<float> ref =
+  const LayerRun ref =
       RunLayer(vt::DeviceType::kCPU, grouped, c, d, in.h, T, in.ssm, in.conv);
-  const std::vector<float> got =
+  const LayerRun got =
       RunLayer(vt::DeviceType::kCPU, tiled, c, d, in.h, T, in.ssm, in.conv);
 
   // THE BAR IS EQUALITY, not a tolerance: this is a re-indexing.
@@ -358,11 +406,30 @@ TEST_CASE("GDN deferred V-head permutation == the load-time one (CPU)") {
   // products move, the summands inside each do not). `out_proj`'s COLUMN
   // permutation reorders the summation inside every dot product, so this
   // assertion is where that either holds or is measured.
-  const size_t bad = BitDiffs(got, ref);
-  const float worst = MaxAbsDiff(got, ref);
+  //
+  // AND IT IS A MEASUREMENT OF THIS FIXTURE, ON BOTH AXES. `value_dim` is 96
+  // here, not the released 6144, so the reordered dot product is 64x shorter
+  // than the one that ships; and `out_proj` is `[value_dim, H]` with `nk` unset
+  // through the bf16 CPU `Matmul`, not the released `[H, value_dim]`
+  // `nk = true` Q6_K operand through `QuantDotGemm*`. A `bad == 0` here does
+  // not extend to either. Header note (a).
+  const size_t bad = BitDiffs(got.out, ref.out);
+  const float worst = MaxAbsDiff(got.out, ref.out);
   CAPTURE(bad);
   CAPTURE(worst);
   CHECK(bad == 0);
+
+  // THE WRITE SIDE OF BOTH PERSISTENT CACHES, which the output alone cannot
+  // see: the spec's rule is that `conv1d`, `a_log` and `dt_bias` stay permuted
+  // at LOAD precisely so the conv state and the SSM state keep the grouped
+  // order every older build wrote. If the deferred arm moved either cache's
+  // channel order, a resumed request would read its own state re-indexed.
+  CHECK(BitDiffs(got.ssm, ref.ssm) == 0);
+  CHECK(BitDiffs(got.conv, ref.conv) == 0);
+  // And the caches were actually WRITTEN — an all-zero pair would make the two
+  // assertions above agree about nothing.
+  CHECK(BitDiffs(got.ssm, in.ssm) > 0);
+  CHECK(BitDiffs(got.conv, in.conv) > 0);
 }
 
 TEST_CASE("GDN deferred V-head permutation: a vector permuted the WRONG way is seen") {
@@ -376,14 +443,17 @@ TEST_CASE("GDN deferred V-head permutation: a vector permuted the WRONG way is s
   const int64_t T = 3;
   const Inputs in = MakeInputs(d, T);
   const GdnLayerWeights grouped = MakeGroupedWeights(d);
-  const std::vector<float> ref =
+  const LayerRun ref =
       RunLayer(vt::DeviceType::kCPU, grouped, c, d, in.h, T, in.ssm, in.conv);
 
-  for (int which : {0, 1, 2, 3}) {
+  // FIVE, NOT FOUR: `in_proj_b` (2) and `in_proj_a` (3) are separate indices
+  // now. They shared one index before, flipped together, and a case that flips
+  // two tensors convicts neither of them alone.
+  for (int which : {0, 1, 2, 3, 4}) {
     CAPTURE(which);
     const GdnLayerWeights bad_w = MakeTiledWeights(d, grouped, which);
-    const std::vector<float> got =
+    const LayerRun got =
         RunLayer(vt::DeviceType::kCPU, bad_w, c, d, in.h, T, in.ssm, in.conv);
-    CHECK(BitDiffs(got, ref) > 0);
+    CHECK(BitDiffs(got.out, ref.out) > 0);
   }
 }

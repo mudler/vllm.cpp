@@ -282,10 +282,37 @@ Qwen4ExpGdnWeights LoadGdn(const GgufFile& g, const GgufLoadPolicy& pol,
   // A permutation of a GEMV operand does not have to touch the weight. For
   // `out = W x`, a ROW permutation satisfies `(P W) x = P (W x)` and a COLUMN
   // permutation satisfies `(W P) x = W (P x)`. Both are exact re-indexings with
-  // no arithmetic, so the result is BIT-IDENTICAL, and both are O(n) on a
-  // vector of at most 10,240 elements against 115 MB of weight traffic per
-  // layer. That covers `ssm_out`'s COLUMN reorder too, which permuting whole
-  // rows inside the block stream never could.
+  // no arithmetic. That covers `ssm_out`'s COLUMN reorder too, which permuting
+  // whole rows inside the block stream never could.
+  //
+  // THE RE-INDEXING IS EXACT; THE REDUCTION THAT CONSUMES IT IS NOT, so
+  // "bit-identical" is true of four of the five and OVERSTATED for `ssm_out`. A
+  // ROW permutation moves whole dot products — `attn_qkv`, `attn_gate`,
+  // `ssm_beta` and `ssm_alpha` are bit-identical by construction. A COLUMN
+  // permutation reorders the summation INSIDE every dot product, and
+  // floating-point addition is not associative, so `ssm_out` is bit-identical
+  // only under exact arithmetic. That it holds in this tree is a MEASUREMENT,
+  // and a narrow one: `tests/vllm/models/test_gdn_v_head_permute.cpp` reads
+  // `bad == 0` at `value_dim` 96 rather than the released 6144, on a bf16 CPU
+  // `Matmul` over an `[value_dim, H]` `out_proj` with `nk` unset, not on the
+  // released `[H, value_dim]` `nk = true` Q6_K operand through `QuantDotGemm*`.
+  //
+  // THE COST IS O(T * N) PER LAYER PER FORWARD, NOT O(N), and the earlier
+  // "O(n) on a vector of at most 10,240 elements" was a DECODE-only reading
+  // with the token count dropped. Per token per layer the four sites move
+  // `mixed` 10,240 + `z` 6,144 + the out-projection input 6,144 + `a` and `b`
+  // 48 each = 22,624 elements, gathered read-and-written at bf16 = 90.5 kB, so
+  // 3.26 MB per token over 36 layers. The saving is 2.649 GB per STEP whatever
+  // T is, so the two cross at T ~= 817 and a single T = 2048 prefill step
+  // overpays by ~4.0 GB.
+  //
+  // THAT IS ONE STEP IN ISOLATION AND IT IS NOT THE WORKLOAD. Every decode step
+  // underpays by 2.646 GB, so a T = 2048 prefill is repaid after 1.5 decode
+  // steps: prompt 2048 plus 16 decodes is already ~38 GB net-negative, and this
+  // row's reference workload (35-token prompt, 400 decodes) is ~1060 GB
+  // net-negative. NEITHER HALF IS MEASURED ON A DEVICE — the prefill cost and
+  // its repayment are owed as a measurement under `## Owed` in
+  // `.agents/specs/qwen4-exp-flash-next.md`.
   //
   // EVERY OTHER V-INDEXED TENSOR IS STILL PERMUTED HERE — `ssm_conv1d`'s V
   // channels, `ssm_a`, `ssm_dt.bias`. They are f32 and tiny, nothing is saved

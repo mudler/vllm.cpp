@@ -226,8 +226,24 @@ enum class OpId : uint8_t {
   // qwen4exp GGUF loader keep its Gated DeltaNet projections QUANTIZED: the
   // converter's tiled V-head order is undone on the [T, N] activation instead
   // of on the weight, which a k-quant block stream cannot represent. Pure
-  // re-indexing, no arithmetic, so it is bit-identical to the load-time
-  // permutation it replaces. See `VHeadPermuteArgs`.
+  // re-indexing, no arithmetic. See `VHeadPermuteArgs`.
+  //
+  // BIT-IDENTICAL TO THE LOAD-TIME PERMUTATION FOR FOUR OF THE FIVE
+  // PROJECTIONS, NOT ALL FIVE. A ROW permutation moves whole dot products, so
+  // `attn_qkv`, `attn_gate`, `ssm_beta` and `ssm_alpha` are bit-identical by
+  // construction. `ssm_out`'s is a COLUMN permutation: it reorders the
+  // summation inside every dot product, and floating-point addition is not
+  // associative, so there it is bit-identical only under exact arithmetic. That
+  // it holds in this tree is a measurement at `value_dim` 96 on a bf16 CPU
+  // `Matmul`, not a property of the released 6144-wide Q6_K path — see
+  // `tests/vllm/models/test_gdn_v_head_permute.cpp` and
+  // `qwen4_exp_weights.cpp`'s `LoadGdn`.
+  //
+  // THE COST IS O(T * N) PER LAYER PER FORWARD. It is net-negative per DECODE
+  // step by ~2.646 GB and net-POSITIVE for one large prefill step in isolation
+  // (breakeven T ~= 817; a T = 2048 prefill overpays ~4.0 GB and is repaid
+  // after 1.5 decode steps). `LoadGdn` carries the full arithmetic, and neither
+  // half is device-measured yet.
   kVHeadPermute,
   // BF16 grouped-MoE GEMM: the dtype-native analog of kMoeGroupedGemmNvfp4 (no
   // fp4 decode). Powers the Qwen3-Coder (Qwen3MoeForCausalLM) fast bf16 MoE path.

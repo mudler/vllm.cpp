@@ -526,12 +526,16 @@ checkpoint → `LoRAModel` path that produces the per-layer containers.
   `ValidateLegal` takes `int max_lora_rank` and performs the same check.
   This is a narrowing, not a behavior change.
 
-- **`get_lora_id()` NOT ported.** vLLM's `from_local_checkpoint`
-  (lora_model.py:299) auto-assigns a model id when `lora_model_id` is
-  `None` via a global counter (`get_lora_id`). The id allocator belongs
-  with the manager (W5). W4 requires the caller to supply
-  `lora_model_id`; a non-positive id raises `std::invalid_argument`,
-  mirroring upstream's `assert lora_model_id > 0` (lora_model.py:83).
+- **`get_lora_id()` ported as `GetLoraId()`.** vLLM's
+  `from_local_checkpoint` (lora_model.py:299) auto-assigns a model id
+  when `lora_model_id` is `None` via a global counter (`get_lora_id`).
+  The counter is ported as `GetLoraId()` (a monotonic static local). W4
+  still requires the caller to supply `lora_model_id` explicitly; the
+  auto-assign path that uses `GetLoraId()` when no id is given is wired
+  in W5 with the manager. A non-positive id raises
+  `std::invalid_argument`, mirroring upstream's `assert lora_model_id >
+  0` (lora_model.py:83) but as a runtime check so it survives a
+  Release build.
 
 - **`device` / `dtype` / `pin_memory` NOT ported.** vLLM moves tensors
   to a device and casts dtype during load (lora_model.py:129, 155-162).
@@ -544,8 +548,9 @@ checkpoint → `LoRAModel` path that produces the per-layer containers.
   (models/utils.py) supports prefix, suffix, and regex mappings. W4
   ports only `orig_to_new_prefix` and `orig_to_new_substr` (the two
   kinds the LoRA tests exercise). Regex mapping is not needed for any
-  LoRA checkpoint format. The `_map_name` method applies prefix
-  replacement then substring replacement, matching upstream's order.
+  LoRA checkpoint format.   The `_map_name` method applies substring
+  replacement then prefix replacement, matching upstream's order
+  (models/utils.py:108-113 substr first, 121-126 prefix second).
 
 - **`target_modules` as `std::vector<std::string>`.** vLLM's
   `target_modules` can be a `str` or `list[str]`
@@ -565,11 +570,13 @@ checkpoint → `LoRAModel` path that produces the per-layer containers.
   expert-parallel loading. FusedMoE LoRA is W7. The parameter is absent
   from the C++ signature.
 
-- **`skip_prefixes` NOT ported.** The `skip_prefixes` parameter
+- **`skip_prefixes` ported.** The `skip_prefixes` parameter
   (lora_model.py:126, 195, 220-224) skips modules like MTP layers
-  during loading. No vllm.cpp model defines skip prefixes yet. The
-  parameter is absent from the C++ signature and tracked to W5, where
-  the manager first needs it.
+  during loading. `ShouldSkipModule` checks whether a tensor name
+  starts with any skip prefix. `FromLoraTensors` and
+  `FromLocalCheckpoint` both accept `skip_prefixes` and skip matching
+  tensors. No vllm.cpp model defines skip prefixes yet, but the
+  parameter is wired and tested.
 
 - **`is_base_embedding_weights` ported but always returns false in
   practice.** vLLM skips tensors whose names end in

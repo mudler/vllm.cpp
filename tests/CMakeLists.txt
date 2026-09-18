@@ -594,6 +594,12 @@ vllm_cpp_add_test(test_qwen3_5_gdn_spec_routing vllm/models/test_qwen3_5_gdn_spe
 vllm_cpp_add_test(test_qwen3_5_gguf_mtp vllm/models/test_qwen3_5_gguf_mtp.cpp)
 vllm_cpp_add_test(test_qwen3_dflash_gguf vllm/models/test_qwen3_dflash_gguf.cpp)
 target_include_directories(test_qwen3_5_gdn_spec_routing PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# MODEL-MM-QWEN4-EXP (ISSUE-LOCAL-01M2ENTH6YA5FWEDY6CFHF4NAM): the deferred GDN
+# V-head permutation. Same reason for the src/ include — it drives the block
+# through `GdnBlockPagedForTest`.
+vllm_cpp_add_test(test_gdn_v_head_permute vllm/models/test_gdn_v_head_permute.cpp)
+target_include_directories(test_gdn_v_head_permute PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_qwen27_dense_forward vllm/models/test_qwen27_dense_forward.cpp)
 # MODEL-GDN-OUTPUT-GATE-TYPE (#489): `GlueFuseEnabled()` defaults ON and is read
 # ONCE per process into a function-local static, so one run of these two suites
@@ -872,6 +878,13 @@ vllm_cpp_add_test(test_deepseek_v4_1_engram vllm/models/test_deepseek_v4_1_engra
 # references. Full-model gate multi-Spark-blocked (156.7 GiB); device-kernel +
 # forward assembly are W7 (.agents/specs/deepseek-v4-flash.md).
 vllm_cpp_add_test(test_deepseek_v4_moe vllm/models/test_deepseek_v4_moe.cpp)
+# DeepSeek-V4.1-Flash W3b — the MXFP8 32x32 UE8M0 linear family host reference.
+# Ports tests/quantization/test_fp8.py:67-238 @ vLLM e77daef89e (a BIT-EXACT
+# oracle for the scale expansion) and derives the quantizer / emulation-linear
+# cases from first principles in double precision, because every upstream mxfp8
+# linear test is CUDA/ROCm-gated. No e2e gate exists: no published V4.1 artifact
+# fits any device this project reaches (.agents/specs/deepseek-v4-1-flash.md).
+vllm_cpp_add_test(test_deepseek_v4_1_mxfp8 vllm/models/test_deepseek_v4_1_mxfp8.cpp)
 # DeepSeek-V4-Flash W7 — the DeepseekV4Model::Forward ASSEMBLY: composes the four
 # landed host primitives (W3 DSA/MLA seams, W4 compressor + fp8_ds_mla KV, W5 MHC
 # + Sinkhorn, W6 sqrtsoftplus/hash MoE) into an end-to-end logits producer at a
@@ -2230,6 +2243,8 @@ vllm_cpp_add_test(test_chunked_local_attention
   vllm/v1/attention/test_chunked_local_attention.cpp)
 vllm_cpp_add_test(test_rotary_embedding
   vllm/model_executor/layers/rotary_embedding/test_rotary_embedding.cpp)
+vllm_cpp_add_test(test_linear_scaling_rope
+  vllm/model_executor/layers/rotary_embedding/test_linear_scaling_rope.cpp)
 vllm_cpp_add_test(test_pooler
   vllm/model_executor/layers/pooler/test_pooler.cpp)
 vllm_cpp_add_test(test_pooler_heads
@@ -3445,6 +3460,7 @@ vllm_cpp_add_test(test_ops_activation vt/test_ops_activation.cpp)
 vllm_cpp_add_test(test_ops_rope vt/test_ops_rope.cpp)
 vllm_cpp_add_test(test_ops_rope_cache vt/test_ops_rope_cache.cpp)
 vllm_cpp_add_test(test_ops_fused_norm_rope vt/test_ops_fused_norm_rope.cpp)
+vllm_cpp_add_test(test_compiled_gemma vt/test_compiled_gemma.cpp)
 vllm_cpp_add_test(test_ops_gdn vt/test_ops_gdn.cpp)
 target_include_directories(test_ops_gdn PRIVATE ${CMAKE_SOURCE_DIR}/src)
 if(VLLM_CPP_TRITON)

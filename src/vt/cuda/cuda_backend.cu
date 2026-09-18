@@ -19,6 +19,7 @@
 #ifdef VT_BENCH_PROFILE_CONTROL
 #include "vt/cuda/cuda_profiler_control.h"
 #endif
+#include "vt/cuda/cuda_exl3_internal.h"
 #ifdef VLLM_CPP_FLASH_ATTN
 #include "vt/cuda/cuda_flash_attn_fa2_internal.h"
 #endif
@@ -123,6 +124,7 @@ class CudaBackend final : public Backend {
   }
   void DestroyQueue(Queue& q) override {
     if (q.handle == nullptr) return;
+    ReleaseExl3ReconScratch(device_, q.handle);
 #ifdef VLLM_CPP_FLASH_ATTN
     ReleaseFa2Scratch(device_, q.handle);
 #endif

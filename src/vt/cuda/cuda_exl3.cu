@@ -80,6 +80,8 @@
 #include "vt/ops.h"
 #include "vt/cuda/cublas_lt_hgemm.h"
 #include "vt/cuda/cuda_device_caps.h"
+#include "vt/cuda/cuda_exl3_internal.h"
+#include "vt/cuda/graph_safe_scratch.h"
 
 namespace vt::cuda {
 namespace {
@@ -2771,6 +2773,88 @@ void ReconstructHadSlice(Queue& q, Tensor& w, const Tensor& trellis,
 // GEMMed in 32768-column slices (exl3.py:199-211).
 constexpr int kMaxReconstructSliceN = 32768;
 
+// ── the persistent reconstruct scratch (QUANT-EXL3 W7) ───────────────────────
+//
+// `.agents/specs/quant-exl3-recon-scratch.md`. ONE grow-only fp16 buffer per
+// (device, stream), owned here and never by the DevicePool. #3150 drew it as a
+// pool `DBuf` per call, and a pool block a CUDA-graph step demands is PINNED
+// for that graph's lifetime (`device_pool.h` PinForGraph), so every lazily
+// captured verify width held one block of every [k, min(n, 32768)] class: about
+// 786 MiB per slot on Qwen3.8-27B EXL3, and a host OOM on GB10 at c = 32
+// (ISSUE-LOCAL-01M2DW8CXYEWWMJSZZ6GRH48SZ). exllamav3's `torch.empty` in
+// `reconstruct_hgemm` (exl3.py:161-217) is one block shared by every call and
+// every graph under torch's caching allocator; this restores that.
+//
+// SHARING IS SAFE because the contents are dead once the GEMM that reads them is
+// enqueued, and every consumer of one stream runs in that stream's order. The
+// premise is that one host thread at a time enqueues EXL3 linears on a stream;
+// the engine busy loop is the only such thread today (spec §6).
+//
+// THE HOUSE RULES for a per-stream grow-only scratch, and one refinement:
+//   * one lock across the capacity check and the publish
+//     (vt/grow_only_stream_scratch.h, rule 1);
+//   * growth is FORBIDDEN while the stream is capturing, by name, as
+//     cuda_dropin.cu's workspace and cuda_mla_attn.cu's attn-logits scratch
+//     refuse it: a `cudaMallocAsync` inside capture is a graph-owned allocation
+//     whose lifetime is the graph's execution;
+//   * on growth the old block is RETIRED when a capture may have baked it
+//     (graph_safe_scratch.h). The refinement: a block that was never handed out
+//     while its stream was capturing cannot be referenced by any graph, so it is
+//     freed on the stream instead. The buffer's size depends on the weight and
+//     not on m, so it reaches the model's largest class within the first eager
+//     reconstruct step, and retiring every intermediate class of that step would
+//     keep them all resident for the process for no graph at all.
+struct Exl3ReconScratch {
+  void* buf = nullptr;
+  size_t bytes = 0;
+  bool exposed_to_capture = false;
+};
+
+std::mutex& Exl3ReconScratchMutex() {
+  static std::mutex mu;
+  return mu;
+}
+
+std::map<std::pair<int, cudaStream_t>, Exl3ReconScratch>& Exl3ReconScratchTable() {
+  static std::map<std::pair<int, cudaStream_t>, Exl3ReconScratch> table;
+  return table;
+}
+
+// A contiguous f16 [k, w_cols] view of this queue's persistent scratch.
+Tensor Exl3PersistentReconScratch(const Queue& q, int64_t k, int64_t w_cols) {
+  const cudaStream_t stream = AsStream(q);
+  const size_t need = static_cast<size_t>(k) * static_cast<size_t>(w_cols) * sizeof(uint16_t);
+  cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+  Check(cudaStreamIsCapturing(stream, &capture), "exl3 reconstruct scratch capture-status query");
+  const bool capturing = capture != cudaStreamCaptureStatusNone;
+
+  std::lock_guard<std::mutex> lock(Exl3ReconScratchMutex());
+  Exl3ReconScratch& sc = Exl3ReconScratchTable()[{q.device.index, stream}];
+  if (need > sc.bytes) {
+    if (capturing) {
+      throw std::runtime_error(
+          "vt cuda exl3: exl3 reconstruct scratch growth is forbidden during CUDA graph "
+          "capture (have " + std::to_string(sc.bytes) + " bytes, need " +
+          std::to_string(need) + " for [" + std::to_string(k) + ", " +
+          std::to_string(w_cols) + "] f16); run this shape eagerly on the stream first");
+    }
+    void* grown = nullptr;
+    Check(cudaMallocAsync(&grown, need, stream), "cudaMallocAsync(exl3 reconstruct scratch)");
+    if (sc.buf != nullptr) {
+      if (sc.exposed_to_capture) {
+        RetireGraphScratch(sc.buf);
+      } else {
+        Check(cudaFreeAsync(sc.buf, stream), "cudaFreeAsync(exl3 reconstruct scratch)");
+      }
+    }
+    sc.buf = grown;
+    sc.bytes = need;
+    sc.exposed_to_capture = false;
+  }
+  if (capturing) sc.exposed_to_capture = true;
+  return Tensor::Contiguous(sc.buf, DType::kF16, q.device, {k, w_cols});
+}
+
 void Exl3ReconstructGemmKernelCuda(Queue& q, Tensor& c, const Tensor& a,
                                     const Tensor& trellis, const Tensor& suh,
                                     const Tensor& svh, Tensor& a_had,
@@ -2786,6 +2870,17 @@ void Exl3ReconstructGemmKernelCuda(Queue& q, Tensor& c, const Tensor& a,
   const int size_k = static_cast<int>(a.shape[1]);
   const int size_n = static_cast<int>(c.shape[1]);
   if (size_m == 0 || size_k == 0 || size_n == 0) return;
+
+  // QUANT-EXL3 W7: an EMPTY scratch selects this stream's persistent buffer
+  // (vt::Exl3ReconstructGemm without w_scratch). Resolved before any launch, so
+  // a growth refused under capture has enqueued nothing of this call.
+  Tensor persistent_scratch;
+  Tensor* scratch = &w_scratch;
+  if (w_scratch.data == nullptr) {
+    persistent_scratch = Exl3PersistentReconScratch(
+        q, size_k, EXL3_MIN(size_n, kMaxReconstructSliceN));
+    scratch = &persistent_scratch;
+  }
 
   // exl3.py:176-184. Fused requires both dims 128-divisible (always true for
   // EXL3 tensors, which are Hadamard-transformed at quant time) and M >= 1024.
@@ -2806,11 +2901,11 @@ void Exl3ReconstructGemmKernelCuda(Queue& q, Tensor& c, const Tensor& a,
   if (size_n <= kMaxReconstructSliceN) {
     // Single slice: reconstruct the full weight, then GEMM.
     if (use_fused) {
-      ReconstructHadSlice(q, w_scratch, trellis, suh, svh, args.bits, args.codebook, 0);
+      ReconstructHadSlice(q, *scratch, trellis, suh, svh, args.bits, args.codebook, 0);
     } else {
-      ReconstructSlice(q, w_scratch, trellis, args.bits, args.codebook, 0);
+      ReconstructSlice(q, *scratch, trellis, args.bits, args.codebook, 0);
     }
-    CublasLtHgemm(q, c, *xh, w_scratch);
+    CublasLtHgemm(q, c, *xh, *scratch);
   } else {
     // exl3.py:199-211. Reconstruct + GEMM in 32768-column slices, reusing
     // w_scratch.
@@ -2818,7 +2913,7 @@ void Exl3ReconstructGemmKernelCuda(Queue& q, Tensor& c, const Tensor& a,
       const int n_end = EXL3_MIN(n_start + kMaxReconstructSliceN, size_n);
       const int n_slice = n_end - n_start;
       // Slice w_scratch to [k, n_slice] for this iteration.
-      Tensor w_slice = w_scratch.Slice(1, 0, n_slice);
+      Tensor w_slice = scratch->Slice(1, 0, n_slice);
       if (use_fused) {
         // svh must be pre-offset by the caller; slice it from n_start.
         Tensor svh_slice = svh.Slice(0, n_start, n_end);
@@ -3085,4 +3180,59 @@ struct Registrar {
 } registrar;
 
 }  // namespace
+
+// QUANT-EXL3 W7 review repair: the queue-teardown release, the house pattern of
+// ReleaseFa2Scratch (cuda_flash_attn_fa2.cu) and ReleaseGdnTritonScratch.
+// Without it a destroyed queue kept its [k, min(n, 32768)] block for the process,
+// and a new stream whose handle value equals the old one inherited the entry.
+void ReleaseExl3ReconScratch(int device, void* stream_handle) {
+  const cudaStream_t stream = static_cast<cudaStream_t>(stream_handle);
+  Exl3ReconScratch sc;
+  {
+    std::lock_guard<std::mutex> lock(Exl3ReconScratchMutex());
+    auto& table = Exl3ReconScratchTable();
+    const auto it = table.find({device, stream});
+    if (it == table.end()) return;
+    sc = it->second;
+    table.erase(it);
+  }
+  if (sc.buf == nullptr) return;
+  // Every launch this stream enqueued against the block completes before the
+  // block leaves the entry's ownership.
+  Check(cudaStreamSynchronize(stream), "cudaStreamSynchronize(exl3 reconstruct scratch release)");
+  if (sc.exposed_to_capture) {
+    // A graph captured on this stream may outlive the queue and still hold the
+    // pointer; the retire list keeps it valid for the process.
+    RetireGraphScratch(sc.buf);
+  } else {
+    Check(cudaFreeAsync(sc.buf, stream), "cudaFreeAsync(exl3 reconstruct scratch release)");
+  }
+}
+
+namespace testing {
+
+size_t Exl3ReconScratchBytesForTesting(int device, void* stream_handle) {
+  std::lock_guard<std::mutex> lock(Exl3ReconScratchMutex());
+  const auto& table = Exl3ReconScratchTable();
+  const auto it = table.find({device, static_cast<cudaStream_t>(stream_handle)});
+  return it == table.end() ? 0 : it->second.bytes;
+}
+
+void* Exl3ReconScratchPtrForTesting(int device, void* stream_handle) {
+  std::lock_guard<std::mutex> lock(Exl3ReconScratchMutex());
+  const auto& table = Exl3ReconScratchTable();
+  const auto it = table.find({device, static_cast<cudaStream_t>(stream_handle)});
+  return it == table.end() ? nullptr : it->second.buf;
+}
+
+size_t Exl3ReconScratchLiveBytesForTesting() {
+  std::lock_guard<std::mutex> lock(Exl3ReconScratchMutex());
+  size_t total = 0;
+  for (const auto& entry : Exl3ReconScratchTable()) total += entry.second.bytes;
+  return total;
+}
+
+size_t RetiredGraphScratchCountForTesting() { return RetiredGraphScratchCount(); }
+
+}  // namespace testing
 }  // namespace vt::cuda

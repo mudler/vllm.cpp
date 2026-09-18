@@ -8,9 +8,11 @@
 #include <stdexcept>
 #include <string>
 
-#include "vt/ops.h"
 #include "vt/fp8_kv.h"
+#include "vt/grow_only_stream_scratch.h"
+#include "vt/ops.h"
 #include "vt/rocm/rocm_f16_codec.h"
+#include "vt/rocm/rocm_runtime.h"
 
 namespace vt::rocm {
 namespace {
@@ -143,12 +145,20 @@ __device__ inline double L3Scale(double freq, double sf, double lo, double hi, d
 
 template <typename Tid>
 __global__ void RopeCacheK(float* cs, const Tid* pos, int64_t t, int rot, int64_t half,
-                           double base, double sf, double lo, double hi, double omax) {
+                           double base, double sf, double lo, double hi, double omax, float linear) {
   const int64_t n = t * half;
   for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n;
        idx += gridDim.x * blockDim.x) {
     const int64_t pair = idx % half, tok = idx / half;
     const int64_t p = static_cast<int64_t>(pos[tok]);
+    if (linear > 0.f) {
+      const float exponent = static_cast<float>(2 * pair) / static_cast<float>(rot);
+      const float inv = 1.f / powf(static_cast<float>(base), exponent);
+      const float angle = (static_cast<float>(p) / linear) * inv;
+      cs[tok * rot + pair] = cosf(angle);
+      cs[tok * rot + half + pair] = sinf(angle);
+      continue;
+    }
     double freq = pow(base, -2.0 * static_cast<double>(pair) / static_cast<double>(rot));
     freq = L3Scale(freq, sf, lo, hi, omax);
     const double ang = static_cast<double>(p) * freq;
@@ -375,11 +385,11 @@ void RopeCosSinCacheKernelRocm(Queue& q, Tensor& cos_sin, const Tensor& pos,
   if (pos.dtype == DType::kI32)
     RopeCacheK<int32_t><<<GridFor(n), kBlock, 0, st>>>(
         cos_sin.Ptr<float>(), pos.Ptr<int32_t>(), t, args.rotary_dim, half, base, sf, lo, hi,
-        omax);
+        omax, args.linear_scaling_factor);
   else
     RopeCacheK<int64_t><<<GridFor(n), kBlock, 0, st>>>(
         cos_sin.Ptr<float>(), pos.Ptr<int64_t>(), t, args.rotary_dim, half, base, sf, lo, hi,
-        omax);
+        omax, args.linear_scaling_factor);
   Check(hipGetLastError(), "rope_cos_sin_cache");
 }
 

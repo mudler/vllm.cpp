@@ -334,6 +334,14 @@ fix is tracked as #3124 under Owed.
 
 ## Owed
 
+- **No band above 3.3k prompt tokens.** The `XL` band is 40% of the served
+  `--max-model-len 8192`, so every long-context claim here stops well short of
+  the context this server runs. The successor row `BENCH-QWEN38-EXL3-LONGCTX`
+  ([spec](bench-qwen38-exl3-longctx.md)) adds an `XXL` band and publishes as its
+  own benchmark id. The issue that tracks it now hangs under that spec's
+  `## Owed`, where the unreached band it left behind is also recorded; an
+  `_owed` issue has exactly one owning spec, and this is no longer it.
+
 - **`ISSUE-LOCAL-01M2CZX87ZB0WHRW2YZYPW7VRZ` (closed 2026-09-13): the binary
   cache never restored on the CIFS share.** Fixed with an existence guard, a
   manifest written before an atomic rename, and an md5 check on restore. Still

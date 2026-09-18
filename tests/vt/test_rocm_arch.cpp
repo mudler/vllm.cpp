@@ -16,10 +16,51 @@
 #include <doctest/doctest.h>
 
 #include "vt/rocm/rocm_arch.h"
+#include "vt/rocm/rocm_attn_wmma_arch.h"
 #include "vt/rocm/rocm_quant_wmma_arch.h"
 #include "vt/rocm/rocm_skinny_gemm_arch.h"
 
 using vt::rocm::CapabilityFromGcnArch;
+
+TEST_CASE("SharedK attention WMMA admits measured gfx1100 and retains gfx12") {
+  using vt::rocm::GcnArchNameHasSharedKAttentionWmma;
+  for (const char* arch : {"gfx1100", "gfx1100:xnack-", "gfx1100:sramecc+:xnack-",
+                           "gfx1200", "gfx1201", "gfx1201:xnack-"}) {
+    CHECK_MESSAGE(GcnArchNameHasSharedKAttentionWmma(arch), arch);
+  }
+  for (const char* arch : {"", "gfx110", "gfx11000", "gfx1100junk", "foogfx1100",
+                           "gfx1101", "gfx1102", "gfx1103", "gfx1151", "gfx942",
+                           "gfx1202", "gfx12010"}) {
+    CHECK_FALSE_MESSAGE(GcnArchNameHasSharedKAttentionWmma(arch), arch);
+  }
+  // The existing predicate also serves quantized dispatch on this base.
+  CHECK_FALSE(vt::rocm::GcnArchNameIsGfx12PrefillWmma("gfx1100"));
+}
+
+TEST_CASE("SharedK gfx1100 WMMA is enabled by default after full model parity") {
+  using vt::rocm::SharedKAttentionWmmaEnabled;
+  for (const char* arch : {"gfx1100", "gfx1100:xnack-"}) {
+    CHECK(SharedKAttentionWmmaEnabled(arch, nullptr));
+    CHECK_FALSE(SharedKAttentionWmmaEnabled(arch, "0"));
+    CHECK(SharedKAttentionWmmaEnabled(arch, "1"));
+  }
+  for (const char* arch : {"gfx1200", "gfx1201", "gfx1201:xnack-"}) {
+    CHECK(SharedKAttentionWmmaEnabled(arch, nullptr));
+    CHECK_FALSE(SharedKAttentionWmmaEnabled(arch, "0"));
+    CHECK(SharedKAttentionWmmaEnabled(arch, "1"));
+  }
+  for (const char* arch : {"gfx1101", "gfx1151", "gfx12010", ""}) {
+    CHECK_FALSE(SharedKAttentionWmmaEnabled(arch, nullptr));
+    CHECK_FALSE(SharedKAttentionWmmaEnabled(arch, "1"));
+  }
+}
+
+TEST_CASE("Gemma matrix decode is admitted only on measured gfx1100") {
+  CHECK(vt::rocm::GcnArchNameHasGemmaDecodeWmma("gfx1100"));
+  CHECK(vt::rocm::GcnArchNameHasGemmaDecodeWmma("gfx1100:xnack-"));
+  for (const char* arch : {"gfx1101", "gfx1100junk", "gfx1151", "gfx1200", "gfx1201", ""})
+    CHECK_FALSE(vt::rocm::GcnArchNameHasGemmaDecodeWmma(arch));
+}
 
 namespace {
 std::array<int, 4> skinny_arch_resolves{};

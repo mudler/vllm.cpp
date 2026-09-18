@@ -42,3 +42,26 @@ Two more runs on dgx:gpu0, same recipe and watchdog. Evidence is in `/workspace/
 **CUDA graphs account for roughly 20 GiB of it.** Graphs off with the pool on plateaued at 23.0 GiB. Graphs off with the pool bypassed held 34.3 GiB. Graphs on with the pool on went below 13.7 GiB.
 
 **Next hypothesis:** graphs are captured lazily during serving, so their memory is not accounted when the KV pool is sized. The pool's free retention is uncapped on top of that. vLLM captures every size in `cudagraph_capture_sizes` during `capture_model` before serving, and accounts graph memory in the profiled budget that `gpu_memory_utilization` sizes the KV cache from (`vllm/v1/worker/gpu_model_runner.py` `capture_model`, `profile_run`). This is not yet read against our runner.
+
+## Progress 2026-09-18: the #3150 increment is removed; the rest stays open
+
+`QUANT-EXL3` W7 landed the per-stream reconstruct scratch. Measured on
+`dgx:gpu0` (lease `3a419fc7`, boot `aa8685cb`), the same c = 32 leg, two rounds
+per arm, interleaved:
+
+| arm | MemAvailable min GiB | p05 | median | output tok/s |
+|---|---|---|---|---|
+| `3cafbcaf`, #3150's parent | 15.93 / 16.59 | 17.81 / 18.30 | 19.06 / 18.43 | 50.57 / 50.72 |
+| `75984bbf`, main + W7 | 15.10 / 14.96 | 16.13 / 16.59 | 17.59 / 18.16 | 94.26 / 94.37 |
+
+`39d3af455` could not finish this leg: it fell below a 14 GiB watchdog in about
+two minutes and was still falling. With W7 the leg completes, no watchdog fires
+on any of four legs, and the floor is within 1 GiB of the parent's while serving
+1.86x the tokens per second.
+
+**What this does NOT close.** The growth this issue reports is larger than
+#3150's share. With graphs off the same binary plateaued at 23.0 GiB, and with
+graphs off plus `VT_POOL_BYPASS=1` at 34.3 GiB, so roughly 20 GiB is CUDA-graph
+capture memory that the KV sizing never accounts for, and about 9.7 GiB was pool
+free list across 348 size classes. Both remain open here, and the DFlash2 draft
+context stores (5.35 GiB at `max_num_seqs 32`, `#2993`) remain beside them.

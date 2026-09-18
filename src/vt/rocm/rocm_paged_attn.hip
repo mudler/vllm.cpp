@@ -3,9 +3,15 @@
 // Supports bf16/f32 query x bf16/f32 KV (mixed allowed).
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
-// rocWMMA only on gfx12 (R9700). Fat builds also emit gfx1036 — must not include there.
-#if defined(__gfx1200__) || defined(__gfx1201__)
+
+#include "rocm_rdna3_attn_decode.h"
+#include "rocm_rdna3_dot2.h"
+// Compile the same rocWMMA BF16 tiles for the admitted RDNA3 and RDNA4 targets.
+// Keep this set aligned with GcnArchNameHasSharedKAttentionWmma at host dispatch.
+#if defined(__gfx1100__) || defined(__gfx1200__) || defined(__gfx1201__)
 #include <rocwmma/rocwmma.hpp>
+
+#include "rocm_rdna3_wmma.h"
 #define VT_ROCWMMA_OK 1
 #endif
 
@@ -19,6 +25,7 @@
 #include "vt/backend.h"
 #include "vt/fp8_kv.h"
 #include "vt/rocm/rocm_arch.h"
+#include "vt/rocm/rocm_attn_wmma_arch.h"
 
 #include <atomic>
 #include <cstdlib>
@@ -35,15 +42,16 @@ inline void Check(hipError_t err, const char* what) {
   }
 }
 
-// Per-device, once: launch SharedK WMMA only when this device's gcnArchName is
-// gfx1200/gfx1201 (prefix). Not per-build, not getenv. Device kernel body
+// Per-device, once: launch SharedK WMMA only on an admitted device.
+// Not per-build, not getenv. Device kernel body
 // still uses VT_ROCWMMA_OK (#785).
-bool PrefillSharedKWmmaHostOk() {
+bool SharedKAttentionWmmaHostOk(bool decode = false) {
   int dev = 0;
   if (hipGetDevice(&dev) != hipSuccess || dev < 0) return false;
   struct Slot {
     std::once_flag once;
     bool ok = false;
+    bool decode_ok = false;
   };
   static std::array<Slot, 64> slots;
   if (static_cast<unsigned>(dev) >= slots.size()) return false;
@@ -53,9 +61,13 @@ bool PrefillSharedKWmmaHostOk() {
       slots[static_cast<unsigned>(dev)].ok = false;
       return;
     }
-    slots[static_cast<unsigned>(dev)].ok = GcnArchNameIsGfx12PrefillWmma(prop.gcnArchName);
+    slots[static_cast<unsigned>(dev)].decode_ok = GcnArchNameHasGemmaDecodeWmma(prop.gcnArchName);
+    slots[static_cast<unsigned>(dev)].ok =
+        SharedKAttentionWmmaEnabled(
+            prop.gcnArchName, std::getenv("VT_ATTN_PREFILL_SHAREDK_WMMA"));
   });
-  return slots[static_cast<unsigned>(dev)].ok;
+  return decode ? slots[static_cast<unsigned>(dev)].decode_ok
+                : slots[static_cast<unsigned>(dev)].ok;
 }
 
 // Optional correctness path: run the CPU paged-attn oracle on host copies.
@@ -739,7 +751,12 @@ __global__ void PagedAttnDecodeOptBf16T(__hip_bfloat16* out, const __hip_bfloat1
     }
     const float inv = (gl > 0.f) ? (1.f / gl) : 0.f;
 #pragma unroll
-    for (int i = 0; i < kEpl; ++i) acc[i] *= inv;
+    for (int i = 0; i < kEpl; ++i) {
+      if constexpr (d_expect == 256)
+        acc[i] /= gl + 1e-10f;
+      else
+        acc[i] *= inv;
+    }
     StoreRowEplBf16<kEpl>(out, qoff, lane, acc);
   }
 }
@@ -819,13 +836,96 @@ __global__ void PagedAttnDecodeGqaBf16(__hip_bfloat16* out, const __hip_bfloat16
     for (int i = 0; i < kEpl; ++i) o_reg[hh][i] = 0.f;
   }
 
-  for (int64_t j = jmin + warp; j <= jmax; j += NWARPS) {
-    const int64_t blk = block_table[r * bt_row + (j / block_size) * bt_col];
-    const int64_t off = j % block_size;
-    float k_reg[kEpl];
-    LoadRowEplBf16<kEpl>(k_cache, blk * kc_blk + off * kc_pg + g * kc_hd, lane, k_reg);
+  if constexpr (d_expect == 256) {
+    // Match prefix_prefill for each prefill row and paged decode for each
+    // decode row, including mixed batches and non-power-of-two cache blocks.
+    __shared__ float tile_maxima[NWARPS * QG];
+    constexpr int kPerWarp = (128 + NWARPS - 1) / NWARPS;
+    const bool prefill = query_len > 1;
+    const bool pow2 = block_size > 0 && (block_size & (block_size - 1)) == 0;
+    const int current_tile =
+        prefill ? (pow2 ? 64 : 32)
+                : (pow2 ? static_cast<int>(block_size < 128 ? block_size : 128) : 32);
+    for (int phase = prefill && context > 0 ? 0 : 1; phase < 2; ++phase) {
+      const int tile = phase == 0 ? 32 : current_tile;
+      const int64_t start = phase == 0 || !prefill ? 0 : context;
+      const int64_t end = phase == 0 ? context - 1 : jmax;
+      for (int64_t begin = start; begin <= end; begin += tile) {
+        if (begin + tile <= jmin) continue;
+        float scores[QG][kPerWarp];
+        float local_max[QG];
+#pragma unroll
+        for (int h = 0; h < QG; ++h) local_max[h] = -INFINITY;
+#pragma unroll
+        for (int k = 0; k < kPerWarp; ++k) {
+          const int64_t j = begin + warp + k * NWARPS;
+          float kr[kEpl];
+          const bool valid = warp + k * NWARPS < tile && j >= jmin && j <= jmax && j <= end;
+          if (valid) {
+            const int64_t blk = block_table[r * bt_row + (j / block_size) * bt_col];
+            LoadRowEplBf16<kEpl>(k_cache, blk * kc_blk + (j % block_size) * kc_pg + g * kc_hd, lane,
+                                 kr);
+          }
+#pragma unroll
+          for (int h = 0; h < QG; ++h) {
+            float score = -INFINITY;
+            if (valid) {
+              float dot = 0.f;
+#pragma unroll
+              for (int i = 0; i < kEpl; ++i) dot += q_reg[h][i] * kr[i];
+#pragma unroll
+              for (int offset = 16; offset > 0; offset /= 2) dot += __shfl_down(dot, offset);
+              score = Softcap(__shfl(dot, 0) * scale, softcap);
+            }
+            scores[h][k] = score;
+            local_max[h] = fmaxf(local_max[h], score);
+          }
+        }
+        if (lane == 0) {
+#pragma unroll
+          for (int h = 0; h < QG; ++h) tile_maxima[warp * QG + h] = local_max[h];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int h = 0; h < QG; ++h) {
+          float next = m[h];
+#pragma unroll
+          for (int w = 0; w < NWARPS; ++w) next = fmaxf(next, tile_maxima[w * QG + h]);
+          if (!(next > -INFINITY)) next = 0.f;
+          const float alpha = FastExp(m[h] - next);
+          m[h] = next;
+          lsum[h] *= alpha;
+#pragma unroll
+          for (int i = 0; i < kEpl; ++i) o_reg[h][i] *= alpha;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < kPerWarp; ++k) {
+          const int64_t j = begin + warp + k * NWARPS;
+          if (warp + k * NWARPS >= tile || j < jmin || j > jmax || j > end) continue;
+          const int64_t blk = block_table[r * bt_row + (j / block_size) * bt_col];
+          float vr[kEpl];
+          LoadRowEplBf16<kEpl>(v_cache, blk * vc_blk + (j % block_size) * vc_pg + g * vc_hd, lane,
+                               vr);
+#pragma unroll
+          for (int h = 0; h < QG; ++h) {
+            const float p = FastExp(scores[h][k] - m[h]);
+            lsum[h] += p;
+            const float pv = ProbInValueDtype<__hip_bfloat16>(p);
+#pragma unroll
+            for (int i = 0; i < kEpl; ++i) o_reg[h][i] += pv * vr[i];
+          }
+        }
+      }
+    }
+  } else {
+    for (int64_t j = jmin + warp; j <= jmax; j += NWARPS) {
+      const int64_t blk = block_table[r * bt_row + (j / block_size) * bt_col];
+      const int64_t off = j % block_size;
+      float k_reg[kEpl];
+      LoadRowEplBf16<kEpl>(k_cache, blk * kc_blk + off * kc_pg + g * kc_hd, lane, k_reg);
 
-    float s_h[QG];
+      float s_h[QG];
 #pragma unroll
     for (int hh = 0; hh < QG; ++hh) {
       float dot = 0.f;
@@ -848,6 +948,7 @@ __global__ void PagedAttnDecodeGqaBf16(__hip_bfloat16* out, const __hip_bfloat16
       lsum[hh] = lsum[hh] * corr + pw;
       m[hh] = m_new;
     }
+  }
   }
 
   extern __shared__ float smem_gqa[];
@@ -884,7 +985,12 @@ __global__ void PagedAttnDecodeGqaBf16(__hip_bfloat16* out, const __hip_bfloat16
     }
     const float inv = (gl > 0.f) ? (1.f / gl) : 0.f;
 #pragma unroll
-    for (int i = 0; i < kEpl; ++i) acc[i] *= inv;
+    for (int i = 0; i < kEpl; ++i) {
+      if constexpr (d_expect == 256)
+        acc[i] /= gl + 1e-10f;
+      else
+        acc[i] *= inv;
+    }
     StoreRowEplBf16<kEpl>(out, (t * hq + (h0 + hh)) * d, lane, acc);
   }
 }
@@ -1787,6 +1893,67 @@ __global__ void PagedAttnPrefillWmmaWave(__hip_bfloat16* out, const __hip_bfloat
 //   K/V streamed in BN tiles into smem once per tile; online softmax in regs.
 //   No score matrix, no multi-wave mma. Grid=(ceil(total_q/BM), num_kv_heads[, z]).
 //   blockIdx.z tiles large GQA groups (global qg=8 → z=4 with QG=2).
+// Match the primary's 64-key current-chunk tile and BF16 PV probabilities.
+template <int QG, int EPL>
+__device__ void SharedKTileValue64(const float (&scores)[QG][2], const __hip_bfloat16* values,
+                                   int n_k, int lane, float (&m)[QG], float (&lsum)[QG],
+                                   float (&out)[QG][EPL]) {
+  float probabilities[QG][2];
+#pragma unroll
+  for (int h = 0; h < QG; ++h) {
+    float tile_max = fmaxf(scores[h][0], scores[h][1]);
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2)
+      tile_max = fmaxf(tile_max, __shfl_xor(tile_max, offset));
+    const float next = fmaxf(m[h], tile_max);
+    const float alpha = m[h] > -INFINITY ? FastExp(m[h] - next) : 0.f;
+    const float p0 = next > -INFINITY ? FastExp(scores[h][0] - next) : 0.f;
+    const float p1 = next > -INFINITY ? FastExp(scores[h][1] - next) : 0.f;
+    float sum = 0.f;
+#pragma unroll
+    for (int i = 0; i < 32; ++i) {
+      const int kk = 2 * i + (lane & 1);
+      sum += __shfl(kk < 32 ? p0 : p1, kk % 32);
+    }
+    sum += __shfl_xor(sum, 1);
+    probabilities[h][0] = ProbInValueDtype<__hip_bfloat16>(p0);
+    probabilities[h][1] = ProbInValueDtype<__hip_bfloat16>(p1);
+    lsum[h] = fmaf(lsum[h], alpha, sum);
+    m[h] = next;
+#pragma unroll
+    for (int i = 0; i < EPL; ++i) out[h][i] *= alpha;
+  }
+#if defined(__gfx1100__)
+  for (int kk = 0; kk < n_k; kk += 2) {
+    float v0[EPL], v1[EPL] = {};
+    LoadRowEplBf16<EPL>(values, static_cast<int64_t>(kk) * EPL * 32, lane, v0);
+    if (kk + 1 < n_k)
+      LoadRowEplBf16<EPL>(values, static_cast<int64_t>(kk + 1) * EPL * 32, lane, v1);
+#pragma unroll
+    for (int h = 0; h < QG; ++h) {
+      const float p0 = __shfl(probabilities[h][kk / 32], kk % 32);
+      const float p1 = __shfl(probabilities[h][kk / 32], kk % 32 + 1);
+      const unsigned p = AttentionBf16Pair(p0, p1);
+#pragma unroll
+      for (int i = 0; i < EPL; ++i)
+        out[h][i] = AttentionDot2(p, AttentionBf16Pair(v0[i], v1[i]), out[h][i]);
+    }
+  }
+#else
+#pragma unroll 1
+  for (int kk = 0; kk < n_k; ++kk) {
+    float v[EPL];
+    LoadRowEplBf16<EPL>(values, static_cast<int64_t>(kk) * EPL * 32, lane, v);
+#pragma unroll
+    for (int h = 0; h < QG; ++h) {
+      const float p = __shfl(probabilities[h][kk / 32], kk % 32);
+#pragma unroll
+      for (int i = 0; i < EPL; ++i) out[h][i] += p * v[i];
+    }
+  }
+#endif
+}
+
 template <int QG, int EPL, int BM, int BN, typename TKV = __hip_bfloat16,
           typename TQ = __hip_bfloat16, typename TO = __hip_bfloat16>
 __global__ void PagedAttnPrefillSharedK(TO* out, const TQ* query,
@@ -1803,6 +1970,9 @@ __global__ void PagedAttnPrefillSharedK(TO* out, const TQ* query,
   static_assert(BN <= 64, "BN smem/regs");
   constexpr int kEpl = EPL;
   constexpr int d_expect = kEpl * 32;
+  constexpr bool kBf16Tile =
+      d_expect == 256 && BN == 64 && QG == 2 && std::is_same_v<TQ, __hip_bfloat16> &&
+      std::is_same_v<TKV, __hip_bfloat16> && std::is_same_v<TO, __hip_bfloat16>;
   const int64_t q_tile = blockIdx.x;
   const int64_t g = blockIdx.y;
   const int tid = static_cast<int>(threadIdx.x);
@@ -1900,62 +2070,70 @@ __global__ void PagedAttnPrefillSharedK(TO* out, const TQ* query,
   // d=256 BN=32 → 32KB; d=512 BN=16 → 32KB. (BN=64×2 would be 64KB edge.)
   extern __shared__ __hip_bfloat16 dyn_kv[];
   __hip_bfloat16* k_sm = dyn_kv;
-  __hip_bfloat16* v_sm = dyn_kv + static_cast<size_t>(BN) * static_cast<size_t>(d_expect);
+  __hip_bfloat16* v_sm =
+      kBf16Tile ? k_sm : dyn_kv + static_cast<size_t>(BN) * static_cast<size_t>(d_expect);
   __shared__ int64_t s_blk[BN], s_off[BN];
 
-  for (int64_t j0 = s_jmin; j0 <= s_jmax; j0 += BN) {
-    const int n_k = static_cast<int>((s_jmax - j0 + 1) < BN ? (s_jmax - j0 + 1) : BN);
-    for (int kk = tid; kk < n_k; kk += bdx) {
-      const int64_t j = j0 + kk;
-      s_blk[kk] = block_table[r * bt_row + (j / block_size) * bt_col];
-      s_off[kk] = j % block_size;
-    }
-    __syncthreads();
-    // Prefetch K and V tiles together. For bf16, vectorized uint4 = 8 bf16
-    // when d%8==0. For fp8 (uint8_t), dequantize each byte to bf16 with
-    // F8E4M3ToF32Dev * scale, then store to the same bf16 smem tile.
-    if constexpr (std::is_same_v<TKV, __hip_bfloat16>) {
-      if ((static_cast<int>(d) & 7) == 0) {
-        const int d8 = static_cast<int>(d) >> 3;
-        const int nvec = n_k * d8;
-        for (int e = tid; e < nvec; e += bdx) {
-          const int kk = e / d8;
-          const int v = e - kk * d8;
-          const int dd = v << 3;
-          const int64_t bo = s_blk[kk] * kc_blk + s_off[kk] * kc_pg + g * kc_hd + dd;
-          const int64_t vo = s_blk[kk] * vc_blk + s_off[kk] * vc_pg + g * vc_hd + dd;
-          const size_t dst = (static_cast<size_t>(kk) * static_cast<size_t>(d) + dd) >> 3;
-          reinterpret_cast<uint4*>(k_sm)[dst] = *reinterpret_cast<const uint4*>(k_cache + bo);
-          reinterpret_cast<uint4*>(v_sm)[dst] = *reinterpret_cast<const uint4*>(v_cache + vo);
+  const bool pow2_block = block_size > 0 && (block_size & (block_size - 1)) == 0;
+  for (int phase = 0; phase < (kBf16Tile ? 2 : 1); ++phase) {
+    const int64_t begin = kBf16Tile ? (phase == 0 ? 0 : context) : s_jmin;
+    const int64_t end = kBf16Tile && phase == 0 ? context - 1 : s_jmax;
+    const int tile = kBf16Tile ? (phase == 0 || !pow2_block ? 32 : BN) : BN;
+    for (int64_t j0 = begin; j0 <= end; j0 += tile) {
+      if (j0 + tile <= s_jmin) continue;
+      const int n_k = static_cast<int>((end - j0 + 1) < tile ? (end - j0 + 1) : tile);
+      for (int kk = tid; kk < n_k; kk += bdx) {
+        const int64_t j = j0 + kk;
+        s_blk[kk] = block_table[r * bt_row + (j / block_size) * bt_col];
+        s_off[kk] = j % block_size;
+      }
+      __syncthreads();
+      // Prefetch K and V tiles together. For bf16, vectorized uint4 = 8 bf16
+      // when d%8==0. For fp8 (uint8_t), dequantize each byte to bf16 with
+      // F8E4M3ToF32Dev * scale, then store to the same bf16 smem tile.
+      if constexpr (std::is_same_v<TKV, __hip_bfloat16>) {
+        if ((static_cast<int>(d) & 7) == 0) {
+          const int d8 = static_cast<int>(d) >> 3;
+          const int nvec = n_k * d8;
+          for (int e = tid; e < nvec; e += bdx) {
+            const int kk = e / d8;
+            const int v = e - kk * d8;
+            const int dd = v << 3;
+            const int64_t bo = s_blk[kk] * kc_blk + s_off[kk] * kc_pg + g * kc_hd + dd;
+            const int64_t vo = s_blk[kk] * vc_blk + s_off[kk] * vc_pg + g * vc_hd + dd;
+            const size_t dst = (static_cast<size_t>(kk) * static_cast<size_t>(d) + dd) >> 3;
+            reinterpret_cast<uint4*>(k_sm)[dst] = *reinterpret_cast<const uint4*>(k_cache + bo);
+            if constexpr (!kBf16Tile)
+              reinterpret_cast<uint4*>(v_sm)[dst] = *reinterpret_cast<const uint4*>(v_cache + vo);
+          }
+        } else {
+          for (int e = tid; e < n_k * static_cast<int>(d); e += bdx) {
+            const int kk = e / static_cast<int>(d);
+            const int dd = e - kk * static_cast<int>(d);
+            const int64_t bo = s_blk[kk] * kc_blk + s_off[kk] * kc_pg + g * kc_hd + dd;
+            const int64_t vo = s_blk[kk] * vc_blk + s_off[kk] * vc_pg + g * vc_hd + dd;
+            k_sm[static_cast<size_t>(kk) * d + dd] = k_cache[bo];
+            if constexpr (!kBf16Tile) v_sm[static_cast<size_t>(kk) * d + dd] = v_cache[vo];
+          }
         }
       } else {
-        for (int e = tid; e < n_k * static_cast<int>(d); e += bdx) {
-          const int kk = e / static_cast<int>(d);
-          const int dd = e - kk * static_cast<int>(d);
-          const int64_t bo = s_blk[kk] * kc_blk + s_off[kk] * kc_pg + g * kc_hd + dd;
-          const int64_t vo = s_blk[kk] * vc_blk + s_off[kk] * vc_pg + g * vc_hd + dd;
-          k_sm[static_cast<size_t>(kk) * d + dd] = k_cache[bo];
-          v_sm[static_cast<size_t>(kk) * d + dd] = v_cache[vo];
-        }
-      }
-    } else {
-      // fp8: load uint8_t, dequant to bf16 with scale, store to smem.
-      // Vectorized uint4 load = 16 fp8 elements per thread.
-      if ((static_cast<int>(d) & 15) == 0) {
-        const int d16 = static_cast<int>(d) >> 4;
-        const int nvec = n_k * d16;
-        for (int e = tid; e < nvec; e += bdx) {
-          const int kk = e / d16;
-          const int v = e - kk * d16;
-          const int dd = v << 4;
-          const int64_t bo = s_blk[kk] * kc_blk + s_off[kk] * kc_pg + g * kc_hd + dd;
-          const int64_t vo = s_blk[kk] * vc_blk + s_off[kk] * vc_pg + g * vc_hd + dd;
-          const uint4 kw = *reinterpret_cast<const uint4*>(k_cache + bo);
-          const uint4 vw = *reinterpret_cast<const uint4*>(v_cache + vo);
-          const uint8_t* kb = reinterpret_cast<const uint8_t*>(&kw);
-          const uint8_t* vb = reinterpret_cast<const uint8_t*>(&vw);
-          __hip_bfloat16* kdst = k_sm + static_cast<size_t>(kk) * d + dd;
-          __hip_bfloat16* vdst = v_sm + static_cast<size_t>(kk) * d + dd;
+        // fp8: load uint8_t, dequant to bf16 with scale, store to smem.
+        // Vectorized uint4 load = 16 fp8 elements per thread.
+        if ((static_cast<int>(d) & 15) == 0) {
+          const int d16 = static_cast<int>(d) >> 4;
+          const int nvec = n_k * d16;
+          for (int e = tid; e < nvec; e += bdx) {
+            const int kk = e / d16;
+            const int v = e - kk * d16;
+            const int dd = v << 4;
+            const int64_t bo = s_blk[kk] * kc_blk + s_off[kk] * kc_pg + g * kc_hd + dd;
+            const int64_t vo = s_blk[kk] * vc_blk + s_off[kk] * vc_pg + g * vc_hd + dd;
+            const uint4 kw = *reinterpret_cast<const uint4*>(k_cache + bo);
+            const uint4 vw = *reinterpret_cast<const uint4*>(v_cache + vo);
+            const uint8_t* kb = reinterpret_cast<const uint8_t*>(&kw);
+            const uint8_t* vb = reinterpret_cast<const uint8_t*>(&vw);
+            __hip_bfloat16* kdst = k_sm + static_cast<size_t>(kk) * d + dd;
+            __hip_bfloat16* vdst = v_sm + static_cast<size_t>(kk) * d + dd;
   #pragma unroll
           for (int i = 0; i < 16; ++i) {
             kdst[i] = __float2bfloat16(F8E4M3ToF32Dev(kb[i]) * k_scale);
@@ -1977,8 +2155,59 @@ __global__ void PagedAttnPrefillSharedK(TO* out, const TQ* query,
     }
     __syncthreads();
 
-    // Fused QK + online V (scoreless, one pass — no s_h[BN] regs).
-    if (live) {
+    if constexpr (kBf16Tile) {
+      float scores[QG][2];
+#pragma unroll
+      for (int hh = 0; hh < QG; ++hh) scores[hh][0] = scores[hh][1] = -INFINITY;
+      if (live) {
+#if defined(__gfx1100__)
+        // Each lane owns a key score. Preserve the primary's consecutive
+        // BF16 DOT2 chain across D rather than reducing separate lane sums.
+        for (int half = 0; half < 2; ++half) {
+          const int kk = lane + 32 * half;
+          const int64_t j = j0 + kk;
+          if (kk >= n_k || j < jmin || j > jmax) continue;
+#pragma unroll
+          for (int hh = 0; hh < QG; ++hh) {
+            const auto* qp =
+                reinterpret_cast<const unsigned*>(query + ((t_base + qq) * hq + h0 + hh) * d);
+            const auto* kp = reinterpret_cast<const unsigned*>(k_sm + kk * d);
+            float dot = 0.f;
+            for (int i = 0; i < d_expect / 2; ++i) dot = AttentionDot2(qp[i], kp[i], dot);
+            scores[hh][half] = Softcap(dot * scale, softcap);
+          }
+        }
+#else
+        for (int kk = 0; kk < n_k; ++kk) {
+          const int64_t j = j0 + kk;
+          if (j < jmin || j > jmax) continue;
+          float kr[kEpl];
+          LoadRowEplBf16<kEpl>(k_sm, static_cast<int64_t>(kk) * d, lane, kr);
+#pragma unroll
+          for (int hh = 0; hh < QG; ++hh) {
+            float dot = 0.f;
+#pragma unroll
+            for (int i = 0; i < kEpl; ++i) dot += q_reg[hh][i] * kr[i];
+#pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) dot += __shfl_down(dot, offset);
+            const float score = Softcap(__shfl(dot, 0) * scale, softcap);
+            if (lane == kk % 32) scores[hh][kk / 32] = score;
+          }
+        }
+#endif
+      }
+      __syncthreads();
+      const int d8 = static_cast<int>(d) / 8;
+      for (int e = tid; e < n_k * d8; e += bdx) {
+        const int kk = e / d8, dd = (e % d8) * 8;
+        const int64_t vo = s_blk[kk] * vc_blk + s_off[kk] * vc_pg + g * vc_hd + dd;
+        reinterpret_cast<uint4*>(v_sm)[e] = *reinterpret_cast<const uint4*>(v_cache + vo);
+      }
+      __syncthreads();
+      if (live) SharedKTileValue64<QG, kEpl>(scores, v_sm, n_k, lane, m, lsum, o_reg);
+    } else {
+      // Fused QK + online V (scoreless, one pass — no s_h[BN] regs).
+      if (live) {
 #pragma unroll 1
       for (int kk = 0; kk < n_k; ++kk) {
         const int64_t j = j0 + kk;
@@ -2005,7 +2234,9 @@ __global__ void PagedAttnPrefillSharedK(TO* out, const TQ* query,
         }
       }
     }
+    }
     __syncthreads();
+    }
   }
 
   if (live) {
@@ -2015,7 +2246,12 @@ __global__ void PagedAttnPrefillSharedK(TO* out, const TQ* query,
       const float inv = (lsum[hh] > 0.f) ? (1.f / lsum[hh]) : 0.f;
       float acc[kEpl];
 #pragma unroll
-      for (int i = 0; i < kEpl; ++i) acc[i] = o_reg[hh][i] * inv;
+      for (int i = 0; i < kEpl; ++i) {
+        if constexpr (kBf16Tile)
+          acc[i] = o_reg[hh][i] / (lsum[hh] + 1e-10f);
+        else
+          acc[i] = o_reg[hh][i] * inv;
+      }
       if constexpr (std::is_same_v<TO, __hip_bfloat16>)
         StoreRowEplBf16<kEpl>(out, (t * hq + (h0 + hh)) * d, lane, acc);
       else
@@ -2071,6 +2307,7 @@ __global__ void PagedAttnPrefillSharedKWmma(__hip_bfloat16* out, const __hip_bfl
   constexpr int kEpl = EPL;
   constexpr int d_expect = kEpl * 32;
   constexpr int WM = 16, WN = 16, WK = 16;
+  constexpr bool kMatrixPV = d_expect == 256 && BM == 16 && BN == 64 && QG == 2 && !kQGlobal;
   const int64_t q_tile = blockIdx.x;
   const int64_t g = blockIdx.y;
   const int tid = static_cast<int>(threadIdx.x);
@@ -2156,18 +2393,18 @@ __global__ void PagedAttnPrefillSharedKWmma(__hip_bfloat16* out, const __hip_bfl
   if constexpr (kQGlobal) {
     // Dyn = K+V only (d=512: BN16 → 32KB).
     k_sm = dyn_bf;
-    v_sm = k_sm + static_cast<size_t>(BN) * static_cast<size_t>(d_expect);
+    v_sm = kMatrixPV ? k_sm : k_sm + static_cast<size_t>(BN) * static_cast<size_t>(d_expect);
   } else {
     q_sm = dyn_bf;
     k_sm = q_sm + static_cast<size_t>(BM) * QG * static_cast<size_t>(d_expect);
-    v_sm = k_sm + static_cast<size_t>(BN) * static_cast<size_t>(d_expect);
+    v_sm = kMatrixPV ? k_sm : k_sm + static_cast<size_t>(BN) * static_cast<size_t>(d_expect);
   }
   __shared__ int64_t s_blk[BN], s_off[BN];
   __shared__ float s_sc[QG * BM * BN];
 
   // Q: smem tile (d=256) or per-warp regs for scalar tail (d=512 global).
   float q_reg[QG][kEpl];
-  if constexpr (!kQGlobal) {
+  if constexpr (!kQGlobal && !kMatrixPV) {
     for (int e = tid; e < BM * QG * static_cast<int>(d); e += bdx) q_sm[e] = __hip_bfloat16{};
     __syncthreads();
     for (int e = tid; e < nq * QG * static_cast<int>(d); e += bdx) {
@@ -2197,97 +2434,141 @@ __global__ void PagedAttnPrefillSharedKWmma(__hip_bfloat16* out, const __hip_bfl
   }
 
   using namespace rocwmma;
+  fragment<accumulator, WM, WN, WK, float> pv_acc[2];
+  __shared__ float pv_alpha[QG * BM];
+  if constexpr (kMatrixPV) {
+    fill_fragment(pv_acc[0], 0.f);
+    fill_fragment(pv_acc[1], 0.f);
+  }
+
   // Full BM tiles can WMMA from global Q without OOB; partial last tile uses scalar QK.
   const bool use_wmma_qk = !kQGlobal || (nq == BM);
-  for (int64_t j0 = s_jmin; j0 <= s_jmax; j0 += BN) {
-    const int n_k = static_cast<int>((s_jmax - j0 + 1) < BN ? (s_jmax - j0 + 1) : BN);
-    for (int kk = tid; kk < n_k; kk += bdx) {
-      const int64_t j = j0 + kk;
-      s_blk[kk] = block_table[r * bt_row + (j / block_size) * bt_col];
-      s_off[kk] = j % block_size;
-    }
-    __syncthreads();
-    // Prefetch K+V together (vectorized when d%8==0).
-    if ((static_cast<int>(d) & 7) == 0) {
-      const int d8 = static_cast<int>(d) >> 3;
-      const int nvec_all = BN * d8;
-      for (int e = tid; e < nvec_all; e += bdx) {
-        reinterpret_cast<uint4*>(k_sm)[static_cast<size_t>(e)] = uint4{0, 0, 0, 0};
-        reinterpret_cast<uint4*>(v_sm)[static_cast<size_t>(e)] = uint4{0, 0, 0, 0};
+  const bool pow2_block = block_size > 0 && (block_size & (block_size - 1)) == 0;
+  const bool decode = kMatrixPV && query_len == 1;
+  for (int phase = decode ? 1 : 0; phase < (kMatrixPV ? 2 : 1); ++phase) {
+    const int64_t begin = decode ? 0 : (kMatrixPV ? (phase == 0 ? 0 : context) : s_jmin);
+    const int64_t end = kMatrixPV && phase == 0 ? context - 1 : s_jmax;
+    const int tile = decode ? (pow2_block ? static_cast<int>(block_size) : 32)
+                            : (kMatrixPV ? (phase == 0 || !pow2_block ? 32 : BN) : BN);
+    for (int64_t j0 = begin; j0 <= end; j0 += tile) {
+      if (j0 + tile <= s_jmin) continue;
+      const int n_k = static_cast<int>((end - j0 + 1) < tile ? (end - j0 + 1) : tile);
+      for (int kk = tid; kk < n_k; kk += bdx) {
+        const int64_t j = j0 + kk;
+        s_blk[kk] = block_table[r * bt_row + (j / block_size) * bt_col];
+        s_off[kk] = j % block_size;
       }
       __syncthreads();
-      const int nvec = n_k * d8;
-      for (int e = tid; e < nvec; e += bdx) {
-        const int kk = e / d8;
-        const int v = e - kk * d8;
-        const int dd = v << 3;
-        const int64_t bo = s_blk[kk] * kc_blk + s_off[kk] * kc_pg + g * kc_hd + dd;
-        const int64_t vo = s_blk[kk] * vc_blk + s_off[kk] * vc_pg + g * vc_hd + dd;
-        const size_t dst = static_cast<size_t>(e);
-        reinterpret_cast<uint4*>(k_sm)[dst] = *reinterpret_cast<const uint4*>(k_cache + bo);
-        reinterpret_cast<uint4*>(v_sm)[dst] = *reinterpret_cast<const uint4*>(v_cache + vo);
-      }
-    } else {
-      for (int e = tid; e < BN * static_cast<int>(d); e += bdx) {
-        k_sm[e] = __hip_bfloat16{};
-        v_sm[e] = __hip_bfloat16{};
-      }
-      __syncthreads();
-      for (int e = tid; e < n_k * static_cast<int>(d); e += bdx) {
-        const int kk = e / static_cast<int>(d);
-        const int dd = e - kk * static_cast<int>(d);
-        k_sm[e] = k_cache[s_blk[kk] * kc_blk + s_off[kk] * kc_pg + g * kc_hd + dd];
-        v_sm[e] = v_cache[s_blk[kk] * vc_blk + s_off[kk] * vc_pg + g * vc_hd + dd];
-      }
-    }
-    __syncthreads();
-
-    if (use_wmma_qk) {
-      // WMMA QK → s_sc[hh][qq][kk]
-      constexpr int tiles_m = BM / WM;
-      constexpr int tiles_n = BN / WN;
-      constexpr int ntiles_h = tiles_m * tiles_n;
-      constexpr int ntiles = ntiles_h * QG;
-      const int step = nwarps;
-      for (int t = warp; t < ntiles; t += step) {
-        const int hh = t / ntiles_h;
-        const int t2 = t - hh * ntiles_h;
-        const int tm = t2 / tiles_n;
-        const int tn = t2 - tm * tiles_n;
-        const int m0 = tm * WM;
-        const int n0 = tn * WN;
-        fragment<matrix_a, WM, WN, WK, bfloat16_t, row_major> a_frag;
-        fragment<matrix_b, WM, WN, WK, bfloat16_t, col_major> b_frag;
-        fragment<accumulator, WM, WN, WK, float> acc;
-        fill_fragment(acc, 0.f);
-        const bfloat16_t* Kbase =
-            reinterpret_cast<const bfloat16_t*>(k_sm + static_cast<size_t>(n0) * d);
-        if constexpr (kQGlobal) {
-          // query layout [t][hq][d]; fixed head h0+hh, row stride = hq*d
-          const bfloat16_t* Qbase = reinterpret_cast<const bfloat16_t*>(
-              query + ((t_base + m0) * hq + (h0 + hh)) * d);
-          const long lda = static_cast<long>(hq) * static_cast<long>(d);
-          for (int k = 0; k < d_expect; k += WK) {
-            load_matrix_sync(a_frag, Qbase + k, lda);
-            load_matrix_sync(b_frag, Kbase + k, d);
-            mma_sync(acc, a_frag, b_frag, acc);
-          }
-        } else {
-          const bfloat16_t* Qbase =
-              reinterpret_cast<const bfloat16_t*>(q_sm + static_cast<size_t>(hh) * d);
-          const long lda = static_cast<long>(QG) * static_cast<long>(d);
-          for (int k = 0; k < d_expect; k += WK) {
-            load_matrix_sync(a_frag, Qbase + static_cast<long>(m0) * lda + k, lda);
-            load_matrix_sync(b_frag, Kbase + k, d);
-            mma_sync(acc, a_frag, b_frag, acc);
-          }
+      // Prefetch K+V together (vectorized when d%8==0).
+      if ((static_cast<int>(d) & 7) == 0) {
+        const int d8 = static_cast<int>(d) >> 3;
+        const int nvec_all = BN * d8;
+        for (int e = tid; e < nvec_all; e += bdx) {
+          reinterpret_cast<uint4*>(k_sm)[static_cast<size_t>(e)] = uint4{0, 0, 0, 0};
+          if constexpr (!kMatrixPV)
+            reinterpret_cast<uint4*>(v_sm)[static_cast<size_t>(e)] = uint4{0, 0, 0, 0};
         }
-        float* sc_base = s_sc + static_cast<size_t>(hh) * BM * BN + static_cast<size_t>(m0) * BN + n0;
-        store_matrix_sync(sc_base, acc, BN, mem_row_major);
+        __syncthreads();
+        const int nvec = n_k * d8;
+        for (int e = tid; e < nvec; e += bdx) {
+          const int kk = e / d8;
+          const int v = e - kk * d8;
+          const int dd = v << 3;
+          const int64_t bo = s_blk[kk] * kc_blk + s_off[kk] * kc_pg + g * kc_hd + dd;
+          const int64_t vo = s_blk[kk] * vc_blk + s_off[kk] * vc_pg + g * vc_hd + dd;
+          const size_t dst = static_cast<size_t>(e);
+          reinterpret_cast<uint4*>(k_sm)[dst] = *reinterpret_cast<const uint4*>(k_cache + bo);
+          if constexpr (!kMatrixPV)
+            reinterpret_cast<uint4*>(v_sm)[dst] = *reinterpret_cast<const uint4*>(v_cache + vo);
+        }
+      } else {
+        for (int e = tid; e < BN * static_cast<int>(d); e += bdx) {
+          k_sm[e] = __hip_bfloat16{};
+          if constexpr (!kMatrixPV) v_sm[e] = __hip_bfloat16{};
+        }
+        __syncthreads();
+        for (int e = tid; e < n_k * static_cast<int>(d); e += bdx) {
+          const int kk = e / static_cast<int>(d);
+          const int dd = e - kk * static_cast<int>(d);
+          k_sm[e] = k_cache[s_blk[kk] * kc_blk + s_off[kk] * kc_pg + g * kc_hd + dd];
+          if constexpr (!kMatrixPV)
+            v_sm[e] = v_cache[s_blk[kk] * vc_blk + s_off[kk] * vc_pg + g * vc_hd + dd];
+        }
       }
       __syncthreads();
-    } else if (live) {
-      // Partial tile + global Q: scalar QK into s_sc for this row (no OOB WMMA).
+
+      if constexpr (kMatrixPV) {
+        for (int e = tid; e < BM * QG * static_cast<int>(d); e += bdx) q_sm[e] = __hip_bfloat16{};
+        __syncthreads();
+        for (int e = tid; e < nq * QG * static_cast<int>(d); e += bdx) {
+          const int dd = e % static_cast<int>(d);
+          const int tmp = e / static_cast<int>(d);
+          const int hh = tmp % QG;
+          const int qi = tmp / QG;
+          q_sm[(static_cast<size_t>(qi) * QG + hh) * d + dd] =
+              query[((t_base + qi) * hq + (h0 + hh)) * d + dd];
+        }
+        __syncthreads();
+      }
+
+      if (use_wmma_qk) {
+        // WMMA QK → s_sc[hh][qq][kk]
+        constexpr int tiles_m = BM / WM;
+        constexpr int tiles_n = BN / WN;
+        constexpr int ntiles_h = tiles_m * tiles_n;
+        constexpr int ntiles = ntiles_h * QG;
+        const int step = nwarps;
+        for (int t = warp; t < ntiles; t += step) {
+          const int hh = t / ntiles_h;
+          const int t2 = t - hh * ntiles_h;
+          const int tm = t2 / tiles_n;
+          const int tn = t2 - tm * tiles_n;
+          const int m0 = tm * WM;
+          const int n0 = tn * WN;
+          fragment<matrix_a, WM, WN, WK, bfloat16_t, row_major> a_frag;
+          fragment<matrix_b, WM, WN, WK, bfloat16_t, col_major> b_frag;
+          fragment<accumulator, WM, WN, WK, float> acc;
+          fill_fragment(acc, 0.f);
+          const bfloat16_t* Kbase =
+              reinterpret_cast<const bfloat16_t*>(k_sm + static_cast<size_t>(n0) * d);
+          if constexpr (kQGlobal) {
+            // query layout [t][hq][d]; fixed head h0+hh, row stride = hq*d
+            const bfloat16_t* Qbase =
+                reinterpret_cast<const bfloat16_t*>(query + ((t_base + m0) * hq + (h0 + hh)) * d);
+            const long lda = static_cast<long>(hq) * static_cast<long>(d);
+            for (int k = 0; k < d_expect; k += WK) {
+              load_matrix_sync(a_frag, Qbase + k, lda);
+              load_matrix_sync(b_frag, Kbase + k, d);
+              if constexpr (kMatrixPV)
+                AttentionMmaSync(acc, a_frag, b_frag, acc);
+              else
+                mma_sync(acc, a_frag, b_frag, acc);
+            }
+          } else {
+            const bfloat16_t* Qbase =
+                reinterpret_cast<const bfloat16_t*>(q_sm + static_cast<size_t>(hh) * d);
+            const long lda = static_cast<long>(QG) * static_cast<long>(d);
+            for (int k = 0; k < d_expect; k += WK) {
+              if constexpr (kMatrixPV) {
+                load_matrix_sync(a_frag, Kbase + k, d);
+                load_matrix_sync(b_frag, Qbase + static_cast<long>(m0) * lda + k, lda);
+              } else {
+                load_matrix_sync(a_frag, Qbase + static_cast<long>(m0) * lda + k, lda);
+                load_matrix_sync(b_frag, Kbase + k, d);
+              }
+              if constexpr (kMatrixPV)
+                AttentionMmaSync(acc, a_frag, b_frag, acc);
+              else
+                mma_sync(acc, a_frag, b_frag, acc);
+            }
+          }
+          float* sc_base =
+              s_sc + static_cast<size_t>(hh) * BM * BN + static_cast<size_t>(m0) * BN + n0;
+          store_matrix_sync(sc_base, acc, BN, kMatrixPV ? mem_col_major : mem_row_major);
+        }
+        __syncthreads();
+      } else if (live) {
+        // Partial tile + global Q: scalar QK into s_sc for this row (no OOB WMMA).
 #pragma unroll 1
       for (int kk = 0; kk < n_k; ++kk) {
         float k_reg[kEpl];
@@ -2309,10 +2590,93 @@ __global__ void PagedAttnPrefillSharedKWmma(__hip_bfloat16* out, const __hip_bfl
       __syncthreads();
     }
 
-    // Online softmax + V from v_sm (no K reload, no V global round-trip).
-    if (live) {
-      const int64_t jmin = s_jmin_q[qq];
-      const int64_t jmax = s_jmax_q[qq];
+    if constexpr (kMatrixPV) {
+      // All QK readers have reached the preceding barrier. Reuse K's shared
+      // storage for V, keeping the 64-key probability tile below 64 KiB LDS.
+      const int d8 = static_cast<int>(d) / 8;
+      for (int e = tid; e < n_k * d8; e += bdx) {
+        const int kk = e / d8, dd = (e % d8) * 8;
+        const int64_t vo = s_blk[kk] * vc_blk + s_off[kk] * vc_pg + g * vc_hd + dd;
+        reinterpret_cast<uint4*>(v_sm)[e] = *reinterpret_cast<const uint4*>(v_cache + vo);
+      }
+      __syncthreads();
+      float probabilities[QG][2];
+#pragma unroll
+      for (int hh = 0; hh < QG; ++hh) {
+        float scores[2];
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+          const int kk = lane + 32 * half;
+          const int64_t j = j0 + kk;
+          scores[half] = (live && kk < n_k && j >= s_jmin_q[qq] && j <= s_jmax_q[qq])
+                             ? Softcap(s_sc[static_cast<size_t>(hh) * BM * BN +
+                                            static_cast<size_t>(qq) * BN + kk] *
+                                           scale,
+                                       softcap)
+                             : -INFINITY;
+        }
+        float tile_max = fmaxf(scores[0], scores[1]);
+#pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+          tile_max = fmaxf(tile_max, __shfl_xor(tile_max, offset));
+        const float next = fmaxf(m[hh], tile_max);
+        const float alpha = m[hh] > -INFINITY ? FastExp(m[hh] - next) : 0.f;
+        float sum = 0.f;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+          const float prob = next > -INFINITY ? FastExp(scores[half] - next) : 0.f;
+          probabilities[hh][half] = prob;
+          sum += prob;
+        }
+        // The primary's transposed WMMA layout reduces each lane's even
+        // or odd key columns in order, then adds its paired lane's sum.
+        sum = 0.f;
+#pragma unroll
+        for (int i = 0; i < 32; ++i) {
+          const int kk = 2 * i + (lane & 1);
+          sum += __shfl(probabilities[hh][kk / 32], kk % 32);
+        }
+        sum += __shfl_xor(sum, 1);
+        lsum[hh] = fmaf(lsum[hh], alpha, sum);
+        m[hh] = next;
+        if (lane == 0) pv_alpha[hh * BM + qq] = alpha;
+      }
+      __syncthreads();  // Every float score has been read before its storage becomes P.
+      auto* p_sm = reinterpret_cast<__hip_bfloat16*>(s_sc);
+#pragma unroll
+      for (int hh = 0; hh < QG; ++hh)
+#pragma unroll
+        for (int half = 0; half < 2; ++half)
+          p_sm[hh * BM * BN + qq * BN + lane + 32 * half] =
+              __float2bfloat16(probabilities[hh][half]);
+      __syncthreads();
+      // Public rocWMMA stores expose row coordinates for alpha scaling. Q is
+      // reloaded on the next iteration; its 16 KiB now holds one tile per wave.
+      float* tile_scratch = reinterpret_cast<float*>(q_sm) + warp * WM * WN;
+      const int pv_head = warp / 8;
+#pragma unroll
+      for (int f = 0; f < 2; ++f) {
+        const int column = (warp % 8) * 32 + f * WN;
+        store_matrix_sync(tile_scratch, pv_acc[f], WN, mem_col_major);
+        __syncthreads();
+        for (int i = lane; i < WM * WN; i += 32) tile_scratch[i] *= pv_alpha[pv_head * BM + i / WN];
+        __syncthreads();
+        load_matrix_sync(pv_acc[f], tile_scratch, WN, mem_col_major);
+        fragment<matrix_a, WM, WN, WK, bfloat16_t, col_major> pf;
+        fragment<matrix_b, WM, WN, WK, bfloat16_t, col_major> vf;
+        for (int k = 0; k < tile; k += WK) {
+          load_matrix_sync(pf, reinterpret_cast<bfloat16_t*>(v_sm) + k * d + column, d);
+          load_matrix_sync(vf, reinterpret_cast<bfloat16_t*>(p_sm) + pv_head * BM * BN + k, BN);
+          AttentionMmaSync(pv_acc[f], pf, vf, pv_acc[f]);
+        }
+        // Triton's executing IR folds decode's acc += dot(P,V) into a dot
+        // with the scaled accumulator, just as in prefix prefill.
+      }
+    } else {
+      // Online softmax + V from v_sm (no K reload, no V global round-trip).
+      if (live) {
+        const int64_t jmin = s_jmin_q[qq];
+        const int64_t jmax = s_jmax_q[qq];
 #pragma unroll 1
       for (int kk = 0; kk < n_k; ++kk) {
         const int64_t j = j0 + kk;
@@ -2341,10 +2705,32 @@ __global__ void PagedAttnPrefillSharedKWmma(__hip_bfloat16* out, const __hip_bfl
         }
       }
     }
+    }
     __syncthreads();
+    }
   }
 
-  if (live) {
+  if constexpr (kMatrixPV) {
+#pragma unroll
+    for (int hh = 0; hh < QG; ++hh)
+      if (lane == 0) pv_alpha[hh * BM + qq] = lsum[hh] + 1e-10f;
+    __syncthreads();
+    float* tile_scratch = reinterpret_cast<float*>(q_sm) + warp * WM * WN;
+    const int pv_head = warp / 8;
+#pragma unroll
+    for (int f = 0; f < 2; ++f) {
+      const int column = (warp % 8) * 32 + f * WN;
+      store_matrix_sync(tile_scratch, pv_acc[f], WN, mem_col_major);
+      __syncthreads();
+      for (int i = lane; i < WM * WN; i += 32) {
+        const int row = i / WN, col = i % WN;
+        if (row < nq)
+          out[((t_base + row) * hq + h0 + pv_head) * d + column + col] =
+              __float2bfloat16(tile_scratch[i] / pv_alpha[pv_head * BM + row]);
+      }
+      __syncthreads();
+    }
+  } else if (live) {
     const int64_t t = t_base + qq;
 #pragma unroll
     for (int hh = 0; hh < QG; ++hh) {
@@ -2551,39 +2937,62 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
         ((qg == 2 && (d == 128 || d == 256 || d == 512)) || (qg == 8 && d == 512))) {
       // Prefill SharedK (scoreless). Default ON for long single-req prefill (lab win
       // ~1.09× @11k vs DecodeGqa-z4). Set VT_ATTN_PREFILL_FLASH_SHAREDK=0 to disable.
-      // SHAREDK_WMMA=1: rocWMMA QK + online V (lab; keep only if beats scalar SharedK).
+      // Admitted d=256 targets use rocWMMA QK/PV by default.
       static const bool prefill_sharedk = [] {
         const char* e = std::getenv("VT_ATTN_PREFILL_FLASH_SHAREDK");
         if (!e) return true;  // default ON
         return e[0] != '0';
       }();
       static const bool sharedk_wmma = [] {
-        // Default ON: d=256 Q-smem WMMA only. d=512 stays scalar SharedK
+        // Default ON on admitted gfx1100 and gfx12 devices.
+        // Only d=256 Q-smem WMMA is admitted. d=512 stays scalar SharedK
         // until a separately gated kernel repair (shipping f58b spills).
         // =0 forces scalar SharedK for A/B.
         const char* e = std::getenv("VT_ATTN_PREFILL_SHAREDK_WMMA");
         if (!e) return true;
         return e[0] != '0';
       }();
+      // The gfx1100 decode prerequisite uses identical matrix arithmetic in
+      // both prefill control arms. Keep other targets and short prefill unchanged.
+      if (d == 256 && num_reqs == 1 && total_q == 1 && block_size <= 64 &&
+          SharedKAttentionWmmaHostOk(/*decode=*/true)) {
+        if (block_size < 16 && (block_size & (block_size - 1)) == 0) {
+          // Preserve the existing sub-16 cache-block realization.
+          PagedAttnPrefillSharedKWmma<2, 8, 16, 64, false>
+              <<<dim3(1, static_cast<unsigned>(num_kv_heads)), 512, 49152, st>>>(
+                  out.Ptr<__hip_bfloat16>(), query.Ptr<__hip_bfloat16>(),
+                  k_cache.Ptr<__hip_bfloat16>(), v_cache.Ptr<__hip_bfloat16>(),
+                  block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+                  query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size, bt_row,
+                  bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+                  args.logits_soft_cap, args.causal, window_left, window_right);
+          Check(hipGetLastError(), "paged_attention sharedk_wmma decode launch");
+        } else {
+          Rdna3AttentionDecode(q, out, query, k_cache, v_cache, block_table, seq_lens, args,
+                               window_left, window_right);
+        }
+        return;
+      }
       if (prefill_sharedk && total_q >= 64 && num_reqs == 1) {
         auto smem_kv = [&](int bn) -> size_t {
-          // K[bn*d] + V[bn*d] fused scoreless
-          return sizeof(__hip_bfloat16) * static_cast<size_t>(2 * bn) * static_cast<size_t>(d);
+          // d=256 reuses the K tile for V after the score consumers finish.
+          return sizeof(__hip_bfloat16) * static_cast<size_t>((d == 256 ? 1 : 2) * bn) *
+                 static_cast<size_t>(d);
         };
         auto smem_qkv = [&](int bm, int bn) -> size_t {
-          // Q[bm*QG*d] + K[bn*d] + V[bn*d]  (QG=2 packed as bm*2*d)
+          // Q[bm*QG*d] plus K[bn*d]. The d=256 V tile reuses K storage.
           return sizeof(__hip_bfloat16) *
                  (static_cast<size_t>(bm) * 2 * static_cast<size_t>(d) +
-                  static_cast<size_t>(2 * bn) * static_cast<size_t>(d));
+                  static_cast<size_t>((d == 256 ? 1 : 2) * bn) * static_cast<size_t>(d));
         };
         const unsigned z_groups = (qg == 8 && d == 512) ? 4u : 1u;
-        // Host must not launch WMMA stubs on non-gfx1200/1201 devices
+        // Host must not launch WMMA stubs on devices excluded at compilation
         // (kernel body is empty there → silent garbage out). Runtime prefix
         // match on hipDeviceProp_t.gcnArchName; VT_ROCWMMA_OK is device-only.
-        if (sharedk_wmma && PrefillSharedKWmmaHostOk()) {
+        if (sharedk_wmma && SharedKAttentionWmmaHostOk()) {
           if (d == 256) {
-            // Q16K+K16K+V16K=48KB dyn + s_sc~4KB
-            constexpr int BM = 16, BN = 32;
+            // Q 16 KiB plus a shared K/V tile of 32 KiB. Static LDS is 9616 B.
+            constexpr int BM = 16, BN = 64;
             const unsigned tiles = static_cast<unsigned>((total_q + BM - 1) / BM);
             dim3 grid(tiles, static_cast<unsigned>(num_kv_heads), z_groups);
             dim3 block(static_cast<unsigned>(BM * 32));
@@ -2600,7 +3009,7 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
           }
         }
         if (d == 256) {
-          constexpr int BM = 32, BN = 32;  // K+V 32KB; BM32 ~+2% vs BM16 @11k
+          constexpr int BM = 32, BN = 64;  // Reuse the 32 KiB K tile for V.
           const unsigned tiles = static_cast<unsigned>((total_q + BM - 1) / BM);
           dim3 grid(tiles, static_cast<unsigned>(num_kv_heads), z_groups);
           dim3 block(static_cast<unsigned>(BM * 32));

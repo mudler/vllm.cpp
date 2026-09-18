@@ -222,6 +222,29 @@ enum class OpId : uint8_t {
   // scatter the per-group core outputs back to their original row positions.
   kIndexSelect,
   kIndexCopy,
+  // V-head re-indexing of a GDN projection vector. Additive op that lets the
+  // qwen4exp GGUF loader keep its Gated DeltaNet projections QUANTIZED: the
+  // converter's tiled V-head order is undone on the [T, N] activation instead
+  // of on the weight, which a k-quant block stream cannot represent. Pure
+  // re-indexing, no arithmetic. See `VHeadPermuteArgs`.
+  //
+  // BIT-IDENTICAL TO THE LOAD-TIME PERMUTATION FOR FOUR OF THE FIVE
+  // PROJECTIONS, NOT ALL FIVE. A ROW permutation moves whole dot products, so
+  // `attn_qkv`, `attn_gate`, `ssm_beta` and `ssm_alpha` are bit-identical by
+  // construction. `ssm_out`'s is a COLUMN permutation: it reorders the
+  // summation inside every dot product, and floating-point addition is not
+  // associative, so there it is bit-identical only under exact arithmetic. That
+  // it holds in this tree is a measurement at `value_dim` 96 on a bf16 CPU
+  // `Matmul`, not a property of the released 6144-wide Q6_K path — see
+  // `tests/vllm/models/test_gdn_v_head_permute.cpp` and
+  // `qwen4_exp_weights.cpp`'s `LoadGdn`.
+  //
+  // THE COST IS O(T * N) PER LAYER PER FORWARD. It is net-negative per DECODE
+  // step by ~2.646 GB and net-POSITIVE for one large prefill step in isolation
+  // (breakeven T ~= 817; a T = 2048 prefill overpays ~4.0 GB and is repaid
+  // after 1.5 decode steps). `LoadGdn` carries the full arithmetic, and neither
+  // half is device-measured yet.
+  kVHeadPermute,
   // BF16 grouped-MoE GEMM: the dtype-native analog of kMoeGroupedGemmNvfp4 (no
   // fp4 decode). Powers the Qwen3-Coder (Qwen3MoeForCausalLM) fast bf16 MoE path.
   kMoeGroupedGemmBf16,
@@ -894,6 +917,9 @@ enum class OpId : uint8_t {
   // but with per-element clamping. Appended before kCount so no existing op's
   // id shifts.
   kClampedSwiGLU,
+  kScaledRmsNorm,
+  kSandwichRmsNorm,
+  kCompiledGeluErfMul,
   kCount
 };
 
@@ -1149,6 +1175,11 @@ struct RopeArgs {
   std::array<int32_t, 3> mrope_section = {0, 0, 0};
   bool mrope_interleaved = false;
 
+  // RopeCosSinCache only: positive selects the primary's FP32 cache math,
+  // including position / factor before the outer product. One is unscaled.
+  // Zero preserves the legacy FP64 cache math and Llama-3 rescaling.
+  float linear_scaling_factor = 0.0f;
+
   // Llama-3 rope frequency rescaling (rope_type=="llama3", e.g. Llama-3.2). When
   // llama3_scaling_factor <= 0 (the default) NO rescale is applied and the RoPE
   // is byte-identical to plain RoPE — so every existing caller (Qwen, the gate
@@ -1217,6 +1248,15 @@ struct Qwen4ExpPleGateArgs {
 
 struct L2NormArgs {
   float eps = 1e-6f;  // upstream default (gdn-semantics.md §4)
+};
+
+// Geometry of one Gated DeltaNet V-head re-indexing. See `vt::VHeadPermute`.
+struct VHeadPermuteArgs {
+  int64_t prefix_elems = 0;   // leading columns copied through unpermuted
+  int64_t num_key_heads = 0;  // K
+  int64_t heads_per_key = 0;  // R = num_value_heads / K
+  int64_t head_width = 1;     // elements per V head (value_head_dim, or 1)
+  bool inverse = false;       // false: tiled -> grouped; true: grouped -> tiled
 };
 
 struct RmsNormGatedArgs {
@@ -2587,6 +2627,8 @@ using GdnStateScatterFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using IndexSelectFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
 using IndexCopyFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
+using VHeadPermuteFn =
+    void (*)(Queue&, Tensor&, const Tensor&, const VHeadPermuteArgs&);
 using MoeRouterTopKFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&,
                                  const MoeRouterTopKArgs&, const Tensor*);
 // The trailing float is `routed_scale` — the routed_scaling_factor applied to
@@ -4509,6 +4551,34 @@ void GdnStateScatter(Queue& q, Tensor& cache, const Tensor& working,
 // (qwen_gdn_linear_attn.py:1334-1335,1407-1408).
 void IndexSelect(Queue& q, Tensor& out, const Tensor& in, const Tensor& idx);
 
+// ── V-head re-indexing of a GDN projection vector ──────────────────────────
+//
+// WHY THIS EXISTS. The `qwen4exp` converter writes the Gated DeltaNet V heads
+// TILED (`t = r * num_key_heads + k`) while every downstream GDN kernel and
+// every HuggingFace reference indexes them GROUPED (`g = k * heads_per_key + r`,
+// so value head g belongs to key head `g / heads_per_key` — the rule the
+// recurrence hard-codes). The loader used to undo that on the WEIGHT, which
+// forces a k-quant superblock to be dequantized because the permutation moves
+// elements the superblock spans. For `out = W x` a ROW permutation satisfies
+// `(P W) x = P (W x)` and a COLUMN permutation satisfies `(W P) x = W (P x)`,
+// so the same re-indexing on the VECTOR leaves the weight verbatim. This op is
+// that re-indexing.
+//
+// `out` and `in` are [T, N] with N == prefix_elems + num_key_heads *
+// heads_per_key * head_width. Both are inner-contiguous and MAY carry an outer
+// row stride on dim 0; they must not alias. Elements [0, prefix_elems) are
+// copied straight through — that is `in_proj_qkv`'s leading q and k rows, which
+// the converter does NOT tile. Any elementwise dtype; in/out share it.
+//
+// `inverse == false` maps TILED -> GROUPED: `out[g] = in[r * K + k]` for
+// `g = k * R + r`. That is the four ROW-permuted projections (`attn_qkv`'s V
+// rows, `attn_gate`, `ssm_beta`, `ssm_alpha`), permuted on their OUTPUT.
+// `inverse == true` maps GROUPED -> TILED: `out[t] = in[k * R + r]` for
+// `t = r * K + k`. That is `ssm_out`, whose permutation is on its COLUMNS and
+// therefore on its INPUT.
+void VHeadPermute(Queue& q, Tensor& out, const Tensor& in,
+                  const VHeadPermuteArgs& args);
+
 // Row scatter over dim 0 (torch `index_copy_(0, idx, src)`): out[idx[i], ...] =
 // in[i, ...]. `idx` is i32 [M]; in is [M, D...] contiguous; out is [N, D...]
 // contiguous. Rows of out not named by idx are untouched. Merges the per-group
@@ -6253,8 +6323,33 @@ void Exl3MoeMlp(Queue& q, Tensor& output_state, const Tensor& hidden_state,
 // the bound is set by cuBLAS's fp16 GEMM accumulation order, which is
 // non-deterministic in reduction order. The bound is RMS relative 1.0e-3 and
 // 8 fp16 ulps, the same tier as Exl3Gemm.
+//
+// TEST-ONLY since QUANT-EXL3 W7. No production path calls this overload; a model
+// forward uses the overload below. It stays as the reference spelling with a
+// caller-owned scratch, which the W7 byte-identity case in
+// tests/vt/test_exl3_matmul_dispatch.cpp and tests/vt/test_exl3_gemm.cpp call.
 void Exl3ReconstructGemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trellis,
                           const Tensor& suh, const Tensor& svh, Tensor& a_had,
                           Tensor& w_scratch, const Exl3GemmArgs& args);
+
+// QUANT-EXL3 W7 (.agents/specs/quant-exl3-recon-scratch.md). The same op with no
+// caller scratch: the backend supplies the reconstructed weight from ONE
+// persistent, grow-only buffer per (device, queue) that it owns outside every
+// scratch pool. This is the spelling a model forward uses. A per-call pool
+// scratch is part of a CUDA-graph step's demand profile, so every captured
+// graph pinned its own copy of each [k, min(n, 32768)] class; exllamav3's
+// `torch.empty` in `reconstruct_hgemm` (exl3.py:161-217) is one shared block
+// under torch's caching allocator instead.
+//
+// Growth is refused while the queue's stream is capturing, by name. A driver
+// that runs one eager step at a shape before capturing it never trips that,
+// because the buffer's size depends on the weight and not on m.
+//
+// Internally the registered kernel receives an EMPTY `w_scratch` (data ==
+// nullptr, rank 0). A backend that registers `kExl3ReconstructGemm` must honour
+// that; CUDA is the only one today.
+void Exl3ReconstructGemm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trellis,
+                          const Tensor& suh, const Tensor& svh, Tensor& a_had,
+                          const Exl3GemmArgs& args);
 
 }  // namespace vt

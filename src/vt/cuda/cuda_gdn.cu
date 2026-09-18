@@ -467,6 +467,58 @@ __global__ void IndexCopyRowKernel(T* out, const T* in, const int32_t* idx,
   }
 }
 
+
+// V-head re-indexing of a GDN projection vector (vt::VHeadPermute). Mirrors
+// `VHeadPermuteKernel` in src/vt/cpu/cpu_ops.cpp element for element; see that
+// file for the two index maps and why K == R cannot tell them apart.
+template <typename T>
+__global__ void VHeadPermuteKernelCu(T* out, const T* in, int64_t n,
+                                        int64_t out_row_stride,
+                                        int64_t in_row_stride, int64_t pre,
+                                        int64_t kk, int64_t rr, int64_t w,
+                                        int inverse, int64_t n_total) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < n_total; i += step) {
+    const int64_t row = i / n;
+    const int64_t c = i - row * n;
+    int64_t sc = c;
+    if (c >= pre) {
+      const int64_t d = c - pre;
+      const int64_t h = d / w;
+      const int64_t o = d - h * w;
+      const int64_t sh =
+          inverse ? (h % kk) * rr + (h / kk) : (h % rr) * kk + (h / rr);
+      sc = pre + sh * w + o;
+    }
+    out[row * out_row_stride + c] = in[row * in_row_stride + sc];
+  }
+}
+
+void VHeadPermuteKernelCuda(Queue& q, Tensor& out, const Tensor& in,
+                            const VHeadPermuteArgs& args) {
+  const int64_t n = in.shape[1];
+  const int64_t n_total = in.shape[0] * n;
+  if (n_total == 0) return;
+  cudaStream_t s = AsStream(q);
+  const int64_t os = out.stride[0], is = in.stride[0];
+  const int inv = args.inverse ? 1 : 0;
+#define VT_VHP_LAUNCH(TY)                                                      \
+  VHeadPermuteKernelCu<<<GridFor(n_total), kBlock, 0, s>>>(                 \
+      static_cast<TY*>(out.data), static_cast<const TY*>(in.data), n, os, is,  \
+      args.prefix_elems, args.num_key_heads, args.heads_per_key,               \
+      args.head_width, inv, n_total)
+  switch (SizeOf(out.dtype)) {
+    case 1: VT_VHP_LAUNCH(uint8_t); break;
+    case 2: VT_VHP_LAUNCH(uint16_t); break;
+    case 4: VT_VHP_LAUNCH(uint32_t); break;
+    case 8: VT_VHP_LAUNCH(uint64_t); break;
+    default:
+      VT_CHECK(false, "v_head_permute: unsupported element size");
+  }
+#undef VT_VHP_LAUNCH
+}
+
 void IndexSelectKernelCuda(Queue& q, Tensor& out, const Tensor& in,
                            const Tensor& idx) {
   const int64_t rows = idx.shape[0];
@@ -6677,6 +6729,9 @@ struct Registrar {
     RegisterOp(OpId::kIndexCopy, DeviceType::kCUDA,
                reinterpret_cast<void*>(
                    static_cast<IndexCopyFn>(&IndexCopyKernelCuda)));
+    RegisterOp(OpId::kVHeadPermute, DeviceType::kCUDA,
+               reinterpret_cast<void*>(
+                   static_cast<VHeadPermuteFn>(&VHeadPermuteKernelCuda)));
     // Mamba2 / SSD device arm (mamba2-ssd.md W2, #496) — sibling ops, never a
     // parameterisation of the GDN kernels above.
     RegisterOp(OpId::kMamba2ChunkScan, DeviceType::kCUDA,

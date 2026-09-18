@@ -1,0 +1,520 @@
+{
+  "pin": "e126687a9a828d513c01a07cd69f025f27d63280",
+  "sources": {
+    "layer": {
+      "source": "cycnctzmkc6yjxbdnjsayvhkrt7wcw2yzliovagbbvctjna42lab.py",
+      "sha256": "e4ef8a4e67080a024bf231d82f6eeedeac71a3c8785b055833f4f3a3f0e337f6"
+    },
+    "initial": {
+      "source": "cpjgc4xo3dj77l3xvynxdob4hutmkehaur7hymz34uyfdq5ygyxs.py",
+      "sha256": "5bf4b6b5af1feaab7f9c1b8cf57cd098847c5af518006990479c12c6028ca900"
+    }
+  },
+  "cases": [
+    {
+      "name": "sandwich1",
+      "kind": "sandwich",
+      "rows": 1,
+      "width": 2560,
+      "a": {
+        "offset": 0,
+        "bytes": 5120,
+        "shape": [
+          1,
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "e5ee951de27b6e6c1c2c244160412f681e96d860014e0de9ec70d0e92d3549b2"
+      },
+      "base": {
+        "offset": 5120,
+        "bytes": 5120,
+        "shape": [
+          1,
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "c3fe2c61781fb5a5c6c327cacf5bb8171c0b6f5d4d092b988d11408765498bd2"
+      },
+      "delta": {
+        "offset": 10240,
+        "bytes": 5120,
+        "shape": [
+          1,
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "1cb58e30902c7588b20650c6a1024eb964481435d2c5497279b5e85585f05eaa"
+      },
+      "wa": {
+        "offset": 15360,
+        "bytes": 5120,
+        "shape": [
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "610ec73fa9d2028b4e04c18b3321a7312cba86d618dd95da2261c97ad6be30bd"
+      },
+      "wd": {
+        "offset": 20480,
+        "bytes": 5120,
+        "shape": [
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "3b88edb7f53b0d3ae6d52cde7a4c7e8a444f509954e8de407cf36444f636e6c6"
+      },
+      "w": {
+        "offset": 25600,
+        "bytes": 5120,
+        "shape": [
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "4f530c798b6bc06556ebd624a8b2907fd9b2d6e920a82eb73c6c9922b1bad05e"
+      },
+      "out2": {
+        "offset": 30720,
+        "bytes": 5120,
+        "shape": [
+          1,
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "fc718d6acd9bea33471134d5fe633fd03cd2e3ebe5a24175452750c6b44cd8b7"
+      },
+      "out3": {
+        "offset": 35840,
+        "bytes": 5120,
+        "shape": [
+          1,
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "d435719f288be1df8f385e961c305251186efd4c27f2578d0f004f19202ded52"
+      },
+      "res": {
+        "offset": 40960,
+        "bytes": 5120,
+        "shape": [
+          1,
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "f43fc28eb2c35ec95547a49ab9d58198b43a752f034ae6dc898af4ecf01a0cd7"
+      }
+    },
+    {
+      "name": "qk1",
+      "kind": "qk",
+      "rows": 1,
+      "qkv": {
+        "offset": 46080,
+        "bytes": 8192,
+        "shape": [
+          1,
+          4096
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "a32411acb34889c930fe7fa94a58578bd492acfad9450adc0e0ab6189cdc70e8"
+      },
+      "qw": {
+        "offset": 54272,
+        "bytes": 512,
+        "shape": [
+          256
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "6a547ff6366e5ea8fd7af3993cc6e96f1b16db4e604d7f3b17edc2a3b137e901"
+      },
+      "kw": {
+        "offset": 54784,
+        "bytes": 512,
+        "shape": [
+          256
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "954f68fce2a8f204c8477485cfd497592a8b71c5a007013837390eed2c256206"
+      },
+      "cs": {
+        "offset": 55296,
+        "bytes": 32768,
+        "shape": [
+          64,
+          256
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "4f9e98ad6841e4b5ed3416eca5d343b1348fc192dd5f2031fba4455a843a806f"
+      },
+      "pos": {
+        "offset": 88064,
+        "bytes": 8,
+        "shape": [
+          1
+        ],
+        "dtype": "torch.int64",
+        "sha256": "35e3a6176b50da27fcb868bf840f0e76290bd9bf55c40545e67bac66353d0674"
+      },
+      "qo": {
+        "offset": 88072,
+        "bytes": 4096,
+        "shape": [
+          1,
+          8,
+          256
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "a663cf23bcd50665c2f60762a2b38eb31c53cd4b07abff3fdf6d12ac8053f193"
+      },
+      "ko": {
+        "offset": 92168,
+        "bytes": 2048,
+        "shape": [
+          1,
+          4,
+          256
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "e012e0578f17f2a3be2617c7fdee446dc8e749087fa8e6e4da8889c9bf2a2e35"
+      }
+    },
+    {
+      "name": "gelu",
+      "kind": "gelu",
+      "x": {
+        "offset": 94216,
+        "bytes": 40960,
+        "shape": [
+          1,
+          20480
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "f5aafe167dfbf4829ca204b09a816f8b6a944f919b0439174fd08b984ba1759d"
+      },
+      "out": {
+        "offset": 135176,
+        "bytes": 20480,
+        "shape": [
+          1,
+          10240
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "4a333611fb0c4e2806d16080d9a4f592451f78cacaacb1b9e9134c0ea05c819a"
+      }
+    },
+    {
+      "name": "sandwich3",
+      "kind": "sandwich",
+      "rows": 3,
+      "width": 2560,
+      "a": {
+        "offset": 155656,
+        "bytes": 15360,
+        "shape": [
+          3,
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "9fa79e275d458fb26e8fabeef823db0b99956c8e9870148a282701443fd03211"
+      },
+      "base": {
+        "offset": 171016,
+        "bytes": 15360,
+        "shape": [
+          3,
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "bd7c49005bf6b3786cc89d608cb6f895149daaa461bb04b8a64261ec98b605c1"
+      },
+      "delta": {
+        "offset": 186376,
+        "bytes": 15360,
+        "shape": [
+          3,
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "f9ad920f36cb335fed0224bf41b64b2c02b5cfda5758a089f63f918be4e93aec"
+      },
+      "wa": {
+        "offset": 201736,
+        "bytes": 5120,
+        "shape": [
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "d053b70e8cca6053a022128bd7725037e79053dcf2ab8c2346c27a977986371f"
+      },
+      "wd": {
+        "offset": 206856,
+        "bytes": 5120,
+        "shape": [
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "3a32f033aed8400eb0b4b6c8a27a3129ec85fd3c19c8377ad7d8bb21d6d570aa"
+      },
+      "w": {
+        "offset": 211976,
+        "bytes": 5120,
+        "shape": [
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "fbeec2f86319c9ed70baca1bb702424082da4d11da8315be36d19f76f3f3a0e7"
+      },
+      "out2": {
+        "offset": 217096,
+        "bytes": 15360,
+        "shape": [
+          3,
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "835fac9e8cfd0fcb04c14380f14f7fc4fb6ce54f3af98818b2e279ab27736242"
+      },
+      "out3": {
+        "offset": 232456,
+        "bytes": 15360,
+        "shape": [
+          3,
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "a6033135ad38a651688f20ea8f2db03c5c97fc19ee28c078bc331f8d15687dcc"
+      },
+      "res": {
+        "offset": 247816,
+        "bytes": 15360,
+        "shape": [
+          3,
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "77c1128decd9adbd42f215a55f469feb1ca24dcc3305f9902782e20de321345e"
+      }
+    },
+    {
+      "name": "qk3",
+      "kind": "qk",
+      "rows": 3,
+      "qkv": {
+        "offset": 263176,
+        "bytes": 24576,
+        "shape": [
+          3,
+          4096
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "67dfd8e9f91f9630e7cb2dd05d0efc4941d2bc70c18391a246ae20c772373a04"
+      },
+      "qw": {
+        "offset": 287752,
+        "bytes": 512,
+        "shape": [
+          256
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "213093d41c58ddb6bb95e3bdd11593727dc9d5bc0373e61dc490f2d5e75d4fde"
+      },
+      "kw": {
+        "offset": 288264,
+        "bytes": 512,
+        "shape": [
+          256
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "d67a606ebe1ed4e2bfc0b953386d7acaf4e90a784d110f5bd230108a7e9f80a6"
+      },
+      "cs": {
+        "offset": 288776,
+        "bytes": 32768,
+        "shape": [
+          64,
+          256
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "3eef5215823ba6e93ec823e039decb2b63b1ce9c38b054484c8524c895671418"
+      },
+      "pos": {
+        "offset": 321544,
+        "bytes": 24,
+        "shape": [
+          3
+        ],
+        "dtype": "torch.int64",
+        "sha256": "4b187dc828e7440884595c1e356fa5458f1dd57c7854b824e073231579219fc2"
+      },
+      "qo": {
+        "offset": 321568,
+        "bytes": 12288,
+        "shape": [
+          3,
+          8,
+          256
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "e65b233d0a13fba99b74c9570a2b256785314cd52ba2748003e77e8b5d21d03f"
+      },
+      "ko": {
+        "offset": 333856,
+        "bytes": 6144,
+        "shape": [
+          3,
+          4,
+          256
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "8dba962ec479265d6d7b9371136d4b0c227eee91b2735cc90f02e9af90eb0a21"
+      }
+    },
+    {
+      "name": "scaled1",
+      "kind": "scaled",
+      "scale": 50.5,
+      "rows": 1,
+      "width": 2560,
+      "x": {
+        "offset": 340000,
+        "bytes": 5120,
+        "shape": [
+          1,
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "a205cc95ab104ba5a461025da9afc066e6155afc0d9cd1ea38ea01b378e98fb2"
+      },
+      "w": {
+        "offset": 345120,
+        "bytes": 5120,
+        "shape": [
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "42d0fa9acb22c813f0c74f5d6a16a9b138f5b85d89a4690152614036baeab36b"
+      },
+      "res": {
+        "offset": 350240,
+        "bytes": 5120,
+        "shape": [
+          1,
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "af45d16f19182e16506b24bfc77cfadf0b2ab86bffa4503062f38d46685da21e"
+      },
+      "out": {
+        "offset": 355360,
+        "bytes": 5120,
+        "shape": [
+          1,
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "14f1ee4dfce07365822d6e3ee8cfcfa73903b7716605b35995c5dcb9cb88769e"
+      }
+    },
+    {
+      "name": "scaled3",
+      "kind": "scaled",
+      "scale": 50.5,
+      "rows": 3,
+      "width": 2560,
+      "x": {
+        "offset": 360480,
+        "bytes": 15360,
+        "shape": [
+          3,
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "df4ffffc32e670f2516d2c34c26163fe68907aaffdbfddcbbe7c09ccd179e893"
+      },
+      "w": {
+        "offset": 375840,
+        "bytes": 5120,
+        "shape": [
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "c787528d5cf6604926b0f848ba9dbd5a787c8f34b11675617b45082a66a07320"
+      },
+      "res": {
+        "offset": 380960,
+        "bytes": 15360,
+        "shape": [
+          3,
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "ac26ff3d2ab3937b3569a2722ce468c1330abc57431dbcf9f929701ca2a1854e"
+      },
+      "out": {
+        "offset": 396320,
+        "bytes": 15360,
+        "shape": [
+          3,
+          2560
+        ],
+        "dtype": "torch.bfloat16",
+        "sha256": "229e2d082242253b18fe700817d1fc9e092202f8f0d0d0e35df2e27228699981"
+      }
+    }
+  ],
+  "origin": "Frozen executing torch.compile kernels, ROCm production Gemma3 at the recorded vLLM pin. Harness extraction preserves generated expressions and stores.",
+  "rope_cache_source": "vllm/model_executor/layers/rotary_embedding/base.py:89-112 and linear_scaling_rope.py:107-127; executing Gemma3 layer buffers on gfx1100",
+  "rope_cache": [
+    {
+      "name": "local",
+      "base": 10000.0,
+      "factor": 1.0,
+      "positions": [
+        0,
+        42,
+        53,
+        64,
+        86,
+        106,
+        518,
+        1207,
+        4095,
+        131071
+      ],
+      "offset": 411680,
+      "bytes": 5120,
+      "shape": [
+        10,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256": "1e9942f82f5cb65a3ea83c3337e70d15b185e47dff23f9a3709a37bd3245af92"
+    },
+    {
+      "name": "global",
+      "base": 1000000.0,
+      "factor": 8.0,
+      "positions": [
+        0,
+        82,
+        107,
+        212,
+        518,
+        1207,
+        4095,
+        131071,
+        1048575
+      ],
+      "offset": 416800,
+      "bytes": 4608,
+      "shape": [
+        9,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256": "f52702bd0d8b4707cf65098e88f4395626eb15e38d46752bb7f0b134c1ea9e89"
+    }
+  ],
+  "data_file": "cases.bin",
+  "data_bytes": 421408
+}

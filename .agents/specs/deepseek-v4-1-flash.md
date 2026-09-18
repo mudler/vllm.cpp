@@ -552,8 +552,8 @@ its own fresh implementer and fresh reviewer, and each states what gates it.
 |---|---|---|---|
 | W1 | **LANDED 2026-09-13.** Resolve and register `deepseek_v41`; parse and VALIDATE the nested config; refuse every unimplemented arm BY NAME. Moved the row to `PARTIAL`; closed `ISSUE-LOCAL-01M2C04E8N4NTXYNS584M1TSFP` | no | no |
 | W2 | Advance the vLLM parity pin to `e77daef89e` or later, reconciling every affected row and gate | it IS the pin | yes, for revalidation |
-| W3a | **Engram** host reference: the n-gram hash state, the compressed token map, the two ~384M-row tables, and the gate into the hyper-connection stream | no | no |
-| W3b | **MXFP8 32x32 UE8M0** host reference: block dequant and the linear arm, against V4's 128x128 fp8 | no | no |
+| W3a | **LANDED 2026-09-13.** **Engram** host reference: the n-gram hash state, the compressed token map, the two ~384M-row tables, and the gate into the hyper-connection stream. Landed UNREACHED, per `## Owed`, so `ISSUE-LOCAL-01M2C40RNXB871VW0E560PVBFA` stays OPEN | no | no |
+| W3b | **LANDS WITH THIS CHANGE, 2026-09-13.** **MXFP8 32x32 UE8M0** host reference: block dequant and the linear arm, against V4's 128x128 fp8. Lands UNREACHED, per `## Owed` | no | no |
 | W3c | **Indexer arm** host reference. The V4.1 backend delta is TWO methods (`indexer.py:252-259`): a name, and `get_supported_kernel_block_sizes()` returning 64 on Hopper and 128 elsewhere against V4's 256 -- arch-conditional, not a flat change. The net-new op is `indexer_k_norm_rope_store` (`indexer_k_store.py:29,120`), which replaces V4's indexer-local `DeepseekCompressor`: index K is derived from the MAIN compressor's latent as `k_norm(wk(latent))`, RoPE'd at the group's FIRST position `(pos//r)*r`, emitted only at group boundaries `(pos+1)%r==0`, into a 132-byte fp8 or 68-byte MXFP4 paged row with values and scales in separate regions. `fused_indexer_q_rope_quant` and `fused_inv_rope_fp8_quant` are NOT replaced -- `common/ops/__init__.py:12-22` re-exports them byte-identically from V4. `query_quant.py` is a CUDA+Blackwell-only fusion behind `can_fuse_query_quant`; a host port implements plain `fused_q_kv_rmsnorm` and is correct, so it is owed perf, not a gap | no | no |
 | W3d | **The `kv_source_layer`-keyed KV topology** -- what the card calls CED and CSA2, which are ONE work item and not two. **There is no encoder-decoder split to port.** Measured 2026-09-13 at `e77daef89e`: `bounded.?replay\|csa2` returns ZERO across all of `vllm/`, all 40 layers are built by ONE `make_layers` call with one lambda (`nvidia/model.py:451-460`), and the 9 `encoder` / 24 `decoder` hits are vision-TP flags, multimodal `EncoderCache`, fp8 `encoder`-as-writer comments and the ordinary `DeepseekV4DecoderLayer`. The topology is CONFIG: `max(s for s in kv_source_layers if s <= layer_id)` (`attention.py:284-286`, index twin `:287-289`) resolves every layer 20-39 to layer 20, whose compressor consumes layer 19's output -- which IS the card's "decoder KV projected from the final encoder hidden states". `compress_ratios` flips 2 to 1 at layer 20 and `candidate_source_layer_id` is 20; three fields agree on one boundary. Only FOUR compressed-KV caches and FOUR indexer-K caches exist (layers 2/8/14/20). **SWA Bounded Replay is a persistence policy, not a forward-pass mechanism** -- each layer's 128-token ring is a pure function of that layer's own hidden states, so a correct forward owes nothing for it; whether vLLM implements it at all is UNVERIFIED and the reading is that it does not | no | no |
 | W3e | **DSpark** host reference: block drafting at `dspark_block_size` 5 over target layers [37,38,39], its own 128-expert MoE at top-3, and the Markov rank-256 state | no | no |
@@ -669,6 +669,36 @@ that ends in a claim.
 
 - `QUANT-GGUF-Q1_0` stays `INVENTORIED`: the type is recognised and no
   executable path consumes it. Named here so the id-41 evidence has an owner.
+- **W3b's MXFP8 host reference lands UNREACHED**, and this bullet is the
+  AGENTS.md §"Nothing lands dead" record for it. `deepseek_v4_1_mxfp8.{h,cpp}`
+  carries the five pieces of the MXFP8 32x32 UE8M0 linear family — the
+  checkpoint-to-runtime scale row expansion, the runtime per-32-column dequant,
+  the dynamic activation quantizer, the emulation linear arm (bf16 in and bf16
+  out, `Mxfp8LinearEmulationBf16`, with an f32 reference beside it) and the
+  `weight_scale` / `weight_scale_inv` name split. Nothing calls any of them:
+  **W1** registered `deepseek_v41`, but its forward and its loader refuse by
+  name, so no production entry point reaches this file. The wiring is owned
+  by this row, split across **W8** (the loader arm, which calls the expansion and
+  the name split) and **W4** (the host forward assembly, which calls the dequant
+  and the linear arm). The W3b issue under this row's directory in
+  [`.agents/issues/`](../issues/MODEL-MM-deepseek-v4-1-deepseek-v41-for-causal-lm/)
+  tracks it and stays OPEN until a production entry point reaches the family; the
+  landing commit names its ID. **It is deliberately not spelled here**, because
+  `## Owed` carries ROWLESS issue IDs and `issue_records.py:518` refuses a
+  row-owned ID in this section. AGENTS.md §"Nothing lands dead" and that checker
+  are compatible in exactly one way: this section names the unreached SLICE, and
+  the commit and pull-request bodies name the issue.
+- **Two W3b guarantees are not gateable on a host, and both were measured, not
+  assumed.** Mirroring upstream's MULTIPLY by `exp2(127 - sb)` rather than a
+  divide by `exp2(sb - 127)` survives mutation with the binary proved changed,
+  because the two forms are exact powers of two and only CDNA's flush-to-zero
+  separates them (`mxfp8_utils.py:129-134`). The `amax` TINY floor survives for
+  the same kind of reason: the low clamp already maps `log2(0) == -inf` to
+  `sb == 0`. **W5's CUDA/ROCm arm owes both measurements**; until then the two
+  are source-level fidelity decisions and this spec does not claim a gate holds
+  them. A third fact belongs beside them: the upper clamp `254` is unreachable
+  from any finite f32 (`ceil(log2(FLT_MAX / 448)) + 127 == 247`), so it bounds
+  only a non-finite `amax`.
 - The stale killgate-fork provenance in the reader, which lives at **three**
   comment sites and not one:
   [`gguf_reader.cpp:194`](../../src/vllm/model_executor/model_loader/gguf_reader.cpp#L194),
@@ -707,9 +737,10 @@ that ends in a claim.
 - **W3a's Engram host reference lands UNREACHED**, and this bullet is the record
   AGENTS.md §"Nothing lands dead" requires. `src/vllm/model_executor/models/`
   `deepseek_v4_1_engram.cpp` and its header are reached today only by
-  `tests/vllm/models/test_deepseek_v4_1_engram.cpp`. There is no registry entry
-  for `deepseek_v41` (W1), no loader arm (W8) and no `ModelRegistry::Forward`
-  arm (W4), so no production entry point can reach it at its own merge commit.
+  `tests/vllm/models/test_deepseek_v4_1_engram.cpp`. **W1** registered
+  `deepseek_v41`, but its forward and its loader refuse by name, so no production
+  entry point can reach it: the loader arm is owed to **W8** and the
+  `ModelRegistry::Forward` arm to **W4**.
   The wiring is owned by this row, whose W3a issue is named in the commit that
   landed the reference; it is deliberately NOT written as an owed local ID
   here, for the reason the `QUANT-GGUF-Q1_0` bullet above states — `## Owed`

@@ -1,3 +1,7 @@
+#ifdef VLLM_CPP_HIP
+#include "vt/rocm/rocm_attn_wmma_arch.h"
+#include "vt/rocm/rocm_runtime.h"
+#endif
 // CPU-tier contract for the Platform seam (a faithful port of
 // vllm/platforms/interface.py:134-229). Mirrors the backend-registry test style
 // (tests/vt/test_backend.cpp): registration + the CPU capability values, plus
@@ -56,6 +60,7 @@ TEST_CASE("CPU platform is self-registered and advertises CPU capabilities") {
   CHECK_FALSE(cpu.opaque_attention_op());
   CHECK_FALSE(cpu.is_integrated_gpu());
   CHECK_FALSE(cpu.support_static_graph_mode());
+  CHECK_FALSE(cpu.support_static_graph_for_model({"Gemma3ForCausalLM"}, 0));
   // ENG-EXPERT-STREAM-DEVICE W0b (#1124): the CPU leg does NOT override this.
   //
   // That reads backwards at first glance — a CPU kernel obviously reads host
@@ -466,6 +471,13 @@ TEST_CASE("allocates_bounded_device_memory is independent of needs_weight_stagin
 TEST_CASE("ROCm leg values (real hardware, HIP build only)") {
   if (!HasPlatform(DeviceType::kROCM)) return;  // no device: nothing to assert
   Platform& rocm = GetPlatform(DeviceType::kROCM);
+  CHECK_FALSE(rocm.support_static_graph_mode());
+  CHECK_FALSE(rocm.support_static_graph_for_model({"Qwen3ForCausalLM"}, 0));
+  CHECK_FALSE(rocm.support_static_graph_for_model({}, 0));
+#ifdef VLLM_CPP_HIP
+  CHECK(rocm.support_static_graph_for_model({"Gemma3ForCausalLM"}, 0) ==
+        vt::rocm::GcnArchNameHasGemmaDecodeWmma(vt::rocm::DeviceArchName(0)));
+#endif
 
   CHECK_FALSE(rocm.needs_weight_staging());
   CHECK(rocm.allocates_bounded_device_memory());

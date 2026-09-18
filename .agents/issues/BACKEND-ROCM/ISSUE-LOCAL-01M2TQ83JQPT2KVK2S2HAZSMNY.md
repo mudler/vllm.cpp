@@ -1,14 +1,14 @@
 ID: ISSUE-LOCAL-01M2TQ83JQPT2KVK2S2HAZSMNY
 Title: test_check_rocm_dp4a_intrinsic is red on main: the live scalar mutation no longer makes the dp4a checker fire
 Row: BACKEND-ROCM
-State: OPEN
+State: CLOSED
 Kind: bug
 GitHub: -
 Mirror: PENDING
 Availability: FULL
 Created: 2026-09-18
 Updated: 2026-09-18
-Closed: -
+Closed: 2026-09-18
 
 ## Problem
 
@@ -35,4 +35,4 @@ Found while running the full harness suite for `BENCH-QWEN38-EXL3-LONGCTX`, whic
 
 ## Resolution
 
--
+2026-09-18: fixed on main by df87f880e (merge: row/ROCMDP4A-checker-blind, make the dp4a checker require a call and not a mention), by another session, independently of this record. Verified here on a detached checkout of origin/main at df87f880e: python3 -m unittest tests.scripts.test_check_rocm_dp4a_intrinsic runs 10 tests, OK, where the same command at 7fa861392 failed test_live_scalar_mutation_fails with AssertionError: 0 != 1. The suite also grew from 6 cases to 10. This issue therefore closes on the tree that falsifies it rather than on work of its own.

@@ -48,7 +48,9 @@ bytes, the seed, the band weights and the count, so the same command on another
 machine produces the same file. The manifest it writes carries the sha256 of
 every source and of the corpus itself.
 
-Four bands, one composition rule each:
+Five bands, one composition rule each. Four of them carry a default share, and
+the table's shares are the DEFAULT distribution, which is the one every
+published page so far used:
 
 | Band | Default share | Source | Rule |
 |---|---|---|---|
@@ -56,9 +58,27 @@ Four bands, one composition rule each:
 | `M` code completion | 40% | HumanEval `HumanEval.jsonl` | one `prompt` field, verbatim |
 | `L` prose summary | 15% | vLLM `benchmarks/sonnet.txt` | a contiguous line block, under a fixed instruction |
 | `XL` long code review | 10% | HumanEval `HumanEval.jsonl` | `k` problems concatenated, under a review instruction |
+| `XXL` long code review | none | HumanEval `HumanEval.jsonl` | `XL`'s rule, targeting `XXL_TARGET_CHARS` |
 
-The `L` block length and the `XL` problem count are drawn per prompt, so each
-band has its own internal spread instead of one length repeated.
+`XXL` exists because every band above stops at about 3.3k prompt tokens, which
+is 40% of the `--max-model-len 8192` the first run served. It is `XL` with the
+target changed and nothing else, so the pair reads as one length axis. It has no
+default share, so a corpus built without naming it is byte-identical to the
+four-band corpus the predecessor published. A run asks for it on the command
+line:
+
+```sh
+--weights S=0.2,M=0.2,L=0.2,XL=0.2,XXL=0.2
+```
+
+Its target is sized against a served context rather than against a round
+number, and the derivation, its ratio and its provenance are in the comment
+above `XXL_TARGET_CHARS` in `build_corpus.py`. A page that quotes `XXL` states
+the served context it was built for, because a target in characters is not a
+promise about tokens.
+
+The `L` block length and the `XL` and `XXL` problem counts are drawn per prompt,
+so each band has its own internal spread instead of one length repeated.
 
 **Why these sources.** HumanEval keeps continuity with the predecessor run and
 is the only band the two pages share. GSM8K supplies real short natural
@@ -73,8 +93,8 @@ independent offsets.
 
 **What the mix cannot claim.** It is not a trace of production traffic. No such
 trace is pinned in this repository, and a benchmark job may not download one.
-Three of the four bands are code or arithmetic, so the register is narrower than
-a real chat deployment. What it is: variadic in length, which is the axis this
+Four of the five bands are code or arithmetic, and three of the four that carry
+a default share are, so the register is narrower than a real chat deployment. What it is: variadic in length, which is the axis this
 method measures, and reproducible byte for byte, which a trace would not be.
 
 ### The realised histogram is read back, never assumed

@@ -249,6 +249,87 @@ void FillGdn(vllm::Qwen4ExpGdnWeights& g, const GdnArrays& s,
   g.out_proj = Bf16(s.out, {H, value_dim}, /*nk=*/true);
 }
 
+// ─── THE DEFERRED V-HEAD PERMUTATION, END TO END (F4 of the fresh review) ───
+//
+// `FillGdn` above builds every GDN projection in HuggingFace GROUPED V-head
+// order and leaves `v_head_perm_key_heads` at 0, which is what every loader but
+// the `qwen4exp` GGUF one produces. With the flag at 0 `vt::VHeadPermute` is
+// never called, so this suite ran the whole layer loop with the deferred
+// permutation INERT: inverting the op's two index maps at every production site
+// left it green.
+//
+// `TileGdnVHeads` puts the fixture into the shape the `qwen4exp` loader
+// actually hands the block — the SAME VALUES re-indexed into the converter's
+// TILED V-head order on exactly the five projections the loader now leaves
+// verbatim, with the flag set to the key-head count. `conv1d`, `a_log` and
+// `dt_bias` stay GROUPED, because that is the loader's rule and it is what
+// confines the run-time permutation to the projection boundary.
+//
+// The arm is then gated against THE SAME transformers 5.16.0 golden, at the
+// same bound. That is what makes it convict: a wrong map pairs value head g
+// with the wrong key head, and the fixture's ratio is K = 2 against R = 3, so
+// the map is neither the identity (K == 1) nor its own inverse (K == R) and
+// both wrong answers are reachable.
+
+// Destination head `t` takes source head `(t % K) * R + (t / K)` — GROUPED to
+// TILED, the direction that turns a HuggingFace-order tensor into the file's
+// own layout. Composed with `vt::VHeadPermute`'s forward map it is the identity.
+void PermuteBf16HeadBlocks(OwnedTensor& t, int64_t outer, int64_t seg,
+                           int64_t prefix, int64_t heads, int64_t width,
+                           int64_t kk, int64_t rr) {
+  REQUIRE(t.dtype == DType::kBF16);
+  REQUIRE(prefix + heads * width == seg);
+  const size_t n = t.bytes.size() / 2;
+  REQUIRE(static_cast<int64_t>(n) == outer * seg);
+  auto* p = reinterpret_cast<uint16_t*>(t.bytes.data());
+  const std::vector<uint16_t> src(p, p + n);
+  for (int64_t o = 0; o < outer; ++o) {
+    const uint16_t* s = src.data() + static_cast<size_t>(o * seg);
+    uint16_t* dst = p + static_cast<size_t>(o * seg);
+    for (int64_t h = 0; h < heads; ++h) {
+      const int64_t g = (h % kk) * rr + (h / kk);
+      std::memcpy(dst + prefix + h * width, s + prefix + g * width,
+                  static_cast<size_t>(width) * sizeof(uint16_t));
+    }
+  }
+}
+
+void TileGdnVHeads(Qwen4ExpWeights& w, const Qwen4ExpParams& p) {
+  const int64_t H = p.hidden_size;
+  const int64_t kk = p.linear_num_key_heads;
+  const int64_t num_v = p.linear_num_value_heads;
+  REQUIRE(num_v % kk == 0);
+  REQUIRE(kk != 1);          // the identity map: it can convict nothing
+  REQUIRE(num_v / kk != kk); // its own inverse: it cannot see a flipped map
+  const int64_t rr = num_v / kk;
+  const int64_t Dv = p.linear_value_head_dim;
+  const int64_t key_dim = kk * p.linear_key_head_dim;
+  const int64_t value_dim = num_v * Dv;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  for (auto& lw : w.layers) {
+    if (!lw.is_linear_attention) continue;
+    vllm::Qwen4ExpGdnWeights& g = lw.gdn;
+    // `[conv_dim, H]` `nk = true`: the V-head axis is FIRST, one head is Dv
+    // whole rows of H, and the leading `2 * key_dim` q/k rows are the PREFIX
+    // the converter does not tile.
+    PermuteBf16HeadBlocks(g.in_proj_qkv, 1, conv_dim * H, 2 * key_dim * H,
+                          num_v, Dv * H, kk, rr);
+    PermuteBf16HeadBlocks(g.in_proj_z, 1, value_dim * H, 0, num_v, Dv * H, kk,
+                          rr);
+    // `[num_v, H]`: one row per V head.
+    PermuteBf16HeadBlocks(g.in_proj_b, 1, num_v * H, 0, num_v, H, kk, rr);
+    PermuteBf16HeadBlocks(g.in_proj_a, 1, num_v * H, 0, num_v, H, kk, rr);
+    // `out_proj` is `[H, value_dim]` `nk = true` — THE RELEASED ORIENTATION,
+    // head axis LAST, which `test_gdn_v_head_permute.cpp` does not run (it
+    // builds `[value_dim, H]` with `nk` unset). The permutation is on the
+    // COLUMNS, so the block applies its INVERSE to the out-projection input.
+    PermuteBf16HeadBlocks(g.out_proj, H, value_dim, 0, num_v, Dv, kk, rr);
+    // `conv1d`, `a_log`, `dt_bias` and `norm_weight` are NOT touched: the
+    // loader keeps permuting those at load, and the block relies on it.
+    g.v_head_perm_key_heads = kk;
+  }
+}
+
 struct MoeArrays {
   const float *router, *gate_exps, *up_exps, *down_exps, *shared_gate,
       *shared_gate_proj, *shared_up_proj, *shared_down_proj;
@@ -407,6 +488,29 @@ TEST_CASE(
   const Qwen4ExpParams p = MakeParams();
   const vllm::HfConfig config = MakeHfConfig(p);
   Qwen4ExpWeights w = MakeWeights(p);
+
+  // ─── TWO ARMS, ONE GOLDEN ────────────────────────────────────────────────
+  // The second is the `qwen4exp` GGUF loader's own shape: the five GDN
+  // projections in the converter's TILED V-head order with
+  // `v_head_perm_key_heads` set, which is the ONLY configuration in which
+  // `vt::VHeadPermute` runs at all. Without it this whole suite is blind to
+  // V-head order — inverting the op's index maps at every production site left
+  // it green. See `TileGdnVHeads`.
+  int64_t want_perm_key_heads = 0;
+  SUBCASE("GROUPED projections, v_head_perm_key_heads == 0 (every other loader)") {
+    want_perm_key_heads = 0;
+  }
+  SUBCASE("TILED projections with the deferred V-head permutation ACTIVE") {
+    TileGdnVHeads(w, p);
+    want_perm_key_heads = p.linear_num_key_heads;
+  }
+  for (auto& lw : w.layers) {
+    if (!lw.is_linear_attention) continue;
+    REQUIRE(lw.gdn.v_head_perm_key_heads == want_perm_key_heads);
+    // And the flag reaches the block through the SAME carrier production uses.
+    REQUIRE(vllm::Qwen4ExpGdnBlockWeights(lw.gdn, p).v_head_perm_key_heads ==
+            want_perm_key_heads);
+  }
 
   // THE GDN OUTPUT GATE IS SIGMOID HERE AND THE SHARED READER DEFAULTS TO SILU.
   // Asserted rather than assumed, because it is the one field `Qwen4ExpParams`
@@ -585,7 +689,8 @@ TEST_CASE(
   const double worst = vllm_test::MaxAbsDiff(got, kFwdExpectedHidden,
                                              got.size());
   MESSAGE("layer loop vs transformers 5.16.0: max|diff| = " << worst
-          << " against a bound of " << kTol);
+          << " against a bound of " << kTol
+          << " (v_head_perm_key_heads = " << want_perm_key_heads << ")");
   CHECK(worst < kTol);
 }
 

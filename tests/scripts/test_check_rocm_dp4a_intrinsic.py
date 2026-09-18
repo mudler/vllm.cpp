@@ -2,9 +2,16 @@
 """Mutation tests for scripts/check-rocm-dp4a-intrinsic.py.
 
 The checker verifies that the `Dp4a` function in `rocm_grouped_gemm.hip`
-uses the `__ockl_sdot4` hardware intrinsic.  Each mutation below replaces
-the intrinsic with the scalar expansion and asserts the checker goes red,
-proving the gate detects the regression.
+CALLS the `__ockl_sdot4` hardware intrinsic.  Each mutation below removes
+the call and asserts the checker goes red, proving the gate detects the
+regression.
+
+The distinction between naming the symbol and calling it is what the gate
+is for, so three cases pin it from both sides: the probe alone is red, a
+comment alone is red, and the live shape — a guarded call followed by a
+scalar fallback — is green.  Before the checker was repaired the first two
+were green, and `test_live_scalar_mutation_fails` failed on `main` because
+of it.
 """
 
 from __future__ import annotations
@@ -92,12 +99,84 @@ class TestRocmDp4aIntrinsic(unittest.TestCase):
             self.assertEqual(len(errors), 1, errors)
             self.assertIn("__ockl_sdot4", errors[0])
 
-    def test_missing_dp4a_function_fails(self) -> None:
+    def test_empty_dp4a_body_fails(self) -> None:
+        """An empty body has the signature but calls nothing."""
         with FakeTree("") as root:
-            # Empty body still has the function signature, so the body is
-            # empty and the intrinsic is absent.
             errors = checker.check(root=root)
             self.assertEqual(len(errors), 1, errors)
+            self.assertIn("__ockl_sdot4", errors[0])
+
+    def test_missing_dp4a_function_fails(self) -> None:
+        """No `Dp4a` signature at all reaches the `not found` branch.
+
+        The case that used to carry this name passed an empty BODY, so the
+        `Dp4a function not found` branch had no test of its own.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "src/vt/rocm").mkdir(parents=True)
+            (root / "src/vt/rocm/rocm_grouped_gemm.hip").write_text(
+                "// no Dp4a here\n__device__ int Other(int a) { return a; }\n",
+                encoding="utf-8",
+            )
+            errors = checker.check(root=root)
+            self.assertEqual(len(errors), 1, errors)
+            self.assertIn("not found", errors[0])
+
+    def test_has_builtin_probe_alone_fails(self) -> None:
+        """The availability probe is not a call.
+
+        This is the exact shape the live mutation produces: the guard
+        survives, the call inside it does not.  The checker carried a
+        `has_conditional_fallback` disjunct that passed on this body, and
+        its bare-substring test passed on it too, so BOTH halves of the old
+        checker are pinned dead here.
+        """
+        body = (
+            "#if defined(__has_builtin)\n"
+            "#if __has_builtin(__ockl_sdot4)\n"
+            f"{_SCALAR_BODY}"
+            "#endif\n"
+            "#endif\n"
+            "  return acc;\n"
+        )
+        with FakeTree(body) as root:
+            errors = checker.check(root=root)
+            self.assertEqual(len(errors), 1, errors)
+            self.assertIn("__ockl_sdot4", errors[0])
+
+    def test_intrinsic_in_comment_only_fails(self) -> None:
+        """Naming the intrinsic in prose is not calling it."""
+        body = (
+            "  // was __ockl_sdot4(va, vb, acc, false); see the perf note\n"
+            "  /* __ockl_sdot4 */\n"
+            f"{_SCALAR_BODY}"
+        )
+        with FakeTree(body) as root:
+            errors = checker.check(root=root)
+            self.assertEqual(len(errors), 1, errors)
+            self.assertIn("__ockl_sdot4", errors[0])
+
+    def test_guarded_call_with_scalar_fallback_passes(self) -> None:
+        """2bde17f6c's real shape stays legal: guard, call, then fallback.
+
+        The repair must not refuse the conditional compilation that commit
+        added for ROCm installs without the intrinsic.
+        """
+        body = (
+            "  using char4_native = char __attribute__((ext_vector_type(4)));\n"
+            "  char4_native va = *reinterpret_cast<const char4_native*>(&a);\n"
+            "  char4_native vb = *reinterpret_cast<const char4_native*>(&b);\n"
+            "#if defined(__has_builtin)\n"
+            "#if __has_builtin(__ockl_sdot4)\n"
+            "  return __ockl_sdot4(va, vb, acc, false);\n"
+            "#endif\n"
+            "#endif\n"
+            f"{_SCALAR_BODY}"
+        )
+        with FakeTree(body) as root:
+            errors = checker.check(root=root)
+            self.assertEqual(errors, [], errors)
 
     def test_missing_source_file_fails(self) -> None:
         with tempfile.TemporaryDirectory() as d:

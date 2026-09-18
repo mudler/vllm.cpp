@@ -1480,6 +1480,14 @@ void RopeCosSinCacheKernel(Queue&, Tensor& cos_sin, const Tensor& positions, con
     const int64_t p =
         positions.dtype == DType::kI32 ? positions.Ptr<int32_t>()[i] : positions.Ptr<int64_t>()[i];
     for (int64_t pair = 0; pair < half; ++pair) {
+      if (args.linear_scaling_factor > 0.f) {
+        const float exponent = static_cast<float>(2 * pair) / static_cast<float>(rot);
+        const float inv = 1.f / std::pow(args.base, exponent);
+        const float angle = (static_cast<float>(p) / args.linear_scaling_factor) * inv;
+        StoreF32(cos_sin, i * rot + pair, std::cos(angle));
+        StoreF32(cos_sin, i * rot + half + pair, std::sin(angle));
+        continue;
+      }
       double freq = std::pow(base, -2.0 * static_cast<double>(pair) / static_cast<double>(rot));
       freq = Llama3ScaleFreq(freq, args);
       const double angle = static_cast<double>(p) * freq;
@@ -3103,6 +3111,47 @@ void IndexCopyKernel(Queue&, Tensor& out, const Tensor& in, const Tensor& idx) {
   }
 }
 
+// V-head re-indexing of a GDN projection vector (vt::VHeadPermute). CPU
+// REFERENCE: the source column of every output column is computed here in the
+// plainest possible form, and the device kernels mirror it.
+//
+// `g = k * R + r` is the GROUPED (HuggingFace) V-head index and
+// `t = r * K + k` the TILED (converter) one. A gather names the SOURCE for each
+// DESTINATION, so the two directions are:
+//   tiled -> grouped  : dst g, src = (g % R) * K + (g / R)
+//   grouped -> tiled  : dst t, src = (t % K) * R + (t / K)
+// which is the same expression with K and R exchanged. At K == R it is its own
+// inverse — the fixture shape that cannot tell the two apart.
+void VHeadPermuteKernel(Queue&, Tensor& out, const Tensor& in,
+                        const VHeadPermuteArgs& args) {
+  const int64_t rows = in.shape[0];
+  const int64_t n = in.shape[1];
+  const int64_t pre = args.prefix_elems;
+  const int64_t kk = args.num_key_heads;
+  const int64_t rr = args.heads_per_key;
+  const int64_t w = args.head_width;
+  const int64_t heads = kk * rr;
+  const size_t esz = SizeOf(out.dtype);
+  const auto* src = static_cast<const char*>(in.data);
+  auto* dst = static_cast<char*>(out.data);
+  for (int64_t row = 0; row < rows; ++row) {
+    const char* sr = src + static_cast<size_t>(row) *
+                               static_cast<size_t>(in.stride[0]) * esz;
+    char* dr = dst + static_cast<size_t>(row) *
+                         static_cast<size_t>(out.stride[0]) * esz;
+    if (pre > 0)
+      std::memcpy(dr, sr, static_cast<size_t>(pre) * esz);
+    for (int64_t h = 0; h < heads; ++h) {
+      const int64_t sh = args.inverse ? (h % kk) * rr + (h / kk)
+                                      : (h % rr) * kk + (h / rr);
+      std::memcpy(dr + static_cast<size_t>(pre + h * w) * esz,
+                  sr + static_cast<size_t>(pre + sh * w) * esz,
+                  static_cast<size_t>(w) * esz);
+    }
+    (void)n;
+  }
+}
+
 // Grouped-topk (`noaux_tc`) router — the CPU REFERENCE and the executable spec
 // for the DeepSeek router. 1:1 port of
 // vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py:106-161
@@ -4368,6 +4417,9 @@ struct Registrar {
     RegisterOp(OpId::kIndexCopy, DeviceType::kCPU,
                reinterpret_cast<void*>(
                    static_cast<IndexCopyFn>(&IndexCopyKernel)));
+    RegisterOp(OpId::kVHeadPermute, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<VHeadPermuteFn>(&VHeadPermuteKernel)));
     RegisterOp(OpId::kMoeRouterTopK, DeviceType::kCPU,
                reinterpret_cast<void*>(static_cast<MoeRouterTopKFn>(&MoeRouterTopKKernel)));
     RegisterOp(OpId::kMoeCombine, DeviceType::kCPU,

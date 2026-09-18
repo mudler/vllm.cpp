@@ -26,6 +26,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -35,6 +36,7 @@
 #include "vt/backend.h"
 #include "vt/op_provider.h"
 #include "vt/ops.h"
+#include "vt/quant.h"
 #include "vt/rocm/rocm_arch.h"
 #include "vt/rocm/rocm_runtime.h"
 
@@ -51,6 +53,90 @@ namespace {
 // lie about the hardware.
 bool NoDevice() { return !vt::rocm::DeviceAvailable(); }
 }  // namespace
+
+TEST_CASE("ROCm embedding rejects bad IDs and recovers on the same queue") {
+  if (NoDevice()) return;
+  Backend& rocm = vt::GetBackend(DeviceType::kROCM);
+  Queue q = rocm.CreateQueue();
+  constexpr int64_t vocab = 7, width = 8;
+  std::vector<float> values(vocab * width);
+  for (size_t i = 0; i < values.size(); ++i) values[i] = static_cast<float>(i);
+  void* table = rocm.Alloc(values.size() * sizeof(float));
+  void* ids = rocm.Alloc(sizeof(int64_t));
+  void* output = rocm.Alloc(width * sizeof(float));
+  rocm.Copy(q, table, values.data(), values.size() * sizeof(float));
+  Tensor t = Tensor::Contiguous(table, DType::kF32, q.device, {vocab, width});
+  Tensor out = Tensor::Contiguous(output, DType::kF32, q.device, {1, width});
+  for (DType dtype : {DType::kI32, DType::kI64}) {
+    Tensor index = Tensor::Contiguous(ids, dtype, q.device, {1});
+    for (int64_t value : {int64_t{-1}, vocab, int64_t{0}, vocab - 1, int64_t{0}}) {
+      const int32_t narrow = static_cast<int32_t>(value);
+      rocm.Copy(q, ids,
+                dtype == DType::kI32 ? static_cast<const void*>(&narrow)
+                                     : static_cast<const void*>(&value),
+                vt::SizeOf(dtype));
+      if (value < 0 || value >= vocab) {
+        CHECK_THROWS_WITH_AS(vt::Embedding(q, out, t, index), doctest::Contains("out of range"),
+                             std::runtime_error);
+      } else {
+        vt::Embedding(q, out, t, index);
+        std::vector<float> actual(width);
+        rocm.Copy(q, actual.data(), output, width * sizeof(float));
+        rocm.Synchronize(q);
+        for (int64_t i = 0; i < width; ++i) CHECK(actual[i] == values[value * width + i]);
+      }
+    }
+  }
+  rocm.Synchronize(q);
+  rocm.Free(table);
+  rocm.Free(ids);
+  rocm.Free(output);
+  rocm.DestroyQueue(q);
+}
+
+// vLLM e126687a9a sampler.py: greedy sampling is torch.argmax(dim=-1).
+// Large and ragged rows enter the same public selector used by Gemma decode.
+TEST_CASE("ROCm large-vocabulary greedy selection preserves the first maximum") {
+  if (NoDevice()) return;
+  Backend& rocm = vt::GetBackend(DeviceType::kROCM);
+  Queue q = rocm.CreateQueue();
+  constexpr int64_t rows = 4;
+  for (int64_t cols : {int64_t{65537}, int64_t{262208}}) {
+    std::vector<float> values(rows * cols, -std::numeric_limits<float>::infinity());
+    values[511] = values[1024] = values[cols - 1] = 8.f;
+    values[2 * cols - 1] = 2.f;
+    values[3 * cols + 1023] = 9.f;
+    std::vector<uint16_t> bf16(values.size());
+    for (size_t i = 0; i < values.size(); ++i) bf16[i] = vt::F32ToBF16(values[i]);
+    for (DType dtype : {DType::kF32, DType::kBF16}) {
+      const size_t bytes = values.size() * vt::SizeOf(dtype);
+      void* device_values = rocm.Alloc(bytes);
+      void* device_ids = rocm.Alloc(rows * sizeof(int64_t));
+      rocm.Copy(q, device_values,
+                dtype == DType::kF32 ? static_cast<void*>(values.data())
+                                     : static_cast<void*>(bf16.data()),
+                bytes);
+      Tensor logits = Tensor::Contiguous(device_values, dtype, q.device, {rows, cols});
+      Tensor ids = Tensor::Contiguous(device_ids, DType::kI64, q.device, {rows});
+      if (dtype == DType::kBF16) {
+        // The public sampling contract accepts FP32 logits; the runner widens
+        // Gemma's BF16 projection before reaching this operation.
+        CHECK_THROWS_WITH_AS(vt::GreedyArgmax(q, ids, logits),
+                             doctest::Contains("logits must be f32"), std::runtime_error);
+      } else {
+        vt::GreedyArgmax(q, ids, logits);
+        std::vector<int64_t> actual(rows);
+        rocm.Copy(q, actual.data(), device_ids, rows * sizeof(int64_t));
+        rocm.Synchronize(q);
+        CHECK(actual == std::vector<int64_t>{511, cols - 1, 0, 1023});
+      }
+      rocm.Synchronize(q);
+      rocm.Free(device_values);
+      rocm.Free(device_ids);
+    }
+  }
+  rocm.DestroyQueue(q);
+}
 
 TEST_CASE("ROCm backend registers when a device is present") {
   if (NoDevice()) return;

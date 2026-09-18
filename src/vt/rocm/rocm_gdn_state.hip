@@ -241,6 +241,7 @@ __global__ void IndexCopyRowK(T* out, const T* in, const int32_t* idx,
 // The dtype is erased to an element WIDTH, exactly as the donor does: the op
 // moves bytes and never reads a value, so bf16/f16 need no conversion helper
 // and every dtype of a given width shares one instantiation.
+
 void IndexSelectKernelRocm(Queue& q, Tensor& out, const Tensor& in,
                            const Tensor& idx) {
   const int64_t rows = idx.shape[0];
@@ -313,11 +314,61 @@ void IndexCopyKernelRocm(Queue& q, Tensor& out, const Tensor& in,
   Check(hipGetLastError(), "index_copy row launch");
 }
 
-// Registers both arms during static init, UNCONDITIONAL and at preprocessor
-// depth 0. Neither kernel has an arch literal or a feature dependency, so a
-// build gate would only make the ops vanish on some builds; on `gfx1151` there
-// is nothing to fall through to, because the portable reference tier is not
-// installed there (spec D2), and the call would refuse by name.
+// V-head re-indexing of a GDN projection vector (vt::VHeadPermute). Mirrors
+// `VHeadPermuteKernel` in src/vt/cpu/cpu_ops.cpp element for element; see that
+// file for the two index maps and why K == R cannot tell them apart.
+template <typename T>
+__global__ void VHeadPermuteK(T* out, const T* in, int64_t n,
+                              int64_t out_row_stride, int64_t in_row_stride,
+                              int64_t pre, int64_t kk, int64_t rr, int64_t w,
+                              int inverse, int64_t n_total) {
+  const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < n_total; i += step) {
+    const int64_t row = i / n;
+    const int64_t c = i - row * n;
+    int64_t sc = c;
+    if (c >= pre) {
+      const int64_t d = c - pre;
+      const int64_t h = d / w;
+      const int64_t o = d - h * w;
+      const int64_t sh =
+          inverse ? (h % kk) * rr + (h / kk) : (h % rr) * kk + (h / rr);
+      sc = pre + sh * w + o;
+    }
+    out[row * out_row_stride + c] = in[row * in_row_stride + sc];
+  }
+}
+
+void VHeadPermuteKernelRocm(Queue& q, Tensor& out, const Tensor& in,
+                            const VHeadPermuteArgs& args) {
+  const int64_t n = in.shape[1];
+  const int64_t n_total = in.shape[0] * n;
+  if (n_total == 0) return;
+  hipStream_t s = AsStream(q);
+  const int64_t os = out.stride[0], is = in.stride[0];
+  const int inv = args.inverse ? 1 : 0;
+#define VT_VHP_LAUNCH(TY)                                                      \
+  VHeadPermuteK<<<GridFor(n_total), kBlock, 0, s>>>(                           \
+      static_cast<TY*>(out.data), static_cast<const TY*>(in.data), n, os, is,  \
+      args.prefix_elems, args.num_key_heads, args.heads_per_key,               \
+      args.head_width, inv, n_total)
+  switch (SizeOf(out.dtype)) {
+    case 1: VT_VHP_LAUNCH(uint8_t); break;
+    case 2: VT_VHP_LAUNCH(uint16_t); break;
+    case 4: VT_VHP_LAUNCH(uint32_t); break;
+    case 8: VT_VHP_LAUNCH(uint64_t); break;
+    default:
+      VT_CHECK(false, "v_head_permute: unsupported element size");
+  }
+#undef VT_VHP_LAUNCH
+}
+
+// Registers all three arms during static init, UNCONDITIONAL and at
+// preprocessor depth 0. No kernel here has an arch literal or a feature
+// dependency, so a build gate would only make the ops vanish on some builds; on
+// `gfx1151` there is nothing to fall through to, because the portable reference
+// tier is not installed there (spec D2), and the call would refuse by name.
 struct IndexRowRegistrar {
   IndexRowRegistrar() {
     RegisterOp(OpId::kIndexSelect, DeviceType::kROCM,
@@ -326,6 +377,9 @@ struct IndexRowRegistrar {
     RegisterOp(OpId::kIndexCopy, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<IndexCopyFn>(&IndexCopyKernelRocm)));
+    RegisterOp(OpId::kVHeadPermute, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<VHeadPermuteFn>(&VHeadPermuteKernelRocm)));
   }
 };
 const IndexRowRegistrar index_row_registrar;

@@ -1103,11 +1103,25 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
   const int64_t key_dim = num_k * c.linear_key_head_dim;
   const bool reorder = num_v != num_k && num_k > 0 && (num_v % num_k) == 0;
   const int64_t rpk = num_k > 0 ? num_v / num_k : 1;  // num_v_per_k
-  // When the V-head reorder is active these projections are LAYOUT-rewritten
-  // at load, so they are kTransformedWeight and can never keep their blocks;
-  // without it they are ordinary verbatim GEMM weights. (out_proj's reorder
-  // permutes COLUMNS, which live inside a block, so it is unconditionally
-  // block-unsafe when active — same rule, stated per tensor below.)
+  // When the V-head reorder is active, the projections are LAYOUT-rewritten at
+  // load. For COLUMN-permuted tensors (out_proj/ssm_out) the reorder cuts across
+  // quantization block boundaries, so they are kTransformedWeight and must
+  // expand to bf16. For ROW-permuted tensors (in_proj_qkv, in_proj_z) the
+  // reorder only changes row order — quantization blocks are along the K
+  // (column) dimension and are self-contained per row — so the blocks can be
+  // kept and the permutation applied to the block rows at load time (T21).
+  // Without reorder they are ordinary verbatim GEMM weights. Column-permuted
+  // tensors (out_proj/ssm_out) stay kTransformedWeight and expand to bf16.
+  // T21 env gate: VT_GDN_ROWPERM_KEEP_QUANT=0 forces the row-permuted tensors
+  // back to kTransformedWeight (bf16 expansion) for A/B isolation.
+  // Opt-in, by VALUE like its VT_GDN_COLPERM_KEEP_QUANT sibling: unset keeps
+  // the load path byte-identical to the trunk (reorder, then expand to bf16).
+  // A default-on flip here silently changed the trunk numerics of every
+  // row-permuted V-head projection and broke the token-exact gate -- caught on
+  // the gfx1100 engine leg, reverted to opt-in.
+  const char* rpkq = std::getenv("VT_GDN_ROWPERM_KEEP_QUANT");
+  const bool rowperm_keep =
+      rpkq != nullptr && rpkq[0] == '1' && rpkq[1] == '\0';
   const GgufTensorRole proj_role = reorder
                                        ? GgufTensorRole::kTransformedWeight
                                        : GgufTensorRole::kMatmulWeight;
@@ -1123,6 +1137,11 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
   GdnLayerWeights gdn;
 
   // in_proj_qkv <- attn_qkv [conv_dim, H]; only the trailing V rows reorder.
+  // T21: ReorderVRows is a row permutation (block-safe for K-quant). Route as
+  // kMatmulWeight to allow keep-quant, then permute the block rows in place.
+  // Saves ~661 MB/tok of bf16 read amplification (24 Q5_K tensors × 2.9x).
+  // The forward pass already dispatches quantized nk=true weights through
+  // vt::MatmulBT → matmul_bt_quant, so no forward-pass change is needed.
   {
     const std::string nm = Blk(il, "attn_qkv.weight");
     // W4d W4 (tenstorrent-27b-gdn-keepquant.md): with the V-head reorder
@@ -1131,9 +1150,12 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
     // keep-quant (kMatmulWeight) instead of expanding to bf16 — which
     // cost the P150 ~9.7 GiB of attn_qkv staging at 27B
     // (ISSUE-LOCAL-01M2AA4ZVD9EWJG5NNQD5DWZXS).
+    // T21: VT_GDN_ROWPERM_KEEP_QUANT=1 gates the row-permuted keep-quant
+    // path (opt-in, by value). Without it, the packed_reorder check below
+    // is false and the projections expand to bf16 as before.
     vt::DType kq_dt = vt::DType::kF32;
     const bool packed_reorder =
-        reorder && pol.keep_quant &&
+        reorder && pol.keep_quant && rowperm_keep &&
         KeepQuantDType(g.Get(nm).ggml_type, &kq_dt) &&
         g.Get(nm).shape[1] % vt::BlockElems(kq_dt) == 0 &&
         DeviceKeepQuantSupported(kq_dt, pol.device);
@@ -1165,11 +1187,13 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
     }
   }
   // in_proj_z <- attn_gate [value_dim, H]; all rows are V.
+  // T21: Same row-permutation keep-quant path as in_proj_qkv above.
+  // Saves ~360 MB/tok of bf16 read amplification (24 Q4_K tensors × 2.9x).
   {
     const std::string nm = Blk(il, "attn_gate.weight");
     vt::DType z_dt = vt::DType::kF32;
     const bool packed_reorder_z =
-        reorder && pol.keep_quant &&
+        reorder && pol.keep_quant && rowperm_keep &&
         KeepQuantDType(g.Get(nm).ggml_type, &z_dt) &&
         g.Get(nm).shape[1] % vt::BlockElems(z_dt) == 0 &&
         DeviceKeepQuantSupported(z_dt, pol.device);

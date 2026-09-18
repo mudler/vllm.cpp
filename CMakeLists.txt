@@ -820,6 +820,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/deepseek_v4_moe.cpp
   src/vllm/model_executor/models/deepseek_v4_device.cpp
   src/vllm/model_executor/models/deepseek_v4_1_engram.cpp
+  src/vllm/model_executor/models/deepseek_v4_1_mxfp8.cpp
   src/vllm/model_executor/models/dots3_note.cpp
   src/vllm/model_executor/models/dots3_note_attn.cpp
   src/vllm/model_executor/models/dots3_note_device.cpp
@@ -1261,6 +1262,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/layers/rotary_embedding/dynamic_ntk_alpha_rope.cpp
   src/vllm/model_executor/layers/rotary_embedding/dynamic_ntk_scaling_rope.cpp
   src/vllm/model_executor/layers/rotary_embedding/llama3_rope.cpp
+  src/vllm/model_executor/layers/rotary_embedding/linear_scaling_rope.cpp
   src/vllm/model_executor/layers/rotary_embedding/phi3_long_rope_scaled_rope.cpp
   src/vllm/model_executor/layers/rotary_embedding/yarn_scaling_rope.cpp
   src/vllm/model_executor/layers/rotary_embedding/mrope.cpp
@@ -1366,6 +1368,8 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_backend.cpp
   src/vt/cpu/cpu_threadpool.cpp
   src/vt/cpu/cpu_ops.cpp
+  src/vt/compiled_gemma.cpp
+  src/vt/cpu/cpu_compiled_gemma.cpp
   src/vt/cpu/cpu_residual_rmsnorm.cpp
   src/vt/cpu/cpu_minimax_h3.cpp
   src/vt/cpu/cpu_ltx2.cpp
@@ -1735,6 +1739,7 @@ if(VLLM_CPP_HIP)
     src/vllm/platforms/rocm.cpp
     src/vt/rocm/rocm_backend.hip
     src/vt/rocm/rocm_rmsnorm.hip
+    src/vt/rocm/rocm_compiled_gemma.hip
     src/vt/rocm/rocm_residual_rmsnorm.hip
     src/vt/rocm/rocm_embedding.hip
     src/vt/rocm/rocm_embedding_quant.hip
@@ -1742,6 +1747,7 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_attn_gate_split.hip
     src/vt/rocm/rocm_matmul_hipblaslt.hip
     src/vt/rocm/rocm_paged_attn.hip
+    src/vt/rocm/rocm_rdna3_attn_decode.hip
     src/vt/rocm/rocm_gemma4_experts.hip
     src/vt/rocm/rocm_gemma4_fused_experts.hip
     src/vt/rocm/rocm_gemma4_expert_geglu.hip
@@ -1776,6 +1782,7 @@ if(VLLM_CPP_HIP)
     set_source_files_properties(
       src/vt/rocm/rocm_backend.hip
       src/vt/rocm/rocm_rmsnorm.hip
+      src/vt/rocm/rocm_compiled_gemma.hip
       src/vt/rocm/rocm_residual_rmsnorm.hip
       src/vt/rocm/rocm_embedding.hip
       src/vt/rocm/rocm_embedding_quant.hip
@@ -1783,6 +1790,7 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_attn_gate_split.hip
       src/vt/rocm/rocm_matmul_hipblaslt.hip
       src/vt/rocm/rocm_paged_attn.hip
+      src/vt/rocm/rocm_rdna3_attn_decode.hip
       src/vt/rocm/rocm_gemma4_experts.hip
       src/vt/rocm/rocm_gemma4_fused_experts.hip
       src/vt/rocm/rocm_gemma4_expert_geglu.hip

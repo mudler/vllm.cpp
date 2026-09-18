@@ -871,6 +871,30 @@ struct GdnLayerWeights {
   OwnedTensor norm_weight;    // bf16 [Dv]           (RMSNormGated)
   OwnedTensor out_proj;       // bf16 [value_dim, H] (FP8 dequant + T)
 
+  // ── DEFERRED V-HEAD PERMUTATION (MODEL-MM-QWEN4-EXP,
+  //    ISSUE-LOCAL-01M2ENTH6YA5FWEDY6CFHF4NAM) ───────────────────────────────
+  //
+  // 0 on EVERY loader but the `qwen4exp` GGUF one, and 0 means "the weights
+  // above are already in HuggingFace GROUPED V-head order", which is what every
+  // other checkpoint in this tree ships and what the GDN block has always
+  // assumed. Nothing changes for them.
+  //
+  // Non-zero is the number of KEY heads, and it says that `in_proj_qkv`'s
+  // TRAILING V rows, `in_proj_z`, `in_proj_b`, `in_proj_a` and `out_proj`'s
+  // COLUMNS are in the converter's TILED V-head order instead — because undoing
+  // that order on the weight forces a k-quant superblock to be dequantized at
+  // load (4.152 GB/step of bf16 against 1.508 GB in the file, 61% of this
+  // model's decode weight traffic). The block undoes it on the projection
+  // VECTORS instead, which is an exact re-indexing of the same values.
+  //
+  // EVERY OTHER V-INDEXED WEIGHT STAYS GROUPED — `conv1d_weight`'s V channels,
+  // `a_log`, `dt_bias` — because they are f32/bf16 already and cost nothing to
+  // permute at load. So the permutation the block applies is confined to the
+  // four projection outputs and the out-projection input; the conv, the
+  // recurrence, the gated norm and both persistent state caches see exactly the
+  // grouped order they see today. `norm_weight` is [Dv] and head-agnostic.
+  int64_t v_head_perm_key_heads = 0;
+
   // MODEL-FP8-BLOCK-WEIGHT (#1189 M3): block-wise FP8 GDN projections. The
   // target checkpoint lists the GDN small tensors under
   // `modules_to_not_convert`, so these stay empty for it; the rung exists

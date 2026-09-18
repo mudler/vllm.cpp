@@ -27,6 +27,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -34,12 +35,11 @@
 #include <vector>
 
 #include "vllm/model_executor/models/dense_device_glue.h"
-
-#include "vllm/model_executor/models/dense_nvfp4_gemm.h"   // NVFP4 W4A16 dispatch
-#include "vllm/model_executor/models/device_pool.h"  // DevicePool/Pool/ActivePool (shared)
-#include "vllm/model_executor/models/kv_cache_route.h"  // KV-FP8 W3 store/read route
-#include "vllm/model_executor/models/qwen3.h"         // Qwen3DenseAttnWeights, PagedKvCache
-#include "vllm/model_executor/models/tensor_parallel.h"  // TensorParallel/TpAllReduceSum (W2)
+#include "vllm/model_executor/models/dense_nvfp4_gemm.h"  // NVFP4 W4A16 dispatch
+#include "vllm/model_executor/models/device_pool.h"       // DevicePool/Pool/ActivePool (shared)
+#include "vllm/model_executor/models/kv_cache_route.h"    // KV-FP8 W3 store/read route
+#include "vllm/model_executor/models/qwen3.h"             // Qwen3DenseAttnWeights, PagedKvCache
+#include "vllm/model_executor/models/tensor_parallel.h"   // TensorParallel/TpAllReduceSum (W2)
 #include "vllm/platforms/interface.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/v1/attention/backend.h"  // CommonAttentionMetadata
@@ -178,7 +178,13 @@ inline std::vector<float> WeightF32(const OwnedTensor& w) {
 
 // Device-resident raw-dtype view over an owned weight, uploaded ONCE (lazily) and
 // reused across every forward step (mirrors qwen3_5.cpp ResidentWeight).
-inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = {}) {
+// A generated cache can initialize its device storage with backend operations.
+// The callback runs only on the first device allocation. CPU uses host bytes.
+inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = {},
+                             const std::function<void(Tensor&)>& initialize = {}) {
+  if (initialize)
+    VT_CHECK(w.rank > 0 && w.rank <= vt::kMaxRank,
+             "resident generated tensor requires a valid rank");
   if (shape.empty()) shape.assign(w.shape, w.shape + w.rank);
   // HOST-POINTER ALIASING IS A CPU PROPERTY, NOT A "NOT-CUDA" PROPERTY.
   // This read `!is_cuda()`, which is true for kMETAL, kVULKAN and kXPU as well
@@ -229,20 +235,38 @@ inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> s
            "resident weight: an elem_kn_repacked ([K,N]) weight reached device "
            "staging; VT_CPU_ELEM_KN_REPACK is a CPU-only load transform");
   if (!w.d_dev) {
-    VT_CHECK(!w.bytes.empty(),
+    VT_CHECK(!w.bytes.empty() || initialize,
              std::string("resident weight: EMPTY tensor has no host bytes to "
                          "upload (device-staging arm, dtype ") +
                  vt::Name(w.dtype) + ", rank " + std::to_string(w.rank) + ")");
-    const size_t nb = w.bytes.size();
+    size_t nb = w.bytes.size();
+    if (initialize) {
+      VT_CHECK(!shape.empty() && shape.size() <= vt::kMaxRank,
+               "resident generated tensor requires a valid rank");
+      nb = vt::SizeOf(w.dtype);
+      for (const int64_t dim : shape) {
+        VT_CHECK(dim > 0 && nb > 0 &&
+                     static_cast<uint64_t>(dim) <= static_cast<uint64_t>(INT64_MAX) / nb,
+                 "resident generated tensor size overflow");
+        nb *= static_cast<size_t>(dim);
+      }
+    }
     void* p = d.b.Alloc(nb);
     // Issue #150 accounting: this is the ONE host->device weight upload. When
     // `w.bytes` borrows the safetensors mapping (ENG-LOAD-DIRECT-UPLOAD) the
     // source of this copy IS the file mapping, so the load moved the bytes once
     // rather than twice.
-    vllm::load_stats::AddDeviceUpload(nb);
-    d.b.Copy(d.q, p, w.bytes.data(), nb);
     Backend* bk = &d.b;
-    w.d_dev = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+    auto owner = std::shared_ptr<void>(p, [bk](void* q) { bk->Free(q); });
+    if (initialize) {
+      Tensor generated = w.ViewOn(p, d.q.device, shape);
+      initialize(generated);
+    } else {
+      vllm::load_stats::AddDeviceUpload(nb);
+      d.b.Copy(d.q, p, w.bytes.data(), nb);
+    }
+    w.d_dev = std::move(owner);
+    if (initialize && w.bytes.empty()) w.host_released = true;
     // THE SOURCE PAGES ARE SPENT, AND THIS IS THE ARM QWEN4-EXP ACTUALLY TAKES.
     // The identical release landed first in `qwen3_5.cpp`'s own `ResidentWeight`
     // (the TU-local one, which shadows this function inside that file), and that
@@ -348,11 +372,13 @@ inline DBuf Exl3MatmulD(Dev d, const vt::Tensor& x, const Exl3Weight& w,
   const bool use_reconstruct =
       M > kReconstructThreshold &&
       vt::OpRegistered(vt::OpId::kExl3ReconstructGemm, d.q.device.type);
-  const int64_t w_cols = N <= 32768 ? N : 32768;
-  DBuf w_scratch;
-  if (use_reconstruct) {
-    w_scratch = DBuf(d, vt::DType::kF16, {K, w_cols});
-  }
+  // THE WEIGHT SCRATCH IS NOT A POOL BLOCK (QUANT-EXL3 W7,
+  // .agents/specs/quant-exl3-recon-scratch.md). The fp16 [K, min(N, 32768)]
+  // reconstructed weight comes from the backend's ONE persistent buffer per
+  // (device, queue). As a per-call `DBuf` it was part of every CUDA-graph step's
+  // demand profile, so each captured graph pinned its own block of every class,
+  // about 786 MiB per slot on Qwen3.8-27B EXL3, and GB10 ran out of host memory
+  // at c = 32 (ISSUE-LOCAL-01M2DW8CXYEWWMJSZZ6GRH48SZ).
 
   vt::Tensor trellis = ResidentWeight(d, w.trellis);
   vt::Tensor suh = ResidentWeight(d, w.suh);
@@ -364,8 +390,7 @@ inline DBuf Exl3MatmulD(Dev d, const vt::Tensor& x, const Exl3Weight& w,
 
   auto run_gemm = [&](vt::Tensor& out) {
     if (use_reconstruct) {
-      vt::Exl3ReconstructGemm(d.q, out, a, trellis, suh, svh, a_had.t(),
-                               w_scratch.t(), args);
+      vt::Exl3ReconstructGemm(d.q, out, a, trellis, suh, svh, a_had.t(), args);
     } else {
       vt::Exl3Gemm(d.q, out, a, trellis, suh, svh, a_had.t(), args);
     }

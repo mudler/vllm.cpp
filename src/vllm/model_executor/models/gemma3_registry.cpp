@@ -4,8 +4,6 @@
 // layers are masked at the kernel, not by a smaller cache), the LoadedModel
 // subclass and the factory. Mirrors the qwen3_dense.cpp seam (new TU + one in-TU
 // REGISTER line -> ZERO shared-array edit). See .agents/specs/sweep-gemma.md.
-#include "vllm/model_executor/models/model_registry.h"
-
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -13,6 +11,8 @@
 #include <vector>
 
 #include "vllm/model_executor/models/gemma3.h"
+#include "vllm/model_executor/models/gemma3_decode_graph.h"
+#include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits (shared carrier)
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/v1/kv_cache_dtype.h"
@@ -39,9 +39,11 @@ class Gemma3LoadedModel final : public LoadedModel {
   Gemma3LoadedModel(const ModelRegistration& registration, Gemma3Weights weights)
       : LoadedModel(registration), weights_(std::move(weights)) {}
   const Gemma3Weights& weights() const { return weights_; }
+  std::unique_ptr<Gemma3DecodeGraph>& decode_graph() { return decode_graph_; }
 
  private:
   Gemma3Weights weights_;
+  std::unique_ptr<Gemma3DecodeGraph> decode_graph_;
 };
 
 std::unique_ptr<LoadedModel> LoadGemma3ForCausalLM(
@@ -55,7 +57,7 @@ std::unique_ptr<LoadedModel> LoadGemma3ForCausalLM(
     throw std::runtime_error("safetensors model source is empty");
   }
   return std::make_unique<Gemma3LoadedModel>(
-      registration, LoadGemma3ForCausalLMWeights(*source.safetensors, config));
+      registration, LoadGemma3ForCausalLMWeights(*source.safetensors, config, source.load_queue));
 }
 
 void PrepareGemma3ForCausalLM(LoadedModel& model, const HfConfig& config,
@@ -67,8 +69,10 @@ void PrepareGemma3ForCausalLM(LoadedModel& model, const HfConfig& config,
 
 ForwardLogits ForwardGemma3ForCausalLM(LoadedModel& model,
                                        const ModelForwardInput& input) {
-  const auto& gemma = ModelAs<Gemma3LoadedModel>(model, "Gemma3ForCausalLM");
+  auto& gemma = ModelAs<Gemma3LoadedModel>(model, "Gemma3ForCausalLM");
   const Gemma3Weights& weights = gemma.weights();
+  if (auto result = Gemma3DecodeGraphForward(gemma.decode_graph(), weights, input))
+    return std::move(*result);
   if (input.gather_logits) {
     return Gemma3Model::ForwardDevice(input.token_ids, input.positions,
                                       input.attn_meta, input.attn_kv, weights,

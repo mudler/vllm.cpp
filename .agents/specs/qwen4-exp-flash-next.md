@@ -7531,6 +7531,136 @@ unmeasured claim.
   of which 6 are the second count of one disagreement. COVERAGE at E > 256 is
   half what the doubled numbers imply, and only E = 256 compares two structures.
 
+- **THE DEFERRED V-HEAD PERMUTATION'S PREFILL COST AND ITS REPAYMENT ARE
+  DERIVED, NOT MEASURED (2026-09-15, commit `708a96589` and its repair).**
+  `vt::VHeadPermute` is O(T * N)
+  per layer per forward, and the whole cost/benefit reading above is byte
+  arithmetic off the manifest: 3.26 MB moved per token over 36 layers against a
+  2.649 GB per-step saving, breakeven T ~= 817, a T = 2048 prefill step
+  overpaying 4.0 GB and repaying it after 1.5 decode steps. **Nothing on a
+  device has confirmed any of the three numbers.** What is owed is one A/B on
+  the released 67.564 GiB artifact, same build, arms interleaved: (a) the
+  prefill step time at T = 2048 with the permutation and with the projections
+  pre-permuted at load, (b) the decode step time on both arms, and (c) the
+  end-to-end time for the reference workload (35-token prompt, 400 decodes),
+  which is where the sign of the whole change is decided. Risk 4 of the issue —
+  that moving these operands from cuBLAS bf16 GEMV at 162.3 GB/s to
+  `QuantDotGemm*` at 93.4 GB/s may lower the achieved rate even as it lowers the
+  bytes — is measured by the same run and is still the way this change could
+  disappoint. Needs a CUDA build on `thor:gpu0` or `dgx:gpu0`.
+- **TWO OF THE FIVE PERMUTE SITES ARE UNTESTED BECAUSE THEY ARE UNREACHED
+  (same change).** `GdnBlock` (`qwen3_5.cpp:4741`) and `GdnBlockPagedMixedSpec`
+  (`:5251`) each carry the out-projection-input permutation and neither is
+  exercised. `GdnBlock` is called only from qwen3_5's own NON-PAGED layer loop
+  (`:7804`, `:8040`), whose loaders all leave `v_head_perm_key_heads == 0`;
+  `GdnBlockPagedMixedSpec` is reached from `GdnBlockPaged` (`:5414`) only under
+  an active speculator at concurrency > 1, which `qwen4_exp_forward.cpp` does
+  not configure. The sites exist so a future speculator or a non-paged qwen4exp
+  arm cannot silently drop the permutation; a test today would gate an
+  unreachable path. What is owed is the test AT THE POINT either becomes
+  reachable, not before.
+
+## Mutation record — the deferred V-head permutation repair (2026-09-15)
+
+`thor:gpu0`, sm_110, nvcc 13.0.88, Release, Ninja, `-j 4`,
+`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110 -DVLLM_CPP_TRITON=OFF`.
+`rc` jobs `ea9bd1ff-ede3-4d03-98be-a9afc30b1cd8` (first run) and
+`9cae72c4-b2bd-4fe3-b388-28639a6e105a` (the valid one; see "The first run's
+restore arm was a lie" below). Repaired tree
+`aea9b99f0`, off `708a96589`.
+
+### The one mutation, and what it convicts
+
+M1 inverts `vt::VHeadPermute`'s TWO index maps in the CPU kernel
+(`src/vt/cpu/cpu_ops.cpp`), swapping the `inverse` and forward branches. This is
+the reviewer's own mutation, the one that left `test_qwen4_exp_layer_loop`
+14/14 and `test_qwen4_exp_forward` 2/2 GREEN before this repair.
+
+| suite | A2 pristine | B2 M1 applied | C2 restored |
+|---|---|---|---|
+| `test_gdn_v_head_permute` | 3/3 · 234/234 | **1/3 · 206/234, 2 cases RED** | 3/3 · 234/234 |
+| `test_qwen4_exp_layer_loop` | 14/14 · 716/716 | **13/14 · 715/716, 1 case RED** | 14/14 · 716/716 |
+| `test_qwen4_exp_forward` | 2/2 · 429/429 | 2/2 · 429/429 (see below) | 2/2 · 429/429 |
+| `test_qwen4_exp_gguf_weights` | 14/14 · 3097/3097 | — | 14/14 · 3097/3097 |
+| `test_qwen4_exp_qsa` | 14/14 · 7263/7263 | — | 14/14 · 7263/7263 |
+| `test_qwen4_exp_gguf_load_plan` | 10/10 · 7462/7462 | — | 10/10 · 7462/7462 |
+| `test_qwen3_5_gdn_spec_routing` | 13 cases, 1 RED | — | 13 cases, 1 RED |
+
+**THE END-TO-END CONVICTION IS THE POINT.** The oracle case prints its measured
+residual per arm, and the two arms separate by 155x:
+
+```
+grouped (v_head_perm_key_heads = 0): max|diff| = 0.0118021  vs a bound of 0.03
+tiled   (v_head_perm_key_heads = 2): max|diff| = 0.0118021   [pristine]
+tiled   (v_head_perm_key_heads = 2): max|diff| = 1.83194     [M1 applied]  RED
+```
+
+The tiled arm reproduces the grouped arm's residual against the transformers
+5.16.0 golden **to every printed digit**, which is what says the deferred
+permutation is the load-time one; under M1 it lands 61x ABOVE the bound. The
+grouped arm stays 0.0118021 in the SAME binary under M1, so the red is the
+permutation and not the fixture.
+
+**`test_qwen4_exp_forward` STAYS GREEN UNDER M1 AND THAT IS NOT A DEFECT TO
+REPAIR.** Its fixture sets no `v_head_perm_key_heads` either, and unlike the
+layer-loop case it has no second arm to give one. `vt::VHeadPermute` is
+therefore never called in it, so a mutation of that op cannot reach it. Reported
+here rather than silently, because "green under the mutation" reads as coverage
+and is the absence of it.
+
+### The first run's restore arm was a LIE, and the mechanism is worth the line
+
+Job `ea9bd1ff`'s arm C restored `cpu_ops.cpp` with
+`tar -xzf src.tar.gz -C "$SRC" src/vt/cpu/cpu_ops.cpp`. **`tar` restores the
+ARCHIVE's mtime**, which is older than the `.o` ninja had just built from the
+mutant, so ninja found the target up to date, rebuilt nothing, and arm C ran arm
+B's binary. `test_qwen4_exp_layer_loop` carried md5
+`723eb5e3243b93ed1036940d7a3cd07f` in BOTH arms, and the source sha256 check
+passed — `RESTORE_CHECK=OK` — because the SOURCE really was restored. A
+source-hash restore check cannot see this; only the binary can.
+
+Job `9cae72c4` re-ran the whole loop with `touch` before every rebuild. The
+proof that the restore is now real is that **A2 and C2 are byte-identical on
+every one of the seven suites**:
+
+| suite | A2 / C2 md5 (equal) | B2 md5 (differs) |
+|---|---|---|
+| `test_gdn_v_head_permute` | `7f09117c5ab6f2088cd46b5ff4c58fb1` | `8c3e03a6b9c4408e7df36eada1de64c5` |
+| `test_qwen4_exp_layer_loop` | `e11284f6c0c9cee23390e352356a73fa` | `4174e7c34a609106274797d77927f3ac` |
+| `test_qwen4_exp_forward` | `966dd23a847addd8c19022ac44218e9b` | `83c31d72123944962feadfe57f962ac7` |
+| `test_qwen4_exp_gguf_weights` | `57fcdaedcc7c2581fdc2f1fdab333631` | — |
+| `test_qwen4_exp_qsa` | `86ffd3e3d62588a65026de2cc8034cb8` | — |
+| `test_qwen4_exp_gguf_load_plan` | `0a184ba56a41ad040debadcdd80a1238` | — |
+| `test_qwen3_5_gdn_spec_routing` | `064acac6c9241cf87c9d529b9183bc37` | — |
+
+`SOURCE_SHA256_ORIG` and `SOURCE_SHA256_BACK` are both
+`7008953ebf996ae811ca30a3a0e32e6d47347a57a75911841128c9c173146592`;
+`SOURCE_SHA256_MUT` is
+`5786065a9ecb435382ac681a746525708ebe62b28b500ebebfd82f54e1f91361`.
+
+### `test_qwen3_5_gdn_spec_routing` fails on this arm, and it is NOT this change
+
+13 cases rather than the 7 the row's earlier gate recorded, and one of them —
+`GDN merged FP8 qkvz == the two split fp8 GEMMs, bitwise`,
+`test_qwen3_5_gdn_spec_routing.cpp:798`, 8 assertions — is RED. The earlier
+reading was a different build configuration; this is the CUDA sm_110 arm.
+
+**It cannot be caused by this commit, and that is checkable rather than
+asserted.** `git diff 708a96589..aea9b99f0 -- src include` touches three files,
+and of those:
+
+- `include/vt/ops.h` — **zero** non-comment lines changed;
+- `src/vllm/model_executor/models/qwen4_exp_weights.cpp` — **zero** non-comment
+  lines changed;
+- `src/vt/rocm/rocm_gdn_state.hip` — relocation only: the non-comment lines of
+  the two revisions are the same multiset (`grep -v '^\s*//' | sort | md5sum`
+  gives `67afbbbbc1615f2fd59cf64c1af79776` on both), and a CUDA build compiles
+  no `.hip` file at all.
+
+So the object code reaching that FP8 case is identical at the base and at the
+repair. The failure is pre-existing on the CUDA arm and belongs to whoever owns
+the merged-FP8 qkvz path, not here.
+
 ## Mutation record — W5k (#2031)
 
 **THE ORACLE, AND HOW IT WAS PROVED TO BE THE ORACLE.** W5j stopped rather than
@@ -10286,6 +10416,163 @@ negligible. Issue
 [#1958](https://github.com/mudler/vllm.cpp/issues/1958) is closed; the fix is
 owned by row `SAMPLE-CORE` (spec: `.agents/specs/sampling-controls-c7.md`).
 
+### THE CONSUMER AUDIT FOR THE DEFERRED V-HEAD PERMUTATION, and the one place the "bit-identical" claim is too strong (2026-09-14)
+
+Implementation of `ISSUE-LOCAL-01M2ENTH6YA5FWEDY6CFHF4NAM`. The scope named the
+correctness question as the actual work: the load-time reorder exists so every
+downstream consumer sees HuggingFace GROUPED V-head order, and permuting the
+vectors moves that obligation outward. This is that audit, read off
+`GdnBlockPaged`, `GdnBlock` and `GdnBlockPagedMixedSpec` rather than assumed.
+
+**THE BINDING CONSTRAINT IS THE RECURRENCE'S HEAD PAIRING.** `vt::GdnDecode`,
+`vt::GdnPrefill`, `vt::GdnSpecDecode` and `vt::GdnPackedDecode` take q/k at
+`[T, Hk, Dk]` and v/g/beta at `[T, Hv, *]`, and they pair value head `v` with
+key head `v / (Hv / Hk)`. That integer-divide rule IS the grouped order. In the
+converter's tiled order the same pairing would read `v % Hk`, so running the
+recurrence in tiled order is not an option, and the `attn_qkv` q and k rows the
+converter does NOT tile are what makes it unavailable — there is no permutation
+of 16 key heads that repairs a 48-head modulo grouping.
+
+**SO THE PERMUTATION IS APPLIED AT THE PROJECTION BOUNDARY AND NOWHERE ELSE.**
+Four sites, all before the first V-head-indexed consumer:
+
+| vector | shape | permuted | first consumer, and why it is satisfied |
+|---|---|---|---|
+| `mixed`'s trailing V channels | `[T, conv_dim]` | tiled -> grouped, prefix `2*key_dim` | `vt::CausalConv1d{Fwd,Update,SpecUpdate}` is DEPTHWISE — channel `c` pairs with row `c` of `conv1d_weight`, which the loader still permutes at load. Both sides grouped. |
+| `z` | `[T, value_dim]` | tiled -> grouped | `vt::RmsNormGated`'s gate, read as `[T, Hv, Dv]`. `norm_weight` is `[Dv]` and head-agnostic. |
+| `a`, `b` | `[T, Hv]` | tiled -> grouped | `vt::GdnGBeta` / `vt::GdnPostConv` / `vt::GdnPackedDecode`, which pair them ELEMENTWISE with `a_log` and `dt_bias` — both still permuted at load. |
+| the out-projection input | `[T, value_dim]` | grouped -> tiled | `out_proj`, whose permutation is on its COLUMNS, so the identity is `(W P) x = W (P x)` and the direction is the INVERSE one. |
+
+**WHAT IS NOT PERMUTED AT RUN TIME, AND WHY THAT IS THE POINT.**
+`ssm_conv1d`, `ssm_a` and `ssm_dt.bias` keep their load-time permutation. They
+are f32 and tiny — 0 of the 4.152 GB — so deferring them would buy nothing and
+cost a second permutation site. Leaving them grouped is exactly what confines
+the run-time work to the table above: the causal conv, the delta rule, the gated
+norm and BOTH PERSISTENT STATE CACHES (`conv_state` `[slots, conv_dim, K-1]`,
+`ssm_state` `[slots, Hv, Dv, Dk]`) see the grouped order they have always seen,
+so no cache written by an older build is re-indexed by a newer one.
+
+`vt::IndexSelect` in `GdnBlockPagedMixedSpec` splits by TOKEN, never by channel,
+and `vt::IndexCopy` merges the same way, so the mixed spec+prefill path inherits
+the permutation from the projections it is handed and needs no site of its own.
+Its out-projection tail needs the inverse, and has it.
+
+#### THE BIT-IDENTITY CLAIM IS TRUE FOR FOUR OF THE FIVE AND OVERSTATED FOR `ssm_out`
+
+The issue says "Both are exact re-indexings with no arithmetic, so both are
+BIT-IDENTICAL". **The re-indexing is exact in both directions; the REDUCTION
+that consumes it is not.**
+
+- A ROW permutation moves whole dot products. Output element `g` is the same sum
+  of the same products in the same order; only the index it is written to
+  changes. `attn_qkv`, `attn_gate`, `ssm_beta` and `ssm_alpha` are bit-identical
+  by construction.
+- A COLUMN permutation permutes the summation order INSIDE every dot product,
+  and floating-point addition is not associative. `ssm_out` is therefore
+  bit-identical only under exact arithmetic. Whether it moves a float in
+  practice is a measurement, and the `GDN deferred V-head permutation == the
+  load-time one` case in `tests/vllm/models/test_gdn_v_head_permute.cpp` is the
+  one that makes it.
+
+**AND THAT MEASUREMENT IS NARROW ON TWO AXES, WHICH THE FIRST WRITING OF THIS
+SECTION DISCLOSED ONLY ONE OF (2026-09-15 repair).** It reads `bad == 0`:
+
+1. at `value_dim` **96**, not the released **6144** — the reordered dot product
+   is 64x shorter than the one that ships, and the reassociation error a column
+   permutation can introduce grows with the reduction length; and
+2. on an `out_proj` built `[value_dim, H]` with `nk` UNSET, consumed by the
+   **bf16 CPU `Matmul`** — while the released path is `[H, value_dim]` with
+   `nk = true`, a **Q6_K** operand consumed by **`QuantDotGemm*`**. A different
+   orientation, a different operand encoding and a different kernel each choose
+   their own summation order, so none of the three is held fixed by this
+   reading.
+
+The released orientation is now covered on the VALUE axis by the deferred
+subcase of `test_qwen4_exp_layer_loop.cpp` (`[H, value_dim]`, `nk = true`,
+against the transformers golden at `kTol`), but that is a tolerance and not an
+equality, so the bit-identity claim itself remains a 96-wide bf16-CPU reading.
+Both comments that asserted it without qualification
+(`qwen4_exp_weights.cpp:280-288`, `include/vt/ops.h:229`) were corrected in the
+same repair; the commit body of `708a96589` is immutable and still carries the
+unqualified wording.
+
+**AND A SECOND, LARGER CAVEAT ON THE GATE AS THE ISSUE WROTE IT.** "Bit identity
+against today's output on the released artifact" is not reachable by ANY
+implementation of this change, because the change's whole purpose is to stop
+dequantizing. Today the five projections are bf16 values rounded from an f32
+dequant, consumed by cuBLAS `gemvx`; afterwards they are native Q5_K/Q6_K
+operands consumed by `QuantDotGemm*`. Different operand encodings and a
+different kernel cannot produce identical floats, and a gate that demanded it
+would be demanding the defect back. What IS gateable at equality, and what the
+committed tests gate, is the PERMUTATION MECHANISM held apart from the residency
+change: the same weight values, in the same dtype, permuted at load versus
+permuted on the vector.
+
+#### THE COST IS O(T * N) PER LAYER PER FORWARD, AND ONE PREFILL STEP IN ISOLATION PAYS MORE THAN IT SAVES
+
+The issue, `qwen4_exp_weights.cpp` and the commit body all said the permutation
+is "O(n) on a vector of at most 10,240 elements". **That is a DECODE reading
+with the token count dropped.** The op runs on `mixed [T, 10240]`,
+`z [T, 6144]`, the out-projection input `[T, 6144]` and `a`/`b` `[T, 48]` each,
+at five sites in `qwen3_5.cpp` (`:4536`, `:4539`, `:4741`, `:5251`, `:5775`),
+once per layer per forward. Per token per layer that is 22,624 elements,
+gathered read-and-written at bf16 = 90.5 kB, so **3.26 MB per token over 36
+layers**.
+
+The saving is **2.649 GB per STEP whatever T is** (4.152 GB of bf16 becoming
+1.503 GB of file bytes). So:
+
+| | permutation cost | saving | net |
+|---|---|---|---|
+| breakeven | 2.649 GB | 2.649 GB | T ~= **817** |
+| one T = 2048 prefill step | 6.67 GB | 2.649 GB | **+4.0 GB, net-POSITIVE** |
+| one decode step (T = 1) | 3.26 MB | 2.649 GB | **-2.646 GB** |
+
+**READ ONLY THE SECOND ROW AND THE CHANGE LOOKS NET-NEGATIVE AT THE DEFAULT
+TOKEN BUDGET. IT IS NOT, FOR ANY GENERATION LONGER THAN TWO TOKENS.** A
+T = 2048 prefill overpays by 4.0 GB and each decode step underpays by 2.646 GB,
+so the prefill is repaid after **1.5 decode steps**. End to end: a 2048-token
+prompt plus 16 decodes is already **-38 GB**, and this row's reference workload
+(35-token prompt, 400 decodes) is **-1060 GB**. The prefill loss is real and
+worth stating; it is not a reason to fold the re-indexing into consumer
+addressing, which is a different and much larger change that this arithmetic
+does not justify.
+
+**NEITHER HALF IS MEASURED ON A DEVICE.** The prefill cost, the decode saving
+and the crossing point are all derived from byte counts. See `## Owed`.
+
+#### THE END-TO-END SUITE WAS BLIND TO V-HEAD ORDER, AND THAT WAS THE MOST VALUABLE FINDING OF THE REVIEW
+
+A fresh review inverted `vt::VHeadPermute`'s two index maps at every production
+site and `test_qwen4_exp_layer_loop` stayed 14/14 and `test_qwen4_exp_forward`
+2/2 **green**. The cause is not a degenerate fixture — the fixture's ratio is
+K = 2 against R = 3, the released ratio in miniature. The cause is that
+`FillGdn` (`test_qwen4_exp_layer_loop.cpp`) builds `Qwen4ExpGdnWeights` by hand
+and never sets `v_head_perm_key_heads`, so the deferred permutation was **inert
+in the one transformers-oracle case in the tree**, and the whole out-projection
+permutation rested on one assertion, `CHECK(bad == 0)` in
+`test_gdn_v_head_permute.cpp`.
+
+The repair adds a second ARM to that oracle case rather than a second case:
+`TileGdnVHeads` re-indexes the same values into the converter's tiled V-head
+order on exactly the five projections, sets the flag, and the arm is gated
+against the SAME transformers 5.16.0 golden at the same bound. It also runs the
+RELEASED `out_proj` orientation — `[H, value_dim]` with `nk = true` — which
+`test_gdn_v_head_permute.cpp` does not.
+
+Three smaller test defects were repaired with it:
+
+- `MakeTiledWeights`'s `which == 2` flipped `in_proj_b` AND `in_proj_a`
+  together, so neither was ever convicted alone. They are indices 2 and 3 now,
+  and `out_proj` moved to 4; the red-first loop runs five cases.
+- `RunLayer` took `ssm` and `conv` BY VALUE, so the block's writes to both
+  persistent caches died with the call and the spec's "both persistent state
+  caches see the grouped order they have always seen" claim had no test. It
+  returns them now, and the equality case asserts both are bit-equal across the
+  two arms AND that both actually moved.
+- The two axes on which the `bad == 0` reading is narrow are stated where the
+  claim is made, in the test and in both shipped comments.
+
 ### THE NEXT ROW, NAMED: keep the GDN projections quantized by permuting a vector (2026-09-14)
 
 The attribution found that **61% of decode weight traffic is a load-time bf16
@@ -10577,6 +10864,38 @@ section above says.
 3. **Do NOT start from the q/k/v merge**, for the reason the issue already gives
    and which this attribution now quantifies: at batch 1 the activation is under
    0.1% of the bytes a GEMV moves.
+
+### THE SLOWEST KERNEL IS ONE WARP PER OUTPUT WITH A 2.5-ITERATION LOOP (2026-09-18)
+
+The bandwidth attribution ranked the decode kernels ascending and the floor is
+the IQ1_S expert gate/up grouped kernel at **41.6 GB/s, 15.2% of peak**, against
+cuBLAS `gemvx` at 162.3 GB/s in the same capture.
+
+Read off the source: `cuda_quant_dot.cu:1986` `QuantDotGemmGrouped32Kernel`
+assigns **one warp per output element**, and `LaunchGrouped32` (`:2092`) uses
+`kWarpsPerBlock = 4`. At `hidden_size` 2560 the weight row is `nb = 80` blocks,
+so `for (b = lane; b < 80; b += 32)` is **2.50 iterations per lane** -- two or
+three loads, then a five-step `__shfl_down_sync`, then 31 of 32 lanes idle while
+lane 0 writes one float. Five reduction steps to amortise two and a half loads.
+That is latency-bound by construction.
+
+**The fix has a precedent 120 lines below it.**
+`QuantDotGemmGroupedFusedSwiGLU32Kernel` (`:2019`) already amortises at width 2 --
+one warp computes gate AND up for the same `(p, j)` against one broadcast
+activation. Generalising that to N output columns per warp makes the loop
+`2.5 x N` useful iterations per reduction and reads the broadcast activation once
+per warp instead of once per output.
+
+**Bound, not promise:** at cuBLAS's measured 162.3 GB/s the family's 26.22 ms/step
+becomes ~15.1 ms, about 11 ms off a 76.9 ms step; at full peak, ~17 ms. Neither is
+predicted -- 15.2% of peak has one measurement behind it, and register pressure
+turns the N sweep over somewhere. Scoped in
+`ISSUE-LOCAL-01M2TZ9AE416FW4GH23V09783Q`, which owes the sweep before any width
+is chosen.
+
+**And the bit-identity bar here IS achievable**, unlike the two this row has
+already written and had to retract: each output keeps its own accumulator and its
+own ascending block order, so only the assignment of work to warps changes.
 
 ### THE FULL DECODE KERNEL TABLE, and a retraction: the lead is GEMM, not QSA (2026-09-13)
 

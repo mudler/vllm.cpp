@@ -770,7 +770,7 @@ TEST_CASE("LoadHfConfig keeps unsupported or malformed RoPE loud") {
     "num_attention_heads": 4,
     "rope_parameters": )";
   SUBCASE("future formula family remains rejected until its leaf lands") {
-    TempJson f(prefix + R"({"rope_type":"linear"}})");
+    TempJson f(prefix + R"({"rope_type":"future_formula"}})");
     CHECK_THROWS_WITH_AS(vllm::LoadHfConfig(f.path()),
                          doctest::Contains("does not implement yet"),
                          std::runtime_error);
@@ -819,6 +819,17 @@ TEST_CASE("LoadHfConfig keeps unsupported or malformed RoPE loud") {
     CHECK(rp.at("full_attention").at("rope_theta").get<double>() == 1000000.0);
     CHECK(rp.at("sliding_attention").at("rope_theta").get<double>() == 10000.0);
   }
+}
+
+TEST_CASE("LoadHfConfig admits Gemma 3 linear RoPE with its factor") {
+  TempJson f(R"({"model_type":"gemma3_text","architectures":["Gemma3ForCausalLM"],
+    "hidden_size":64,"num_hidden_layers":2,"num_attention_heads":4,
+    "rope_theta":1000000.0,"rope_scaling":{"rope_type":"linear","factor":8.0}})");
+  const auto cfg = vllm::LoadHfConfig(f.path());
+  CHECK(cfg.rope_parameters.rope_type == "linear");
+  REQUIRE(cfg.rope_parameters.factor.has_value());
+  CHECK(*cfg.rope_parameters.factor == 8.0);
+  CHECK(cfg.rope_parameters.rope_theta == 1000000.0);
 }
 
 // ─── generation_config.json eos ids (vllm/config/model.py try_get_generation_

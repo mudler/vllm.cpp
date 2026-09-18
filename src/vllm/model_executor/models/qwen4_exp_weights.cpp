@@ -227,28 +227,6 @@ void ReorderVRows(std::vector<float>& buf, int64_t cols, int64_t row_off,
               tmp.size() * sizeof(float));
 }
 
-// The full column range [0, cols) of a [rows, cols] row-major buffer, where
-// `cols == num_k * v_per_k * head_cols` — `out_proj`, whose reorder is on its
-// INPUT dimension.
-void ReorderVCols(std::vector<float>& buf, int64_t rows, int64_t cols,
-                  int64_t num_k, int64_t v_per_k, int64_t head_cols) {
-  std::vector<float> tmp(buf.size());
-  for (int64_t row = 0; row < rows; ++row) {
-    const float* src = buf.data() + static_cast<size_t>(row * cols);
-    float* dst = tmp.data() + static_cast<size_t>(row * cols);
-    for (int64_t k = 0; k < num_k; ++k) {
-      for (int64_t r = 0; r < v_per_k; ++r) {
-        const int64_t g = k * v_per_k + r;
-        const int64_t t = r * num_k + k;
-        std::memcpy(dst + static_cast<size_t>(g * head_cols),
-                    src + static_cast<size_t>(t * head_cols),
-                    static_cast<size_t>(head_cols) * sizeof(float));
-      }
-    }
-  }
-  buf.swap(tmp);
-}
-
 // ── the per-module loads ────────────────────────────────────────────────────
 
 Qwen4ExpGatedResidualWeights LoadGatedResidual(const GgufFile& g,
@@ -289,41 +267,70 @@ Qwen4ExpGdnWeights LoadGdn(const GgufFile& g, const GgufLoadPolicy& pol,
   const bool reorder = num_v != num_k;
   const int64_t v_per_k = num_v / num_k;
 
-  // A reordered projection is LAYOUT-REWRITTEN at load, so it is
-  // `kTransformedWeight` and can never keep its blocks — a k-quant superblock
-  // spans elements the permutation moves. Without the reorder these are
-  // ordinary verbatim GEMM operands.
+  // THE FIVE PROJECTIONS LOAD VERBATIM, REORDER OR NOT, and their V-head
+  // permutation is deferred to the projection VECTORS at run time
+  // (`GdnLayerWeights::v_head_perm_key_heads`, `vt::VHeadPermute`,
+  // ISSUE-LOCAL-01M2ENTH6YA5FWEDY6CFHF4NAM).
   //
-  // THE COST IS REAL AND IT IS NOT HIDDEN: on the released 16-vs-48 config the
-  // reorder is always on, so every Gated DeltaNet projection of all 36 linear
-  // layers expands to bf16 at load rather than staying Q5_K/Q6_K. That is the
-  // same property `qwen3_5_gguf_weights.cpp` already has for the 27B, and the
-  // alternative — permuting whole rows inside the block stream — is only
-  // available for the ROW reorders, never for `out_proj`'s COLUMN one.
+  // WHAT THIS REPLACES, AND WHY. Applying the permutation to the WEIGHT makes a
+  // reordered projection `kTransformedWeight`, because a k-quant superblock
+  // spans elements the permutation moves — so on the released 16-vs-48 config,
+  // where the reorder is ALWAYS on, all five projections of all 36 linear
+  // layers used to expand to bf16 at load: 4.152 GB per decode step against
+  // 1.508 GB in the file, 61% of this model's entire decode weight traffic.
+  //
+  // A permutation of a GEMV operand does not have to touch the weight. For
+  // `out = W x`, a ROW permutation satisfies `(P W) x = P (W x)` and a COLUMN
+  // permutation satisfies `(W P) x = W (P x)`. Both are exact re-indexings with
+  // no arithmetic. That covers `ssm_out`'s COLUMN reorder too, which permuting
+  // whole rows inside the block stream never could.
+  //
+  // THE RE-INDEXING IS EXACT; THE REDUCTION THAT CONSUMES IT IS NOT, so
+  // "bit-identical" is true of four of the five and OVERSTATED for `ssm_out`. A
+  // ROW permutation moves whole dot products — `attn_qkv`, `attn_gate`,
+  // `ssm_beta` and `ssm_alpha` are bit-identical by construction. A COLUMN
+  // permutation reorders the summation INSIDE every dot product, and
+  // floating-point addition is not associative, so `ssm_out` is bit-identical
+  // only under exact arithmetic. That it holds in this tree is a MEASUREMENT,
+  // and a narrow one: `tests/vllm/models/test_gdn_v_head_permute.cpp` reads
+  // `bad == 0` at `value_dim` 96 rather than the released 6144, on a bf16 CPU
+  // `Matmul` over an `[value_dim, H]` `out_proj` with `nk` unset, not on the
+  // released `[H, value_dim]` `nk = true` Q6_K operand through `QuantDotGemm*`.
+  //
+  // THE COST IS O(T * N) PER LAYER PER FORWARD, NOT O(N), and the earlier
+  // "O(n) on a vector of at most 10,240 elements" was a DECODE-only reading
+  // with the token count dropped. Per token per layer the four sites move
+  // `mixed` 10,240 + `z` 6,144 + the out-projection input 6,144 + `a` and `b`
+  // 48 each = 22,624 elements, gathered read-and-written at bf16 = 90.5 kB, so
+  // 3.26 MB per token over 36 layers. The saving is 2.649 GB per STEP whatever
+  // T is, so the two cross at T ~= 817 and a single T = 2048 prefill step
+  // overpays by ~4.0 GB.
+  //
+  // THAT IS ONE STEP IN ISOLATION AND IT IS NOT THE WORKLOAD. Every decode step
+  // underpays by 2.646 GB, so a T = 2048 prefill is repaid after 1.5 decode
+  // steps: prompt 2048 plus 16 decodes is already ~38 GB net-negative, and this
+  // row's reference workload (35-token prompt, 400 decodes) is ~1060 GB
+  // net-negative. NEITHER HALF IS MEASURED ON A DEVICE — the prefill cost and
+  // its repayment are owed as a measurement under `## Owed` in
+  // `.agents/specs/qwen4-exp-flash-next.md`.
+  //
+  // EVERY OTHER V-INDEXED TENSOR IS STILL PERMUTED HERE — `ssm_conv1d`'s V
+  // channels, `ssm_a`, `ssm_dt.bias`. They are f32 and tiny, nothing is saved
+  // by deferring them, and leaving them grouped is what lets the block confine
+  // the run-time permutation to the projection boundary: the causal conv, the
+  // delta rule, the gated norm and both persistent state caches then see the
+  // grouped order they have always seen.
   Qwen4ExpGdnWeights w;
+  w.v_head_perm_key_heads = reorder ? num_k : 0;
 
   // in_proj_qkv <- attn_qkv [conv_dim, H]. Only the TRAILING V rows reorder;
   // the leading `2 * key_dim` q and k rows are untouched.
   {
-    const std::string nm = Blk(il, "attn_qkv.weight");
-    if (!reorder) {
-      w.in_proj_qkv = LoadMatmul(g, pol, nm, conv_dim, h);
-    } else {
-      std::vector<float> f = DequantAll(g, nm, {conv_dim, h});
-      ReorderVRows(f, h, /*row_off=*/2 * key_dim, num_k, v_per_k, dv);
-      w.in_proj_qkv = Bf16From(f, {conv_dim, h}, /*nk=*/true);
-    }
+    w.in_proj_qkv = LoadMatmul(g, pol, Blk(il, "attn_qkv.weight"), conv_dim, h);
   }
   // in_proj_z <- attn_gate [value_dim, H]; ALL rows reorder.
   {
-    const std::string nm = Blk(il, "attn_gate.weight");
-    if (!reorder) {
-      w.in_proj_z = LoadMatmul(g, pol, nm, value_dim, h);
-    } else {
-      std::vector<float> f = DequantAll(g, nm, {value_dim, h});
-      ReorderVRows(f, h, /*row_off=*/0, num_k, v_per_k, dv);
-      w.in_proj_z = Bf16From(f, {value_dim, h}, /*nk=*/true);
-    }
+    w.in_proj_z = LoadMatmul(g, pol, Blk(il, "attn_gate.weight"), value_dim, h);
   }
   // in_proj_b <- ssm_beta, in_proj_a <- ssm_alpha, both [num_v, H]. One ROW per
   // V head, so the head "row count" is 1.
@@ -335,14 +342,7 @@ Qwen4ExpGdnWeights LoadGdn(const GgufFile& g, const GgufLoadPolicy& pol,
   for (const auto& [dst, nm] :
        {std::pair<OwnedTensor*, const char*>{&w.in_proj_b, "ssm_beta.weight"},
         std::pair<OwnedTensor*, const char*>{&w.in_proj_a, "ssm_alpha.weight"}}) {
-    const std::string full = Blk(il, nm);
-    if (!reorder) {
-      *dst = LoadMatmul(g, pol, full, num_v, h);
-    } else {
-      std::vector<float> f = DequantAll(g, full, {num_v, h});
-      ReorderVRows(f, h, /*row_off=*/0, num_k, v_per_k, /*head_rows=*/1);
-      *dst = Bf16From(f, {num_v, h}, /*nk=*/true);
-    }
+    *dst = LoadMatmul(g, pol, Blk(il, nm), num_v, h);
   }
   // conv1d <- ssm_conv1d [conv_dim, K]. Only the V CHANNELS reorder, and this is
   // NOT a matmul operand: it is a depthwise filter, so it is never transposed
@@ -383,14 +383,7 @@ Qwen4ExpGdnWeights LoadGdn(const GgufFile& g, const GgufLoadPolicy& pol,
                                /*unshift=*/false);
   // out_proj <- ssm_out [H, value_dim]; the V COLUMNS reorder.
   {
-    const std::string nm = Blk(il, "ssm_out.weight");
-    if (!reorder) {
-      w.out_proj = LoadMatmul(g, pol, nm, h, value_dim);
-    } else {
-      std::vector<float> f = DequantAll(g, nm, {h, value_dim});
-      ReorderVCols(f, h, value_dim, num_k, v_per_k, dv);
-      w.out_proj = Bf16From(f, {h, value_dim}, /*nk=*/true);
-    }
+    w.out_proj = LoadMatmul(g, pol, Blk(il, "ssm_out.weight"), h, value_dim);
   }
   return w;
 }

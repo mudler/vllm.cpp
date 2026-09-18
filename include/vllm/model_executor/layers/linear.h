@@ -21,10 +21,10 @@
 // (`vt::OpRegistered`) which kernel is available here rather than testing
 // `device == kCUDA` — see base_config.h for the policy/implementation split.
 #pragma once
-
 #include "vllm/model_executor/layers/quantization/base_config.h"
 #include "vllm/model_executor/models/dense_attn_block.h"  // Dev, DBuf, ResidentWeight
 #include "vllm/model_executor/models/qwen3_5_weights.h"   // OwnedTensor
+#include "vt/compiled_gemma.h"
 #include "vt/dtype.h"
 #include "vt/ops.h"
 
@@ -235,8 +235,9 @@ class UnquantizedMlpGateUpBiasMethod : public MlpGateUpMethodBase {
 // way the SwiGLU one gets GateUpFusedMarlinD.
 class UnquantizedMlpGateUpGeluMethod : public MlpGateUpMethodBase {
  public:
-  UnquantizedMlpGateUpGeluMethod(const OwnedTensor* gate_up, int64_t intermediate)
-      : gate_up_(gate_up), I_(intermediate) {}
+  UnquantizedMlpGateUpGeluMethod(const OwnedTensor* gate_up, int64_t intermediate,
+                                 bool compiled_erf = false)
+      : gate_up_(gate_up), I_(intermediate), compiled_erf_(compiled_erf) {}
 
   DBuf Apply(Dev d, const vt::Tensor& x) const override {
     const int64_t M = x.shape[0];
@@ -244,7 +245,10 @@ class UnquantizedMlpGateUpGeluMethod : public MlpGateUpMethodBase {
     DBuf gate_up(d, vt::DType::kBF16, {M, 2 * I_});
     vt::MatmulBT(d.q, gate_up.t(), x, wgu);
     DBuf act(d, vt::DType::kBF16, {M, I_});
-    vt::GeluAndMul(d.q, act.t(), gate_up.t());  // gelu_tanh(gate)*up
+    if (compiled_erf_)
+      vt::CompiledGeluErfMul(d.q, act.t(), gate_up.t());
+    else
+      vt::GeluAndMul(d.q, act.t(), gate_up.t());
     return act;
   }
 
@@ -253,6 +257,7 @@ class UnquantizedMlpGateUpGeluMethod : public MlpGateUpMethodBase {
  private:
   const OwnedTensor* gate_up_;
   int64_t I_;
+  bool compiled_erf_;
 };
 
 }  // namespace layers

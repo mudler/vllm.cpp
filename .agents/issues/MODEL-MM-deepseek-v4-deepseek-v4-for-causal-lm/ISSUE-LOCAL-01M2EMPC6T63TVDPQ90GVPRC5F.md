@@ -101,3 +101,33 @@ refusal at `deepseek_v4.cpp:4658`, owned by
 `.agents/specs/deepseek-v4-device-decode.md`. The resolved backend name is
 RECORDED and not DISPATCHED on (owed to #1332 M4), so a correct name here is not
 a working kernel.
+
+CONFIRMED ON THE REAL ARTIFACT 2026-09-18, which closes the "WHAT IS NOT CLOSED
+BY THIS" caveat directly above. This issue was ALREADY `CLOSED` when that run was
+taken; nothing about its state changes here, and the paragraph is appended rather
+than rewritten so the caveat and its answer both stay readable.
+
+rc job `1ec05714-8cbd-41d6-8c45-9396f4d92223`, `thor:gpu0` (NVIDIA Thor,
+compute_cap 11.0, driver 595.78, aarch64), head
+`7722c8c716f91be2188408d688e0cc5f3268c6f1` re-verified ON THE WORKER by
+re-hashing the extracted tree (`git write-tree` ->
+`852f827f5bab1ac85b96a436f20e4e39c9ddf464`), `Release` with NDEBUG defined,
+`-DVLLM_CPP_CUDA=ON -DVLLM_CPP_CUDA_ARCHITECTURES=110`, nvcc 13.0, 41 `.cu.o`,
+`fa2: DISABLED`, cli md5 `964ef06d43231e8125673dae0fdfbc3c`. Artifact byte-exact
+on the worker at 82,438,622,112 B plus the 934,462,656 B projector.
+
+`vllm-cli --device cuda` exits `0`. The `vllm_engine_load: Block size must be a
+multiple of 16.` line is ABSENT, and the run reaches `vllm.cpp: Asynchronous
+scheduling is enabled (max_concurrent_batches=2)`, which only prints once the
+engine is BUILT. The first three log lines are byte-identical to the 2026-09-13
+run, so this is the same load reaching further. The SYNTHETIC-fixture caveat is
+therefore answered on the released checkpoint.
+
+ONE PREDICTION IN THE PARAGRAPH ABOVE WAS WRONG, and it is corrected here rather
+than edited away: "the next wall on the production path is unchanged and is NOT
+this issue: the W7-device forward refusal at `deepseek_v4.cpp:4658`". That wall
+did NOT fire. `V4DeviceKernelsAvailable()` was TRUE on this build, so
+`kDevicePending` was never reached, and the model generated (` Paris`, first
+token only, NO ORACLE, not a parity result). The wall that did fire is on the
+`--device cpu` arm at `deepseek_v4.cpp:631`, and it has its own row-owned issue
+`ISSUE-LOCAL-01M2TYBE9TWX09XG62QVA5TXHZ`.

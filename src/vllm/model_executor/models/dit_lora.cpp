@@ -756,4 +756,181 @@ void DitApplyRuntimeLoraDelta(vt::Queue& q, const vt::Tensor& a,
   vt::Add(q, o, o, delta);
 }
 
+// ── runtime LoRA loading (ROAD-V1-LORA-RUNTIME phase 5) ─────────────────────
+
+// Read a rank-2 LoRA factor into f32 values. Handles BF16, F32, and F16 storage.
+// Unlike the load-time ReadFactorAsBf16 (which narrows to bf16 for the fuse
+// rule's aggregation dtype), runtime LoRA computes the delta in f32 throughout.
+std::vector<float> ReadFactorAsF32(const std::string& key, const StTensor& t,
+                                     const std::string& path) {
+  if (t.shape.size() != 2) {
+    Fail("'" + key + "' in '" + path + "' is rank " + std::to_string(t.shape.size()) +
+         " " + ShapeText(t.shape) + "; a LoRA factor is rank 2");
+  }
+  int64_t numel = t.shape[0] * t.shape[1];
+  if (numel <= 0) {
+    Fail("'" + key + "' in '" + path + "' is empty " + ShapeText(t.shape));
+  }
+  std::vector<float> out(static_cast<size_t>(numel));
+  if (t.dtype == "F32") {
+    if (t.nbytes != out.size() * sizeof(float)) {
+      Fail("'" + key + "' in '" + path + "' declares " + std::to_string(t.nbytes) +
+           " F32 bytes but its shape " + ShapeText(t.shape) + " needs " +
+           std::to_string(out.size() * sizeof(float)));
+    }
+    std::memcpy(out.data(), t.data, t.nbytes);
+    return out;
+  }
+  if (t.dtype == "BF16") {
+    if (t.nbytes != out.size() * sizeof(uint16_t)) {
+      Fail("'" + key + "' in '" + path + "' declares " + std::to_string(t.nbytes) +
+           " BF16 bytes but its shape " + ShapeText(t.shape) + " needs " +
+           std::to_string(out.size() * sizeof(uint16_t)));
+    }
+    const auto* raw = reinterpret_cast<const uint16_t*>(t.data);
+    for (size_t i = 0; i < out.size(); ++i) {
+      out[i] = vt::BF16ToF32(raw[i]);
+    }
+    return out;
+  }
+  if (t.dtype == "F16") {
+    if (t.nbytes != out.size() * sizeof(uint16_t)) {
+      Fail("'" + key + "' in '" + path + "' declares " + std::to_string(t.nbytes) +
+           " F16 bytes but its shape " + ShapeText(t.shape) + " needs " +
+           std::to_string(out.size() * sizeof(uint16_t)));
+    }
+    const auto* raw = reinterpret_cast<const uint16_t*>(t.data);
+    for (size_t i = 0; i < out.size(); ++i) {
+      out[i] = vt::F16ToF32(raw[i]);
+    }
+    return out;
+  }
+  Fail("'" + key + "' in '" + path + "' has dtype " + t.dtype +
+       ", which this reader does not read. LoRA factors are BF16, F16, or F32.");
+}
+
+DitRuntimeLoraState DitLoadRuntimeLoras(
+    const std::vector<DitRuntimeLoraSpec>& specs,
+    const std::vector<std::string>& contract_names,
+    const std::vector<std::string>& prefixes, vt::Device device) {
+  DitRuntimeLoraState state;
+  if (specs.empty()) return state;
+
+  const std::set<std::string> known(contract_names.begin(), contract_names.end());
+
+  for (const DitRuntimeLoraSpec& spec : specs) {
+    if (spec.path.empty()) Fail("a runtime LoRA adapter path is empty");
+
+    const SafetensorsFile file = SafetensorsFile::Open(spec.path);
+    const auto& metadata = file.Metadata();
+
+    // lora_alpha from __metadata__ (default: rank, so alpha/rank = 1).
+    // Mirrors vLLM-Omni optimize() (lora_weights.py:31-41): scaling = alpha/rank,
+    // folded into lora_b.
+    int64_t lora_alpha = 0;
+    const auto alpha_it = metadata.find("lora_alpha");
+    if (alpha_it != metadata.end()) {
+      try {
+        lora_alpha = std::stoll(alpha_it->second);
+      } catch (const std::exception&) {
+        Fail("'" + spec.path + "' carries metadata lora_alpha='" +
+             alpha_it->second + "', which is not an integer");
+      }
+      if (lora_alpha < 1) {
+        Fail("'" + spec.path + "' carries metadata lora_alpha='" +
+             alpha_it->second + "', which is not a positive integer");
+      }
+    }
+
+    // Gather A and B halves by target, mirroring DitLoraAdapter::Open.
+    std::map<std::string, const StTensor*> a_of;
+    std::map<std::string, const StTensor*> b_of;
+    std::map<std::string, std::string> a_key_of;
+    std::map<std::string, std::string> b_key_of;
+    for (const std::string& key : file.Names()) {
+      std::string target;
+      bool is_a = false;
+      if (!DitLoraContractName(key, prefixes, &target, &is_a)) continue;
+      auto& side = is_a ? a_of : b_of;
+      if (side.count(target) != 0) {
+        Fail("'" + spec.path + "' carries two " + std::string(is_a ? "A" : "B") +
+             " factors for '" + target + "'");
+      }
+      side[target] = &file.Get(key);
+      (is_a ? a_key_of : b_key_of)[target] = key;
+    }
+
+    if (a_of.empty() && b_of.empty()) {
+      Fail("'" + spec.path +
+           "' carries no `.lora_A.weight` / `.lora_B.weight` pair at all, "
+           "so it is not a LoRA adapter");
+    }
+
+    for (const auto& kv : a_of) {
+      const std::string& target = kv.first;
+      const auto b_it = b_of.find(target);
+      if (b_it == b_of.end()) {
+        Fail("'" + spec.path + "' has an A factor for '" + target +
+             "' with no matching B factor");
+      }
+      if (known.count(target) == 0) {
+        Fail("'" + spec.path + "' targets '" + target +
+             "', which the DiT contract does not bind");
+      }
+      if (state.layers.count(target) != 0) {
+        Fail("'" + spec.path + "' targets '" + target +
+             "', which a previous runtime LoRA adapter already bound. "
+             "Multiple runtime adapters targeting the same layer are not "
+             "supported; use prompt-tag strength instead");
+      }
+
+      const StTensor& a = *kv.second;
+      const StTensor& b = *b_it->second;
+      const int64_t rank = a.shape.size() == 2 ? a.shape[0] : 0;
+      const int64_t in_features = a.shape.size() == 2 ? a.shape[1] : 0;
+      const int64_t out_features = b.shape.size() == 2 ? b.shape[0] : 0;
+      if (b.shape.size() != 2 || b.shape[1] != rank) {
+        Fail("'" + spec.path + "' pairs A " + ShapeText(a.shape) + " with B " +
+             ShapeText(b.shape) + " for '" + target +
+             "'; B's second dimension must be A's first (the rank)");
+      }
+
+      // Read factors as f32.
+      std::vector<float> a_data = ReadFactorAsF32(a_key_of[target], a, spec.path);
+      std::vector<float> b_data = ReadFactorAsF32(b_key_of[target], b, spec.path);
+
+      // Fold alpha/rank and strength into B.
+      // effective_b = b * (alpha/rank) * strength
+      const int64_t effective_alpha = lora_alpha > 0 ? lora_alpha : rank;
+      const float scale = static_cast<float>(effective_alpha) /
+                          static_cast<float>(rank) *
+                          static_cast<float>(spec.strength);
+      for (float& v : b_data) v *= scale;
+
+      // Store in backing storage (map elements are node-based, data pointers
+      // stay stable for the state's lifetime).
+      state.a_storage[target] = std::move(a_data);
+      state.b_storage[target] = std::move(b_data);
+
+      // Construct tensor views into the backing storage.
+      DitRuntimeLoraLayer layer;
+      layer.lora_a = vt::Tensor::Contiguous(
+          state.a_storage[target].data(), vt::DType::kF32, device,
+          {rank, in_features});
+      layer.lora_b = vt::Tensor::Contiguous(
+          state.b_storage[target].data(), vt::DType::kF32, device,
+          {out_features, rank});
+      layer.strength = 1.0f;  // already folded into lora_b
+      state.layers[target] = layer;
+    }
+    for (const auto& kv : b_of) {
+      if (a_of.count(kv.first) == 0) {
+        Fail("'" + spec.path + "' has a B factor for '" + kv.first +
+             "' with no matching A factor");
+      }
+    }
+  }
+  return state;
+}
+
 }  // namespace vllm

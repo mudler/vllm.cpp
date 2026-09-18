@@ -324,6 +324,10 @@ int main(int argc, char** argv) {
         g_engine.lora_values.push_back(argv[++i]);
       }
     }
+    else if (a == "--lora-dir") {
+      g_engine.lora_keys.push_back("lora_dir");
+      g_engine.lora_values.push_back(Arg(argc, argv, i));
+    }
     else if (a == "--device") g_engine.device = Arg(argc, argv, i);
     else if (a == "--keep-quant") g_engine.dequant_bf16 = 0;
     else if (a == "--dequant-bf16") g_engine.dequant_bf16 = 1;
@@ -342,6 +346,7 @@ int main(int argc, char** argv) {
           "          [--workdir DIR] [--ffmpeg PATH] [--ui DIR]\n"
           "          [--models-dir DIR]  offer every .gguf here in the picker\n"
           "          [--lora <adapter.safetensors> [STRENGTH]]  fused at load; 1.0\n"
+          "          [--lora-dir DIR]  resolve <lora:name:strength> prompt tags\n"
           "          [--host H] [--port P]\n\n"
           "A browser console for MiniMax-H3 video generation: all three tasks,\n"
           "and the loaded checkpoint can be swapped without restarting.\n"

@@ -98,7 +98,8 @@ const char* Need(int argc, char** argv, int i, const char* flag) {
       "[--fp4-resident]\n"
       "                      [--first-frame f.ppm] [--last-frame f.ppm] [--noise-aug A]\n"
       "                      [--ref-image f.ppm] [--ref-video DIR] [--ref-audio f.wav]\n"
-      "                      [--lora <adapter.safetensors> [STRENGTH]]  fused at load; 1.0\n");
+      "                      [--lora <adapter.safetensors> [STRENGTH]]  fused at load; 1.0\n"
+      "                      [--lora-dir DIR]  resolve <lora:name:strength> prompt tags\n");
   std::exit(code);
 }
 
@@ -159,6 +160,7 @@ int main(int argc, char** argv) {
         SetExtra("lora_strength" + suffix, argv[++i]);
       }
     }
+    else if (f == "--lora-dir") SetExtra("lora_dir", Need(argc, argv, ++i, "--lora-dir"));
     else if (f == "--workdir") workdir = Need(argc, argv, ++i, "--workdir");
     else if (f == "--out") out_path = Need(argc, argv, ++i, "--out");
     else if (f == "--ffmpeg") ffmpeg = Need(argc, argv, ++i, "--ffmpeg");

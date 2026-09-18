@@ -1878,7 +1878,8 @@ MiniMaxH3T2vaResult MiniMaxH3GenerateT2va(vt::Device device, const MiniMaxH3T2va
                                           // costs tens of seconds, so a driver or server stages
                                           // ONCE and passes it here rather than per generation.
                                           // Null stages internally, as before.
-                                          const MiniMaxH3DitDeviceWeights* prestaged = nullptr);
+                                          const MiniMaxH3DitDeviceWeights* prestaged = nullptr,
+                                          const DitRuntimeLoraState* lora_state = nullptr);
 
 // The DENOISE half of `MiniMaxH3GenerateT2va` on its own: packed layout, the two
 // sigma schedules, and the step loop, stopping before the VAEs.
@@ -1945,6 +1946,7 @@ MiniMaxH3DenoiseResult MiniMaxH3DenoiseT2va(vt::Device device, const MiniMaxH3T2
                                             const std::vector<float>& initial_video_rows,
                                             const std::vector<float>& initial_audio_rows,
                                             vt::DType compute_dtype,
-                                            const MiniMaxH3DitDeviceWeights* prestaged = nullptr);
+                                            const MiniMaxH3DitDeviceWeights* prestaged = nullptr,
+                                            const DitRuntimeLoraState* lora_state = nullptr);
 
 }  // namespace vllm

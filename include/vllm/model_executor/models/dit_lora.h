@@ -243,6 +243,12 @@ void DitCheckLorasWereApplied(
 inline constexpr char kDitLoraPathExtra[] = "lora_path";
 inline constexpr char kDitLoraStrengthExtra[] = "lora_strength";
 
+// The model-load extra that tells the engine where to resolve prompt-tag LoRA
+// names to safetensors files. Mirrors sd.cpp's `lora_dir` (gosd.cpp:110-158).
+// Rides in `VideoModelParams.extras` (LTX2) or `MiniMaxH3VideoModelParams.extras`
+// (H3) — a model-load knob, not a per-generation extra.
+inline constexpr char kDitLoraDirExtra[] = "lora_dir";
+
 // Read `lora_path[_<N>]` / `lora_strength[_<N>]` from the extras map and return
 // one `DitLoraSpec` per adapter, in index order. A gap in the sequence refuses
 // by name, as does a `lora_strength_<N>` without its `lora_path_<N>`.
@@ -328,6 +334,12 @@ struct DitRuntimeLoraState {
     return it != layers.end() ? &it->second : nullptr;
   }
   std::map<std::string, DitRuntimeLoraLayer> layers;
+  // Backing storage for factor data, populated by DitLoadRuntimeLoras. Map
+  // elements are node-based (never move on insert), so vt::Tensor views into
+  // them stay valid for the state's lifetime. Tests that construct layers by
+  // hand leave these empty.
+  std::map<std::string, std::vector<float>> a_storage;
+  std::map<std::string, std::vector<float>> b_storage;
 };
 
 // Compute the runtime LoRA delta and add it to the output:
@@ -345,5 +357,20 @@ struct DitRuntimeLoraState {
 void DitApplyRuntimeLoraDelta(vt::Queue& q, const vt::Tensor& a,
                                float* out, int64_t rows, int64_t out_features,
                                const DitRuntimeLoraLayer* lora);
+
+// Open the runtime LoRA adapters named by `specs` and build a
+// `DitRuntimeLoraState` whose layers are keyed by contract target name. Each
+// adapter's A/B factors are read as f32; `alpha/rank` is folded into B when the
+// adapter carries `lora_alpha` in its `__metadata__` (mirrors vLLM-Omni's
+// `optimize()`, lora_weights.py:36-41), and `strength` is always folded into B.
+// The result is a per-forward delta of `(x @ A^T) @ B_eff^T` with no scaling.
+//
+// `contract_names` is the set of tensor names the DiT actually binds;
+// `prefixes` is the ComfyUI prefix set to strip (same as `DitLoraAdapter::Open`).
+// Tensors are placed on `device` (CPU for now; device upload is a Phase 7 step).
+DitRuntimeLoraState DitLoadRuntimeLoras(
+    const std::vector<DitRuntimeLoraSpec>& specs,
+    const std::vector<std::string>& contract_names,
+    const std::vector<std::string>& prefixes, vt::Device device);
 
 }  // namespace vllm

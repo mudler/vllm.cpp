@@ -33,6 +33,7 @@
 
 #include "vllm/model_executor/model_loader/safetensors_reader.h"
 #include "vllm/model_executor/models/device_pool.h"  // ActivePool(b)/DevicePool::Drain
+#include "vllm/model_executor/models/dit_lora.h"
 #include "vllm/model_executor/models/ltx2.h"
 #include "vllm/model_executor/models/ltx2_audio_input.h"
 #include "vllm/model_executor/models/ltx2_audio_vae.h"
@@ -444,7 +445,7 @@ constexpr char kLtx2AutoDurationExtra[] = "auto_duration";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 646 647 1264 1360 1456 1472 1607 1611 1769 1805 1957 2075 2117 2159 2161
+// 648 649 1266 1362 1458 1474 1609 1613 1771 1807 1959 2077 2119 2161 2163
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -455,6 +456,7 @@ const char* const kKnownLoadExtras[] = {
     kLtx2LoraPathExtra,          kLtx2LoraStrengthExtra,
     kLtx2NegativePromptEmbedsExtra, kLtx2NegativeAudioPromptEmbedsExtra,
     kLtx2CheckpointClassExtra,
+    kDitLoraDirExtra,
 };
 
 // FNV-1a over the raw bytes of a float buffer — the `Ltx2ConditioningTrace`
@@ -2552,6 +2554,32 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   Impl& im = *impl_;
   std::lock_guard<std::mutex> guard(im.mutex);
 
+  // ── runtime LoRA (ROAD-V1-LORA-RUNTIME phase 5) ─────────────────────────
+  //
+  // Parse `<lora:name:strength>` tags from the prompt and load the referenced
+  // adapters. The cleaned prompt (tags stripped) is used for text conditioning,
+  // so the tags never reach the text encoder. Mirrors sd.cpp's
+  // `parse_loras_from_prompt` (gosd.cpp:174-330). `lora_dir` is a model-load
+  // extra (VideoModelParams::extras); when absent, no parsing happens and the
+  // prompt is used verbatim.
+  const auto lora_dir_it = im.params.extras.find(kDitLoraDirExtra);
+  const std::string lora_dir =
+      lora_dir_it != im.params.extras.end() ? lora_dir_it->second : "";
+  const DitParseLoraResult lora_parsed =
+      lora_dir.empty() ? DitParseLoraResult{{}, gen.prompt}
+                       : DitParseLoraTags(gen.prompt, lora_dir);
+  const std::string& prompt = lora_parsed.clean_prompt;
+
+  DitRuntimeLoraState lora_state;
+  if (!lora_parsed.loras.empty()) {
+    const std::vector<Ltx2TensorSpec> contract = EnumerateLtx2DitTensors(im.dit.params);
+    std::vector<std::string> names;
+    names.reserve(contract.size());
+    for (const Ltx2TensorSpec& spec : contract) names.push_back(spec.name);
+    lora_state = DitLoadRuntimeLoras(lora_parsed.loras, names, {"diffusion_model."},
+                                     im.on_device ? im.device : vt::Device{vt::DeviceType::kCPU, 0});
+  }
+
   // ── W0: this render's slice of the timeline (#1010) ───────────────────────
   //
   // The counter is a process static rather than a member: the table is a PROCESS
@@ -2904,13 +2932,13 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     }
   }
 
-  if (!gen.prompt.empty() && !im.has_encoder) {
+  if (!prompt.empty() && !im.has_encoder) {
     Fail(
         "a prompt was supplied but no text tower is loaded, so it cannot condition this "
         "render. Rendering the prompt-embeds conditioning INSTEAD would silently ignore the "
         "request's own prompt. Load with encoder_path to condition on the prompt.");
   }
-  if (gen.prompt.empty() && im.video_prompt_embeds.empty()) {
+  if (prompt.empty() && im.video_prompt_embeds.empty()) {
     if (im.has_encoder) {
       Fail(
           "this request carries no prompt, and no prompt-embeds conditioning was loaded "
@@ -3003,7 +3031,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         static_cast<int64_t>(im.duration_head_weights.Bytes());
   }
 
-  if (!gen.prompt.empty()) {
+  if (!prompt.empty()) {
     // W0: the phase #1269 and W4 are about. Split into the TOWER and the
     // CONNECTOR because they are different work on different weights, and the
     // spike's 39-100% bound could not tell them apart.
@@ -3012,7 +3040,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     phase::Scope tower_phase("conditioning.tower");
     const Ltx2PromptConditioning encoded = Ltx2EncodePromptToConditioning(
         *im.tower, *im.tokenizer, im.gemma_ids, im.caption_projections, im.feature_cfg,
-        gen.prompt, text_queue);
+        prompt, text_queue);
     tower_phase.Close();
     prompt_video = encoded.conditioning.video;
     prompt_audio = encoded.conditioning.audio;
@@ -3060,7 +3088,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     video_context = prompt_video.data();
     audio_context = prompt_audio.data();
     im.trace.from_prompt = true;
-    im.trace.prompt = gen.prompt;
+    im.trace.prompt = prompt;
   }
 
   {
@@ -3743,7 +3771,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   const float* negative_video_context = nullptr;
   const float* negative_audio_context = nullptr;
   if (wants_negative) {
-    if (!im.negative_video_prompt_embeds.empty() && gen.prompt.empty()) {
+    if (!im.negative_video_prompt_embeds.empty() && prompt.empty()) {
       // The embeds fallback's own second half. Taken only when the request
       // carries no prompt, which is the same polarity the POSITIVE fallback has
       // above: a typed prompt encodes both halves through the tower.
@@ -5296,9 +5324,11 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
         }
         const Ltx2DitOutputs velocity =
             im.on_device ? Ltx2DitForwardDevice(*im.queue, im.dit.params, im.dit.weights, v, a,
-                                                im.compute_dtype, /*cache=*/nullptr, p)
+                                                im.compute_dtype, /*cache=*/nullptr, p,
+                                                lora_state.empty() ? nullptr : &lora_state)
                          : Ltx2DitForward(im.device, im.dit.params, im.dit.weights, v, a,
-                                          im.compute_dtype, /*cache=*/nullptr, p);
+                                          im.compute_dtype, /*cache=*/nullptr, p,
+                                          lora_state.empty() ? nullptr : &lora_state);
         // EVERY ACTUAL DiT FORWARD IS COUNTED HERE, and that is a different
         // number from `dit_evaluations` one level up. One denoiser evaluation is
         // one to four forwards (cond, uncond, ptb, mod — denoisers.py:100-137),

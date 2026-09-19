@@ -432,8 +432,15 @@ HfConfig ParseHfConfigDoc(nlohmann::json doc, const std::string& path,
   const nlohmann::json& text = ResolveTextConfig(doc);
 
   RequireKey(doc, "model_type", path);
-  RequireKey(text, "hidden_size", path);
-  RequireKey(text, "num_hidden_layers", path);
+
+  // GLiNER2.5 configs (model_type "extractor") carry no encoder fields —
+  // hidden_size and num_hidden_layers are inferred from weight shapes in
+  // gliner2_weights.cpp::InferEncoderParams, so skip the requirement here.
+  const bool is_extractor = GetString(doc, "model_type") == "extractor";
+  if (!is_extractor) {
+    RequireKey(text, "hidden_size", path);
+    RequireKey(text, "num_hidden_layers", path);
+  }
 
   HfConfig cfg;
   try {

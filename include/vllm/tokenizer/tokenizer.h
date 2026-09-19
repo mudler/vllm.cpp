@@ -155,6 +155,13 @@ class Tokenizer {
   // begins at byte 0 of the whole input (drives prepend_scheme="first").
   void EncodePlainSp(std::string_view text, bool at_input_start,
                      std::vector<int32_t>& out) const;
+  // Viterbi DP tokenization for a SentencePiece Unigram piece (model.type ==
+  // "Unigram"). Replaces BPE merges with a lattice search: at each byte
+  // position, try every vocab entry that matches, plus unk for one UTF-8
+  // character. Matches HF tokenizers UnigramModel::tokenize
+  // (tokenizers/src/models/unigram/model.rs).
+  void EncodePlainUnigram(std::string_view piece,
+                         std::vector<int32_t>& out) const;
 
   std::unordered_map<std::string, int32_t> vocab_;  // mapped symbol -> id
   MergeRanks merge_ranks_;
@@ -193,6 +200,14 @@ class Tokenizer {
   int32_t template_bos_ = -1;
   int32_t template_eos_ = -1;
   bool ignore_merges_ = false;  // BPE option: whole-pretoken vocab hit wins
+  // --- Unigram (SentencePiece Unigram model, model.type == "Unigram"). Uses
+  // Viterbi DP instead of BPE merges. The vocab is an array of [token, score]
+  // pairs where score is a log-probability; index == id. The unk penalty is
+  // unigram_min_score_ - 10.0 (HF tokenizers default when no unk_score is
+  // declared). ---
+  bool is_unigram_ = false;
+  std::unordered_map<std::string, float> unigram_scores_;
+  float unigram_min_score_ = 0.0f;
 };
 
 }  // namespace vllm::tok

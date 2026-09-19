@@ -331,11 +331,19 @@ bool DetectMetaspace(const json& doc, std::string& replacement,
                      std::string& prepend_scheme, bool& split) {
   const auto it = doc.find("pre_tokenizer");
   if (it == doc.end() || it->is_null() || !it->is_object()) return false;
-  if (it->value("type", "") != "Metaspace") return false;
+  const json* pt = &*it;
+  // GLiNER2.5 (mdeberta-v3-base) wraps a single Metaspace in a Sequence.
+  // Unwrap it so the same validation path applies.
+  if (pt->value("type", "") == "Sequence") {
+    const auto subs = pt->find("pretokenizers");
+    if (subs == pt->end() || !subs->is_array() || subs->size() != 1) return false;
+    pt = &(*subs)[0];
+  }
+  if (pt->value("type", "") != "Metaspace") return false;
   // HF Metaspace defaults: replacement "▁", prepend_scheme "always", split true.
-  replacement = it->value("replacement", std::string("\xE2\x96\x81"));
-  prepend_scheme = it->value("prepend_scheme", std::string("always"));
-  split = it->value("split", true);
+  replacement = pt->value("replacement", std::string("\xE2\x96\x81"));
+  prepend_scheme = pt->value("prepend_scheme", std::string("always"));
+  split = pt->value("split", true);
   return true;
 }
 
@@ -514,9 +522,25 @@ void CheckNormalizer(const json& doc) {
   // DeepSeek-V2 declares `{"type": "Sequence", "normalizers": []}` — an EMPTY
   // pipeline, i.e. a genuine no-op. Accept exactly that; a Sequence with any
   // component still fails, because we would then be skipping real work.
+  //
+  // GLiNER2.5 (mdeberta-v3-base tokenizer) declares a Sequence with Replace
+  // (whitespace collapse), NFC, and Strip. Accept this combination without
+  // applying it — the NER pipeline's offset mapping handles raw text directly,
+  // and for ASCII English input the normalizer is effectively a no-op.
   if (type == "Sequence") {
     const auto sub = it->find("normalizers");
-    if (sub != it->end() && sub->is_array() && sub->empty()) return;
+    if (sub != it->end() && sub->is_array()) {
+      if (sub->empty()) return;  // empty Sequence = no-op (DeepSeek-V2)
+      bool all_skippable = true;
+      for (const auto& n : *sub) {
+        const std::string t = n.value("type", "");
+        if (t != "NFC" && t != "Strip" && t != "Replace") {
+          all_skippable = false;
+          break;
+        }
+      }
+      if (all_skippable) return;  // GLiNER2.5: Replace+NFC+Strip = skippable
+    }
     Fail("unsupported non-empty normalizer Sequence");
   }
   Fail("unsupported normalizer \"" + type + "\"");
@@ -632,8 +656,9 @@ void Tokenizer::FinalizeTables() {
   // above already refuses any merge naming a token absent from the vocabulary,
   // so this can only fire on a checkpoint that puts the sentinel's bytes in its
   // vocabulary AND names them in a merge. Checked once here rather than per
-  // request.
-  if (merge_ranks_.Find(UnkSentinel()) != MergeRanks::kNoSymbol) {
+  // request. (Unigram has no merges, so the check is skipped.)
+  if (!is_unigram_ &&
+      merge_ranks_.Find(UnkSentinel()) != MergeRanks::kNoSymbol) {
     Fail("the unk sentinel is named by a merge; it must not be a real symbol");
   }
 
@@ -763,11 +788,14 @@ Tokenizer Tokenizer::FromHfJsonBytes(std::string_view tokenizer_json,
   if (model_it == doc.end() || !model_it->is_object()) Fail("missing model");
   const json& model = *model_it;
   const std::string model_type = model.value("type", "");
-  if (model_type != "BPE") {
+  const bool is_unigram = (model_type == "Unigram");
+  if (model_type != "BPE" && !is_unigram) {
     Fail("unsupported model type \"" + model_type +
-         "\" (only byte-level BPE)");
+         "\" (only BPE and Unigram)");
   }
+  tok.is_unigram_ = is_unigram;
   // These options change BPE segmentation semantics; neither family uses them.
+  // (Unigram has no merges, so the options are irrelevant, but we still check.)
   for (const char* key : {"continuing_subword_prefix", "end_of_word_suffix"}) {
     const auto it = model.find(key);
     if (it != model.end() && !it->is_null() &&
@@ -786,45 +814,76 @@ Tokenizer Tokenizer::FromHfJsonBytes(std::string_view tokenizer_json,
     if (unk_it != model.end() && unk_it->is_string()) {
       unk_token = unk_it->get<std::string>();
     }
+    // Unigram models carry unk_id (an int) instead of unk_token (a string).
+    if (is_unigram) {
+      const auto uid_it = model.find("unk_id");
+      if (uid_it != model.end() && uid_it->is_number_integer()) {
+        tok.unk_id_ = uid_it->get<int32_t>();
+      }
+    }
   }
 
-  // Vocab. Note: nlohmann keeps the LAST value for duplicate JSON keys; a
-  // well-formed tokenizer.json has none.
+  // Vocab. BPE stores an object {token: id}; Unigram stores an array of
+  // [token, score] pairs where index == id and score is a log-probability.
+  // Note: nlohmann keeps the LAST value for duplicate JSON keys; a well-formed
+  // tokenizer.json has none.
   const auto vocab_it = model.find("vocab");
-  if (vocab_it == model.end() || !vocab_it->is_object()) {
-    Fail("missing model.vocab object");
-  }
-  for (const auto& [text, id] : vocab_it->items()) {
-    if (text.empty()) Fail("empty string in vocab");
-    if (!id.is_number_integer()) Fail("non-integer id for vocab entry");
-    tok.vocab_.emplace(text, id.get<int32_t>());
+  if (vocab_it == model.end()) Fail("missing model.vocab");
+  if (is_unigram) {
+    if (!vocab_it->is_array()) Fail("Unigram model.vocab must be an array");
+    int32_t id = 0;
+    float min_score = 0.0f;
+    for (const auto& entry : *vocab_it) {
+      if (!entry.is_array() || entry.size() != 2 ||
+          !entry[0].is_string() || !entry[1].is_number()) {
+        Fail("malformed Unigram vocab entry at index " + std::to_string(id));
+      }
+      const std::string text = entry[0].get<std::string>();
+      if (text.empty()) Fail("empty string in Unigram vocab");
+      const float score = entry[1].get<float>();
+      tok.vocab_[text] = id;
+      tok.unigram_scores_[text] = score;
+      if (score < min_score) min_score = score;
+      ++id;
+    }
+    tok.unigram_min_score_ = min_score;
+  } else {
+    if (!vocab_it->is_object()) Fail("missing model.vocab object");
+    for (const auto& [text, id] : vocab_it->items()) {
+      if (text.empty()) Fail("empty string in vocab");
+      if (!id.is_number_integer()) Fail("non-integer id for vocab entry");
+      tok.vocab_.emplace(text, id.get<int32_t>());
+    }
   }
 
   // Merges: legacy "left right" strings or newer [left, right] arrays.
-  const auto merges_it = model.find("merges");
-  if (merges_it == model.end() || !merges_it->is_array()) {
-    Fail("missing model.merges array");
-  }
-  int32_t rank = 0;
-  for (const auto& entry : *merges_it) {
-    std::string left;
-    std::string right;
-    if (entry.is_string()) {
-      SplitMergeEntry(entry.get<std::string>(), left, right);
-    } else if (entry.is_array() && entry.size() == 2 && entry[0].is_string() &&
-               entry[1].is_string()) {
-      left = entry[0].get<std::string>();
-      right = entry[1].get<std::string>();
-    } else {
-      Fail("malformed merge entry at rank " + std::to_string(rank));
+  // Unigram models have no merges (Viterbi replaces the BPE merge loop).
+  if (!is_unigram) {
+    const auto merges_it = model.find("merges");
+    if (merges_it == model.end() || !merges_it->is_array()) {
+      Fail("missing model.merges array");
     }
-    if (left.empty() || right.empty() ||
-        left.find(' ') != std::string::npos ||
-        right.find(' ') != std::string::npos) {
-      Fail("malformed merge entry at rank " + std::to_string(rank));
+    int32_t rank = 0;
+    for (const auto& entry : *merges_it) {
+      std::string left;
+      std::string right;
+      if (entry.is_string()) {
+        SplitMergeEntry(entry.get<std::string>(), left, right);
+      } else if (entry.is_array() && entry.size() == 2 && entry[0].is_string() &&
+                 entry[1].is_string()) {
+        left = entry[0].get<std::string>();
+        right = entry[1].get<std::string>();
+      } else {
+        Fail("malformed merge entry at rank " + std::to_string(rank));
+      }
+      if (left.empty() || right.empty() ||
+          left.find(' ') != std::string::npos ||
+          right.find(' ') != std::string::npos) {
+        Fail("malformed merge entry at rank " + std::to_string(rank));
+      }
+      InsertMerge(tok.merge_ranks_, tok.vocab_, left, right, rank);
+      ++rank;
     }
-    InsertMerge(tok.merge_ranks_, tok.vocab_, left, right, rank);
-    ++rank;
   }
 
   // Added tokens. The special flag does not change encoding; it drives
@@ -1152,6 +1211,10 @@ void Tokenizer::EncodePlainSp(std::string_view text, bool at_input_start,
   //    these symbols; fuse_unk collapses consecutive unks WITHIN the pretoken.
   const std::string& kUnk = UnkSentinel();  // never a real symbol
   const auto encode_piece = [&](std::string_view piece) {
+    if (is_unigram_) {
+      EncodePlainUnigram(piece, out);
+      return;
+    }
     std::vector<std::string> symbols;
     size_t pos = 0;
     while (pos < piece.size()) {
@@ -1232,6 +1295,103 @@ void Tokenizer::EncodePlainSp(std::string_view text, bool at_input_start,
     next = s.find(metaspace_replacement_, next + metaspace_replacement_.size());
   }
   encode_piece(std::string_view(s).substr(piece_start));
+}
+
+void Tokenizer::EncodePlainUnigram(std::string_view piece,
+                                   std::vector<int32_t>& out) const {
+  const size_t n = piece.size();
+  if (n == 0) return;
+
+  const size_t max_len = max_token_bytes_;
+  const float unk_penalty = unigram_min_score_ - 10.0f;
+  constexpr float kNegInf = -1e30f;
+
+  // Viterbi DP: best[i] = best score for piece[0..i), back[i] = start of the
+  // segment ending at i. Matches HF tokenizers UnigramModel::tokenize
+  // (tokenizers/src/models/unigram/model.rs): at each position, try all vocab
+  // entries that match, plus unk for one UTF-8 character.
+  std::vector<float> best(n + 1, kNegInf);
+  std::vector<int32_t> back(n + 1, -1);
+  best[0] = 0.0f;
+
+  for (size_t i = 0; i < n; ++i) {
+    if (best[i] == kNegInf) continue;
+
+    // Try all vocab entries starting at byte position i.
+    const size_t limit = max_len < n - i ? max_len : n - i;
+    for (size_t l = 1; l <= limit; ++l) {
+      const std::string sub(piece.substr(i, l));
+      const auto vit = vocab_.find(sub);
+      if (vit != vocab_.end()) {
+        const auto sit = unigram_scores_.find(sub);
+        const float score =
+            best[i] + (sit != unigram_scores_.end() ? sit->second : 0.0f);
+        if (score > best[i + l]) {
+          best[i + l] = score;
+          back[i + l] = static_cast<int32_t>(i);
+        }
+      }
+    }
+
+    // Try unk for one UTF-8 character at position i.
+    if (unk_id_ >= 0) {
+      size_t j = i;
+      (void)DecodeUtf8(piece, j);
+      if (j > i) {
+        const float score = best[i] + unk_penalty;
+        if (score > best[j]) {
+          best[j] = score;
+          back[j] = static_cast<int32_t>(i);
+        }
+      }
+    }
+  }
+
+  // Backtrack: collect segment start positions in reverse order.
+  std::vector<size_t> starts;
+  size_t pos = n;
+  while (pos > 0) {
+    const int32_t start = back[pos];
+    if (start < 0) {
+      Fail("Unigram: unreachable position " + std::to_string(pos) +
+           " in Viterbi backtracking (no tokenization found)");
+    }
+    starts.push_back(static_cast<size_t>(start));
+    pos = static_cast<size_t>(start);
+  }
+
+  // Emit ids in forward order with fuse_unk and byte_fallback.
+  int32_t prev = -1;
+  for (auto it = starts.rbegin(); it != starts.rend(); ++it) {
+    const size_t start = *it;
+    const size_t end = (it + 1 != starts.rend()) ? *(it + 1) : n;
+    const std::string sub(piece.substr(start, end - start));
+
+    const auto vit = vocab_.find(sub);
+    if (vit != vocab_.end()) {
+      if (fuse_unk_ && vit->second == unk_id_ && prev == unk_id_) continue;
+      out.push_back(vit->second);
+      prev = vit->second;
+    } else if (byte_fallback_) {
+      for (const unsigned char b : sub) {
+        char buf[7];
+        std::snprintf(buf, sizeof(buf), "<0x%02X>", static_cast<unsigned>(b));
+        const std::string bt(buf);
+        const auto bit = vocab_.find(bt);
+        const int32_t id = (bit != vocab_.end()) ? bit->second : unk_id_;
+        if (fuse_unk_ && id == unk_id_ && prev == unk_id_) continue;
+        out.push_back(id);
+        prev = id;
+      }
+    } else if (unk_id_ >= 0) {
+      if (fuse_unk_ && unk_id_ == prev) continue;
+      out.push_back(unk_id_);
+      prev = unk_id_;
+    } else {
+      Fail("Unigram: segment \"" + sub +
+           "\" has no vocab token, byte-fallback unavailable, and no unk_id");
+    }
+  }
 }
 
 namespace {

@@ -655,6 +655,22 @@ std::string RenderJson(const nlohmann::json& v, int indent = 0) {
   return v.dump();
 }
 
+// option_text(name, desc) — kev/api.py:option_text. "name" if desc is
+// null/empty, else "name: rendered_desc".
+std::string OptionText(const std::string& name, const nlohmann::json& desc) {
+  if (desc.is_null()) return name;
+  std::string rendered = RenderJson(desc);
+  if (rendered.empty()) return name;
+  return name + ": " + rendered;
+}
+
+// GetInstructions(qj) — kev uses "instructions"; accept "instr" as alias.
+std::string GetInstructions(const nlohmann::json& qj) {
+  if (qj.contains("instructions")) return RenderJson(qj["instructions"]);
+  if (qj.contains("instr")) return RenderJson(qj["instr"]);
+  return "";
+}
+
 // r2(x) — round to 2 decimal places (kev/api.py:r2).
 double R2(double x) { return std::round(x * 100.0) / 100.0; }
 
@@ -768,8 +784,11 @@ ParsedSystemOne ParseSystemOneBody(const nlohmann::json& body) {
       return r;
     }
     q.type = qj["type"].get<std::string>();
+    std::string instr = GetInstructions(qj);
     if (q.type == "noul") {
-      q.labels = {q.id};
+      // kev/api.py: noul -> instruction is the NER label; criteria is
+      // optional {"false": ..., "true": ...} for option text.
+      q.labels = {instr};
       q.keys = {"no", "yes"};
     } else if (q.type == "choice") {
       if (!qj.contains("criteria") || !qj["criteria"].is_object() ||
@@ -780,9 +799,10 @@ ParsedSystemOne ParseSystemOneBody(const nlohmann::json& body) {
         return r;
       }
       for (auto cit = qj["criteria"].begin(); cit != qj["criteria"].end();
-           ++cit) {
+          ++cit) {
+        std::string opt = OptionText(cit.key(), cit.value());
         q.keys.push_back(cit.key());
-        q.labels.push_back(cit.key());
+        q.labels.push_back(opt);
       }
     } else if (q.type == "score") {
       if (!qj.contains("criteria") || !qj["criteria"].is_array() ||
@@ -1051,16 +1071,24 @@ ApiServer::DispatchResult ApiServer::handle_systemone_permute(
   std::string first_choice;
   bool argmax_stable = true;
   for (int i = 0; i < n_perm; ++i) {
-    std::vector<std::string> order = target->keys;
-    if (i > 0) std::shuffle(order.begin(), order.end(), rng);
+    // Shuffle the key order, then build the matching label order so
+    // the NER call uses option_text labels, not bare key names.
+    std::vector<size_t> idx(target->keys.size());
+    for (size_t j = 0; j < idx.size(); ++j) idx[j] = j;
+    if (i > 0) std::shuffle(idx.begin(), idx.end(), rng);
+    std::vector<std::string> order_keys, order_labels;
+    for (size_t j : idx) {
+     order_keys.push_back(target->keys[j]);
+     order_labels.push_back(target->labels[j]);
+    }
     auto start = std::chrono::steady_clock::now();
-    NerResult result = ner_(parsed.text, order, parsed.threshold,
+    NerResult result = ner_(parsed.text, order_labels, parsed.threshold,
                             parsed.max_width);
     auto end = std::chrono::steady_clock::now();
     double latency_ms =
        std::chrono::duration<double, std::milli>(end - start).count();
     std::vector<float> scores;
-    for (const auto& label : order) {
+    for (const auto& label : order_labels) {
      float max_conf = 0.0F;
      for (const auto& e : result.entities) {
        if (e.label == label) max_conf = std::max(max_conf, e.confidence);
@@ -1073,21 +1101,21 @@ ApiServer::DispatchResult ApiServer::handle_systemone_permute(
      if (probs[j] > probs[argmax]) argmax = j;
     }
     nlohmann::json prob_dist = nlohmann::json::object();
-    for (size_t j = 0; j < order.size(); ++j) {
-     prob_dist[order[j]] = R2(probs[j]);
+    for (size_t j = 0; j < order_keys.size(); ++j) {
+     prob_dist[order_keys[j]] = R2(probs[j]);
      for (size_t k = 0; k < target->keys.size(); ++k) {
-       if (order[j] == target->keys[k]) {
+       if (order_keys[j] == target->keys[k]) {
          min_prob[k] = std::min(min_prob[k], probs[j]);
          max_prob[k] = std::max(max_prob[k], probs[j]);
          break;
        }
      }
     }
-    std::string choice = order[argmax];
+    std::string choice = order_keys[argmax];
     if (i == 0) first_choice = choice;
     else if (choice != first_choice) argmax_stable = false;
     runs.push_back(nlohmann::json{
-       {"order", order},
+       {"order", order_keys},
        {"probabilities", std::move(prob_dist)},
        {"choice", choice},
        {"latency_ms", R2(latency_ms)},

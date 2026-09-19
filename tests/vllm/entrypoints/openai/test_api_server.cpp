@@ -5426,7 +5426,8 @@ TEST_CASE("api_server: systemone dispatch — jev-compatible answers shape") {
 
   ApiServer::DispatchResult r = h.server.handle_systemone(
       R"({"state":"john works at google",)"
-      R"("questions":{"person":{"type":"noul"},"organization":{"type":"noul"}}})");
+      R"("questions":{"person":{"type":"noul","instructions":"person"},)"
+      R"("organization":{"type":"noul","instructions":"organization"}}})");
   CHECK(r.status == 200);
   json j = json::parse(r.body);
   CHECK(j.at("model") == "gliner2-fixture");
@@ -5445,7 +5446,7 @@ TEST_CASE("api_server: systemone dispatch — jev-compatible answers shape") {
 
   // state as a non-string (JSON value) — stringified internally.
   r = h.server.handle_systemone(
-      R"({"state":42,"questions":{"x":{"type":"noul"}}})");
+      R"({"state":42,"questions":{"x":{"type":"noul","instructions":"thing"}}})");
   CHECK(r.status == 200);
 }
 
@@ -5477,7 +5478,8 @@ TEST_CASE("api_server: systemone choice question") {
   ApiServer::DispatchResult r = h.server.handle_systemone(
       R"({"state":"john works at google",)"
       R"("questions":{"pick":{"type":"choice",)"
-      R"("criteria":{"person":"a person","organization":"an org"}}}})");
+      R"("instructions":"entity type",)"
+      R"("criteria":{"person":null,"organization":null}}}})");
   CHECK(r.status == 200);
   json j = json::parse(r.body);
   json& ans = j.at("answers").at("pick");
@@ -5518,7 +5520,8 @@ TEST_CASE("api_server: systemone separate — N passes, summed tokens") {
   NerHarness h;
   ApiServer::DispatchResult r = h.server.handle_systemone_separate(
       R"({"state":"john works at google",)"
-      R"("questions":{"person":{"type":"noul"},"organization":{"type":"noul"}}})");
+      R"("questions":{"person":{"type":"noul","instructions":"person"},)"
+      R"("organization":{"type":"noul","instructions":"organization"}}})");
   CHECK(r.status == 200);
   json j = json::parse(r.body);
   CHECK(j.at("answers").at("person").at("type") == "noul");
@@ -5536,7 +5539,8 @@ TEST_CASE("api_server: systemone permute — choice under n_perm orders") {
   ApiServer::DispatchResult r = h.server.handle_systemone_permute(
       R"({"request":{"state":"john works at google",)"
       R"("questions":{"pick":{"type":"choice",)"
-      R"("criteria":{"person":"a person","organization":"an org"}}}},)"
+      R"("instructions":"entity type",)"
+      R"("criteria":{"person":null,"organization":null}}}},)"
       R"("question":"pick","n_perm":3,"seed":42})");
   CHECK(r.status == 200);
   json j = json::parse(r.body);
@@ -5570,7 +5574,7 @@ TEST_CASE("api_server: systemone permute without a ner callback is a 500") {
   ApiServer server{models, "test-version"};
   ApiServer::DispatchResult r = server.handle_systemone_permute(
       R"({"request":{"state":"x","questions":{"q":{"type":"choice",)"
-      R"("criteria":{"a":"x","b":"y"}}}},"question":"q"})");
+      R"("instructions":"i","criteria":{"a":null,"b":null}}}},"question":"q"})");
   CHECK(r.status == 500);
 }
 

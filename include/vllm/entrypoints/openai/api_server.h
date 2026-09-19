@@ -160,11 +160,24 @@ class ApiServer {
   // precedent), so a text server answers 404 at the route table.
   DispatchResult handle_ner(const std::string& request_body) const;
 
-  // POST /v1/systemone (MODEL-GLINER25). Jev / System One-compatible endpoint:
-  // `state` = text to extract from, `questions` = entity labels (each with
-  // type "noul"). Response maps each label to its extracted entities. The SAME
-  // NER callback backs this and /v1/ner.
+  // POST /v1/systemone (MODEL-GLINER25). Jev / System One-compatible endpoint
+  // mirroring the kev project's serve.py. `state` is the text (or any JSON) to
+  // extract from; `questions` is a map of id → Question, each with type "noul",
+  // "choice", or "score". The SAME NER callback backs this and /v1/ner. One NER
+  // pass serves all questions (the separate endpoint does N passes).
   DispatchResult handle_systemone(const std::string& request_body) const;
+
+  // POST /v1/systemone/permute (kev serve.py:systemone_permute). Re-runs one
+  // choice question under n_perm option orders and reports per-order
+  // probabilities, argmax stability, and spread.
+  DispatchResult handle_systemone_permute(
+      const std::string& request_body) const;
+
+  // POST /v1/systemone/separate (kev serve.py:systemone_separate). Answers each
+  // question in its own NER call (N passes). Response shape matches
+  // /v1/systemone.
+  DispatchResult handle_systemone_separate(
+      const std::string& request_body) const;
 
   // POST /v1/audio/speech (W6 of #672). OpenAI's createSpeech spelling, with
   // the two MUSIC inputs (`lyrics`, `description`) as ADDITIONAL named fields

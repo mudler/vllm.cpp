@@ -329,36 +329,151 @@ dependency `libc6 (>= 2.38)`. Its shared object has SONAME
 `usr/lib/x86_64-linux-gnu/libsqlite3.so.0` must target
 `libsqlite3.so.0.8.6`.
 
-The SQLite shared object has two `DT_NEEDED` entries: `libm.so.6` and
-`libc.so.6`. The retained qualification manifest already permits and binds
-these base-runtime files. It binds `/lib/x86_64-linux-gnu/libm.so.6` to
-SHA256 `e9c4b28d340e415b8137480ec442662f981e1399386c5931dae0e886e3639e91`.
-It binds `/lib/x86_64-linux-gnu/libc.so.6` to SHA256
-`8db37cf3f2169f59a0f07ef1fea308c35656668c64c8ff294e1860f4121eb161`.
-The SQLite package adds no unbound dependency.
+### Recursive runtime-closure finding
 
 The 19 September 2026 CPU inspection extracted all six packages into one local
-prefix. `ldd` on the tool resolved `libsqlite3.so.0` from that prefix and
-reported no missing dependency. The inspection supplied the other ROCm
-dependencies from base-runtime files already bound by the qualification
-manifest. A Python process imported no engine or GPU runtime module, then
-loaded the SDK and tool with `ctypes.CDLL` and `RTLD_GLOBAL`. The command exited
-zero after printing `CDLL_LOAD_OK`. It also reported that the local CPU host
-lacked Kernel Fusion Driver (KFD) topology nodes. This inspection proves
-package and loader closure only. It does not prove profiler initialization,
-GPU access, or hardware readiness.
+prefix. A clean Python process loaded the SDK and tool with `ctypes.CDLL` and
+`RTLD_GLOBAL`. The process printed `CDLL_LOAD_OK`, but that result did not prove
+a reproducible dependency closure.
 
-Read each ELF `DT_NEEDED` entry recursively with the dynamic loader search
-roots that the manifest permits. Record the resolved canonical path, byte
-count, SHA256, and GNU build ID for every dependency. Reject `not found`, a
-path outside the extracted prefix and the manifest-pinned base runtime, or a
-hash absent from the retained qualification manifest. The extracted
-`librocprofiler-register.so.0.6.0` must match SHA256
-`1a23a2b5a62dc7feee9259b9a307bca94caef7cfbaebc7b1b20a0289ed7e69f0`.
-Record its build ID in the recovery receipt before use. A dependency without a
-retained hash and build-ID receipt stops the preparation stage. The authorized
-job must archive its exact package by name, version, size, and SHA256 before a
-later hardware attempt.
+The final review evidence has SHA256
+`91d16a335e113686e8661ce4ea94411e2c1d91009a846fc5f5f8b910eab23d2a`.
+Its recursive audit reports `UNBOUND_COUNT=8`. The unbound set contains
+`libm.so.6`, `libc.so.6`, the dynamic loader, `libdl.so.2`, `liblzma.so.5`,
+`libbz2.so.1`, `libpthread.so.0`, and `librt.so.1`. The review host's libc,
+libm, and dynamic-loader hashes differ from the retained Strix hashes. The
+qualification manifest is therefore not a complete runtime-closure manifest.
+
+### Public runtime-closure preparation
+
+The implementation adds the importable
+`tools.bench.strix_worker_profile.runtime_closure.prepare` callable. Its
+contract identifier is `vllm.cpp/runtime-loader-closure/v1`. The callable owns
+closure discovery, validation, copying, serialization, archive creation, and
+atomic publication. No hidden script or launch-client branch can implement a
+second closure algorithm.
+
+Its public signature is
+`prepare(request: RuntimeClosureRequest) -> RuntimeClosureResult`.
+`RuntimeClosureRequest` contains the strict profile manifest bytes and the new
+output directory. `RuntimeClosureResult` contains the contract identifier,
+status, output path, manifest, archive, receipt identities, fixed-point file and
+edge counts, total bytes, and `UNBOUND_COUNT`. The implementation owns these
+types and their strict JSON encodings in the same module as the callable.
+
+The public preparation command is:
+
+```text
+python3 tools/bench/strix_worker_profile/worker.py \
+  --phase prepare-runtime-closure \
+  --manifest <manifest.json> \
+  --output <new-directory>
+```
+
+The preparation phase rejects `--engine`. It creates one engine-independent
+closure for both later arms. The existing profiled-process launch seam consumes
+the sealed result. It does not discover or acquire a library itself.
+
+The operator later runs this phase through `rc run strix:gpu0`, never through
+SSH. The phase runs on the pinned worker image from the qualification manifest.
+It records the lease job, device, boot ID, image identity, `/etc/os-release`
+bytes and SHA256, dpkg database identity, and dpkg architecture. The dpkg
+identity is the byte count and SHA256 of `/var/lib/dpkg/status`, plus the sorted
+`dpkg-query -W` package, version, and architecture rows used by the closure.
+It verifies every qualification-bound file before it resolves one dependency.
+
+The phase must not initialize HSA, HIP, or a GPU. It imports no engine, Torch,
+ROCm runtime, or profiler library. It records `/proc/self/maps` before and after
+preparation. It rejects a new HSA, HIP, profiler, engine, or GPU mapping. It
+also rejects GPU device access.
+
+The phase has a 10-minute wall timeout. It permits at most 64 ELF files and
+512 MiB of canonical ELF bytes. The deterministic archive must also be at most
+512 MiB. Check the NAS capacity before work starts. Reject a special file,
+absolute symlink, path escape, hard link, socket, device, or FIFO.
+The reviewed recursive audit contains 24 ELF records totaling 187,411,084
+bytes. The limits provide bounded headroom without authorizing unbounded growth.
+
+### Fixed-point closure algorithm
+
+Start from these exact extracted roots:
+
+- `opt/rocm-7.2.4/lib/librocprofiler-sdk.so.1.1.0`;
+- `opt/rocm-7.2.4/lib/rocprofiler-sdk/librocprofiler-sdk-tool.so.1.1.0`;
+- `opt/rocm-7.2.4/lib/librocprofiler-register.so.0.6.0`; and
+- `usr/lib/x86_64-linux-gnu/libsqlite3.so.0.8.6`.
+
+The preparation manifest lists every permitted search root in exact order. It
+includes the six-package root and absolute directories in the pinned worker
+image. It provides no implicit system default. Resolve only declared roots.
+
+Use this deterministic walk:
+
+1. Verify each root's path, package owner, byte count, SHA256, and GNU build ID.
+2. Put the roots in a queue sorted by their canonical relative paths.
+3. Read each dequeued ELF's `DT_SONAME` and ordered `DT_NEEDED` entries.
+4. Resolve each needed name to exactly one canonical file under a declared root.
+5. Reject a missing name or distinct canonical files for one needed name.
+6. Record every dependency edge and enqueue each new canonical file once.
+7. Enforce the file-count and byte limits before each insertion.
+8. Repeat until the sorted queue is empty and the resolved set reaches a fixed point.
+9. Run the same walk again over the assembled roots and require an identical set.
+
+The final audit must report `UNBOUND_COUNT=0`. Reject a duplicate manifest
+record, duplicate archive path, unresolved edge, path escape, unowned file,
+missing hash, missing build ID, or closure growth during the second walk.
+
+Each record contains its SONAME, canonical path, symlink chain, byte count,
+SHA256, GNU build ID, and ordered `DT_NEEDED` list. It also contains the owning
+package, version, architecture, and source category.
+The allowed source categories are `six-package`, `sealed-non-glibc`, and
+`host-glibc-witness`. Resolve package ownership with `dpkg-query -S`. Bind the
+package fields with `dpkg-query -W`. An unowned file fails preparation.
+
+### Sealed closure and glibc safety
+
+Copy every resolved file outside the six-package root into
+`runtime-closure-root`. Preserve each relative symlink chain inside that root.
+Copy the glibc-family files as identity witnesses, but never use those copies
+as loader inputs. Normalize directories to mode `0755` and regular ELF files to
+mode `0555`. Preserve no timestamp, owner, group, extended attribute, or other
+host metadata.
+
+Serialize the closure manifest as UTF-8 JSON with sorted keys, compact
+separators, and one terminal newline. Sort file records by source category,
+SONAME, and canonical path. Sort edges by requester path, needed name, and
+resolved path. Build a deterministic `ustar` archive with lexical path order,
+numeric owner and group zero, modification time zero, and normalized modes.
+
+The phase writes the manifest, archive, and hash receipt into a fresh staging
+directory on NAS. The receipt binds their names, byte counts, SHA256 values,
+schema identifiers, file count, and total ELF bytes. After fsyncing all three
+files and the staging directory, the phase atomically publishes them with one
+same-filesystem rename and fsyncs the parent directory. It refuses overwrite
+and retains a bounded failure result outside the final name.
+
+The sealed archive is the only source for a non-six-package dependency after a
+reboot. The byte-matched host glibc set is the only exception, and it is an
+execution requirement rather than an acquisition fallback. No live-library
+fallback is permitted. A `PENDING` result without a bounded archive is
+insufficient. It cannot authorize readiness.
+
+Do not inject an alternate libc or dynamic loader into the running Python
+process. Before bootstrap, require the target interpreter and host libc, libm,
+the dynamic loader, libdl, libpthread, and librt to byte-match their sealed
+records. Compare paths, symlink chains, bytes, SHA256 values, build IDs, and
+package identities. A mismatch stops before `sitecustomize` or user code.
+
+Extract non-glibc dependencies into a fresh `runtime-closure-root`. Add only its
+non-glibc directories and the six-package directories to the local loader
+search path. Exclude every archived `host-glibc-witness` path. Reject a mapped
+closure dependency from any live system path.
+
+After a reboot, validate the receipt, manifest, archive, and every extracted
+file. Rerun the fixed-point walk against only the six-package root, the closure
+root, and the byte-matched host glibc set. Require the same file and edge sets,
+the same hashes, no closure growth, and `UNBOUND_COUNT=0` before any CDLL load
+or bootstrap.
 
 The package SDK library does not match the earlier 8,133,513-byte SDK library
 with build ID `82dd8833b65c17523a3054f6b54da0e7a8831c82`. Do not substitute one
@@ -366,12 +481,13 @@ for the other. The recovered package set becomes one new pinned profiler
 identity only after dependency closure and readiness pass. Both trace arms
 must use that same identity.
 
-After a host reboot, reconstruct the profiler only from this six-package set.
-Recover the engines from their verified archives and the pinned model cache on
-NAS. Use a fresh worker-local directory under `/tmp` and a project virtual
-environment under `/workspace`. Copy only finalized, bounded evidence back to
-a new NAS directory. Do not use the harness archive as SDK source, use a
-global install, reuse an unverified build, or duplicate the model tree.
+After a host reboot, reconstruct the profiler only from the six packages and
+the sealed runtime-closure archive. Recover the engines from their verified
+archives and the pinned model cache on NAS. Use a fresh worker-local directory
+under `/tmp` and a project virtual environment under `/workspace`. Copy only
+finalized, bounded evidence back to a new NAS directory. Do not use the harness
+archive as SDK source, use a global install, reuse an unverified build, or
+duplicate the model tree.
 
 ## Alternatives and decision
 
@@ -489,11 +605,12 @@ artifact schema defines later in this document.
 
 The callable owns manifest validation, package and binary binding, bootstrap,
 subprocess lifecycle, receipts, bounds, finalization, and artifact checks. It
-has no score-mode, benchmark verdict, or engine-specific performance
-semantics. A caller must supply the complete production argument array and the
-expected supervisor and GPU-owner roles. The callable rejects an unknown
-schema version, a missing role, or an engine command that differs from the
-bound manifest.
+validates and consumes one `vllm.cpp/runtime-loader-closure/v1` result before
+bootstrap. It has no score-mode, benchmark verdict, or engine-specific
+performance semantics. A caller must supply the complete production argument
+array and the expected supervisor and GPU-owner roles. The callable rejects an
+unknown schema version, a missing role, or an engine command that differs from
+the bound manifest.
 
 This seam owns the reusable worker-start launch requirement for downstream
 profiling, including issue #3077. A downstream caller must require the exact
@@ -505,16 +622,22 @@ The implementation also adds one repository command:
 
 ```text
 python3 tools/bench/strix_worker_profile/worker.py \
-  --phase readiness|trace \
+  --phase prepare-runtime-closure|readiness|trace \
   --manifest <manifest.json> \
-  --engine vllmcpp|vllm \
+  [--engine vllmcpp|vllm] \
   --output <new-directory>
 ```
 
 The command is a thin client of the importable seam. It parses arguments,
 constructs the launch request, invokes the callable once, and maps its result
 to the process exit status. It does not implement separate validation,
-bootstrap, lifecycle, or artifact logic.
+bootstrap, lifecycle, closure, or artifact logic. The preparation phase invokes
+the public runtime-closure callable exactly once. The readiness and trace phases
+invoke the public launch seam exactly once.
+
+The preparation phase forbids `--engine`. The readiness and trace phases
+require it. All three phases reject arguments that their selected phase does
+not own.
 
 The command accepts no implicit engine, model, profiler, or workload defaults.
 Arguments stored in the manifest are arrays and are never interpolated through
@@ -537,7 +660,11 @@ The manifest schema identifier is
 - the six prompt byte strings and their hashes, tokenizer identity, sampling
   fields, concurrency schedule, warmup schedule, and expected 128-token stop;
 - the permitted environment, ROCm library roots, device, lease, timeout,
-  per-file limit, aggregate-output limit, and cleanup timeout; and
+  per-file limit, aggregate-output limit, and cleanup timeout;
+- the runtime-closure schema, preparation search roots, pinned worker image,
+  closure limits, and required source categories;
+- the closure manifest, archive, and receipt paths, byte counts, and SHA256 values;
+- the sealed interpreter and host-glibc file identities; and
 - the `vllm.cpp/profiled-process-tree-launch/v1` seam version, exact production
   command arrays, bootstrap file identity, multiprocessing method, and expected
   supervisor and worker lifecycle roles.
@@ -546,30 +673,36 @@ Unknown fields, duplicate JSON keys, missing full revisions, relative paths,
 and schema-version drift fail before a subprocess starts. The implementation
 records the raw manifest and its SHA256 in every phase result.
 
+Both engines must use the same closure manifest and archive hashes. The pair
+validator rejects different closure schemas, receipts, hashes, limits, worker
+image identities, host-glibc identities, or fixed-point file and edge sets.
+
 ## Lifecycle and observation window
 
 One owner controls this sequence:
 
-1. Verify the lease, NAS free space, manifest, archives, model files,
-   executable, libraries, profiler, build IDs, environment, and new output
-   directory.
+1. Verify the lease, NAS free space, manifest, archives, runtime-closure
+   receipt, model files, executable, libraries, profiler, build IDs,
+   environment, and new output directory.
 2. Record a pre-run binding manifest, the boot ID, device identity, lease job,
    process limits, and monotonic and wall-clock start times.
-3. Start the exact production argument array through the pre-import bootstrap.
+3. Extract the sealed closure into a fresh root. Recompute its fixed point,
+   require `UNBOUND_COUNT=0`, and byte-match the host glibc set.
+4. Start the exact production argument array through the pre-import bootstrap.
    Require the root receipt before any engine import. For vLLM, also require
    the at-fork child receipt before `EngineCoreProc.run_engine_core` resumes.
-4. Run the declared warmup. Open the recorded observation window only after
+5. Run the declared warmup. Open the recorded observation window only after
    warmup and close it after the last matched request completes.
-5. Run the complete ordered corpus. Emit correlated phase, request-dispatch,
+6. Run the complete ordered corpus. Emit correlated phase, request-dispatch,
    request-complete, and scheduler-step markers. Record actual request, token,
    padded-batch, graph-batch, and active-sequence shapes from the executing
    scheduler or runner.
-6. Request profiler finalization while the owner still controls the process
+7. Request profiler finalization while the owner still controls the process
    tree. Wait within the cleanup bound for each required worker artifact to
    close and become parseable.
-7. Record the worker's finalization receipt. Then allow normal production
+8. Record the worker's finalization receipt. Then allow normal production
    shutdown and record the worker and supervisor exit statuses.
-8. Recheck every bound file and build ID. Hash each artifact, write a failure
+9. Recheck every bound file and build ID. Hash each artifact, write a failure
    result for any discrepancy, and publish the complete result atomically only
    after every required check succeeds.
 
@@ -588,6 +721,9 @@ prompt at concurrency one. It has a 10-minute wall timeout, a 256 MiB aggregate
 output stop threshold, and a 192 MiB per-file limit. It proves only:
 
 - profiler initialization precedes runtime initialization;
+- the sealed closure replays to the identical fixed point with
+  `UNBOUND_COUNT=0` before bootstrap;
+- the interpreter and host glibc set match the sealed identities;
 - the selected launch seam, bootstrap hash, exact argument array, process
   roles, and `fork` method match the manifest;
 - the profiler follows the actual GPU worker;
@@ -623,6 +759,8 @@ artifacts. It never renames that file to a passing result.
   start and end times, boot ID, lease job, device, and status;
 - launch-seam identifier, bootstrap path and SHA256, Python and `site.py`
   identities, exact production argument array, and resolved start method;
+- runtime-closure schema, manifest, archive, and receipt identities, file and
+  edge counts, total bytes, replay audit, and `UNBOUND_COUNT`;
 - pre-run and post-run bindings for sources, model files, executable, every
   loaded engine and profiler library, configuration, and build IDs;
 - the process tree with process IDs, start times, executable identities,
@@ -652,6 +790,11 @@ A trace arm passes only when all of these claims are supported by records from
 the identified GPU worker:
 
 - profiler initialization happened before Torch, HSA, or HIP initialization;
+- the closure manifest and archive match the profile manifest, replay reaches
+  the identical fixed point, and `UNBOUND_COUNT=0`;
+- each closure mapping comes from the six-package root or sealed non-glibc
+  root, except for the byte-matched host glibc set;
+- no loader mapping uses an unsealed live-library fallback;
 - the launch seam and bootstrap match their pinned versions, `LD_PRELOAD` is
   absent, and the exact production argument array ran without replacement;
 - production vLLM used `fork`, the pinned `EngineCoreProc.run_engine_core`
@@ -712,8 +855,18 @@ do not claim GPU coverage. At minimum they prove:
 - package recovery rejects a missing package, wrong byte count, wrong package
   field, wrong payload hash, wrong ELF build ID, unresolved dependency, or
   dependency outside the allowed roots;
+- the eight-unbound reviewer fixture is RED before closure preparation;
+- a sealed synthetic closure reaches `UNBOUND_COUNT=0` at acquisition and replay;
+- closure preparation rejects an omitted transitive dependency, duplicate
+  SONAME target, changed symlink, hash, build ID, archive member, or package
+  identity;
+- closure preparation rejects host glibc mismatch, either resource limit,
+  closure growth, live fallback, or a nonzero unbound count;
+- deterministic fixtures reproduce byte-identical manifest, archive, and
+  receipt outputs after source mtimes, owners, and enumeration order change;
 - the pair validator rejects different profiler configuration bytes,
-  categories, tool libraries, workload bytes, or resource bounds;
+  categories, tool libraries, workload bytes, resource bounds, or closure
+  hashes;
 - the environment guard rejects eager, V1, `LD_PRELOAD`, tuning variables, and
   unexpected runtime library roots;
 - a fake supervisor and GPU worker preserve their arguments, file descriptors,
@@ -721,6 +874,10 @@ do not claim GPU coverage. At minimum they prove:
 - the public command reaches the importable
   `vllm.cpp/profiled-process-tree-launch/v1` callable exactly once, and schema
   drift fails before any subprocess starts;
+- the preparation command reaches the importable
+  `vllm.cpp/runtime-loader-closure/v1` callable exactly once;
+- production call-site reachability fails if the launch seam stops consuming
+  the sealed closure result;
 - a real CPU fixture starts a fresh Python interpreter with the hashed
   `sitecustomize` bootstrap, records activation before user code, and uses an
   at-fork receipt before the unchanged child target executes;
@@ -745,11 +902,14 @@ do not claim GPU coverage. At minimum they prove:
 
 The fresh reviewer mutates each guard and its production call site in a scratch
 copy. At minimum, remove the pre-runtime ordering check, worker ownership check,
-package-set validation, callable-to-command connection, at-fork receipt, one
-category check, graph-replay join, scheduler-shape join, finalization-order
-check, post-run binding check, output bound, and eager or preload refusal one
-at a time. The focused suite must detect each mutation. Restore the tree
-byte-for-byte after every mutation.
+package-set validation, closure fixed-point check, zero-unbound check, no-live-
+fallback check, callable-to-command connection, closure-to-launch connection,
+at-fork receipt, one category check, graph-replay join, scheduler-shape join,
+finalization-order check, post-run binding check, output bound, and eager or
+preload refusal one at a time. Mutate an omitted transitive dependency, symlink,
+file hash, build ID, archive hash, host glibc mismatch, resource limit, and live
+fallback independently. The focused suite must detect each mutation. Restore
+the tree byte-for-byte after every mutation.
 
 ## Hardware stages and gates
 
@@ -762,10 +922,14 @@ uses these gates in order:
 3. Full repository preflight with `scripts/agent-preflight.sh`.
 4. Fresh static and mutation review of the immutable implementation commit.
 5. Operator rerun of the focused suite and full preflight.
-6. One leased readiness arm for vllm.cpp, then one for production vLLM.
-7. One leased full trace per arm, sequentially, using the same accepted
+6. One leased `prepare-runtime-closure` phase on the pinned worker image. It
+   initializes no GPU runtime and atomically publishes the bounded closure.
+7. Offline validation and extraction of the sealed closure. The replay audit
+   must reach the identical fixed point with `UNBOUND_COUNT=0`.
+8. One leased readiness arm for vllm.cpp, then one for production vLLM.
+9. One leased full trace per arm, sequentially, using the same accepted
    manifest and profiler configuration.
-8. An offline pair check that rehashes both outputs, verifies every completeness
+10. An offline pair check that rehashes both outputs, verifies every completeness
    rule, and emits a diagnostic comparison without a performance verdict.
 
 The hardware report records every command exit, omitted gate, resource stop,
@@ -784,8 +948,12 @@ receipt. An implementer or reviewer report cannot replace the operator's gate.
 - Diagnostic markers can perturb timing. They are accepted only for correlation,
   and instrumented timing is never the acceptance denominator.
 - A reboot can invalidate worker-local builds. The recovery path rebuilds from
-  the verified package set and rebinds every binary and library. The missing
-  dependency packages must reach NAS before a readiness lease starts.
+  the verified package set and sealed closure. It rebinds every binary and
+  library before bootstrap.
+- A copied glibc can corrupt a running Python process. The launch seam never
+  loads the archived glibc witnesses and requires byte-identical host files.
+- A live system fallback can make one run pass and the rebooted run fail. The
+  replay audit rejects every non-glibc mapping outside the sealed roots.
 - Current NAS and local free space are narrow. The implementation must check
   capacity before each phase and must not duplicate model artifacts.
 
@@ -798,6 +966,14 @@ Stop without attribution or optimization when any of these occurs:
   before-and-after binding differs;
 - the package set is incomplete, its dependency closure is unresolved, or a
   dependency lacks the required hash and build-ID receipt;
+- closure preparation does not reach a stable fixed point with
+  `UNBOUND_COUNT=0` within 64 ELF files and 512 MiB;
+- the closure manifest, archive, receipt, package ownership, symlink chain, or
+  deterministic reproduction differs;
+- the target interpreter or host libc, libm, dynamic loader, libdl, libpthread,
+  or librt differs from the sealed identity;
+- a non-six-package dependency resolves outside the sealed closure, or a live
+  fallback supplies it;
 - the launch seam or result schema differs from
   `vllm.cpp/profiled-process-tree-launch/v1`;
 - the pinned profiler cannot start before the production GPU worker initializes

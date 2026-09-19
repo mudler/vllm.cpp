@@ -103,6 +103,14 @@ class DriftTests(unittest.TestCase):
         errors = chk.supported_models_errors(set(), _features(TWO))
         self.assertTrue(any("no REGISTER_VLLM_MODEL registrations" in e for e in errors), errors)
 
+    def test_extractor_suffix_registered_arch_passes_self_check(self) -> None:
+        # The GLiNER2 "Extractor" suffix was added to ARCH_TOKEN_RE alongside
+        # the BoundaryExtractor registration. A registered *Extractor arch must
+        # pass the self-check; remove the suffix and it fails as unrepresentable.
+        registered = REGISTERED | {"Gliner2Extractor"}
+        text = _features(TWO + ["`Gliner2Extractor`"])
+        self.assertEqual(chk.supported_models_errors(registered, text), [])
+
     def test_unrepresentable_registered_arch_fails_the_self_check(self) -> None:
         # A registered string the FEATURES arch-token pattern cannot express must
         # surface as an error, never be silently excluded from the comparison.

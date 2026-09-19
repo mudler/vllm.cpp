@@ -29,10 +29,11 @@ Current main lacks these harness files. Port only the diagnostic's required publ
 Preserve provenance for every adapted function. Do not import the four-engine benchmark or lifecycle campaign as incidental scope.
 
 The separate performance issue numbered 3076 owns the reusable worker-start
-profiling mechanism. It also owns ordinary-production baseline evidence when
-every binding in this design matches exactly. `ISSUE-GH-3077` owns the
-mode-aware integration and trace evidence for capture-only, self-replay, and
-common-replay runs.
+profiling mechanism at commit
+`0d5f89a54858b217e42860b625473a39eeb19d57`. It also owns
+ordinary-production baseline evidence when every binding in this design
+matches exactly. `ISSUE-GH-3077` owns the mode-aware integration and trace
+evidence for capture-only, self-replay, and common-replay runs.
 The issue-3076 CLI does not accept score-capture or replay mode fields.
 This design does not change the profiler or engine kernels. Missing traces
 prevent equivalence acceptance but do not prevent CPU diagnostic implementation.
@@ -67,6 +68,9 @@ These anchors refer to that archive at the vLLM pin, not current upstream.
 | `vllm/config/vllm.py:1071,2599,2722` | Replay requires V2; custom logits processors are unsupported in V2 |
 | `vllm/sampling_params.py:376,802,908` | Public trace IDs, full-vocabulary limits, replay validation |
 | `vllm/v1/engine/input_processor.py:125,161,370` | Enablement refusal and request-local replay normalization |
+| `vllm/v1/engine/async_llm.py:551-615` | Public generation yields request outputs from one collector per request |
+| `vllm/v1/engine/output_processor.py:48-96,395-419` | The collector can merge delta output; delta slicing can contain more than one completed row |
+| `vllm/logprobs.py:30-93,167-210` | `FlatLogprobs` retains primitive arrays and avoids per-entry `Logprob` objects |
 | `vllm/v1/worker/gpu/model_runner.py:442,445,1132,1328` | V2 sampler configuration and request-ID to state-index mapping |
 | `vllm/v1/worker/gpu/sample/states.py:59` | Request `logprobs=-1` resolves to vocabulary size |
 | `vllm/v1/worker/gpu/sample/sampler.py:140,152,157,177,216,303` | Sample, overwrite IDs, extract original logits, mask unfinished prefill |
@@ -128,7 +132,77 @@ Each row records prompt and consumed-prefix hashes, original argmax and runner-u
 Position zero is first-prefill output. Positions 1 through 127 require incremental KV decode witnesses.
 Do not turn whole-prefix forward calls into decode evidence. Partial-prefill steps with no emitted token produce no accepted score row.
 Check request mapping after compaction, refill, and tails. Completion ordering must not define request identity.
-Bound retained score data to 8 GiB per run directory and refuse overwrite, overflow, or incomplete publication.
+
+The pinned public vLLM API emits `RequestOutput` objects from
+`AsyncLLM.generate` at `vllm/v1/engine/async_llm.py:551-615`.
+`RequestOutputCollector` can merge pending delta outputs when the producer
+outpaces the consumer at `vllm/v1/engine/output_processor.py:48-96`.
+The adapter therefore sets `flat_logprobs=True`,
+`output_kind=RequestOutputKind.DELTA`, `stream_interval=1`, and
+`detokenize=False`. It reads the primitive `FlatLogprobs` arrays directly.
+It never iterates the container into per-row dictionaries. The adapter does
+not claim one-token streaming because the engine can clamp the interval or
+merge pending output. These settings change transport representation and
+delivery only. They do not change scores, token selection, replay IDs, or the
+engine schedule.
+
+Treat each yielded object as a batch of 1 through 128 completed score rows.
+Start all c4 request generators concurrently and keep one consumer coroutine
+per request. Do not serialize engine requests or wait for one request to finish
+before consuming another. Each consumer copies every delivered batch into its
+bounded binary artifact and metadata stream immediately. It then hashes and
+flushes those bytes. Next, release each public `RequestOutput`, its completion
+output, and its `FlatLogprobs` arrays. Clear every adapter reference.
+
+The score manifest fixes these independent limits:
+
+- `max_completed_requests_in_flight = 4`;
+- `max_completed_request_object_bytes = 3221225472`;
+- `max_resident_score_row_bytes = 311164928`;
+- `max_resident_score_buffer_bytes = 13958643712`; and
+- `max_persisted_score_bytes = 8589934592`.
+
+The public result can carry one sampled-token duplicate per row. One complete
+request therefore has 19,447,936 entries: 128 times 151,937. The pinned 64-bit
+CPython 3.12 ABI uses 28 bytes for an integer, 24 bytes for a float, and 8 bytes
+for one list slot. A conservative 12.5% list-capacity allowance makes each slot
+9 bytes. The accumulated and pending `FlatLogprobs` containers share primitive
+objects but own two sets of four list arrays. The upper calculation is therefore
+152 bytes per entry: 28 + 24 + 28 + 8 times 9. This is 2,956,086,272 bytes per
+request. The 3 GiB object cap leaves 265,139,200 bytes for container headers,
+request objects, and a transient row.
+
+The 311,164,928-byte row limit is the aggregate normalized F32 payload for four
+128-row requests: 4 times 128 times 151,936 times 4 bytes. The 13 GiB absolute
+resident ceiling holds four 3 GiB request envelopes and that raw payload. It
+leaves 762,576,896 bytes of stop headroom. The object budget includes the live
+public output, its accumulated `FlatLogprobs`, and a pending merged output. The
+row budget covers adapter staging. At startup, require the exact Python object
+sizes and list-growth bound used by this calculation. Fail before subprocess
+start if the interpreter or output representation exceeds any input.
+
+The manifest also records `cgroup_memory_limit_bytes`,
+`post_model_baseline_rss_bytes`, `baseline_peak_rss_bytes`, and
+`engine_supervisor_reserve_bytes`. Derive the reserve from the largest matched
+ordinary-production increase above post-model steady state plus the largest
+positive adjacent-sample increase. Bind the sampling period and every input
+sample. Do not supply a default reserve.
+
+Set the effective resident ceiling to the lower of 13 GiB and measured
+headroom. Measured headroom is the cgroup memory limit minus post-model resident
+bytes and the derived engine/supervisor reserve. Before score collection, prove
+that this effective ceiling holds all four 3 GiB request envelopes plus the
+311,164,928-byte raw payload. A missing finite cgroup limit or missing matched
+baseline measurement is `PENDING` before subprocess start. Insufficient
+measured headroom is `FAILING` before score collection. It does not authorize a
+smaller c4 workload or serialized requests.
+
+During collection, record each object's deep resident byte count, all live
+score-object bytes, resident binary-buffer bytes, cgroup current and peak
+memory, and process peak RSS. Refuse another delivered batch when its complete
+reserved size can cross the effective ceiling. Refuse a write when the next
+complete row can cross 8 GiB. Abort before either bound, preserve the bounded
+failure record, and publish no incomplete artifact.
 
 ## Equivalence before calibration
 
@@ -162,15 +236,36 @@ python3 -m tools.bench.strix_score_capture \
 ```
 
 The score manifest selects the engine, mode, and c1 or c4 stratum. The profile
-manifest supplies the immutable profiler identity, configuration, resource
-bounds, and expected process roles from the issue-3076 schema. It contains no
-score-capture or replay mode field. The issue-3077 adapter resolves the
-mode-specific production command, environment, and worker lineage. It passes
-those values to the reusable worker-start launch seam before any worker runtime
-initializes. The seam returns lifecycle receipts, finalized trace artifacts,
-and the identified GPU worker. The adapter must not invoke the issue-3076 CLI
-as if that CLI understood score modes. If the issue-3076 implementation does
-not expose this launch seam, return `PENDING: reusable worker-start seam from issue 3076` before hardware starts.
+manifest uses schema `vllm.cpp/strix-qwen3-worker-profile/v1` from exact commit
+`0d5f89a54858b217e42860b625473a39eeb19d57`. It supplies the immutable
+profiler identity, configuration, resource bounds, and expected process roles.
+It contains no score-capture or replay mode field.
+
+Import `tools.bench.strix_worker_profile.launch` and require contract
+`vllm.cpp/profiled-process-tree-launch/v1`. The issue-3077 adapter supplies one
+validated launch request. The request contains the exact mode-specific
+production argument array, engine identity, supervisor and GPU-owner role
+bindings, environment allowlist, profiler binding, lifecycle limits, and new
+output directory. The callable returns the structured worker-profile result.
+That result contains the schema and launch identifiers, lifecycle receipts,
+process tree, uniquely identified GPU worker, finalized trace artifacts,
+bindings, counts, and fail-closed checklist.
+
+The launch callable owns manifest validation, package and binary binding,
+pre-import bootstrap, subprocess lifecycle, receipts, bounds, finalization,
+and artifact checks. `ISSUE-GH-3077` owns only the mode-specific argument and
+role binding through that callable. It must not copy the bootstrap, implement
+profiler startup, bypass the lifecycle owner, or invoke the issue-3076 CLI as
+if the CLI understood score modes.
+
+Commit `0d5f89a54858b217e42860b625473a39eeb19d57` is a dependency pin, not
+code that this design claims is present. Before implementation or hardware,
+require that exact commit to be base-reachable from the implementation head.
+If it is not base-reachable, return
+`PENDING: worker-profile dependency 0d5f89a54858b217e42860b625473a39eeb19d57 is not base-reachable`
+before import or subprocess start. After it becomes base-reachable, an import,
+contract-version, manifest-schema, or result-schema mismatch is `FAILING`.
+There is no CLI, copied-bootstrap, older-schema, or unprofiled fallback.
 
 Reuse issue-3076 baseline evidence only when the engine and c1 or c4 window are
 separately identifiable. All these bindings must match this design exactly:
@@ -183,12 +278,25 @@ separately identifiable. All these bindings must match this design exactly:
 The artifacts must also satisfy this design's comparison and completeness
 rules. Otherwise, issue 3077 captures a new baseline through the public entry.
 
-Reuse the issue-3076 worker ownership and wrapper order from commit `74ca0f06`
-under `Selected: one process-tree owner and a worker-owned start wrapper`.
-Reuse that design's `Lifecycle and observation window`, `Artifact schema`, and
-`Completeness rules` without weakening them. Each engine and mode must first
-pass the mode-aware readiness route. Each readiness output has a 10-minute wall
-timeout, a 256 MiB aggregate stop threshold, and a 192 MiB per-file limit.
+Bind the worker-profile manifest and result schema exactly as defined at
+`0d5f89a54858b217e42860b625473a39eeb19d57`. That immutable design separates
+profiler-harness revision `8952c3c9e7712daf54521e5eb8a5b0a1ee9e1660`
+from nested SDK source revision
+`97f5574fe2fdc7bef44fb01545347912ee9f1779`. Its recovery identity is the
+exact six-package set. The set includes
+`libsqlite3-0_3.45.1-1ubuntu2.8_amd64.deb`, size 701,602, SHA-256
+`b1190bb72359f5fcc47406aa46065eaf4f1ca208085c51224a52b04bedc0b4bb`.
+Its extracted SQLite library has SHA-256
+`85265a9d4afca6f4b325ceb078b669c754fb881abed4cafe91ccebe9d625d975`
+and build ID `5701975a7ab1644d59e6b20df0257e183eafa78e`.
+
+Commit `74ca0f06` records historical worker-ownership semantics only. It does
+not define the implementation schema or recovery identity. Reuse the
+`Lifecycle and observation window`, `Artifact schema`, and `Completeness rules`
+from exact commit `0d5f89a54858b217e42860b625473a39eeb19d57` without weakening them.
+Each engine and mode must first pass the mode-aware readiness route. Each
+readiness output has a 10-minute wall timeout, a 256 MiB aggregate stop
+threshold, and a 192 MiB per-file limit.
 
 Write each engine, mode, and concurrency trace to a new output directory. Each
 directory has a 30-minute wall timeout and a 60-second cleanup timeout. It has
@@ -210,6 +318,7 @@ An extra capture operation is not automatically a numerical-path change, but mis
 Reject eager substitution, V1 fallback, changed precision, unknown kernels, dropped intervals, incomplete graph traces, or unmatched scheduler shapes.
 If capture changes scheduling, report the mismatch and retain evidence. Do not infer equivalence from requested concurrency.
 Do not publish instrumented throughput as production throughput.
+Profiler timing remains diagnostic-only.
 
 ## Calibration and later ratification
 
@@ -251,6 +360,10 @@ Required mutation cases include altered original scores, post-force copies, skip
 wrong vocabulary order, missing rows, duplicate inconsistent scores, nonfinite values, wrong consumed prefixes, and partial-prefill rows.
 Also mutate input hashes, model/KV dtype, phase labels, trace truncation, replay normalization, changed runner,
 eager execution, missing graph intervals, changed scheduler shapes, and the production adapter call site.
+Revert the launch dependency to an unversioned issue-3076 seam and require the
+focused suite to fail before subprocess start. Remove the completed-request
+release and resident-memory guard independently. Each mutation must fail before
+the run can exceed its declared memory bound.
 Each mutation must fail its intended regression rather than fixture setup.
 The operator reruns the focused and full gates on the reviewed immutable head, then performs leased equivalence checks.
 

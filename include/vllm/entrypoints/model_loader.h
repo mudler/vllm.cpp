@@ -610,6 +610,13 @@ class LoadedEngine {
   // the enablement gate can assert the C-ABI/C++/flag toggle took effect.
   bool jump_forward_enabled() const { return jump_forward_enabled_; }
   const vllm::v1::GPUModelRunner& runner() const { return runner_; }
+  // MODEL-GLINER25 Phase 4: direct access to the type-erased LoadedModel so
+  // custom inference paths (the GLiNER2 NER pipeline: encoder → boundary head
+  // → candidate decoder) can reach architecture-specific weights without going
+  // through the text-generation/embedding forward. The model outlives every
+  // borrower because it is declared before runner_ and every consumer below.
+  LoadedModel& loaded_model() { return *model_; }
+  const LoadedModel& loaded_model() const { return *model_; }
   // KV-FP8 W3: the RESOLVED KV-cache config — the block count the sizing knobs
   // produced and the group specs carrying the storage dtype `--kv-cache-dtype`
   // selected. Exposed so a gate reads what the loader actually sized instead of

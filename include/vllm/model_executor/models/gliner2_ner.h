@@ -74,4 +74,28 @@ std::vector<NerEntity> DecodeNer(
     const NerParams& params);
 
 }  // namespace gliner2
+
+// ── Phase 4: NER inference entry point ───────────────────────────────────
+// Full NER pipeline: tokenize text + entity labels, run the DeBERTa v2 encoder,
+// run the boundary head (encoder + query head), decode marginals into entities.
+// Exposed so the C ABI (vllm_gliner_ner) and the server endpoint can reach the
+// NER capability without going through the text-generation/embedding forward.
+class LoadedModel;
+namespace tok { class Tokenizer; }
+
+struct Gliner2NerResult {
+  std::vector<gliner2::NerEntity> entities;
+};
+
+// Run NER inference on `text` for the given entity `labels`.
+// `model` must be a BoundaryExtractor-loaded model (checked via ModelAs).
+// `tokenizer` tokenizes text and labels.
+// `params` controls threshold, max_width, and overlap suppression.
+Gliner2NerResult Gliner2NerInference(
+    const LoadedModel& model,
+    const tok::Tokenizer& tokenizer,
+    std::string_view text,
+    const std::vector<std::string>& labels,
+    const gliner2::NerParams& params);
+
 }  // namespace vllm

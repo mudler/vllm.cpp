@@ -21,6 +21,7 @@
 #include <atomic>
 #include <chrono>
 #include <map>
+#include <algorithm>
 #include <cmath>
 #include <mutex>
 #include <cstdint>
@@ -5316,4 +5317,155 @@ TEST_CASE("api_server: an n>1 chat completion returns n choices over a socket") 
   }
 
   server_thread.join();  // stops the server, then joins
+}
+
+// ─── /v1/ner + /v1/systemone (MODEL-GLINER25 Phase 4f) ──────────────────────
+//
+// NER dispatch over a MOCK NerFn callback: the callback wraps the ONE library
+// seam (Gliner2NerInference) — the SAME path vllm_gliner_ner drives — so HTTP
+// and FFI cannot drift. The mock returns deterministic entities so the JSON
+// shape is asserted exactly. The "without ner" case is a 500, not a crash,
+// mirroring the embedder pattern.
+
+namespace {
+
+struct NerHarness {
+  vllm::entrypoints::openai::OpenAIServingModels models{"gliner2-fixture"};
+  ApiServer server{models, "test-version"};
+
+  NerHarness() {
+    server.set_ner(
+        [](const std::string& text, const std::vector<std::string>& labels,
+           float threshold, int64_t max_width) {
+          (void)threshold;
+          (void)max_width;
+          ApiServer::NerResult result;
+          result.prompt_tokens = 7;
+          if (text == "john works at google" &&
+              std::find(labels.begin(), labels.end(), "person") !=
+                  labels.end()) {
+            result.entities.push_back(
+                {"person", "john", 0, 4, 0.95F});
+          }
+          if (text == "john works at google" &&
+              std::find(labels.begin(), labels.end(), "organization") !=
+                  labels.end()) {
+            result.entities.push_back(
+                {"organization", "google", 15, 21, 0.88F});
+          }
+          return result;
+        });
+  }
+};
+
+}  // namespace
+
+TEST_CASE("api_server: NER dispatch — OpenAI shape over the mock callback") {
+  NerHarness h;
+
+  // Valid request with two labels.
+  ApiServer::DispatchResult r = h.server.handle_ner(
+      R"({"model":"gliner2-fixture","text":"john works at google",)"
+      R"("labels":["person","organization"],"threshold":0.5})");
+  CHECK(r.status == 200);
+  json j = json::parse(r.body);
+  CHECK(j.at("object") == "ner");
+  CHECK(j.at("model") == "gliner2-fixture");
+  CHECK(std::string(j.at("id")).rfind("ner-", 0) == 0);
+  REQUIRE(j.at("entities").size() == 2);
+  // Entities are sorted by the mock in insertion order.
+  CHECK(j.at("entities").at(0).at("label") == "person");
+  CHECK(j.at("entities").at(0).at("text") == "john");
+  CHECK(j.at("entities").at(0).at("start") == 0);
+  CHECK(j.at("entities").at(0).at("end") == 4);
+  CHECK(j.at("entities").at(0).at("confidence") == doctest::Approx(0.95F));
+  CHECK(j.at("entities").at(1).at("label") == "organization");
+  CHECK(j.at("entities").at(1).at("text") == "google");
+  CHECK(j.at("usage").at("prompt_tokens").get<int64_t>() == 7);
+  CHECK(j.at("usage").at("total_tokens") == 7);
+
+  // Single label — one entity.
+  r = h.server.handle_ner(
+      R"({"text":"john works at google","labels":["person"]})");
+  CHECK(r.status == 200);
+  j = json::parse(r.body);
+  REQUIRE(j.at("entities").size() == 1);
+  CHECK(j.at("entities").at(0).at("label") == "person");
+
+  // No match — zero entities is a 200 with an empty array.
+  r = h.server.handle_ner(R"({"text":"nothing here","labels":["person"]})");
+  CHECK(r.status == 200);
+  j = json::parse(r.body);
+  CHECK(j.at("entities").size() == 0);
+}
+
+TEST_CASE("api_server: NER malformed requests") {
+  NerHarness h;
+  CHECK(h.server.handle_ner("not json").status == 400);
+  CHECK(h.server.handle_ner(R"({"model":"x"})").status == 404);
+  CHECK(h.server.handle_ner(R"({"text":"x"})").status == 400);  // no labels
+  CHECK(h.server.handle_ner(R"({"labels":["x"]})").status == 400);  // no text
+  CHECK(h.server.handle_ner(R"({"text":42,"labels":["x"]})").status == 400);
+  CHECK(h.server.handle_ner(R"({"text":"x","labels":"notarray"})").status == 400);
+  CHECK(h.server.handle_ner(R"({"text":"x","labels":[42]})").status == 400);
+  CHECK(h.server.handle_ner(R"({"text":"x","labels":[]})").status == 400);
+}
+
+TEST_CASE("api_server: NER without a ner callback is a 500, not a crash") {
+  vllm::entrypoints::openai::OpenAIServingModels models{"m"};
+  ApiServer server{models, "test-version"};
+  ApiServer::DispatchResult r =
+      server.handle_ner(R"({"text":"x","labels":["y"]})");
+  CHECK(r.status == 500);
+  CHECK(json::parse(r.body).at("error").at("message") ==
+        "The model does not support NER");
+}
+
+TEST_CASE("api_server: systemone dispatch — jev-compatible answers shape") {
+  NerHarness h;
+
+  ApiServer::DispatchResult r = h.server.handle_systemone(
+      R"({"state":"john works at google",)"
+      R"("questions":{"person":{"type":"noul"},"organization":{"type":"noul"}}})");
+  CHECK(r.status == 200);
+  json j = json::parse(r.body);
+  CHECK(j.at("model") == "gliner2-fixture");
+  REQUIRE(j.at("answers").is_object());
+  REQUIRE(j.at("answers").contains("person"));
+  REQUIRE(j.at("answers").contains("organization"));
+  CHECK(j.at("answers").at("person").at("type") == "noul");
+  CHECK(j.at("answers").at("person").at("noul") == doctest::Approx(0.95F));
+  REQUIRE(j.at("answers").at("person").at("entities").size() == 1);
+  CHECK(j.at("answers").at("person").at("entities").at(0).at("text") ==
+        "john");
+  CHECK(j.at("answers").at("organization").at("noul") ==
+        doctest::Approx(0.88F));
+  CHECK(j.at("usage").at("input_tokens").get<int64_t>() == 7);
+  CHECK(j.at("usage").at("output_tokens").get<int64_t>() == 0);
+
+  // state as a non-string (JSON value) — stringified internally.
+  r = h.server.handle_systemone(
+      R"({"state":42,"questions":{"x":{"type":"noul"}}})");
+  CHECK(r.status == 200);
+}
+
+TEST_CASE("api_server: systemone malformed requests") {
+  NerHarness h;
+  CHECK(h.server.handle_systemone("not json").status == 400);
+  CHECK(h.server.handle_systemone(R"({})").status == 400);  // no state
+  CHECK(h.server.handle_systemone(R"({"state":"x"})").status == 400);  // no questions
+  CHECK(h.server.handle_systemone(
+            R"({"state":"x","questions":"notobj"})").status == 400);
+  CHECK(h.server.handle_systemone(R"({"state":"x","questions":{}})").status ==
+        400);
+}
+
+TEST_CASE("api_server: systemone without a ner callback is a 500") {
+  vllm::entrypoints::openai::OpenAIServingModels models{"m"};
+  ApiServer server{models, "test-version"};
+  ApiServer::DispatchResult r =
+      server.handle_systemone(R"({"state":"x","questions":{"y":{"type":"noul"}}})");
+  CHECK(r.status == 500);
+  CHECK(json::parse(r.body).at("error").at("message") ==
+        "The model does not support NER");
 }

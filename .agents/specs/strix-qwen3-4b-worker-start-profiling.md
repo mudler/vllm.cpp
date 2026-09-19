@@ -68,7 +68,8 @@ before the normal engine shutdown completes.
 
 In scope:
 
-- one public diagnostic entry point and versioned input manifest;
+- one importable launch seam, one thin public diagnostic client, and versioned
+  input contracts;
 - one launch owner for each arm, from profiler initialization through artifact
   finalization and production worker shutdown;
 - production vLLM V2 and vllm.cpp process trees with their existing supervisor,
@@ -127,9 +128,12 @@ supported rocprofiler spellings from the pinned build and store them in the
 manifest. A missing category, ignored option, or differing resolved
 configuration fails the pair.
 
-The retained SDK 1.1 tool binary has SHA256
-`478df9af09b74707652d9d5574ef37151ff1234d09c68843972c1409a505cdd0`.
-The earlier environment recorded its registration library binary with SHA256
+The retained SDK 1.1 tool library has SHA256
+`478df9af09b74707652d9d5574ef37151ff1234d09c68843972c1409a505cdd0`
+and build ID `0ca5ba0e4c583fcb8a8a2beb5698038cf3aff0e1`. The retained
+`rocprofv3` file is a Python script. It is not that tool library.
+
+The earlier environment recorded a different SDK library binary with SHA256
 `40a5ecd8ca25dc3facb132b730066354812fe82d6889625d43371dbb0655b1ca`
 and build ID `82dd8833b65c17523a3054f6b54da0e7a8831c82`. These values identify
 built artifacts, not either source commit. The implementation must rebuild or
@@ -157,6 +161,22 @@ At vLLM commit `e126687a9a828d513c01a07cd69f025f27d63280`:
 
 These are the production V2 anchors. The implementation must not replace them
 with V1, `--enforce-eager`, or a synthetic model call.
+
+The production worker bootstrap is also pinned. The SHA256 values below cover
+the complete file bytes at vLLM commit `e126687a9a828d513c01a07cd69f025f27d63280`:
+
+| Source | SHA256 | Decisive anchors |
+|---|---|---|
+| `vllm/v1/engine/utils.py` | `d09f86b107b3c63b62f40a6590036be5b711778ea997fc5a6af6de94fdd2ccd3` | lines 164 and 179-235 select the context, bind `EngineCoreProc.run_engine_core`, and call `proc.start()` |
+| `vllm/v1/engine/core.py` | `f990e260cebf0826d08cfd30955c0c7a85b9af00504841b91759ca5bc7b036f6` | lines 23-95 import vLLM modules before `run_engine_core` at lines 1290-1311 |
+| `vllm/utils/system_utils.py` | `837e6ff0ab524c06c048d6b42d4f35b77baba2e9d9e57837fe333ca0aaee1cfb` | lines 126-181 select and return the multiprocessing context |
+| `vllm/envs.py` | `0e2dce375da631b54288a0f0ad783a46dadd9f19cac7c65724463031a99f9c9f` | lines 927-928 define `fork` as the default `VLLM_WORKER_MULTIPROC_METHOD` |
+
+This order rules out a wrapper that starts inside `run_engine_core`. Python
+imports `core.py` before that target runs. The accepted production-vLLM route
+must retain the default `fork` start method and the exact target and keyword
+arguments at `utils.py:190-195`. A changed start method fails manifest
+validation and readiness.
 
 ### vllm.cpp
 
@@ -189,6 +209,12 @@ The retained nested rocprofiler SDK source has these decisive anchors:
 - `sdk-attach.cpp` requests registration attach or detach but cannot recreate
   graph activity that occurred before its observation window.
 
+The extracted 11,537-byte `include/rocprofiler-sdk/registration.h` has SHA256
+`98eed78778685f6e01f9a29f9c415b8c0d5e0517476c5d8f84a978b37486ce0e`.
+Its lines 104-115 define `rocprofiler_is_initialized`: status `1` means the SDK
+completed its configuration scan. The pre-import bootstrap uses this public
+query for its activation receipt.
+
 The production-vLLM provider observation found both relevant GOT relocations
 for `rocprofiler_configure` bound to the same symbol in `libtorch_cpu.so`. Its
 status is `OBSERVED_NOT_COMPATIBILITY_PROOF`, and it is not a trace. Together
@@ -212,6 +238,7 @@ shared checkout.
 | `vllm-matched-trace-06.log` | `9140e80cd1934b700b7d982a9d33b931f1a04cd2fd8aa008f795a2e71616938d` | process-start attempt and finalization failure |
 | `vllm-trace06-preserve-07.log` | `dc5c732b9c69fd6d3bf31ace3735f07df673e3665f82aaac2a922c1b853f1d94` | preserved sizes and failure evidence |
 | `vllm-trace06-partial-07.tar` | `fd25b19fbd02fc805e31c25a2ce8f1e21f6e1ad9b6135702d484b82cd4c44afc` | partial diagnostic output, never trace authority |
+| `systemlibs3108.6xsEkD/Packages.gz` | `ca9ce1e681e736592a8dc8a7309a2ef5e0a71b7152da450de4dc672a3ce62e6e` | 61,300-byte package index that binds the two missing package payloads |
 
 The harness at `8952c3c9e7712daf54521e5eb8a5b0a1ee9e1660` checked out the ROCm
 monorepo and built `projects/rocprofiler-sdk` from nested source pin
@@ -227,12 +254,90 @@ and `sdk-attachment-source.TktBaK/sdk-attach.cpp` with SHA256
 The historical patched controller was only `BUILT_NOT_HARDWARE_VALIDATED` and
 does not become part of this design.
 
-If the host reboots, reconstruct only from these verified archives and the
-pinned model cache on NAS. Use a fresh worker-local directory under `/tmp`, at
-most four build jobs, and a project virtual environment under `/workspace`.
-Copy finalized, bounded evidence back to a new NAS directory. Do not use a
-global install, reuse an unverified build, or allocate the 61 GiB remaining on
-NAS for duplicate model or source trees.
+### Executable profiler recovery
+
+The harness archive is not SDK source and is never an SDK recovery input. The
+selected recovery route extracts Debian packages into a fresh worker-local
+prefix. It never invokes `dpkg -i`, `apt install`, or writes under the host
+`/opt`.
+
+Three package payloads already exist under
+`systemlibs3108.6xsEkD/`:
+
+| Package | Bytes | SHA256 | Package metadata |
+|---|---:|---|---|
+| `rocprofiler-sdk_1.1.0-93~24.04_amd64.deb` | 5,680,890 | `39270239e68660cd025d3c9e84a04478696d9737f69012cd350c380aad911c30` | `rocprofiler-sdk`, `1.1.0-93~24.04`, `amd64`, depends on `rocm-core`, `rocprofiler-sdk-roctx (>= 1.1.0)`, and `rocprofiler-sdk-rocpd (>= 1.1.0)` |
+| `rocprofiler-sdk-rocpd_1.1.0-93~24.04_amd64.deb` | 4,229,746 | `313873a14f76dde8f4ca2aa7fed8eae68240dc6ae446537dd3b363180c38095d` | `rocprofiler-sdk-rocpd`, `1.1.0-93~24.04`, `amd64`, depends on `rocm-core` |
+| `rocprofiler-sdk-roctx_1.1.0-93~24.04_amd64.deb` | 258,610 | `4c45f467341b14fc1e1db3c9dc2475d7e880650df8ec71db46b461d7b12ffb91` | `rocprofiler-sdk-roctx`, `1.1.0-93~24.04`, `amd64`, depends on `rocm-core` and `rocprofiler-register` |
+
+The retained package index binds the two missing dependency payloads:
+
+| Package | Bytes | SHA256 | Exact repository path |
+|---|---:|---|---|
+| `rocm-core_7.2.4.70204-93~24.04_amd64.deb` | 32,692 | `dfe0d173da998a669921faf08351a01add377cd4d1b471865f921a03484974b6` | `https://repo.radeon.com/rocm/apt/7.2.4/pool/main/r/rocm-core/rocm-core_7.2.4.70204-93~24.04_amd64.deb` |
+| `rocprofiler-register_0.6.0.70204-93~24.04_amd64.deb` | 242,888 | `3b13874e567fa40b6eaf9f8d572d5c9a4ac780eb37496b31565755463a378295` | `https://repo.radeon.com/rocm/apt/7.2.4/pool/main/r/rocprofiler-register/rocprofiler-register_0.6.0.70204-93~24.04_amd64.deb` |
+
+Before a hardware lease, an authorized network-capable job must fetch those
+two files into a new NAS staging directory. It uses these argument arrays and
+never uses a shell:
+
+```text
+["/usr/bin/curl", "--fail", "--location", "--proto", "=https",
+ "--tlsv1.2", "--output", "<stage>/rocm-core_7.2.4.70204-93~24.04_amd64.deb",
+ "https://repo.radeon.com/rocm/apt/7.2.4/pool/main/r/rocm-core/rocm-core_7.2.4.70204-93~24.04_amd64.deb"]
+["/usr/bin/curl", "--fail", "--location", "--proto", "=https",
+ "--tlsv1.2", "--output",
+ "<stage>/rocprofiler-register_0.6.0.70204-93~24.04_amd64.deb",
+ "https://repo.radeon.com/rocm/apt/7.2.4/pool/main/r/rocprofiler-register/rocprofiler-register_0.6.0.70204-93~24.04_amd64.deb"]
+```
+
+The job verifies both byte counts and SHA256 values. It then atomically moves
+the two files and a hash receipt into `systemlibs3108.6xsEkD/`. Until that
+receipt exists, profiler recovery is `PENDING` and no readiness lease starts.
+This is the only network acquisition in the recovery contract.
+
+For every run, create `<run>/sdk-root` under a fresh `/tmp` directory. Verify
+all five package files. For each package, run
+`["/usr/bin/dpkg-deb", "-f", "<package>", "Package", "Version",
+"Architecture", "Depends"]` and compare the exact fields earlier in this
+section. Extract each package with
+`["/usr/bin/dpkg-deb", "-x", "<package>", "<run>/sdk-root"]`.
+Reject an absolute or symlinked prefix and reject any path that escapes it.
+
+The extracted prefix must contain these identities:
+
+| Relative path | Bytes | SHA256 | Build ID |
+|---|---:|---|---|
+| `opt/rocm-7.2.4/bin/rocprofv3` | 62,506 | `195ff5e6faf48a3abbc6f4db9f69dd598fe71fa9ff695ba2556d65af636fdc48` | n/a, Python script |
+| `opt/rocm-7.2.4/lib/librocprofiler-sdk.so.1.1.0` | 8,314,944 | `40cf6fefffa5e9e8da249dbc1ce6feab0bb2613438caf37b0224d7fce09241e1` | `3b9c4332f65be22417cec9d7ba6bad2eb7e6e039` |
+| `opt/rocm-7.2.4/lib/rocprofiler-sdk/librocprofiler-sdk-tool.so.1.1.0` | 5,435,848 | `478df9af09b74707652d9d5574ef37151ff1234d09c68843972c1409a505cdd0` | `0ca5ba0e4c583fcb8a8a2beb5698038cf3aff0e1` |
+| `opt/rocm-7.2.4/lib/librocprofiler-sdk-rocpd.so.1.1.0` | 493,128 | `000b898ef15ef5a5de6f4c61f11064e817883a02ddaa5610223fa394ff15cca0` | `c90598ff578bfcecba55e40d4e6291408d92843a` |
+| `opt/rocm-7.2.4/lib/librocprofiler-sdk-roctx.so.1.1.0` | 456,232 | `1d99a44a8c24370dbbabbc1b68b6b9606db53c5662dffc2dac31948a377b0ca9` | `626cd91b7d6cacc633cb874faae0edda01eb967d` |
+
+Read each ELF `DT_NEEDED` entry recursively with the dynamic loader search
+roots that the manifest permits. Record the resolved canonical path, byte
+count, SHA256, and GNU build ID for every dependency. Reject `not found`, a
+path outside the extracted prefix and the manifest-pinned base runtime, or a
+hash absent from the retained qualification manifest. The extracted
+`librocprofiler-register.so.0.6.0` must match SHA256
+`1a23a2b5a62dc7feee9259b9a307bca94caef7cfbaebc7b1b20a0289ed7e69f0`.
+Record its build ID in the recovery receipt before use. A dependency without a
+retained hash and build-ID receipt stops the preparation stage. The authorized
+job must archive its exact package by name, version, size, and SHA256 before a
+later hardware attempt.
+
+The package SDK library does not match the earlier 8,133,513-byte SDK library
+with build ID `82dd8833b65c17523a3054f6b54da0e7a8831c82`. Do not substitute one
+for the other. The recovered package set becomes one new pinned profiler
+identity only after dependency closure and readiness pass. Both trace arms
+must use that same identity.
+
+After a host reboot, reconstruct the profiler only from this five-package set.
+Recover the engines from their verified archives and the pinned model cache on
+NAS. Use a fresh worker-local directory under `/tmp` and a project virtual
+environment under `/workspace`. Copy only finalized, bounded evidence back to
+a new NAS directory. Do not use the harness archive as SDK source, use a
+global install, reuse an unverified build, or duplicate the model tree.
 
 ## Alternatives and decision
 
@@ -252,34 +357,86 @@ A parent-only trace can be parseable while omitting the executing process. The
 harness must reject that result rather than infer inheritance from a command
 line.
 
+### Rejected: use `rocprofv3 -- <command>`
+
+The retained `rocprofv3` script has SHA256
+`195ff5e6faf48a3abbc6f4db9f69dd598fe71fa9ff695ba2556d65af636fdc48`.
+Its `run` function appends the tool and SDK libraries to `LD_PRELOAD` at lines
+1142-1145. Lines 1146-1155 then set `ROCP_TOOL_LIBRARIES` and
+`LD_LIBRARY_PATH`. The earlier process-start log proves that this command can
+reach the child worker, but it does not satisfy this design's no-`LD_PRELOAD`
+rule. The implementation must not invoke `rocprofv3 -- <command>`.
+
 ### Rejected: preload or intercept runtime APIs
 
 `LD_PRELOAD`, a HIP shim, or an API replacement can change library resolution,
 capture, synchronization, or numerical execution. Such a result would not
 measure the production route.
 
-### Selected: one process-tree owner and a worker-owned start wrapper
+### Selected: pre-import process-tree bootstrap
 
-The diagnostic entry point owns the normal production process tree but places
-the pinned profiler wrapper at the GPU worker's existing launch seam. The
-wrapper starts before that worker imports Torch or initializes ROCm, passes one
-immutable profiler configuration and one run identifier, then transfers
-control to the unmodified production worker target. An in-process startup hook
-is admissible only when it is the first worker action before any runtime import
-and has the same ordering and identity receipts as the executable wrapper.
-The worker emits a startup receipt before runtime initialization and a shutdown
-receipt after trace finalization.
+The launch owner starts a fresh Python production subprocess with the exact
+manifest command array. It adds one verified bootstrap directory to the front
+of `PYTHONPATH`. That directory contains only the tracked and hashed
+`sitecustomize.py` bootstrap. The owner rejects `-S`, `-I`, `-E`, a different
+Python executable, an unbound existing `PYTHONPATH`, and any preexisting
+`sitecustomize` module. The hook removes its directory from `sys.path` after
+startup so it cannot resolve production imports.
 
-For vllm.cpp, the production public adapter is the GPU owner. For vLLM, the
-production V2 supervisor retains its existing EngineCore worker and
-interprocess communication. Its worker wrapper must preserve the EngineCore
-target, arguments, inherited file descriptors, process group, result channel,
-error propagation, and shutdown order. It must not replace EngineCore with an
-in-process model call. The harness identifies the owner from profiler records,
-the worker receipt, and observed GPU activity; all three must agree. If no
-production launch seam can start the pinned profiler before the normal worker,
-implementation stops. It does not fall back to a generic parent-only wrapper or
-attach.
+CPython 3.12 runs `site.main()` automatically unless `-S` is present. The
+retained `/usr/lib/python3.12/site.py` has SHA256
+`619436355cbe91c3b29681ab486ee63f5f2e0a7d6274dfae747bdb94e60bca55`.
+Its lines 571-588 import `sitecustomize`, and lines 611-643 do so before the
+user command executes. The implementation binds the production interpreter
+by path, version, size, SHA256, and build ID before launch. It binds `site.py`
+by path, size, and SHA256.
+
+The bootstrap imports only Python standard-library modules. Before profiler
+activation, it rejects `torch` or `vllm` in `sys.modules`. It also rejects any
+HIP, HSA, rocprofiler, or engine library in `/proc/self/maps`. The owner sets
+the exact `ROCP_TOOL_LIBRARIES`, `ROCPROFILER_LIBRARY_CTOR`, output, category,
+and local-prefix library values from the validated manifest. It sets no
+`LD_PRELOAD` value. The bootstrap loads the exact extracted
+`librocprofiler-sdk.so.1.1.0` with
+`ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)`. It then calls
+`rocprofiler_is_initialized` and requires a successful return with status `1`.
+Only then does it write the root startup receipt and return control to CPython.
+Because `site.py:571-588` reports and swallows ordinary hook exceptions, every
+bootstrap failure writes a bounded failure receipt and calls `os._exit` with a
+reserved nonzero status. User code must never run after a bootstrap failure.
+
+The bootstrap registers an `os.register_at_fork(after_in_child=...)` callback.
+The callback writes a child receipt before Python resumes the forked target.
+It records the parent and child process IDs, start times, executable, process
+group, profiler identities, initialization status, and loaded-library maps.
+It rejects a child in which the SDK or tool mapping differs. The callback does
+not replace the target, arguments, file descriptors, process group, result or
+error channels, interprocess communication, signal handlers, or shutdown.
+
+For production vLLM, manifest validation requires the pinned default `fork`
+method. The unchanged supervisor imports `core.py`, constructs
+`context.Process(target=EngineCoreProc.run_engine_core, kwargs=...)`, and calls
+`proc.start()` as pinned earlier. The inherited active provider and the
+at-fork receipt therefore exist before the worker resumes any imported runtime
+code. A `spawn` or `forkserver` observation fails readiness. For vllm.cpp, the
+production public Python adapter is the GPU owner, so its root receipt must
+precede its first library load.
+
+The retained process-start log has SHA256
+`9140e80cd1934b700b7d982a9d33b931f1a04cd2fd8aa008f795a2e71616938d`.
+Lines 87-110 show inherited tool registration. Lines 222-258 show profiler
+initialization before the production command. Lines 688-1076 identify child
+PID 55455 and its V2 initialization. Lines 1414 and 2016-2019 associate that
+child with kernel records and its result file. Lines 2054-2117 show parent
+finalization failure. This is observed reachability evidence only. Readiness
+must reproduce the ordering with the selected no-`LD_PRELOAD` bootstrap and
+must finalize cleanly.
+
+The harness identifies the GPU owner from profiler records, the at-fork or
+root receipt, and observed GPU activity. All three identities must agree. A
+missing callback, changed start method, import before activation, parent-only
+trace, or absent child provider receipt fails readiness. The implementation
+does not fall back to attach, `LD_PRELOAD`, or a modified EngineCore target.
 
 This process-tree form is used identically on both arms. Engine-specific code
 may decode existing logs or emit diagnostic markers, but it cannot change
@@ -288,7 +445,29 @@ worker lifetime.
 
 ## Public diagnostic contract
 
-The implementation adds one repository entry point:
+The implementation adds the importable
+`tools.bench.strix_worker_profile.launch` seam. Its contract identifier is
+`vllm.cpp/profiled-process-tree-launch/v1`. The seam accepts one validated
+launch request with an exact production argument array, engine identity,
+process-role binding, environment allowlist, profiler binding, lifecycle
+limits, and output directory. It returns the same structured result that the
+artifact schema defines later in this document.
+
+The callable owns manifest validation, package and binary binding, bootstrap,
+subprocess lifecycle, receipts, bounds, finalization, and artifact checks. It
+has no score-mode, benchmark verdict, or engine-specific performance
+semantics. A caller must supply the complete production argument array and the
+expected supervisor and GPU-owner roles. The callable rejects an unknown
+schema version, a missing role, or an engine command that differs from the
+bound manifest.
+
+This seam owns the reusable worker-start launch requirement for downstream
+profiling, including issue #3077. A downstream caller must require the exact
+`v1` contract. It must fail closed on a version or result-schema mismatch. The
+caller cannot copy the bootstrap or bypass the seam's validation and lifecycle
+owner.
+
+The implementation also adds one repository command:
 
 ```text
 python3 tools/bench/strix_worker_profile/worker.py \
@@ -297,6 +476,11 @@ python3 tools/bench/strix_worker_profile/worker.py \
   --engine vllmcpp|vllm \
   --output <new-directory>
 ```
+
+The command is a thin client of the importable seam. It parses arguments,
+constructs the launch request, invokes the callable once, and maps its result
+to the process exit status. It does not implement separate validation,
+bootstrap, lifecycle, or artifact logic.
 
 The command accepts no implicit engine, model, profiler, or workload defaults.
 Arguments stored in the manifest are arrays and are never interpolated through
@@ -320,8 +504,9 @@ The manifest schema identifier is
   fields, concurrency schedule, warmup schedule, and expected 128-token stop;
 - the permitted environment, ROCm library roots, device, lease, timeout,
   per-file limit, aggregate-output limit, and cleanup timeout; and
-- the exact production command arrays and the expected supervisor and worker
-  lifecycle roles.
+- the `vllm.cpp/profiled-process-tree-launch/v1` seam version, exact production
+  command arrays, bootstrap file identity, multiprocessing method, and expected
+  supervisor and worker lifecycle roles.
 
 Unknown fields, duplicate JSON keys, missing full revisions, relative paths,
 and schema-version drift fail before a subprocess starts. The implementation
@@ -336,9 +521,9 @@ One owner controls this sequence:
    directory.
 2. Record a pre-run binding manifest, the boot ID, device identity, lease job,
    process limits, and monotonic and wall-clock start times.
-3. Start the worker-owned profiler wrapper before the executing worker
-   initializes Torch, HSA, or HIP. Require startup receipts from the owner and
-   worker that prove this ordering while preserving the normal supervisor path.
+3. Start the exact production argument array through the pre-import bootstrap.
+   Require the root receipt before any engine import. For vLLM, also require
+   the at-fork child receipt before `EngineCoreProc.run_engine_core` resumes.
 4. Run the declared warmup. Open the recorded observation window only after
    warmup and close it after the last matched request completes.
 5. Run the complete ordered corpus. Emit correlated phase, request-dispatch,
@@ -369,6 +554,8 @@ prompt at concurrency one. It has a 10-minute wall timeout, a 256 MiB aggregate
 output stop threshold, and a 192 MiB per-file limit. It proves only:
 
 - profiler initialization precedes runtime initialization;
+- the selected launch seam, bootstrap hash, exact argument array, process
+  roles, and `fork` method match the manifest;
 - the profiler follows the actual GPU worker;
 - every required semantic category produces a parseable record;
 - graph capture or the resolved no-graph decision is explicit;
@@ -400,6 +587,8 @@ artifacts. It never renames that file to a passing result.
 
 - schema identifier, phase, engine, run identifier, manifest path and SHA256,
   start and end times, boot ID, lease job, device, and status;
+- launch-seam identifier, bootstrap path and SHA256, Python and `site.py`
+  identities, exact production argument array, and resolved start method;
 - pre-run and post-run bindings for sources, model files, executable, every
   loaded engine and profiler library, configuration, and build IDs;
 - the process tree with process IDs, start times, executable identities,
@@ -429,6 +618,10 @@ A trace arm passes only when all of these claims are supported by records from
 the identified GPU worker:
 
 - profiler initialization happened before Torch, HSA, or HIP initialization;
+- the launch seam and bootstrap match their pinned versions, `LD_PRELOAD` is
+  absent, and the exact production argument array ran without replacement;
+- production vLLM used `fork`, the pinned `EngineCoreProc.run_engine_core`
+  target, and matching root and at-fork child receipts;
 - the production engine mode, graph defaults, resolved graph mode, dtype,
   sampling, model, binaries, libraries, and build IDs match the manifest before
   and after the run;
@@ -482,12 +675,27 @@ do not claim GPU coverage. At minimum they prove:
 - strict manifest parsing rejects duplicate keys, unknown fields, incomplete
   pins, wrong hashes, path escapes, symlinks, existing outputs, and engine or
   profiler mismatches;
+- package recovery rejects a missing package, wrong byte count, wrong package
+  field, wrong payload hash, wrong ELF build ID, unresolved dependency, or
+  dependency outside the allowed roots;
 - the pair validator rejects different profiler configuration bytes,
   categories, tool libraries, workload bytes, or resource bounds;
 - the environment guard rejects eager, V1, `LD_PRELOAD`, tuning variables, and
   unexpected runtime library roots;
 - a fake supervisor and GPU worker preserve their arguments, file descriptors,
   exit status, and shutdown order under the launch owner;
+- the public command reaches the importable
+  `vllm.cpp/profiled-process-tree-launch/v1` callable exactly once, and schema
+  drift fails before any subprocess starts;
+- a real CPU fixture starts a fresh Python interpreter with the hashed
+  `sitecustomize` bootstrap, records activation before user code, and uses an
+  at-fork receipt before the unchanged child target executes;
+- the CPU fixture proves the exact argument array, target, keyword arguments,
+  inherited file descriptors, process group, result and error pipes, exit
+  status, and shutdown order are unchanged;
+- `-S`, `-I`, `-E`, `spawn`, `forkserver`, preloaded engine libraries, a
+  swallowed bootstrap exception, and any `LD_PRELOAD` value fail before user
+  code;
 - a startup receipt after a simulated runtime-init marker fails;
 - a parent trace without the GPU-worker receipt and GPU activity fails;
 - missing HIP API, kernel, HSA/AQL, graph-capture, graph-replay, marker, actual
@@ -503,9 +711,10 @@ do not claim GPU coverage. At minimum they prove:
 
 The fresh reviewer mutates each guard and its production call site in a scratch
 copy. At minimum, remove the pre-runtime ordering check, worker ownership check,
-one category check, graph-replay join, scheduler-shape join, finalization-order
-check, post-run binding check, output bound, and eager or preload refusal one at
-a time. The focused suite must detect each mutation. Restore the tree
+package-set validation, callable-to-command connection, at-fork receipt, one
+category check, graph-replay join, scheduler-shape join, finalization-order
+check, post-run binding check, output bound, and eager or preload refusal one
+at a time. The focused suite must detect each mutation. Restore the tree
 byte-for-byte after every mutation.
 
 ## Hardware stages and gates
@@ -541,7 +750,8 @@ receipt. An implementer or reviewer report cannot replace the operator's gate.
 - Diagnostic markers can perturb timing. They are accepted only for correlation,
   and instrumented timing is never the acceptance denominator.
 - A reboot can invalidate worker-local builds. The recovery path rebuilds from
-  verified NAS archives and rebinds every binary and library.
+  the verified package set and rebinds every binary and library. The missing
+  dependency packages must reach NAS before a readiness lease starts.
 - Current NAS and local free space are narrow. The implementation must check
   capacity before each phase and must not duplicate model artifacts.
 
@@ -552,8 +762,14 @@ Stop without attribution or optimization when any of these occurs:
 - the Strix lease is absent, lost, or shared with an unrelated GPU job;
 - a pin, archive, model file, binary, library, build ID, configuration, or
   before-and-after binding differs;
+- the package set is incomplete, its dependency closure is unresolved, or a
+  dependency lacks the required hash and build-ID receipt;
+- the launch seam or result schema differs from
+  `vllm.cpp/profiled-process-tree-launch/v1`;
 - the pinned profiler cannot start before the production GPU worker initializes
   its runtime or cannot follow that worker without attach or interposition;
+- `sitecustomize` does not run first, the vLLM start method is not `fork`, or
+  the at-fork child receipt does not precede the unchanged worker target;
 - the production V2 or normal vllm.cpp route cannot run with the declared
   defaults;
 - a graph mode, actual scheduler shape, request marker, trace category, or

@@ -144,12 +144,18 @@ class Scheduler {
   // the publisher) and is NOT retained, so it need not outlive the call.
   // data_parallel_rank mirrors parallel_config.data_parallel_index: the
   // publisher stamps it onto every batch it emits.
+  // hash_block_size (scheduler.py:76,268-270) is the granularity a request's
+  // block hashes are computed at. It is NOT always block_size: a KV cache group
+  // may page SMALLER than the engine's block table strides, and upstream
+  // resolves the two separately (engine/core.py:158-170). 0 is upstream's
+  // `None` — "same as block_size" — which is what every existing call site
+  // means and what keeps them byte-identical.
   Scheduler(SchedulerConfig scheduler_config, KVCacheConfig kv_cache_config,
             int block_size, bool enable_caching = false,
             StructuredOutputManager* structured_output_manager = nullptr,
             std::optional<SpeculativeConfig> speculative_config = std::nullopt,
             const distributed::KVEventsConfig* kv_events_config = nullptr,
-            int data_parallel_rank = 0);
+            int data_parallel_rank = 0, int hash_block_size = 0);
 
   // VIRTUAL destructor — REQUIRED, not cosmetic. `AsyncScheduler` derives from
   // this class and production/test code owns the derived object through a

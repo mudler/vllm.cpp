@@ -1313,11 +1313,24 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     vt::Fp8KVCacheDataType fp8_kind;
     float k_scale;
     float v_scale;
+    // KV-DSV4-MULTICACHE W8 slice 4 (#2455): the entry's OWN page in bytes, the
+    // same `page_size_bytes()` this loop already spends on the allocation. It
+    // travels beside the view geometry because the two disagree for any spec
+    // whose page is not `block_size * head_size * sizeof(dtype)` — see the
+    // field's comment on `PagedKvCache`.
+    int64_t page_size_bytes;
   };
   std::vector<FaDims> fa_dims;
   // Parallel to fa_dims: 1 when the layer's spec kind is kMlaAttention (the
   // fused 3-dim cache view) vs 0 for a dense NHD layer.
   std::vector<char> mla_layer_mask;
+  // KV-DSV4 PER-GROUP DISPATCH (ISSUE-LOCAL-01M2EMPC6T63TVDPQ90GVPRC5F):
+  // parallel to `fa_dims` / `mla_layer_mask`, one entry per allocated cache —
+  // the backend the GROUP names, i.e. upstream's `AttentionGroupKey.attn_backend`
+  // taken from the layer (`gpu_model_runner.py:7150`, `:7170`). EMPTY for every
+  // group that does not name one, which is every group of every other model, so
+  // the selector path below is entered exactly as often as it was before.
+  std::vector<std::string> named_backend;
   layer_kv_class_.assign(static_cast<size_t>(num_layers), LayerKvClass::kNone);
   layer_attn_kv_indices_.clear();
   attn_kv_layer_names_.clear();
@@ -1423,8 +1436,9 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
             kv_cache_backend_resident_));
         fa_dims.push_back(FaDims{spec->num_kv_heads, spec->head_size,
                                  spec->dtype, spec->block_size, spec->fp8_kind,
-                                 spec->k_scale, spec->v_scale});
+                                 spec->k_scale, spec->v_scale, page});
         mla_layer_mask.push_back(static_cast<char>(fused));
+        named_backend.push_back(group.attn_backend);
       }
     }
 
@@ -1584,7 +1598,7 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
             static_cast<size_t>(num_blocks_) * static_cast<size_t>(l_page),
             kv_cache_backend_resident_));
         fa_dims.push_back(FaDims{l_Hkv, l_Dh, l_dtype, fa_block_size, l_fp8_kind,
-                                 l_k_scale, l_v_scale});
+                                 l_k_scale, l_v_scale, l_page});
         // Per-layer MLA flag, parallel to fa_dims: the view loop picks the right
         // backend name (TRITON_MLA for an MLA group) and the right expected KV
         // shape (fused 3-dim, not the NHD 5-dim) per group.
@@ -1595,6 +1609,12 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
                   .kv_cache_groups[static_cast<size_t>(full_attn_group_id_)]
                   .kv_cache_spec->kind();
         mla_layer_mask.push_back(layer_kind == KVCacheSpecKind::kMlaAttention);
+        // The legacy (single-group) path: the group's own name, which is empty
+        // for every model that reaches this branch.
+        named_backend.push_back(
+            kv_cache_config
+                .kv_cache_groups[static_cast<size_t>(full_attn_group_id_)]
+                .attn_backend);
       }
       // else: this layer is named by NO KV cache group, so it caches nothing.
       // Reachable only on the by-name path, and it is the correct answer there:
@@ -1612,6 +1632,9 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // to `full_attn_buf_`; in the uniform case every entry is {Hkv, Dh, kv_dtype}.
   VT_CHECK(fa_dims.size() == full_attn_buf_.size(),
            "runner: per-layer KV view geometry out of sync with buffers");
+  VT_CHECK(named_backend.size() == fa_dims.size(),
+           "runner: the per-group attention-backend names are out of sync with "
+           "the KV view geometry");
   attn_kv_.clear();
   attn_backend_names_.clear();
   for (size_t i = 0; i < full_attn_buf_.size(); ++i) {
@@ -1630,6 +1653,10 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     kv.fp8_kind = fa_dims[i].fp8_kind;
     kv.k_scale = fa_dims[i].k_scale;
     kv.v_scale = fa_dims[i].v_scale;
+    // KV-DSV4-MULTICACHE W8 slice 4 (#2455): the allocated page, so a consumer
+    // of a packed or compressed page can build a view over the bytes that were
+    // actually reserved instead of the bytes the rank-3 geometry implies.
+    kv.page_size_bytes = fa_dims[i].page_size_bytes;
     // M3: the backend selection resolved for THIS group must describe the view
     // geometry the engine allocates + KvSlice reads — the NHD 5-dim
     // (num_blocks, 2, block_size, num_kv_heads, head_size) for a dense group,
@@ -1670,7 +1697,27 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
     cfg.quantized_kv_cache = vllm::v1::IsQuantizedKvCacheName(cfg.kv_cache_dtype);
 
     std::string name;
-    if (is_mla) {
+    // THE GROUP'S OWN BACKEND WINS, and it is taken DIRECTLY rather than
+    // through the capability walk. That is upstream's shape: a layer that
+    // names its backend (`compressor.py:189-190`, `sparse_swa.py:116-118`,
+    // `indexer.py:183-196`) is never offered to `get_attn_backend_cls`, and the
+    // named class is in no priority list. It is also the whole repair: the
+    // resolution below is cached per CLASS, so DeepSeek-V4's 256-token latent
+    // group resolved TRITON_MLA and the 4/4/8 compressor and indexer groups
+    // then inherited a `% 16` refusal that was never about them, which is what
+    // killed a real checkpoint at engine construction
+    // (ISSUE-LOCAL-01M2EMPC6T63TVDPQ90GVPRC5F).
+    //
+    // A name no device registers throws HERE, at init, naming the device and
+    // the backend — not later and not silently.
+    if (!named_backend[i].empty()) {
+      VT_CHECK(vllm::v1::HasAttentionBackend(queue_.device.type,
+                                             named_backend[i]),
+               std::string("runner: a KV cache group names attention backend '") +
+                   named_backend[i] +
+                   "', which is not registered for this device type");
+      name = named_backend[i];
+    } else if (is_mla) {
       if (!mla_backend_resolved) {
         mla_backend_resolved = true;
         vllm::platforms::AttnSelectorConfig mla_cfg = cfg;
@@ -1817,6 +1864,11 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
       dkv.fp8_kind = kv_fp8_kind;
       dkv.k_scale = kv_k_scale;
       dkv.v_scale = kv_v_scale;
+      // The draft buffer is allocated at `fa_page_bytes` three lines above, so
+      // that is its page. Carrying the target's value here is the same choice
+      // the dtype and fp8 fields already make, and for the same reason: both
+      // sides index one shared block table.
+      dkv.page_size_bytes = fa_page_bytes;
       draft_attn_kv_.push_back(dkv);
       break;  // exactly one fa_draft group at k=1.
     }
@@ -1886,6 +1938,38 @@ void GPUModelRunner::alloc_recurrent_layer_states(
 std::vector<int32_t> GPUModelRunner::gather_block_table(int group_id,
                                                         int num_reqs,
                                                         int* num_cols) const {
+  // NO SUCH GROUP IS AN EMPTY TABLE, and it used to be an out-of-bounds read.
+  //
+  // `full_attn_group_id_` and `gdn_group_id_` are -1 SENTINELS meaning "this
+  // model published no group of that kind". The GDN call site guards on its
+  // sentinel; the full-attention one does not, and
+  // `MultiGroupBlockTable::operator[]` casts the index to `size_t`, so
+  // `block_tables[-1]` read a `BlockTable` object that does not exist. The
+  // `max_num_blocks_per_req` it produced then decided the step: a garbage 0
+  // gathered an empty table and the request went on to the model, while a
+  // garbage negative made `num_reqs * cols` a ~1.8e19 `size_t` and the engine's
+  // busy loop died with `std::length_error` before any forward ran. Which one
+  // happened moved with the BINARY'S LAYOUT rather than with anything about the
+  // request -- adding one earlier test case to the same suite flipped it -- and
+  // that is issue #3027's `gather_block_table` signature.
+  //
+  // DeepSeek-V4 publishes no `kFullAttention` and no `kMlaAttention` group, so
+  // `full_attn_group_id_` is -1 on EVERY served request for that architecture
+  // and the read above happened on all of them. Whether that group should be
+  // classified as the target attention group is a separate question, owed by
+  // row KV-DSV4-MULTICACHE W3 (#2068); this only makes the sentinel mean what
+  // it says.
+  //
+  // `MakeCommonAttentionMetadata` already tolerates the same sentinel one line
+  // later -- its `group < slot_mapping.size()` is false for -1, so the group's
+  // slot mapping is left empty -- so an empty table is what the rest of the
+  // step is already written against. BYTE-NEUTRAL for every model that
+  // publishes a full-attention group, which is every model shipping today.
+  if (group_id < 0 || static_cast<size_t>(group_id) >=
+                          input_batch_.block_table.block_tables.size()) {
+    *num_cols = 0;
+    return {};
+  }
   const BlockTable& bt = input_batch_.block_table[group_id];
   const int cols = bt.max_num_blocks_per_req;
   *num_cols = cols;

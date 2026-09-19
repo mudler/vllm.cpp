@@ -501,6 +501,26 @@ struct KVCacheGroupSpec {
   std::vector<std::string> layer_names;
   std::shared_ptr<KVCacheSpec> kv_cache_spec;
   bool is_eagle_group = false;
+
+  // The attention backend that SERVES this group, named by the model's KV
+  // factory. Upstream's `AttentionGroupKey.attn_backend`
+  // (`vllm/v1/worker/gpu_model_runner.py:7170`), whose value comes from the
+  // LAYER: `layers[layer_name].get_attn_backend()` at `:7150`. DeepSeek-V4's
+  // compressor, sparse-SWA and indexer layers each name their own
+  // (`compressor.py:189-190`, `sparse_swa.py:116-118`, `indexer.py:183-196`),
+  // and that is the whole reason upstream can publish 4- and 8-token groups
+  // while three of its dense backends refuse anything that is not a multiple of
+  // 16.
+  //
+  // EMPTY means "resolve through the platform selector", which is what every
+  // model in this tree did before this field existed and still does: the runner
+  // reads the field and falls back to its existing lazy dense/MLA resolution
+  // when it is empty, so every existing topology resolves byte-identically.
+  //
+  // Keyed per GROUP rather than per LAYER, which is exact for every group any
+  // factory here publishes because each one is homogeneous. A group that needed
+  // two backends inside it would need the finer key; nothing here prevents that.
+  std::string attn_backend;
 };
 
 // The KV cache configuration of a model. (Upstream KVCacheConfig.)

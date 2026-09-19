@@ -148,6 +148,29 @@ struct ModelSource {
   // reached by a safetensors source, and no safetensors path reads it — the
   // residency policy is GGUF-only.
   vt::DeviceType device = vt::DeviceType::kCPU;
+  // MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm W4 (#2411): the SECOND FILE
+  // of a GGUF multimodal load -- the `clip`-architecture projector the user
+  // named with `--mmproj`, BORROWED for the duration of one load.
+  //
+  // It belongs here for the reason `multimodal` and `load_queue` do: this struct
+  // is already the per-load CONTEXT and not only the checkpoint, and a family's
+  // on-disk name map belongs inside that family's `load_weights`. The
+  // alternative, reading the projector in `model_loader.cpp` and handing the
+  // result down, needs a CONCRETE tower type in the loader. That is what pinned
+  // the existing Qwen3-VL arm to `Qwen3VLVisionWeights` and left it unable to
+  // carry a second architecture's tower at all.
+  //
+  // NULL on every load that named no `--mmproj`, and on the Qwen3-VL arm, which
+  // is still read in `model_loader.cpp`. So every other architecture is
+  // byte-identical. A source that carries one may only be handed to a
+  // registration whose `ModelFactory::consumes_mmproj` is true;
+  // `ModelRegistry::Load` refuses it otherwise, so a projector paired with a
+  // language model that cannot use it costs a message rather than being dropped
+  // in silence.
+  const GgufFile* mmproj = nullptr;
+  // The path the user typed. Quoted back by every projector refusal, so a
+  // message names WHICH file was wrong. Empty when `mmproj` is null.
+  std::string mmproj_path;
 };
 
 struct ModelFactory;
@@ -942,6 +965,16 @@ struct ModelFactory {
   // while doing asymptotically more work, so no token gate can see it. A
   // capability whose absence is invisible must be opt-in.
   bool consumes_multi_kv = false;
+  // MODEL-MM-deepseek-v4-deepseek-v4-for-causal-lm W4 (#2411): does this
+  // architecture's `load_weights` READ `ModelSource::mmproj`?
+  //
+  // Declared rather than inferred, and `ModelRegistry::Load` refuses a source
+  // that carries a projector this registration would ignore. Without the
+  // refusal the failure is silent and fluent: the user names `--mmproj`, the
+  // load succeeds, no tower exists, and the first image request is answered as
+  // text. That is the same class of defect `consumes_multi_kv` exists for, and
+  // it is declared the same way.
+  bool consumes_mmproj = false;
   // ENG-ASYNC-DEVICE-IDS-REFUSAL ([#2710](https://github.com/mudler/vllm.cpp/issues/2710)):
   // whether THIS model's registered forward READS
   // `ModelForwardInput::device_token_ids` rather than embedding from the host

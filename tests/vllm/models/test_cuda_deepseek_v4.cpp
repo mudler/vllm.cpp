@@ -18,6 +18,7 @@
 #include "vllm/model_executor/models/deepseek_v4_mhc.h"
 #include "vllm/model_executor/models/deepseek_v4_exl3_device.h"
 #include "vllm/model_executor/models/deepseek_v4_moe.h"
+#include "vllm/model_executor/models/deepseek_v4_vision.h"
 
 #include "dsv4_exl3_fixture.h"
 
@@ -469,7 +470,8 @@ TEST_CASE("W7-device sqrtsoftplus/hash router: CUDA ids BIT-EXACT, weights near-
   // (a) learned top-k with the noaux_tc bias (selection biased, weights unbiased).
   {
     const auto ref = dv4::SqrtSoftplusRouteTopk(gating, T, E, topk, bias, true, 1.5f, {}, {}, vocab);
-    const auto got = dv4::MoeDevice()->route(g.q, gating, T, E, topk, bias, true, 1.5f, {}, {}, vocab);
+    const auto got = dv4::MoeDevice()->route(g.q, gating, T, E, topk, bias, true, 1.5f, {}, {},
+                                             vocab, {}, {});
     REQUIRE(got.topk_ids.size() == ref.topk_ids.size());
     for (size_t i = 0; i < ref.topk_ids.size(); ++i) CHECK(got.topk_ids[i] == ref.topk_ids[i]);
     CHECK(RelL2(got.topk_weights, ref.topk_weights) < kTol);
@@ -482,10 +484,118 @@ TEST_CASE("W7-device sqrtsoftplus/hash router: CUDA ids BIT-EXACT, weights near-
       for (int64_t j = 0; j < topk; ++j)
         tid2eid[static_cast<size_t>(tok * topk + j)] = static_cast<int32_t>((tok * 5 + j) % E);
     const auto ref = dv4::SqrtSoftplusRouteTopk(gating, T, E, topk, {}, true, 1.5f, in_tokens, tid2eid, vocab);
-    const auto got = dv4::MoeDevice()->route(g.q, gating, T, E, topk, {}, true, 1.5f, in_tokens, tid2eid, vocab);
+    const auto got = dv4::MoeDevice()->route(g.q, gating, T, E, topk, {}, true, 1.5f, in_tokens,
+                                             tid2eid, vocab, {}, {});
     for (size_t i = 0; i < ref.topk_ids.size(); ++i) CHECK(got.topk_ids[i] == ref.topk_ids[i]);
     CHECK(RelL2(got.topk_weights, ref.topk_weights) < kTol);
   }
+}
+
+// MODEL-MM-deepseek-v4 W7-CUDA (#2411, ISSUE-LOCAL-01M2C26CSZWB7WVRS5H7YPW4S8):
+// THE PER-ROW VISION BIAS on the device routers. The host arm
+// `SqrtSoftplusRouteTopk` is the oracle, because the kernel transcribes its rule.
+//
+// The two biases deliberately name DIFFERENT experts. A near-uniform pair would
+// leave a wrong-bias bug invisible in the ids and detectable only in generated
+// text, which is the "a token gate cannot see this" trap the row's spec records.
+// RED-first: before the selector existed the device arms could not take these
+// arguments at all, and routing an image row on the text bias changes the ids.
+TEST_CASE("W7-CUDA per-row vision bias: image rows take exp_probs_b_vl, text rows do not") {
+  if (!HasCuda()) { MESSAGE("no CUDA; skip"); return; }
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  Rng r;
+  const int64_t T = 4, E = 8, topk = 3, vocab = 12;
+  const auto gating = Rand(r, T * E, -3.0f, 3.0f);
+  std::vector<float> text_bias(static_cast<size_t>(E), 0.0f);
+  std::vector<float> vision_bias(static_cast<size_t>(E), 0.0f);
+  text_bias[0] = 9.0f;   text_bias[1] = 8.0f;   text_bias[2] = 7.0f;
+  vision_bias[E - 1] = 9.0f; vision_bias[E - 2] = 8.0f; vision_bias[E - 3] = 7.0f;
+  const std::vector<char> is_media = {0, 1, 0, 1};  // rows 1 and 3 are image rows
+
+  // BOTH kernels: the warp top-k is the shipped default and the single-thread one
+  // is its A/B baseline, and the selector must behave identically in each.
+  for (const char* warp : {"0", "1"}) {
+    setenv("VT_V4_ROUTE_WARP_TOPK", warp, 1);
+    CAPTURE(warp);
+    // (a) a noaux_tc layer, mixed text/image batch.
+    {
+      const auto ref = dv4::SqrtSoftplusRouteTopk(gating, T, E, topk, text_bias, true, 1.5f, {},
+                                                  {}, vocab, vision_bias, is_media);
+      const auto got = dv4::MoeDevice()->route(g.q, gating, T, E, topk, text_bias, true, 1.5f, {},
+                                               {}, vocab, vision_bias, is_media);
+      REQUIRE(got.topk_ids.size() == ref.topk_ids.size());
+      for (size_t i = 0; i < ref.topk_ids.size(); ++i) CHECK(got.topk_ids[i] == ref.topk_ids[i]);
+      CHECK(RelL2(got.topk_weights, ref.topk_weights) < kTol);
+      // THE SWAP IS OBSERVABLE, which is what makes this a gate and not a
+      // restatement: routing every row on the text bias moves the IMAGE row's ids
+      // and leaves the TEXT row's alone.
+      const auto all_text = dv4::MoeDevice()->route(g.q, gating, T, E, topk, text_bias, true,
+                                                    1.5f, {}, {}, vocab, {}, {});
+      bool image_row_differs = false;
+      for (int64_t j = 0; j < topk; ++j)
+        if (got.topk_ids[static_cast<size_t>(topk + j)] !=
+            all_text.topk_ids[static_cast<size_t>(topk + j)])
+          image_row_differs = true;
+      CHECK(image_row_differs);
+      for (int64_t j = 0; j < topk; ++j)
+        CHECK(got.topk_ids[static_cast<size_t>(j)] == all_text.topk_ids[static_cast<size_t>(j)]);
+    }
+    // (b) a HASH layer: the image row LEAVES the hash route, the text row keeps it.
+    {
+      std::vector<int64_t> in_tokens = {3, 7, 1, 9};
+      std::vector<int32_t> tid2eid(static_cast<size_t>(vocab * topk));
+      for (int64_t tok = 0; tok < vocab; ++tok)
+        for (int64_t j = 0; j < topk; ++j)
+          tid2eid[static_cast<size_t>(tok * topk + j)] = static_cast<int32_t>((tok * 5 + j) % E);
+      // A hash layer carries NO text bias -- the converter drops `ffn.gate.bias`
+      // there -- while `exp_probs_b_vl` is present on every layer.
+      const auto ref = dv4::SqrtSoftplusRouteTopk(gating, T, E, topk, {}, true, 1.5f, in_tokens,
+                                                  tid2eid, vocab, vision_bias, is_media);
+      const auto got = dv4::MoeDevice()->route(g.q, gating, T, E, topk, {}, true, 1.5f, in_tokens,
+                                               tid2eid, vocab, vision_bias, is_media);
+      for (size_t i = 0; i < ref.topk_ids.size(); ++i) CHECK(got.topk_ids[i] == ref.topk_ids[i]);
+      CHECK(RelL2(got.topk_weights, ref.topk_weights) < kTol);
+      const int64_t tok0 = in_tokens[0] % vocab;
+      for (int64_t j = 0; j < topk; ++j)
+        CHECK(got.topk_ids[static_cast<size_t>(j)] ==
+              tid2eid[static_cast<size_t>(tok0 * topk + j)]);
+      const int64_t tok1 = in_tokens[1] % vocab;
+      bool image_left_hash = false;
+      for (int64_t j = 0; j < topk; ++j)
+        if (got.topk_ids[static_cast<size_t>(topk + j)] !=
+            tid2eid[static_cast<size_t>(tok1 * topk + j)])
+          image_left_hash = true;
+      CHECK(image_left_hash);
+    }
+    // (c) AN EMPTY MASK IS EVERY TEXT STEP, and must be byte-identical to the call
+    //     that carries no vision bias at all.
+    {
+      const auto with_empty = dv4::MoeDevice()->route(g.q, gating, T, E, topk, text_bias, true,
+                                                      1.5f, {}, {}, vocab, vision_bias, {});
+      const auto without = dv4::MoeDevice()->route(g.q, gating, T, E, topk, text_bias, true, 1.5f,
+                                                   {}, {}, vocab, {}, {});
+      CHECK(with_empty.topk_ids == without.topk_ids);
+      REQUIRE(with_empty.topk_weights.size() == without.topk_weights.size());
+      CHECK(std::memcmp(with_empty.topk_weights.data(), without.topk_weights.data(),
+                        without.topk_weights.size() * sizeof(float)) == 0);
+    }
+    // (d) THE IN-PLACE ROUTER carries the same selector.
+    {
+      dv4::MoeRouteResult ip;
+      ip.topk_ids.assign(static_cast<size_t>(T * topk), 0);
+      ip.topk_weights.assign(static_cast<size_t>(T * topk), 0.0f);
+      dv4::MoeDevice()->route_ip(g.q, ip.topk_ids.data(), ip.topk_weights.data(), gating.data(), T,
+                                 E, topk, text_bias.data(), true, nullptr, false, nullptr, vocab,
+                                 true, 1.5f, vision_bias.data(), true, is_media.data());
+      gpu.Synchronize(g.q);
+      const auto ref = dv4::SqrtSoftplusRouteTopk(gating, T, E, topk, text_bias, true, 1.5f, {},
+                                                  {}, vocab, vision_bias, is_media);
+      for (size_t i = 0; i < ref.topk_ids.size(); ++i) CHECK(ip.topk_ids[i] == ref.topk_ids[i]);
+      CHECK(RelL2(ip.topk_weights, ref.topk_weights) < kTol);
+    }
+  }
+  unsetenv("VT_V4_ROUTE_WARP_TOPK");
 }
 
 // ds4-gap Lever 3 / Brick 10 — the warp-parallel router top-k (RouteWarpKernel,
@@ -516,10 +626,10 @@ TEST_CASE("Lever 3 warp-topk router == single-thread RouteKernel BYTE-IDENTICAL 
     {
       setenv("VT_V4_ROUTE_WARP_TOPK", "0", 1);
       const auto st = dv4::MoeDevice()->route(g.q, gating, c.T, c.E, c.topk, bias, true, 1.5f, {},
-                                              {}, c.vocab);
+                                              {}, c.vocab, {}, {});
       setenv("VT_V4_ROUTE_WARP_TOPK", "1", 1);
       const auto wp = dv4::MoeDevice()->route(g.q, gating, c.T, c.E, c.topk, bias, true, 1.5f, {},
-                                              {}, c.vocab);
+                                              {}, c.vocab, {}, {});
       REQUIRE(wp.topk_ids.size() == st.topk_ids.size());
       for (size_t i = 0; i < st.topk_ids.size(); ++i) CHECK(wp.topk_ids[i] == st.topk_ids[i]);
       CHECK(bytes_equal(wp.topk_weights, st.topk_weights));  // BIT-EXACT, not near-tie
@@ -535,10 +645,10 @@ TEST_CASE("Lever 3 warp-topk router == single-thread RouteKernel BYTE-IDENTICAL 
               static_cast<int32_t>((tok * 5 + j) % c.E);
       setenv("VT_V4_ROUTE_WARP_TOPK", "0", 1);
       const auto st = dv4::MoeDevice()->route(g.q, gating, c.T, c.E, c.topk, {}, true, 1.5f,
-                                              in_tokens, tid2eid, c.vocab);
+                                              in_tokens, tid2eid, c.vocab, {}, {});
       setenv("VT_V4_ROUTE_WARP_TOPK", "1", 1);
       const auto wp = dv4::MoeDevice()->route(g.q, gating, c.T, c.E, c.topk, {}, true, 1.5f,
-                                              in_tokens, tid2eid, c.vocab);
+                                              in_tokens, tid2eid, c.vocab, {}, {});
       for (size_t i = 0; i < st.topk_ids.size(); ++i) CHECK(wp.topk_ids[i] == st.topk_ids[i]);
       CHECK(bytes_equal(wp.topk_weights, st.topk_weights));
     }
@@ -873,12 +983,14 @@ TEST_CASE("DeepseekV4 device MHC + router in place == round-trip (Brick B)") {
     const int64_t T = 2, E = 8, topk = 3;
     const auto gating = Rand(r, T * E, -2.0f, 2.0f);
     const auto bias = Rand(r, E, -0.5f, 0.5f);
-    const auto rt = dv4::MoeDevice()->route(g.q, gating, T, E, topk, bias, true, 1.5f, {}, {}, 0);
+    const auto rt = dv4::MoeDevice()->route(g.q, gating, T, E, topk, bias, true, 1.5f, {}, {}, 0,
+                                            {}, {});
     dv4::MoeRouteResult ip;
     ip.topk_ids.assign(static_cast<size_t>(T * topk), 0);
     ip.topk_weights.assign(static_cast<size_t>(T * topk), 0.0f);
     dv4::MoeDevice()->route_ip(g.q, ip.topk_ids.data(), ip.topk_weights.data(), gating.data(), T,
-                              E, topk, bias.data(), true, nullptr, false, nullptr, 0, true, 1.5f);
+                              E, topk, bias.data(), true, nullptr, false, nullptr, 0, true, 1.5f,
+                              nullptr, false, nullptr);
     gpu.Synchronize(g.q);
     for (size_t i = 0; i < ip.topk_ids.size(); ++i) CHECK(ip.topk_ids[i] == rt.topk_ids[i]);
     for (size_t i = 0; i < ip.topk_weights.size(); ++i) CHECK(ip.topk_weights[i] == rt.topk_weights[i]);
@@ -1293,6 +1405,282 @@ TEST_CASE("W2: the EXL3 routed experts COMPUTE on CUDA and agree with the CPU ar
   CHECK(max_abs < 1e-2);
 }
 
+
+// ===========================================================================
+// MODEL-MM-deepseek-v4 W7-CUDA (#2411): THE VISION TOWER ON A CUDA QUEUE.
+//
+// RED BEFORE, and measured on the device rather than argued: at 4abe547d2 the
+// `deepseek4v` mmproj reader left every weight a HOST view, so `ValidateQueue`
+// refused every CUDA queue. On thor:gpu0 that read
+// `DeepSeek-V4 vision queue and weights must share one device` on all four
+// `lead_pad` rungs of the real 934,462,656-byte projector, and the SERVED image
+// request in `test_deepseek_v4_mm_chat` died with the same sentence
+// (`engine-fatal: EngineCore busy loop threw: ...`). This case is that failure
+// reduced to a synthetic tower so it has a home in the suite that owns exit 77.
+//
+// IT IS NOT ENOUGH THAT THE FORWARD STOPS THROWING. A staging bug that uploaded
+// garbage, or that left the gate-up borrows pointing at freed host memory, also
+// stops throwing. So the device output is compared against the SAME weights run
+// on the CPU arm, which is the tower W6 gated against llama.cpp b10766.
+// ===========================================================================
+namespace {
+
+// A contiguous host view over an arena slice. `vt::Tensor::Contiguous` takes an
+// `initializer_list`, which a shape computed at runtime cannot bind to, so the
+// fields are filled here instead.
+vt::Tensor MakeView(void* data, vt::DType dt, vt::Device dev,
+                    const std::vector<int64_t>& shape) {
+  vt::Tensor v;
+  v.data = data;
+  v.dtype = dt;
+  v.device = dev;
+  v.rank = static_cast<int>(shape.size());
+  int64_t acc = 1;
+  for (int i = v.rank - 1; i >= 0; --i) {
+    v.shape[i] = shape[static_cast<size_t>(i)];
+    v.stride[i] = acc;
+    acc *= shape[static_cast<size_t>(i)];
+  }
+  return v;
+}
+
+struct TinyVisionTower {
+  vllm::multimodal::DeepSeekV4VisionConfig cfg;
+  std::vector<uint16_t> bf16;   // every model-dtype weight, one arena
+  std::vector<float> f32;       // the three RMSNorm weights
+  std::vector<uint16_t> patches;
+  vllm::multimodal::DeepSeekV4VisionWeights weights;
+};
+
+// A host arena whose tensors are all CPU views, exactly like the mmproj reader's.
+TinyVisionTower MakeTinyVisionTower() {
+  TinyVisionTower t;
+  t.cfg.patch_size = 2;
+  t.cfg.hidden_size = 8;
+  t.cfg.num_heads = 2;      // head_dim 4, which the config requires to be % 4
+  // DEPTH 2, NOT 1, and the reason is the shape of the staging code. W7-CUDA's
+  // `EnsureResident` stages the tower block by block in a loop over
+  // `weights_.blocks`, so a regression that dropped a block would land on an
+  // index the loop reaches after the first. At depth 1 that loop has one
+  // iteration and every such regression is invisible. Two is the smallest depth
+  // that executes the loop more than once; the production projector has 32.
+  t.cfg.depth = 2;
+  t.cfg.intermediate_size = 4;
+  t.cfg.output_size = 8;
+  t.cfg.downsample_ratio = 2;
+  t.cfg.compute_dtype = vt::DType::kBF16;
+
+  const int64_t H = t.cfg.hidden_size, I = t.cfg.intermediate_size;
+  const int64_t PD = t.cfg.patch_dim();            // 12
+  const int64_t AI = t.cfg.aligner_input_size();   // 32
+  const int64_t O = t.cfg.output_size;
+
+  Rng r;
+  const int64_t D = t.cfg.depth;
+  // ONE arena, sized first and never resized, so every view below stays valid.
+  const int64_t nbf = H * PD + H
+                    + D * (3 * H * H + 3 * H + H * H + H + 2 * I * H + H * I)
+                    + O * AI + O + O * O + O;
+  t.bf16 = Bf16Of(Rand(r, nbf, -0.3f, 0.3f));
+  // Two RMSNorm weights per block, plus the tower's final norm.
+  t.f32.resize(static_cast<size_t>((2 * D + 1) * H), 1.0f);
+  for (auto& v : t.f32) v = 1.0f + r.next(-0.05f, 0.05f);
+
+  const vt::Device cpu{vt::DeviceType::kCPU, 0};
+  size_t off = 0;
+  auto take = [&](std::vector<int64_t> shape) {
+    int64_t n = 1;
+    for (int64_t d : shape) n *= d;
+    vt::Tensor v = MakeView(t.bf16.data() + off, vt::DType::kBF16, cpu, shape);
+    off += static_cast<size_t>(n);
+    return v;
+  };
+  size_t foff = 0;
+  auto takef = [&](std::vector<int64_t> shape) {
+    int64_t n = 1;
+    for (int64_t d : shape) n *= d;
+    vt::Tensor v = MakeView(t.f32.data() + foff, vt::DType::kF32, cpu, shape);
+    foff += static_cast<size_t>(n);
+    return v;
+  };
+
+  t.weights.patch_weight = take({H, PD});
+  t.weights.patch_bias = take({H});
+  // One distinct weight set per block: every block takes its own slice of the
+  // arena, so no two blocks alias and a block read in place of another is a
+  // different answer rather than the same one.
+  for (int64_t layer = 0; layer < D; ++layer) {
+    vllm::multimodal::DeepSeekV4VisionBlockWeights b;
+    b.norm1_weight = takef({H});
+    b.qkv_weight = take({3 * H, H});
+    b.qkv_bias = take({3 * H});
+    b.out_weight = take({H, H});
+    b.out_bias = take({H});
+    b.norm2_weight = takef({H});
+    b.mlp_w1_weight = take({2 * I, H});
+    b.mlp_w2_weight = take({H, I});
+    t.weights.blocks.push_back(b);
+  }
+  t.weights.final_norm_weight = takef({H});
+  t.weights.aligner_w1_weight = take({O, AI});
+  t.weights.aligner_w1_bias = take({O});
+  t.weights.aligner_w2_weight = take({O, O});
+  t.weights.aligner_w2_bias = take({O});
+
+  t.patches = Bf16Of(Rand(r, 4 * PD, -1.0f, 1.0f));  // a 2x2 patch grid
+  return t;
+}
+
+}  // namespace
+
+TEST_CASE("W7-CUDA: the vision tower STAGES to the device and matches the CPU arm") {
+  if (!HasCuda()) {
+    MESSAGE("SKIPPED: no CUDA backend on this host; this case gates the vision "
+            "tower's device STAGING and must run under an rc lease on a GPU");
+    return;
+  }
+  TinyVisionTower t = MakeTinyVisionTower();
+  const int64_t gh = 2, gw = 2;
+  const int64_t tokens = gh * gw;
+  const int64_t rows = t.cfg.aligned_rows(gh, gw);
+  const int64_t O = t.cfg.output_size;
+  const vt::Device cpu{vt::DeviceType::kCPU, 0};
+
+  // The CPU arm: the tower W6 compared against llama.cpp, on these weights.
+  vt::Backend& host = vt::GetBackend(vt::DeviceType::kCPU);
+  QueueGuard hq{host};
+  std::vector<uint16_t> cpu_out(static_cast<size_t>(rows * O), 0);
+  {
+    vllm::multimodal::DeepSeekV4Vision tower(host, t.cfg, t.weights);
+    vt::Tensor p = vt::Tensor::Contiguous(t.patches.data(), vt::DType::kBF16, cpu,
+                                          {tokens, t.cfg.patch_dim()});
+    vt::Tensor o = vt::Tensor::Contiguous(cpu_out.data(), vt::DType::kBF16, cpu,
+                                          {rows, O});
+    tower.Forward(hq.q, o, p, gh, gw);
+    host.Synchronize(hq.q);
+  }
+
+  // The DEVICE arm: the SAME host weights, handed to a CUDA backend. Before the
+  // staging landed this threw instead of running.
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  QueueGuard gq{gpu};
+  vllm::multimodal::DeepSeekV4Vision tower(gpu, t.cfg, t.weights);
+
+  const size_t bf = vt::SizeOf(vt::DType::kBF16);
+  void* dp = gpu.Alloc(t.patches.size() * bf);
+  void* dobuf = gpu.Alloc(static_cast<size_t>(rows * O) * bf);
+  gpu.Copy(gq.q, dp, t.patches.data(), t.patches.size() * bf);
+  vt::Tensor p = vt::Tensor::Contiguous(dp, vt::DType::kBF16, gq.q.device,
+                                        {tokens, t.cfg.patch_dim()});
+  vt::Tensor o = vt::Tensor::Contiguous(dobuf, vt::DType::kBF16, gq.q.device, {rows, O});
+  tower.Forward(gq.q, o, p, gh, gw);
+  gpu.Synchronize(gq.q);
+
+  std::vector<uint16_t> dev_out(static_cast<size_t>(rows * O), 0);
+  gpu.Copy(gq.q, dev_out.data(), dobuf, dev_out.size() * bf);
+  gpu.Synchronize(gq.q);
+
+  // (0) EVERY BLOCK WAS STAGED, not only block 0. Destroy the host arena the
+  //     weights were built over and run the SAME already-staged tower again.
+  //     A weight that was never copied still points into this memory, so a miss
+  //     on ANY index -- `EnsureResident`'s per-block loop is where a regression
+  //     would land -- changes this second answer. Both comparisons below run
+  //     against `dev_out`, which was captured before the arena was destroyed.
+  for (auto& v : t.bf16) v = 0;
+  for (auto& v : t.f32) v = 0.0f;
+  std::vector<uint16_t> dev_again(static_cast<size_t>(rows * O), 0);
+  tower.Forward(gq.q, o, p, gh, gw);
+  gpu.Synchronize(gq.q);
+  gpu.Copy(gq.q, dev_again.data(), dobuf, dev_again.size() * bf);
+  gpu.Synchronize(gq.q);
+  CHECK(dev_again == dev_out);
+
+  gpu.Free(dp);
+  gpu.Free(dobuf);
+
+  // (1) The device arm produced the CPU arm's answer. A staging bug that copied
+  //     nothing, copied the wrong bytes, or left the MLP gate-up borrows on
+  //     freed host memory fails HERE and not on the throw.
+  std::vector<float> a(dev_out.size()), b(cpu_out.size());
+  for (size_t i = 0; i < dev_out.size(); ++i) a[i] = vt::BF16ToF32(dev_out[i]);
+  for (size_t i = 0; i < cpu_out.size(); ++i) b[i] = vt::BF16ToF32(cpu_out[i]);
+  MESSAGE("vision tower CUDA vs CPU: relL2 = " << RelL2(a, b));
+  CHECK(RelL2(a, b) < 5e-2);
+  // (2) ...and it is not trivially zero on both arms, which would satisfy (1)
+  //     while measuring nothing.
+  double energy = 0.0;
+  for (float v : b) energy += static_cast<double>(v) * v;
+  CHECK(energy > 0.0);
+}
+
+TEST_CASE("W7-CUDA: a tower already staged to one device still REFUSES a foreign queue") {
+  if (!HasCuda()) {
+    MESSAGE("SKIPPED: no CUDA backend on this host; this case gates the refusal "
+            "that the staging NARROWED rather than deleted");
+    return;
+  }
+  TinyVisionTower t = MakeTinyVisionTower();
+  const int64_t gh = 2, gw = 2, tokens = gh * gw;
+  const int64_t rows = t.cfg.aligned_rows(gh, gw), O = t.cfg.output_size;
+
+  vt::Backend& gpu = vt::GetBackend(vt::DeviceType::kCUDA);
+  QueueGuard gq{gpu};
+  vllm::multimodal::DeepSeekV4Vision tower(gpu, t.cfg, t.weights);
+  const size_t bf = vt::SizeOf(vt::DType::kBF16);
+  void* dp = gpu.Alloc(t.patches.size() * bf);
+  void* dobuf = gpu.Alloc(static_cast<size_t>(rows * O) * bf);
+  gpu.Copy(gq.q, dp, t.patches.data(), t.patches.size() * bf);
+  vt::Tensor p = vt::Tensor::Contiguous(dp, vt::DType::kBF16, gq.q.device,
+                                        {tokens, t.cfg.patch_dim()});
+  vt::Tensor o = vt::Tensor::Contiguous(dobuf, vt::DType::kBF16, gq.q.device, {rows, O});
+  tower.Forward(gq.q, o, p, gh, gw);   // stages to CUDA
+  gpu.Synchronize(gq.q);
+
+  // Now ask the SAME tower for a CPU queue. The weights live on CUDA, so this is
+  // the device-to-device case the staging deliberately does NOT implement, and
+  // it must still be refused by name rather than answered from foreign memory.
+  vt::Backend& host = vt::GetBackend(vt::DeviceType::kCPU);
+  QueueGuard hq{host};
+  const vt::Device cpu{vt::DeviceType::kCPU, 0};
+  std::vector<uint16_t> hp = t.patches;
+  std::vector<uint16_t> ho(static_cast<size_t>(rows * O), 0);
+  vt::Tensor hpt = vt::Tensor::Contiguous(hp.data(), vt::DType::kBF16, cpu,
+                                          {tokens, t.cfg.patch_dim()});
+  vt::Tensor hot = vt::Tensor::Contiguous(ho.data(), vt::DType::kBF16, cpu, {rows, O});
+  std::string thrown;
+  try {
+    tower.Forward(hq.q, hot, hpt, gh, gw);
+  } catch (const std::exception& e) {
+    thrown = e.what();
+  }
+  CHECK(thrown.find("must share one device") != std::string::npos);
+  gpu.Free(dp);
+  gpu.Free(dobuf);
+}
+
+// W7-CUDA repair (#2411). THE FIXTURE CANNOT DEGENERATE BACK TO ONE BLOCK.
+//
+// The two device cases above are the only gate on `EnsureResident`, and what
+// they can detect depends entirely on this fixture's depth: at depth 1 the
+// per-block staging loop runs once and no block-index regression is reachable.
+// That state is what this case forbids, and it is the one part of the coverage
+// a host with no CUDA can still check -- the device cases themselves return
+// early here and the suite exits 77.
+TEST_CASE("W7-CUDA: the tiny vision fixture keeps more than one block") {
+  TinyVisionTower t = MakeTinyVisionTower();
+  REQUIRE(t.cfg.depth >= 2);
+  REQUIRE(static_cast<int64_t>(t.weights.blocks.size()) == t.cfg.depth);
+  // ...and the blocks are distinct storage, so reading one in place of another
+  // is an observable difference rather than the same bytes twice.
+  for (size_t i = 1; i < t.weights.blocks.size(); ++i) {
+    CHECK(t.weights.blocks[i].qkv_weight.data !=
+          t.weights.blocks[i - 1].qkv_weight.data);
+    CHECK(t.weights.blocks[i].mlp_w1_weight.data !=
+          t.weights.blocks[i - 1].mlp_w1_weight.data);
+    CHECK(t.weights.blocks[i].norm1_weight.data !=
+          t.weights.blocks[i - 1].norm1_weight.data);
+  }
+}
 
 // Exit 77 -> CTest reports SKIPPED. The real rc comes FIRST: a genuine failure
 // must never be laundered into a skip, so 77 is reached only on a clean run that

@@ -1466,10 +1466,46 @@ bool LoadedEngine::ResolveAsyncEnabled(
       runner_supports_async, is_pooling_model, spec_decode_incompatible));
 }
 
+std::pair<int, int> LoadedEngine::ResolveSchedulerBlockSizes(
+    const vllm::v1::KVCacheConfig& kv_cfg, int block_size,
+    bool enable_prefix_caching) {
+  // STEP 1 — re-derive the cache block size from the groups that were actually
+  // built. `block_size` is what the engine ASKED to page at (raised to the
+  // architecture's `kv_block_size_floor`); a group may publish a SMALLER page
+  // regardless, because upstream fixes some of them by tensor sharing rather
+  // than by configuration — DeepSeek-V4's SWA cache is a hard 64 tokens
+  // (`vllm/v1/attention/backends/mla/sparse_swa.py:76-83`, `self.block_size =
+  // 64`) and its compressor states are 4 and 8 (`compressor.py:174-186`).
+  // Upstream reconciles the two by writing the minimum back over the
+  // configured value before anything reads it as a scheduling quantity:
+  // `cache_config.block_size = min(g.kv_cache_spec.block_size for g in
+  // kv_cache_groups)` (`vllm/v1/engine/core.py:335-338` @ `e126687a9a`),
+  // guarded by `if kv_cache_groups:` because an attention-free model publishes
+  // none and then keeps the size it paged at.
+  int cache_block_size = block_size;
+  for (const auto& group : kv_cfg.kv_cache_groups) {
+    if (!group.kv_cache_spec) continue;
+    if (group.kv_cache_spec->block_size < cache_block_size) {
+      cache_block_size = group.kv_cache_spec->block_size;
+    }
+  }
+  // STEP 2 — split that into the scheduler's token-alignment invariant and the
+  // prefix-hash granularity (`core.py:158-160`). For one group both are the
+  // cache block size; for several they are the LCM and the GCD. This call is
+  // what makes `resolve_kv_cache_block_sizes` REACHED: it was ported at
+  // `kv_cache_utils.cpp:640` with no production caller, so the engine was
+  // deriving neither value and handing the coordinator the configured size for
+  // both.
+  return vllm::v1::resolve_kv_cache_block_sizes(
+      kv_cfg, cache_block_size, /*prefix_match_unit=*/std::nullopt,
+      enable_prefix_caching, /*connector_enabled=*/false,
+      /*dcp_world_size=*/1);
+}
+
 std::unique_ptr<vllm::v1::Scheduler> LoadedEngine::MakeScheduler(
     bool async_enabled, vllm::SchedulerConfig scheduler_config,
     vllm::v1::KVCacheConfig kv_cache_config, int block_size,
-    bool enable_caching,
+    int hash_block_size, bool enable_caching,
     vllm::v1::StructuredOutputManager* structured_output_manager,
     std::optional<vllm::SpeculativeConfig> speculative_config) {
   if (async_enabled) {
@@ -1481,11 +1517,12 @@ std::unique_ptr<vllm::v1::Scheduler> LoadedEngine::MakeScheduler(
     return std::make_unique<vllm::v1::AsyncScheduler>(
         std::move(scheduler_config), std::move(kv_cache_config), block_size,
         enable_caching, structured_output_manager,
-        std::move(speculative_config));
+        std::move(speculative_config), hash_block_size);
   }
   return std::make_unique<vllm::v1::Scheduler>(
       std::move(scheduler_config), std::move(kv_cache_config), block_size,
-      enable_caching, structured_output_manager, std::move(speculative_config));
+      enable_caching, structured_output_manager, std::move(speculative_config),
+      /*kv_events_config=*/nullptr, /*data_parallel_rank=*/0, hash_block_size);
 }
 
 std::optional<vllm::SpeculativeConfig> LoadedEngine::ResolveSpecConfig(
@@ -2191,6 +2228,19 @@ LoadedEngine::LoadedEngine(HfConfig config,
           params, max_model_len_, ModelRegistry::IsDenseModel(*model_))),
       prefix_caching_enabled_(ResolveEnablePrefixCaching(
           params, model_->registration().info)),
+      // The scheduler's two block sizes, derived from the BUILT `kv_cfg_`
+      // rather than from `block_size_`. Upstream derives them in exactly this
+      // position — after the KV cache config exists and before the Scheduler is
+      // constructed (`vllm/v1/engine/core.py:335-338` then `:158-170` @
+      // `e126687a9a`). See ResolveSchedulerBlockSizes.
+      scheduler_block_size_(
+          ResolveSchedulerBlockSizes(kv_cfg_, block_size_,
+                                     prefix_caching_enabled_)
+              .first),
+      hash_block_size_(
+          ResolveSchedulerBlockSizes(kv_cfg_, block_size_,
+                                     prefix_caching_enabled_)
+              .second),
       // ENG-SGLANG-BEHAVIOR-FLAG SW3: resolve jump-forward once (config field +
       // VT_ENABLE_JUMP_FORWARD env override). Default nullopt+no-env => false =>
       // the byte-identical decode path (jump-forward is inert until enabled).
@@ -2259,7 +2309,7 @@ LoadedEngine::LoadedEngine(HfConfig config,
           MakeSchedulerConfig(
               max_model_len_, max_num_seqs_,
               max_num_batched_tokens_, params.policy),
-          kv_cfg_, block_size_,
+          kv_cfg_, scheduler_block_size_, hash_block_size_,
           /*enable_caching=*/prefix_caching_enabled_,
           &structured_output_manager_, resolved_spec_config_)),
       executor_(runner_),
@@ -2274,9 +2324,14 @@ LoadedEngine::LoadedEngine(HfConfig config,
       // the raw checkpoint context and let through prompts the pool cannot hold.
       input_processor_(tokenizer_, config_, max_model_len_),
       output_processor_(&tokenizer_),
+      // `hash_block_size_`, not `block_size_`: the hasher's granularity must be
+      // the one the coordinator matches against, which is upstream's own
+      // pairing (`get_request_block_hasher(hash_block_size, caching_hash_fn)`,
+      // `vllm/v1/engine/core.py:232` @ `e126687a9a`). Hashing at the configured
+      // size while the pool pages smaller produces hashes no lookup can hit.
       block_hasher_(prefix_caching_enabled_
                         ? vllm::v1::get_request_block_hasher(
-                              block_size_, vllm::v1::sha256_cbor)
+                              hash_block_size_, vllm::v1::sha256_cbor)
                         : nullptr),
       engine_(input_processor_, engine_core_, output_processor_, block_hasher_) {
   (void)hash_ready_;
@@ -3044,45 +3099,75 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // freed" (the same distinction the Muse Glimmer text-only case draws).
     bool mmproj_tower_skipped = false;
     std::optional<vllm::GgufFile> mmproj;
+    // MODEL-MM-deepseek-v4 W4 (#2411): the `deepseek4v` arm, and the ONE thing
+    // this function does for it is decide which reader gets the file.
+    //
+    // A DeepSeek-V4 projector is NOT read here. Its reader fills the W2 vision
+    // types, and the tower has to end up on the LANGUAGE model rather than on
+    // the engine, because the registered `encode_mm` hook reaches it through
+    // `LoadedModel`. The engine's own `vision_tower_` is typed
+    // `Qwen3VLVisionWeights`, which is exactly why it could not carry a second
+    // architecture's tower. So the file travels down on `ModelSource::mmproj`
+    // and `LoadDeepseekV4ForCausalLM` opens it -- a family's on-disk name map
+    // living inside that family's `load_weights`, as everywhere else here.
+    //
+    // `RefuseUnsupportedClipMmproj` below keeps refusing `deepseek4v` and the
+    // W3A gate keeps asserting that it does. Widening it would send a DeepSeek
+    // projector into the Qwen3-VL reader and build a tower that runs and is
+    // wrong; the branch is what stops it being reached at all.
+    const vllm::GgufFile* deepseek_v4_mmproj = nullptr;
     if (!params.mmproj_path.empty()) {
       mmproj = vllm::GgufFile::Open(params.mmproj_path);
-      vllm::RefuseUnsupportedClipMmproj(*mmproj, params.mmproj_path);
-      vision_config = vllm::ClipMmprojVisionConfig(*mmproj);
-      // QUANT-QWEN38-27B-GGUF-ARM (#821): the projector's own accounting, and
-      // it runs BEFORE the read, so a file this reader would only partly
-      // consume costs a message rather than a silently incomplete tower.
-      vllm::RefuseUnaccountedClipMmproj(*mmproj, vision_config,
-                                        params.mmproj_path);
-      // #607 L3, the THIRD production tower load, and the one the first cut of
-      // this row missed. It is a tower like the other two: `--mmproj` names a
-      // projector, this reads every one of its tensors into owned host f32, and
-      // the engine holds them for the process lifetime. So
-      // `--language-model-only` zeroed every limit, refused every image request,
-      // AND STILL PAID FOR THE PROJECTOR — the exact L2 failure this row exists
-      // to close, surviving on the one architecture nothing was looking at.
-      //
-      // Gated on the same predicate and the same modality set as the two
-      // safetensors sites ({"image","video"} — interfaces.py:293 and
-      // qwen3_vl.py:1747), because this projector IS the Qwen3-VL tower, read
-      // out of a `clip` GGUF instead of out of the model's own shards. `image:
-      // 0` alone must therefore not skip it here either.
-      //
-      // ONLY THE READ IS CONDITIONAL. `GgufFile::Open`, both refusals and
-      // `ClipMmprojVisionConfig` above still run: that is the construct half of
-      // construct-without-initialise (utils.py:762), so the geometry resolves
-      // either way and a `--mmproj` this build cannot load is still refused by
-      // name rather than accepted in silence at zero limits. What stops is the
-      // storage — and with it the reader's own missing-tensor refusals, which is
-      // the mirror of `StageMissingLayer` keeping a skipped stage out of the
-      // loader's key accounting (utils.py:693-695).
-      //
-      // `vision_tower` stays nullopt, which is already a supported engine state:
-      // it is what every load that named no `--mmproj` produces.
-      if (vllm::SkipTowerForModalities(&params.multimodal, {"image", "video"})) {
-        mmproj_tower_skipped = true;
+      if (vllm::IsClipMmprojGguf(*mmproj) &&
+          vllm::ClipProjectorType(*mmproj) == vllm::kClipProjectorDeepSeekV4) {
+        deepseek_v4_mmproj = &*mmproj;
+        // REFUSE HERE, before the tokenizer and every weight byte, for the same
+        // reason the Qwen3-VL arm below refuses here: a projector this build
+        // cannot load must cost the user a message, not a 91 GiB map followed
+        // by one. Only the READ is deferred, and it happens inside
+        // `LoadDeepseekV4ForCausalLM` because the tower belongs on the model.
+        multimodal::DeepSeekV4VisionConfig deepseek_v4_vision_config;
+        vllm::RefuseDeepSeekV4ClipMmprojArm(*mmproj, params.mmproj_path,
+                                            &deepseek_v4_vision_config);
       } else {
-        vision_tower =
-            vllm::LoadQwen3VLVisionFromClipMmproj(*mmproj, vision_config);
+        vllm::RefuseUnsupportedClipMmproj(*mmproj, params.mmproj_path);
+        vision_config = vllm::ClipMmprojVisionConfig(*mmproj);
+        // QUANT-QWEN38-27B-GGUF-ARM (#821): the projector's own accounting, and
+        // it runs BEFORE the read, so a file this reader would only partly
+        // consume costs a message rather than a silently incomplete tower.
+        vllm::RefuseUnaccountedClipMmproj(*mmproj, vision_config,
+                                          params.mmproj_path);
+        // #607 L3, the THIRD production tower load, and the one the first cut of
+        // this row missed. It is a tower like the other two: `--mmproj` names a
+        // projector, this reads every one of its tensors into owned host f32, and
+        // the engine holds them for the process lifetime. So
+        // `--language-model-only` zeroed every limit, refused every image request,
+        // AND STILL PAID FOR THE PROJECTOR — the exact L2 failure this row exists
+        // to close, surviving on the one architecture nothing was looking at.
+        //
+        // Gated on the same predicate and the same modality set as the two
+        // safetensors sites ({"image","video"} — interfaces.py:293 and
+        // qwen3_vl.py:1747), because this projector IS the Qwen3-VL tower, read
+        // out of a `clip` GGUF instead of out of the model's own shards. `image:
+        // 0` alone must therefore not skip it here either.
+        //
+        // ONLY THE READ IS CONDITIONAL. `GgufFile::Open`, both refusals and
+        // `ClipMmprojVisionConfig` above still run: that is the construct half of
+        // construct-without-initialise (utils.py:762), so the geometry resolves
+        // either way and a `--mmproj` this build cannot load is still refused by
+        // name rather than accepted in silence at zero limits. What stops is the
+        // storage — and with it the reader's own missing-tensor refusals, which is
+        // the mirror of `StageMissingLayer` keeping a skipped stage out of the
+        // loader's key accounting (utils.py:693-695).
+        //
+        // `vision_tower` stays nullopt, which is already a supported engine state:
+        // it is what every load that named no `--mmproj` produces.
+        if (vllm::SkipTowerForModalities(&params.multimodal, {"image", "video"})) {
+          mmproj_tower_skipped = true;
+        } else {
+          vision_tower =
+              vllm::LoadQwen3VLVisionFromClipMmproj(*mmproj, vision_config);
+        }
       }
     }
     tok::Tokenizer tokenizer = tok::Tokenizer::FromGguf(gguf);
@@ -3129,6 +3214,15 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
     // (see `gguf_device`).
     ModelSource gguf_source = ModelSource::FromGguf(gguf, gguf_device);
     gguf_source.multimodal = &params.multimodal;
+    // MODEL-MM-deepseek-v4 W4 (#2411): hand the projector to the architecture's
+    // own loader. Null for every other arm, and `ModelRegistry::Load` refuses a
+    // non-null one whose registration does not declare `consumes_mmproj`, so a
+    // DeepSeek projector named beside another family's language file costs a
+    // message rather than a tower-free engine that answers images as text.
+    gguf_source.mmproj = deepseek_v4_mmproj;
+    if (deepseek_v4_mmproj != nullptr) {
+      gguf_source.mmproj_path = params.mmproj_path;
+    }
     const auto t_gguf_weights = std::chrono::steady_clock::now();
     TtAllocTraceStage("load/stage/pre-registry-load");
     std::unique_ptr<LoadedModel> model = ModelRegistry::Load(config, gguf_source);

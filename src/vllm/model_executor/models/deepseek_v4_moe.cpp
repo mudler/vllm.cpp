@@ -35,9 +35,12 @@ MoeRouteResult SqrtSoftplusRouteTopk(const std::vector<float>& gating, int64_t n
                                      bool renormalize, float routed_scaling_factor,
                                      const std::vector<int64_t>& input_tokens,
                                      const std::vector<int32_t>& hash_indices_table,
-                                     int64_t vocab_size) {
+                                     int64_t vocab_size,
+                                     const std::vector<float>& vision_bias,
+                                     const std::vector<char>& is_media_token) {
   const bool has_bias = !e_score_correction_bias.empty();
   const bool is_hash = !hash_indices_table.empty() && !input_tokens.empty();
+  const bool any_media = !is_media_token.empty() && !vision_bias.empty();
 
   MoeRouteResult out;
   out.topk_ids.assign(static_cast<size_t>(num_tokens * topk), 0);
@@ -55,7 +58,15 @@ MoeRouteResult SqrtSoftplusRouteTopk(const std::vector<float>& gating, int64_t n
     int32_t* ids = out.topk_ids.data() + t * topk;
     float* w = out.topk_weights.data() + t * topk;
 
-    if (is_hash) {
+    // MODEL-MM-deepseek-v4 W4 (#2411): an IMAGE row takes the vision bias and
+    // the learned top-k route, on EVERY layer. On a hash layer that replaces
+    // the `tid2eid` lookup rather than adding to it, because the row has no
+    // token identifier to hash -- which is the same answer llama.cpp gives by
+    // skipping its hash branch for a whole media ubatch.
+    const bool media =
+        any_media && is_media_token[static_cast<size_t>(t)] != 0;
+
+    if (is_hash && !media) {
       // Hash MoE: experts are predetermined by the tid2eid lookup on the token
       // id; the bias is NOT used (a hash layer carries none). Weights are
       // gathered from the UNBIASED scores (fused_topk_bias_router.py:100-106,
@@ -68,8 +79,11 @@ MoeRouteResult SqrtSoftplusRouteTopk(const std::vector<float>& gating, int64_t n
       }
     } else {
       // scores_for_choice = scores + bias  (SELECTION ONLY).
+      const std::vector<float>& row_bias =
+          media ? vision_bias : e_score_correction_bias;
+      const bool row_has_bias = media ? true : has_bias;
       for (int64_t e = 0; e < num_experts; ++e) {
-        scores_for_choice[e] = has_bias ? scores[e] + e_score_correction_bias[e] : scores[e];
+        scores_for_choice[e] = row_has_bias ? scores[e] + row_bias[e] : scores[e];
       }
       // top-k by scores_for_choice, descending; ties → smaller expert index
       // (a stable partial sort — mirrors torch.topk(sorted=True) with a

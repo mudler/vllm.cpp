@@ -15,6 +15,8 @@
 // select), nvidia/ops/o_proj.py:58-73 (grouped output-LoRA), flashinfer_sparse.py
 // :777,:896 + attention.py:219-222 (attention sinks).
 #include "vllm/model_executor/models/deepseek_v4_dsa.h"
+#include "vllm/model_executor/models/deepseek_v4.h"
+#include "vllm/multimodal/deepseek_v4_processor.h"
 
 #include <doctest/doctest.h>
 
@@ -236,4 +238,224 @@ TEST_CASE("dsv4-mla: grouped output-LoRA vs independent double reference (rel-L2
     }
   }
   CHECK(RelL2(got, ref) < 1e-6);
+}
+
+// ── MODEL-MM-deepseek-v4 W4 (#2411): IMAGE-SPAN ATTENTION VISIBILITY ─────────
+//
+// `deepseek4.attention.sliding_window` is 128 and one image block reaches 384
+// tokens, so a window applied inside a span hides more than half of it. These
+// are INDEX tests on purpose: a 128-against-384 mismatch is exactly the case
+// where the argmax stays plausible while two thirds of the span is invisible,
+// so a token gate would pass through it.
+//
+// The rule has two upstream statements. llama.cpp's `swa_full_non_causal`
+// skips the window mask at and above the span start and applies it normally
+// below (`llama-hparams.h` and the `set_input_kq_mask_impl` hunk in
+// `llama-kv-cache.cpp` at `llama-cpp-dsv4vision`); the model author writes the
+// same rule as an index list in `get_window_topk_idxs_visible`
+// (`inference/model.py:289-299`).
+namespace {
+
+constexpr int64_t kSpanBegin = 1000;
+constexpr int64_t kSpanLen = 384;   // the released `vision_max_n_token`
+constexpr int64_t kWindow = 128;    // the released `attention.sliding_window`
+constexpr int64_t kKeys = 2000;
+
+std::vector<int64_t> Visible(int64_t query, int64_t window,
+                             const std::vector<vllm::DeepseekV4ImageSpan>& spans) {
+  std::vector<int64_t> out;
+  vllm::DeepseekV4VisibleRows(query, kKeys, window, spans, &out);
+  return out;
+}
+
+bool Sees(const std::vector<int64_t>& rows, int64_t r) {
+  for (const int64_t v : rows) {
+    if (v == r) return true;
+  }
+  return false;
+}
+
+bool AscendingAndUnique(const std::vector<int64_t>& rows) {
+  for (size_t i = 1; i < rows.size(); ++i) {
+    if (rows[i] <= rows[i - 1]) return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+TEST_CASE("dsv4 visibility: inside a 384-token span every position sees the WHOLE span") {
+  const std::vector<vllm::DeepseekV4ImageSpan> spans{
+      {kSpanBegin, kSpanBegin + kSpanLen}};
+  // A query 10 rows into the span. Causally it could see 11 span rows; the rule
+  // gives it all 384, which is the part no token gate can observe.
+  const int64_t q = kSpanBegin + 10;
+  const std::vector<int64_t> rows = Visible(q, kWindow, spans);
+  CHECK(AscendingAndUnique(rows));
+  CHECK(Sees(rows, kSpanBegin));
+  CHECK(Sees(rows, kSpanBegin + kSpanLen - 1));  // 373 rows AHEAD of the query
+  int64_t span_seen = 0;
+  for (int64_t r = kSpanBegin; r < kSpanBegin + kSpanLen; ++r) {
+    if (Sees(rows, r)) ++span_seen;
+  }
+  CHECK(span_seen == kSpanLen);
+  // A CAUSAL-ONLY implementation, which is what this branch built before W4,
+  // would see 11 of them. Stating the number the defect produces is what makes
+  // the assertion above a measurement rather than a restatement.
+  CHECK(span_seen != 11);
+
+  // The LAST position of the span sees the whole span too, and that is the
+  // direction a "causal plus the span so far" implementation also satisfies --
+  // so it is checked, and it is not what the case above rests on.
+  const std::vector<int64_t> last =
+      Visible(kSpanBegin + kSpanLen - 1, kWindow, spans);
+  int64_t last_seen = 0;
+  for (int64_t r = kSpanBegin; r < kSpanBegin + kSpanLen; ++r) {
+    if (Sees(last, r)) ++last_seen;
+  }
+  CHECK(last_seen == kSpanLen);
+}
+
+TEST_CASE("dsv4 visibility: below the span start the window still applies") {
+  const std::vector<vllm::DeepseekV4ImageSpan> spans{
+      {kSpanBegin, kSpanBegin + kSpanLen}};
+  const int64_t q = kSpanBegin + 10;
+  const std::vector<int64_t> rows = Visible(q, kWindow, spans);
+  // `sliding_window` is an INCLUSIVE count, so the oldest windowed row is
+  // `q - 127`. One row older than that is outside it and, being below the span
+  // start, is not exempt either.
+  CHECK(Sees(rows, q - (kWindow - 1)));
+  CHECK_FALSE(Sees(rows, q - kWindow));
+  CHECK_FALSE(Sees(rows, 0));
+  CHECK_FALSE(Sees(rows, kSpanBegin - 200));
+  // And nothing above the query that is outside the span is visible.
+  CHECK_FALSE(Sees(rows, kSpanBegin + kSpanLen));
+}
+
+TEST_CASE("dsv4 visibility: the exemption does NOT leak to a query after the span") {
+  const std::vector<vllm::DeepseekV4ImageSpan> spans{
+      {kSpanBegin, kSpanBegin + kSpanLen}};
+  // llama.cpp exempts the MEDIA ubatch; a later text token is not in it, so it
+  // takes the ordinary window and the span is simply old context.
+  const int64_t q = kSpanBegin + kSpanLen + 500;
+  const std::vector<int64_t> rows = Visible(q, kWindow, spans);
+  CHECK(AscendingAndUnique(rows));
+  CHECK(static_cast<int64_t>(rows.size()) == kWindow);
+  CHECK(rows.front() == q - (kWindow - 1));
+  CHECK(rows.back() == q);
+  CHECK_FALSE(Sees(rows, kSpanBegin));
+  CHECK_FALSE(Sees(rows, kSpanBegin + kSpanLen - 1));
+}
+
+TEST_CASE("dsv4 visibility: no span and no window is the dense causal list") {
+  const std::vector<vllm::DeepseekV4ImageSpan> none;
+  const std::vector<int64_t> rows = Visible(37, /*window=*/0, none);
+  REQUIRE(rows.size() == 38);
+  for (int64_t r = 0; r <= 37; ++r) CHECK(rows[static_cast<size_t>(r)] == r);
+}
+
+TEST_CASE("dsv4 visibility: with no window a span still adds its FORWARD half") {
+  const std::vector<vllm::DeepseekV4ImageSpan> spans{{10, 20}};
+  const std::vector<int64_t> rows = Visible(12, /*window=*/0, spans);
+  CHECK(AscendingAndUnique(rows));
+  // Full prefix 0..12, plus 13..19 from the span.
+  REQUIRE(rows.size() == 20);
+  CHECK(rows.front() == 0);
+  CHECK(rows.back() == 19);
+}
+
+TEST_CASE("dsv4 image spans: read from the step's OWN sentinel identifiers") {
+  const int32_t vocab = 129280;
+  const auto sentinel = [&](vllm::multimodal::DeepSeekV4ImageTokenType t) {
+    return static_cast<int32_t>(vocab + static_cast<int64_t>(t));
+  };
+  // [text, START, pad, image, END, text]
+  const std::vector<int32_t> ids{7,
+                                 sentinel(vllm::multimodal::kImageStart),
+                                 sentinel(vllm::multimodal::kImagePad),
+                                 sentinel(vllm::multimodal::kImage),
+                                 sentinel(vllm::multimodal::kImageEnd),
+                                 9};
+  const std::vector<vllm::DeepseekV4ImageSpan> spans =
+      vllm::DeepseekV4ImageSpans(ids, vocab);
+  REQUIRE(spans.size() == 1);
+  CHECK(spans[0].begin == 1);
+  CHECK(spans[0].end == 5);  // one past the END row
+
+  // `base` shifts the span into GLOBAL positions, which is what a chunked
+  // prefill hands the rule.
+  const std::vector<vllm::DeepseekV4ImageSpan> shifted =
+      vllm::DeepseekV4ImageSpans(ids, vocab, /*base=*/64);
+  REQUIRE(shifted.size() == 1);
+  CHECK(shifted[0].begin == 65);
+  CHECK(shifted[0].end == 69);
+
+  // A text step has none, which is what keeps every text forward byte-identical.
+  CHECK(vllm::DeepseekV4ImageSpans({1, 2, 3}, vocab).empty());
+
+  // A span cut by a chunk boundary is REFUSED, not truncated. Half a visible
+  // span answers fluently, which is the failure this refusal exists for.
+  const std::vector<int32_t> cut{7, sentinel(vllm::multimodal::kImageStart),
+                                 sentinel(vllm::multimodal::kImage)};
+  CHECK_THROWS(vllm::DeepseekV4ImageSpans(cut, vocab));
+
+  // THE TAIL of the same cut: an END with no START before it.
+  const std::vector<int32_t> tail{sentinel(vllm::multimodal::kImage),
+                                  sentinel(vllm::multimodal::kImageEnd), 9};
+  CHECK_THROWS(vllm::DeepseekV4ImageSpans(tail, vocab));
+
+  // AND THE MIDDLE, which the two above cannot see. A chunk cut from inside one
+  // block carries NEITHER identifier, so both partial checks stay silent; this
+  // used to return zero spans on a step made entirely of image rows, which left
+  // the visibility rule on the ordinary sliding window AND left the paged arm's
+  // non-empty-span refusal unarmed. `disable_chunked_mm_input` defaults to
+  // false and nothing in this tree can turn it on, so the shape is reachable
+  // from a served request the moment one exists.
+  const std::vector<int32_t> interior{sentinel(vllm::multimodal::kImage),
+                                      sentinel(vllm::multimodal::kImagePad),
+                                      sentinel(vllm::multimodal::kImage)};
+  CHECK_THROWS(vllm::DeepseekV4ImageSpans(interior, vocab));
+
+  // A block followed by a LOOSE image row is refused too: the accounting is
+  // over every media row, not merely over the outermost pair, so a step that
+  // closed one block and then began another mid-way is not read as whole.
+  const std::vector<int32_t> trailing{
+      sentinel(vllm::multimodal::kImageStart),
+      sentinel(vllm::multimodal::kImage),
+      sentinel(vllm::multimodal::kImageEnd),
+      sentinel(vllm::multimodal::kImage)};
+  CHECK_THROWS(vllm::DeepseekV4ImageSpans(trailing, vocab));
+
+  // THE PAD-ONLY CHUNK, and it is the boundary a chunked prefill cuts most
+  // often. `BuildDeepSeekV4ImageBlock` writes `compress_pad` PAD rows AHEAD of
+  // the START identifier, so a chunk that ends between those pads and the START
+  // carries NEITHER identifier and no image row that is not a pad: every
+  // in-loop check passes it and it opens no span. Only the trailing `pad_run`
+  // rule refuses it, and until this case nothing drove that rule -- a second,
+  // redundant refusal ran ahead of it and answered for it, so deleting the
+  // trailing rule left every case in this suite green.
+  //
+  // The count is asserted because it is what identifies WHICH rule fired: the
+  // trailing rule reports how many pads the step ends on, and no other refusal
+  // in this function reports a count.
+  const std::vector<int32_t> pad_only{7,
+                                      sentinel(vllm::multimodal::kImagePad),
+                                      sentinel(vllm::multimodal::kImagePad)};
+  std::string pad_only_message;
+  try {
+    (void)vllm::DeepseekV4ImageSpans(pad_only, vocab);
+  } catch (const std::exception& e) {
+    pad_only_message = e.what();
+  }
+  INFO("pad-only: ", pad_only_message);
+  CHECK(pad_only_message.find("2 image-pad row(s)") != std::string::npos);
+  CHECK(pad_only_message.find("scheduled whole") != std::string::npos);
+
+  // THE NEGATIVE CONTROL, from the W4 repair round. A row that is out of
+  // vocabulary but INSIDE a span this step closed is NOT refused. Without this
+  // every refusal above is satisfiable by refusing everything.
+  const std::vector<int32_t> whole{7, sentinel(vllm::multimodal::kImageStart),
+                                   sentinel(vllm::multimodal::kImage),
+                                   sentinel(vllm::multimodal::kImageEnd), 9};
+  CHECK(vllm::DeepseekV4ImageSpans(whole, vocab).size() == 1);
 }

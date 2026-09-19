@@ -14,6 +14,7 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -39,6 +40,7 @@
 #include "vllm/entrypoints/model_loader.h"
 #include "vllm/entrypoints/openai/protocol.h"
 #include "vllm/config/generation.h"
+#include "vllm/entrypoints/openai/mm_chat_registry.h"
 #include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/entrypoints/openai/serving_utils.h"
 #include "vllm/entrypoints/openai/tool_parsers/abstract.h"  // get_tool_parser
@@ -88,6 +90,13 @@ struct vllm_engine {
   // <model_path>/tokenizer_config.json default. Ignored for a .gguf model_path
   // (its template lives in GGUF metadata).
   std::string tokenizer_config_path;
+  // ABI v22 vllm_model_params.mmproj_path: the SECOND GGUF this engine was
+  // loaded with, empty when none. Kept because the multimodal chat seam's
+  // install context carries it: for a two-file vehicle it is the only thing
+  // that can say whether the vision half arrived, and an architecture whose
+  // string names both a text and a vision checkpoint cannot answer that
+  // itself (MODEL-MM-deepseek-v4, #2411).
+  std::string mmproj_path;
   // Test-hook override for the chat-prompt seam (MakeEngineHandle overload):
   // when set, chat_serving is built with it instead of the resolved template.
   vllm::entrypoints::openai::ChatPromptFn test_prompt_fn;
@@ -382,6 +391,10 @@ vllm::entrypoints::openai::OpenAIServingChat& EnsureChatServing(
         engine->model_path.empty()
             ? std::string("model")
             : std::filesystem::path(engine->model_path).filename().string();
+    // Copied before the move: the multimodal install context below needs both,
+    // and `OpenAIServingChat` publishes neither.
+    const std::string served_name_copy = served_name;
+    const vllm::entrypoints::openai::ChatPromptFn prompt_fn_copy = prompt_fn;
     engine->chat_serving =
         std::make_unique<vllm::entrypoints::openai::OpenAIServingChat>(
             engine->loaded->async_engine(), std::move(served_name),
@@ -397,6 +410,51 @@ vllm::entrypoints::openai::OpenAIServingChat& EnsureChatServing(
     engine->chat_serving->set_default_sampling_params(
         vllm::GetDiffSamplingParam(engine->loaded->config(),
                                    vllm::kGenerationConfigAuto));
+
+    // ── THE MULTIMODAL CHAT SEAM, on the ABI's own chat handler ─────────────
+    //
+    // MODEL-MM-deepseek-v4 W5 (#2411). `include/vllm.h` said for four ABI
+    // versions that this library had NO multimodal chat request path: a chat
+    // body carrying an `image_url` content part was answered as TEXT, with the
+    // part silently dropped, because `server_main.cpp` was the only caller of
+    // `InstallMultiModalChatSeam` and `vllm_chat` never installed one. That
+    // made every shipped multimodal capability reachable only from the bundled
+    // HTTP server, which AGENTS.md "Shared seams" does not allow: the ABI is
+    // the surface and the server is a client of it.
+    //
+    // It is the SAME function `server_main.cpp` calls, given the SAME context,
+    // including the same `DefaultImageCodec` -- two entry points of one library
+    // must not accept different containers.
+    //
+    // A TEXT architecture is byte-identical. `is_multimodal_model()` is the
+    // architecture's own declaration, and the install's `kTextOnlyModel` arm
+    // wires nothing at all, so `serving_chat.cpp`'s `if (mm_chat_fn_)` gate is
+    // never taken and the chat path is exactly what it was.
+    vllm::entrypoints::openai::MultiModalChatContext mm_ctx;
+    mm_ctx.architecture = std::string(engine->loaded->architecture());
+    // For a `.gguf` model_path the "directory" is the file's parent, which is
+    // what a factory reading a sibling config by name expects; for a directory
+    // it is the directory itself.
+    const std::filesystem::path model_path(engine->model_path);
+    mm_ctx.model_dir =
+        std::filesystem::is_directory(model_path)
+            ? model_path.string()
+            : model_path.parent_path().string();
+    mm_ctx.config_path = (std::filesystem::path(mm_ctx.model_dir) /
+                          "config.json").string();
+    mm_ctx.served_model_name = served_name_copy;
+    mm_ctx.tokenizer = &engine->loaded->tokenizer();
+    mm_ctx.prompt_fn = prompt_fn_copy;
+    mm_ctx.codec = vllm::entrypoints::openai::DefaultImageCodec();
+    mm_ctx.mm_config = &engine->loaded->mm_config();
+    mm_ctx.config = &engine->loaded->config();
+    mm_ctx.mmproj_path = engine->mmproj_path;
+    // The install announces every outcome on the stream it is given, exactly as
+    // it does for the server; there is no arm that installs nothing on a model
+    // that says it is multimodal.
+    (void)vllm::entrypoints::openai::InstallMultiModalChatSeam(
+        *engine->chat_serving, engine->loaded->is_multimodal_model(), mm_ctx,
+        std::cerr);
   }
   return *engine->chat_serving;
 }
@@ -825,6 +883,7 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
     auto* handle = new vllm_engine;
     handle->loaded = std::move(loaded);
     handle->model_path = params->model_path;
+    if (params->mmproj_path != nullptr) handle->mmproj_path = params->mmproj_path;
     // ABI v9: an explicit tokenizer_config.json override for the chat template.
     if (params->tokenizer_config_path != nullptr)
       handle->tokenizer_config_path = params->tokenizer_config_path;

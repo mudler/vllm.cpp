@@ -230,7 +230,7 @@ Scheduler::Scheduler(SchedulerConfig scheduler_config,
                      StructuredOutputManager* structured_output_manager,
                      std::optional<SpeculativeConfig> speculative_config,
                      const distributed::KVEventsConfig* kv_events_config,
-                     int data_parallel_rank)
+                     int data_parallel_rank, int hash_block_size)
     : max_num_running_reqs(scheduler_config.max_num_seqs),
       max_num_scheduled_tokens(
           scheduler_config.ResolvedMaxNumScheduledTokens()),
@@ -266,15 +266,26 @@ Scheduler::Scheduler(SchedulerConfig scheduler_config,
   kv_event_publisher_ = distributed::EventPublisherFactory::create(
       kv_events_config, data_parallel_rank);
 
-  // Build the KV cache manager (upstream scheduler.py ctor). hash_block_size
-  // defaults to block_size; use_eagle off and dcp/pcp world sizes 1 at T0.
+  // Build the KV cache manager (upstream scheduler.py ctor). use_eagle off and
+  // dcp/pcp world sizes 1 at T0.
   //
+  // `hash_block_size` is the CALLER'S when it gave one and `block_size`
+  // otherwise, which is upstream's `if hash_block_size is None:
+  // hash_block_size = block_size` (scheduler.py:268-270). This line used to
+  // spell `block_size` unconditionally, and that is what aborted `vllm serve`
+  // on DeepSeek-V4: the engine strides 256 while the architecture's SWA group
+  // pages at 64, and `UnitaryKVCacheCoordinator` asserts the hash granularity
+  // equals the group's block size (kv_cache_coordinator.py:516 @ e126687a9a).
+  // A hard-coded equality cannot express a model whose groups page smaller.
+  const int resolved_hash_block_size =
+      hash_block_size > 0 ? hash_block_size : block_size;
+
   // log_stats is ON: upstream's `disable_log_stats` defaults False, and the
   // benchmark protocol VOIDS any caching arm that cannot report queries/hits.
   // Cost is three integer adds per admitted request.
   kv_cache_manager = std::make_unique<KVCacheManager>(
       kv_cache_config_, max_model_len, /*scheduler_block_size=*/block_size,
-      /*hash_block_size=*/block_size,
+      resolved_hash_block_size,
       /*max_num_batched_tokens=*/scheduler_config.max_num_batched_tokens,
       enable_caching, /*use_eagle=*/false, /*log_stats=*/true,
       enable_kv_cache_events_, /*dcp_world_size=*/1,

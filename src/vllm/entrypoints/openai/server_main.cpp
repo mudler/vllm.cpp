@@ -1546,41 +1546,27 @@ int VllmServerMain(int argc, char** argv) {
     mm_ctx.served_model_name = served_model_name;
     mm_ctx.tokenizer = &tokenizer;
     mm_ctx.prompt_fn = chat_prompt_fn;
-    // The container-format image codec (PNG/JPEG → RGB) is a NAMED MM-SERVE
-    // residual: no codec is vendored, so this one rejects encoded images with a
-    // clear message and the M2c single-sequence gate's raw RGB passes through.
-    // It belongs to the SERVER and not to an architecture, which is why it is
-    // supplied here once for every factory rather than grown per model.
-    mm_ctx.codec = [](const oai::DecodedMedia& media) -> oai::DecodedImageRgb {
-      // Raw-RGB passthrough (image/x-raw-rgb): the single-sequence e2e /
-      // gate fixture format. A square raw-RGB payload is decoded directly;
-      // any container format (PNG/JPEG) is the NAMED codec residual.
-      if (media.media_type == "image/x-raw-rgb") {
-        const std::size_t n = media.bytes.size();
-        const std::size_t px = n / 3;
-        const auto side =
-            static_cast<int64_t>(std::llround(std::sqrt(
-                static_cast<double>(px))));
-        if (side <= 0 || static_cast<std::size_t>(side * side * 3) != n) {
-          throw std::runtime_error(
-              "image/x-raw-rgb payload is not a square HxWx3 buffer");
-        }
-        oai::DecodedImageRgb out;
-        out.rgb = media.bytes;
-        out.height = side;
-        out.width = side;
-        return out;
-      }
-      throw std::runtime_error(
-          "multimodal image: container-format decode (PNG/JPEG -> RGB) is a "
-          "named MM-SERVE residual; supply raw RGB (image/x-raw-rgb)");
-    };
+    // The ONE image codec, shared with the `vllm_chat` install through
+    // `include/vllm.h` so the two entry points of one library cannot accept
+    // different containers. The container-format decode (PNG/JPEG -> RGB) is a
+    // NAMED MM-SERVE residual and this codec refuses it by name; it belongs to
+    // the LIBRARY and not to an architecture, which is why it is supplied here
+    // once for every factory rather than grown per model.
+    mm_ctx.codec = oai::DefaultImageCodec();
     // #607 L2 / #686: where --limit-mm-per-prompt / --language-model-only
     // landed. The seam folds them by min() against the architecture's own
     // ceiling, so a three-image request is answered with HTTP 400 "At most 1
     // image(s) may be provided in one prompt." instead of being served with its
     // first image.
     mm_ctx.mm_config = &loaded->mm_config();
+    // The RESOLVED config, not `config.json`. A `.gguf` checkpoint has no such
+    // file, and a factory whose processor is keyed on `vocab_size` -- as
+    // DeepSeek-V4's is, because it spells every image position
+    // `vocab_size + type` -- would otherwise have to guess it.
+    mm_ctx.config = &loaded->config();
+    // The `--mmproj` second file, so a factory can refuse a tower-free load at
+    // INSTALL rather than inside the engine's busy loop.
+    mm_ctx.mmproj_path = args.mmproj_path;
     oai::InstallMultiModalChatSeam(chat, loaded->is_multimodal_model(), mm_ctx,
                                    std::cerr);
 

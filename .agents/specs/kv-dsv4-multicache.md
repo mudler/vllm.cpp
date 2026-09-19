@@ -13,6 +13,23 @@ recorded at `include/vllm/model_executor/models/deepseek_v4.h:13`.
 
 ## Now
 
+`ACTIVE` — **W8 slices 4 and 6 landed (2026-09-11,
+[#2455](https://github.com/mudler/vllm.cpp/issues/2455)), and DeepSeek-V4 now
+CONSTRUCTS on a default configuration.** `--kv-cache-dtype auto` stopped
+refusing the layout the model's own factory published, and the packed
+fp8_ds_mla page is written and read from the model through
+`vt::ConcatAndCacheDsMla` / `vt::DequantAndGatherDsMla` -- the first callers
+either op has ever had. See `### W8 design` and this document's `## Owed`.
+
+**The paragraphs below are the W1-W3 history and two of their sentences are
+STALE.** "Still nothing reads a cache" and "W4 through W7 remain proposals with
+no owner" were true when written and are not now: W5 landed
+([#2323](https://github.com/mudler/vllm.cpp/issues/2323)), `consumes_multi_kv`
+exists, DeepSeek-V4 sets it, and `ModelRegistry::Forward` gates on
+`MultiKvRefusalApplies` rather than refusing unconditionally. They are marked
+rather than deleted, because a reader who met them deserves to see the
+correction beside them.
+
 `ACTIVE` — W1 ([#1960](https://github.com/mudler/vllm.cpp/issues/1960)) landed
 as `c1e6f3fb9`: the KV-cache spec hierarchy gained `SlidingWindowMLASpec`, the
 four DeepSeek-V4 fields on `MLAAttentionSpec`, both `storage_block_size()`
@@ -1770,6 +1787,77 @@ Findings 4 and 5 are record repairs, made while the append-only index row is
 still correctable. Finding 6 is #2085, owed with its own line.
 
 
+### W8 slice 4 third-repair-round evidence
+
+A third independent review of `714c342d4` PASSED all five claims and returned
+three findings, none of which falsified a claim. This round repairs them.
+
+**THE BUILD CONFIGURATION IS RECORDED HERE BECAUSE IT WAS THE FINDING.** The
+slice-4 rounds above record md5s and pass counts and name no build type, so the
+numbers could not be reproduced from the record alone — and the lane this
+document declares (`CPU Release`, `:1155` and `:1716`) turned out not to compile
+the suite at all. Measured in `/home/mudler/.cache/kv-w8-s4-repair3`:
+
+| axis | value |
+|---|---|
+| build type | `Release` (`-O3 -DNDEBUG`) |
+| configure | `cmake -S . -B build-rel -G Ninja -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF` |
+| compiler | `g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0` |
+| cmake / generator | `3.28.3` / Ninja |
+| per-TU flags, verbatim | `-O3 -DNDEBUG -std=c++20 -fPIE -ffp-contract=off -Wall -Wextra -Werror` |
+
+**FINDING 3 — THE DECLARED GATE LANE DID NOT BUILD, and it was pre-existing.**
+In CPU Release the suite failed `-Werror=stringop-overflow=` at
+`test_deepseek_v4_gguf_load.cpp:1468`, inside the case this row landed at
+`0ca5f1b13`; every measurement above was in fact taken in `RelWithDebInfo`. The
+diagnostic names its own cause: a `memset` bound "between 9223372036854775808
+and 18446744073709551615", i.e. `[2^63, 2^64)` — the range a NEGATIVE `int64_t`
+occupies once cast to `size_t`. `padded_block_bytes` is an `int64_t` the shared
+packer returns, nothing in that TU proves it non-negative, and at `-O3` GCC
+inlines `vector::assign` to that `memset`. **The repair establishes the bound
+(`REQUIRE(block_bytes > 0)` / `REQUIRE(num_blocks > 0)`) at all three sites that
+size a page buffer this way, rather than suppressing the diagnostic**: a pragma
+would have left an unproven precondition standing under every index derived from
+the same value.
+
+**FINDING 1 — THE EXL3 CASE RESUMED OVER HISTORY NOTHING WROTE.** It set
+`kv_base = 4` with no prior step, so rows 0..3 were still `0xA5` and
+`CHECK(NonFinite(out.host) == 0)` was a property of the fp8 decoder applied to
+poison. It now drives a real history, **in four one-token steps rather than the
+GGUF sibling's single four-token one, and that shape is forced**: this junction
+passes `have_compressor_state = true` (`deepseek_v4_registry.cpp:184`), so
+`deepseek_v4.cpp:3743` refuses any step carrying more than one token. The source
+comment's existing reason — that `CompressorLayerStep`'s `seen == kv_base` guard
+never runs on a compressor-free fixture — was accurate and is kept; what it
+omitted was that the history still had to be written by something.
+
+**FINDING 2 — THE HISTORY COMPARISON COVERED ONLY THE DATA REGION.** A token's
+8 scale bytes sit at `scale_region_offset + row * scale_dim`, in a different
+region from its 576 data bytes (`cache_utils.py:59-66`), so a defect rewriting
+only history SCALE bytes moved no data byte and passed both arms unseen. Both
+comparisons now cover both regions.
+
+| what | result |
+|---|---|
+| red before (Finding 3), CPU Release | `ninja rc=1` at `555/559`; `error: 'void* __builtin_memset(void*, int, long unsigned int)' specified bound between 9223372036854775808 and 18446744073709551615 exceeds maximum object size 9223372036854775807 [-Werror=stringop-overflow=]`, inlined from `vector::assign` at `test_deepseek_v4_gguf_load.cpp:1468:42` |
+| green after | `ninja rc=0`, ZERO diagnostics; `test_deepseek_v4_gguf_load` **21 cases / 1143 assertions**, `test_deepseek_v4_exl3_loader` **23 cases / 640 assertions**, both SUCCESS |
+| assertion deltas | `+4` GGUF and `+10` EXL3 against `714c342d4`'s 1139/630, accounted exactly: two bound assertions per packed-page case, plus the four warm steps' two assertions each. Case counts UNCHANGED at 21 and 23 |
+| binaries present vs registered | **2 present, 750 registered.** Only the two named targets were built; the rest of the registered suite was NOT built and is therefore not a pass. Stated rather than implied |
+
+Two mutations, each recorded as build rc, then the binary md5 DELTA, and only
+then the verdict — a mutant that fails to compile leaves the old binary and
+reports a green that measured nothing.
+
+| mutation | ninja | binary md5 | run | verdict |
+|---|---|---|---|---|
+| **Finding 1**: `kv_base` -> literal `0` at the EXL3 junction (`deepseek_v4_registry.cpp:187-190`) | rc=0 | `45864b73…` -> `30830261…` | 23 cases, 2 failed, **6 assertions failed**: `:1782` `CHECK(moved)`, `:1785` the zero scale pad and `:1810` `CHECK(below == 0)`, on both layers, beside the pre-existing `:1317` | RED — giving the case a real history did not weaken the `kv_base` gate |
+| **Finding 2**: corrupt ONLY history scale bytes (one XOR on row 0's scale byte in `Fp8DsMlaStoreToken`, touching no data byte) | rc=0 | `49ef573d…` -> `5f500753…`, `45864b73…` -> `964992a4…` | GGUF: **the single failing assertion is `:1854` `REQUIRE(now_sc[i] == was_sc[i])`** — the NEW scale comparison — while `:1843`, the old data-only one, stayed GREEN under the identical mutant. EXL3: `:1810` `CHECK(below == 0)` on both layers | RED where the old assertion was BLIND — which is the whole claim |
+
+Both files restored byte-for-byte, sha256 verified equal
+(`deepseek_v4_registry.cpp` `3aba8a41…`, `deepseek_v4_compressor.cpp`
+`90dbb48d…`), rebuilt, and both binaries returned to their green-after md5s with
+both suites green again.
+
 
 ## Gates
 
@@ -2098,30 +2186,75 @@ config parse and upstream's disagree about the layer partition (that would be a
   [#2068](https://github.com/mudler/vllm.cpp/issues/2068).
 
 
-- **W8 slices 1, 2 and 3 have landed UNREACHED**
-  ([#2455](https://github.com/mudler/vllm.cpp/issues/2455)).
-  Slice 1 is the host packer -- `Fp8DsMlaPageLayout` / `MakeFp8DsMlaPageLayout` /
-  `Fp8DsMlaStoreToken` / `Fp8DsMlaLoadToken` in `deepseek_v4_compressor.{h,cpp}`,
-  beside the existing encode/decode pair. Slices 2 and 3 are the two ops built on
-  it: `vt::ConcatAndCacheDsMla` (`OpId::kConcatAndCacheDsMla`) and
-  `vt::DequantAndGatherDsMla` (`OpId::kDequantAndGatherDsMla`), CPU arms in
-  `src/vt/cpu/cpu_cache.cpp`, gated byte-exactly against a poison-filled block in
-  `tests/vt/test_ops_ds_mla_cache.cpp`.
+- **W8 slices 4 and 6 have LANDED, and the packed page is REACHED. Slice 5 is
+  what remains** ([#2455](https://github.com/mudler/vllm.cpp/issues/2455)).
 
-  **Nothing calls either op.** No model edit, no registry, no `include/vllm.h`
-  entry. That is deliberate rather than forgotten: the packer is the single host
-  reference the CUDA kernels of slice 5 are the other port of, so the layout is
-  written and gated once rather than three times, and the ops are the seam slice 4
-  routes onto. A slice that landed the model bridge first would have had nothing
-  byte-comparable to route TO.
+  Slices 1, 2 and 3 landed the host packer (`Fp8DsMlaPageLayout` /
+  `MakeFp8DsMlaPageLayout` / `Fp8DsMlaStoreToken` / `Fp8DsMlaLoadToken` in
+  `deepseek_v4_compressor.{h,cpp}`) and the two ops built on it,
+  `vt::ConcatAndCacheDsMla` and `vt::DequantAndGatherDsMla`, with CPU arms in
+  `src/vt/cpu/cpu_cache.cpp` gated byte-exactly against a poison-filled block in
+  `tests/vt/test_ops_ds_mla_cache.cpp`. **This entry recorded that NOTHING CALLED
+  EITHER OP**, which was true for three slices and is no longer true.
 
-  What is owed is the wiring, and it is `### W8 design` slices 4 through 6 in
-  this document: the model bridge in `deepseek_v4.cpp` /
-  `ResolveDeepseekV4SwaPages` that picks the packed store when the bound page is
-  `kI8`/fp8_ds_mla, the CUDA arms, and only then the `ApplyCacheDType` resolution
-  question. Until slice 4 lands, `ApplyCacheDType` still refuses every
-  `MLAAttentionSpec` on the default path and the real artifact still dies there.
-  Owned by this row, tracked under
+  **Slice 4 is the caller.** `ResolveDeepseekV4SwaPages` binds a PACKED page
+  instead of refusing it, as a rank-2 `[num_blocks, block_bytes]` byte view --
+  the shape the region split forces, because a token's scale bytes sit in a
+  different region from its data (`cache_utils.py:59-66`). `AttentionBlock`
+  stores through `vt::ConcatAndCacheDsMla` and reads through
+  `vt::DequantAndGatherDsMla` into an f32 scratch that the existing
+  `vt::MlaDecodeAttention` consumes unchanged, mirroring upstream's own split
+  between a dequant-gathering prefill (`nvidia/flashmla.py:296`) and a vendor
+  decode kernel (`:219-226`) this tree does not have.
+
+  **Slice 6 changed RESOLUTION, not the guard.** `auto` now means "use the dtype
+  the model's factory resolved", mirroring `_resolve_dsv4_kv_cache_dtype` writing
+  `cache_dtype = "fp8_ds_mla"` back onto the cache config
+  (`attention.py:89-119`). `RetypeAttentionSpec`'s MLA refusal is untouched and
+  still fires for every explicit override. It also closed two SILENT defects the
+  original entry never named: the indexer key cache (`kI8`, no `cache_dtype_str`)
+  hit that refusal, and the three f32 compressor state caches are
+  `SlidingWindowMLASpec`, which derives from `SlidingWindowSpec` and so never
+  reached the MLA guard at all -- they passed the float branch and had
+  `spec.dtype = kBF16` written over a page the runner allocates in f32.
+
+  **`PagedKvCache` gained `page_size_bytes`**, filled only by
+  `GPUModelRunner::initialize_kv_cache`. That is the expressible half of
+  [#2085](https://github.com/mudler/vllm.cpp/issues/2085): the view
+  (`block_size * head_size` = 32768) and the allocated page (37440) disagree by
+  design for this spec, and a packed store that believed the view would overrun
+  the block by 3.5x.
+
+  **What is still owed here.** Slice 5, the CUDA arms of both ops, byte-compared
+  against the CPU kernels; this wave is CPU-only. And a COMPRESSOR layer with a
+  packed page still REFUSES by name: `CompressorLayerStep` attends its window
+  through `vt::MlaDecodeAttention`, which takes a rank-3 float cache, so a
+  region-split byte page is not expressible there. Dequantising that window is
+  owed to `MODEL-DSV4-DSA-COMPOSE`
+  ([#2286](https://github.com/mudler/vllm.cpp/issues/2286)) and
+  `MODEL-DSV4-PAGED-ENTRY`
+  ([#2447](https://github.com/mudler/vllm.cpp/issues/2447)).
+
+  **That refusal is PER STEP, not per layer, and an earlier wording of this
+  entry got it wrong.** `ResolveDeepseekV4SwaPages` returns a refusal string on
+  the FIRST compressor layer it meets, and `ForwardDeepseekV4ForCausalLM` then
+  does `VT_CHECK(refusal.empty(), refusal)`.
+
+  **Which refusal fires first is NOT the packed-page branch, and this entry
+  named the wrong one.** On the released topology the GGUF arm passes
+  `dsa_dense = true`, and the resolver's `DeepseekV4PagedArmComposesCompressor`
+  loop (`src/vllm/model_executor/models/deepseek_v4.cpp`, the loop above the
+  per-layer page-format branch) runs FIRST and refuses layer 2 outright -- a
+  layer whose compressor this arm does not compose would attend the raw prefix.
+  The packed-page branch, which is what the previous wording cited, is never
+  reached on that topology, so it cannot be the clause that refuses. The
+  conclusion below is unchanged; only the clause responsible for it is
+  corrected. No layer binds a page when any layer is refused, so reachability is
+  all-or-nothing for the whole step. On the released 43-layer topology, where
+  layers 2-42 all carry compressors, ZERO layers bind a packed page and the step
+  throws. The packed path is therefore reachable today only on a topology whose
+  every layer is SWA-only, which is what the gate drives; the released artifact
+  is not one. Owned by this row, tracked under
   [#2455](https://github.com/mudler/vllm.cpp/issues/2455).
 
 ## Evidence

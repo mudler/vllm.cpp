@@ -270,12 +270,14 @@ only when it appears in this table and has a recorded pin:
 | vLLM | `vllm` | always, as the primary wherever it implements the behavior |
 | vLLM-Omni | `vllm-omni` | diffusion, TTS, and omni-only architectures that vLLM does not register |
 | HuggingFace `transformers` | `transformers` | a model, processor, or tokenizer reference implementation that vLLM mirrors |
+| DeepSeek `DeepSeek-V4-Flash-Vision-Exp` | `deepseek-v4-vision` | the model-author prompt encoder, image processor, ViT, aligner and image-span visibility, which vLLM and Transformers do not implement |
 | `diffusers` | `diffusers` | schedulers, VAEs, and diffusion pipelines |
 | Lightricks `LTX-2` | `ltx-2` | the LTX-2.5 architecture and pipeline recipes, from the model author's own runtime, for the generations and defaults vLLM-Omni's `ltx2` registration does not reach |
 | SGLang | `sglang` | a model or serving path that SGLang implements and vLLM does not |
 | SGLang-Omni | `sglang-omni` | omni, speech, TTS, and music models served by SGLang's pipeline runtime, in a third repository that is not SGLang |
 | llama.cpp | `llama-cpp` | CPU and GGUF k-quant floors |
 | `unslothai/llama.cpp` fork | `llama-cpp-unsloth` | the sub-IQ1_S quant encodings (IQ1_XS, IQ1_XXS, IQ1_XXXS) that no upstream llama.cpp defines, and that a published Qwen3.8-2.4T checkpoint stores its experts in |
+| llama.cpp release `b10766` | `llama-cpp-dsv4vision` | the `deepseek4` VISION variant: the `deepseek4v` clip projector, its mmproj container, the `exp_probs_b_vl` media routing bias and the non-causal image-span window, none of which the stock `llama-cpp` pin at `b10451` contains |
 | `ggml-org/llama.cpp` PR #27742 | `llama-cpp-qwen4exp` | the `qwen4exp` architecture, its GGUF conversion and its graph, which no released llama.cpp defines, so the stock `llama-cpp` pin cannot supply a denominator for it |
 | `ggml-org/llama.cpp` PR #27752 | `llama-cpp-glm5next` | the `glm5next` TEXT architecture, its GGUF conversion and its graph, which no released llama.cpp defines either; it is the head whose architecture string matches the published artifact, and it carries no vision tower |
 | turboderp-org `exllamav3` | `exllamav3` | the EXL3 trellis quantization format and its kernels, and the DeepSeek-V4 support the pinned HEAD carries, which neither vLLM nor vLLM-Omni implements |

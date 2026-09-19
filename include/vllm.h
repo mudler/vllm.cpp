@@ -192,28 +192,43 @@ extern "C" {
  * fields land on the engine's ONE MultiModalConfig
  * (vllm_engine_load -> EngineParams::multimodal -> LoadedEngine::mm_config()),
  * and that config is what BaseProcessingInfo::ValidateNumItems refuses against.
- * The caller that reaches ValidateNumItems on a live request is the OPENAI
- * SERVER: it is the one place that installs the multimodal chat seam
- * (server_main.cpp `oai::InstallMultiModalChatSeam(...)`, which since #2475 is
- * the ONE production caller of `set_multimodal_chat_fn` and dispatches on the
- * model's architecture), and serving_chat.cpp
- * gates the whole multimodal branch on that seam being set. So a server started
- * with --language-model-only answers a multimodal chat request with HTTP 400
+ * The caller that reaches ValidateNumItems on a live request is the multimodal
+ * chat seam, installed by `oai::InstallMultiModalChatSeam(...)`, which since
+ * #2475 is the ONE production caller of `set_multimodal_chat_fn` and dispatches
+ * on the model's architecture; serving_chat.cpp gates the whole multimodal
+ * branch on that seam being set. So an engine loaded with
+ * language_model_only=1 answers a multimodal chat request with
  * "At most 0 image(s) may be provided in one prompt." rather than serving it.
  *
- * THIS ABI HAS NO MULTIMODAL CHAT REQUEST PATH YET, so on a C-ABI engine the
- * two fields are RECORDED and read by nothing the ABI itself can reach.
- * vllm_chat / vllm_chat_stream never install that seam. A chat request whose
- * content array carries an `image_url` part is therefore answered as TEXT: the
- * part is dropped, its text siblings still form the prompt, no limit is
- * consulted, and language_model_only changes neither the status nor the body.
- * Setting these fields configures the ENGINE — including an OpenAI server built
- * on one — but it does not make a C-ABI chat call refuse an image. Carrying
- * media across this ABI is a later version, and the refusal arm becomes
- * reachable from here only when it lands. That is pinned behaviourally by
- * tests/capi/test_capi.cpp ("capi: the v19 limits are RECORDED on a C-ABI
- * engine; there is no multimodal request path to enforce them on"), so this
+ * THIS ABI CARRIES A MULTIMODAL CHAT REQUEST PATH since MODEL-MM-deepseek-v4 W5
+ * (issue #2411). It used to have none: `server_main.cpp` was the sole caller of
+ * that install, so a chat body carrying an `image_url` part was answered as
+ * TEXT with the part silently dropped, and every shipped multimodal capability
+ * was reachable only from the bundled HTTP server. `vllm_chat` and
+ * `vllm_chat_stream` now install the SAME seam with the SAME context, so the
+ * three outcomes a C-ABI caller can get are exactly the server's:
+ *   - a TEXT architecture installs nothing and the chat path is byte-identical
+ *     to every earlier version;
+ *   - a registered multimodal architecture SERVES the image, subject to these
+ *     two fields;
+ *   - a multimodal architecture with no registered chat seam, or one whose
+ *     factory refuses, REFUSES the request with VLLM_ERR_INVALID_ARGUMENT and
+ *     a vllm_last_error() naming the architecture and the missing part — never
+ *     a silent text answer, because an image request answered as text looks
+ *     like a working engine.
+ * The image bytes travel in the request JSON itself, as an OpenAI `image_url`
+ * content part; there is no new ABI symbol and no struct field for media.
+ * The CONTAINER-FORMAT decode (PNG/JPEG -> RGB) and the http(s) fetch are NAMED
+ * residuals: the one codec this library ships decodes raw RGB
+ * (`image/x-raw-rgb`) and refuses everything else by name. A request that hits
+ * either is a caller error and is reported as one.
+ * That is pinned behaviourally by tests/capi/test_capi.cpp ("capi: a multimodal
+ * chat request is ANSWERED or REFUSED, never silently served as text"), so this
  * paragraph cannot silently become false.
+ * NO ABI VERSION BUMP CARRIES THIS: no symbol and no struct field changed, so
+ * a client compiled against v26 links and runs unchanged. What changed is what
+ * an engine DOES with a request it already accepted, which is why the change is
+ * recorded in this paragraph and pinned by that test rather than by a number.
  * The memory win upstream also gets from zero limits (skipping the vision tower
  * weights, interfaces.py:293) is NOT in this version — it is wave L3, and until
  * it lands and is MEASURED this field must not be described as freeing VRAM.
@@ -286,11 +301,13 @@ extern "C" {
  * them and the failure would be a wrong-shaped model rather than an error.
  *
  * SCOPE, and it carries the same weight as the field: this loads the tower and
- * hands it to the engine. THIS ABI STILL HAS NO MULTIMODAL REQUEST PATH, so
- * `vllm_chat` / `vllm_generate` cannot yet feed the tower an image — exactly
- * the state the v19 note above records for the multimodal limits. What the
- * field buys today is that the projector is READ, VALIDATED and REFUSED BY
- * NAME at load instead of being unnameable.
+ * hands it to the engine, and since MODEL-MM-deepseek-v4 W5 (issue #2411)
+ * `vllm_chat` / `vllm_chat_stream` can FEED it — see the v19 note above for the
+ * three outcomes a multimodal chat request can get. The path is the request
+ * JSON's own `image_url` content part; `vllm_generate` still takes text only.
+ * A two-file vehicle whose second file was NOT named refuses an image request
+ * at install rather than inside the engine's busy loop, so the omission costs
+ * one refusal naming `--mmproj` rather than every later request.
  *
  * Appended at the END of vllm_model_params, so a zero-initialized v21 struct is
  * byte-identical: NULL/empty means no projector, which is every load that

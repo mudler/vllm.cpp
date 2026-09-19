@@ -803,6 +803,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/deepseek_v2_weights.cpp
   src/vllm/model_executor/models/deepseek_v2.cpp
   src/vllm/model_executor/models/deepseek_v4_registry.cpp
+  src/vllm/model_executor/models/deepseek_v4_mm.cpp
   # DeepSeek-V4.1 is a SIBLING of V4, not a widening of it: upstream forked
   # `vllm/models/deepseek_v4_1/` from `vllm/models/deepseek_v4/`, and the two
   # disagree on values the V4 parser hard-validates (compress_ratios {0,1,2}
@@ -816,6 +817,7 @@ add_library(vllm STATIC
   # `## Owed`).
   src/vllm/model_executor/models/deepseek_v4_1_indexer.cpp
   src/vllm/model_executor/models/deepseek_v4_weights.cpp
+  src/vllm/model_executor/models/deepseek_v4_vision_weights.cpp
   src/vllm/model_executor/models/deepseek_v4.cpp
   src/vllm/model_executor/models/deepseek_v4_dsa.cpp
   src/vllm/model_executor/models/deepseek_v4_dspark.cpp
@@ -1094,6 +1096,7 @@ add_library(vllm STATIC
   # SAME Qwen3VLVisionWeights from a SECOND GGUF file beside the language one.
   src/vllm/model_executor/models/clip_mmproj_gguf.cpp
   src/vllm/model_executor/models/gemma4_vision.cpp
+  src/vllm/model_executor/models/deepseek_v4_vision.cpp
   src/vllm/model_executor/models/gemma4_audio.cpp
   src/vllm/model_executor/models/whisper_audio.cpp
   src/vllm/model_executor/models/qwen3_vl_text.cpp
@@ -1112,6 +1115,7 @@ add_library(vllm STATIC
   # cubic (dots3-note W6c, #2537).
   src/vllm/multimodal/pil_resize.cpp
   src/vllm/multimodal/qwen3vl_processor.cpp
+  src/vllm/multimodal/deepseek_v4_processor.cpp
   src/vllm/multimodal/audio_processor.cpp
   src/vllm/multimodal/audio_resample.cpp
   # Parakeet / FastConformer audio encoder + CTC head + its log-mel front end
@@ -1228,6 +1232,8 @@ add_library(vllm STATIC
   src/vllm/v1/attention/backends/utils.cpp
   src/vllm/v1/attention/backends/cpu_attn.cpp
   src/vllm/v1/attention/backends/gdn_attn.cpp
+  src/vllm/v1/attention/backends/mla/sparse_swa.cpp
+  src/vllm/v1/attention/backends/mla/indexer.cpp
   src/vllm/v1/structured_output/backend_types.cpp
   src/vllm/v1/structured_output/backend_native.cpp
   src/vllm/v1/structured_output/backend_xgrammar.cpp
@@ -1277,6 +1283,7 @@ add_library(vllm STATIC
   # registry, and Qwen3-VL's registration into it. The registration TU is
   # SELF-REGISTERING and is reached through vllm's INTERFACE --whole-archive.
   src/vllm/entrypoints/openai/mm_chat_registry.cpp
+  src/vllm/entrypoints/openai/mm_chat_deepseek_v4.cpp
   src/vllm/entrypoints/openai/mm_chat_dots3note.cpp
   src/vllm/entrypoints/openai/mm_chat_qwen3vl.cpp
   src/vllm/entrypoints/openai/serving_utils.cpp

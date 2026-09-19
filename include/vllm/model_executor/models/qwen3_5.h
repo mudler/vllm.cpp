@@ -95,6 +95,31 @@ struct PagedKvCache {
   vt::Fp8KVCacheDataType fp8_kind = vt::Fp8KVCacheDataType::kAuto;
   float k_scale = 1.0F;
   float v_scale = 1.0F;
+
+  // KV-DSV4-MULTICACHE W8 slice 4 (#2455) — the entry's OWN allocated page, in
+  // BYTES, exactly as the runner sized it (`spec->page_size_bytes()`).
+  //
+  // NOT DERIVABLE FROM THE FIELDS ABOVE, which is why it is carried. The view
+  // `{num_blocks, block_size, head_size}` describes a rank-3 float page, and a
+  // spec whose page comes from a `storage_block_size` or from a packed byte
+  // layout disagrees with it: DeepSeek-V4's SWA cache is `block_size` 64,
+  // `head_size` 512, `kI8`, which multiplies out to 32768, while the buffer the
+  // runner allocates is 37440 (`64 * 584` rounded up to a 576 multiple). That
+  // contradiction is #2085, recorded against this row, and reading the page off
+  // the view is how a store lands outside the block it was given.
+  //
+  // A REGION-SPLIT PAGE CANNOT BE A rank-3 TENSOR AT ALL. The fp8_ds_mla block
+  // keeps a token's scale bytes in a different region from its data
+  // (`cache_utils.py:59-66`), so a consumer has to build a rank-2
+  // `[num_blocks, block_bytes]` byte view, and `block_bytes` is this field.
+  //
+  // 0 MEANS UNKNOWN, and it is the default for a reason: roughly a hundred
+  // hand-built `PagedKvCache` fixtures in this tree set the named fields and
+  // nothing else. Only `GPUModelRunner::initialize_kv_cache` fills this, from
+  // the same spec that supplied `dtype` and `block_size`. A consumer that needs
+  // it REFUSES on 0 rather than recomputing the page, because a recomputation
+  // is a second derivation of a number the spec already owns.
+  int64_t page_size_bytes = 0;
 };
 
 // Per-GDN-layer PERSISTENT mamba state (device buffers, updated in place). Rows

@@ -108,7 +108,19 @@ TEST_CASE("deepseek-v4 scaffold: DeepseekV4ForCausalLM RESOLVES through the regi
   const vllm::ModelRegistration& reg = ModelRegistry::Resolve(cfg);
   CHECK(reg.architecture == "DeepseekV4ForCausalLM");
   CHECK(reg.info.is_text_generation_model);
-  CHECK_FALSE(reg.info.supports_multimodal);
+  // MODEL-MM-deepseek-v4 W4 (#2411): this read `CHECK_FALSE` until W4, and the
+  // fact it pinned is now the opposite one. `DeepseekV4ForCausalLM` names both
+  // the TEXT checkpoint and the Flash-Vision one, so the architecture cannot
+  // advertise this conditionally; what keeps a text checkpoint inert is
+  // `DeepseekV4LoadedModel::has_vision()` being false, which
+  // `test_deepseek_v4_mm_reach` asserts against a loaded model rather than
+  // against a registration. The two hooks below are added rather than
+  // substituted: they are what `ModelRegistry::SupportsMmInputs` reads, and
+  // they are the pair the runner's multimodal arm actually turns on.
+  CHECK(reg.info.supports_multimodal);
+  CHECK(reg.factory->encode_mm != nullptr);
+  CHECK(reg.factory->embed_mm != nullptr);
+  CHECK(reg.factory->consumes_mmproj);
 }
 
 TEST_CASE("deepseek-v4 expert probe input stays in the float domain") {

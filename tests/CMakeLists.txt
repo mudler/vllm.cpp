@@ -2669,6 +2669,7 @@ target_compile_definitions(test_capi PRIVATE
   PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e"
   MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold"
   LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e"
+  GLINER2_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/gliner2_e2e"
   # #1681: the real published Qwen3.8 chat template, rendered through the C
   # ABI's own vllm_chat path. Absolute so it resolves from whatever working
   # directory ctest runs the suite in.

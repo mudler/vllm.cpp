@@ -265,6 +265,40 @@ def main() -> None:
         json.dump(config, f, indent=2)
         f.write("\n")
 
+    # Minimal BPE tokenizer matching vocab_size: ▁ + a-z + 0-4 = 32 entries.
+    # The NER pipeline (Gliner2NerInference) tokenizes text and labels through
+    # this; Metaspace pre-tokenizer, no merges (each character is one token).
+    vocab = {"\u2581": 0}
+    for i, ch in enumerate("abcdefghijklmnopqrstuvwxyz"):
+        vocab[ch] = i + 1
+    for i, ch in enumerate("01234"):
+        vocab[ch] = 27 + i
+    tokenizer = {
+        "version": "1.0",
+        "pre_tokenizer": {
+            "type": "Metaspace",
+            "replacement": "\u2581",
+            "prepend_scheme": "always",
+            "split": True,
+        },
+        "decoder": {
+            "type": "Metaspace",
+            "replacement": "\u2581",
+            "prepend_scheme": "always",
+            "split": True,
+        },
+        "model": {
+            "type": "BPE",
+            "unk_token": None,
+            "vocab": vocab,
+            "merges": [],
+        },
+        "added_tokens": [],
+    }
+    with open(OUT / "tokenizer.json", "w") as f:
+        json.dump(tokenizer, f, indent=2)
+        f.write("\n")
+
     tensors = {**encoder_tensors(), **boundary_head_tensors()}
     write_safetensors(OUT / "model.safetensors", tensors)
 

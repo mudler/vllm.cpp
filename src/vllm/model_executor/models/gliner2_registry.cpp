@@ -21,6 +21,7 @@
 // port against the HuggingFace transformers + GLiNER2 library references.
 #include "vllm/model_executor/models/model_registry.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -32,7 +33,9 @@
 #include "vllm/model_executor/layers/pooler/methods.h"  // SequencePoolingType
 #include "vllm/model_executor/layers/pooler/pooler_config.h"
 #include "vllm/model_executor/models/gliner2.h"
+#include "vllm/model_executor/models/gliner2_ner.h"
 #include "vllm/model_executor/models/qwen3_5.h"  // ForwardLogits carrier
+#include "vllm/tokenizer/tokenizer.h"
 #include "vllm/v1/kv_cache_dtype.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/dtype.h"
@@ -152,6 +155,144 @@ const ModelFactory kGliner2Factory{
 };
 
 }  // namespace
+
+// ── Phase 4: NER inference ──────────────────────────────────────────────
+// Full NER pipeline reachable from the C ABI (vllm_gliner_ner) and the server
+// endpoint. Tokenizes text + entity labels, runs the DeBERTa v2 encoder, runs
+// the boundary head (encoder + query head), and decodes marginals into entities.
+//
+// The query state for each label is the mean of the label's token hidden
+// states — a Phase 4 approximation. Upstream GLiNER2 uses the hidden state at
+// the label's representation position (the [SEP] after the label tokens);
+// matching that exactly is an owed correctness refinement.
+Gliner2NerResult Gliner2NerInference(
+    const LoadedModel& model,
+    const tok::Tokenizer& tokenizer,
+    std::string_view text_sv,
+    const std::vector<std::string>& labels,
+    const gliner2::NerParams& params) {
+  Gliner2NerResult result;
+  if (text_sv.empty() || labels.empty()) return result;
+
+  const auto& m = ModelAs<Gliner2LoadedModel>(model, "BoundaryExtractor");
+  const auto& w = m.weights();
+  const std::string text(text_sv);
+
+  // 1. Tokenize text (no special tokens — we build the full sequence ourselves).
+  std::vector<int32_t> text_ids = tokenizer.Encode(text);
+  const int64_t L = static_cast<int64_t>(text_ids.size());
+  if (L == 0) return result;
+
+  // 2. Compute token-to-character offset mapping by greedy matching decoded
+  //    tokens against the original text. The tokenizer has no offset API, so we
+  //    decode each token and find it in the text. This is approximate for
+  //    SentencePiece's ▁→space mapping but sufficient for entity extraction.
+  std::vector<int64_t> start_mappings(L), end_mappings(L);
+  size_t search_pos = 0;
+  for (int64_t i = 0; i < L; ++i) {
+    std::string decoded = tokenizer.Decode({text_ids[i]});
+    if (decoded.empty()) {
+      start_mappings[i] = static_cast<int64_t>(search_pos);
+      end_mappings[i] = static_cast<int64_t>(search_pos);
+      continue;
+    }
+    size_t found = text.find(decoded, search_pos);
+    if (found == std::string::npos) {
+      // Try trimming leading whitespace (SentencePiece Strip(1 leading space)).
+      std::string trimmed = decoded;
+      while (!trimmed.empty() &&
+             (trimmed.front() == ' ' || trimmed.front() == '\t')) {
+        trimmed.erase(0, 1);
+      }
+      if (!trimmed.empty()) {
+        found = text.find(trimmed, search_pos);
+        if (found != std::string::npos) {
+          decoded = trimmed;
+        }
+      }
+    }
+    if (found == std::string::npos) {
+      start_mappings[i] = static_cast<int64_t>(search_pos);
+      end_mappings[i] = static_cast<int64_t>(search_pos);
+    } else {
+      start_mappings[i] = static_cast<int64_t>(found);
+      end_mappings[i] = static_cast<int64_t>(found + decoded.size());
+      search_pos = found + decoded.size();
+    }
+  }
+
+  // 3. Tokenize each entity label (no special tokens).
+  std::vector<std::vector<int32_t>> label_ids;
+  label_ids.reserve(labels.size());
+  for (const auto& label : labels) {
+    label_ids.push_back(tokenizer.Encode(label));
+  }
+
+  // 4. Build the full sequence: [BOS] text_tokens [EOS] label1 [EOS] label2 [EOS] ...
+  const int32_t bos = tokenizer.BosId();
+  const int32_t eos = tokenizer.EosId();
+  std::vector<int64_t> full_ids;
+  if (bos >= 0) full_ids.push_back(bos);
+  const size_t text_offset = full_ids.size();
+  for (int32_t id : text_ids) full_ids.push_back(id);
+  if (eos >= 0) full_ids.push_back(eos);
+
+  // Track each label's token positions in the full sequence.
+  struct LabelRange { size_t start; size_t end; };
+  std::vector<LabelRange> label_ranges;
+  label_ranges.reserve(labels.size());
+  for (const auto& ids : label_ids) {
+    size_t start = full_ids.size();
+    for (int32_t id : ids) full_ids.push_back(id);
+    label_ranges.push_back({start, full_ids.size()});
+    if (eos >= 0) full_ids.push_back(eos);
+  }
+
+  // 5. Run the DeBERTa v2 encoder forward on the full sequence.
+  std::vector<float> hidden =
+      deberta_v2::ForwardHost(w.encoder_params, w.encoder_weights, full_ids);
+  const int64_t H = w.encoder_params.hidden_size;
+
+  // 6. Extract text_states [L, H] from the text token positions.
+  std::vector<float> text_states(static_cast<size_t>(L * H));
+  for (int64_t i = 0; i < L; ++i) {
+    const float* src = &hidden[static_cast<size_t>((text_offset + i) * H)];
+    std::copy(src, src + H, &text_states[static_cast<size_t>(i * H)]);
+  }
+
+  // 7. Extract query_states [Q, H] — mean of each label's token hidden states.
+  const int64_t Q = static_cast<int64_t>(labels.size());
+  std::vector<float> query_states(static_cast<size_t>(Q * H), 0.0f);
+  for (int64_t q = 0; q < Q; ++q) {
+    const size_t start = label_ranges[q].start;
+    const size_t end = label_ranges[q].end;
+    const int64_t n = static_cast<int64_t>(end - start);
+    if (n > 0) {
+      const float inv = 1.0f / static_cast<float>(n);
+      for (int64_t h = 0; h < H; ++h) {
+        float sum = 0.0f;
+        for (int64_t i = 0; i < n; ++i) {
+          sum += hidden[static_cast<size_t>((start + i) * H + h)];
+        }
+        query_states[static_cast<size_t>(q * H + h)] = sum * inv;
+      }
+    }
+  }
+
+  // 8. Run the boundary encoder: text_states [L, H] → boundary_states [L+1, d].
+  std::vector<float> boundary_states = gliner2::BoundaryEncoderForward(
+      w.boundary_params, w.boundary_head.encoder, text_states, L);
+
+  // 9. Run the boundary query head: boundary_states + text_states + query_states → marginals.
+  gliner2::BoundaryMarginals marginals = gliner2::BoundaryQueryHeadForward(
+      w.boundary_params, w.boundary_head.query_head,
+      boundary_states, L, text_states, query_states, Q);
+
+  // 10. Decode marginals into entities.
+  result.entities = gliner2::DecodeNer(
+      marginals, labels, L, start_mappings, end_mappings, text, params);
+  return result;
+}
 
 REGISTER_VLLM_MODEL(boundary_extractor, "BoundaryExtractor", kGliner2Factory,
                      kGliner2Info)

@@ -4,6 +4,7 @@
 #include "vllm/entrypoints/openai/api_server.h"
 
 #include <atomic>
+#include <algorithm>
 #include <cstdlib>
 #include <ctime>
 #include <exception>
@@ -602,6 +603,184 @@ ApiServer::DispatchResult ApiServer::handle_embeddings(
         {"usage",
          nlohmann::json{{"prompt_tokens", batch.prompt_tokens},
                         {"total_tokens", batch.prompt_tokens}}},
+    }.dump();
+    return r;
+  } catch (const std::exception& e) {
+    return MakeError(500, "InternalServerError", e.what());
+  }
+}
+
+ApiServer::DispatchResult ApiServer::handle_ner(
+    const std::string& request_body) const {
+  if (!ner_) {
+    return MakeError(500, "InternalServerError",
+                    "The model does not support NER");
+  }
+  nlohmann::json body;
+  try {
+    body = nlohmann::json::parse(request_body);
+  } catch (const std::exception& e) {
+    return MakeError(400, "BadRequestError",
+                    std::string("invalid JSON body: ") + e.what());
+  }
+  if (!body.is_object()) {
+    return MakeError(400, "BadRequestError", "request body must be an object");
+  }
+  // model: honoured like every other serving handler.
+  if (body.contains("model") && body["model"].is_string() &&
+     !models_.is_base_model(body["model"].get<std::string>())) {
+    return MakeError(404, "NotFoundError",
+                    "The model `" + body["model"].get<std::string>() +
+                        "` does not exist.");
+  }
+  // text: required string.
+  if (!body.contains("text") || !body["text"].is_string()) {
+    return MakeError(400, "BadRequestError",
+                    "text is required and must be a string");
+  }
+  const std::string text = body["text"].get<std::string>();
+  // labels: required array of strings.
+  if (!body.contains("labels") || !body["labels"].is_array()) {
+    return MakeError(400, "BadRequestError",
+                    "labels is required and must be an array of strings");
+  }
+  std::vector<std::string> labels;
+  for (const nlohmann::json& item : body["labels"]) {
+    if (!item.is_string()) {
+     return MakeError(400, "BadRequestError",
+                      "labels must be an array of strings");
+    }
+    labels.push_back(item.get<std::string>());
+  }
+  if (labels.empty()) {
+    return MakeError(400, "BadRequestError",
+                    "labels must contain at least one string");
+  }
+  // threshold: optional, default 0.5.
+  float threshold = 0.5F;
+  if (body.contains("threshold") && body["threshold"].is_number()) {
+    threshold = body["threshold"].get<float>();
+  }
+  // max_width: optional, default 12 (0 = use model default).
+  int64_t max_width = 12;
+  if (body.contains("max_width") && body["max_width"].is_number_integer()) {
+    max_width = body["max_width"].get<int64_t>();
+  }
+
+  try {
+    const NerResult result = ner_(text, labels, threshold, max_width);
+    nlohmann::json entities = nlohmann::json::array();
+    for (const NerEntity& e : result.entities) {
+     entities.push_back(nlohmann::json{
+         {"label", e.label},
+         {"text", e.text},
+         {"start", e.start},
+         {"end", e.end},
+         {"confidence", e.confidence},
+     });
+    }
+    static std::atomic<uint64_t> ner_counter{0};
+    DispatchResult r;
+    r.body = nlohmann::json{
+       {"id", "ner-" + std::to_string(ner_counter.fetch_add(1))},
+       {"object", "ner"},
+       {"created", static_cast<int64_t>(std::time(nullptr))},
+       {"model", models_.model_name()},
+       {"entities", std::move(entities)},
+       {"usage",
+        nlohmann::json{{"prompt_tokens", result.prompt_tokens},
+                       {"total_tokens", result.prompt_tokens}}},
+    }.dump();
+    return r;
+  } catch (const std::exception& e) {
+    return MakeError(500, "InternalServerError", e.what());
+  }
+}
+
+ApiServer::DispatchResult ApiServer::handle_systemone(
+    const std::string& request_body) const {
+  if (!ner_) {
+    return MakeError(500, "InternalServerError",
+                    "The model does not support NER");
+  }
+  nlohmann::json body;
+  try {
+    body = nlohmann::json::parse(request_body);
+  } catch (const std::exception& e) {
+    return MakeError(400, "BadRequestError",
+                    std::string("invalid JSON body: ") + e.what());
+  }
+  if (!body.is_object()) {
+    return MakeError(400, "BadRequestError", "request body must be an object");
+  }
+  // state: the text to extract entities from (string or JSON-encoded value).
+  if (!body.contains("state")) {
+    return MakeError(400, "BadRequestError", "state is required");
+  }
+  std::string text;
+  if (body["state"].is_string()) {
+    text = body["state"].get<std::string>();
+  } else {
+    text = body["state"].dump();
+  }
+  // questions: map of label -> question spec. Each question's type is "noul"
+  // (is this text an entity of this type?). The label names are the entity
+  // types to extract.
+  if (!body.contains("questions") || !body["questions"].is_object()) {
+    return MakeError(400, "BadRequestError",
+                    "questions is required and must be an object");
+  }
+  std::vector<std::string> labels;
+  for (auto it = body["questions"].begin(); it != body["questions"].end();
+      ++it) {
+    labels.push_back(it.key());
+  }
+  if (labels.empty()) {
+    return MakeError(400, "BadRequestError",
+                    "questions must contain at least one question");
+  }
+
+  // threshold / max_width: optional fields on the questions or the top level.
+  float threshold = 0.5F;
+  int64_t max_width = 12;
+  if (body.contains("threshold") && body["threshold"].is_number()) {
+    threshold = body["threshold"].get<float>();
+  }
+  if (body.contains("max_width") && body["max_width"].is_number_integer()) {
+    max_width = body["max_width"].get<int64_t>();
+  }
+
+  try {
+    const NerResult result = ner_(text, labels, threshold, max_width);
+    // Build jev-compatible answers: for each label, list matching entities.
+    nlohmann::json answers = nlohmann::json::object();
+    for (const std::string& label : labels) {
+     nlohmann::json label_entities = nlohmann::json::array();
+     float max_conf = 0.0F;
+     for (const NerEntity& e : result.entities) {
+       if (e.label == label) {
+         label_entities.push_back(nlohmann::json{
+             {"text", e.text},
+             {"start", e.start},
+             {"end", e.end},
+             {"confidence", e.confidence},
+         });
+         max_conf = std::max(max_conf, e.confidence);
+       }
+     }
+     answers[label] = nlohmann::json{
+         {"type", "noul"},
+         {"noul", max_conf},
+         {"entities", std::move(label_entities)},
+     };
+    }
+    DispatchResult r;
+    r.body = nlohmann::json{
+       {"model", models_.model_name()},
+       {"answers", std::move(answers)},
+       {"usage",
+        nlohmann::json{{"input_tokens", result.prompt_tokens},
+                       {"output_tokens", 0}}},
     }.dump();
     return r;
   } catch (const std::exception& e) {
@@ -1217,6 +1396,22 @@ void ApiServer::register_routes() {
                 [this, write](const httplib::Request& req,
                               httplib::Response& res) {
                   write(handle_embeddings(req.body), res);
+                });
+  }
+
+  if (ner_) {
+    // NER (MODEL-GLINER25, ABI v27). Registered ONLY when a NER callback is
+    // attached, so a text/embedding server answers 404 at the route table.
+    server.Post("/v1/ner",
+                [this, write](const httplib::Request& req,
+                              httplib::Response& res) {
+                  write(handle_ner(req.body), res);
+                });
+    // Jev / System One-compatible endpoint (same NER callback).
+    server.Post("/v1/systemone",
+                [this, write](const httplib::Request& req,
+                              httplib::Response& res) {
+                  write(handle_systemone(req.body), res);
                 });
   }
 

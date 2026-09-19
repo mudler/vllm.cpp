@@ -2850,3 +2850,113 @@ TEST_CASE("capi: v21 speech device 1 is GRANTED or REFUSED, and the handle says 
   std::error_code ec;
   std::filesystem::remove_all(root, ec);
 }
+
+// ─── ABI v27: NER (MODEL-GLINER25 Phase 4f) ─────────────────────────────────
+//
+// The NER slice gated THROUGH the public ABI on the committed tiny BoundaryExtractor
+// fixture (tests/vllm/models/fixtures/gliner2_e2e): a REAL checkpoint-directory
+// load through vllm_engine_load, then vllm_gliner_ner through the SAME
+// Gliner2NerInference seam the server's /v1/ner route drives. Plus the argument
+// contract and the refuse-by-architecture pin (a text-generation engine must be
+// refused, the mirror of vllm_embed refusing a pooling handle).
+
+namespace {
+std::string Gliner2Fixture() { return std::string(GLINER2_E2E_FIXTURE_DIR); }
+}  // namespace
+
+TEST_CASE("capi v27: vllm_gliner_ner argument contract") {
+  // A text-generation engine is the refuse-by-architecture denominator.
+  vllm_engine* text = MakeSyntheticEngine();
+  REQUIRE(text != nullptr);
+
+  const char* labels[1] = {"person"};
+  vllm_ner_result out;
+
+  // null out
+  CHECK(vllm_gliner_ner(text, "hello", labels, 1, 0.5F, 0, nullptr) ==
+       VLLM_ERR_INVALID_ARGUMENT);
+  // null engine
+  CHECK(vllm_gliner_ner(nullptr, "hello", labels, 1, 0.5F, 0, &out) ==
+       VLLM_ERR_INVALID_ARGUMENT);
+  // null text
+  CHECK(vllm_gliner_ner(text, nullptr, labels, 1, 0.5F, 0, &out) ==
+       VLLM_ERR_INVALID_ARGUMENT);
+  // null labels
+  CHECK(vllm_gliner_ner(text, "hello", nullptr, 1, 0.5F, 0, &out) ==
+       VLLM_ERR_INVALID_ARGUMENT);
+  // n_labels <= 0
+  CHECK(vllm_gliner_ner(text, "hello", labels, 0, 0.5F, 0, &out) ==
+       VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(vllm_gliner_ner(text, "hello", labels, -1, 0.5F, 0, &out) ==
+       VLLM_ERR_INVALID_ARGUMENT);
+  // null labels[i]
+  const char* bad_labels[2] = {"person", nullptr};
+  CHECK(vllm_gliner_ner(text, "hello", bad_labels, 2, 0.5F, 0, &out) ==
+       VLLM_ERR_INVALID_ARGUMENT);
+  // On every refused call *out stays zeroed.
+  CHECK(out.entities == nullptr);
+  CHECK(out.n_entities == 0);
+
+  vllm_engine_free(text);
+}
+
+TEST_CASE("capi v27: vllm_gliner_ner refuses a non-BoundaryExtractor engine") {
+  vllm_engine* text = MakeSyntheticEngine();
+  REQUIRE(text != nullptr);
+  const char* labels[1] = {"person"};
+  vllm_ner_result out;
+  CHECK(vllm_gliner_ner(text, "hello", labels, 1, 0.5F, 0, &out) ==
+       VLLM_ERR_INVALID_ARGUMENT);
+  CHECK(std::string(vllm_last_error()).find("BoundaryExtractor") !=
+       std::string::npos);
+  CHECK(out.entities == nullptr);
+  CHECK(out.n_entities == 0);
+  vllm_engine_free(text);
+}
+
+TEST_CASE("capi v27: vllm_gliner_ner runs end-to-end on the fixture") {
+  vllm_model_params mp = vllm_model_params_default();
+  const std::string dir = Gliner2Fixture();
+  mp.model_path = dir.c_str();
+  vllm_engine* eng = nullptr;
+  REQUIRE(vllm_engine_load(&mp, &eng) == VLLM_OK);
+  REQUIRE(eng != nullptr);
+
+  const char* labels[2] = {"person", "organization"};
+  vllm_ner_result out;
+  REQUIRE(vllm_gliner_ner(eng, "john works at google", labels, 2, 0.5F, 12,
+                         &out) == VLLM_OK);
+  // The fixture has random weights, so entities may or may not survive the
+  // threshold. The gate is that the call SUCCEEDS and the result structure is
+  // valid: n_entities matches the array length, every entity has non-null
+  // label/text strings, and the offsets are in range.
+  for (int32_t i = 0; i < out.n_entities; ++i) {
+    REQUIRE(out.entities[i].label != nullptr);
+    REQUIRE(out.entities[i].text != nullptr);
+    CHECK(out.entities[i].label[0] != '\0');
+    CHECK(out.entities[i].confidence >= 0.0F);
+    CHECK(out.entities[i].confidence <= 1.0F);
+    CHECK(out.entities[i].char_start >= 0);
+    CHECK(out.entities[i].char_end >= out.entities[i].char_start);
+  }
+
+  // vllm_ner_result_free zeroes the struct.
+  vllm_ner_result_free(&out);
+  CHECK(out.entities == nullptr);
+  CHECK(out.n_entities == 0);
+  // double-free is a safe no-op, as is nullptr.
+  vllm_ner_result_free(&out);
+  vllm_ner_result_free(nullptr);
+
+  // A second call with a single label also succeeds (different code path: Q=1).
+  const char* one_label[1] = {"location"};
+  REQUIRE(vllm_gliner_ner(eng, "paris", one_label, 1, 0.5F, 0, &out) == VLLM_OK);
+  vllm_ner_result_free(&out);
+
+  // Empty text is a no-op (returns OK with zero entities).
+  REQUIRE(vllm_gliner_ner(eng, "", one_label, 1, 0.5F, 0, &out) == VLLM_OK);
+  CHECK(out.n_entities == 0);
+  CHECK(out.entities == nullptr);
+
+  vllm_engine_free(eng);
+}

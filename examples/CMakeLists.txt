@@ -56,6 +56,13 @@ add_executable(vllm-cli cli/main.cpp)
 target_link_libraries(vllm-cli PRIVATE vllm::shared)
 vllm_cpp_set_warnings(vllm-cli)
 
+# gliner-cli: a THIN CLIENT of the public C ABI (MODEL-GLINER25). Loads a
+# GLiNER2.5 checkpoint and runs zero-shot NER via vllm_gliner_ner (ABI v27),
+# proving library-first consumption of the NER surface.
+add_executable(gliner-cli gliner_cli/main.cpp)
+target_link_libraries(gliner-cli PRIVATE vllm::shared)
+vllm_cpp_set_warnings(gliner-cli)
+
 # quant-gemm-bench (QUANT-GGUF-CIQ-GEMM G6 evidence tool, NOT a gate): op-level
 # GFLOP/s for kMatmulBTQuant, portable vs Arm i8mm mmla tier.
 add_executable(quant-gemm-bench quant_gemm_bench/main.cpp)

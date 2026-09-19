@@ -10,6 +10,7 @@
 // OPEN; if it renames a key before it merges, this file changes and
 // `tests/vllm/models/glm5_next_gguf_manifest.inc` is regrown.
 #include "vllm/model_executor/models/glm5_next_loader.h"
+#include "vllm/model_executor/models/mla_attention.h"
 
 #include <algorithm>
 #include <cmath>
@@ -383,6 +384,74 @@ Glm5NextIndexerWeights LoadIndexer(const GgufFile& g,
   return w;
 }
 
+// ── W9c-1: post-load MLA absorption ─────────────────────────────────────────
+// The shared `mla::ForwardMlaAttentionBlock` decode arm needs `w_uk_t` and
+// `w_uv` as bf16 — the quantized `k_b_proj` / `v_b_proj` are not admissible for
+// `vt::BatchedMatmul`. This mirrors the sibling `GlmMoeDsa` loader's `AbsorbMla`
+// (`glm_moe_dsa_loader.cpp:224-273`): dequantize, transpose the k half, stack
+// into `kv_b_proj`, run the SHARED `mla::AbsorbKvBProjBf16`. Param paths differ
+// (`p.mla.*` here vs flat `p.*` there), but the math is identical.
+void AbsorbMla(const GgufFile& g, const Glm5NextParams& p, int64_t il,
+               Glm5NextMlaWeights& w) {
+  const int64_t heads = p.num_attention_heads;
+  const int64_t kv_lora = p.mla.kv_lora_rank;
+  const int64_t qk_nope = p.mla.qk_nope_head_dim;
+  const int64_t v_head = p.mla.v_head_dim;
+  const int64_t row = qk_nope + v_head;
+
+  const std::vector<float> kb =
+      DequantAll(g, Blk(il, "attn_k_b.weight"), {heads, kv_lora, qk_nope});
+  const std::vector<float> vb =
+      DequantAll(g, Blk(il, "attn_v_b.weight"), {heads, v_head, kv_lora});
+
+  std::vector<float> kvb(static_cast<size_t>(heads * row * kv_lora), 0.0f);
+  for (int64_t h = 0; h < heads; ++h) {
+    for (int64_t i = 0; i < qk_nope; ++i) {
+      for (int64_t j = 0; j < kv_lora; ++j) {
+        kvb[static_cast<size_t>((h * row + i) * kv_lora + j)] =
+            kb[static_cast<size_t>((h * kv_lora + j) * qk_nope + i)];
+      }
+    }
+    for (int64_t i = 0; i < v_head; ++i) {
+      for (int64_t j = 0; j < kv_lora; ++j) {
+        kvb[static_cast<size_t>((h * row + qk_nope + i) * kv_lora + j)] =
+            vb[static_cast<size_t>((h * v_head + i) * kv_lora + j)];
+      }
+    }
+  }
+  w.kv_b_proj = Bf16From(kvb, {heads * row, kv_lora}, /*nk=*/true);
+
+  mla::MlaBlockDims dims{};
+  dims.hidden_size = p.hidden_size;
+  dims.num_heads = heads;
+  dims.q_lora_rank = p.mla.q_lora_rank;
+  dims.kv_lora_rank = kv_lora;
+  dims.qk_nope_head_dim = qk_nope;
+  dims.qk_rope_head_dim = p.mla.qk_rope_head_dim;
+  dims.v_head_dim = v_head;
+  dims.is_neox_style = false;
+  mla::DeepseekYarnRopeParams rope{};
+  rope.base = 10000.0;
+  rope.rotary_dim = p.mla.qk_rope_head_dim;
+  rope.yarn = false;
+  dims.scale = mla::MlaAttentionScale(dims, rope);
+
+  const mla::AbsorbedKvBProj abs = mla::AbsorbKvBProjBf16(
+      reinterpret_cast<const uint16_t*>(w.kv_b_proj.bytes.data()), dims);
+  VT_CHECK(static_cast<int64_t>(abs.w_uk_t.size()) == heads * qk_nope * kv_lora &&
+               static_cast<int64_t>(abs.w_uv.size()) == heads * kv_lora * v_head,
+           "glm5_next gguf: the shared MLA absorber returned unexpected sizes for "
+           "block " + std::to_string(il));
+  w.w_uk_t = MakeTensor(vt::DType::kBF16, {heads, qk_nope, kv_lora},
+                        /*nk=*/false, sizeof(uint16_t));
+  std::memcpy(w.w_uk_t.bytes.data(), abs.w_uk_t.data(),
+              abs.w_uk_t.size() * sizeof(uint16_t));
+  w.w_uv = MakeTensor(vt::DType::kBF16, {heads, kv_lora, v_head},
+                      /*nk=*/false, sizeof(uint16_t));
+  std::memcpy(w.w_uv.bytes.data(), abs.w_uv.data(),
+              abs.w_uv.size() * sizeof(uint16_t));
+}
+
 Glm5NextMlaWeights LoadMla(const GgufFile& g, const GgufLoadPolicy& pol,
                            const Glm5NextParams& p, int64_t il) {
   const int64_t h = p.hidden_size;
@@ -419,6 +488,7 @@ Glm5NextMlaWeights LoadMla(const GgufFile& g, const GgufLoadPolicy& pol,
   w.o_proj =
       LoadMatmul(g, pol, Blk(il, "attn_output.weight"), h, heads * v_head);
   w.indexer = LoadIndexer(g, pol, p, il);
+  AbsorbMla(g, p, il, w);
   return w;
 }
 

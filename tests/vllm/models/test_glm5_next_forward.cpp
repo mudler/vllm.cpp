@@ -1817,8 +1817,12 @@ TEST_CASE("glm5_next W9c-3 device: the device forward matches the host reference
   // way, so the device forward uploads weight rows to the queue's device.
   const bool cuda_here =
       vt::TryGetBackend(vt::Device{vt::DeviceType::kCUDA, 0}) != nullptr;
-  vt::Queue dev_q{vt::Device{cuda_here ? vt::DeviceType::kCUDA
-                                       : vt::DeviceType::kCPU, 0}, nullptr};
+  const bool rocm_here =
+      vt::TryGetBackend(vt::Device{vt::DeviceType::kROCM, 0}) != nullptr;
+  const vt::DeviceType dev_type = cuda_here   ? vt::DeviceType::kCUDA
+                                   : rocm_here ? vt::DeviceType::kROCM
+                                               : vt::DeviceType::kCPU;
+  vt::Queue dev_q{vt::Device{dev_type, 0}, nullptr};
   const std::vector<float> dev = gn::Glm5NextDeviceForward(w, ids, {}, dev_q, nullptr);
 
   REQUIRE(dev.size() == host.size());

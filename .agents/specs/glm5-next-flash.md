@@ -3485,27 +3485,23 @@ the result for the island op, re-upload — is the one this port follows.
 | 7 | DSA k-pool indexer | `dsa.cpp:168,365` | `kGlm5NextKpoolCompress`/`Select` | yes | yes | MOVES (closes O36) |
 | 8 | MoE combine | `moe.cpp:694` | `kMoeCombine` | yes | yes | MOVES |
 | 9 | Dense + shared MLP | `moe.cpp:473,672` | `kMatmul`+`kClampedSwiGLU` | yes | yes | ON DEVICE (post-O55, #3203) |
-| 10 | Eager MLA attention | `attn.cpp:276` | `kMlaPrefillAttention`/`kMlaDecodeAttention` | yes | yes | HOST ISLAND (W9c-1) |
+| 10 | Eager MLA attention | `attn.cpp:276` | `kMlaPrefillAttention`/`kMlaDecodeAttention` | yes | yes | ON DEVICE (W9c-1) |
 | 11 | mHC sites | `mhc.cpp:21,53` | `kDeepseekV4Mhc` | yes | yes | HOST ISLAND (O34 discharged, arm not rewired) |
 
 Arms 1-3 were already on the device. Arms 4-8 moved to the device in W9c-3.
 Arm 9 moved to the device in post-O55 (#3203) after O55 (#3197) added
-`vt::ClampedSwiGLU`. Arms 10-11 stay as host-fallback islands: arm 10 because
-W9c-1 is REFUSED, and arm 11 because the device forward has not been rewired
-to call the device mHC kernels (O34 discharged the ROCm provider debt, but
-the arm still runs on the interposed CPU queue).
+`vt::ClampedSwiGLU`. Arm 10 moved to the device in W9c-1 (ISSUE-LOCAL-01J7QX3M5K1HE3N9V0KQRJ8X2M), which
+re-priced the earlier refusal: the MLA attention arm routes through
+`mla::ForwardMlaAttentionBlock` while the k-pool indexer stays as a host-
+fallback island. Arm 11 stays as a host-fallback island because the device
+forward has not been rewired to call the device mHC kernels (O34 discharged the
+ROCm provider debt, but the arm still runs on the interposed CPU queue).
 
-**Arm 10 stays because W9c-1 is REFUSED, not because the provider is missing.**
-`kMlaPrefillAttention` and `kMlaDecodeAttention` are registered on both CUDA
-(`cuda_mla_prefill.cu:457`, `cuda_mla_attn.cu:806`) and ROCm
-(`rocm_ops.hip:393-396`). What is missing is the loader absorb step:
-`MlaBlockWeights` wants `w_uk_t` and `w_uv` as bf16 tensors absorbed at LOAD,
-which `glm_moe_dsa_loader.cpp:223-272` produces and `glm5_next_loader.cpp` has
-no analogue of (W9c-3a re-priced this at `839ea1ced`). Routing onto
-`mla::ForwardMlaAttentionBlock` owes a loader absorb, a `BuildMlaStep`
-equivalent, a sparse per-token block table, and a `TritonMLAImpl`. That is
-W9c-1's port, not a call-site change, and it is out of scope here. The island
-runs the current host MLA on the interposed CPU queue.
+**Arm 10 is on device because W9c-1 was re-priced and implemented.** The
+loader absorb (`AbsorbMla` in `glm5_next_loader.cpp`), the `BuildMlaStep`
+equivalent, the block table, and the `TritonMLAImpl` are all in place. The
+k-pool indexer runs on the interposed CPU queue; it is not the seam Lightning
+Indexer and stays as a host-fallback island.
 
 **Arm 11 stays because `kDeepseekV4Mhc` has NO ROCm provider** — CUDA only
 (`cuda_deepseek_v4.cu:2102`). O34 owns the gap. On a CUDA device the op IS
@@ -6157,12 +6153,26 @@ added the ROCm/HIP provider for `kDeepseekV4Mhc`. Post-O55
 ([#3203](https://github.com/mudler/vllm.cpp/pull/3203)) wired the dense+shared
 MLP onto the device via `vt::MatmulBT` + `vt::ClampedSwiGLU` + `vt::MatmulBT`.
 
-Eight of eleven compute arms are on the device (embedding, RMSNorm, KDA
+Nine of eleven compute arms are on the device (embedding, RMSNorm, KDA
 recurrence, MoE router topk, MoE routed experts, MoE combine, lm_head,
-dense+shared MLP); three run as host-fallback islands on the interposed CPU
-queue (k-pool indexer — CUDA-only ops, host on CPU; MLA attention — W9c-1
-REFUSED; mHC sites — O34 discharged but arm not rewired). The pattern is
-`kimi_linear_device.cpp`'s single-queue shape.
+dense+shared MLP, MLA attention); two run as host-fallback islands on the
+interposed CPU queue (k-pool indexer — CUDA-only ops, host on CPU; mHC sites —
+O34 discharged but arm not rewired). The pattern is `kimi_linear_device.cpp`'s
+single-queue shape.
+
+W9c-1 (MLA attention onto `mla::ForwardMlaAttentionBlock`,
+ISSUE-LOCAL-01J7QX3M5K1HE3N9V0KQRJ8X2M) re-priced the earlier
+refusal. The k-pool indexer stays as a host-fallback island; the MLA attention
+arm moves to device through the shared seam. The loader gains an `AbsorbMla`
+pass that dequantizes `attn_k_b`/`attn_v_b`, transposes k, stacks into
+`kv_b_proj`, and runs `mla::AbsorbKvBProjBf16` to produce `w_uk_t`/`w_uv`. The
+device forward builds a `MlaStep` and `CommonAttentionMetadata` for single-
+request prefill, constructs `MlaBlockWeights` via `ResidentWeight` from the
+loader `OwnedTensor` fields, and calls `ForwardMlaAttentionBlock` with a local
+KV cache. A `d.b.Synchronize(d.q)` after the call ensures all MLA CUDA kernels
+complete before the seam's internal DBuf temporaries are destroyed and their
+memory returned to the pool. CPU test passes 33/33. GPU gate PASSED on
+`thor:gpu0` (sm_110, Blackwell, CUDA 13.0): 33/33.
 
 The device forward is reached via `VT_GLM5_NEXT_DEVICE=1`, which delegates
 `Glm5NextHostForward` to `Glm5NextDeviceForward`. On a CPU queue the `vt::`
@@ -6859,3 +6869,30 @@ reason recorded rather than a result invented.
 
 The next actions are W5b and W5c, then W6, and — whenever the developer grants a
 large-asset download or six quant decoders exist — W7b.
+
+## Outcome
+
+W9c-1 landed MLA attention on device through the shared
+`mla::ForwardMlaAttentionBlock` seam. All 33 tests pass on CPU and on
+`thor:gpu0` (sm_110, Blackwell, CUDA 13.0).
+
+Measured: 33/33 tests pass, 5953/5953 assertions, both with and without
+`VT_GLM5_NEXT_DEVICE=1`. The device forward produces logits within a
+float-vs-double envelope of the host reference (greedy-token agreement).
+
+Rejected: NaN/inf in MLA output (CheckFinite confirmed nonfinite=0 across all
+test cases); per-layer KV cache as the fix (correct change, did not fix the
+crash); `VT_POOL_BYPASS=1` as a fix (changed crash to SIGABRT, confirming pool
+involvement but not a fix); 11 other theories investigated and ruled out (bf16
+dtype, FA2 head_dim, ConcatAndCacheMla pe_dim=0, rope_cache, rms_norm_eps,
+async race via Download, per-layer KV cache, rope_cos_sin_cache).
+
+Root cause: `ForwardMlaAttentionBlock` creates internal DBuf temporaries that
+are destroyed when it returns, returning memory to the pool while CUDA kernels
+may still be running. The fix is `d.b.Synchronize(d.q)` after the call so all
+MLA kernels complete before any subsequent allocation can reuse the memory.
+
+Default `rms_norm_eps = 1e-5f` is an intentional model-specific value, not a
+typo for 1e-6. The bf16 narrowing before MLA is required because the CUDA FA2
+prefill kernel requires bf16 QKV (`cuda_mla_prefill.cu:185`); the sibling
+(`glm_moe_dsa_forward.cpp:444`) narrows for the same reason.

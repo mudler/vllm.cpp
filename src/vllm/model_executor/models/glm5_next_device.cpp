@@ -34,14 +34,19 @@
 #include "vllm/model_executor/models/glm5_next_device.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <numeric>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/models/dense_attn_block.h"  // ResidentWeight
 #include "vllm/model_executor/models/dense_device_glue.h"
+#include "vllm/model_executor/models/deepseek_v2.h"  // MlaStep / BuildMlaStep
+#include "vllm/model_executor/models/mla_attention.h"
 #include "vllm/model_executor/models/glm5_next.h"
 #include "vllm/model_executor/models/glm5_next_forward.h"
 #include "vllm/model_executor/models/glm5_next_layer.h"
@@ -67,6 +72,9 @@ namespace {
 using dense_attn::DBuf;
 using dense_attn::Dev;
 using dense_attn::MakeTensor;
+using dense_attn::ResidentWeight;
+using v1::CommonAttentionMetadata;
+using v1::TritonMLAImpl;
 using vt::DType;
 using vt::Tensor;
 
@@ -126,7 +134,61 @@ std::vector<float> DeviceDenseMlpForward(
   return out;
 }
 
-}  // namespace
+// ── MLA block dims for GLM-5.3 NoPE ──────────────────────────────────────────
+// Mirrors `GlmMoeDsaMlaBlockDims` (glm_moe_dsa.cpp:497) for the geometry this
+// model shares with its sibling, minus the indexer schedule: GLM-5.3's k-pool
+// indexer is NOT the MLA seam's Lightning Indexer and stays on host, so every
+// layer's dims carry no indexer geometry.
+mla::MlaBlockDims Glm5NextMlaBlockDims(const Glm5NextParams& p) {
+  mla::MlaBlockDims d{};
+  d.hidden_size = p.hidden_size;
+  d.num_heads = p.num_attention_heads;
+  d.q_lora_rank = p.mla.q_lora_rank;
+  d.kv_lora_rank = p.mla.kv_lora_rank;
+  d.qk_nope_head_dim = p.mla.qk_nope_head_dim;
+  d.qk_rope_head_dim = p.mla.qk_rope_head_dim;  // 0 — NoPE
+  d.v_head_dim = p.mla.v_head_dim;
+  d.rms_norm_eps = static_cast<float>(p.rms_norm_eps);
+  // NoPE: no rotation to style. Validate refuses a set flag when R == 0.
+  d.is_neox_style = false;
+  d.indexer_rope_is_neox_style = false;
+  // No Lightning Indexer — GLM-5.3's k-pool is separate and stays on host.
+  d.index_n_heads = 0;
+  d.index_head_dim = 0;
+  d.index_topk = 0;
+  d.skip_topk = false;
+  d.sliding_window = 0;
+  mla::DeepseekYarnRopeParams rope{};
+  rope.rotary_dim = 0;  // NoPE
+  rope.yarn = false;
+  d.scale = mla::MlaAttentionScale(d, rope);
+  d.Validate();
+  return d;
+}
+
+// `MlaBlockWeights` from one layer's `Glm5NextMlaWeights`. The SPLIT
+// A-projection arm (q_a_proj + kv_a_proj_with_mqa separately), matching the
+// sibling's `GlmResidentMla` (glm_moe_dsa_forward.cpp:158). The absorbed trio
+// (kv_b_proj, w_uk_t, w_uv) were produced at load by `AbsorbMla`.
+// `rope_cos_sin_cache` stays empty — NoPE has no rotary. Indexer fields stay
+// empty — the k-pool indexer is NOT the seam's Lightning Indexer.
+mla::MlaBlockWeights Glm5NextResidentMla(Dev d, const Glm5NextMlaWeights& w,
+                                         const mla::MlaBlockDims& dm) {
+  mla::MlaBlockWeights m;
+  m.q_a_proj = ResidentWeight(d, w.q_a_proj);
+  m.q_a_layernorm = ResidentWeight(d, w.q_a_layernorm, {dm.q_lora_rank});
+  m.q_b_proj = ResidentWeight(d, w.q_b_proj);
+  m.kv_a_proj_with_mqa = ResidentWeight(d, w.kv_a_proj_with_mqa);
+  m.kv_a_layernorm = ResidentWeight(d, w.kv_a_layernorm, {dm.kv_lora_rank});
+  m.kv_b_proj = ResidentWeight(d, w.kv_b_proj);
+  m.w_uk_t = ResidentWeight(d, w.w_uk_t);
+  m.w_uv = ResidentWeight(d, w.w_uv);
+  m.o_proj = ResidentWeight(d, w.o_proj);
+  return m;
+  }
+
+
+  }  // namespace
 
 std::vector<float> Glm5NextDeviceForward(
     const Glm5NextWeights& weights, const std::vector<int32_t>& token_ids,
@@ -189,10 +251,39 @@ std::vector<float> Glm5NextDeviceForward(
 
   // ── the layer loop ──────────────────────────────────────────────────────────
   // Mirrors DecoderLayerForward but swaps the host double-acc RmsNorm for the
-  // device float-acc vt::RmsNorm. The mHC sites and DSA attention stay on host
-  // as islands.
-  std::vector<int32_t> topk;
-  int64_t topk_width = 0;
+  // device float-acc vt::RmsNorm. The mHC sites stay on host as islands; DSA/MLA
+  // attention is on device via the shared mla::ForwardMlaAttentionBlock.
+
+  // ── MLA step (shared by all DSA/MLA layers) ──────────────────────────────
+  // The per-step metadata (positions, slot_mapping, block table) is built ONCE
+  // and reused by every MLA layer, matching the sibling's pattern
+  // (glm_moe_dsa_forward.cpp:546-547). Each MLA layer gets its own local KV
+  // cache, matching the sibling's per-layer `attn_kv[l]`
+  // (glm_moe_dsa_forward.cpp:582-587). The persistent `caches` parameter is not
+  // wired here; the test path passes caches == nullptr (single-shot prefill).
+  const mla::MlaBlockDims mla_dims = Glm5NextMlaBlockDims(p);
+  const int64_t mla_head_size = mla_dims.head_size();
+  std::vector<int32_t> mla_positions(static_cast<size_t>(T));
+  std::iota(mla_positions.begin(), mla_positions.end(), int32_t{0});
+  CommonAttentionMetadata am;
+  am.num_reqs = 1;
+  am.num_actual_tokens = static_cast<int>(T);
+  am.query_start_loc = {0, static_cast<int32_t>(T)};
+  am.query_start_loc_cpu = am.query_start_loc;
+  am.seq_lens = {static_cast<int32_t>(T)};
+  am.seq_lens_cpu = am.seq_lens;
+  am.num_computed_tokens_cpu = {0};
+  am.max_query_len = static_cast<int>(T);
+  am.max_seq_len = static_cast<int>(T);
+  const int64_t mla_block_size = T;
+  am.block_table_num_cols = 1;
+  am.block_table_tensor = {0};
+  am.slot_mapping.resize(static_cast<size_t>(T));
+  std::iota(am.slot_mapping.begin(), am.slot_mapping.end(), int64_t{0});
+  am.causal = true;
+  const MlaStep mla_step =
+      BuildMlaStep(d, mla_positions, am, mla_block_size, p.max_position_embeddings);
+  TritonMLAImpl mla_impl;
 
   for (int64_t i = 0; i < L; ++i) {
     const DecoderLayerWeights& w = layers.Layer(i);
@@ -235,26 +326,44 @@ std::vector<float> Glm5NextDeviceForward(
       if (static_cast<int64_t>(out.size()) != T * H)
         Fail("KDA layer output size mismatch");
       std::copy_n(out.data(), static_cast<size_t>(T * H), attn_out.data());
-      // KDA wipes the topk thread.
-      topk.clear();
-      topk_width = 0;
     } else {
-      const MlaDims md = MlaDimsFrom(p);
-      const IndexerDims idd = IndexerDimsFrom(p);
-      const IndexerRole role = IndexerRoleFor(p, i);
-      const IndexerWeights iw = w.dsa.IndexerView();
-      const AttentionResult a = Attention(
-          md, w.dsa.mla, idd, role.skip_topk ? nullptr : &iw, role, normed, mask,
-          topk.empty() ? nullptr : &topk, topk_width, 1, T,
-          caches != nullptr ? &(*caches)[static_cast<size_t>(i)].dsa : nullptr);
-      attn_out = a.attn_output;
-      if (a.propagates_topk) {
-        topk = a.topk_indices;
-        topk_width = a.topk_width;
-      } else {
-        topk.clear();
-        topk_width = 0;
-      }
+      // ── DSA/MLA attention — DEVICE via shared mla::ForwardMlaAttentionBlock ──
+      // Replaces the host Attention() island. The k-pool indexer is NOT part of
+      // this seam; for the test geometry (index_topk > T) the k-pool mask is a
+      // no-op, so dense attention matches the host's sparse attention.
+      //
+      // The CUDA FA2 prefill kernel requires bf16 query/key/value
+      // (cuda_mla_prefill.cu:185), and ConcatAndCacheMla is a raw byte copy
+      // (cpu_cache.cpp:88-89) so the kv_cache must match the compute dtype. The
+      // sibling (glm_moe_dsa_forward.cpp:444) narrows hidden to bf16 before MLA
+      // for the same reason. We cast f32 normed → bf16, run MLA in bf16, then
+      // widen the output back to f32 for the host-side mHC post island.
+      const mla::MlaBlockWeights mw =
+          Glm5NextResidentMla(d, weights.layers[static_cast<size_t>(i)].mla,
+                              mla_dims);
+      DBuf dhidden_f32(d, DType::kF32, {T, H}, normed.data());
+      DBuf dhidden(d, DType::kBF16, {T, H});
+      vt::CastBf16(d.q, dhidden.t(), dhidden_f32.t());
+      DBuf dattn_bf16(d, DType::kBF16, {T, H});
+      Tensor attn_t = dattn_bf16.t();
+      DBuf mla_kv_cache(d, DType::kBF16, {1, mla_block_size, mla_head_size});
+      Tensor kv_cache_t = mla_kv_cache.t();
+      mla::ForwardMlaAttentionBlock(d, mla_dims, mw, dhidden.t(),
+                                     mla_step.positions, kv_cache_t,
+                                     mla_step.slot_mapping, mla_step.meta,
+                                     mla_impl, attn_t,
+                                     /*attn_pre_o_proj=*/nullptr,
+                                     /*shared=*/nullptr);
+      // ForwardMlaAttentionBlock creates internal DBuf temporaries that are
+      // destroyed when it returns, returning memory to the pool. Without a
+      // sync, CUDA kernels may still be running when that memory is reused,
+      // causing an illegal memory access. Sync the queue so all MLA kernels
+      // complete before any subsequent allocation can reuse the memory.
+      d.b.Synchronize(d.q);
+      DBuf dattn_f32(d, DType::kF32, {T, H});
+      vt::CastF32(d.q, dattn_f32.t(), dattn_bf16.t());
+      attn_out.assign(static_cast<size_t>(T * H), 0.0F);
+      dattn_f32.Download(d, attn_out.data());
     }
     if (static_cast<int64_t>(attn_out.size()) != T * H)
       Fail("attention output size mismatch");
@@ -312,7 +421,6 @@ std::vector<float> Glm5NextDeviceForward(
                    streams.data() + t * hc * H);
     }
   }
-
   // ── HcHeadCollapseMean — HOST ISLAND ───────────────────────────────────────
   // Unweighted mean over the stream axis: [T, hc, H] → [T, H].
   std::vector<float> hidden(static_cast<size_t>(T * H));

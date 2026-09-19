@@ -227,6 +227,20 @@ struct Glm5NextMlaWeights {
   OwnedTensor v_b_proj;            // [num_heads, v_head_dim, kv_lora_rank]
   OwnedTensor o_proj;              // [hidden, num_heads * v_head_dim]
   Glm5NextIndexerWeights indexer;
+
+  // ─── W9c-1: the POST-LOAD ABSORPTION (#2214) ──────────────────────────────
+  // The shared `mla::ForwardMlaAttentionBlock` decode arm needs `w_uk_t`
+  // `[heads, qk_nope, kv_lora]` and `w_uv` `[heads, kv_lora, v_head]` as bf16,
+  // because `vt::BatchedMatmul` requires f32-or-bf16 with a unit-stride inner
+  // dimension — the quantized `k_b_proj` / `v_b_proj` above are not admissible.
+  // `kv_b_proj` is the CHECKPOINT-layout `[heads*(qk_nope+v_head), kv_lora]`
+  // linear the prefill arm would need; the GGUF does not ship it, so it is
+  // rebuilt from the two halves (k transposed, v verbatim) — the same pattern
+  // the sibling `GlmMoeDsa` loader uses (`glm_moe_dsa_loader.cpp:224-273`).
+  // `w_uk_t` / `w_uv` then come from the SHARED `mla::AbsorbKvBProjBf16`.
+  OwnedTensor kv_b_proj;  // bf16 [heads*(qk_nope+v_head), kv_lora]
+  OwnedTensor w_uk_t;     // bf16 [heads, qk_nope, kv_lora]
+  OwnedTensor w_uv;       // bf16 [heads, kv_lora, v_head]
 };
 
 // A gated (SwiGLU) MLP — the dense layer's `Glm5NextTextMLP` (`:86-105`) and

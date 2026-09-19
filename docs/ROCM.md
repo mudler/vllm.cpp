@@ -1,7 +1,7 @@
 # Use the ROCm backend
 
 The ROCm backend runs on integrated and discrete AMD GPUs. Contributors have
-run the HIP gates on gfx1100, gfx1103, gfx1151, gfx1200, and gfx1201. Gemma
+run the HIP gates on gfx1100, gfx1102, gfx1103, gfx1151, gfx1200, and gfx1201. Gemma
 3 1B IT is token-identical to two vLLM ROCm oracles on gfx1200. Qwen3 0.6B has
 one deterministic, version-sensitive near tie on that device.
 
@@ -131,7 +131,8 @@ regardless of which device it registered for.
 | Hardware | Architecture | Memory | Current path |
 |---|---|---|---|
 | Strix Halo | gfx1151 | Unified, `PageableMemoryAccess = 0` | Plain `hipMalloc`, no reference tier: run a model whose every operation ROCm registers natively (#2511) |
-| Radeon 780M | gfx1103 | Shared, `PageableMemoryAccess = 0` | Same path as Strix Halo, with a smaller model |
+| Radeon 780M | gfx1103 | Shared, `PageableMemoryAccess = 0` | Same path as Strix Halo, with a smaller model. HIP reports 27.4 GiB of shared memory on a 54 GiB host. `VT_ROCM_MANAGED_ALLOC=1` ran Qwen3 0.6B without a fault in 7 of 7 legs, but decode fell from 34 tok/s to 12-21 tok/s, so the default stays plain `hipMalloc` |
+| Radeon RX 7700S | gfx1102 | Discrete, 8 GiB | Native kernels are required. Qwen3 0.6B matches the CPU greedy output at 61 tok/s; `VT_ROCM_MANAGED_ALLOC=1` changes nothing measurable |
 | Radeon 7900 XTX | gfx1100 | Discrete | Native kernels are required; this class can also host the vLLM ROCm oracle |
 | Radeon R9700 | gfx1201 | Discrete | Contributor-tested Gemma 4 FP8 MoE and SharedK WMMA path |
 | Radeon RX 9060 XT | gfx1200 | Discrete | Gemma 3 1B IT oracle parity; Qwen3 0.6B has a recorded near tie |

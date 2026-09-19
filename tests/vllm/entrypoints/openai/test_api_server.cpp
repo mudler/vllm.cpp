@@ -5469,3 +5469,136 @@ TEST_CASE("api_server: systemone without a ner callback is a 500") {
   CHECK(json::parse(r.body).at("error").at("message") ==
         "The model does not support NER");
 }
+
+// ── kev full-compatibility: choice, score, permute, separate ─────────────────
+
+TEST_CASE("api_server: systemone choice question") {
+  NerHarness h;
+  ApiServer::DispatchResult r = h.server.handle_systemone(
+      R"({"state":"john works at google",)"
+      R"("questions":{"pick":{"type":"choice",)"
+      R"("criteria":{"person":"a person","organization":"an org"}}}})");
+  CHECK(r.status == 200);
+  json j = json::parse(r.body);
+  json& ans = j.at("answers").at("pick");
+  CHECK(ans.at("type") == "choice");
+  // person (0.95) > organization (0.88) after softmax → choice = "person"
+  CHECK(ans.at("choice") == "person");
+  REQUIRE(ans.at("probabilities").is_object());
+  CHECK(ans.at("probabilities").contains("person"));
+  CHECK(ans.at("probabilities").contains("organization"));
+  CHECK(ans.at("confidence").is_number());
+  // latency_ms present (kev serve.py returns it)
+  CHECK(j.contains("latency_ms"));
+}
+
+TEST_CASE("api_server: systemone score question") {
+  NerHarness h;
+  ApiServer::DispatchResult r = h.server.handle_systemone(
+      R"({"state":"john works at google",)"
+      R"("questions":{"rate":{"type":"score",)"
+      R"("criteria":["person","organization","other"]}}})");
+  CHECK(r.status == 200);
+  json j = json::parse(r.body);
+  json& ans = j.at("answers").at("rate");
+  CHECK(ans.at("type") == "score");
+  CHECK(ans.at("score").is_number());
+  REQUIRE(ans.at("legend").is_object());
+  CHECK(ans.at("legend").contains("0"));
+  CHECK(ans.at("legend").contains("1"));
+  CHECK(ans.at("legend").contains("2"));
+  REQUIRE(ans.at("probabilities").is_object());
+  CHECK(ans.at("probabilities").contains("0"));
+  CHECK(ans.at("probabilities").contains("1"));
+  CHECK(ans.at("probabilities").contains("2"));
+  CHECK(ans.at("confidence").is_number());
+}
+
+TEST_CASE("api_server: systemone separate — N passes, summed tokens") {
+  NerHarness h;
+  ApiServer::DispatchResult r = h.server.handle_systemone_separate(
+      R"({"state":"john works at google",)"
+      R"("questions":{"person":{"type":"noul"},"organization":{"type":"noul"}}})");
+  CHECK(r.status == 200);
+  json j = json::parse(r.body);
+  CHECK(j.at("answers").at("person").at("type") == "noul");
+  CHECK(j.at("answers").at("person").at("noul") ==
+        doctest::Approx(0.95F));
+  CHECK(j.at("answers").at("organization").at("noul") ==
+        doctest::Approx(0.88F));
+  // Two questions, each costs 7 prompt tokens in the mock → 14 total.
+  CHECK(j.at("usage").at("input_tokens").get<int64_t>() == 14);
+  CHECK(j.contains("latency_ms"));
+}
+
+TEST_CASE("api_server: systemone permute — choice under n_perm orders") {
+  NerHarness h;
+  ApiServer::DispatchResult r = h.server.handle_systemone_permute(
+      R"({"request":{"state":"john works at google",)"
+      R"("questions":{"pick":{"type":"choice",)"
+      R"("criteria":{"person":"a person","organization":"an org"}}}},)"
+      R"("question":"pick","n_perm":3,"seed":42})");
+  CHECK(r.status == 200);
+  json j = json::parse(r.body);
+  REQUIRE(j.at("runs").is_array());
+  CHECK(j.at("runs").size() == 3);
+  // Each run carries order, probabilities, choice, latency_ms.
+  for (const auto& run : j.at("runs")) {
+    REQUIRE(run.at("order").is_array());
+    REQUIRE(run.at("probabilities").is_object());
+    CHECK(run.at("choice").is_string());
+    CHECK(run.contains("latency_ms"));
+  }
+  // The mock NER is order-invariant, so the argmax must be stable.
+  CHECK(j.at("argmax_stable").get<bool>() == true);
+  REQUIRE(j.at("spread").is_object());
+  CHECK(j.at("spread").contains("person"));
+  CHECK(j.at("spread").contains("organization"));
+}
+
+TEST_CASE("api_server: systemone permute rejects non-choice questions") {
+  NerHarness h;
+  ApiServer::DispatchResult r = h.server.handle_systemone_permute(
+      R"({"request":{"state":"john works at google",)"
+      R"("questions":{"q":{"type":"noul"}}},)"
+      R"("question":"q"})");
+  CHECK(r.status == 400);
+}
+
+TEST_CASE("api_server: systemone permute without a ner callback is a 500") {
+  vllm::entrypoints::openai::OpenAIServingModels models{"m"};
+  ApiServer server{models, "test-version"};
+  ApiServer::DispatchResult r = server.handle_systemone_permute(
+      R"({"request":{"state":"x","questions":{"q":{"type":"choice",)"
+      R"("criteria":{"a":"x","b":"y"}}}},"question":"q"})");
+  CHECK(r.status == 500);
+}
+
+TEST_CASE("api_server: systemone separate without a ner callback is a 500") {
+  vllm::entrypoints::openai::OpenAIServingModels models{"m"};
+  ApiServer server{models, "test-version"};
+  ApiServer::DispatchResult r = server.handle_systemone_separate(
+      R"({"state":"x","questions":{"y":{"type":"noul"}}})");
+  CHECK(r.status == 500);
+}
+
+TEST_CASE("api_server: systemone unknown question type is a 400") {
+  NerHarness h;
+  ApiServer::DispatchResult r = h.server.handle_systemone(
+      R"({"state":"x","questions":{"q":{"type":"bogus"}}})");
+  CHECK(r.status == 400);
+}
+
+TEST_CASE("api_server: systemone choice without criteria is a 400") {
+  NerHarness h;
+  ApiServer::DispatchResult r = h.server.handle_systemone(
+      R"({"state":"x","questions":{"q":{"type":"choice"}}})");
+  CHECK(r.status == 400);
+}
+
+TEST_CASE("api_server: systemone score with too few levels is a 400") {
+  NerHarness h;
+  ApiServer::DispatchResult r = h.server.handle_systemone(
+      R"({"state":"x","questions":{"q":{"type":"score","criteria":["only"]}}})");
+  CHECK(r.status == 400);
+}

@@ -5,6 +5,8 @@
 
 #include <atomic>
 #include <algorithm>
+#include <cmath>
+#include <chrono>
 #include <cstdlib>
 #include <ctime>
 #include <exception>
@@ -15,6 +17,7 @@
 #include <memory>
 #include <optional>
 #include <mutex>
+#include <random>
 #include <thread>
 #include <type_traits>
 #include <stdexcept>
@@ -610,6 +613,262 @@ ApiServer::DispatchResult ApiServer::handle_embeddings(
   }
 }
 
+// ── kev SystemOne API helpers (ported from kev/api.py) ─────────────────────
+//
+// GLiNER2.5 backs the NER callback. These helpers map NER confidence scores
+// onto the kev probability shapes (noul / choice / score), so /v1/systemone
+// is API-compatible with kev's serve.py.
+namespace {
+
+// render(v, indent) — flatten JSON content into text. Ported from
+// kev/api.py:render. Field names are kept as labels.
+std::string RenderJson(const nlohmann::json& v, int indent = 0) {
+  if (v.is_null()) return "";
+  if (v.is_string()) return v.get<std::string>();
+  if (v.is_boolean()) return v.get<bool>() ? "true" : "false";
+  if (v.is_number()) return v.dump();
+  std::string pad(static_cast<size_t>(2 * indent), ' ');
+  if (v.is_array()) {
+    std::string out;
+    for (size_t i = 0; i < v.size(); ++i) {
+      std::string rendered = RenderJson(v[i], indent + 1);
+      auto s = rendered.find_first_not_of(" \t\n");
+      if (s == std::string::npos) s = 0;
+      if (i > 0) out += "\n";
+      out += pad + "- " + rendered.substr(s);
+    }
+    return out;
+  }
+  if (v.is_object()) {
+    std::string out;
+    size_t i = 0;
+    for (auto it = v.begin(); it != v.end(); ++it, ++i) {
+      if (i > 0) out += "\n";
+      if (it.value().is_object() || it.value().is_array()) {
+        out += pad + it.key() + ":\n" + RenderJson(it.value(), indent + 1);
+      } else {
+        out += pad + it.key() + ": " + RenderJson(it.value());
+      }
+    }
+    return out;
+  }
+  return v.dump();
+}
+
+// r2(x) — round to 2 decimal places (kev/api.py:r2).
+double R2(double x) { return std::round(x * 100.0) / 100.0; }
+
+// choice_confidence(p) — normalized margin (kev/api.py:choice_confidence).
+double ChoiceConfidence(const std::vector<float>& p) {
+  size_t k = p.size();
+  if (k <= 1) return 1.0;
+  float mx = *std::max_element(p.begin(), p.end());
+  return (static_cast<double>(mx) - 1.0 / static_cast<double>(k)) /
+         (1.0 - 1.0 / static_cast<double>(k));
+}
+
+// score_confidence(p) — 1 - E|level - mode| / (L - 1)
+// (kev/api.py:score_confidence).
+double ScoreConfidence(const std::vector<float>& p) {
+  size_t l = p.size();
+  if (l <= 1) return 1.0;
+  size_t mode = 0;
+  float max_p = p[0];
+  for (size_t i = 1; i < l; ++i) {
+    if (p[i] > max_p) { max_p = p[i]; mode = i; }
+  }
+  double s = 0.0;
+  for (size_t i = 0; i < l; ++i) {
+    s += static_cast<double>(p[i]) *
+         std::abs(static_cast<double>(i) - static_cast<double>(mode));
+  }
+  return 1.0 - s / static_cast<double>(l - 1);
+}
+
+// Numerically stable softmax.
+std::vector<float> Softmax(const std::vector<float>& scores) {
+  if (scores.empty()) return {};
+  float mx = *std::max_element(scores.begin(), scores.end());
+  std::vector<float> exps;
+  float sum = 0.0F;
+  for (float s : scores) {
+    float e = std::exp(s - mx);
+    exps.push_back(e);
+    sum += e;
+  }
+  if (sum <= 0.0F) {
+    return std::vector<float>(scores.size(), 1.0F / scores.size());
+  }
+  for (float& e : exps) e /= sum;
+  return exps;
+}
+
+// Parsed question from a SystemOneRequest.
+struct SystemOneQuestion {
+  std::string id;
+  std::string type;  // "noul", "choice", "score"
+  std::vector<std::string> keys;   // option names (choice) / level text (score)
+  std::vector<std::string> labels;  // NER labels for this question
+};
+
+// Parsed SystemOneRequest body.
+struct ParsedSystemOne {
+  std::string text;
+  std::string model;
+  float threshold = 0.5F;
+  int64_t max_width = 12;
+  std::vector<SystemOneQuestion> questions;
+  std::vector<std::string> all_labels;
+  bool ok = true;
+  int error_status = 400;
+  std::string error_type = "BadRequestError";
+  std::string error_msg;
+};
+
+ParsedSystemOne ParseSystemOneBody(const nlohmann::json& body) {
+  ParsedSystemOne r;
+  if (!body.is_object()) {
+    r.ok = false;
+    r.error_msg = "request body must be an object";
+    return r;
+  }
+  if (!body.contains("state")) {
+    r.ok = false;
+    r.error_msg = "state is required";
+    return r;
+  }
+  r.text = RenderJson(body["state"]);
+  if (body.contains("model") && body["model"].is_string()) {
+    r.model = body["model"].get<std::string>();
+  }
+  if (body.contains("threshold") && body["threshold"].is_number()) {
+    r.threshold = body["threshold"].get<float>();
+  }
+  if (body.contains("max_width") && body["max_width"].is_number_integer()) {
+    r.max_width = body["max_width"].get<int64_t>();
+  }
+  if (!body.contains("questions") || !body["questions"].is_object()) {
+    r.ok = false;
+    r.error_msg = "questions is required and must be an object";
+    return r;
+  }
+  if (body["questions"].empty()) {
+    r.ok = false;
+    r.error_msg = "questions must contain at least one question";
+    return r;
+  }
+  for (auto it = body["questions"].begin(); it != body["questions"].end();
+       ++it) {
+    SystemOneQuestion q;
+    q.id = it.key();
+    const auto& qj = it.value();
+    if (!qj.is_object() || !qj.contains("type") || !qj["type"].is_string()) {
+      r.ok = false;
+      r.error_msg = "question '" + q.id + "' must have a string type";
+      return r;
+    }
+    q.type = qj["type"].get<std::string>();
+    if (q.type == "noul") {
+      q.labels = {q.id};
+      q.keys = {"no", "yes"};
+    } else if (q.type == "choice") {
+      if (!qj.contains("criteria") || !qj["criteria"].is_object() ||
+          qj["criteria"].empty()) {
+        r.ok = false;
+        r.error_msg = "question '" + q.id +
+                      "' (choice) requires a non-empty criteria object";
+        return r;
+      }
+      for (auto cit = qj["criteria"].begin(); cit != qj["criteria"].end();
+           ++cit) {
+        q.keys.push_back(cit.key());
+        q.labels.push_back(cit.key());
+      }
+    } else if (q.type == "score") {
+      if (!qj.contains("criteria") || !qj["criteria"].is_array() ||
+          qj["criteria"].size() < 2) {
+        r.ok = false;
+        r.error_msg = "question '" + q.id +
+                      "' (score) requires a criteria array with >= 2 levels";
+        return r;
+      }
+      for (const auto& level : qj["criteria"]) {
+        std::string rendered = RenderJson(level);
+        q.keys.push_back(rendered);
+        q.labels.push_back(rendered);
+      }
+    } else {
+      r.ok = false;
+      r.error_msg = "question '" + q.id + "' has unknown type: " + q.type;
+      return r;
+    }
+    for (const auto& l : q.labels) r.all_labels.push_back(l);
+    r.questions.push_back(std::move(q));
+  }
+  return r;
+}
+
+// Build one kev answer from NER results for one question.
+nlohmann::json BuildSystemOneAnswer(
+    const SystemOneQuestion& q, const ApiServer::NerResult& result) {
+  std::vector<float> scores;
+  for (const auto& label : q.labels) {
+    float max_conf = 0.0F;
+    for (const auto& e : result.entities) {
+      if (e.label == label) max_conf = std::max(max_conf, e.confidence);
+    }
+    scores.push_back(max_conf);
+  }
+  std::vector<float> probs;
+  if (q.type == "noul") {
+    probs = {1.0F - scores[0], scores[0]};
+  } else {
+    probs = Softmax(scores);
+  }
+  if (q.type == "noul") {
+    nlohmann::json entities = nlohmann::json::array();
+    for (const auto& e : result.entities) {
+      if (e.label == q.labels[0]) {
+        entities.push_back(nlohmann::json{
+            {"text", e.text}, {"start", e.start}, {"end", e.end},
+            {"confidence", e.confidence}});
+      }
+    }
+    return nlohmann::json{{"type", "noul"}, {"noul", R2(probs[1])},
+                          {"entities", std::move(entities)}};
+  }
+  if (q.type == "choice") {
+    size_t argmax = 0;
+    for (size_t i = 1; i < probs.size(); ++i) {
+      if (probs[i] > probs[argmax]) argmax = i;
+    }
+    nlohmann::json dist = nlohmann::json::object();
+    for (size_t i = 0; i < q.keys.size(); ++i) {
+      dist[q.keys[i]] = R2(probs[i]);
+    }
+    return nlohmann::json{{"type", "choice"}, {"choice", q.keys[argmax]},
+                          {"confidence", R2(ChoiceConfidence(probs))},
+                          {"probabilities", std::move(dist)}};
+  }
+  // score
+  double score = 0.0;
+  for (size_t i = 0; i < probs.size(); ++i) {
+    score += static_cast<double>(i) * probs[i];
+  }
+  nlohmann::json legend = nlohmann::json::object();
+  nlohmann::json dist = nlohmann::json::object();
+  for (size_t i = 0; i < q.keys.size(); ++i) {
+    legend[std::to_string(i)] = q.keys[i];
+    dist[std::to_string(i)] = R2(probs[i]);
+  }
+  return nlohmann::json{{"type", "score"}, {"score", R2(score)},
+                        {"legend", std::move(legend)},
+                        {"probabilities", std::move(dist)},
+                        {"confidence", R2(ScoreConfidence(probs))}};
+}
+
+}  // namespace
+
 ApiServer::DispatchResult ApiServer::handle_ner(
     const std::string& request_body) const {
   if (!ner_) {
@@ -710,77 +969,182 @@ ApiServer::DispatchResult ApiServer::handle_systemone(
     return MakeError(400, "BadRequestError",
                     std::string("invalid JSON body: ") + e.what());
   }
-  if (!body.is_object()) {
-    return MakeError(400, "BadRequestError", "request body must be an object");
+  auto parsed = ParseSystemOneBody(body);
+  if (!parsed.ok) {
+    return MakeError(parsed.error_status, parsed.error_type, parsed.error_msg);
   }
-  // state: the text to extract entities from (string or JSON-encoded value).
-  if (!body.contains("state")) {
-    return MakeError(400, "BadRequestError", "state is required");
-  }
-  std::string text;
-  if (body["state"].is_string()) {
-    text = body["state"].get<std::string>();
-  } else {
-    text = body["state"].dump();
-  }
-  // questions: map of label -> question spec. Each question's type is "noul"
-  // (is this text an entity of this type?). The label names are the entity
-  // types to extract.
-  if (!body.contains("questions") || !body["questions"].is_object()) {
-    return MakeError(400, "BadRequestError",
-                    "questions is required and must be an object");
-  }
-  std::vector<std::string> labels;
-  for (auto it = body["questions"].begin(); it != body["questions"].end();
-      ++it) {
-    labels.push_back(it.key());
-  }
-  if (labels.empty()) {
-    return MakeError(400, "BadRequestError",
-                    "questions must contain at least one question");
-  }
-
-  // threshold / max_width: optional fields on the questions or the top level.
-  float threshold = 0.5F;
-  int64_t max_width = 12;
-  if (body.contains("threshold") && body["threshold"].is_number()) {
-    threshold = body["threshold"].get<float>();
-  }
-  if (body.contains("max_width") && body["max_width"].is_number_integer()) {
-    max_width = body["max_width"].get<int64_t>();
-  }
-
+  auto start = std::chrono::steady_clock::now();
   try {
-    const NerResult result = ner_(text, labels, threshold, max_width);
-    // Build jev-compatible answers: for each label, list matching entities.
+    const NerResult result = ner_(parsed.text, parsed.all_labels,
+                                 parsed.threshold, parsed.max_width);
+    auto end = std::chrono::steady_clock::now();
+    double latency_ms =
+       std::chrono::duration<double, std::milli>(end - start).count();
     nlohmann::json answers = nlohmann::json::object();
-    for (const std::string& label : labels) {
-     nlohmann::json label_entities = nlohmann::json::array();
-     float max_conf = 0.0F;
-     for (const NerEntity& e : result.entities) {
-       if (e.label == label) {
-         label_entities.push_back(nlohmann::json{
-             {"text", e.text},
-             {"start", e.start},
-             {"end", e.end},
-             {"confidence", e.confidence},
-         });
-         max_conf = std::max(max_conf, e.confidence);
-       }
-     }
-     answers[label] = nlohmann::json{
-         {"type", "noul"},
-         {"noul", max_conf},
-         {"entities", std::move(label_entities)},
-     };
+    for (const auto& q : parsed.questions) {
+     answers[q.id] = BuildSystemOneAnswer(q, result);
     }
     DispatchResult r;
     r.body = nlohmann::json{
-       {"model", models_.model_name()},
+       {"model", parsed.model.empty() ? models_.model_name() : parsed.model},
        {"answers", std::move(answers)},
-       {"usage",
-        nlohmann::json{{"input_tokens", result.prompt_tokens},
-                       {"output_tokens", 0}}},
+       {"usage", nlohmann::json{{"input_tokens", result.prompt_tokens},
+                                {"output_tokens", 0}}},
+       {"latency_ms", R2(latency_ms)},
+    }.dump();
+    return r;
+  } catch (const std::exception& e) {
+    return MakeError(500, "InternalServerError", e.what());
+  }
+}
+
+// POST /v1/systemone/permute (kev serve.py:systemone_permute). Re-runs one
+// choice question under n_perm option orders. GLiNER's NER is order-invariant,
+// so probabilities are stable across permutations; the API shape matches kev.
+ApiServer::DispatchResult ApiServer::handle_systemone_permute(
+    const std::string& request_body) const {
+  if (!ner_) {
+    return MakeError(500, "InternalServerError",
+                    "The model does not support NER");
+  }
+  nlohmann::json body;
+  try {
+    body = nlohmann::json::parse(request_body);
+  } catch (const std::exception& e) {
+    return MakeError(400, "BadRequestError",
+                    std::string("invalid JSON body: ") + e.what());
+  }
+  if (!body.is_object()) {
+    return MakeError(400, "BadRequestError", "request body must be an object");
+  }
+  if (!body.contains("request") || !body["request"].is_object()) {
+    return MakeError(400, "BadRequestError",
+                    "request is required and must be an object");
+  }
+  auto parsed = ParseSystemOneBody(body["request"]);
+  if (!parsed.ok) {
+    return MakeError(parsed.error_status, parsed.error_type, parsed.error_msg);
+  }
+  if (!body.contains("question") || !body["question"].is_string()) {
+    return MakeError(400, "BadRequestError",
+                    "question is required and must be a string");
+  }
+  std::string question_id = body["question"].get<std::string>();
+  const SystemOneQuestion* target = nullptr;
+  for (const auto& q : parsed.questions) {
+    if (q.id == question_id) { target = &q; break; }
+  }
+  if (!target) {
+    return MakeError(400, "BadRequestError",
+                    "question '" + question_id + "' not found");
+  }
+  if (target->type != "choice") {
+    return MakeError(400, "BadRequestError",
+                    "question must be a choice question");
+  }
+  int n_perm = body.value("n_perm", 6);
+  int seed = body.value("seed", 0);
+  std::mt19937 rng(static_cast<std::mt19937::result_type>(seed));
+  nlohmann::json runs = nlohmann::json::array();
+  std::vector<float> min_prob(target->keys.size(), 1.0F);
+  std::vector<float> max_prob(target->keys.size(), 0.0F);
+  std::string first_choice;
+  bool argmax_stable = true;
+  for (int i = 0; i < n_perm; ++i) {
+    std::vector<std::string> order = target->keys;
+    if (i > 0) std::shuffle(order.begin(), order.end(), rng);
+    auto start = std::chrono::steady_clock::now();
+    NerResult result = ner_(parsed.text, order, parsed.threshold,
+                            parsed.max_width);
+    auto end = std::chrono::steady_clock::now();
+    double latency_ms =
+       std::chrono::duration<double, std::milli>(end - start).count();
+    std::vector<float> scores;
+    for (const auto& label : order) {
+     float max_conf = 0.0F;
+     for (const auto& e : result.entities) {
+       if (e.label == label) max_conf = std::max(max_conf, e.confidence);
+     }
+     scores.push_back(max_conf);
+    }
+    std::vector<float> probs = Softmax(scores);
+    size_t argmax = 0;
+    for (size_t j = 1; j < probs.size(); ++j) {
+     if (probs[j] > probs[argmax]) argmax = j;
+    }
+    nlohmann::json prob_dist = nlohmann::json::object();
+    for (size_t j = 0; j < order.size(); ++j) {
+     prob_dist[order[j]] = R2(probs[j]);
+     for (size_t k = 0; k < target->keys.size(); ++k) {
+       if (order[j] == target->keys[k]) {
+         min_prob[k] = std::min(min_prob[k], probs[j]);
+         max_prob[k] = std::max(max_prob[k], probs[j]);
+         break;
+       }
+     }
+    }
+    std::string choice = order[argmax];
+    if (i == 0) first_choice = choice;
+    else if (choice != first_choice) argmax_stable = false;
+    runs.push_back(nlohmann::json{
+       {"order", order},
+       {"probabilities", std::move(prob_dist)},
+       {"choice", choice},
+       {"latency_ms", R2(latency_ms)},
+    });
+  }
+  nlohmann::json spread_json = nlohmann::json::object();
+  for (size_t k = 0; k < target->keys.size(); ++k) {
+    spread_json[target->keys[k]] = R2(max_prob[k] - min_prob[k]);
+  }
+  DispatchResult r;
+  r.body = nlohmann::json{
+     {"runs", std::move(runs)},
+     {"argmax_stable", argmax_stable},
+     {"spread", std::move(spread_json)},
+  }.dump();
+  return r;
+}
+
+// POST /v1/systemone/separate (kev serve.py:systemone_separate). Answers each
+// question in its own NER call (N passes). Response shape matches /v1/systemone.
+ApiServer::DispatchResult ApiServer::handle_systemone_separate(
+    const std::string& request_body) const {
+  if (!ner_) {
+    return MakeError(500, "InternalServerError",
+                    "The model does not support NER");
+  }
+  nlohmann::json body;
+  try {
+    body = nlohmann::json::parse(request_body);
+  } catch (const std::exception& e) {
+    return MakeError(400, "BadRequestError",
+                    std::string("invalid JSON body: ") + e.what());
+  }
+  auto parsed = ParseSystemOneBody(body);
+  if (!parsed.ok) {
+    return MakeError(parsed.error_status, parsed.error_type, parsed.error_msg);
+  }
+  auto start = std::chrono::steady_clock::now();
+  try {
+    nlohmann::json answers = nlohmann::json::object();
+    int64_t total_tokens = 0;
+    for (const auto& q : parsed.questions) {
+     const NerResult result = ner_(parsed.text, q.labels, parsed.threshold,
+                                   parsed.max_width);
+     total_tokens += result.prompt_tokens;
+     answers[q.id] = BuildSystemOneAnswer(q, result);
+    }
+    auto end = std::chrono::steady_clock::now();
+    double latency_ms =
+       std::chrono::duration<double, std::milli>(end - start).count();
+    DispatchResult r;
+    r.body = nlohmann::json{
+       {"model", parsed.model.empty() ? models_.model_name() : parsed.model},
+       {"answers", std::move(answers)},
+       {"usage", nlohmann::json{{"input_tokens", total_tokens},
+                                {"output_tokens", 0}}},
+       {"latency_ms", R2(latency_ms)},
     }.dump();
     return r;
   } catch (const std::exception& e) {
@@ -1407,11 +1771,21 @@ void ApiServer::register_routes() {
                               httplib::Response& res) {
                   write(handle_ner(req.body), res);
                 });
-    // Jev / System One-compatible endpoint (same NER callback).
+    // kev / System One-compatible endpoints (same NER callback).
     server.Post("/v1/systemone",
                 [this, write](const httplib::Request& req,
                               httplib::Response& res) {
                   write(handle_systemone(req.body), res);
+                });
+    server.Post("/v1/systemone/permute",
+                [this, write](const httplib::Request& req,
+                              httplib::Response& res) {
+                  write(handle_systemone_permute(req.body), res);
+                });
+    server.Post("/v1/systemone/separate",
+                [this, write](const httplib::Request& req,
+                              httplib::Response& res) {
+                  write(handle_systemone_separate(req.body), res);
                 });
   }
 

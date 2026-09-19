@@ -651,4 +651,46 @@ bool DeviceShadowExact(const Tensor& t, uint32_t rows, uint32_t cols) {
          s->dev_rows == rows && s->dev_cols == cols;
 }
 
+// to host (the residency win). Host is marked stale until EnsureHost.
+// Device tensor is stored as logical [rows, cols] TILE (may differ from out's
+// rank-3 view as long as numel matches) so a later Reshape+EnsureDevice2D hits.
+void CommitDeviceLogical2D(Tensor& out, ttnn::Tensor dev, uint32_t rows, uint32_t cols) {
+  VT_CHECK(out.IsContiguous(), "tenstorrent: CommitDeviceLogical2D expects contiguous out");
+  VT_CHECK(out.Numel() == static_cast<int64_t>(rows) * static_cast<int64_t>(cols),
+           "tenstorrent: CommitDeviceLogical2D numel mismatch");
+  {
+    int64_t vol = 1;
+    const auto ds = dev.logical_shape();
+    for (uint32_t i = 0; i < ds.rank(); ++i) vol *= ds[i];
+    VT_CHECK(vol == static_cast<int64_t>(rows) * static_cast<int64_t>(cols),
+             std::string("tenstorrent: CommitDeviceLogical2D device volume ") +
+                 std::to_string(vol) + " != rows*cols " +
+                 std::to_string(rows * cols));
+  }
+  std::lock_guard<std::mutex> g(SlotMutex());
+  BufferSlot* s = FindSlot(out.data);
+  if (std::getenv("VT_TT_SLOT_TRACE") != nullptr) {
+    const auto ds = dev.logical_shape();
+    int64_t vol = 1;
+    for (uint32_t i = 0; i < ds.rank(); ++i) vol *= ds[i];
+    std::fprintf(stderr,
+                 "[TT-SLOT] commit out=%p rows=%u cols=%u tracked=%d vol=%" PRId64
+                 " dt=%d\n",
+                 static_cast<const void*>(out.data), rows, cols,
+                 s != nullptr ? 1 : 0, vol, static_cast<int>(dev.dtype()));
+  }
+  if (s == nullptr) {
+    // Untracked buffer (e.g. stack/test scratch): fall back to host write.
+    DownloadToHost(dev, out, "CommitDeviceLogical2D(untracked)");
+    return;
+  }
+  s->device = std::move(dev);
+  s->dev_rows = rows;
+  s->dev_cols = cols;
+  s->device_current = true;
+  s->host_current = false;
+  s->conv_transposed = false;  // logical [rows, cols] — oracle layout
+  s->device_reserved = false;  // real bytes committed — the reservation is spent
+}
+
 }  // namespace vt::tenstorrent

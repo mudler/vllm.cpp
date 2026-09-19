@@ -443,6 +443,87 @@ ttnn::Tensor EnsureWeightViewDevice(const Tensor& t, MeshDevice& device);
 ttnn::Tensor EnsureMatmulWeightDevice(const Tensor& b, MeshDevice& device);
 ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device);
 bool DeviceShadowExact(const Tensor& t, uint32_t rows, uint32_t cols);
+// ---- KEEPQUANT W3: the resident i32 word shadow -------------------------
+struct KeepQuantWordShadow {
+  ttnn::Tensor words;  // {B, wpb} INT32 ROW_MAJOR — the packed stream, word-staged
+  int64_t rows = 0;
+  int64_t nb = 0;
+  int wpb = 0;
+};
+
+inline std::mutex& KeepQuantWordMutex() {
+  static std::mutex m;
+  return m;
+}
+// Keyed by the packed tensor's host base pointer — the EnsureMatmulWeightDevice
+// persistent-shadow pattern. An interior view carries its own pointer, so a
+// differently-offset view stages its own shadow and never consumes another
+// slice's bytes (the Qwen3.5 BA interior-view fatality).
+inline std::map<const void*, KeepQuantWordShadow>& KeepQuantWordShadows() {
+  static std::map<const void*, KeepQuantWordShadow>* m =
+      new std::map<const void*, KeepQuantWordShadow>();  // never destroyed (#1486)
+  return *m;
+}
+
+// dense keep-quant matmul no longer inserts (it serves packed words through
+// the E=1 grouped arm), so a populated entry for a matmul weight is exactly
+// the regression the probe names. Same collision discipline as before: the
+// free path drops by host pointer (UnregisterHostBuffer).
+struct DecodedWeightShadow {
+  std::optional<ttnn::Tensor> device;
+  uint32_t rows = 0, cols = 0;
+  DType enc = DType::kF32;
+};
+inline std::mutex& DecodedWeightMutex() {
+  static std::mutex m;
+  return m;
+}
+inline std::map<uintptr_t, DecodedWeightShadow>& DecodedWeightShadows() {
+  static std::map<uintptr_t, DecodedWeightShadow>* m =
+      new std::map<uintptr_t, DecodedWeightShadow>(); // never destroyed (#1486)
+  return *m;
+}
+
+// GroupedActShadow: the grouped-quant activation's device-side bf16 TILE
+// staging, keyed by the host activation pointer. EnsureDevice2D's slot
+// staging corrupts under trace capture (ISSUE-LOCAL-01M2NSDATJQ1YNW1PA9ZBMAAM5);
+// from_span stages directly from host, and the shadow cache serves the same
+// device tensor under capture (the warm-first contract — the eager step stages
+// before capture, the capture-time miss refuses). Same collision discipline as
+// the other resident shadows: the free path drops by host pointer.
+struct GroupedActShadow {
+  ttnn::Tensor device;
+  uint32_t rows = 0, cols = 0;
+  DType dtype = DType::kF32;
+};
+inline std::mutex& GroupedActMutex() {
+  static std::mutex m;
+  return m;
+}
+inline std::map<uintptr_t, GroupedActShadow>& GroupedActShadows() {
+  static std::map<uintptr_t, GroupedActShadow>* m =
+      new std::map<uintptr_t, GroupedActShadow>(); // never destroyed (#1486)
+  return *m;
+}
+
+// ---- moved declarations (definitions in tenstorrent_keepquant.cpp) ----
+ttnn::Tensor EnsureKeepQuantWords(const Tensor& packed, DType enc, int64_t rows,
+                                  int64_t nb, MeshDevice& device);
+void TTReclaimPlanes(MeshDevice& device, std::vector<ttnn::Tensor>& planes);
+void KeepQuantDecodeKernel(Queue&, Tensor& out, const Tensor& packed);
+void MatmulBTQuantKernel(Queue& q, Tensor& out, const Tensor& a, const Tensor& b);
+void MatmulBTQuantGroupedKernel(Queue&, Tensor& out, const Tensor& act,
+                                const Tensor& weight, const Tensor& expert_ids);
+void MatmulBTQuantGroupedKernel(Queue&, Tensor& out, const Tensor& act,
+                                const Tensor& weight);
+void MatmulBTQuantInt8DotKernel(Queue& q, Tensor& out, const Tensor& a,
+                                const Tensor& b);
+void DropKeepQuantWordShadow(void* host);
+void DropDecodedWeightShadow(void* host);
+void DropGroupedActShadow(void* host);
+void CommitDeviceLogical2D(Tensor& out, ttnn::Tensor dev, uint32_t rows,
+                           uint32_t cols);
+
 // ---- BACKEND-TENSTORRENT-QWEN35 W4 (#2107): bulk staging counters ----
 std::atomic<uint64_t>& StagingBulkUploads();
 std::atomic<uint64_t>& StagingBulkBytes();

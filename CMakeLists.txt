@@ -1715,7 +1715,8 @@ if(VLLM_CPP_TENSTORRENT)
     src/vt/tenstorrent/tenstorrent_backend.cpp)
   add_library(vllm_tenstorrent_ops OBJECT
     src/vt/tenstorrent/tenstorrent_ops.cpp
-    src/vt/tenstorrent/tenstorrent_residency.cpp)
+    src/vt/tenstorrent/tenstorrent_residency.cpp
+    src/vt/tenstorrent/tenstorrent_keepquant.cpp)
   target_include_directories(vllm_tenstorrent_ops PRIVATE
     ${CMAKE_SOURCE_DIR}/include ${CMAKE_BINARY_DIR}/include ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(vllm_tenstorrent_ops PRIVATE TTNN::TTNN)

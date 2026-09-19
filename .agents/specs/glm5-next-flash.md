@@ -3486,16 +3486,18 @@ the result for the island op, re-upload — is the one this port follows.
 | 8 | MoE combine | `moe.cpp:694` | `kMoeCombine` | yes | yes | MOVES |
 | 9 | Dense + shared MLP | `moe.cpp:473,672` | `kMatmul`+`kClampedSwiGLU` | yes | yes | ON DEVICE (post-O55, #3203) |
 | 10 | Eager MLA attention | `attn.cpp:276` | `kMlaPrefillAttention`/`kMlaDecodeAttention` | yes | yes | ON DEVICE (W9c-1) |
-| 11 | mHC sites | `mhc.cpp:21,53` | `kDeepseekV4Mhc` | yes | yes | HOST ISLAND (O34 discharged, arm not rewired) |
+| 11 | mHC pre/post | `mhc.cpp:21,53` | `kDeepseekV4Mhc` | yes | yes | ON DEVICE (pre/post via MhcDevice()->pre()/post(); HcHeadCollapseMean on host) |
 
 Arms 1-3 were already on the device. Arms 4-8 moved to the device in W9c-3.
 Arm 9 moved to the device in post-O55 (#3203) after O55 (#3197) added
 `vt::ClampedSwiGLU`. Arm 10 moved to the device in W9c-1 (ISSUE-LOCAL-01J7QX3M5K1HE3N9V0KQRJ8X2M), which
 re-priced the earlier refusal: the MLA attention arm routes through
 `mla::ForwardMlaAttentionBlock` while the k-pool indexer stays as a host-
-fallback island. Arm 11 stays as a host-fallback island because the device
-forward has not been rewired to call the device mHC kernels (O34 discharged the
-ROCm provider debt, but the arm still runs on the interposed CPU queue).
+fallback island. Arm 11 is on device: mHC pre/post route through
+`MhcDevice()->pre()` and `MhcDevice()->post()` when `kDeepseekV4Mhc` is
+registered on the queue's device (CUDA, O34; ROCm, O34). `HcHeadCollapseMean`
+stays on host because GLM-5.3 uses an unweighted mean and V4's weighted `head`
+kernel diverges — there is no device kernel for this op.
 
 **Arm 10 is on device because W9c-1 was re-priced and implemented.** The
 loader absorb (`AbsorbMla` in `glm5_next_loader.cpp`), the `BuildMlaStep`
@@ -3503,12 +3505,14 @@ equivalent, the block table, and the `TritonMLAImpl` are all in place. The
 k-pool indexer runs on the interposed CPU queue; it is not the seam Lightning
 Indexer and stays as a host-fallback island.
 
-**Arm 11 stays because `kDeepseekV4Mhc` has NO ROCm provider** — CUDA only
-(`cuda_deepseek_v4.cu:2102`). O34 owns the gap. On a CUDA device the op IS
-registered and could run, but this wave does not wire it, because a CUDA-only
-path is a mirror image of the CPU-only half this row already carries, and O34
-is the debt that owns the decision. The island runs the current host mHC on
-the interposed CPU queue on both backends.
+**Arm 11 is on device.** `kDeepseekV4Mhc` has providers on both CUDA
+(`cuda_deepseek_v4.cu:2102`) and ROCm (O34, #3199). The device forward probes
+`vt::OpRegistered(vt::OpId::kDeepseekV4Mhc, ...)` and routes pre/post through
+`MhcDevice()->pre()`/`post()` with the same host-vector interface as V4's
+`be.device` path. On a CPU queue (or when no provider is registered), the host
+`MhcPre`/`MhcPost` functions are used. `HcHeadCollapseMean` stays on host:
+GLM-5.3 uses an unweighted mean (`hidden_streams.mean(dim=2)`) and V4's
+weighted `head` kernel diverges. There is no device kernel for this op.
 
 #### Scope
 
@@ -5643,9 +5647,10 @@ Debts this row carries, each visible rather than waived:
   ROCm provider, which was the mirror image of every other family on this row.
   [#3199](https://github.com/mudler/vllm.cpp/pull/3199) added the ROCm/HIP
   provider for all seven MHC device kernels and fixed the device resolver to
-  fall back to kROCm. The mHC arm itself still runs on the interposed CPU queue
-  because the device forward has not been rewired to call the device mHC kernels
-  through the probe; that wiring is a separate change.
+  fall back to kROCm. The mHC arm itself is now rewired: the device forward probes
+  `kDeepseekV4Mhc` and routes pre/post through `MhcDevice()->pre()`/`post()`
+  when the op is registered on the queue's device. `HcHeadCollapseMean` stays
+  on host (unweighted mean, no device kernel).
 - **O35 — TWO ANCHORS IN THIS ROW'S OWN DISPATCH BRIEFING WERE WRONG, and they
   were caught by re-reading rather than by a checker.** `dense_device_glue.h:146`
   was cited as `DBuf`; `DBuf` is declared at `:109` and `:146` is a line inside
@@ -6153,12 +6158,12 @@ added the ROCm/HIP provider for `kDeepseekV4Mhc`. Post-O55
 ([#3203](https://github.com/mudler/vllm.cpp/pull/3203)) wired the dense+shared
 MLP onto the device via `vt::MatmulBT` + `vt::ClampedSwiGLU` + `vt::MatmulBT`.
 
-Nine of eleven compute arms are on the device (embedding, RMSNorm, KDA
+Ten of eleven compute arms are on the device (embedding, RMSNorm, KDA
 recurrence, MoE router topk, MoE routed experts, MoE combine, lm_head,
-dense+shared MLP, MLA attention); two run as host-fallback islands on the
-interposed CPU queue (k-pool indexer — CUDA-only ops, host on CPU; mHC sites —
-O34 discharged but arm not rewired). The pattern is `kimi_linear_device.cpp`'s
-single-queue shape.
+dense+shared MLP, MLA attention, mHC pre/post); one runs as a host-fallback
+island on the interposed CPU queue (k-pool indexer — CUDA-only ops, host on
+CPU). `HcHeadCollapseMean` stays on host (unweighted mean, no device kernel).
+The pattern is `kimi_linear_device.cpp`'s single-queue shape.
 
 W9c-1 (MLA attention onto `mla::ForwardMlaAttentionBlock`,
 ISSUE-LOCAL-01J7QX3M5K1HE3N9V0KQRJ8X2M) re-priced the earlier

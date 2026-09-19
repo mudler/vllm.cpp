@@ -14,11 +14,12 @@
 //   MoE combine             vt::MoeCombine (via the queue passed to MoeForward)
 //   lm_head                 vt::MatmulBT (float acc, vs the host's chunked double)
 //
-// ─── HOST-FALLBACK ISLANDS (no portable device op) ─────────────────────────
-//   (1) mHC sites — MhcPre/MhcPost per token. kDeepseekV4Mhc now has both CUDA
-//       and ROCm providers (O34, #3199), but the device forward has not been
-//       rewired to call the device kernels. The [T, hc, H] residual stream
-//       lives on host because mHC wraps every sublayer.
+// ─── DEVICE ARMS (vt:: dispatch or family device kernel) ──────────────────
+//   (1) mHC pre/post — ON DEVICE when kDeepseekV4Mhc is registered on the
+//       queue's device (CUDA O34, #3199; ROCm O34). Routes through
+//       MhcDevice()->pre()/post() with the same host-vector interface as V4.
+//       HcHeadCollapseMean stays on host: GLM-5.3 uses an unweighted mean,
+//       which has no device kernel (V4's weighted head diverges).
 //   (2) DSA/MLA attention — Attention() is a monolithic host function. The
 //       k-pool indexer ops (kGlm5NextKpoolCompress/Select) are CUDA-only, so on
 //       a CPU queue the indexer stays on host too.
@@ -46,6 +47,7 @@
 #include "vllm/model_executor/models/dense_attn_block.h"  // ResidentWeight
 #include "vllm/model_executor/models/dense_device_glue.h"
 #include "vllm/model_executor/models/deepseek_v2.h"  // MlaStep / BuildMlaStep
+#include "vllm/model_executor/models/deepseek_v4_device.h"  // MhcDeviceKernels / MhcDevice
 #include "vllm/model_executor/models/mla_attention.h"
 #include "vllm/model_executor/models/glm5_next.h"
 #include "vllm/model_executor/models/glm5_next_forward.h"
@@ -213,10 +215,21 @@ std::vector<float> Glm5NextDeviceForward(
   // memory; on CUDA it uploads/downloads. Reached via VT_GLM5_NEXT_DEVICE=1.
   Dev d{vt::GetBackend(queue.device), queue};
 
-  // A CPU host queue for the host-fallback islands (mHC, DSA attention).
+  // A CPU host queue for the host-fallback islands (HcHeadCollapseMean).
   // When the caller's queue is already CPU, reuse it.
   vt::Queue host_queue{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
   vt::Queue& hq = queue.device.type == vt::DeviceType::kCPU ? queue : host_queue;
+
+  // mHC device kernels: kDeepseekV4Mhc is registered on CUDA (O34, #3199) and
+  // ROCm. When available on the queue's device, route pre/post through the
+  // device kernels (same host-vector interface as V4's be.device path).
+  // HcHeadCollapseMean stays on host: unweighted mean, no device kernel.
+  const bool mhc_on_device =
+      queue.device.type != vt::DeviceType::kCPU &&
+      (vt::OpRegistered(vt::OpId::kDeepseekV4Mhc, vt::DeviceType::kCUDA) ||
+       vt::OpRegistered(vt::OpId::kDeepseekV4Mhc, vt::DeviceType::kROCM));
+  const deepseek_v4::MhcDeviceKernels* mhc_kernels =
+      mhc_on_device ? deepseek_v4::MhcDevice() : nullptr;
 
   // ── embedding (ON DEVICE) ──────────────────────────────────────────────────
   // Decode the full table to f32, then vt::Embedding (a row gather). On CPU
@@ -236,7 +249,8 @@ std::vector<float> Glm5NextDeviceForward(
 
   // ── expand to hidden streams (host) ────────────────────────────────────────
   // The [T, H] embedding is broadcast to [T, hc, H] — the manifold every decoder
-  // layer operates on. mHC has no device provider, so the stream stays on host.
+  // layer operates on. The stream stays on host: mHC pre/post upload/download
+  // per token, and HcHeadCollapseMean is host-only.
   std::vector<float> streams = ExpandToHiddenStreams(embeds, 1, T, hc, H);
 
   // ── the mask (all ones for a single sequence) ───────────────────────────────
@@ -251,8 +265,9 @@ std::vector<float> Glm5NextDeviceForward(
 
   // ── the layer loop ──────────────────────────────────────────────────────────
   // Mirrors DecoderLayerForward but swaps the host double-acc RmsNorm for the
-  // device float-acc vt::RmsNorm. The mHC sites stay on host as islands; DSA/MLA
-  // attention is on device via the shared mla::ForwardMlaAttentionBlock.
+  // device float-acc vt::RmsNorm. mHC pre/post route through device kernels
+  // when available; HcHeadCollapseMean stays on host. DSA/MLA attention is on
+  // device via the shared mla::ForwardMlaAttentionBlock.
 
   // ── MLA step (shared by all DSA/MLA layers) ──────────────────────────────
   // The per-step metadata (positions, slot_mapping, block table) is built ONCE
@@ -288,16 +303,25 @@ std::vector<float> Glm5NextDeviceForward(
   for (int64_t i = 0; i < L; ++i) {
     const DecoderLayerWeights& w = layers.Layer(i);
 
-    // ── mHC pre (attn site) — HOST ISLAND ────────────────────────────────
+    // ── mHC pre (attn site) — DEVICE (when kDeepseekV4Mhc registered) ────
     // One MhcPre per token: collapses [hc, H] → [H] and retains the MhcPreResult
-    // the matching MhcPost needs.
+    // the matching MhcPost needs. On a device queue with kDeepseekV4Mhc
+    // registered, routes through MhcDevice()->pre() (same interface as V4).
     std::vector<float> collapsed(static_cast<size_t>(T * H));
     std::vector<deepseek_v4::MhcPreResult> pre(static_cast<size_t>(T));
     for (int64_t t = 0; t < T; ++t) {
       std::vector<float> slab(streams.begin() + t * hc * H,
                                streams.begin() + (t + 1) * hc * H);
-      pre[static_cast<size_t>(t)] =
-          MhcPre(slab, w.attn_hc, p.mhc, H, eps);
+      if (mhc_kernels) {
+        pre[static_cast<size_t>(t)] = mhc_kernels->pre(
+            queue, slab, w.attn_hc.fn, w.attn_hc.scale, w.attn_hc.base,
+            hc, H, eps, static_cast<float>(p.mhc.eps),
+            static_cast<float>(p.mhc.eps), kHcPostAlpha,
+            p.mhc.sinkhorn_iters, /*norm_weight=*/{}, /*norm_eps=*/0.0f);
+      } else {
+        pre[static_cast<size_t>(t)] =
+            MhcPre(slab, w.attn_hc, p.mhc, H, eps);
+      }
       std::copy_n(pre[static_cast<size_t>(t)].layer_input.data(),
                    static_cast<size_t>(H), collapsed.data() + t * H);
     }
@@ -368,27 +392,41 @@ std::vector<float> Glm5NextDeviceForward(
     if (static_cast<int64_t>(attn_out.size()) != T * H)
       Fail("attention output size mismatch");
 
-    // ── mHC post (attn site) — HOST ISLAND ───────────────────────────────
+    // ── mHC post (attn site) — DEVICE (when kDeepseekV4Mhc registered) ───
     // Folds the sublayer's [H] output back onto the [hc, H] stream.
     for (int64_t t = 0; t < T; ++t) {
       const std::vector<float> out(attn_out.begin() + t * H,
                                     attn_out.begin() + (t + 1) * H);
       const std::vector<float> resid(streams.begin() + t * hc * H,
                                       streams.begin() + (t + 1) * hc * H);
-      const std::vector<float> mixed =
-          MhcPost(out, resid, pre[static_cast<size_t>(t)], hc, H);
+      std::vector<float> mixed;
+      if (mhc_kernels) {
+        mixed = mhc_kernels->post(queue, out, resid,
+                                   pre[static_cast<size_t>(t)].post_mix,
+                                   pre[static_cast<size_t>(t)].comb_mix, hc, H);
+      } else {
+        mixed = MhcPost(out, resid, pre[static_cast<size_t>(t)], hc, H);
+      }
       std::copy_n(mixed.data(), static_cast<size_t>(hc * H),
                    streams.data() + t * hc * H);
     }
 
-    // ── mHC pre (ffn site) — HOST ISLAND ─────────────────────────────────
+    // ── mHC pre (ffn site) — DEVICE (when kDeepseekV4Mhc registered) ─────
     // The residual is the stream the attention fold just produced.
     const std::vector<float> ffn_residual = streams;
     for (int64_t t = 0; t < T; ++t) {
       std::vector<float> slab(ffn_residual.begin() + t * hc * H,
                                ffn_residual.begin() + (t + 1) * hc * H);
-      pre[static_cast<size_t>(t)] =
-          MhcPre(slab, w.ffn_hc, p.mhc, H, eps);
+      if (mhc_kernels) {
+        pre[static_cast<size_t>(t)] = mhc_kernels->pre(
+            queue, slab, w.ffn_hc.fn, w.ffn_hc.scale, w.ffn_hc.base,
+            hc, H, eps, static_cast<float>(p.mhc.eps),
+            static_cast<float>(p.mhc.eps), kHcPostAlpha,
+            p.mhc.sinkhorn_iters, /*norm_weight=*/{}, /*norm_eps=*/0.0f);
+      } else {
+        pre[static_cast<size_t>(t)] =
+            MhcPre(slab, w.ffn_hc, p.mhc, H, eps);
+      }
       std::copy_n(pre[static_cast<size_t>(t)].layer_input.data(),
                    static_cast<size_t>(H), collapsed.data() + t * H);
     }
@@ -409,20 +447,26 @@ std::vector<float> Glm5NextDeviceForward(
     if (static_cast<int64_t>(mlp_out.size()) != T * H)
       Fail("MLP output size mismatch");
 
-    // ── mHC post (ffn site) — HOST ISLAND ───────────────────────────────
+    // ── mHC post (ffn site) — DEVICE (when kDeepseekV4Mhc registered) ───
     for (int64_t t = 0; t < T; ++t) {
       const std::vector<float> out(mlp_out.begin() + t * H,
                                     mlp_out.begin() + (t + 1) * H);
       const std::vector<float> resid(ffn_residual.begin() + t * hc * H,
                                       ffn_residual.begin() + (t + 1) * hc * H);
-      const std::vector<float> mixed =
-          MhcPost(out, resid, pre[static_cast<size_t>(t)], hc, H);
+      std::vector<float> mixed;
+      if (mhc_kernels) {
+        mixed = mhc_kernels->post(queue, out, resid,
+                                   pre[static_cast<size_t>(t)].post_mix,
+                                   pre[static_cast<size_t>(t)].comb_mix, hc, H);
+      } else {
+        mixed = MhcPost(out, resid, pre[static_cast<size_t>(t)], hc, H);
+      }
       std::copy_n(mixed.data(), static_cast<size_t>(hc * H),
                    streams.data() + t * hc * H);
     }
   }
-  // ── HcHeadCollapseMean — HOST ISLAND ───────────────────────────────────────
-  // Unweighted mean over the stream axis: [T, hc, H] → [T, H].
+  // ── HcHeadCollapseMean — HOST ISLAND (unweighted mean, no device kernel) ──
+  // GLM-5.3 uses an unweighted mean; V4's weighted head diverges. Stays on host.
   std::vector<float> hidden(static_cast<size_t>(T * H));
   for (int64_t t = 0; t < T; ++t) {
     const std::vector<float> slab(streams.begin() + t * hc * H,

@@ -152,6 +152,33 @@ class ApiServer {
   // route table.
   DispatchResult handle_embeddings(const std::string& request_body) const;
 
+  // POST /v1/ner (MODEL-GLINER25, ABI v27). GLiNER-native NER endpoint:
+  // request carries `text` + `labels` (entity types) + optional `threshold`
+  // (default 0.5) and `max_width` (default 12). Response returns extracted
+  // entities as spans with text, label, start/end character offsets, and
+  // confidence. Registered ONLY when a NER callback is attached (the embedder
+  // precedent), so a text server answers 404 at the route table.
+  DispatchResult handle_ner(const std::string& request_body) const;
+
+  // POST /v1/systemone (MODEL-GLINER25). Jev / System One-compatible endpoint
+  // mirroring the kev project's serve.py. `state` is the text (or any JSON) to
+  // extract from; `questions` is a map of id → Question, each with type "noul",
+  // "choice", or "score". The SAME NER callback backs this and /v1/ner. One NER
+  // pass serves all questions (the separate endpoint does N passes).
+  DispatchResult handle_systemone(const std::string& request_body) const;
+
+  // POST /v1/systemone/permute (kev serve.py:systemone_permute). Re-runs one
+  // choice question under n_perm option orders and reports per-order
+  // probabilities, argmax stability, and spread.
+  DispatchResult handle_systemone_permute(
+      const std::string& request_body) const;
+
+  // POST /v1/systemone/separate (kev serve.py:systemone_separate). Answers each
+  // question in its own NER call (N passes). Response shape matches
+  // /v1/systemone.
+  DispatchResult handle_systemone_separate(
+      const std::string& request_body) const;
+
   // POST /v1/audio/speech (W6 of #672). OpenAI's createSpeech spelling, with
   // the two MUSIC inputs (`lyrics`, `description`) as ADDITIONAL named fields
   // — see speech_api.h for why they are not one `input` behind a separator.
@@ -250,6 +277,29 @@ class ApiServer {
       std::function<EmbeddingBatch(const std::vector<std::string>& inputs)>;
   void set_embedder(EmbedFn embedder) { embedder_ = std::move(embedder); }
 
+  // Attach the NER seam backing POST /v1/ner and POST /v1/systemone
+  // (MODEL-GLINER25, ABI v27). ADDITIVE and OPT-IN like the embedder above:
+  // absent => routes unregistered => 404, byte-identical to a server without
+  // a GLiNER2.5 model. The callback wraps the ONE library seam
+  // (Gliner2NerInference) — the SAME path vllm_gliner_ner drives — so HTTP
+  // and FFI cannot drift. Returns extracted entities + prompt token count;
+  // throws to fail the request (-> 500).
+  struct NerEntity {
+    std::string label;
+    std::string text;
+    int64_t start;
+    int64_t end;
+    float confidence;
+  };
+  struct NerResult {
+    std::vector<NerEntity> entities;
+    int64_t prompt_tokens = 0;
+  };
+  using NerFn = std::function<NerResult(
+      const std::string& text, const std::vector<std::string>& labels,
+      float threshold, int64_t max_width)>;
+  void set_ner(NerFn ner) { ner_ = std::move(ner); }
+
   // Attach the speech/music synthesis seam backing POST /v1/audio/speech (W6 of
   // #672). ADDITIVE and OPT-IN like the embedder above: absent => route
   // unregistered => 404, byte-identical to a server without a speech model. The
@@ -343,6 +393,7 @@ class ApiServer {
   ::vllm::openai::VideoRunner video_runner_;
   TranscribeFn transcriber_;
   EmbedFn embedder_;
+  NerFn ner_;
   SynthesizeFn synthesizer_;
   ::vllm::openai::SpeechCapabilities speech_capabilities_;
   mutable ::vllm::openai::VideoJobStore video_jobs_;

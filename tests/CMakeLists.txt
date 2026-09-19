@@ -185,6 +185,14 @@ target_include_directories(test_w2vbert PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm
 target_include_directories(test_campplus PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_gpt2 vllm/models/test_gpt2.cpp)
 target_include_directories(test_gpt2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+vllm_cpp_add_test(test_deberta_v2 vllm/models/test_deberta_v2.cpp)
+target_include_directories(test_deberta_v2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+vllm_cpp_add_test(test_gliner2 vllm/models/test_gliner2.cpp)
+target_include_directories(test_gliner2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+vllm_cpp_add_test(test_gliner2_e2e vllm/models/test_gliner2_e2e.cpp)
+target_compile_definitions(test_gliner2_e2e PRIVATE
+  GLINER2_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/gliner2_e2e")
+vllm_cpp_add_test(test_gliner2_ner vllm/models/test_gliner2_ner.cpp)
 vllm_cpp_add_test(test_minimax_h3 vllm/models/test_minimax_h3.cpp)
 # VT-CONV1D-MODEL-BLOCK (#1684): the time-block case reads `Conv1dTimeBlock` so
 # it asserts the geometry it claims. Same reach as test_vocoder1d.
@@ -2661,6 +2669,7 @@ target_compile_definitions(test_capi PRIVATE
   PARAKEET_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/parakeet_e2e"
   MINIMAX_H3_VIDEO_FOLD_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/minimax_h3_video_fold"
   LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e"
+  GLINER2_E2E_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/gliner2_e2e"
   # #1681: the real published Qwen3.8 chat template, rendered through the C
   # ABI's own vllm_chat path. Absolute so it resolves from whatever working
   # directory ctest runs the suite in.

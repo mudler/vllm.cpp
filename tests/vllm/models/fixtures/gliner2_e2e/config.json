@@ -1,0 +1,21 @@
+{
+  "architectures": [
+    "BoundaryExtractor"
+  ],
+  "model_type": "extractor",
+  "hidden_size": 24,
+  "num_hidden_layers": 2,
+  "vocab_size": 32,
+  "num_attention_heads": 4,
+  "intermediate_size": 48,
+  "token_pooling": "first",
+  "config_version": 3,
+  "boundary_head": {
+    "boundary_dim": 16,
+    "boundary_attention_heads": 2,
+    "boundary_attention_layers": 1,
+    "boundary_attention_window": 8,
+    "boundary_refinement_layers": 1,
+    "boundary_ffn_multiplier": 2.0
+  }
+}

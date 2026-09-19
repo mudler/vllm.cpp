@@ -21,6 +21,7 @@
 #include <atomic>
 #include <chrono>
 #include <map>
+#include <algorithm>
 #include <cmath>
 #include <mutex>
 #include <cstdint>
@@ -5316,4 +5317,288 @@ TEST_CASE("api_server: an n>1 chat completion returns n choices over a socket") 
   }
 
   server_thread.join();  // stops the server, then joins
+}
+
+// ─── /v1/ner + /v1/systemone (MODEL-GLINER25 Phase 4f) ──────────────────────
+//
+// NER dispatch over a MOCK NerFn callback: the callback wraps the ONE library
+// seam (Gliner2NerInference) — the SAME path vllm_gliner_ner drives — so HTTP
+// and FFI cannot drift. The mock returns deterministic entities so the JSON
+// shape is asserted exactly. The "without ner" case is a 500, not a crash,
+// mirroring the embedder pattern.
+
+namespace {
+
+struct NerHarness {
+  vllm::entrypoints::openai::OpenAIServingModels models{"gliner2-fixture"};
+  ApiServer server{models, "test-version"};
+
+  NerHarness() {
+    server.set_ner(
+        [](const std::string& text, const std::vector<std::string>& labels,
+           float threshold, int64_t max_width) {
+          (void)threshold;
+          (void)max_width;
+          ApiServer::NerResult result;
+          result.prompt_tokens = 7;
+          if (text == "john works at google" &&
+              std::find(labels.begin(), labels.end(), "person") !=
+                  labels.end()) {
+            result.entities.push_back(
+                {"person", "john", 0, 4, 0.95F});
+          }
+          if (text == "john works at google" &&
+              std::find(labels.begin(), labels.end(), "organization") !=
+                  labels.end()) {
+            result.entities.push_back(
+                {"organization", "google", 15, 21, 0.88F});
+          }
+          return result;
+        });
+  }
+};
+
+}  // namespace
+
+TEST_CASE("api_server: NER dispatch — OpenAI shape over the mock callback") {
+  NerHarness h;
+
+  // Valid request with two labels.
+  ApiServer::DispatchResult r = h.server.handle_ner(
+      R"({"model":"gliner2-fixture","text":"john works at google",)"
+      R"("labels":["person","organization"],"threshold":0.5})");
+  CHECK(r.status == 200);
+  json j = json::parse(r.body);
+  CHECK(j.at("object") == "ner");
+  CHECK(j.at("model") == "gliner2-fixture");
+  CHECK(std::string(j.at("id")).rfind("ner-", 0) == 0);
+  REQUIRE(j.at("entities").size() == 2);
+  // Entities are sorted by the mock in insertion order.
+  CHECK(j.at("entities").at(0).at("label") == "person");
+  CHECK(j.at("entities").at(0).at("text") == "john");
+  CHECK(j.at("entities").at(0).at("start") == 0);
+  CHECK(j.at("entities").at(0).at("end") == 4);
+  CHECK(j.at("entities").at(0).at("confidence") == doctest::Approx(0.95F));
+  CHECK(j.at("entities").at(1).at("label") == "organization");
+  CHECK(j.at("entities").at(1).at("text") == "google");
+  CHECK(j.at("usage").at("prompt_tokens").get<int64_t>() == 7);
+  CHECK(j.at("usage").at("total_tokens") == 7);
+
+  // Single label — one entity.
+  r = h.server.handle_ner(
+      R"({"text":"john works at google","labels":["person"]})");
+  CHECK(r.status == 200);
+  j = json::parse(r.body);
+  REQUIRE(j.at("entities").size() == 1);
+  CHECK(j.at("entities").at(0).at("label") == "person");
+
+  // No match — zero entities is a 200 with an empty array.
+  r = h.server.handle_ner(R"({"text":"nothing here","labels":["person"]})");
+  CHECK(r.status == 200);
+  j = json::parse(r.body);
+  CHECK(j.at("entities").size() == 0);
+}
+
+TEST_CASE("api_server: NER malformed requests") {
+  NerHarness h;
+  CHECK(h.server.handle_ner("not json").status == 400);
+  CHECK(h.server.handle_ner(R"({"model":"x"})").status == 404);
+  CHECK(h.server.handle_ner(R"({"text":"x"})").status == 400);  // no labels
+  CHECK(h.server.handle_ner(R"({"labels":["x"]})").status == 400);  // no text
+  CHECK(h.server.handle_ner(R"({"text":42,"labels":["x"]})").status == 400);
+  CHECK(h.server.handle_ner(R"({"text":"x","labels":"notarray"})").status == 400);
+  CHECK(h.server.handle_ner(R"({"text":"x","labels":[42]})").status == 400);
+  CHECK(h.server.handle_ner(R"({"text":"x","labels":[]})").status == 400);
+}
+
+TEST_CASE("api_server: NER without a ner callback is a 500, not a crash") {
+  vllm::entrypoints::openai::OpenAIServingModels models{"m"};
+  ApiServer server{models, "test-version"};
+  ApiServer::DispatchResult r =
+      server.handle_ner(R"({"text":"x","labels":["y"]})");
+  CHECK(r.status == 500);
+  CHECK(json::parse(r.body).at("error").at("message") ==
+        "The model does not support NER");
+}
+
+TEST_CASE("api_server: systemone dispatch — jev-compatible answers shape") {
+  NerHarness h;
+
+  ApiServer::DispatchResult r = h.server.handle_systemone(
+      R"({"state":"john works at google",)"
+      R"("questions":{"person":{"type":"noul"},"organization":{"type":"noul"}}})");
+  CHECK(r.status == 200);
+  json j = json::parse(r.body);
+  CHECK(j.at("model") == "gliner2-fixture");
+  REQUIRE(j.at("answers").is_object());
+  REQUIRE(j.at("answers").contains("person"));
+  REQUIRE(j.at("answers").contains("organization"));
+  CHECK(j.at("answers").at("person").at("type") == "noul");
+  CHECK(j.at("answers").at("person").at("noul") == doctest::Approx(0.95F));
+  REQUIRE(j.at("answers").at("person").at("entities").size() == 1);
+  CHECK(j.at("answers").at("person").at("entities").at(0).at("text") ==
+        "john");
+  CHECK(j.at("answers").at("organization").at("noul") ==
+        doctest::Approx(0.88F));
+  CHECK(j.at("usage").at("input_tokens").get<int64_t>() == 7);
+  CHECK(j.at("usage").at("output_tokens").get<int64_t>() == 0);
+
+  // state as a non-string (JSON value) — stringified internally.
+  r = h.server.handle_systemone(
+      R"({"state":42,"questions":{"x":{"type":"noul"}}})");
+  CHECK(r.status == 200);
+}
+
+TEST_CASE("api_server: systemone malformed requests") {
+  NerHarness h;
+  CHECK(h.server.handle_systemone("not json").status == 400);
+  CHECK(h.server.handle_systemone(R"({})").status == 400);  // no state
+  CHECK(h.server.handle_systemone(R"({"state":"x"})").status == 400);  // no questions
+  CHECK(h.server.handle_systemone(
+            R"({"state":"x","questions":"notobj"})").status == 400);
+  CHECK(h.server.handle_systemone(R"({"state":"x","questions":{}})").status ==
+        400);
+}
+
+TEST_CASE("api_server: systemone without a ner callback is a 500") {
+  vllm::entrypoints::openai::OpenAIServingModels models{"m"};
+  ApiServer server{models, "test-version"};
+  ApiServer::DispatchResult r =
+      server.handle_systemone(R"({"state":"x","questions":{"y":{"type":"noul"}}})");
+  CHECK(r.status == 500);
+  CHECK(json::parse(r.body).at("error").at("message") ==
+        "The model does not support NER");
+}
+
+// ── kev full-compatibility: choice, score, permute, separate ─────────────────
+
+TEST_CASE("api_server: systemone choice question") {
+  NerHarness h;
+  ApiServer::DispatchResult r = h.server.handle_systemone(
+      R"({"state":"john works at google",)"
+      R"("questions":{"pick":{"type":"choice",)"
+      R"("criteria":{"person":"a person","organization":"an org"}}}})");
+  CHECK(r.status == 200);
+  json j = json::parse(r.body);
+  json& ans = j.at("answers").at("pick");
+  CHECK(ans.at("type") == "choice");
+  // person (0.95) > organization (0.88) after softmax → choice = "person"
+  CHECK(ans.at("choice") == "person");
+  REQUIRE(ans.at("probabilities").is_object());
+  CHECK(ans.at("probabilities").contains("person"));
+  CHECK(ans.at("probabilities").contains("organization"));
+  CHECK(ans.at("confidence").is_number());
+  // latency_ms present (kev serve.py returns it)
+  CHECK(j.contains("latency_ms"));
+}
+
+TEST_CASE("api_server: systemone score question") {
+  NerHarness h;
+  ApiServer::DispatchResult r = h.server.handle_systemone(
+      R"({"state":"john works at google",)"
+      R"("questions":{"rate":{"type":"score",)"
+      R"("criteria":["person","organization","other"]}}})");
+  CHECK(r.status == 200);
+  json j = json::parse(r.body);
+  json& ans = j.at("answers").at("rate");
+  CHECK(ans.at("type") == "score");
+  CHECK(ans.at("score").is_number());
+  REQUIRE(ans.at("legend").is_object());
+  CHECK(ans.at("legend").contains("0"));
+  CHECK(ans.at("legend").contains("1"));
+  CHECK(ans.at("legend").contains("2"));
+  REQUIRE(ans.at("probabilities").is_object());
+  CHECK(ans.at("probabilities").contains("0"));
+  CHECK(ans.at("probabilities").contains("1"));
+  CHECK(ans.at("probabilities").contains("2"));
+  CHECK(ans.at("confidence").is_number());
+}
+
+TEST_CASE("api_server: systemone separate — N passes, summed tokens") {
+  NerHarness h;
+  ApiServer::DispatchResult r = h.server.handle_systemone_separate(
+      R"({"state":"john works at google",)"
+      R"("questions":{"person":{"type":"noul"},"organization":{"type":"noul"}}})");
+  CHECK(r.status == 200);
+  json j = json::parse(r.body);
+  CHECK(j.at("answers").at("person").at("type") == "noul");
+  CHECK(j.at("answers").at("person").at("noul") ==
+        doctest::Approx(0.95F));
+  CHECK(j.at("answers").at("organization").at("noul") ==
+        doctest::Approx(0.88F));
+  // Two questions, each costs 7 prompt tokens in the mock → 14 total.
+  CHECK(j.at("usage").at("input_tokens").get<int64_t>() == 14);
+  CHECK(j.contains("latency_ms"));
+}
+
+TEST_CASE("api_server: systemone permute — choice under n_perm orders") {
+  NerHarness h;
+  ApiServer::DispatchResult r = h.server.handle_systemone_permute(
+      R"({"request":{"state":"john works at google",)"
+      R"("questions":{"pick":{"type":"choice",)"
+      R"("criteria":{"person":"a person","organization":"an org"}}}},)"
+      R"("question":"pick","n_perm":3,"seed":42})");
+  CHECK(r.status == 200);
+  json j = json::parse(r.body);
+  REQUIRE(j.at("runs").is_array());
+  CHECK(j.at("runs").size() == 3);
+  // Each run carries order, probabilities, choice, latency_ms.
+  for (const auto& run : j.at("runs")) {
+    REQUIRE(run.at("order").is_array());
+    REQUIRE(run.at("probabilities").is_object());
+    CHECK(run.at("choice").is_string());
+    CHECK(run.contains("latency_ms"));
+  }
+  // The mock NER is order-invariant, so the argmax must be stable.
+  CHECK(j.at("argmax_stable").get<bool>() == true);
+  REQUIRE(j.at("spread").is_object());
+  CHECK(j.at("spread").contains("person"));
+  CHECK(j.at("spread").contains("organization"));
+}
+
+TEST_CASE("api_server: systemone permute rejects non-choice questions") {
+  NerHarness h;
+  ApiServer::DispatchResult r = h.server.handle_systemone_permute(
+      R"({"request":{"state":"john works at google",)"
+      R"("questions":{"q":{"type":"noul"}}},)"
+      R"("question":"q"})");
+  CHECK(r.status == 400);
+}
+
+TEST_CASE("api_server: systemone permute without a ner callback is a 500") {
+  vllm::entrypoints::openai::OpenAIServingModels models{"m"};
+  ApiServer server{models, "test-version"};
+  ApiServer::DispatchResult r = server.handle_systemone_permute(
+      R"({"request":{"state":"x","questions":{"q":{"type":"choice",)"
+      R"("criteria":{"a":"x","b":"y"}}}},"question":"q"})");
+  CHECK(r.status == 500);
+}
+
+TEST_CASE("api_server: systemone separate without a ner callback is a 500") {
+  vllm::entrypoints::openai::OpenAIServingModels models{"m"};
+  ApiServer server{models, "test-version"};
+  ApiServer::DispatchResult r = server.handle_systemone_separate(
+      R"({"state":"x","questions":{"y":{"type":"noul"}}})");
+  CHECK(r.status == 500);
+}
+
+TEST_CASE("api_server: systemone unknown question type is a 400") {
+  NerHarness h;
+  ApiServer::DispatchResult r = h.server.handle_systemone(
+      R"({"state":"x","questions":{"q":{"type":"bogus"}}})");
+  CHECK(r.status == 400);
+}
+
+TEST_CASE("api_server: systemone choice without criteria is a 400") {
+  NerHarness h;
+  ApiServer::DispatchResult r = h.server.handle_systemone(
+      R"({"state":"x","questions":{"q":{"type":"choice"}}})");
+  CHECK(r.status == 400);
+}
+
+TEST_CASE("api_server: systemone score with too few levels is a 400") {
+  NerHarness h;
+  ApiServer::DispatchResult r = h.server.handle_systemone(
+      R"({"state":"x","questions":{"q":{"type":"score","criteria":["only"]}}})");
+  CHECK(r.status == 400);
 }

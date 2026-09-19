@@ -92,6 +92,7 @@
 #include "vllm/platform/process.h"
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/model_executor/models/model_registry.h"
+#include "vllm/model_executor/models/gliner2_ner.h"  // Gliner2NerInference (MODEL-GLINER25)
 #include "vllm/multimodal/minimax_h3_video.h"
 #include "vllm/multimodal/parakeet_transcription.h"
 #include "vllm/multimodal/video_engine.h"
@@ -1128,6 +1129,82 @@ int VllmServerMain(int argc, char** argv) {
           transcription_only = false;  // unknown arch: the text path diagnoses
         }
       }
+      // ── GLINER2.5 NER TASK DISPATCH (MODEL-GLINER25): a model dir whose
+      // architectures resolve to "BoundaryExtractor" (GLiNER2.5) serves
+      // /v1/ner and /v1/systemone through the ONE library seam
+      // (Gliner2NerInference — the same path vllm_gliner_ner drives) and
+      // registers NO generate or embedding routes. This check runs BEFORE
+      // the pooling_model check because BoundaryExtractor IS a pooling model
+      // (is_pooling_model = true), but it needs the NER server, not the
+      // embedding server.
+      bool gliner2_model = false;
+      if (!archs.empty()) {
+        try {
+          gliner2_model =
+              vllm::ModelRegistry::Resolve(std::span<const std::string>(archs))
+                  .architecture == "BoundaryExtractor";
+        } catch (const std::exception&) {
+          gliner2_model = false;
+        }
+      }
+      if (gliner2_model) {
+        std::cerr << "server: GLiNER2.5 model (" << archs[0]
+                  << "); serving /v1/ner and /v1/systemone\n";
+        vllm::entrypoints::EngineParams ner_params;
+        ner_params.block_size = args.block_size;
+        ner_params.num_blocks = args.num_blocks;
+        ner_params.gpu_memory_utilization = args.gpu_memory_utilization;
+        ner_params.kv_cache_memory_bytes = args.kv_cache_memory_bytes;
+        ner_params.max_model_len = args.max_model_len;
+        ner_params.max_num_seqs = args.max_num_seqs;
+        ner_params.max_num_batched_tokens = args.max_num_batched_tokens;
+        ner_params.enable_prefix_caching = args.enable_prefix_caching;
+        ner_params.offload_config = parsed_offload_config;
+        ner_params.weight_residency = parsed_weight_residency;
+        auto loaded_ner = std::shared_ptr<vllm::entrypoints::LoadedEngine>(
+            vllm::entrypoints::LoadedEngine::FromModelDir(args.model_dir,
+                                                          ner_params));
+        namespace oai = vllm::entrypoints::openai;
+        oai::OpenAIServingModels ner_models(served_model_name);
+        oai::ApiServer ner_server(ner_models, vllm::Version());
+        auto ner_mutex = std::make_shared<std::mutex>();
+        ner_server.set_ner(
+            [loaded_ner, ner_mutex](
+                const std::string& text,
+                const std::vector<std::string>& labels,
+                float threshold, int64_t max_width)
+                -> oai::ApiServer::NerResult {
+              std::lock_guard<std::mutex> lock(*ner_mutex);
+              const vllm::LoadedModel& model = loaded_ner->loaded_model();
+              const vllm::tok::Tokenizer& tokenizer = loaded_ner->tokenizer();
+              vllm::gliner2::NerParams params;
+              params.threshold = threshold;
+              params.max_width = (max_width > 0) ? max_width : 12;
+              vllm::Gliner2NerResult result =
+                  vllm::Gliner2NerInference(model, tokenizer, text,
+                                            labels, params);
+              oai::ApiServer::NerResult out;
+              out.prompt_tokens = static_cast<int64_t>(
+                  tokenizer.Encode(text).size());
+              for (const vllm::gliner2::NerEntity& e : result.entities) {
+                out.entities.push_back(
+                    {e.label, e.text, e.char_start, e.char_end,
+                     e.confidence});
+              }
+              return out;
+            });
+        std::cerr << "server: listening on http://" << args.host << ":"
+                  << args.port << "\n";
+        vllm::platform::ConsoleShutdown shutdown_on_signal(
+            [&]() { ner_server.stop(); });
+        if (!ner_server.listen(args.host, args.port)) {
+          std::cerr << "server: failed to bind " << args.host << ":"
+                    << args.port << "\n";
+          return 1;
+        }
+        return 0;
+      }
+
       // ── POOLING TASK DISPATCH (ARCH-ONE-SURFACE ROW 6): a model dir whose
       // architectures resolve to a POOLING registration (is_pooling_model,
       // e.g. "LlamaModel" — vLLM _EMBEDDING_MODELS registry.py:230) serves

@@ -226,7 +226,7 @@ TEST_CASE("FromModelDir rejects an unknown dense architecture before loading") {
       LoadedEngine::FromModelDir(dir.path().string(), EngineParams{}),
       "Model architectures ['Gemma4ForCausalLM'] are not supported for now. "
       "Supported architectures: "
-      "dict_keys(['CohereForCausalLM', 'DeepseekV2ForCausalLM', "
+      "dict_keys(['BoundaryExtractor', 'CohereForCausalLM', 'DeepseekV2ForCausalLM', "
       "'DeepseekV41ForCausalLM', 'DeepseekV4ForCausalLM', 'Dots3NoteForCausalLM', "
       "'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
       "'Gemma4ForConditionalGeneration', 'Gemma4UnifiedForConditionalGeneration', 'GemmaForCausalLM', "

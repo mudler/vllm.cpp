@@ -46,6 +46,7 @@
 #include "vllm/entrypoints/openai/reasoning_parsers/abstract.h"  // get_reasoning_parser
 #include "vllm/entrypoints/openai/reasoning_parsers/detect.h"  // DetectReasoningParser
 #include "vllm/model_executor/models/model_registry.h"  // refuse-by-task (v11)
+#include "vllm/model_executor/models/gliner2_ner.h"  // Gliner2NerInference (v27)
 #include "vllm/model_executor/models/minimax_h3.h"    // mux argv (v12)
 #include "vllm/multimodal/parakeet_transcription.h"     // vllm_transcribe (v11)
 #include "vllm/multimodal/minimax_h3_video.h"          // vllm_video_* (v12)
@@ -1549,6 +1550,130 @@ VLLM_API void vllm_embedding_result_free(vllm_embedding_result* out) {
   out->n_embeddings = 0;
   out->dim = 0;
   out->prompt_tokens = 0;
+}
+
+// ── NER (ABI v27, GLiNER2.5) ────────────────────────────────────────────────
+// Thin C wrapper over Gliner2NerInference — the ONE library seam the server's
+// /v1/ner route and the gliner_cli example also drive. BLOCKING, like
+// vllm_embed: the encoder forward is a synchronous host-side pass.
+
+VLLM_API vllm_status vllm_gliner_ner(vllm_engine* engine, const char* text,
+                                     const char* const* labels, int32_t n_labels,
+                                     float threshold, int32_t max_width,
+                                     vllm_ner_result* out) {
+  if (out == nullptr) {
+    SetError("vllm_gliner_ner: out is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  out->entities = nullptr;
+  out->n_entities = 0;
+  if (engine == nullptr || text == nullptr || labels == nullptr) {
+    SetError("vllm_gliner_ner: engine, text, or labels is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  if (n_labels <= 0) {
+    SetError("vllm_gliner_ner: n_labels must be > 0");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  for (int32_t i = 0; i < n_labels; ++i) {
+    if (labels[i] == nullptr) {
+      SetError("vllm_gliner_ner: labels[" + std::to_string(i) + "] is null");
+      return VLLM_ERR_INVALID_ARGUMENT;
+    }
+  }
+  if (engine->loaded == nullptr) {
+    SetError(
+        "vllm_gliner_ner: this engine was loaded from a transcription-only "
+        "checkpoint (Parakeet); use vllm_transcribe");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  // Refuse-by-architecture: only a BoundaryExtractor (GLiNER2.5) model serves
+  // this entry point — the mirror of vLLM refusing a task on a non-matching
+  // architecture.
+  if (engine->loaded->architecture() != "BoundaryExtractor") {
+    SetError(
+        "vllm_gliner_ner: this engine's architecture is '" +
+        std::string(engine->loaded->architecture()) +
+        "', not 'BoundaryExtractor' (GLiNER2.5); use vllm_complete / vllm_embed");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    std::lock_guard<std::mutex> lock(engine->embed_mutex);
+    const vllm::LoadedModel& model = engine->loaded->loaded_model();
+    const vllm::tok::Tokenizer& tokenizer = engine->loaded->tokenizer();
+
+    std::vector<std::string> label_vec;
+    label_vec.reserve(static_cast<size_t>(n_labels));
+    for (int32_t i = 0; i < n_labels; ++i) {
+      label_vec.emplace_back(labels[i]);
+    }
+
+    vllm::gliner2::NerParams params;
+    params.threshold = threshold;
+    params.max_width = (max_width > 0)
+                           ? static_cast<int64_t>(max_width)
+                           : 12;
+
+    vllm::Gliner2NerResult result =
+        vllm::Gliner2NerInference(model, tokenizer, text, label_vec, params);
+
+    const int32_t n = static_cast<int32_t>(result.entities.size());
+    if (n == 0) {
+      out->entities = nullptr;
+      out->n_entities = 0;
+      ClearError();
+      return VLLM_OK;
+    }
+
+    vllm_ner_entity* ents = static_cast<vllm_ner_entity*>(
+        std::calloc(static_cast<size_t>(n), sizeof(vllm_ner_entity)));
+    if (ents == nullptr) {
+      SetError("vllm_gliner_ner: out-of-memory allocating entities");
+      return VLLM_ERR_RUNTIME;
+    }
+    for (int32_t i = 0; i < n; ++i) {
+      const vllm::gliner2::NerEntity& e = result.entities[static_cast<size_t>(i)];
+      ents[i].label = DupString(e.label);
+      ents[i].text = DupString(e.text);
+      ents[i].char_start = static_cast<int32_t>(e.char_start);
+      ents[i].char_end = static_cast<int32_t>(e.char_end);
+      ents[i].token_start = static_cast<int32_t>(e.token_start);
+      ents[i].token_end = static_cast<int32_t>(e.token_end);
+      ents[i].confidence = e.confidence;
+      if (ents[i].label == nullptr || ents[i].text == nullptr) {
+        for (int32_t j = 0; j <= i; ++j) {
+          std::free(ents[j].label);
+          std::free(ents[j].text);
+        }
+        std::free(ents);
+        SetError("vllm_gliner_ner: out-of-memory copying entity strings");
+        return VLLM_ERR_RUNTIME;
+      }
+    }
+    out->entities = ents;
+    out->n_entities = n;
+    ClearError();
+    return VLLM_OK;
+  } catch (const std::exception& e) {
+    SetError(std::string("vllm_gliner_ner: ") + e.what());
+    return VLLM_ERR_RUNTIME;
+  } catch (...) {
+    SetError("vllm_gliner_ner: unknown error");
+    return VLLM_ERR_UNKNOWN;
+  }
+}
+
+VLLM_API void vllm_ner_result_free(vllm_ner_result* out) {
+  if (out == nullptr) return;
+  if (out->entities != nullptr) {
+    for (int32_t i = 0; i < out->n_entities; ++i) {
+      std::free(out->entities[i].label);
+      std::free(out->entities[i].text);
+    }
+    std::free(out->entities);
+  }
+  out->entities = nullptr;
+  out->n_entities = 0;
 }
 
 // ── Video+audio generation (ABI v12; generalized at v18) ────────────────────

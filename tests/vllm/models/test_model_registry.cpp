@@ -72,7 +72,11 @@ TEST_CASE("registry_imports: every registered architecture has a complete factor
   // and not by two: upstream's text-only `DeepseekV41LLMForCausalLM` is
   // internal and declared by no published artifact, and the `DSparkV41DraftModel`
   // speculator (registry.py:647) is INVENTORIED and deliberately NOT registered.
-  REQUIRE(registrations.size() == 45);
+  // 45 -> 46 on MODEL-GLINER25: `BoundaryExtractor`, its own additive TU. No
+  // vLLM registration (vLLM has no DeBERTa support), ported from scratch against
+  // the HuggingFace transformers + GLiNER2 library references. A POOLING model
+  // (is_pooling_model=true) like `LlamaModel`, not a text-generation arch.
+  REQUIRE(registrations.size() == 46);
 
   for (const ModelRegistration& registration : registrations) {
     CAPTURE(registration.architecture);
@@ -165,6 +169,10 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   // OWN DeepSeek-V2 loader refuses at its `index_topk` tripwire, so it registers
   // from its own TU with its own params struct rather than sharing one.
   CHECK(has_arch("GlmMoeDsaForCausalLM"));
+  // GLiNER2.5 (MODEL-GLINER25): the first NER/extraction model — a POOLING
+  // architecture (DeBERTa v2 encoder + GLiNER2 boundary head) with no vLLM
+  // precedent, ported from scratch against HuggingFace + GLiNER2 library.
+  CHECK(has_arch("BoundaryExtractor"));
 
   // Registration arrival order across TUs is unspecified under C++ static init,
   // so the registry imposes a stable canonical sort by architecture name (byte
@@ -173,7 +181,7 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   // with the kExampleConfigArchitectures ledger; adding a model appends its two
   // entries here.
   const std::vector<std::string_view> supported = ModelRegistry::SupportedArchs();
-  REQUIRE(supported.size() == 45);
+  REQUIRE(supported.size() == 46);
   CHECK(std::is_sorted(supported.begin(), supported.end()));
   // The full byte-order sequence. Note "MiniCPM3" < "MiniCPMF" and "Phi3" <
   // "PhiF" ('3' 0x33 < 'F' 0x46); "OPT" < "Olmo" ('P' 0x50 < 'l' 0x6C); and among
@@ -182,6 +190,8 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   // "Ca" < "Co" ('a' 0x61 < 'o' 0x6F), so each text-only ForCausalLM arm sorts
   // immediately BEFORE its ForConditionalGeneration wrapper.
   const std::vector<std::string_view> kSortedArchs{
+      // 'B' 0x42 < 'C' 0x43: BoundaryExtractor sorts before CohereForCausalLM.
+      "BoundaryExtractor",
       "CohereForCausalLM",
       "DeepseekV2ForCausalLM",
       // "DeepseekV41For" < "DeepseekV4For": they agree through "DeepseekV4" and
@@ -264,6 +274,19 @@ TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo")
       // registry.py:230, wrapped by as_embedding_model adapters.py:230) — a
       // POOLING model with NO text-generation path; the text entrypoints
       // refuse it by task and vllm_embed / /v1/embeddings serve it.
+      CHECK(registration.info.is_pooling_model);
+      CHECK_FALSE(registration.info.is_text_generation_model);
+      CHECK_FALSE(registration.info.supports_transcription);
+      CHECK_FALSE(registration.info.supports_transcription_only);
+      CHECK_FALSE(registration.info.is_hybrid);
+      CHECK_FALSE(registration.info.supports_multimodal);
+      continue;
+    }
+    if (registration.architecture == "BoundaryExtractor") {
+      // MODEL-GLINER25: a POOLING model (DeBERTa v2 encoder + GLiNER2 boundary
+      // head) with NO text-generation path — the same task-routing shape as
+      // LlamaModel above. vllm_embed / /v1/embeddings serve it; the text
+      // entrypoints refuse by task. No vLLM precedent (ported from scratch).
       CHECK(registration.info.is_pooling_model);
       CHECK_FALSE(registration.info.is_text_generation_model);
       CHECK_FALSE(registration.info.supports_transcription);
@@ -668,7 +691,8 @@ TEST_CASE("Qwen3.5 SSM cache dtype accepts upstream torch aliases exactly") {
 TEST_CASE("hf_registry_coverage: every registration has an example config fixture") {
   // C++ fixture registry for the currently implemented subset. Keep this list
   // alias-for-alias with the central ordered table, mirroring HF_EXAMPLE_MODELS.
-  constexpr std::array<std::string_view, 45> kExampleConfigArchitectures{
+  constexpr std::array<std::string_view, 46> kExampleConfigArchitectures{
+      "BoundaryExtractor",
       "CohereForCausalLM",
       "DeepseekV2ForCausalLM",
       // "DeepseekV41For" < "DeepseekV4For": they agree through "DeepseekV4" and
@@ -787,7 +811,7 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       ModelRegistry::Resolve(unknown),
       "Model architectures ['Gemma4ForCausalLM'] are not supported for now. "
       "Supported architectures: "
-      "dict_keys(['CohereForCausalLM', 'DeepseekV2ForCausalLM', "
+      "dict_keys(['BoundaryExtractor', 'CohereForCausalLM', 'DeepseekV2ForCausalLM', "
       "'DeepseekV41ForCausalLM', "
       "'DeepseekV4ForCausalLM', 'Dots3NoteForCausalLM', 'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
       "'Gemma4ForConditionalGeneration', 'Gemma4UnifiedForConditionalGeneration', 'GemmaForCausalLM', "
@@ -813,7 +837,7 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       ModelRegistry::Resolve(multiple),
       "Model architectures ['UnknownA', 'UnknownB'] are not supported for now. "
       "Supported architectures: "
-      "dict_keys(['CohereForCausalLM', 'DeepseekV2ForCausalLM', "
+      "dict_keys(['BoundaryExtractor', 'CohereForCausalLM', 'DeepseekV2ForCausalLM', "
       "'DeepseekV41ForCausalLM', "
       "'DeepseekV4ForCausalLM', 'Dots3NoteForCausalLM', 'Gemma2ForCausalLM', 'Gemma3ForCausalLM', "
       "'Gemma4ForConditionalGeneration', 'Gemma4UnifiedForConditionalGeneration', 'GemmaForCausalLM', "

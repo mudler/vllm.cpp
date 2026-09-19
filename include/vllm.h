@@ -351,7 +351,14 @@ extern "C" {
  * model families that have a window and to none of the other three. A new
  * TRAILING field on a struct whose callers zero-initialize, and 0 is the existing
  * default, so a zero-initialized v25 struct is byte-identical. */
-#define VLLM_ABI_VERSION 26
+/* v27 — vllm_gliner_ner / vllm_ner_result(_free), ZERO-SHOT NER through the
+ * ONE surface (row `MODEL-GLINER25`). A GLiNER2.5 engine (architecture
+ * "BoundaryExtractor", a pooling model) runs the full NER pipeline — DeBERTa
+ * v2 encoder → boundary head → candidate decoder — and returns extracted
+ * entities with character offsets. The entry point is additive: a
+ * non-GLiNER2 engine is refused by name, and every existing struct and call is
+ * byte-identical. */
+#define VLLM_ABI_VERSION 27
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -1114,6 +1121,49 @@ VLLM_API vllm_status vllm_embed(vllm_engine* engine,
 /* Free the owned members of an embedding result and zero the struct. The
  * struct itself is caller storage. NULL is a no-op. */
 VLLM_API void vllm_embedding_result_free(vllm_embedding_result* out);
+
+
+/* ── Zero-shot NER (ABI v27, MODEL-GLINER25) ────────────────────────────────
+ * The NER slice of the ONE-SURFACE fold: the SAME library pipeline the bundled
+ * server's /v1/ner endpoint drives (vllm::Gliner2NerInference), reachable by
+ * any embedder. A GLiNER2.5 engine (architecture "BoundaryExtractor") runs the
+ * DeBERTa v2 encoder, the boundary head, and the candidate decoder, returning
+ * extracted entities with token and character offsets. */
+
+/* One extracted entity. OWNERSHIP: label and text are library-allocated; free
+ * the containing vllm_ner_result via vllm_ner_result_free. */
+typedef struct vllm_ner_entity {
+  char* label;          /* entity type / query name (NUL-terminated, library-alloc) */
+  char* text;           /* surface text from the input (NUL-terminated, library-alloc) */
+  int32_t char_start;   /* character start offset in the input (inclusive) */
+  int32_t char_end;     /* character end offset in the input (exclusive) */
+  int32_t token_start;  /* token start index (inclusive) */
+  int32_t token_end;    /* token end index (exclusive) */
+  float confidence;     /* sigmoid probability of the span score */
+} vllm_ner_entity;
+
+/* NER result: an array of entities. OWNERSHIP: entities and their label/text
+ * strings are library-allocated; free via vllm_ner_result_free. */
+typedef struct vllm_ner_result {
+  vllm_ner_entity* entities;  /* n_entities entities, or NULL when none */
+  int32_t n_entities;         /* number of entities (may be 0) */
+} vllm_ner_result;
+
+/* Run zero-shot NER on `text` with `n_labels` entity types on a GLiNER2.5
+ * engine handle. `labels` is an array of NUL-terminated entity-type strings
+ * (e.g. {"person", "organization", "location"}). `threshold` is the minimum
+ * sigmoid probability to keep (default 0.5); `max_width` is the maximum span
+ * width in tokens (default 12, 0 = use the model default). BLOCKING. Returns
+ * VLLM_OK on success; VLLM_ERR_INVALID_ARGUMENT for a non-GLiNER2 engine, a
+ * NULL text/labels/out, or n_labels <= 0; VLLM_ERR_RUNTIME on forward failure.
+ * On any non-OK status *out is zeroed and vllm_last_error() carries the detail. */
+VLLM_API vllm_status vllm_gliner_ner(vllm_engine* engine, const char* text,
+                                     const char* const* labels, int32_t n_labels,
+                                     float threshold, int32_t max_width,
+                                     vllm_ner_result* out);
+
+/* Free the owned members of a NER result and zero the struct. NULL is a no-op. */
+VLLM_API void vllm_ner_result_free(vllm_ner_result* out);
 
 
 /* ── Video+audio generation (ABI v12, MiniMax-H3) ────────────────────────────

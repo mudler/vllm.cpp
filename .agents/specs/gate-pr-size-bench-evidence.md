@@ -57,7 +57,7 @@ The set contains only these files under `docs/bench-evidence/`:
 | Run directory | Files |
 |---|---|
 | `qwen38-27b-exl3-headtohead-20260903` | `OURS-A.clientlog`, `OURS-B.clientlog`, `THEIRS-A.clientlog`, `THEIRS-B.clientlog`, `serve_openai-usage.patch` |
-| `qwen38-27b-exl3-variadic-20260905` | `OURS-r1-c1.clientlog`, `OURS-r1-c4.clientlog`, `OURS-r1-c8.clientlog`, `OURS-r2-c1.clientlog`, `OURS-r2-c4.clientlog`, `OURS-r2-c8.clientlog`, `PROBE.clientlog`, `THEIRS-r1-c1.clientlog`, `THEIRS-r1-c4.clientlog`, `THEIRS-r1-c8.clientlog`, `THEIRS-r2-c8.clientlog` |
+| `qwen38-27b-exl3-variadic-20260905` | `OURS-r1-c1.clientlog`, `OURS-r1-c4.clientlog`, `OURS-r1-c8.clientlog`, `OURS-r1-c16.clientlog`, `OURS-r1-c32.clientlog`, `OURS-r2-c1.clientlog`, `OURS-r2-c4.clientlog`, `OURS-r2-c8.clientlog`, `OURS-r2-c16.clientlog`, `OURS-r2-c32.clientlog`, `PROBE.clientlog`, `THEIRS-r1-c1.clientlog`, `THEIRS-r1-c4.clientlog`, `THEIRS-r1-c8.clientlog`, `THEIRS-r1-c16.clientlog`, `THEIRS-r1-c32.clientlog`, `THEIRS-r2-c1.clientlog`, `THEIRS-r2-c4.clientlog`, `THEIRS-r2-c8.clientlog`, `THEIRS-r2-c16.clientlog`, `THEIRS-r2-c32.clientlog` |
 
 Exact paths express the inspected surface without assigning an evidence class to uninspected patches or future logs.
 A new sibling artifact requires its own justified classification.

@@ -133,6 +133,7 @@ class PathClassification(unittest.TestCase):
         for path in (
             f"{head}/OURS-C.clientlog",
             f"{head}/PROBE.clientlog",
+            f"{variadic}/THEIRS-r2-c2.clientlog",
             f"{variadic}/THEIRS-r3-c1.clientlog",
             f"{variadic}/serve_openai-usage.patch",
             f"{head}/other.patch",

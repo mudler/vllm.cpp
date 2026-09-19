@@ -1,0 +1,61 @@
+#version 450
+// vt::MoeCombine — weighted sum of the per-slot expert outputs into the layer
+// delta: out[t,h] = sum_j weights[t,j] * expert_out[t,j,h] (* routed_scale)
+//                    (+ shared[t,h] when present).
+//
+// CPU oracle: MoeCombineKernel (src/vt/cpu/cpu_ops.cpp:2749-2765). The f32
+// accumulate-then-store contract is preserved exactly; bf16 loads widen to f32
+// through the VT_LOAD dtype-erased view, matching LoadF32's widening.
+//
+// GRID: one invocation per OUTPUT element over T*H, with the K=top_k slot loop
+// inside. K=8 on maple so the inner loop is tiny; one workgroup of 128 covers
+// 128 output columns per dispatch row.
+// SHARED handling: bound unconditionally (aliased to expert_out when absent —
+// dead reads on that path, same arrangement as the rope kernel's optional k),
+// gated by a specialization constant instead of a pointer null-check.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) buffer Ob32 { uint v[]; } O32;
+layout(binding = 1) buffer Ob16 { uint16_t v[]; } O16;
+layout(binding = 2) readonly buffer Eb32 { uint v[]; } E32;
+layout(binding = 3) readonly buffer Eb16 { uint16_t v[]; } E16;
+layout(binding = 4) readonly buffer Wb32 { uint v[]; } W32;
+layout(binding = 5) readonly buffer Wb16 { uint16_t v[]; } W16;
+layout(binding = 6) readonly buffer Sb32 { uint v[]; } S32;
+layout(binding = 7) readonly buffer Sb16 { uint16_t v[]; } S16;
+
+// VT_DT_F32/VT_DT_BF16 come from vt_common.glsl (0u / 2u).
+
+layout(constant_id = 0) const uint VT_MC_OUT_DT = 2u;
+layout(constant_id = 1) const uint VT_MC_E_DT = VT_DT_BF16;
+layout(constant_id = 2) const uint VT_MC_HAS_SHARED = 0u;
+
+layout(push_constant) uniform Params {
+  uint tokens;
+  uint h;             // hidden
+  uint k;             // top_k slots
+  float routed_scale;
+  uint out_off, e_off, w_off, s_off;
+} p;
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  if (gid >= p.tokens * p.h) { return; }
+  uint row = gid / p.h;
+  uint col = gid % p.h;
+
+  float acc = 0.0;
+  for (uint j = 0u; j < p.k; ++j) {
+    float w = VT_LOAD(W32, W16, VT_DT_F32, p.w_off, row * p.k + j);
+    float e = VT_LOAD(E32, E16, VT_MC_E_DT, p.e_off, (row * p.k + j) * p.h + col);
+    acc += w * e;
+  }
+  if (p.routed_scale != 1.0) { acc *= p.routed_scale; }
+  if (VT_MC_HAS_SHARED == 1u) {
+    acc += VT_LOAD(S32, S16, VT_MC_OUT_DT, p.s_off, row * p.h + col);
+  }
+  VT_STORE(O32, O16, VT_MC_OUT_DT, p.out_off, gid, acc);
+}

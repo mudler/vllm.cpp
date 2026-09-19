@@ -318,6 +318,8 @@ RECORDED_BENCH_EVIDENCE = frozenset(
         "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r1-c1.clientlog",
         "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r1-c4.clientlog",
         "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r1-c8.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r1-c16.clientlog",
+        "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r1-c32.clientlog",
         "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r2-c1.clientlog",
         "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r2-c4.clientlog",
         "docs/bench-evidence/qwen38-27b-exl3-variadic-20260905/OURS-r2-c8.clientlog",

@@ -34,6 +34,13 @@ historical at commit `b923ac2c4c24e9c608d4a6e02e868538be7536fa`; it is absent
 from current `main` and its attach-first execution sequence is superseded for
 this issue.
 
+Retained qualification evidence does not bind an immutable worker image. The
+design therefore requires a separate no-GPU discovery phase before runtime
+closure preparation. That phase derives one runtime-relevant image digest. It
+atomically seals the lease, device, boot, operating system, dpkg database, and
+the exact 12 live library records. Runtime-closure preparation consumes that
+sealed receipt and cannot authorize the current host or rediscover a binding.
+
 ### Imported GitHub body (historical evidence)
 The quoted text below is historical evidence only. It does not define issue authority or repository procedure.
 

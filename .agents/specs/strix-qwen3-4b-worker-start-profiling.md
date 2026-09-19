@@ -70,6 +70,8 @@ In scope:
 
 - one importable launch seam, one thin public diagnostic client, and versioned
   input contracts;
+- one no-GPU worker-image discovery and seal before runtime-closure
+  preparation;
 - one launch owner for each arm, from profiler initialization through artifact
   finalization and production worker shutdown;
 - production vLLM V2 and vllm.cpp process trees with their existing supervisor,
@@ -246,6 +248,16 @@ monorepo and built `projects/rocprofiler-sdk` from nested source pin
 that relationship. The archive SHA256 binds the harness archive bytes, not the
 nested SDK source or a built binary.
 
+The retained evidence supplies no immutable worker-image authority. A complete
+key and value-path inspection of `qualification-manifest-12.json` found no
+image, container, root-filesystem, operating-system, boot, or dpkg identity.
+Its `audit` field binds `audit-real-f99f5d3a.json` at SHA256
+`4ab481289d457cf7a4f6f6073ff3430a0b5a92e2ff87b24dfc719b548c886656`.
+That file is a model-tensor audit. It contains no worker identity. A scan of
+the retained JSON receipts found no controller-authorized image digest or
+worker-image receipt. A current worker cannot supply this missing authority
+for itself.
+
 The separate retained SDK source anchor files include
 `sdk-attachment-source.TktBaK/rocprofiler_register.cpp` with SHA256
 `a54e43b6546c006b635b263012b7d90abbaf18f64d022dff1a8a9adafc255f0e`
@@ -344,6 +356,114 @@ Its recursive audit reports `UNBOUND_COUNT=8`. The unbound set contains
 libm, and dynamic-loader hashes differ from the retained Strix hashes. The
 qualification manifest is therefore not a complete runtime-closure manifest.
 
+### Public worker-image discovery and seal
+
+Runtime-closure preparation cannot discover the image and then authorize its
+own discovery. The implementation first adds the importable
+`tools.bench.strix_worker_profile.worker_image.discover_and_seal` callable.
+Its contract identifier is `vllm.cpp/worker-image-discovery/v1`.
+
+The public signature is
+`discover_and_seal(request: DiscoverWorkerImageRequest) -> DiscoverWorkerImageResult`.
+`DiscoverWorkerImageRequest` contains strict discovery-request bytes, the
+qualification-manifest bytes and SHA256, the expected `strix:gpu0` device, the
+exact 12 resolver keys listed later in this section, and a new output directory.
+Unknown fields or another key set fail. The discovery request cannot contain a
+caller-selected image identity or library path.
+
+The discovery receipt and detached hash are the only image authority for
+downstream phases. The phase derives a runtime-relevant worker-image digest
+from one canonical envelope. The envelope contains `/etc/os-release`, the dpkg
+status bytes, dpkg architecture, sorted package rows, selected dpkg metadata,
+and all 12 records. It also contains the qualification-bound eight-file image
+subset and their exact hashes. The digest makes no claim about unrelated image
+files. An environment variable, host name, mount label, loader-cache entry, or
+caller-supplied image string cannot authorize the image.
+
+The discovery phase runs through `rc run strix:gpu0`, never through SSH. It
+requires `RC_DEVICE=strix:gpu0` and a nonempty `RC_JOB_ID`. It initializes no
+GPU runtime and makes no device call. It imports no engine, Torch, ROCm runtime,
+or profiler library. It records `/proc/self/maps` before and after discovery.
+It rejects a new HSA, HIP, profiler, engine, or GPU mapping.
+
+The phase reads `/etc/os-release`, `/var/lib/dpkg/status`, the dpkg
+architecture, and the sorted `dpkg-query -W` rows. It binds each byte sequence,
+byte count, and SHA256. It also binds the dpkg executable and every dpkg
+metadata file that supplies ownership for a selected file.
+
+The exact discovery set contains these six `sealed-non-glibc` keys:
+
+- `libbz2.so.1`;
+- `libgcc_s.so.1`;
+- `liblzma.so.5`;
+- `libstdc++.so.6`;
+- `libz.so.1`; and
+- `libzstd.so.1`.
+
+It also contains these six `host-glibc-witness` keys:
+
+- `ld-linux-x86-64.so.2`;
+- `libc.so.6`;
+- `libdl.so.2`;
+- `libm.so.6`;
+- `libpthread.so.0`; and
+- `librt.so.1`.
+
+The phase discovers exactly 12 records. It enumerates only dpkg-owned files
+whose basename or ELF `DT_SONAME` matches one declared key. It resolves each
+symlink without crossing the worker root. Each key must select exactly one
+canonical file. A missing key, unowned file, multiple owner, or two distinct
+canonical candidates fails. Search order, the live loader cache, and a process
+default cannot select a file.
+
+Each selected record binds the resolver key, source class, absolute path,
+canonical path, complete relative symlink chain, bytes, SHA256, GNU build ID,
+ELF `DT_SONAME`, and ordered `DT_NEEDED` list. It also binds the owning package,
+version, architecture, exact `dpkg-query -S` row, exact `dpkg-query -W` row,
+and the byte identity of the package's dpkg list file. Missing data fails. The
+six glibc records remain witnesses and never become loader inputs.
+
+The deterministic receipt is UTF-8 JSON with sorted keys, compact separators,
+and one terminal newline. It contains the contract identifier, lease job,
+device, boot ID, runtime-relevant image digest, operating-system bindings,
+dpkg bindings, the qualification-bound eight-file subset, and the ordered 12
+records. The phase writes `worker-image-discovery-receipt.json` and its
+detached SHA256 file in a fresh staging directory. It fsyncs both files and the
+staging directory. It then publishes the directory with one same-filesystem
+rename and fsyncs the parent. It refuses overwrite. A partial or non-atomic
+receipt never authorizes preparation.
+
+The public discovery command is:
+
+```text
+python3 tools/bench/strix_worker_profile/worker.py \
+  --phase discover-worker-image \
+  --discovery-request <discovery-request.json> \
+  --output <new-directory>
+```
+
+This phase rejects `--engine` and every closure, readiness, or trace argument.
+The command is a thin client. It parses bytes, constructs one request, invokes
+the importable callable exactly once, and maps the result status to its exit
+status. It cannot implement another discovery or publication path.
+
+A receipt applies to one recorded lease job and boot. Preparation can consume
+it during that same job and boot. A fresh lease or reboot requires a new
+discovery phase and a new receipt. A fresh lease after a reboot is one such
+new context. After the first seal, the operator puts the
+runtime-relevant image digest and the 12 sealed identities in the strict
+profile manifest before preparation. Each later discovery request supplies
+those expected values. The phase must reproduce the same image digest and the
+same 12 paths and identities. An image, operating-system, dpkg, path, package,
+hash, build-ID, or symlink change fails closed as `IMAGE_DRIFT` or `FILE_DRIFT`.
+The implementation never relabels drift as a new accepted pin.
+
+Discovery returns one of three states. `SEALED` names the immutable receipt and
+detached hash. `PENDING_IMAGE_AUTHORITY` means that no valid lease identity or
+complete image envelope exists. `FAILED` names the first validation, discovery,
+drift, or publication error and preserves a bounded failure result outside the
+final name. Only `SEALED` reaches runtime-closure preparation.
+
 ### Public runtime-closure preparation
 
 The implementation adds the importable
@@ -355,11 +475,12 @@ second closure algorithm.
 
 Its public signature is
 `prepare(request: RuntimeClosureRequest) -> RuntimeClosureResult`.
-`RuntimeClosureRequest` contains the strict profile manifest bytes and the new
-output directory. `RuntimeClosureResult` contains the contract identifier,
-status, output path, manifest, archive, receipt identities, fixed-point file and
-edge counts, total bytes, and `UNBOUND_COUNT`. The implementation owns these
-types and their strict JSON encodings in the same module as the callable.
+`RuntimeClosureRequest` contains the strict profile manifest bytes, the sealed
+worker-image discovery receipt bytes and detached hash, and the new output
+directory. `RuntimeClosureResult` contains the contract identifier, status,
+output path, manifest, archive, receipt identities, fixed-point file and edge
+counts, total bytes, and `UNBOUND_COUNT`. The implementation owns these types
+and their strict JSON encodings in the same module as the callable.
 
 The public preparation command is:
 
@@ -367,6 +488,7 @@ The public preparation command is:
 python3 tools/bench/strix_worker_profile/worker.py \
   --phase prepare-runtime-closure \
   --manifest <manifest.json> \
+  --worker-image-receipt <worker-image-discovery-receipt.json> \
   --output <new-directory>
 ```
 
@@ -375,11 +497,21 @@ closure for both later arms. The existing profiled-process launch seam consumes
 the sealed result. It does not discover or acquire a library itself.
 
 The operator later runs this phase through `rc run strix:gpu0`, never through
-SSH. The phase runs on the pinned worker image from the qualification manifest.
-It records the lease job, device, boot ID, image identity, `/etc/os-release`
-bytes and SHA256, dpkg database identity, and dpkg architecture. The dpkg
-identity is the byte count and SHA256 of `/var/lib/dpkg/status`, plus the sorted
-`dpkg-query -W` package, version, and architecture rows used by the closure.
+SSH. The sealed discovery receipt and detached hash are its sole authority for
+the image and the 12 live records. Preparation must not rediscover a path,
+package, image, or binding from the live host. It verifies the lease job,
+device, boot ID, and image digest against the receipt. It then
+byte-matches `/etc/os-release`, the dpkg bindings, the qualification-bound
+eight-file subset, and all 12 sealed paths against that receipt. Verification
+cannot change a selected path or provenance record. A mismatch fails before
+closure discovery. The sealed receipt and hash are the sole authority that `prepare()` consumes.
+Preparation and discovery must run in the same boot.
+
+Preparation returns `PENDING_WORKER_IMAGE_RECEIPT` when the receipt or detached
+hash is missing. It returns `FAILED_WORKER_IMAGE_BINDING` for an invalid hash,
+non-atomic publication, wrong job or boot, changed image, or changed sealed
+file. Neither state can reach package extraction or the fixed-point walk.
+Preparation never converts a current-host observation into a new receipt.
 It verifies every qualification-bound file before it resolves one dependency.
 
 The phase must not initialize HSA, HIP, or a GPU. It imports no engine, Torch,
@@ -418,6 +550,12 @@ The only resolver keys and source classes are:
 | `six-package` | `librocprofiler-sdk.so.1`, root-only `librocprofiler-sdk-tool.so.1`, `librocprofiler-sdk-rocpd.so.1`, `librocprofiler-register.so.0`, alias `librocprofiler-register.so`, and `libsqlite3.so.0` | The verified DEB payload under `sdk-root`. |
 | `sealed-non-glibc` | `libamd_comgr.so.3`, `libdrm.so.2`, `libdrm_amdgpu.so.1`, `libdw.so.1`, `libelf.so.1`, `libhsa-amd-aqlprofile64.so.1`, `libhsa-runtime64.so.1`, `libnuma.so.1`, `libbz2.so.1`, `libgcc_s.so.1`, `liblzma.so.5`, `libstdc++.so.6`, `libz.so.1`, and `libzstd.so.1` | The individually bound worker-image file. |
 | `host-glibc-witness` | `ld-linux-x86-64.so.2`, `libc.so.6`, `libdl.so.2`, `libm.so.6`, `libpthread.so.0`, and `librt.so.1` | The witness-only live host component, byte-matched at launch. |
+
+This map selects 5 canonical `six-package` files, 14
+`sealed-non-glibc` files, and 6 `host-glibc-witness` files. The two register
+keys select one canonical package file. Discovery can supply identities only
+for the final 6 non-glibc keys and 6 glibc keys. It cannot change the 5/14/6
+source-class map.
 
 Each `six-package` key resolves only from its verified DEB payload under
 `sdk-root`. Both register keys select the same canonical package file. Each
@@ -686,8 +824,10 @@ The implementation also adds one repository command:
 
 ```text
 python3 tools/bench/strix_worker_profile/worker.py \
-  --phase prepare-runtime-closure|readiness|trace \
-  --manifest <manifest.json> \
+  --phase discover-worker-image|prepare-runtime-closure|readiness|trace \
+  [--discovery-request <discovery-request.json>] \
+  [--manifest <manifest.json>] \
+  [--worker-image-receipt <worker-image-discovery-receipt.json>] \
   [--engine vllmcpp|vllm] \
   --output <new-directory>
 ```
@@ -699,11 +839,16 @@ bootstrap, lifecycle, closure, or artifact logic. The preparation phase invokes
 the public runtime-closure callable exactly once. The readiness and trace phases
 invoke the public launch seam exactly once.
 
-The preparation phase forbids `--engine`. The readiness and trace phases
-require it. All three phases reject arguments that their selected phase does
-not own.
+The discovery and preparation phases forbid `--engine`. The readiness and
+trace phases require it. Discovery requires `--discovery-request` and
+rejects `--manifest`. Preparation requires the manifest and worker-image
+receipt. Every phase rejects arguments that its selected phase does not own.
 
-The command accepts no implicit engine, model, profiler, or workload defaults.
+The discovery command invokes
+`vllm.cpp/worker-image-discovery/v1` exactly once. The preparation command
+invokes `vllm.cpp/runtime-loader-closure/v1` exactly once after the receipt
+gate passes. A missing or invalid receipt must prevent that call. The command
+accepts no implicit engine, model, profiler, or workload defaults.
 Arguments stored in the manifest are arrays and are never interpolated through
 a shell. The output directory must not exist. Hardware phases require
 `RC_DEVICE=strix:gpu0` and a nonempty `RC_JOB_ID`. The command rejects symlinks,
@@ -725,9 +870,12 @@ The manifest schema identifier is
   fields, concurrency schedule, warmup schedule, and expected 128-token stop;
 - the permitted environment, ROCm library roots, device, lease, timeout,
   per-file limit, aggregate-output limit, and cleanup timeout;
+- the `vllm.cpp/worker-image-discovery/v1` contract, runtime-relevant image
+  digest, and exact 12 sealed live records;
 - the runtime-closure schema, closed SONAME binding map, exact selected source
   files, provenance kinds, pinned worker image, closure limits, and required
   source categories;
+- the worker-image discovery receipt path, byte count, SHA256, lease, and boot;
 - the closure manifest, archive, and receipt paths, byte counts, and SHA256 values;
 - the sealed interpreter and host-glibc file identities; and
 - the `vllm.cpp/profiled-process-tree-launch/v1` seam version, exact production
@@ -738,17 +886,18 @@ Unknown fields, duplicate JSON keys, missing full revisions, relative paths,
 and schema-version drift fail before a subprocess starts. The implementation
 records the raw manifest and its SHA256 in every phase result.
 
-Both engines must use the same closure manifest and archive hashes. The pair
-validator rejects different closure schemas, receipts, hashes, limits, worker
-image identities, host-glibc identities, or fixed-point file and edge sets.
+Both engines must use the same worker-image receipt and the same closure
+manifest and archive hashes. The pair validator rejects different discovery
+schemas, receipt hashes, closure schemas, limits, worker-image identities,
+host-glibc identities, or fixed-point file and edge sets.
 
 ## Lifecycle and observation window
 
 One owner controls this sequence:
 
-1. Verify the lease, NAS free space, manifest, archives, runtime-closure
-   receipt, model files, executable, libraries, profiler, build IDs,
-   environment, and new output directory.
+1. Verify the lease, worker-image receipt, NAS free space, manifest, archives,
+   runtime-closure receipt, model files, executable, libraries, profiler,
+   build IDs, environment, and new output directory.
 2. Record a pre-run binding manifest, the boot ID, device identity, lease job,
    process limits, and monotonic and wall-clock start times.
 3. Extract the sealed closure into a fresh root. Recompute its fixed point,
@@ -785,6 +934,7 @@ configuration, model, and route as `trace`. It runs one declared warmup and one
 prompt at concurrency one. It has a 10-minute wall timeout, a 256 MiB aggregate
 output stop threshold, and a 192 MiB per-file limit. It proves only:
 
+- the worker-image receipt matches the current lease and boot;
 - profiler initialization precedes runtime initialization;
 - the sealed closure replays to the identical fixed point with
   `UNBOUND_COUNT=0` before bootstrap;
@@ -822,6 +972,9 @@ artifacts. It never renames that file to a passing result.
 
 - schema identifier, phase, engine, run identifier, manifest path and SHA256,
   start and end times, boot ID, lease job, device, and status;
+- worker-image discovery schema, receipt path and SHA256, runtime-relevant
+  image digest, operating-system identity, dpkg identity, and the exact 12 live
+  records;
 - launch-seam identifier, bootstrap path and SHA256, Python and `site.py`
   identities, exact production argument array, and resolved start method;
 - runtime-closure schema, manifest, archive, and receipt identities, file and
@@ -854,6 +1007,8 @@ any file whose recorded length or hash changes during the post-run check.
 A trace arm passes only when all of these claims are supported by records from
 the identified GPU worker:
 
+- the worker-image receipt matches the current lease, boot, image, operating
+  system, dpkg database, and exact 12 live records;
 - profiler initialization happened before Torch, HSA, or HIP initialization;
 - the closure manifest and archive match the profile manifest, replay reaches
   the identical fixed point, and `UNBOUND_COUNT=0`;
@@ -914,6 +1069,21 @@ CPU tests use temporary files and real bounded subprocesses where lifecycle
 ordering matters. They simulate the profiler and production process tree; they
 do not claim GPU coverage. At minimum they prove:
 
+- worker-image discovery rejects a missing lease identity, wrong device,
+  incomplete image envelope, or caller-selected current-host identity;
+- worker-image discovery seals exactly 12 live records and rejects a missing
+  path, multiple candidate, missing dpkg owner, changed image, changed
+  operating-system or dpkg bytes, or changed path, hash, build ID, package, or
+  symlink for any one record;
+- deterministic discovery fixtures reproduce byte-identical receipt and hash
+  bytes, and interrupted or non-atomic publication never creates a usable
+  final receipt;
+- closure preparation rejects a missing receipt, missing detached hash,
+  receipt-hash mismatch, wrong lease or boot, changed image, or a change to any
+  one of the 12 bindings before package extraction;
+- closure preparation cannot read the loader cache, enumerate a live library
+  directory, run dpkg ownership discovery, select another path, or publish a
+  replacement worker-image receipt;
 - strict manifest parsing rejects duplicate keys, unknown fields, incomplete
   pins, wrong hashes, path escapes, symlinks, existing outputs, and engine or
   profiler mismatches;
@@ -947,6 +1117,8 @@ do not claim GPU coverage. At minimum they prove:
   drift fails before any subprocess starts;
 - the preparation command reaches the importable
   `vllm.cpp/runtime-loader-closure/v1` callable exactly once;
+- the discovery command reaches the importable
+  `vllm.cpp/worker-image-discovery/v1` callable exactly once;
 - production call-site reachability fails if the launch seam stops consuming
   the sealed closure result;
 - a real CPU fixture starts a fresh Python interpreter with the hashed
@@ -977,11 +1149,15 @@ package-set validation, closure fixed-point check, zero-unbound check, no-live-
 fallback check, callable-to-command connection, closure-to-launch connection,
 at-fork receipt, one category check, graph-replay join, scheduler-shape join,
 finalization-order check, post-run binding check, output bound, and eager or
-preload refusal one at a time. Mutate an omitted transitive dependency, symlink,
-file hash, build ID, archive hash, host glibc mismatch, resource limit, live
-fallback, source class, selected path, provenance kind, undeclared SONAME, and
-second-walk edge independently. The focused suite must detect each mutation.
-Restore the tree byte-for-byte after every mutation.
+preload refusal one at a time. Remove the discovery receipt or its detached
+hash. Accept a self-authorized current host, changed image, or changed one of
+the exact 12 bindings. Make preparation rediscover one binding. Publish a
+non-atomic receipt. Each mutation must fail independently. Mutate an omitted
+transitive dependency, symlink, file hash, build ID, archive hash, host glibc
+mismatch, resource limit, live fallback, source class, selected path,
+provenance kind, undeclared SONAME, and second-walk edge independently. The
+focused suite must detect each mutation. Restore the tree byte-for-byte after
+every mutation.
 
 ## Hardware stages and gates
 
@@ -994,15 +1170,23 @@ uses these gates in order:
 3. Full repository preflight with `scripts/agent-preflight.sh`.
 4. Fresh static and mutation review of the immutable implementation commit.
 5. Operator rerun of the focused suite and full preflight.
-6. One leased `prepare-runtime-closure` phase on the pinned worker image. It
-   initializes no GPU runtime and atomically publishes the bounded closure.
-7. Offline validation and extraction of the sealed closure. The replay audit
+6. One leased `discover-worker-image` phase. It derives the runtime-relevant
+   image digest, initializes no GPU runtime, and atomically publishes the
+   sealed worker-image receipt.
+7. One `prepare-runtime-closure` phase in the same lease and boot. It consumes
+   only that receipt for the image and 12 live records. It atomically publishes
+   the bounded closure.
+8. Offline validation and extraction of the sealed closure. The replay audit
    must reach the identical fixed point with `UNBOUND_COUNT=0`.
-8. One leased readiness arm for vllm.cpp, then one for production vLLM.
-9. One leased full trace per arm, sequentially, using the same accepted
+9. One leased readiness arm for vllm.cpp, then one for production vLLM.
+10. One leased full trace per arm, sequentially, using the same accepted
    manifest and profiler configuration.
-10. An offline pair check that rehashes both outputs, verifies every completeness
+11. An offline pair check that rehashes both outputs, verifies every completeness
    rule, and emits a diagnostic comparison without a performance verdict.
+
+Stages 6 through 10 use one lease and boot when one lease can contain them. If
+a later stage starts in a fresh lease or after a reboot, rerun stages 6 through
+8 first. The old worker-image receipt cannot authorize the new context.
 
 The hardware report records every command exit, omitted gate, resource stop,
 and failed completeness rule. A passing CPU suite cannot replace a hardware
@@ -1022,6 +1206,9 @@ receipt. An implementer or reviewer report cannot replace the operator's gate.
 - A reboot can invalidate worker-local builds. The recovery path rebuilds from
   the verified package set and sealed closure. It rebinds every binary and
   library before bootstrap.
+- A fresh lease or reboot invalidates the old worker-image receipt. The new
+  discovery phase must reproduce the pinned image digest and all 12 records
+  before preparation can run.
 - A copied glibc can corrupt a running Python process. The launch seam never
   loads the archived glibc witnesses and requires byte-identical host files.
 - A live system fallback can make one run pass and the rebooted run fail. The
@@ -1034,6 +1221,14 @@ receipt. An implementer or reviewer report cannot replace the operator's gate.
 Stop without attribution or optimization when any of these occurs:
 
 - the Strix lease is absent, lost, or shared with an unrelated GPU job;
+- discovery cannot derive the complete image envelope, or its lease, device,
+  boot, or runtime-relevant digest differs;
+- worker-image discovery does not seal exactly 12 records or cannot publish
+  its receipt and detached hash with one atomic directory rename;
+- preparation lacks the sealed worker-image receipt or detached hash, accepts
+  a self-authorized current host, or tries to rediscover a live binding;
+- the sealed image, operating-system bytes, dpkg identity, or any one of the
+  12 sealed path, hash, build-ID, package, or symlink records changes;
 - a pin, archive, model file, binary, library, build ID, configuration, or
   before-and-after binding differs;
 - the package set is incomplete, its dependency closure is unresolved, or a

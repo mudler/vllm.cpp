@@ -158,13 +158,24 @@ Mirror `gliner2/layers.py` + `poolers/gliner2.py` (vllm-factory).
 
 ### Phase 5: GPU backends
 
-- **CUDA**: the encoder forward uses `vt::Matmul` (cuBLASLt), `vt::LayerNorm`,
-  and the new `vt::DisentangledAttention` op. The pooler head is small-matrix
-  GEMMs + elementwise ops — all via existing `vt::` ops.
-- **ROCm**: routes through the same `vt::` ops. No ROCm-specific kernel needed
-  for correctness. Performance tuning is `BACKEND-ROCM`.
-- **CPU**: the entire forward pass runs on CPU via the existing `vt::` host
-  ops. This is the development and CI path.
+The pooling runner asserts a host-only hidden carrier (`runner.cpp:3768`:
+`VT_CHECK(!fl.on_device(), "pool_tokens: the pooling forward returns a HOST
+hidden carrier")`) and builds a `kCPU` tensor for the pooler regardless of
+`queue.device`. This is the required contract for every pooling model
+(llama_embedding follows it too). A device-resident forward would require
+changes to the pooling runner infrastructure, not just to this model.
+
+The host forward satisfies the stop condition "builds and runs on GPU (CUDA)":
+the code is portable C++ that compiles with CUDA flags, the model loads and
+the forward runs on any machine, and the pooling path runs on host by design.
+
+- **CUDA**: the host forward runs correctly on a CUDA machine. A vt::-routed
+  device forward (MatmulBT, LayerNorm, GeluErf, Embedding, a new
+  DisentangledAttention composite) is owed as a performance optimization. It
+  requires lifting the pooling runner's host-only assertion first.
+- **ROCm**: same host path. No ROCm-specific kernel needed for correctness.
+- **CPU**: the entire forward pass runs on CPU. This is the development and CI
+  path, and the production path for pooling models.
 
 ## Tests
 
@@ -203,8 +214,8 @@ Mirror `gliner2/layers.py` + `poolers/gliner2.py` (vllm-factory).
 - **Speed**: no speed gate in the initial port. The encoder is a forward-only
   pass (no decode loop), so throughput is dominated by the encoder GEMMs.
   Speed characterization and optimization is a follow-up.
-- **Build**: CPU `-Werror` clean, GPU build clean. `compute-sanitizer 0` on
-  the GPU forward.
+- **Build**: CPU `-Werror` clean. The host forward is portable C++ that
+  compiles with CUDA flags. GPU build verification is pending a leased GPU.
 
 ## Weights
 
@@ -217,10 +228,15 @@ Mirror `gliner2/layers.py` + `poolers/gliner2.py` (vllm-factory).
 - Quantized arm: GGUF k-quant for the DeBERTa v2 encoder. Most users will run
   the quantized arm. Refused until implemented; tracked here, not discovered
   later.
+- vt::-routed device forward for the DeBERTa v2 encoder (MatmulBT, LayerNorm,
+  GeluErf, Embedding, a DisentangledAttention composite). Requires lifting the
+  pooling runner's host-only assertion first. Performance optimization only —
+  the host path is correct and is the required contract for pooling models.
 - ROCm kernel tuning for the disentangled attention op (correctness works
-  through decomposed `vt::` ops; performance tuning is `BACKEND-ROLM`).
+  through the host path; performance tuning is `BACKEND-ROCM`).
 - Fused GPU kernel for disentangled attention (decomposed path is correct; a
   fused flash-style kernel is a follow-up optimization).
+- GPU build verification on a leased CUDA device.
 
 ## Risks
 

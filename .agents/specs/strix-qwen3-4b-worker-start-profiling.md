@@ -391,8 +391,13 @@ The phase has a 10-minute wall timeout. It permits at most 64 ELF files and
 512 MiB of canonical ELF bytes. The deterministic archive must also be at most
 512 MiB. Check the NAS capacity before work starts. Reject a special file,
 absolute symlink, path escape, hard link, socket, device, or FIFO.
-The reviewed recursive audit contains 24 ELF records totaling 187,411,084
-bytes. The limits provide bounded headroom without authorizing unbounded growth.
+The complete root-inclusive review walk contains 25 ELF file records, 96
+dependency edges, and 192,846,932 canonical ELF bytes. The earlier 24-file,
+187,411,084-byte audit started from the tool library's dependencies but omitted
+the tool-library root itself. The 512 MiB limit therefore leaves 39 file slots
+and 344,023,980 bytes of raw-ELF headroom. The archive has the same 512 MiB
+ceiling, so tar metadata must fit inside that separately enforced bound. These
+limits provide bounded headroom without authorizing closure growth.
 
 ### Fixed-point closure algorithm
 
@@ -403,32 +408,91 @@ Start from these exact extracted roots:
 - `opt/rocm-7.2.4/lib/librocprofiler-register.so.0.6.0`; and
 - `usr/lib/x86_64-linux-gnu/libsqlite3.so.0.8.6`.
 
-The preparation manifest lists every permitted search root in exact order. It
-includes the six-package root and absolute directories in the pinned worker
-image. It provides no implicit system default. Resolve only declared roots.
+The manifest's `soname_bindings` object is a closed map. Search-root order is
+not a resolver and cannot select a file. Each root and every `DT_NEEDED` name
+must select exactly one source class and one individually named source file.
+The only resolver keys and source classes are:
+
+| Source category | Resolver keys | Required source |
+|---|---|---|
+| `six-package` | `librocprofiler-sdk.so.1`, root-only `librocprofiler-sdk-tool.so.1`, `librocprofiler-sdk-rocpd.so.1`, `librocprofiler-register.so.0`, alias `librocprofiler-register.so`, and `libsqlite3.so.0` | The verified DEB payload under `sdk-root`. |
+| `sealed-non-glibc` | `libamd_comgr.so.3`, `libdrm.so.2`, `libdrm_amdgpu.so.1`, `libdw.so.1`, `libelf.so.1`, `libhsa-amd-aqlprofile64.so.1`, `libhsa-runtime64.so.1`, `libnuma.so.1`, `libbz2.so.1`, `libgcc_s.so.1`, `liblzma.so.5`, `libstdc++.so.6`, `libz.so.1`, and `libzstd.so.1` | The individually bound worker-image file. |
+| `host-glibc-witness` | `ld-linux-x86-64.so.2`, `libc.so.6`, `libdl.so.2`, `libm.so.6`, `libpthread.so.0`, and `librt.so.1` | The witness-only live host component, byte-matched at launch. |
+
+Each `six-package` key resolves only from its verified DEB payload under
+`sdk-root`. Both register keys select the same canonical package file. Each
+`sealed-non-glibc` record binds its absolute source path, symlink chain, bytes,
+SHA256, GNU build ID, provenance kind, and package or qualification identity.
+Each glibc record binds the exact live path and identity during preparation.
+The launch must byte-match that live component. The archived witness is never
+a loader input.
+
+The first class has precedence for its declared keys even when the pinned image
+contains another file with the same name. The second class has precedence for
+its declared keys, and the third is the only admissible source for its six
+keys. A `DT_NEEDED` name absent from this table is undeclared and fails. The
+resolver never searches another class, falls back to a process default, or
+substitutes a same-named file. Within the selected source class, a missing path
+or two distinct canonical files in the selected source class for one key
+fails. A same-named file in an unselected class is recorded as a shadowing
+candidate but cannot create ambiguity or become a fallback.
+
+The eight ROCm-adjacent `sealed-non-glibc` files selected from the production
+vLLM environment (`libamd_comgr`, both DRM libraries, `libdw`, `libelf`, both
+HSA libraries, and `libnuma`) use the exact path and SHA256 record in the
+retained qualification manifest as their source provenance. The six selected
+system non-glibc files and six glibc witnesses use `live-dpkg` ownership:
+`dpkg-query -S` must return exactly one package for the canonical live path,
+and `dpkg-query -W` binds its package, version, and architecture. An unowned or
+multiply owned live path fails.
+
+Files extracted below `sdk-root` do not use the live dpkg database for
+ownership. Their `DEB-payload provenance` is the verified package filename and
+SHA256, exact archive member path, and the package, version, and architecture
+read from that DEB. The member must occur exactly once in the verified payload.
+This distinction prevents an extracted path from being rejected merely because
+it was never installed, while still making every selected worker-image file
+and every package payload independently attributable.
 
 Use this deterministic walk:
 
-1. Verify each root's path, package owner, byte count, SHA256, and GNU build ID.
-2. Put the roots in a queue sorted by their canonical relative paths.
+1. Validate the closed binding map, its exact source paths and identities, its
+   provenance records, and the one allowed source class for every declared key.
+2. Verify each root's canonical path, byte count, SHA256, and GNU build ID plus
+   its DEB-payload provenance. Put the roots in a queue sorted by canonical
+   relative path.
 3. Read each dequeued ELF's `DT_SONAME` and ordered `DT_NEEDED` entries.
-4. Resolve each needed name to exactly one canonical file under a declared root.
-5. Reject a missing name or distinct canonical files for one needed name.
+4. Look up each needed name in the closed map. Validate only its selected file
+   in its selected class. Never search another class or a default loader path.
+5. Reject an undeclared or missing name, an identity mismatch, or two distinct
+   canonical files in the selected source class. Validate every alias and
+   symlink chain against the selected canonical file.
 6. Record every dependency edge and enqueue each new canonical file once.
 7. Enforce the file-count and byte limits before each insertion.
 8. Repeat until the sorted queue is empty and the resolved set reaches a fixed point.
-9. Run the same walk again over the assembled roots and require an identical set.
+9. Assemble the six-package root, copied non-glibc root, and glibc witness set,
+   then run the same closed-map walk again. Require the identical selected
+   canonical-file set and identical ordered edge set, with identical identities
+   and source classes.
 
-The final audit must report `UNBOUND_COUNT=0`. Reject a duplicate manifest
-record, duplicate archive path, unresolved edge, path escape, unowned file,
-missing hash, missing build ID, or closure growth during the second walk.
+Both walks must report 25 files, 96 edges, 192,846,932 bytes, and
+`UNBOUND_COUNT=0` for the reviewed fixture. Preparation on the pinned image
+also records its independently recomputed values. Any drift from the strict
+request fails. Reject a duplicate manifest record, duplicate archive path,
+unresolved or undeclared edge, path escape, or missing provenance. Reject a
+missing hash, missing build ID, or second-walk change to a selected file, edge,
+identity, or source class.
 
 Each record contains its SONAME, canonical path, symlink chain, byte count,
 SHA256, GNU build ID, and ordered `DT_NEEDED` list. It also contains the owning
 package, version, architecture, and source category.
 The allowed source categories are `six-package`, `sealed-non-glibc`, and
-`host-glibc-witness`. Resolve package ownership with `dpkg-query -S`. Bind the
-package fields with `dpkg-query -W`. An unowned file fails preparation.
+`host-glibc-witness`. It also records the resolver key, acquisition source path,
+provenance kind, and whether the file is a loader input or a witness. Apply
+DEB-payload provenance to `six-package` records, qualification-manifest
+provenance to the eight named vLLM-environment files, and live-dpkg ownership
+to the selected live worker-image records. No ownership mechanism can silently
+substitute for another.
 
 ### Sealed closure and glibc safety
 
@@ -661,8 +725,9 @@ The manifest schema identifier is
   fields, concurrency schedule, warmup schedule, and expected 128-token stop;
 - the permitted environment, ROCm library roots, device, lease, timeout,
   per-file limit, aggregate-output limit, and cleanup timeout;
-- the runtime-closure schema, preparation search roots, pinned worker image,
-  closure limits, and required source categories;
+- the runtime-closure schema, closed SONAME binding map, exact selected source
+  files, provenance kinds, pinned worker image, closure limits, and required
+  source categories;
 - the closure manifest, archive, and receipt paths, byte counts, and SHA256 values;
 - the sealed interpreter and host-glibc file identities; and
 - the `vllm.cpp/profiled-process-tree-launch/v1` seam version, exact production
@@ -860,8 +925,14 @@ do not claim GPU coverage. At minimum they prove:
 - closure preparation rejects an omitted transitive dependency, duplicate
   SONAME target, changed symlink, hash, build ID, archive member, or package
   identity;
+- closure preparation rejects an undeclared SONAME, a binding to the wrong
+  source class, ambiguity within the selected class, a selected-path change,
+  or substitution between DEB-payload, qualification-manifest, and live-dpkg
+  provenance;
 - closure preparation rejects host glibc mismatch, either resource limit,
   closure growth, live fallback, or a nonzero unbound count;
+- the second walk must reproduce the selected canonical files and ordered
+  dependency edges, not only the file count;
 - deterministic fixtures reproduce byte-identical manifest, archive, and
   receipt outputs after source mtimes, owners, and enumeration order change;
 - the pair validator rejects different profiler configuration bytes,
@@ -907,9 +978,10 @@ fallback check, callable-to-command connection, closure-to-launch connection,
 at-fork receipt, one category check, graph-replay join, scheduler-shape join,
 finalization-order check, post-run binding check, output bound, and eager or
 preload refusal one at a time. Mutate an omitted transitive dependency, symlink,
-file hash, build ID, archive hash, host glibc mismatch, resource limit, and live
-fallback independently. The focused suite must detect each mutation. Restore
-the tree byte-for-byte after every mutation.
+file hash, build ID, archive hash, host glibc mismatch, resource limit, live
+fallback, source class, selected path, provenance kind, undeclared SONAME, and
+second-walk edge independently. The focused suite must detect each mutation.
+Restore the tree byte-for-byte after every mutation.
 
 ## Hardware stages and gates
 
@@ -970,6 +1042,8 @@ Stop without attribution or optimization when any of these occurs:
   `UNBOUND_COUNT=0` within 64 ELF files and 512 MiB;
 - the closure manifest, archive, receipt, package ownership, symlink chain, or
   deterministic reproduction differs;
+- the closed SONAME map is incomplete, selects another source class or path, is
+  ambiguous within its selected class, or changes a selected edge on replay;
 - the target interpreter or host libc, libm, dynamic loader, libdl, libpthread,
   or librt differs from the sealed identity;
 - a non-six-package dependency resolves outside the sealed closure, or a live

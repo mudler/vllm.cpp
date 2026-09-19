@@ -18,7 +18,8 @@ The developer approved capturing original scores, including extraction after rep
 Use `.agents/specs/strix-qwen3-4b-distributional-calibration.md` as the current diagnostic design.
 Custom vLLM logits processors are unsuitable for the observed V2 runner.
 Use the pinned public raw-logits and trace-replay interfaces, subject to measured production-path equivalence.
-Worker-start profiling implementation belongs to the separately owned performance issue numbered 3076.
+Issue 3076 owns the reusable worker-start profiling mechanism and exact ordinary-production baseline evidence.
+Issue 3077 owns the mode-aware integration and trace evidence for capture-only and replay modes.
 This issue remains open until its diagnostic evidence and ratification proposal land.
 The historical text below predates that source investigation and approval.
 

@@ -28,9 +28,14 @@ Read those complete objects before implementation. They are provenance, not perm
 Current main lacks these harness files. Port only the diagnostic's required public-entry transport and tests.
 Preserve provenance for every adapted function. Do not import the four-engine benchmark or lifecycle campaign as incidental scope.
 
-The separate performance issue numbered 3076 owns worker-start profiling implementation and matched trace evidence.
-This design defines the required evidence interface. It does not implement a profiler or change engine kernels.
-Missing traces prevent equivalence acceptance but do not prevent CPU diagnostic implementation.
+The separate performance issue numbered 3076 owns the reusable worker-start
+profiling mechanism. It also owns ordinary-production baseline evidence when
+every binding in this design matches exactly. `ISSUE-GH-3077` owns the
+mode-aware integration and trace evidence for capture-only, self-replay, and
+common-replay runs.
+The issue-3076 CLI does not accept score-capture or replay mode fields.
+This design does not change the profiler or engine kernels. Missing traces
+prevent equivalence acceptance but do not prevent CPU diagnostic implementation.
 
 ## Immutable inputs
 
@@ -142,7 +147,62 @@ Do not choose a tolerance to make instrumentation pass.
 Because baseline has no score output, prove score immutability separately with the sampler tests and self-replay comparison.
 Never claim baseline score equality from token equality alone.
 
-Require worker-start traces from the separate profiling dependency for all three equivalence arms.
+Trace baseline, capture-only, self-replay, and common-replay for each engine and each c1 and c4 stratum.
+The complete equivalence set therefore contains 16 engine, mode, and concurrency trace strata.
+The separate performance issue numbered 3076 supplies only the reviewed worker-start mechanism and ordinary-production evidence.
+`ISSUE-GH-3077` owns the mode-aware integration and the capture-only, self-replay, and common-replay traces.
+
+Use this public entry for every new mode-aware trace:
+
+```text
+python3 -m tools.bench.strix_score_capture \
+  --manifest <score-manifest.json> \
+  --worker-profile-manifest <profile-manifest.json> \
+  --output <new-directory>
+```
+
+The score manifest selects the engine, mode, and c1 or c4 stratum. The profile
+manifest supplies the immutable profiler identity, configuration, resource
+bounds, and expected process roles from the issue-3076 schema. It contains no
+score-capture or replay mode field. The issue-3077 adapter resolves the
+mode-specific production command, environment, and worker lineage. It passes
+those values to the reusable worker-start launch seam before any worker runtime
+initializes. The seam returns lifecycle receipts, finalized trace artifacts,
+and the identified GPU worker. The adapter must not invoke the issue-3076 CLI
+as if that CLI understood score modes. If the issue-3076 implementation does
+not expose this launch seam, return `PENDING: reusable worker-start seam from issue 3076` before hardware starts.
+
+Reuse issue-3076 baseline evidence only when the engine and c1 or c4 window are
+separately identifiable. All these bindings must match this design exactly:
+
+- the source pins, model revision, tokenizer hash, and model-shard hashes;
+- the binaries, libraries, build IDs, profiler, and configuration bytes;
+- the prompt IDs, request order, token count, and c1 or c4 schedule; and
+- the dtype, graph policy, scheduler shapes, sampling fields, and resource bounds.
+
+The artifacts must also satisfy this design's comparison and completeness
+rules. Otherwise, issue 3077 captures a new baseline through the public entry.
+
+Reuse the issue-3076 worker ownership and wrapper order from commit `74ca0f06`
+under `Selected: one process-tree owner and a worker-owned start wrapper`.
+Reuse that design's `Lifecycle and observation window`, `Artifact schema`, and
+`Completeness rules` without weakening them. Each engine and mode must first
+pass the mode-aware readiness route. Each readiness output has a 10-minute wall
+timeout, a 256 MiB aggregate stop threshold, and a 192 MiB per-file limit.
+
+Write each engine, mode, and concurrency trace to a new output directory. Each
+directory has a 30-minute wall timeout and a 60-second cleanup timeout. It has
+a 1 GiB aggregate trace-output stop threshold. It uses a 768 MiB per-file trace limit.
+Run the two engines for one mode and concurrency sequentially as one pair with
+a 75-minute lease budget. Eight pairs cover the four modes at c1 and c4. A
+pair does not combine its two directory limits. Preserve failed and partial
+artifacts under the issue-3076 failure schema. Publish a passing result only
+after finalization and post-run binding checks succeed.
+
+The 8 GiB score-data bound and these trace-output bounds are independent limits.
+Neither quota includes the other. A larger trace or score bound requires a new
+reviewed design and a capacity check.
+
 Bind trace tool/version/configuration, process lineage, loaded binaries, graph configuration, graph replay events, and complete capture boundaries.
 Record each scheduled request, query length, KV length, active sequences, padded dimensions, dtype, attention backend, and numerical kernel identity.
 Compare the executed model and LM-head graph path. Separate expected capture, copy, top-k, and ID-replay operations from numerical model operations.
@@ -170,7 +230,8 @@ Do not import CUDA, 27B, or quantized-model tolerances. Do not extrapolate this 
 
 Create `tools/bench/strix_score_capture/` with a public CLI, manifest validator, Python adapter, public-header native adapter, and artifact validator.
 Create `tests/tools/test_strix_score_capture.py` for public-entry CPU fixtures.
-Use `python3 -m tools.bench.strix_score_capture --manifest PATH --output UNUSED_DIRECTORY` as the entry point.
+Use `python3 -m tools.bench.strix_score_capture --manifest PATH --output UNUSED_DIRECTORY` for unprofiled CPU fixtures.
+Use the worker-profile-manifest form in `Equivalence before calibration` for hardware trace collection.
 The manifest explicitly selects baseline, capture-only, self-replay, or common-replay mode and binds all identities and limits.
 The result states `DIAGNOSTIC_COMPLETE`, `FAILING`, or a precise `PENDING` dependency. It never emits a correctness pass.
 Do not modify `src/`, `include/`, benchmark acceptance, model pins, or upstream runtime sources in this issue.
@@ -205,5 +266,8 @@ No speed claim, tolerance, or issue closure follows from this design commit.
 
 ## Owed
 
-This row owns diagnostic implementation, independent mutation review, leased equivalence, oracle calibration, and the later ratification proposal.
-The separately owned performance work supplies worker-start trace evidence before equivalence can pass.
+This row owns diagnostic implementation, the mode-aware profile adapter,
+capture and replay trace evidence, independent mutation review, leased
+equivalence, oracle calibration, and the later ratification proposal. The
+separately owned performance work supplies the reusable worker-start mechanism
+and exactly matching ordinary-production baseline evidence.

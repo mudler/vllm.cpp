@@ -103,7 +103,8 @@ it:
 |---|---|
 | vllm.cpp | `6e3cbfb940be89e28d1d71c264fd8c3a4e44afeb` |
 | production vLLM | `e126687a9a828d513c01a07cd69f025f27d63280` |
-| profiler source | `97f5574fe2fdc7bef44fb01545347912ee9f1779` |
+| profiler harness repository | `8952c3c9e7712daf54521e5eb8a5b0a1ee9e1660` |
+| nested rocprofiler SDK source | `97f5574fe2fdc7bef44fb01545347912ee9f1779` |
 | profiler SDK | `1.1` |
 | model | `Qwen/Qwen3-4B` |
 | model revision | `1cfa9a7208912126459214e8b04321603b3df60c` |
@@ -126,14 +127,15 @@ supported rocprofiler spellings from the pinned build and store them in the
 manifest. A missing category, ignored option, or differing resolved
 configuration fails the pair.
 
-The retained SDK 1.1 tool has SHA256
+The retained SDK 1.1 tool binary has SHA256
 `478df9af09b74707652d9d5574ef37151ff1234d09c68843972c1409a505cdd0`.
-The earlier environment recorded its registration library with SHA256
+The earlier environment recorded its registration library binary with SHA256
 `40a5ecd8ca25dc3facb132b730066354812fe82d6889625d43371dbb0655b1ca`
-and build ID `82dd8833b65c17523a3054f6b54da0e7a8831c82`. The implementation
-must rebuild or recover the pinned profiler, verify these identities where the
-same artifact is used, and record any newly built identity without treating it
-as interchangeable with the retained binary.
+and build ID `82dd8833b65c17523a3054f6b54da0e7a8831c82`. These values identify
+built artifacts, not either source commit. The implementation must rebuild or
+recover the pinned SDK binaries, verify these identities where the same
+artifact is used, and record any newly built identity without treating it as
+interchangeable with the retained binary.
 
 ## Source anchors
 
@@ -175,7 +177,7 @@ kernel or fallback ran.
 
 ### Profiler registration and attachment
 
-The retained profiler source has these decisive anchors:
+The retained nested rocprofiler SDK source has these decisive anchors:
 
 - `rocprofiler_register.cpp:335` resolves `rocprofiler_configure` with
   `dlsym(RTLD_DEFAULT, ...)`;
@@ -203,7 +205,7 @@ shared checkout.
 | Evidence | SHA256 | Meaning |
 |---|---|---|
 | `qualification-manifest-12.json` | `4f0b0cbf0e06b7917405edc22bf852a31b037fce19361bde596841afda3c3f10` | pinned workload, model files, runtime, and built identities |
-| `profiler-8952c3c9-source.tar` | `e4b6f98e097356e79848ec8640d980a8699f4ce0c2da36d6d740bfb88cc138a7` | profiler source at `97f5574fe2fdc7bef44fb01545347912ee9f1779` |
+| `profiler-8952c3c9-source.tar` | `e4b6f98e097356e79848ec8640d980a8699f4ce0c2da36d6d740bfb88cc138a7` | profiler-harness repository source at `8952c3c9e7712daf54521e5eb8a5b0a1ee9e1660` |
 | `vllmcpp-6e3cbfb-source.tar` | `df4ab94e5670ff7f7de2fe6427107153616643dbda9996b311398c91cfbb9fda` | vllm.cpp source pin |
 | `oracle-c8d019447-source.tar` | `fa3ca302acb5eda709cfa567dd957411bee6a4a3e00f23632641e6130eb17f35` | retained vLLM oracle harness source |
 | `got-provider-observation.jmEF9j/got-provider.json` | `48a8f328c3f1066464cddb4a64b0bd44a56b947592196e629f3cfc32594e5785` | Torch provider observation, not a trace |
@@ -211,7 +213,13 @@ shared checkout.
 | `vllm-trace06-preserve-07.log` | `dc5c732b9c69fd6d3bf31ace3735f07df673e3665f82aaac2a922c1b853f1d94` | preserved sizes and failure evidence |
 | `vllm-trace06-partial-07.tar` | `fd25b19fbd02fc805e31c25a2ce8f1e21f6e1ad9b6135702d484b82cd4c44afc` | partial diagnostic output, never trace authority |
 
-The retained profiler source files include
+The harness at `8952c3c9e7712daf54521e5eb8a5b0a1ee9e1660` checked out the ROCm
+monorepo and built `projects/rocprofiler-sdk` from nested source pin
+`97f5574fe2fdc7bef44fb01545347912ee9f1779`. Historical build logs record
+that relationship. The archive SHA256 binds the harness archive bytes, not the
+nested SDK source or a built binary.
+
+The separate retained SDK source anchor files include
 `sdk-attachment-source.TktBaK/rocprofiler_register.cpp` with SHA256
 `a54e43b6546c006b635b263012b7d90abbaf18f64d022dff1a8a9adafc255f0e`
 and `sdk-attachment-source.TktBaK/sdk-attach.cpp` with SHA256
@@ -303,9 +311,9 @@ The manifest schema identifier is
 
 - the engine name, complete source revision, source-archive path and SHA256,
   build recipe, executable path, library paths, and expected identities;
-- the profiler revision, SDK version, source archive, executable, libraries,
-  build IDs, configuration bytes and SHA256, resolved categories, and output
-  limits;
+- the profiler harness revision and source archive, nested SDK source revision
+  and version, executable, libraries, build IDs, configuration bytes and
+  SHA256, resolved categories, and output limits;
 - the model repository, revision, dtype, file paths, byte counts, and SHA256
   values;
 - the six prompt byte strings and their hashes, tokenizer identity, sampling

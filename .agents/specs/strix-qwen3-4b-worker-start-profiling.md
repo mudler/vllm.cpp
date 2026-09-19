@@ -238,7 +238,7 @@ shared checkout.
 | `vllm-matched-trace-06.log` | `9140e80cd1934b700b7d982a9d33b931f1a04cd2fd8aa008f795a2e71616938d` | process-start attempt and finalization failure |
 | `vllm-trace06-preserve-07.log` | `dc5c732b9c69fd6d3bf31ace3735f07df673e3665f82aaac2a922c1b853f1d94` | preserved sizes and failure evidence |
 | `vllm-trace06-partial-07.tar` | `fd25b19fbd02fc805e31c25a2ce8f1e21f6e1ad9b6135702d484b82cd4c44afc` | partial diagnostic output, never trace authority |
-| `systemlibs3108.6xsEkD/Packages.gz` | `ca9ce1e681e736592a8dc8a7309a2ef5e0a71b7152da450de4dc672a3ce62e6e` | 61,300-byte package index that binds the two missing package payloads |
+| `systemlibs3108.6xsEkD/Packages.gz` | `ca9ce1e681e736592a8dc8a7309a2ef5e0a71b7152da450de4dc672a3ce62e6e` | 61,300-byte package index that binds the two missing ROCm package payloads |
 
 The harness at `8952c3c9e7712daf54521e5eb8a5b0a1ee9e1660` checked out the ROCm
 monorepo and built `projects/rocprofiler-sdk` from nested source pin
@@ -270,15 +270,18 @@ Three package payloads already exist under
 | `rocprofiler-sdk-rocpd_1.1.0-93~24.04_amd64.deb` | 4,229,746 | `313873a14f76dde8f4ca2aa7fed8eae68240dc6ae446537dd3b363180c38095d` | `rocprofiler-sdk-rocpd`, `1.1.0-93~24.04`, `amd64`, depends on `rocm-core` |
 | `rocprofiler-sdk-roctx_1.1.0-93~24.04_amd64.deb` | 258,610 | `4c45f467341b14fc1e1db3c9dc2475d7e880650df8ec71db46b461d7b12ffb91` | `rocprofiler-sdk-roctx`, `1.1.0-93~24.04`, `amd64`, depends on `rocm-core` and `rocprofiler-register` |
 
-The retained package index binds the two missing dependency payloads:
+The retained package index binds two missing ROCm dependency payloads. The
+Ubuntu Noble security index binds the third acquisition by its exact pool
+filename. The recovery contract does not resolve a floating package version.
 
 | Package | Bytes | SHA256 | Exact repository path |
 |---|---:|---|---|
 | `rocm-core_7.2.4.70204-93~24.04_amd64.deb` | 32,692 | `dfe0d173da998a669921faf08351a01add377cd4d1b471865f921a03484974b6` | `https://repo.radeon.com/rocm/apt/7.2.4/pool/main/r/rocm-core/rocm-core_7.2.4.70204-93~24.04_amd64.deb` |
 | `rocprofiler-register_0.6.0.70204-93~24.04_amd64.deb` | 242,888 | `3b13874e567fa40b6eaf9f8d572d5c9a4ac780eb37496b31565755463a378295` | `https://repo.radeon.com/rocm/apt/7.2.4/pool/main/r/rocprofiler-register/rocprofiler-register_0.6.0.70204-93~24.04_amd64.deb` |
+| `libsqlite3-0_3.45.1-1ubuntu2.8_amd64.deb` | 701,602 | `b1190bb72359f5fcc47406aa46065eaf4f1ca208085c51224a52b04bedc0b4bb` | `https://security.ubuntu.com/ubuntu/pool/main/s/sqlite3/libsqlite3-0_3.45.1-1ubuntu2.8_amd64.deb` |
 
 Before a hardware lease, an authorized network-capable job must fetch those
-two files into a new NAS staging directory. It uses these argument arrays and
+three files into a new NAS staging directory. It uses these argument arrays and
 never uses a shell:
 
 ```text
@@ -289,15 +292,20 @@ never uses a shell:
  "--tlsv1.2", "--output",
  "<stage>/rocprofiler-register_0.6.0.70204-93~24.04_amd64.deb",
  "https://repo.radeon.com/rocm/apt/7.2.4/pool/main/r/rocprofiler-register/rocprofiler-register_0.6.0.70204-93~24.04_amd64.deb"]
+["/usr/bin/curl", "--fail", "--location", "--proto", "=https",
+ "--tlsv1.2", "--output",
+ "<stage>/libsqlite3-0_3.45.1-1ubuntu2.8_amd64.deb",
+ "https://security.ubuntu.com/ubuntu/pool/main/s/sqlite3/libsqlite3-0_3.45.1-1ubuntu2.8_amd64.deb"]
 ```
 
-The job verifies both byte counts and SHA256 values. It then atomically moves
-the two files and a hash receipt into `systemlibs3108.6xsEkD/`. Until that
+The job verifies all three byte counts and SHA256 values. It then atomically
+moves the three files and one hash receipt into `systemlibs3108.6xsEkD/`. The
+receipt binds every acquired filename, byte count, and SHA256 value. Until that
 receipt exists, profiler recovery is `PENDING` and no readiness lease starts.
 This is the only network acquisition in the recovery contract.
 
 For every run, create `<run>/sdk-root` under a fresh `/tmp` directory. Verify
-all five package files. For each package, run
+all six package files. For each package, run
 `["/usr/bin/dpkg-deb", "-f", "<package>", "Package", "Version",
 "Architecture", "Depends"]` and compare the exact fields earlier in this
 section. Extract each package with
@@ -313,6 +321,32 @@ The extracted prefix must contain these identities:
 | `opt/rocm-7.2.4/lib/rocprofiler-sdk/librocprofiler-sdk-tool.so.1.1.0` | 5,435,848 | `478df9af09b74707652d9d5574ef37151ff1234d09c68843972c1409a505cdd0` | `0ca5ba0e4c583fcb8a8a2beb5698038cf3aff0e1` |
 | `opt/rocm-7.2.4/lib/librocprofiler-sdk-rocpd.so.1.1.0` | 493,128 | `000b898ef15ef5a5de6f4c61f11064e817883a02ddaa5610223fa394ff15cca0` | `c90598ff578bfcecba55e40d4e6291408d92843a` |
 | `opt/rocm-7.2.4/lib/librocprofiler-sdk-roctx.so.1.1.0` | 456,232 | `1d99a44a8c24370dbbabbc1b68b6b9606db53c5662dffc2dac31948a377b0ca9` | `626cd91b7d6cacc633cb874faae0edda01eb967d` |
+| `usr/lib/x86_64-linux-gnu/libsqlite3.so.0.8.6` | 1,468,440 | `85265a9d4afca6f4b325ceb078b669c754fb881abed4cafe91ccebe9d625d975` | `5701975a7ab1644d59e6b20df0257e183eafa78e` |
+
+`libsqlite3-0` has version `3.45.1-1ubuntu2.8`, architecture `amd64`, and
+dependency `libc6 (>= 2.38)`. Its shared object has SONAME
+`libsqlite3.so.0`. The relative symlink
+`usr/lib/x86_64-linux-gnu/libsqlite3.so.0` must target
+`libsqlite3.so.0.8.6`.
+
+The SQLite shared object has two `DT_NEEDED` entries: `libm.so.6` and
+`libc.so.6`. The retained qualification manifest already permits and binds
+these base-runtime files. It binds `/lib/x86_64-linux-gnu/libm.so.6` to
+SHA256 `e9c4b28d340e415b8137480ec442662f981e1399386c5931dae0e886e3639e91`.
+It binds `/lib/x86_64-linux-gnu/libc.so.6` to SHA256
+`8db37cf3f2169f59a0f07ef1fea308c35656668c64c8ff294e1860f4121eb161`.
+The SQLite package adds no unbound dependency.
+
+The 19 September 2026 CPU inspection extracted all six packages into one local
+prefix. `ldd` on the tool resolved `libsqlite3.so.0` from that prefix and
+reported no missing dependency. The inspection supplied the other ROCm
+dependencies from base-runtime files already bound by the qualification
+manifest. A Python process imported no engine or GPU runtime module, then
+loaded the SDK and tool with `ctypes.CDLL` and `RTLD_GLOBAL`. The command exited
+zero after printing `CDLL_LOAD_OK`. It also reported that the local CPU host
+lacked Kernel Fusion Driver (KFD) topology nodes. This inspection proves
+package and loader closure only. It does not prove profiler initialization,
+GPU access, or hardware readiness.
 
 Read each ELF `DT_NEEDED` entry recursively with the dynamic loader search
 roots that the manifest permits. Record the resolved canonical path, byte
@@ -332,7 +366,7 @@ for the other. The recovered package set becomes one new pinned profiler
 identity only after dependency closure and readiness pass. Both trace arms
 must use that same identity.
 
-After a host reboot, reconstruct the profiler only from this five-package set.
+After a host reboot, reconstruct the profiler only from this six-package set.
 Recover the engines from their verified archives and the pinned model cache on
 NAS. Use a fresh worker-local directory under `/tmp` and a project virtual
 environment under `/workspace`. Copy only finalized, bounded evidence back to

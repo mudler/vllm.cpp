@@ -339,6 +339,217 @@ Its `model.safetensors` is 1,999,811,208 bytes, SHA-256
 `3d4ef8d71c14db7e448a09ebe891cfb6bf32c57a9b44499ae0d1c098e48516b6`.
 The regression resolves this pinned snapshot through the local HuggingFace cache.
 
+## Run zero-shot NER and structured extraction (GLiNER2.5)
+
+GLiNER2.5 (`fastino/gliner2.5-multi-v1`, architecture `BoundaryExtractor`)
+is a zero-shot named-entity-recognition model. It extracts spans for
+entity types you supply at inference time — there are no fixed labels
+baked into the checkpoint. It is not a generation model; it has no
+vocabulary head and never produces tokens. A forward pass runs the
+DeBERTa v2 encoder with disentangled attention, a GLiNER2 boundary head,
+and a candidate decoder, and the result is a list of entity spans.
+
+Point the server at a GLiNER2.5 checkpoint directory:
+
+```sh
+build/examples/vllm-server \
+  --model /path/to/gliner2.5-multi-v1 \
+  --port 8000
+```
+
+The model loads from a Hugging Face directory that contains `config.json`,
+`model.safetensors`, `tokenizer.json`, and `tokenizer_config.json`. The
+checkpoint is F32: every encoder and head weight is 32-bit float.
+
+### NER endpoint
+
+`POST /v1/ner` runs one NER pass. The request body carries the text, the
+entity labels, and optional tuning parameters:
+
+```sh
+curl http://localhost:8000/v1/ner \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "text": "Tim Cook is the CEO of Apple Inc., based in Cupertino.",
+    "labels": ["person", "organization", "location"],
+    "threshold": 0.5,
+    "max_width": 12
+  }'
+```
+
+`labels` is the list of entity types to find. `threshold` (default 0.5)
+is the minimum sigmoid probability to keep a span. `max_width` (default
+12) is the maximum span width in tokens. The response is an array of
+entities, each with `label`, `text`, `char_start`, `char_end`, and
+`confidence`:
+
+```json
+{
+  "entities": [
+    {"label": "person", "text": "Tim Cook",
+     "char_start": 0, "char_end": 8, "confidence": 0.99},
+    {"label": "organization", "text": "Apple Inc.",
+     "char_start": 27, "char_end": 36, "confidence": 0.98},
+    {"label": "location", "text": "Cupertino",
+     "char_start": 49, "char_end": 58, "confidence": 0.95}
+  ]
+}
+```
+
+Character offsets are into the original input text; `char_start` is
+inclusive, `char_end` is exclusive, so `text[char_start:char_end]` is the
+entity surface.
+
+### SystemOne API (kev-compatible structured extraction)
+
+The server also exposes the structured-extraction API from the
+[kev](https://github.com/jaredpalmer/kev) project. Three question types
+are supported:
+
+- **noul** — binary entity presence. Runs NER with the question's
+  instruction text as the label. Returns `noul` (a float 0 to 1, the
+  max entity confidence) and the matched `entities`.
+- **choice** — pick one option. Runs NER with each option's rendered text
+  as a label. Returns `choice` (the argmax option), `probabilities` (a
+  map of option to confidence), and `confidence` (the normalized margin).
+- **score** — pick one level. Runs NER with each level description as a
+  label. Returns `score` (a weighted average of level positions),
+  `legend` (level to probability), `probabilities`, and `confidence`.
+
+`POST /v1/systemone` answers all questions in one request:
+
+```sh
+curl http://localhost:8000/v1/systemone \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "state": "Tim Cook is the CEO of Apple Inc., based in Cupertino.",
+    "questions": {
+      "q1": {
+        "type": "noul",
+        "instructions": "person"
+      },
+      "q2": {
+        "type": "choice",
+        "criteria": {
+          "apple": "the company Apple Inc.",
+          "google": "the company Google LLC"
+        }
+      },
+      "q3": {
+        "type": "score",
+        "criteria": [
+          "no people mentioned",
+          "one person mentioned",
+          "multiple people mentioned"
+        ]
+      }
+    }
+  }'
+```
+
+`state` is the text to extract from. A non-string value is rendered to
+its JSON representation before NER runs. Each question's `instructions`
+(or `instr`, a backward-compatible alias) field is the label for `noul`
+questions. For `choice` questions, `criteria` is a map of option name to
+description; each `name: description` pair is a NER label. For `score`
+questions, `criteria` is an array of level descriptions, each a NER
+label. The response carries one answer per question:
+
+```json
+{
+  "model": "gliner2.5-multi-v1",
+  "answers": {
+    "q1": {
+      "type": "noul",
+      "noul": 0.99,
+      "entities": [{"label": "person", "text": "Tim Cook",
+        "char_start": 0, "char_end": 8, "confidence": 0.99}]
+    },
+    "q2": {
+      "type": "choice",
+      "choice": "apple",
+      "probabilities": {"apple": 0.98, "google": 0.0},
+      "confidence": 0.98
+    },
+    "q3": {
+      "type": "score",
+      "score": 1.0,
+      "legend": {"0": 0.0, "1": 0.99, "2": 0.0},
+      "probabilities": {"0": 0.0, "1": 0.99, "2": 0.0},
+      "confidence": 0.99
+    }
+  },
+  "usage": {"input_tokens": 15, "output_tokens": 0},
+  "latency_ms": 42.5
+}
+```
+
+Two companion endpoints exist:
+
+- `POST /v1/systemone/permute` — re-runs one `choice` question under
+  `n_perm` randomly shuffled option orders and reports whether the argmax
+  is stable. The request body wraps a `SystemOneRequest` in `request` and
+  names the question to permute in `question`. Returns per-order
+  `probabilities`, `argmax_stable` (boolean), and `spread` (max minus
+  min of the winning option's probability across orders).
+
+- `POST /v1/systemone/separate` — answers each question in its own NER
+  pass (N passes for N questions) against the same state. Returns the
+  same `SystemOneResponse` shape, with summed `input_tokens` across all
+  passes.
+
+`GET /v1/models` lists loaded models and works with any model type.
+
+### CLI example
+
+`build/examples/gliner-cli` is a thin client of the C ABI that loads a
+checkpoint and runs one NER query:
+
+```sh
+build/examples/gliner-cli \
+  /path/to/gliner2.5-multi-v1 \
+  "Tim Cook is the CEO of Apple Inc." \
+  person organization location \
+  --threshold 0.5
+```
+
+### Through the C ABI (v27)
+
+`vllm_gliner_ner` (ABI v27) runs the full NER pipeline on an engine
+loaded from a GLiNER2.5 checkpoint. `vllm_ner_result_free` releases the
+library-allocated entities and strings:
+
+```c
+#include "vllm.h"
+
+vllm_model_params model = vllm_model_params_default();
+model.model_path = "/path/to/gliner2.5-multi-v1";
+
+vllm_engine *engine = NULL;
+if (vllm_engine_load(&model, &engine) != VLLM_OK) {
+    fprintf(stderr, "%s\n", vllm_last_error());
+    return 1;
+}
+
+const char *labels[] = {"person", "organization", "location"};
+vllm_ner_result result;
+if (vllm_gliner_ner(engine, "Tim Cook is the CEO of Apple Inc.",
+                    labels, 3, 0.5f, 12, &result) == VLLM_OK) {
+    for (int32_t i = 0; i < result.n_entities; i++) {
+        vllm_ner_entity *e = &result.entities[i];
+        printf("%s: \"%s\" [%d,%d] conf=%.3f\n",
+               e->label, e->text, e->char_start, e->char_end, e->confidence);
+    }
+    vllm_ner_result_free(&result);
+}
+vllm_engine_free(engine);
+```
+
+`vllm_gliner_ner` refuses a non-GLiNER2 engine by name with
+`VLLM_ERR_INVALID_ARGUMENT`. The `labels` array and each entity's
+`label`/`text` strings are library-allocated; free the whole result with
+`vllm_ner_result_free`, not individually.
+
 ## Disabling a model's sliding window
 
 Gemma-2, Gemma-3, Gemma-4, OLMo-2 and Muse-Glimmer apply a model-level sliding

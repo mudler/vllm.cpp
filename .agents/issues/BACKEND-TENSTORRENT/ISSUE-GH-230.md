@@ -1,6 +1,6 @@
 ID: ISSUE-GH-230
 Title: `test_agent_record.py`: 7 issue-intake tests never run, and error when they do
-Row: -
+Row: BACKEND-TENSTORRENT
 State: UNKNOWN
 Kind: bug
 GitHub: 230

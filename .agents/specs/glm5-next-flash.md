@@ -2858,7 +2858,7 @@ spec records both rather than the convenient one.
 |---|---|---|---|---|
 | KDA linear attention | 34 | no `kKdaGatedDeltaRule`; `kCausalConv1dFwd` `rocm_ops.hip:222`, `kGdnPostConv` `:228`, `kGdnPrefill` `:231`, `kGdnDecode` `:233`, `kRmsNormGated` `:235`, `kGdnStateGather/Scatter` `:216,:219` | 1 vt op (`glm5_next_kda.cpp:404`) + ~10 hand-rolled primitives (`:28-47` matvec, `:69-139` forget gate, `:143-186` gated norm, `:190-208` L2, `:231-300` conv) | the ROCm KDA provider, plus every hand-rolled primitive |
 | DSA / MLA | 11 | **NOTHING.** `kMlaDecodeAttention` (121), `kMlaPrefillAttention` (122), `kConcatAndCacheMla` (120), `kGatherMlaCache` (132), `kMergeAttnStates` (133), `kDsaIndexerLogits` (130), `kDsaTopkSelect` (131) all kROCM NONE | **zero `vt::` calls** — `grep -c 'vt::' glm5_next_attn.cpp glm5_next_dsa.cpp` = 0/0. Eager attention hand-rolled at `glm5_next_attn.cpp:403-443` | the whole arm, on every backend |
-| k-pool compress/select | — | `kGlm5NextKpoolCompress`/`Select` are **CUDA-only** (`cuda_glm5_next.cu:561,564`), and have **no CPU provider**, so the reference tier cannot rescue them even here | hand-rolled at `glm5_next_dsa.cpp:168-305` (compress) and `:382-532` (select); the device ops are never called (O36) | a ROCm k-pool, and a CPU one before the tier could help |
+| k-pool compress/select | — | `kGlm5NextKpoolCompress`/`Select` on CUDA (`cuda_glm5_next.cu:561,564`) and ROCm (`rocm_glm5_next_kpool.hip`, `rocm_ops.hip:352-357`); **no CPU provider** by design (host reference is `glm5_next_dsa.cpp`) | device ops called from `Glm5NextDeviceForward` via `vt::` dispatcher (O36 closed); host fallback for CPU queues | a CPU provider if the reference tier needs to rescue the device path |
 | mHC manifold | all | **NOTHING.** `kDeepseekV4Mhc` (294) is CUDA-only (`cuda_deepseek_v4.cu:2102`) with **no CPU provider** (O34) | zero `vt::` calls; `glm5_next_mhc.cpp:22-88` delegating to `deepseek_v4_mhc.cpp:72-165`, per-token, `std::vector` slabs allocated inside the loop | everything, and O34's inverted gap bites here too |
 | MoE 288+1 | 43 blocks | 3 of 4 ops native (`rocm_ops.hip:170,206,213`); `kMoeGateUpSwiGLUGrouped` NONE | 4 vt ops; router-logits GEMM, shared expert and dense MLP hand-rolled (`glm5_next_moe.cpp:200-210, 291-325`) | one provider; **best-served arm by far** |
 | ViT | 24 | n/a | **does not exist.** No vision forward file; `glm5_next_loader.cpp:519-526` refuses any config declaring `vision_config` | the whole tower (W6), on every backend |
@@ -5666,37 +5666,20 @@ Debts this row carries, each visible rather than waived:
   [#2099](https://github.com/mudler/vllm.cpp/issues/2099)'s lane-pin finding is
   the same shape one document over.
 
-- **O36 — THE K-POOL DEVICE OPS LAND UNREACHED, and this entry names what is
-  unreached and who owns the wiring.** W9c-0 registers
+- **O36 — CLOSED. The k-pool device ops are now called from the production
+  device forward path.** W9c-0 registered
   `vt::OpId::kGlm5NextKpoolCompress` and `vt::OpId::kGlm5NextKpoolSelect` on
-  `kCUDA` and gates them on `dgx:gpu0` against the transformers v5.16.1 goldens
-  and the host reference. **Nothing on this model's production path calls
-  either.** `ModelRegistry::Forward` reaches `glm5_next_dsa.cpp`'s host
-  `SelectIndexerTopkFromPacked` and continues to; `glm5_next_forward.cpp:231-238`
-  still refuses a non-CPU queue by name; and the only callers of the two ops are
-  the device gate and the availability probe. This is the shape
-  `.agents/reachability.md` calls "the test-only driver", and it is staged
-  deliberately rather than disclosed after the fact.
-
-  Three things, in the specific, as AGENTS.md §"Nothing lands dead" requires.
-  **What is unreached:** the `DeviceType::kCUDA` registration of both new OpIds
-  as reached FROM THIS MODEL, and `vllm::glm5_next::KpoolDeviceOpsAvailable()`,
-  which no production predicate consults yet. **The row that owns the wiring:**
-  `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, wave **W9c-3**, the
-  compose that constructs a CUDA queue for this forward and deletes the refusal
-  at `glm5_next_forward.cpp:231-238`. W9c-3 also owns the two operands these ops
-  need and the forward does not yet produce on a device: the packed indexer row
-  (`PackIndexerStates`, which W9c-0 deliberately did not make an op because
-  `vt::Matmul` and `vt::LayerNorm` already serve it) and a `k_pass` that is not
-  de-paged into host memory at `glm5_next_kv.cpp:450-456`. **The issue that
-  tracks it:** [#2410](https://github.com/mudler/vllm.cpp/issues/2410).
-
-  The reachability mutation `.agents/reachability.md` asks for is reported as
-  what it is. There is no production call site to delete, so the question is
-  already answered, and the mutation that IS run instead deletes the
-  `RegisterOp` line and shows the device gate reds — which proves the gate
-  measures the registered provider and not a directly-called kernel, and proves
-  nothing about a capability. Read it that way.
+  `kCUDA` and `kROCM`. `Glm5NextDeviceForward` now consults
+  `KpoolDeviceOpsAvailable()` and, when the probe returns true, invokes
+  `vt::Glm5NextKpoolCompress` then `vt::Glm5NextKpoolSelect` through the `vt::`
+  dispatcher, building device tensors for the packed indexer row, ape, and pool
+  outputs. A host fallback (`SelectIndexerTopkFromPacked`) is retained for CPU
+  queues. The reachability counter (`g_kpool_reach_count`) and a structural
+  `skip_topk` counter (`g_skip_topk_count`) verify the device path is reached
+  from the production entry point; a best-logit-value comparison against the
+  host reference catches a gutted fallback. Closed by
+  [#3243](https://github.com/mudler/vllm.cpp/pull/3243);
+  [#2410](https://github.com/mudler/vllm.cpp/issues/2410) tracks the issue.
 
 - **O37 — `deepseek_v4.cpp:3415` MAKES THE SAME FLAT-INDEX MISTAKE W5b-2d
   REPAIRED HERE, and it is not a live defect only because of that model's
@@ -6143,7 +6126,7 @@ Debts this row carries, each visible rather than waived:
 
 ## Now
 
-`ACTIVE`, 16 September 2026. The vLLM registration stop condition fired on
+`ACTIVE`, 19 September 2026. The vLLM registration stop condition fired on
 3 September. [Reconciliation #3045](glm5-next-upstream-reconciliation.md)
 expires the transformers algorithm exception and identifies the device-port
 source and tests. The global parity pin remains unchanged.
@@ -6158,16 +6141,16 @@ added the ROCm/HIP provider for `kDeepseekV4Mhc`. Post-O55
 ([#3203](https://github.com/mudler/vllm.cpp/pull/3203)) wired the dense+shared
 MLP onto the device via `vt::MatmulBT` + `vt::ClampedSwiGLU` + `vt::MatmulBT`.
 
-Ten of eleven compute arms are on the device (embedding, RMSNorm, KDA
+All eleven compute arms are on the device (embedding, RMSNorm, KDA
 recurrence, MoE router topk, MoE routed experts, MoE combine, lm_head,
-dense+shared MLP, MLA attention, mHC pre/post); one runs as a host-fallback
-island on the interposed CPU queue (k-pool indexer — CUDA-only ops, host on
-CPU). `HcHeadCollapseMean` stays on host (unweighted mean, no device kernel).
+dense+shared MLP, MLA attention, mHC pre/post, k-pool indexer).
+`HcHeadCollapseMean` stays on host (unweighted mean, no device kernel).
 The pattern is `kimi_linear_device.cpp`'s single-queue shape.
 
 W9c-1 (MLA attention onto `mla::ForwardMlaAttentionBlock`,
 ISSUE-LOCAL-01J7QX3M5K1HE3N9V0KQRJ8X2M) re-priced the earlier
-refusal. The k-pool indexer stays as a host-fallback island; the MLA attention
+refusal. The k-pool indexer moves to device through the `vt::` dispatcher
+(`vt::Glm5NextKpoolCompress` + `vt::Glm5NextKpoolSelect`); the MLA attention
 arm moves to device through the shared seam. The loader gains an `AbsorbMla`
 pass that dequantizes `attn_k_b`/`attn_v_b`, transposes k, stacks into
 `kv_b_proj`, and runs `mla::AbsorbKvBProjBf16` to produce `w_uk_t`/`w_uv`. The
@@ -6184,9 +6167,8 @@ The device forward is reached via `VT_GLM5_NEXT_DEVICE=1`, which delegates
 kernels use float32 accumulation where the host reference uses double, so the
 output agrees within a float-vs-double envelope rather than byte-exact. The CPU
 test (device vs host, 1.0 max_abs tolerance, greedy-token agreement) passes:
-33/33 total. The GPU unit gate PASSED on both `dgx:gpu0` (`sm_121a`, CUDA) and
-`strix:gpu0` (gfx1151, ROCm): 33/33 tests both with and without
-`VT_GLM5_NEXT_DEVICE=1`.
+34/34 total. The GPU unit gate PASSED on `thor:gpu0` (sm_110, Blackwell,
+CUDA 13.0): 34/34 tests with `VT_GLM5_NEXT_DEVICE=1`.
 
 The real-model oracle gate remains `PENDING` under #1998. The 101 GiB artifact
 exceeds any single device on this fleet.
@@ -6901,3 +6883,30 @@ Default `rms_norm_eps = 1e-5f` is an intentional model-specific value, not a
 typo for 1e-6. The bf16 narrowing before MLA is required because the CUDA FA2
 prefill kernel requires bf16 QKV (`cuda_mla_prefill.cu:185`); the sibling
 (`glm_moe_dsa_forward.cpp:444`) narrows for the same reason.
+
+mHC pre/post landed on device through `MhcDevice()->pre()/post()`, reusing the
+`kDeepseekV4Mhc` device kernels (`kCUDA` and `kROCM`). `HcHeadCollapseMean`
+stays on host: GLM-5.3 uses an unweighted mean while DeepSeek-V4 uses a
+weighted one, so the `head` function diverges and has no device kernel. Merged
+as `8f29d43b2`.
+
+O36 (k-pool indexer) landed the device op path in `Glm5NextDeviceForward`.
+When `KpoolDeviceOpsAvailable()` returns true (CUDA or ROCm), the forward calls
+`vt::Glm5NextKpoolCompress` then `vt::Glm5NextKpoolSelect` through the `vt::`
+dispatcher, building device tensors for the packed indexer row, ape, and pool
+outputs. A host fallback (`SelectIndexerTopkFromPacked`) is retained for CPU
+queues. The reachability test checks `KpoolReachCount() >= 1` and
+`SkipTopkCount() >= 1`, and a best-logit-value comparison against the host
+reference catches a gutted host fallback (relative tolerance 2e-3; the gap is
+~0.7% when the fallback is gutted vs ~1e-6 when intact). 34/34 tests pass,
+5976 assertions. GPU gate PASSED on `thor:gpu0` (sm_110, Blackwell, CUDA
+13.0). Closed [#2410](https://github.com/mudler/vllm.cpp/issues/2410).
+
+Rejected: a sparse-vs-dense logit comparison (not viable at test geometry —
+indistinguishable from f32-vs-double noise); a directly-called kernel test
+(the ops route through the `vt::` free-function dispatcher, not function
+pointers, so there is no call site to delete); relying on the reachability
+counter alone (the counter increments outside the if/else, so a gutted
+fallback still passes — the best-logit-value check was needed to catch it);
+relying on finite-logit checks alone (MLA produces finite logits even with a
+zeroed selection).

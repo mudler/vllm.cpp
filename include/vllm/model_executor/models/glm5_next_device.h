@@ -35,6 +35,22 @@ struct LayerCache;
 // select op reads, so half a family is not a usable half of the capability.
 bool KpoolDeviceOpsAvailable();
 
+// Reachability instrumentation for the k-pool indexer wiring (O36). The device
+// forward increments a thread-local counter each time it runs the k-pool indexer
+// (device ops or host fallback) on an MLA layer. A test resets the counter,
+// calls `Glm5NextDeviceForward`, and checks it is non-zero. Before the wiring
+// the counter stays zero — the indexer is unreached.
+void ResetKpoolReachCount();
+size_t KpoolReachCount();
+
+// Reachability instrumentation for the MLA `skip_topk` flag (O36). The device
+// forward increments a thread-local counter each time it sets `skip_topk = true`
+// on an MLA block, so a mutation that clears the flag leaves the counter at zero
+// and a test catches it. The dense-equivalent fixture cannot catch the mutation
+// behaviorally, so the counter is structural.
+void ResetSkipTopkCount();
+size_t SkipTopkCount();
+
 // W9c-3 — the device-resident compose forward. Mirrors `Glm5NextHostForward`'s
 // signature but routes the nine device-capable arms through `vt::*` device ops
 // on the queue, with MLA attention and mHC sites as host-fallback islands (the

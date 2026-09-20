@@ -1848,3 +1848,120 @@ TEST_CASE("glm5_next W9c-3 device: the device forward matches the host reference
     CHECK(best_dev == best_host);
   }
 }
+
+// O36 reachability: the k-pool indexer must be reached from the production
+// device forward. Before the wiring (spec W9c-3 arm #7) the MLA arm runs dense
+// attention and the indexer is never called, so the counter stays zero. After
+// the wiring the device forward runs the k-pool indexer (device ops when
+// KpoolDeviceOpsAvailable, host fallback otherwise) per MLA layer and the
+// counter is non-zero.
+//
+// The reachability counter alone is not enough: it increments outside the
+// device/host if-else (glm5_next_device.cpp:582), so gutting the host fallback
+// body (the SelectIndexerTopkFromPacked call at :561-580) still increments it,
+// and MLA produces finite logits even with zeroed selection. The argmax is also
+// not enough: with V=32 one token dominates and the greedy choice is the same
+// whether the MLA attention is correct or zeroed. But a gutted fallback zeroes
+// sel_idx/sel_cnt entirely, the MLA block gets valid_counts=0, its attention
+// output is zero, and the best logit VALUE diverges from the host reference
+// (which runs the indexer through a separate code path, glm5_next_attn.cpp:382)
+// by ~0.7%. When the fallback is intact the majority of rows agree to within
+// f32-vs-double noise (~1e-6). On CPU the test requires at least one row's best
+// logit to agree within 0.2%; on CUDA/ROCm the device k-pool ops run (not the
+// host fallback) so the gutting mutation is invisible and the check is skipped.
+TEST_CASE("glm5_next W9c-3 device: the k-pool indexer is reached from the "
+         "production device forward (O36)") {
+  TempFile f(BuildFixture());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(g);
+  REQUIRE(model != nullptr);
+  const vllm::Glm5NextWeights& w = Weights(model);
+
+  // 17 tokens: T > kIdxTopk (8) so SparseStepEligibilityOf is active.
+  const std::vector<int32_t> ids{3, 11, 7, 20, 5, 14, 2, 9, 6,
+                                  1, 18, 4, 15, 8, 10, 13, 0};
+
+  const bool cuda_here =
+      vt::TryGetBackend(vt::Device{vt::DeviceType::kCUDA, 0}) != nullptr;
+  const bool rocm_here =
+      vt::TryGetBackend(vt::Device{vt::DeviceType::kROCM, 0}) != nullptr;
+  const vt::DeviceType dev_type = cuda_here   ? vt::DeviceType::kCUDA
+                                  : rocm_here ? vt::DeviceType::kROCM
+                                              : vt::DeviceType::kCPU;
+  vt::Queue dev_q{vt::Device{dev_type, 0}, nullptr};
+
+  gn::ResetKpoolReachCount();
+  gn::ResetSkipTopkCount();
+  const std::vector<float> dev =
+      gn::Glm5NextDeviceForward(w, ids, {}, dev_q, nullptr);
+
+  // Host reference runs the indexer through a separate code path
+  // (glm5_next_attn.cpp:382), so a gutted device fallback diverges.
+  vt::Queue cpu_q{vt::Device{vt::DeviceType::kCPU, 0}, nullptr};
+  const std::vector<float> host =
+      gn::Glm5NextHostForward(w, ids, {}, cpu_q, nullptr);
+
+  // The fixture has one DSA/MLA backbone layer (block 2; block 4 is the MTP
+  // block the loader drops). After wiring, the k-pool indexer runs on that
+  // layer, so the counter must be >= 1. Before wiring it stays 0.
+  CHECK(gn::KpoolReachCount() >= 1);
+
+  // skip_topk=true must be set: it tells the MLA block to reuse the shared
+  // sparse selection. If mutated to false, the counter stays 0 and the MLA
+  // block runs dense attention silently.
+  CHECK(gn::SkipTopkCount() >= 1);
+
+  // The forward must still produce finite logits — the wiring must not break
+  // the dense path.
+  CHECK(!dev.empty());
+  for (size_t k = 0; k < dev.size(); ++k) {
+    if (!std::isfinite(dev[k])) {
+      CHECK(false);
+      break;
+    }
+  }
+
+  // The greedy token (argmax) must agree between device and host reference.
+  const int64_t V = static_cast<int64_t>(kVocab);
+  const int64_t rows = static_cast<int64_t>(host.size()) / V;
+  REQUIRE(rows * V == static_cast<int64_t>(host.size()));
+  REQUIRE(dev.size() == host.size());
+  for (int64_t r = 0; r < rows; ++r) {
+    int32_t best_dev = 0, best_host = 0;
+    for (int64_t o = 1; o < V; ++o) {
+      const size_t idx = static_cast<size_t>(r * V + o);
+      if (dev[idx] > dev[static_cast<size_t>(r * V + best_dev)]) best_dev = static_cast<int32_t>(o);
+      if (host[idx] > host[static_cast<size_t>(r * V + best_host)]) best_host = static_cast<int32_t>(o);
+    }
+    CHECK(best_dev == best_host);
+  }
+
+  // On CPU the host fallback (SelectIndexerTopkFromPacked) runs. A gutted
+  // fallback body zeroes sel_idx/sel_cnt, the MLA block gets valid_counts=0
+  // for every token, its attention output is zero, and every row's best
+  // logit diverges from the host reference by ~0.7%. When the fallback is
+  // intact the majority of rows (past the first few causal-only tokens)
+  // agree to within f32-vs-double noise (~1e-6). Require at least one row's
+  // best logit to agree within 0.2% — this catches a gutted fallback while
+  // tolerating the inherent device-vs-host accumulation difference on early
+  // tokens. On CUDA/ROCm the device k-pool ops run (not the host fallback),
+  // so the gutting mutation is invisible and the check is skipped.
+  if (dev_type == vt::DeviceType::kCPU) {
+    bool any_close = false;
+    for (int64_t r = 0; r < rows && !any_close; ++r) {
+      float best_dev_val = dev[static_cast<size_t>(r * V)];
+      float best_host_val = host[static_cast<size_t>(r * V)];
+      for (int64_t o = 1; o < V; ++o) {
+        const size_t idx = static_cast<size_t>(r * V + o);
+        if (dev[idx] > best_dev_val) best_dev_val = dev[idx];
+        if (host[idx] > best_host_val) best_host_val = host[idx];
+      }
+      const double rel =
+          std::fabs(static_cast<double>(best_dev_val) -
+                    static_cast<double>(best_host_val)) /
+          std::max(std::fabs(static_cast<double>(best_host_val)), 1.0);
+      if (rel < 2e-3) any_close = true;
+    }
+    CHECK(any_close);
+  }
+}

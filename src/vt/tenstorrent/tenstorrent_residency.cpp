@@ -463,10 +463,120 @@ ttnn::Tensor EnsureWeightViewDevice(const Tensor& t, MeshDevice& device) {
 // interior views get the persistent shadow instead of the per-call anonymous
 // staging.
 ttnn::Tensor EnsureMatmulWeightDevice(const Tensor& b, MeshDevice& device) {
+  if (Bfp8WeightsEnabled()) return EnsureBfp8WeightDevice(b, device);
   if (b.dtype == DType::kBF16 && !IsTrackedBase2D(b))
     return EnsureWeightViewDevice(b, device);
   return EnsureDevice2D(b, device);
 }
+
+// ---- BFP8 weight residency ----------------------------------------------
+// spec .agents/specs/tenstorrent-bfp-weight-residency.md. DEFAULT OFF
+// (VT_TT_BFP8_WEIGHTS=0 / unset leaves the byte-identical bf16 staging path —
+// the inertness gate pins that). When on, a bf16 matmul weight uploads once in
+// bf16, is TYPECAST on device to BFLOAT8_B (BFP8: 1 sign + 7 shared-group
+// mantissa bits per element, one 8-bit exponent per 16-element group —
+// tt_metal/impl/data_format/blockfloat_common.cpp `convert_bfp_to_u32`,
+// Bfp8_b arm), and the bf16 staging is dropped: exactly the expand-bf16
+// conversion shape, no second full-precision device copy. The native
+// ttnn::matmul consumes it (bf16 activation x bfloat8_b weight is a supported
+// operand pair — ttnn/operations/matmul/matmul.cpp:521-532).
+
+std::atomic<uint64_t> g_bfp8_resident{0};
+std::atomic<uint64_t> g_bfp8_uses{0};
+std::atomic<uint64_t> g_bfp8_refusals{0};
+std::mutex& Bfp8RefusalMutex() {
+  static std::mutex m;
+  return m;
+}
+std::string& Bfp8RefusalMsg() {
+  static std::string* s = new std::string();  // never destroyed (#1486)
+  return *s;
+}
+
+bool Bfp8WeightsEnabled() {
+  const char* e = std::getenv("VT_TT_BFP8_WEIGHTS");
+  return e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0;
+}
+uint64_t Bfp8ResidentWeights() { return g_bfp8_resident.load(std::memory_order_relaxed); }
+uint64_t Bfp8MatmulUses() { return g_bfp8_uses.load(std::memory_order_relaxed); }
+uint64_t Bfp8Refusals() { return g_bfp8_refusals.load(std::memory_order_relaxed); }
+void Bfp8MatmulUse() { g_bfp8_uses.fetch_add(1, std::memory_order_relaxed); }
+const char* Bfp8LastRefusal() {
+  std::lock_guard<std::mutex> g(Bfp8RefusalMutex());
+  return Bfp8RefusalMsg().c_str();
+}
+void NoteBfp8Refusal(std::string reason) {
+  g_bfp8_refusals.fetch_add(1, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> g(Bfp8RefusalMutex());
+  Bfp8RefusalMsg() = std::move(reason);
+}
+
+// Keyed by the weight's host base pointer — the EnsureWeightViewShadow
+// persistent-shadow pattern. An interior view carries its own pointer, so a
+// differently-offset view stages its own BFP8 tensor and never consumes
+// another slice's bytes (the Qwen3.5 BA interior-view fatality).
+struct Bfp8WeightShadow {
+  std::optional<ttnn::Tensor> device;
+  uint32_t rows = 0, cols = 0;
+};
+std::mutex& Bfp8WeightMutex() {
+  static std::mutex m;
+  return m;
+}
+std::map<uintptr_t, Bfp8WeightShadow>& Bfp8WeightShadows() {
+  static std::map<uintptr_t, Bfp8WeightShadow>* m =
+      new std::map<uintptr_t, Bfp8WeightShadow>();  // never destroyed (#1486)
+  return *m;
+}
+
+ttnn::Tensor EnsureBfp8WeightDevice(const Tensor& b, MeshDevice& device) {
+  const uint32_t rows = static_cast<uint32_t>(b.shape[0]);
+  const uint32_t cols = static_cast<uint32_t>(b.shape[1]);
+  const auto refuse = [&](std::string why) {
+    NoteBfp8Refusal(std::move(why));
+    if (b.dtype == DType::kBF16 && !IsTrackedBase2D(b))
+      return EnsureWeightViewDevice(b, device);
+    return EnsureDevice2D(b, device);
+  };
+  if (b.dtype != DType::kBF16)
+    return refuse("tenstorrent BFP8 weight residency: weight is not bf16 (" +
+                  std::to_string(static_cast<int>(b.dtype)) + ")");
+  if (b.rank != 2 || !b.IsContiguous())
+    return refuse("tenstorrent BFP8 weight residency: non-contiguous or "
+                  "non-rank-2 weight");
+  if (rows % 32 != 0 || cols % 32 != 0)
+    return refuse("tenstorrent BFP8 weight residency: shape " +
+                  std::to_string(rows) + "x" + std::to_string(cols) +
+                  " is not TILE-aligned");
+  const uintptr_t key = reinterpret_cast<uintptr_t>(b.data);
+  {
+    std::lock_guard<std::mutex> g(Bfp8WeightMutex());
+    auto it = Bfp8WeightShadows().find(key);
+    if (it != Bfp8WeightShadows().end() && it->second.device.has_value() &&
+        it->second.rows == rows && it->second.cols == cols) {
+      return *it->second.device;
+    }
+  }
+  EnsureHost(b);
+  const size_t n = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+  ttnn::Tensor bf16_dev = ttnn::Tensor::from_span(
+      ttsl::Span<const bfloat16>(static_cast<const bfloat16*>(b.data), n),
+      TileSpecOf(rows, cols), &device);
+  // The device typecast is the SAME single RNE BFP pack the tt-metal host
+  // packer performs (typecast_sharded_program_factory.cpp:48 — BFLOAT16 ->
+  // BFLOAT8_B is a supported TILE conversion), executed on-device so the
+  // packed operand never exists on the host and the bf16 staging is dropped
+  // with the temporary.
+  ttnn::Tensor bfp8_dev = ttnn::typecast(bf16_dev, ttnn::DataType::BFLOAT8_B);
+  g_bfp8_resident.fetch_add(1, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> g(Bfp8WeightMutex());
+  Bfp8WeightShadow& s = Bfp8WeightShadows()[key];
+  s.device = bfp8_dev;
+  s.rows = rows;
+  s.cols = cols;
+  return bfp8_dev;
+}
+
 
 // Return a TILE BFLOAT16 device tensor for rank-2 `t`, uploading only when the
 // device shadow is missing or stale. Same-numel reshape reuses a resident

@@ -443,6 +443,21 @@ ttnn::Tensor EnsureWeightViewDevice(const Tensor& t, MeshDevice& device);
 ttnn::Tensor EnsureMatmulWeightDevice(const Tensor& b, MeshDevice& device);
 ttnn::Tensor EnsureDevice2D(const Tensor& t, MeshDevice& device);
 bool DeviceShadowExact(const Tensor& t, uint32_t rows, uint32_t cols);
+// ---- BFP8 weight residency (spec .agents/specs/tenstorrent-bfp-weight-
+// residency.md) ----------------------------------------------------------
+// VT_TT_BFP8_WEIGHTS=1: a bf16 matmul WEIGHT operand stages once as a
+// device-resident BFLOAT8_B tensor (bf16 upload, device typecast, bf16 staging
+// dropped) and the native ttnn matmul consumes it (bf16 activation x BFP8
+// weight). Read fresh on every call so a test can flip the env mid-process.
+bool Bfp8WeightsEnabled();
+ttnn::Tensor EnsureBfp8WeightDevice(const Tensor& b, MeshDevice& device);
+void Bfp8MatmulUse();  // a matmul consumed a BFP8-resident weight operand
+// Probes for the focused tests (declared in the test TU, defined here — the
+// test TU never includes internal headers).
+uint64_t Bfp8ResidentWeights();   // conversions completed
+uint64_t Bfp8MatmulUses();        // matmul calls that consumed a BFP8 weight
+uint64_t Bfp8Refusals();          // named refusals (fell through to the bf16 arm)
+const char* Bfp8LastRefusal();    // the last refusal reason, "" if none
 // ---- KEEPQUANT W3: the resident i32 word shadow -------------------------
 struct KeepQuantWordShadow {
   ttnn::Tensor words;  // {B, wpb} INT32 ROW_MAJOR — the packed stream, word-staged

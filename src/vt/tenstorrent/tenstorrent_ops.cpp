@@ -573,7 +573,8 @@ void MatmulKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
 
   MeshDevice& device = SharedMeshDevice();
   ttnn::Tensor dev_a = EnsureDevice2D(a, device);
-  ttnn::Tensor dev_b = EnsureDevice2D(b, device);
+  ttnn::Tensor dev_b = EnsureMatmulWeightDevice(b, device);
+  if (dev_b.dtype() == ttnn::DataType::BFLOAT8_B) Bfp8MatmulUse();
   ttnn::Tensor dev_c = ttnn::operations::matmul::matmul(dev_a, dev_b);
   CommitDevice2D(out, std::move(dev_c));
 }
@@ -601,6 +602,7 @@ void MatmulBTKernel(Queue&, Tensor& out, const Tensor& a, const Tensor& b) {
   MeshDevice& device = SharedMeshDevice();
   ttnn::Tensor dev_a = EnsureDevice2D(a, device);
   ttnn::Tensor dev_b = EnsureMatmulWeightDevice(b, device);
+  if (dev_b.dtype() == ttnn::DataType::BFLOAT8_B) Bfp8MatmulUse();
   ttnn::Tensor dev_c =
       ttnn::operations::matmul::matmul(dev_a, dev_b, /*transpose_a=*/false, /*transpose_b=*/true);
   CommitDevice2D(out, std::move(dev_c));

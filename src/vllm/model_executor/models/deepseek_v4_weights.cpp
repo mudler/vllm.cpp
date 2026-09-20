@@ -1591,7 +1591,7 @@ struct V4GgufCtx {
     const GgufTensorInfo& t = Take(name);
     VT_CHECK(t.shape.size() == 2, "deepseek-v4 gguf: expected 2-D MW " + name);
     const GgufResidency r = pol.Route(t, GgufTensorRole::kMatmulWeight);
-    if (r != GgufResidency::kExpandBf16) {
+    if (r == GgufResidency::kKeepQuant || r == GgufResidency::kKeepF16) {
       // mmap-VIEW the blocks when the policy allows (borrow in place out of the
       // file's read-only mapping, refcounted) instead of COPYING them into an owned
       // buffer — the ~91 GiB keep-quant tower then shares the file's page cache
@@ -1614,7 +1614,7 @@ struct V4GgufCtx {
     const int64_t rows = t.shape[0] * t.shape[1];  // E*out
     const int64_t k = t.shape[2];                  // in
     const GgufResidency r = pol.Route(t, GgufTensorRole::kStackedExpertWeight);
-    if (r != GgufResidency::kExpandBf16) {
+    if (r == GgufResidency::kKeepQuant || r == GgufResidency::kKeepF16) {
       // mmap-VIEW when allowed (see Mw) — the 256 routed-expert slabs are the bulk
       // of the ~91 GiB, so borrowing them in place is the dominant memory win.
       return OwnGgufQuantBlocks(t, rows, k, /*row_offset=*/0,

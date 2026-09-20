@@ -3282,3 +3282,97 @@ TEST_CASE("packed V-row reorder equals the element-level reorder (W4d W4)") {
                       fa.size() * sizeof(float)) == 0);
   }
 }
+
+// ── BACKEND-TENSTORRENT: BFP8 weight residency route ───────────────────────
+// spec .agents/specs/tenstorrent-bfp-weight-residency.md. VT_TT_BFP8_WEIGHTS=1
+// admits an UNQUANTIZED (ggml F32/BF16) GEMM/expert weight as kBfp8Device on a
+// load the engine resolved onto kTENSTORRENT; every other role/encoding/device
+// refuses by fall-through, and the DEFAULT OFF policy never elects the arm at
+// all (the inertness pin below). The loader-side product of kBfp8Device is the
+// bf16 expansion — admission decides only whether the Tenstorrent staging seam
+// converts the weight to device-resident BFLOAT8_B.
+TEST_CASE("BFP8 weight residency route: VT_TT_BFP8_WEIGHTS=1 admits an "
+          "unquantized GEMM weight on Tenstorrent; default OFF stays inert") {
+  ::unsetenv("VT_TT_BFP8_WEIGHTS");
+  ::unsetenv("VT_CPU_REF");
+  vllm::GgufTensorInfo f32_w;
+  f32_w.name = "blk.0.attn_q.weight";
+  f32_w.ggml_type = 0;  // GGML_TYPE_F32
+  f32_w.shape = {512, 512};
+
+  // DEFAULT OFF: unset AND explicit "0" never elect the arm, on any device.
+  for (const char* env_val : {(const char*)nullptr, "0"}) {
+    if (env_val != nullptr) ::setenv("VT_TT_BFP8_WEIGHTS", env_val, 1);
+    for (auto dev : {vt::DeviceType::kCPU, vt::DeviceType::kTENSTORRENT}) {
+      const vllm::GgufLoadPolicy p = vllm::GgufLoadPolicy::FromEnv(dev);
+      CHECK(p.bfp8_weights == false);
+      CHECK(p.Route(f32_w, vllm::GgufTensorRole::kMatmulWeight) ==
+            vllm::GgufResidency::kExpandBf16);
+    }
+  }
+  ::unsetenv("VT_TT_BFP8_WEIGHTS");
+
+  // Env ON but the load resolved onto the CPU: refused (no consumer there).
+  ::setenv("VT_TT_BFP8_WEIGHTS", "1", 1);
+  {
+    const vllm::GgufLoadPolicy cpu = vllm::GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
+    CHECK(cpu.bfp8_weights == false);
+    CHECK(cpu.Route(f32_w, vllm::GgufTensorRole::kMatmulWeight) ==
+          vllm::GgufResidency::kExpandBf16);
+  }
+
+  // Env ON and the load resolved onto kTENSTORRENT: admitted, both verbatim
+  // roles, both unquantized encodings.
+  {
+    const vllm::GgufLoadPolicy tt =
+        vllm::GgufLoadPolicy::FromEnv(vt::DeviceType::kTENSTORRENT);
+    CHECK(tt.bfp8_weights == true);
+    CHECK(tt.Route(f32_w, vllm::GgufTensorRole::kMatmulWeight) ==
+          vllm::GgufResidency::kBfp8Device);
+    vllm::GgufTensorInfo bf16_w;
+    bf16_w.name = "blk.3.ffn_up_exps.weight";
+    bf16_w.ggml_type = 30;  // GGML_TYPE_BF16
+    bf16_w.shape = {4, 512, 512};
+    CHECK(tt.Route(bf16_w, vllm::GgufTensorRole::kStackedExpertWeight) ==
+          vllm::GgufResidency::kBfp8Device);
+    CHECK(Name(vllm::GgufResidency::kBfp8Device) == std::string("bfp8_device"));
+
+    // REFUSALS BY FALL-THROUGH, each by its reason:
+    // a value-rewritten tensor never keeps anything,
+    CHECK(tt.Route(f32_w, vllm::GgufTensorRole::kTransformedWeight) ==
+          vllm::GgufResidency::kExpandBf16);
+    CHECK(tt.Route(f32_w, vllm::GgufTensorRole::kVector) ==
+          vllm::GgufResidency::kExpandBf16);
+    CHECK(tt.Route(f32_w, vllm::GgufTensorRole::kEmbeddingTable) ==
+          vllm::GgufResidency::kExpandBf16);
+    // a ragged K cannot pack BFP tiles,
+    vllm::GgufTensorInfo ragged = f32_w;
+    ragged.shape = {512, 33};
+    CHECK(tt.Route(ragged, vllm::GgufTensorRole::kMatmulWeight) ==
+          vllm::GgufResidency::kExpandBf16);
+    // a block encoding stays keep-quant when that residency is available and
+    // NEVER reaches the BFP arm,
+    vllm::GgufTensorInfo q8 = f32_w;
+    q8.ggml_type = 8;  // GGML_TYPE_Q8_0
+    const vllm::GgufResidency q8_r =
+        tt.Route(q8, vllm::GgufTensorRole::kMatmulWeight);
+    CHECK(q8_r != vllm::GgufResidency::kBfp8Device);
+    // and F16 stays keep-f16 / expands, never BFP (this wave: bf16/f32 only).
+    vllm::GgufTensorInfo f16 = f32_w;
+    f16.ggml_type = 1;
+    CHECK(tt.Route(f16, vllm::GgufTensorRole::kMatmulWeight) !=
+          vllm::GgufResidency::kBfp8Device);
+  }
+
+  // The oracle switch forces the arm off, like every other residency.
+  ::setenv("VT_CPU_REF", "1", 1);
+  {
+    const vllm::GgufLoadPolicy oracle =
+        vllm::GgufLoadPolicy::FromEnv(vt::DeviceType::kTENSTORRENT);
+    CHECK(oracle.bfp8_weights == false);
+    CHECK(oracle.Route(f32_w, vllm::GgufTensorRole::kMatmulWeight) ==
+          vllm::GgufResidency::kExpandBf16);
+  }
+  ::unsetenv("VT_CPU_REF");
+  ::unsetenv("VT_TT_BFP8_WEIGHTS");
+}

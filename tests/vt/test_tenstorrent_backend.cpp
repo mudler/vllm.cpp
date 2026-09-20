@@ -9506,3 +9506,276 @@ TEST_CASE("kTENSTORRENT single-chunk keep-quant decode keeps the word shadow res
 // (q6_K + q4_K, bit-for-bit vs the element-level reorder through the real
 // dequantizer) and locked by the bf16-out capture test above.
 
+
+// ── BFP8 weight residency (spec .agents/specs/tenstorrent-bfp-weight-
+// residency.md) ─────────────────────────────────────────────────────────────
+// VT_TT_BFP8_WEIGHTS=1 converts a bf16 matmul WEIGHT to a device-resident
+// BFLOAT8_B operand at first staging and the NATIVE ttnn::matmul consumes it
+// (bf16 activation x BFP8 weight — ttnn/operations/matmul/matmul.cpp:521-532).
+// The f32-exact SFPU floor is not involved. BFLOAT8_B packs 1 sign + 7
+// shared-group mantissa bits per element with one 8-bit exponent per
+// 16-element group (tt_metal/impl/data_format/blockfloat_common.cpp,
+// `convert_bfp_to_u32`, Bfp8_b arm) — the rounding IS the precision contract.
+namespace vt::tenstorrent {
+// Residency probes (tenstorrent_internal.h); declared here so the test TU
+// never includes internal headers.
+uint64_t Bfp8ResidentWeights();
+uint64_t Bfp8MatmulUses();
+uint64_t Bfp8Refusals();
+const char* Bfp8LastRefusal();
+}  // namespace vt::tenstorrent
+
+namespace {
+
+uint16_t F32ToBf16Bits(float v) {
+  uint32_t b;
+  std::memcpy(&b, &v, 4);
+  const uint32_t lsb = (b >> 16) & 1u;
+  b += 0x7fffu + lsb;
+  return static_cast<uint16_t>(b >> 16);
+}
+float Bf16BitsToFloat(uint16_t h) {
+  const uint32_t b = static_cast<uint32_t>(h) << 16;
+  float v;
+  std::memcpy(&v, &b, 4);
+  return v;
+}
+
+// CPU test-ONLY mirror of the BFLOAT8_B quantization: per 16-element group,
+// shared exponent = biased exponent of the group max; each element keeps
+// 1 sign + 7 mantissa bits relative to that shared exponent. This is the
+// DEQUANTIZED reference operand for the quantize-then-compare gate — never a
+// runtime path.
+float Bfp8MirrorDequant(float v, uint8_t shared_exp) {
+  if (v == 0.0f) return 0.0f;
+  const float scale = std::ldexp(1.0f, static_cast<int>(shared_exp) - 127);
+  float x = std::fabs(v) / scale;  // in (2^-8, 2)
+  if (x >= 2.0f) x = 1.9999999f;
+  float q = std::nearbyintf(x * 128.0f);  // RNE on 7 mantissa bits
+  if (q > 255.0f) q = 255.0f;
+  return (v < 0 ? -1.0f : 1.0f) * (q / 128.0f) * scale;
+}
+
+// Runs `a @ b^T` (bf16 operands, bf16 out) through the production kMatmulBT
+// op and returns the device output widened to f32.
+std::vector<float> RunMatmulBTBF16(Backend& backend, Queue& q, uint32_t M,
+                                   uint32_t K, uint32_t N,
+                                   const std::vector<float>& host_a,
+                                   const std::vector<float>& host_b) {
+  std::vector<uint16_t> a_bits(host_a.size()), b_bits(host_b.size());
+  for (size_t i = 0; i < host_a.size(); ++i) a_bits[i] = F32ToBf16Bits(host_a[i]);
+  for (size_t i = 0; i < host_b.size(); ++i) b_bits[i] = F32ToBf16Bits(host_b[i]);
+
+  void* mem_a = backend.Alloc(a_bits.size() * 2);
+  void* mem_b = backend.Alloc(b_bits.size() * 2);
+  void* mem_out = backend.Alloc(static_cast<size_t>(M) * N * 2);
+  backend.Copy(q, mem_a, a_bits.data(), a_bits.size() * 2);
+  backend.Copy(q, mem_b, b_bits.data(), b_bits.size() * 2);
+  Tensor a = Tensor::Contiguous(mem_a, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {M, K});
+  Tensor b = Tensor::Contiguous(mem_b, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {N, K});
+  Tensor out = Tensor::Contiguous(mem_out, vt::DType::kBF16, Device{DeviceType::kTENSTORRENT, 0}, {M, N});
+  auto matmul_bt =
+      reinterpret_cast<vt::MatmulFn>(vt::GetOp(vt::OpId::kMatmulBT, DeviceType::kTENSTORRENT));
+  matmul_bt(q, out, a, b);
+  std::vector<uint16_t> out_bits(static_cast<size_t>(M) * N);
+  backend.Copy(q, out_bits.data(), mem_out, out_bits.size() * 2);
+  backend.Free(mem_a);
+  backend.Free(mem_b);
+  backend.Free(mem_out);
+  std::vector<float> out_f(out_bits.size());
+  for (size_t i = 0; i < out_bits.size(); ++i) out_f[i] = Bf16BitsToFloat(out_bits[i]);
+  return out_f;
+}
+
+struct ScopedEnv {
+  explicit ScopedEnv(const char* v) {
+    const char* old = std::getenv("VT_TT_BFP8_WEIGHTS");
+    had_ = old != nullptr;
+    if (had_) old_ = old;
+    if (v != nullptr) ::setenv("VT_TT_BFP8_WEIGHTS", v, 1);
+    else ::unsetenv("VT_TT_BFP8_WEIGHTS");
+  }
+  ~ScopedEnv() {
+    if (had_) ::setenv("VT_TT_BFP8_WEIGHTS", old_.c_str(), 1);
+    else ::unsetenv("VT_TT_BFP8_WEIGHTS");
+  }
+  bool had_ = false;
+  std::string old_;
+};
+
+}  // namespace
+
+TEST_CASE("kTENSTORRENT VT_TT_BFP8_WEIGHTS default OFF leaves kMatmulBT "
+          "inert (no BFP8 resident, no use)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  // Both the unset default AND the explicit "0" opt-out must leave every
+  // existing path untouched: no conversion, no BFP8 operand consumed, and a
+  // result inside the plain bf16 matmul envelope.
+  for (const char* env_val : {(const char*)nullptr, "0"}) {
+    ScopedEnv guard(env_val);
+    Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+    Queue q = backend.CreateQueue();
+    constexpr uint32_t M = 32, K = 64, N = 32;
+    std::vector<float> host_a(static_cast<size_t>(M) * K),
+        host_b(static_cast<size_t>(N) * K);
+    for (size_t i = 0; i < host_a.size(); ++i) host_a[i] = 0.25f * static_cast<float>(i % 7);
+    for (size_t i = 0; i < host_b.size(); ++i) host_b[i] = 0.125f * static_cast<float>(i % 13);
+    const uint64_t resident_before = vt::tenstorrent::Bfp8ResidentWeights();
+    const uint64_t uses_before = vt::tenstorrent::Bfp8MatmulUses();
+    const std::vector<float> out =
+        RunMatmulBTBF16(backend, q, M, K, N, host_a, host_b);
+    CHECK(vt::tenstorrent::Bfp8ResidentWeights() == resident_before);
+    CHECK(vt::tenstorrent::Bfp8MatmulUses() == uses_before);
+    // Plain bf16-matmul envelope vs the f32 reference.
+    float max_abs = 0.0f;
+    for (uint32_t i = 0; i < M; ++i)
+      for (uint32_t j = 0; j < N; ++j) {
+        float ref = 0.0f;
+        for (uint32_t k = 0; k < K; ++k)
+          ref += Bf16BitsToFloat(F32ToBf16Bits(host_a[i * K + k])) *
+                 Bf16BitsToFloat(F32ToBf16Bits(host_b[j * K + k]));
+        max_abs = std::max(max_abs, std::fabs(out[i * N + j] - ref));
+      }
+    CHECK(max_abs < 0.5f);
+  }
+}
+
+TEST_CASE("kTENSTORRENT VT_TT_BFP8_WEIGHTS=1 stages the weight as a "
+          "device-resident BFLOAT8_B operand consumed by the native matmul "
+          "(quantize-then-compare gate)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  ScopedEnv guard("1");
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+  constexpr uint32_t M = 32, K = 64, N = 32;
+  std::vector<float> host_a(static_cast<size_t>(M) * K),
+      host_b(static_cast<size_t>(N) * K);
+  for (size_t i = 0; i < host_a.size(); ++i) host_a[i] = 0.25f * static_cast<float>(i % 7);
+  for (size_t i = 0; i < host_b.size(); ++i) host_b[i] = 0.125f * static_cast<float>(i % 13);
+
+  const uint64_t resident_before = vt::tenstorrent::Bfp8ResidentWeights();
+  const uint64_t uses_before = vt::tenstorrent::Bfp8MatmulUses();
+  const std::vector<float> out = RunMatmulBTBF16(backend, q, M, K, N, host_a, host_b);
+  // PATH PIN: the weight became a device-resident BFP8 operand and a matmul
+  // consumed it. Without the arm these counters never move — this is what reds
+  // on the wrong path (the bf16 resident arm computes a similar number).
+  CHECK(vt::tenstorrent::Bfp8ResidentWeights() > resident_before);
+  CHECK(vt::tenstorrent::Bfp8MatmulUses() > uses_before);
+  // A second call allocates a FRESH weight staging buffer (a new host
+  // pointer), so it stages its own BFP8 tensor — the shadow cache is keyed by
+  // the host pointer, which at model load is the stable weight allocation.
+  (void)RunMatmulBTBF16(backend, q, M, K, N, host_a, host_b);
+  CHECK(vt::tenstorrent::Bfp8ResidentWeights() == resident_before + 2);
+  CHECK(vt::tenstorrent::Bfp8MatmulUses() > uses_before + 1);
+
+  // QUANTIZE-THEN-COMPARE: dequantize `b` through the CPU BFP8 mirror (groups
+  // of 16 along K) and take the f32 matmul of THAT as the reference. The
+  // contract is "computes what BFP8 defines", so the envelope is the BFP
+  // quantization step — never a raw-f32 tolerance.
+  std::vector<float> b_deq(host_b.size());
+  float max_b = 0.0f;
+  for (float v : host_b) max_b = std::max(max_b, std::fabs(v));
+  for (size_t row = 0; row < host_b.size(); row += 16) {
+    uint8_t shared = 0;
+    for (size_t e = 0; e < 16 && row + e < host_b.size(); ++e) {
+      int exp = 0;
+      std::frexp(host_b[row + e], &exp);
+      shared = std::max(shared, static_cast<uint8_t>(exp - 1 + 127));
+    }
+    for (size_t e = 0; e < 16 && row + e < host_b.size(); ++e)
+      b_deq[row + e] = Bfp8MirrorDequant(host_b[row + e], shared);
+  }
+  for (uint32_t i = 0; i < M; ++i)
+    for (uint32_t j = 0; j < N; ++j) {
+      float ref = 0.0f;
+      float sum_abs_a = 0.0f;
+      for (uint32_t k = 0; k < K; ++k) {
+        const float a = Bf16BitsToFloat(F32ToBf16Bits(host_a[i * K + k]));
+        ref += a * b_deq[j * K + k];
+        sum_abs_a += std::fabs(a);
+      }
+      // |Δb| ≤ max|b|/128 (half ulp of the 7-bit mantissa) doubled for the
+      // device-side rounding-mode difference, plus the bf16 output store.
+      const float bound = (max_b / 64.0f) * sum_abs_a +
+                          std::fabs(ref) * (1.0f / 256.0f) + 1e-3f;
+      const float diff = std::fabs(out[i * N + j] - ref);
+      CHECK_MESSAGE(diff <= bound,
+                    "BFP8 matmul output outside the quantization envelope at ("
+                        << i << "," << j << "): " << diff << " > " << bound);
+    }
+}
+
+TEST_CASE("kTENSTORRENT VT_TT_BFP8_WEIGHTS=1 refuses a non-TILE-aligned "
+          "weight BY NAME and falls through to the bf16 arm") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  ScopedEnv guard("1");
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+  constexpr uint32_t M = 32, K = 33, N = 32;  // K=33 is not TILE-aligned
+  std::vector<float> host_a(static_cast<size_t>(M) * K),
+      host_b(static_cast<size_t>(N) * K);
+  for (size_t i = 0; i < host_a.size(); ++i) host_a[i] = 0.25f * static_cast<float>(i % 5);
+  for (size_t i = 0; i < host_b.size(); ++i) host_b[i] = 0.5f * static_cast<float>(i % 3);
+
+  const uint64_t refusals_before = vt::tenstorrent::Bfp8Refusals();
+  const std::vector<float> out = RunMatmulBTBF16(backend, q, M, K, N, host_a, host_b);
+  CHECK(vt::tenstorrent::Bfp8Refusals() > refusals_before);
+  CHECK(std::string(vt::tenstorrent::Bfp8LastRefusal())
+            .find("TILE-aligned") != std::string::npos);
+  // The fall-through is still CORRECT (bf16 envelope vs the f32 reference).
+  float max_abs = 0.0f;
+  for (uint32_t i = 0; i < M; ++i)
+    for (uint32_t j = 0; j < N; ++j) {
+      float ref = 0.0f;
+      for (uint32_t k = 0; k < K; ++k)
+        ref += Bf16BitsToFloat(F32ToBf16Bits(host_a[i * K + k])) *
+               Bf16BitsToFloat(F32ToBf16Bits(host_b[j * K + k]));
+      max_abs = std::max(max_abs, std::fabs(out[i * N + j] - ref));
+    }
+  CHECK(max_abs < 0.5f);
+}
+
+TEST_CASE("kTENSTORRENT BFP8 vs bf16 resident-weight matmul timing (VT_TT_BFP8_BENCH=1)") {
+  if (std::getenv("VT_TT_BFP8_BENCH") == nullptr) {
+    MESSAGE("SKIPPED: set VT_TT_BFP8_BENCH=1");
+    return;
+  }
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+  // 27B-class MLP gate/up shape family: [N,K] = 17408x5120, decode M=1.
+  constexpr uint32_t M = 1, K = 5120, N = 17408;
+  std::vector<float> host_a(static_cast<size_t>(M) * K, 0.5f),
+      host_b(static_cast<size_t>(N) * K);
+  for (size_t i = 0; i < host_b.size(); ++i)
+    host_b[i] = 0.125f * static_cast<float>(i % 13);
+  for (const char* env_val : {(const char*)nullptr, "1"}) {
+    ScopedEnv guard(env_val);
+    // Warm the staging (first call converts/uploads), then time eager calls.
+    (void)RunMatmulBTBF16(backend, q, M, K, N, host_a, host_b);
+    const auto t0 = std::chrono::steady_clock::now();
+    constexpr int kIters = 10;
+    for (int it = 0; it < kIters; ++it)
+      (void)RunMatmulBTBF16(backend, q, M, K, N, host_a, host_b);
+    const auto t1 = std::chrono::steady_clock::now();
+    // RunMatmulBTBF16 includes host<->device copies; report the whole-call cost
+    // as an upper bound on the GEMM delta.
+    const double us_per_call =
+        std::chrono::duration<double, std::micro>(t1 - t0).count() / kIters;
+    MESSAGE("VT_TT_BFP8_WEIGHTS=", env_val == nullptr ? "unset(bf16)" : "1",
+            ": ", us_per_call, " us/call whole-op (M=", M, ",K=", K, ",N=", N,
+            "), Bfp8MatmulUses=", vt::tenstorrent::Bfp8MatmulUses());
+  }
+}

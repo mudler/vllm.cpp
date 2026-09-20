@@ -90,6 +90,19 @@ enum class GgufResidency {
   // container's own operands, so this residency changes WHERE the arithmetic
   // happens (fp4 kernel, not a load-time bf16 expansion) and not what it is.
   kNvfp4Fp4,
+  // BACKEND-TENSTORRENT BFP weight residency (spec
+  // .agents/specs/tenstorrent-bfp-weight-residency.md). An UNQUANTIZED (ggml
+  // F32/BF16) GEMM/expert weight — the exact population that would otherwise
+  // kExpandBf16 — is admitted for device-side conversion to ttnn BFLOAT8_B at
+  // first staging on Tenstorrent. The LOADER-side product is deliberately
+  // IDENTICAL to kExpandBf16: the host master stays bf16, because every
+  // non-TT consumer and the capture-safe staging path read it, and the bf16 ->
+  // BFLOAT8_B conversion happens once at the device residency seam
+  // (`EnsureBfp8WeightDevice`, src/vt/tenstorrent/tenstorrent_residency.cpp).
+  // The route therefore records ADMISSION (and refusal-by-name for every other
+  // role), not a different load. Gated on `GgufLoadPolicy::bfp8_weights`
+  // (VT_TT_BFP8_WEIGHTS=1 on a Tenstorrent-resolved load, default OFF).
+  kBfp8Device,
 };
 
 const char* Name(GgufTensorRole role);
@@ -171,7 +184,8 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
                               uint32_t ggml_type,
                               const std::vector<int64_t>& shape,
                               vt::DeviceType dev,
-                              std::optional<vt::DType> weight_value_dtype = std::nullopt);
+                              std::optional<vt::DType> weight_value_dtype = std::nullopt,
+                              bool bfp8_weights = false);
 
 // True when the device this process will actually run the forward on can
 // execute `OpId::kMatmulBTQuant` — i.e. when a block-typed weight has a
@@ -303,6 +317,16 @@ struct GgufLoadPolicy {
   // `Nvfp4Weight::IsTrueW4A4()` is false) and the forward takes its W4A16 arm.
   // Rides nvfp4_fp4.
   bool nvfp4_w4a4 = false;
+  // BACKEND-TENSTORRENT BFP weight residency (spec
+  // .agents/specs/tenstorrent-bfp-weight-residency.md). DEFAULT OFF — the
+  // only env that turns it on is VT_TT_BFP8_WEIGHTS=1, and FromEnv() only
+  // elects it on a load the engine resolved onto kTENSTORRENT. When on, the
+  // route admits an UNQUANTIZED (F32/BF16 ggml type) matmul/expert weight as
+  // kBfp8Device; the loader then expands it exactly as kExpandBf16 (the host
+  // master is bf16 either way) and the Tenstorrent residency seam converts it
+  // to a device-resident BFLOAT8_B operand at first staging. Forced off by
+  // cpu_ref like every other residency, so the oracle load stays byte-identical.
+  bool bfp8_weights = false;
   // VT_CPU_REF=1 — the parity ORACLE switch (spec gate 2). Forces the full
   // dequant-to-bf16 load path regardless of `keep_quant`, so the bit-stable
   // reference numerics stay reachable once keep-quant becomes the default.

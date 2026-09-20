@@ -365,20 +365,159 @@ Its contract identifier is `vllm.cpp/worker-image-discovery/v1`.
 
 The public signature is
 `discover_and_seal(request: DiscoverWorkerImageRequest) -> DiscoverWorkerImageResult`.
-`DiscoverWorkerImageRequest` contains strict discovery-request bytes, the
-qualification-manifest bytes and SHA256, the expected `strix:gpu0` device, the
-exact 12 resolver keys listed later in this section, and a new output directory.
-Unknown fields or another key set fail. The discovery request cannot contain a
-caller-selected image identity or library path.
+`DiscoverWorkerImageRequest` is a closed tagged union. It has these two request
+types and no untyped dictionary form:
+
+- `DiscoverWorkerImageBootstrapRequest` has schema
+  `vllm.cpp/worker-image-discovery-bootstrap-request/v1`. It contains the
+  qualification-manifest bytes and SHA256, the literal expected device
+  `strix:gpu0`, the fixed ordered 12-key list, and a new output directory.
+  It contains no baseline, lease, boot, image, package, or library identity.
+- `DiscoverWorkerImageReplayRequest` has schema
+  `vllm.cpp/worker-image-discovery-replay-request/v1`. It contains every
+  bootstrap field, the accepted profile-manifest bytes and SHA256, the prior
+  accepted baseline-receipt bytes, its detached SHA256 value, and one
+  `context_relation` value. The allowed values are
+  `same-lease-same-boot`, `fresh-lease-same-boot`, and
+  `fresh-lease-changed-boot`.
+
+The bootstrap type contains exactly `schema`, `qualification_manifest_bytes`,
+`qualification_manifest_sha256`, `expected_device`, `resolver_keys`, and
+`output_directory`. The replay type adds exactly
+`accepted_profile_manifest_bytes`, `accepted_profile_manifest_sha256`,
+`baseline_receipt_bytes`, `baseline_receipt_sha256`, and `context_relation`.
+Every `*_bytes` value is an immutable byte sequence. Every `*_sha256` value is
+a typed 32-byte value. `resolver_keys` is a fixed 12-string tuple.
+`output_directory` is an absolute nonsymlink path that must not exist.
+
+The `--discovery-request` JSON file represents each byte sequence as padded
+RFC 4648 base64 and each SHA256 as 64 lowercase hexadecimal characters. It
+contains every matching typed field except `output_directory`. The thin client
+adds only the separate `--output` value. It rejects a request-file output field
+or a CLI field that duplicates any other request member. This encoding uses
+the canonical JSON rules defined for the runtime envelope.
+
+Both parsers reject an unknown field, duplicate JSON key, another key order,
+another resolver-key set, or an identity for the current worker. The replay
+parser requires `worker_image_baseline.receipt_sha256`,
+`runtime_envelope_sha256`, and the 12 binding fingerprints in the accepted
+profile manifest. Those values must byte-match the prior baseline receipt.
+The detached value must equal SHA256 over the exact baseline-receipt bytes.
+Discovery never constructs these replay expectations from current observations.
+
+Bootstrap is the only operation that can publish the first baseline. The
+operator accepts that baseline by copying its receipt SHA256, envelope SHA256,
+and 12 binding fingerprints unchanged into the strict profile manifest.
+Replay cannot publish unless that prior accepted baseline and manifest are
+present. A bootstrap request after an accepted baseline is a new campaign
+baseline and cannot continue this campaign.
+
+The controller supplies lease authority outside either JSON request. The
+callable reads `RC_DEVICE` and `RC_JOB_ID` from the process that `rc run`
+started. It requires `RC_DEVICE=strix:gpu0` and a nonempty `RC_JOB_ID`.
+The authoritative boot source is
+`procfs:/proc/sys/kernel/random/boot_id`. Its bytes must match one lowercase
+UUID plus one line feed. The receipt stores the 36-character UUID and the
+literal source name. No request can supply the current lease, device, or boot.
 
 The discovery receipt and detached hash are the only image authority for
-downstream phases. The phase derives a runtime-relevant worker-image digest
-from one canonical envelope. The envelope contains `/etc/os-release`, the dpkg
-status bytes, dpkg architecture, sorted package rows, selected dpkg metadata,
-and all 12 records. It also contains the qualification-bound eight-file image
-subset and their exact hashes. The digest makes no claim about unrelated image
-files. An environment variable, host name, mount label, loader-cache entry, or
-caller-supplied image string cannot authorize the image.
+downstream phases. The runtime-relevant image envelope has schema and hash
+domain `vllm.cpp/worker-image-runtime-envelope/v1`. It contains exactly these
+nine top-level members:
+
+1. `schema`, with that literal value.
+2. `os_release`, a `ByteFileV1` for `/etc/os-release`.
+3. `dpkg_status`, a `ByteFileV1` for `/var/lib/dpkg/status`.
+4. `dpkg_architecture`, the normalized `dpkg --print-architecture` value.
+5. `dpkg_executables`, the canonical two-entry `ByteFileV1` array for
+   `/usr/bin/dpkg` and `/usr/bin/dpkg-query`, sorted by path.
+6. `dpkg_packages`, the complete normalized package-row array.
+7. `dpkg_metadata_files`, the complete normalized array of dpkg list files
+   used by the 12 ownership records.
+8. `qualification_records`, the exact eight qualification-bound bindings.
+9. `live_bindings`, the exact 12 discovery bindings.
+
+`ByteFileV1` contains exactly `path`, `byte_count`, `sha256`, and
+`content_base64`. `path` is the absolute canonical path. `byte_count` is the
+raw content length. `sha256` hashes the same raw bytes. `content_base64` is
+padded RFC 4648 base64 with no whitespace. Decoding must reproduce the byte
+count and SHA256. Raw file bytes never pass through a text normalization.
+
+The implementation obtains `dpkg_architecture` from the exact argument array
+`["/usr/bin/dpkg", "--print-architecture"]`. The output must be one nonempty
+ASCII token plus one line feed. The envelope stores the token without the line
+feed. The package query uses
+`["/usr/bin/dpkg-query", "-W", "-f=${binary:Package}\\t${Version}\\t${Architecture}\\n"]`.
+Each output row must contain three nonempty ASCII fields and one line feed.
+The envelope represents each row as an object with exactly `package`,
+`version`, and `architecture`. It sorts rows by those three UTF-8 byte strings
+and rejects a duplicate tuple or duplicate package and architecture pair.
+
+Each `dpkg_metadata_files` entry is a `ByteFileV1`. The array contains one
+entry for each distinct canonical dpkg `.list` file named by a live binding.
+It sorts entries by path and rejects duplicate paths. `dpkg_executables` uses
+the same ordering and rejects a missing, extra, or duplicate executable path.
+No other file under `/var/lib/dpkg/info` belongs to the envelope.
+
+Each `qualification_records` entry is a `QualificationBindingV1`. It has
+exactly `resolver_key`, `source_class`, `manifest_pointer`, `absolute_path`,
+`canonical_path`, `symlink_chain`, `byte_count`, `sha256`, `gnu_build_id`,
+`dt_soname`, and `dt_needed`.
+`source_class` is `sealed-non-glibc`. `manifest_pointer` is the unique JSON
+Pointer into the strict qualification manifest. The array contains exactly
+`libamd_comgr.so.3`, `libdrm.so.2`, `libdrm_amdgpu.so.1`, `libdw.so.1`,
+`libelf.so.1`, `libhsa-amd-aqlprofile64.so.1`, `libhsa-runtime64.so.1`, and
+`libnuma.so.1`. It sorts entries by resolver key and rejects a duplicate key,
+path, canonical path, or manifest pointer. The observed file must match every
+manifest field before it enters the envelope.
+
+Each `live_bindings` entry is a `WorkerFileBindingV1` with exactly these
+members:
+
+- `resolver_key`, `source_class`, `absolute_path`, and `canonical_path`;
+- `symlink_chain`, as traversal-ordered objects containing exact `path` and
+  relative `target` strings;
+- `byte_count`, `sha256`, `gnu_build_id`, `dt_soname`, and `dt_needed`;
+- `package`, `version`, `architecture`, `dpkg_query_s_row`, and
+  `dpkg_query_w_row`;
+- `dpkg_list_file`, a `ByteFileRefV1` with exactly `path` and `sha256`; and
+- `provenance_kind`, `loader_input`, and `witness`.
+
+The array uses the six `sealed-non-glibc` keys followed by the six
+`host-glibc-witness` keys in the exact order listed later in this section.
+It rejects another order or a duplicate resolver key, path, canonical path,
+symlink-chain path, or package ownership row. `dt_needed` preserves ELF entry
+order and rejects a duplicate needed name. `symlink_chain` preserves traversal
+order and must end at `canonical_path`. The six glibc entries set
+`loader_input=false` and `witness=true`. The other six entries use the inverse.
+
+Each `ByteFileRefV1` must resolve to exactly one byte-identical
+`dpkg_metadata_files` entry. An absent, ambiguous, or unreferenced metadata
+entry fails. No nested representation can override a top-level byte identity.
+
+All schema-controlled strings and discovered path, package, ELF, and dpkg-row
+strings must be valid ASCII. The parser rejects a byte-order mark, carriage
+return, NUL, invalid UTF-8, non-ASCII code point, float, negative integer,
+boolean in an integer field, or integer outside unsigned 64-bit range. JSON
+integers use the shortest base-10 form. JSON strings preserve exact code units;
+no Unicode normalization or case folding occurs.
+
+Canonical envelope bytes are UTF-8 JSON with object keys sorted by code point,
+compact separators, the declared array orders, and one terminal line feed.
+The encoder emits only the shortest required JSON escapes. It rejects duplicate
+object keys before decoding into a typed value. The digest input is the ASCII
+domain string `vllm.cpp/worker-image-runtime-envelope/v1`, one NUL byte, and
+the canonical envelope bytes. SHA256 produces the envelope digest, encoded as
+exactly 64 lowercase hexadecimal characters. Structured JSON and base64 avoid
+unframed concatenation. The typed member list makes omission distinguishable
+from an empty value.
+
+The envelope excludes `RC_JOB_ID`, `RC_DEVICE`, boot ID, host name, mount
+label, loader-cache entry, timestamps, and the output path. The discovery
+receipt binds controller-issued lease and device authority, kernel boot
+authority, the canonical envelope bytes, and its digest as separate members.
+Controller authority can select where discovery runs, but it cannot change the
+derived envelope. The digest makes no claim about unrelated image files.
 
 The discovery phase runs through `rc run strix:gpu0`, never through SSH. It
 requires `RC_DEVICE=strix:gpu0` and a nonempty `RC_JOB_ID`. It initializes no
@@ -388,7 +527,7 @@ It rejects a new HSA, HIP, profiler, engine, or GPU mapping.
 
 The phase reads `/etc/os-release`, `/var/lib/dpkg/status`, the dpkg
 architecture, and the sorted `dpkg-query -W` rows. It binds each byte sequence,
-byte count, and SHA256. It also binds the dpkg executable and every dpkg
+byte count, and SHA256. It also binds both dpkg executables and every dpkg
 metadata file that supplies ownership for a selected file.
 
 The exact discovery set contains these six `sealed-non-glibc` keys:
@@ -423,15 +562,22 @@ version, architecture, exact `dpkg-query -S` row, exact `dpkg-query -W` row,
 and the byte identity of the package's dpkg list file. Missing data fails. The
 six glibc records remain witnesses and never become loader inputs.
 
-The deterministic receipt is UTF-8 JSON with sorted keys, compact separators,
-and one terminal newline. It contains the contract identifier, lease job,
-device, boot ID, runtime-relevant image digest, operating-system bindings,
-dpkg bindings, the qualification-bound eight-file subset, and the ordered 12
-records. The phase writes `worker-image-discovery-receipt.json` and its
-detached SHA256 file in a fresh staging directory. It fsyncs both files and the
-staging directory. It then publishes the directory with one same-filesystem
-rename and fsyncs the parent. It refuses overwrite. A partial or non-atomic
-receipt never authorizes preparation.
+The deterministic receipt has schema
+`vllm.cpp/worker-image-discovery-receipt/v1`. It uses the same canonical JSON
+rules. It contains the request schema, request mode, accepted-baseline receipt
+SHA256 or JSON `null` for bootstrap, `context_relation`, controller lease job,
+device, boot ID and source, canonical runtime envelope, envelope SHA256, and
+the ordered 12 binding fingerprints. Bootstrap uses `context_relation` value
+`initial-baseline`. The phase writes
+`worker-image-discovery-receipt.json` and
+`worker-image-discovery-receipt.json.sha256` in a fresh staging directory.
+The receipt ends in one line feed. The detached file is exactly 65 ASCII bytes:
+64 lowercase hexadecimal SHA256 characters over the exact receipt bytes, then
+one line feed. It has no filename, spaces, carriage return, or byte-order mark.
+
+The phase fsyncs both files and the staging directory. It then publishes the
+directory with one same-filesystem rename and fsyncs the parent. It refuses
+overwrite. A partial or non-atomic receipt never authorizes preparation.
 
 The public discovery command is:
 
@@ -447,22 +593,38 @@ The command is a thin client. It parses bytes, constructs one request, invokes
 the importable callable exactly once, and maps the result status to its exit
 status. It cannot implement another discovery or publication path.
 
-A receipt applies to one recorded lease job and boot. Preparation can consume
-it during that same job and boot. A fresh lease or reboot requires a new
-discovery phase and a new receipt. A fresh lease after a reboot is one such
-new context. After the first seal, the operator puts the
-runtime-relevant image digest and the 12 sealed identities in the strict
-profile manifest before preparation. Each later discovery request supplies
-those expected values. The phase must reproduce the same image digest and the
-same 12 paths and identities. An image, operating-system, dpkg, path, package,
-hash, build-ID, or symlink change fails closed as `IMAGE_DRIFT` or `FILE_DRIFT`.
-The implementation never relabels drift as a new accepted pin.
+A receipt applies to one recorded lease job and boot. Preparation consumes the
+newest replay or bootstrap receipt only in that same lease and boot. Replay
+observes a new current envelope, computes its digest, and compares the digest
+and all 12 binding fingerprints with the accepted baseline. It never copies a
+current value into a baseline field.
 
-Discovery returns one of three states. `SEALED` names the immutable receipt and
-detached hash. `PENDING_IMAGE_AUTHORITY` means that no valid lease identity or
-complete image envelope exists. `FAILED` names the first validation, discovery,
-drift, or publication error and preserves a bounded failure result outside the
-final name. Only `SEALED` reaches runtime-closure preparation.
+The context relation has these exact semantics:
+
+- `same-lease-same-boot` requires the current job, device, and kernel boot ID
+  to equal the baseline authority fields.
+- `fresh-lease-same-boot` requires a different nonempty job, the same device,
+  and the same kernel boot ID.
+- `fresh-lease-changed-boot` requires a different nonempty job, the same
+  device, and a different kernel boot ID.
+
+Only the permitted job and boot fields can differ. Every relation requires an
+identical envelope digest and an explicit field-by-field match for all 12 live
+bindings. A changed boot does not authorize image drift. An unexpected lease
+or boot relation returns `CONTEXT_RELATION_MISMATCH`. An envelope-member change
+returns `IMAGE_DRIFT`. A 12-binding change also returns `FILE_DRIFT`, even when
+another comparison already reported `IMAGE_DRIFT`. The result records all
+applicable failures and publishes no sealed receipt.
+
+Discovery returns one of these fail-closed states. `SEALED` names the immutable
+receipt and detached hash. `PENDING_CONTROLLER_AUTHORITY` means that controller
+lease or device authority is absent. `PENDING_IMAGE_AUTHORITY` applies only to
+a bootstrap that cannot derive a complete envelope. `INVALID_BASELINE` means
+that replay lacks a valid prior receipt, detached hash, accepted manifest, or
+matching baseline fields. `CONTEXT_RELATION_MISMATCH`, `IMAGE_DRIFT`, and
+`FILE_DRIFT` have the meanings defined earlier. `FAILED_PUBLICATION` preserves
+a bounded failure result outside the final name. Only `SEALED` reaches
+runtime-closure preparation.
 
 ### Public runtime-closure preparation
 
@@ -475,12 +637,15 @@ second closure algorithm.
 
 Its public signature is
 `prepare(request: RuntimeClosureRequest) -> RuntimeClosureResult`.
-`RuntimeClosureRequest` contains the strict profile manifest bytes, the sealed
-worker-image discovery receipt bytes and detached hash, and the new output
-directory. `RuntimeClosureResult` contains the contract identifier, status,
-output path, manifest, archive, receipt identities, fixed-point file and edge
-counts, total bytes, and `UNBOUND_COUNT`. The implementation owns these types
-and their strict JSON encodings in the same module as the callable.
+`RuntimeClosureRequest` contains exactly `profile_manifest_bytes`,
+`worker_image_receipt_bytes`, `worker_image_receipt_sha256`, and
+`output_directory`. The SHA256 field is a typed 32-byte value, not a path or
+unchecked string. The request constructor recomputes SHA256 over the exact
+receipt bytes and requires equality before `prepare()` can run.
+`RuntimeClosureResult` contains the contract identifier, status, output path,
+manifest, archive, receipt identities, fixed-point file and edge counts, total
+bytes, and `UNBOUND_COUNT`. The implementation owns these types and their
+strict JSON encodings in the same module as the callable.
 
 The public preparation command is:
 
@@ -489,8 +654,19 @@ python3 tools/bench/strix_worker_profile/worker.py \
   --phase prepare-runtime-closure \
   --manifest <manifest.json> \
   --worker-image-receipt <worker-image-discovery-receipt.json> \
+  --worker-image-receipt-sha256 \
+    <worker-image-discovery-receipt.json.sha256> \
   --output <new-directory>
 ```
+
+The hash flag is mandatory for preparation. Its file must contain exactly 65
+ASCII bytes: 64 lowercase hexadecimal characters and one line feed. The client
+rejects uppercase, a missing line feed, a second line, whitespace, a filename,
+a byte-order mark, or a carriage return. It decodes the 64 digits to the typed
+32-byte request field. It then hashes the exact receipt bytes and requires an
+equal value. Both paths must be regular nonsymlink files under declared roots.
+A missing file, crossed receipt and hash pair, receipt passed as the hash file,
+or hash file passed as the receipt fails before the callable is invoked.
 
 The preparation phase rejects `--engine`. It creates one engine-independent
 closure for both later arms. The existing profiled-process launch seam consumes
@@ -506,6 +682,12 @@ eight-file subset, and all 12 sealed paths against that receipt. Verification
 cannot change a selected path or provenance record. A mismatch fails before
 closure discovery. The sealed receipt and hash are the sole authority that `prepare()` consumes.
 Preparation and discovery must run in the same boot.
+
+For bootstrap, the profile manifest's accepted baseline SHA256 must equal the
+current receipt SHA256. For replay, the receipt's baseline SHA256 and 12
+baseline fingerprints must equal `worker_image_baseline` in the profile
+manifest. The current receipt must also record a successful comparison.
+Preparation rejects any other lineage before it reads a package payload.
 
 Preparation returns `PENDING_WORKER_IMAGE_RECEIPT` when the receipt or detached
 hash is missing. It returns `FAILED_WORKER_IMAGE_BINDING` for an invalid hash,
@@ -828,6 +1010,8 @@ python3 tools/bench/strix_worker_profile/worker.py \
   [--discovery-request <discovery-request.json>] \
   [--manifest <manifest.json>] \
   [--worker-image-receipt <worker-image-discovery-receipt.json>] \
+  [--worker-image-receipt-sha256 \
+    <worker-image-discovery-receipt.json.sha256>] \
   [--engine vllmcpp|vllm] \
   --output <new-directory>
 ```
@@ -842,13 +1026,15 @@ invoke the public launch seam exactly once.
 The discovery and preparation phases forbid `--engine`. The readiness and
 trace phases require it. Discovery requires `--discovery-request` and
 rejects `--manifest`. Preparation requires the manifest and worker-image
-receipt. Every phase rejects arguments that its selected phase does not own.
+receipt plus its detached SHA256 file. Every phase rejects arguments that its
+selected phase does not own.
 
 The discovery command invokes
 `vllm.cpp/worker-image-discovery/v1` exactly once. The preparation command
 invokes `vllm.cpp/runtime-loader-closure/v1` exactly once after the receipt
-gate passes. A missing or invalid receipt must prevent that call. The command
-accepts no implicit engine, model, profiler, or workload defaults.
+and detached-hash gate passes. A missing, malformed, mismatched, or swapped
+pair must prevent that call. The command accepts no implicit engine, model,
+profiler, or workload defaults.
 Arguments stored in the manifest are arrays and are never interpolated through
 a shell. The output directory must not exist. Hardware phases require
 `RC_DEVICE=strix:gpu0` and a nonempty `RC_JOB_ID`. The command rejects symlinks,
@@ -870,12 +1056,14 @@ The manifest schema identifier is
   fields, concurrency schedule, warmup schedule, and expected 128-token stop;
 - the permitted environment, ROCm library roots, device, lease, timeout,
   per-file limit, aggregate-output limit, and cleanup timeout;
-- the `vllm.cpp/worker-image-discovery/v1` contract, runtime-relevant image
-  digest, and exact 12 sealed live records;
+- the `vllm.cpp/worker-image-discovery/v1` contract and a
+  `worker_image_baseline` object with the accepted receipt SHA256, envelope
+  SHA256, and exact 12 binding fingerprints;
 - the runtime-closure schema, closed SONAME binding map, exact selected source
   files, provenance kinds, pinned worker image, closure limits, and required
   source categories;
-- the worker-image discovery receipt path, byte count, SHA256, lease, and boot;
+- the current worker-image discovery receipt path, byte count, SHA256, lease,
+  boot, baseline receipt SHA256, and context relation;
 - the closure manifest, archive, and receipt paths, byte counts, and SHA256 values;
 - the sealed interpreter and host-glibc file identities; and
 - the `vllm.cpp/profiled-process-tree-launch/v1` seam version, exact production
@@ -1069,18 +1257,46 @@ CPU tests use temporary files and real bounded subprocesses where lifecycle
 ordering matters. They simulate the profiler and production process tree; they
 do not claim GPU coverage. At minimum they prove:
 
-- worker-image discovery rejects a missing lease identity, wrong device,
-  incomplete image envelope, or caller-selected current-host identity;
+- bootstrap rejects every replay-only field, and replay rejects a missing or
+  malformed accepted manifest, baseline receipt, or detached baseline hash;
+- both request types reject a caller-supplied current lease, device, boot,
+  image, package, or library identity;
+- discovery rejects a missing controller lease identity, wrong device, invalid
+  kernel boot-ID bytes, or another boot-identity source;
+- relation fixtures cover same job and boot, fresh job and same boot, and fresh
+  job and changed boot. Every unexpected job or boot relation fails;
+- replay compares a newly observed envelope digest and all 12 binding
+  fingerprints with the explicit accepted baseline. A current observation can
+  never replace an expected value;
 - worker-image discovery seals exactly 12 live records and rejects a missing
   path, multiple candidate, missing dpkg owner, changed image, changed
   operating-system or dpkg bytes, or changed path, hash, build ID, package, or
   symlink for any one record;
+- one table-driven envelope suite enumerates all nine top-level members and
+  every member of `ByteFileV1`, the package-row object,
+  `QualificationBindingV1`, `WorkerFileBindingV1`, `ByteFileRefV1`, and the
+  symlink-chain object. For each object member, it removes the member, changes
+  one type-valid value, and injects a duplicate JSON key. For each array, it
+  removes, changes, duplicates, and reorders one element. Every case must fail
+  parsing or change the canonical bytes and digest, then fail baseline replay;
+- envelope fixtures reject an alternate domain, schema, key encoding, string
+  normalization, integer encoding, base64 encoding, array order, duplicate
+  identity, missing terminal line feed, or non-lowercase digest;
+- authority fixtures prove that changing a lease job or boot according to the
+  declared relation leaves the envelope digest unchanged. Injecting authority
+  fields into the envelope fails the exact-member parser;
 - deterministic discovery fixtures reproduce byte-identical receipt and hash
   bytes, and interrupted or non-atomic publication never creates a usable
   final receipt;
 - closure preparation rejects a missing receipt, missing detached hash,
   receipt-hash mismatch, wrong lease or boot, changed image, or a change to any
   one of the 12 bindings before package extraction;
+- the public preparation command requires `--worker-image-receipt-sha256` and
+  accepts only its exact 65-byte encoding. Missing, mismatched, malformed, and
+  crossed receipt and hash paths fail before the public callable runs;
+- a valid receipt and hash pair reaches the public preparation callable once,
+  with the exact receipt bytes and decoded 32-byte hash in
+  `RuntimeClosureRequest`;
 - closure preparation cannot read the loader cache, enumerate a live library
   directory, run dpkg ownership discovery, select another path, or publish a
   replacement worker-image receipt;
@@ -1151,13 +1367,18 @@ at-fork receipt, one category check, graph-replay join, scheduler-shape join,
 finalization-order check, post-run binding check, output bound, and eager or
 preload refusal one at a time. Remove the discovery receipt or its detached
 hash. Accept a self-authorized current host, changed image, or changed one of
-the exact 12 bindings. Make preparation rediscover one binding. Publish a
-non-atomic receipt. Each mutation must fail independently. Mutate an omitted
-transitive dependency, symlink, file hash, build ID, archive hash, host glibc
-mismatch, resource limit, live fallback, source class, selected path,
-provenance kind, undeclared SONAME, and second-walk edge independently. The
-focused suite must detect each mutation. Restore the tree byte-for-byte after
-every mutation.
+the exact 12 bindings. Replace a replay expectation with the current
+observation. Change each context relation and replace the kernel boot source.
+Omit, alter, duplicate, and reorder every envelope member through the shared
+parameterized inventory. Remove the hash domain or inject controller authority
+into the envelope. Remove the prepare hash flag, accept a malformed detached
+file, and swap two valid receipt and hash pairs. Make preparation rediscover
+one binding. Publish a non-atomic receipt. Each mutation must fail
+independently. Mutate an omitted transitive dependency, symlink, file hash,
+build ID, archive hash, host glibc mismatch, resource limit, live fallback,
+source class, selected path, provenance kind, undeclared SONAME, and
+second-walk edge independently. The focused suite must detect each mutation.
+Restore the tree byte-for-byte after every mutation.
 
 ## Hardware stages and gates
 
@@ -1170,9 +1391,10 @@ uses these gates in order:
 3. Full repository preflight with `scripts/agent-preflight.sh`.
 4. Fresh static and mutation review of the immutable implementation commit.
 5. Operator rerun of the focused suite and full preflight.
-6. One leased `discover-worker-image` phase. It derives the runtime-relevant
-   image digest, initializes no GPU runtime, and atomically publishes the
-   sealed worker-image receipt.
+6. One leased `discover-worker-image` phase. The first campaign run uses the
+   bootstrap request. A later run uses replay with the prior accepted receipt,
+   detached hash, and exact context relation. Both modes initialize no GPU
+   runtime and atomically publish the sealed worker-image receipt.
 7. One `prepare-runtime-closure` phase in the same lease and boot. It consumes
    only that receipt for the image and 12 live records. It atomically publishes
    the bounded closure.
@@ -1186,7 +1408,9 @@ uses these gates in order:
 
 Stages 6 through 10 use one lease and boot when one lease can contain them. If
 a later stage starts in a fresh lease or after a reboot, rerun stages 6 through
-8 first. The old worker-image receipt cannot authorize the new context.
+8 with a replay request first. Use `fresh-lease-same-boot` or
+`fresh-lease-changed-boot` as observed. The prior receipt supplies comparison
+expectations only. It cannot authorize preparation in the new context.
 
 The hardware report records every command exit, omitted gate, resource stop,
 and failed completeness rule. A passing CPU suite cannot replace a hardware
@@ -1206,9 +1430,9 @@ receipt. An implementer or reviewer report cannot replace the operator's gate.
 - A reboot can invalidate worker-local builds. The recovery path rebuilds from
   the verified package set and sealed closure. It rebinds every binary and
   library before bootstrap.
-- A fresh lease or reboot invalidates the old worker-image receipt. The new
-  discovery phase must reproduce the pinned image digest and all 12 records
-  before preparation can run.
+- A fresh lease or reboot invalidates the old receipt for preparation. The old
+  receipt remains the accepted replay baseline. The new discovery must match
+  its image digest and all 12 records before preparation can run.
 - A copied glibc can corrupt a running Python process. The launch seam never
   loads the archived glibc witnesses and requires byte-identical host files.
 - A live system fallback can make one run pass and the rebooted run fail. The
@@ -1223,10 +1447,16 @@ Stop without attribution or optimization when any of these occurs:
 - the Strix lease is absent, lost, or shared with an unrelated GPU job;
 - discovery cannot derive the complete image envelope, or its lease, device,
   boot, or runtime-relevant digest differs;
+- replay lacks the explicit accepted baseline receipt and detached hash, uses
+  another boot source, or observes a lease and boot relation that its request
+  does not declare;
+- replay replaces a baseline digest or binding with a current observation, or
+  a second bootstrap attempts to continue the accepted campaign;
 - worker-image discovery does not seal exactly 12 records or cannot publish
   its receipt and detached hash with one atomic directory rename;
 - preparation lacks the sealed worker-image receipt or detached hash, accepts
-  a self-authorized current host, or tries to rediscover a live binding;
+  a malformed, mismatched, or swapped pair, accepts a self-authorized current
+  host, or tries to rediscover a live binding;
 - the sealed image, operating-system bytes, dpkg identity, or any one of the
   12 sealed path, hash, build-ID, package, or symlink records changes;
 - a pin, archive, model file, binary, library, build ID, configuration, or

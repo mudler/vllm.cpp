@@ -1,0 +1,575 @@
+diff --git a/source/lib/rocprofv3-attach/CMakeLists.txt b/source/lib/rocprofv3-attach/CMakeLists.txt
+index a4580e5ea..11eca8da4 100644
+--- a/source/lib/rocprofv3-attach/CMakeLists.txt
++++ b/source/lib/rocprofv3-attach/CMakeLists.txt
+@@ -23,6 +23,8 @@
+ rocprofiler_activate_clang_tidy()
+
+ add_library(rocprofv3-attach SHARED)
++find_package(OpenSSL REQUIRED COMPONENTS Crypto)
++target_link_libraries(rocprofv3-attach PRIVATE OpenSSL::Crypto)
+ target_sources(rocprofv3-attach PRIVATE rocprofv3_attach.cpp ptrace_session.cpp)
+
+ target_link_libraries(
+diff --git a/source/lib/rocprofv3-attach/identity_guard.hpp b/source/lib/rocprofv3-attach/identity_guard.hpp
+new file mode 100644
+index 000000000..b1b69b8df
+--- /dev/null
++++ b/source/lib/rocprofv3-attach/identity_guard.hpp
+@@ -0,0 +1,384 @@
++// Controller-local attachment guard, vllm.cpp #3076. MIT license.
++// This header is included after the upstream get_library_handle implementation.
++#pragma once
++#include <elf.h>
++#include <sys/sysmacros.h>
++#include <sys/syscall.h>
++#include <openssl/evp.h>
++#include <set>
++#include <iomanip>
++#include <limits>
++
++namespace rocprofiler { namespace attach {
++namespace identity {
++inline void require(bool ok, const char* reason) {
++    if(!ok) throw std::runtime_error(reason);
++}
++struct Fd {
++    int value = -1;
++    explicit Fd(int v = -1): value(v) {}
++    ~Fd() { if(value >= 0) ::close(value); }
++    Fd(const Fd&) = delete;
++    Fd& operator=(const Fd&) = delete;
++};
++inline std::string text_at(int dir, const char* name) {
++    Fd f(openat(dir, name, O_RDONLY | O_CLOEXEC));
++    require(f.value >= 0, "unreadable process metadata");
++    std::string out;
++    char buffer[8192];
++    ssize_t n;
++    while((n = read(f.value, buffer, sizeof buffer)) > 0) {
++        require(out.size() + n <= 16 * 1024 * 1024, "oversized process metadata");
++        out.append(buffer, n);
++    }
++    require(n == 0, "process metadata read failed");
++    return out;
++}
++inline std::string start_time(int dir) {
++    auto stat = text_at(dir, "stat");
++    auto end = stat.rfind(')');
++    require(end != std::string::npos, "malformed process stat");
++    std::istringstream fields(stat.substr(end + 1));
++    std::string value;
++    for(int i = 3; i <= 22; ++i) {
++        require(bool(fields >> value), "truncated process stat");
++        if(i == 3) require(value != "Z" && value != "X", "target process exited");
++    }
++    return value;
++}
++inline bool same_stat(const struct stat& a, const struct stat& b) {
++    return a.st_dev == b.st_dev && a.st_ino == b.st_ino && a.st_size == b.st_size &&
++           a.st_mtim.tv_sec == b.st_mtim.tv_sec && a.st_mtim.tv_nsec == b.st_mtim.tv_nsec &&
++           a.st_ctim.tv_sec == b.st_ctim.tv_sec && a.st_ctim.tv_nsec == b.st_ctim.tv_nsec;
++}
++struct File {
++    Fd fd;
++    struct stat stat{};
++    std::vector<uint8_t> bytes;
++    explicit File(int value): fd(value) {
++        require(value >= 0, "unreadable mapped backing file");
++        require(fstat(value, &stat) == 0 && S_ISREG(stat.st_mode) && stat.st_nlink > 0,
++                "invalid mapped backing file");
++        require(stat.st_size > 0 && stat.st_size <= 512 * 1024 * 1024,
++                "invalid backing file size");
++        bytes.resize(stat.st_size);
++        size_t pos = 0;
++        while(pos < bytes.size()) {
++            auto n = pread(value, bytes.data() + pos, bytes.size() - pos, pos);
++            require(n > 0, "backing file read failed");
++            pos += n;
++        }
++        recheck();
++    }
++    void recheck() const {
++        struct stat now{};
++        require(fstat(fd.value, &now) == 0 && now.st_nlink > 0 && same_stat(stat, now),
++                "backing file changed during validation");
++    }
++    template<class T> T object(uint64_t offset) const {
++        require(offset <= bytes.size() && sizeof(T) <= bytes.size() - offset, "truncated ELF");
++        T result;
++        memcpy(&result, bytes.data() + offset, sizeof result);
++        return result;
++    }
++    std::string hash() const {
++        unsigned char digest[EVP_MAX_MD_SIZE]; unsigned int n = 0;
++        require(EVP_Digest(bytes.data(), bytes.size(), digest, &n, EVP_sha256(), nullptr) == 1,
++                "SHA256 failed");
++        std::ostringstream out;
++        for(unsigned int i = 0; i < n; ++i)
++            out << std::hex << std::setw(2) << std::setfill('0') << unsigned(digest[i]);
++        return out.str();
++    }
++};
++struct Elf {
++    const File& file;
++    Elf64_Ehdr header;
++    std::vector<Elf64_Phdr> loads;
++    std::string build_id;
++    explicit Elf(const File& f): file(f), header(f.object<Elf64_Ehdr>(0)) {
++        require(memcmp(header.e_ident, ELFMAG, SELFMAG) == 0 &&
++                header.e_ident[EI_CLASS] == ELFCLASS64 && header.e_ident[EI_DATA] == ELFDATA2LSB &&
++                header.e_type == ET_DYN && header.e_machine == EM_X86_64 &&
++                header.e_phentsize == sizeof(Elf64_Phdr) && header.e_phnum > 0 &&
++                header.e_phnum < 1024, "unsupported ELF object");
++        for(unsigned i = 0; i < header.e_phnum; ++i) {
++            auto p = f.object<Elf64_Phdr>(header.e_phoff + uint64_t(i) * sizeof(Elf64_Phdr));
++            require(p.p_offset <= f.bytes.size() && p.p_filesz <= f.bytes.size() - p.p_offset,
++                    "ELF segment outside file");
++            if(p.p_type == PT_LOAD) loads.push_back(p);
++            if(p.p_type != PT_NOTE) continue;
++            uint64_t off = p.p_offset, end = off + p.p_filesz;
++            while(off < end) {
++                require(end - off >= sizeof(Elf64_Nhdr), "truncated ELF note");
++                auto note = f.object<Elf64_Nhdr>(off); off += sizeof note;
++                uint64_t names = (uint64_t(note.n_namesz) + 3) & ~uint64_t(3);
++                uint64_t desc = (uint64_t(note.n_descsz) + 3) & ~uint64_t(3);
++                require(names <= end - off && desc <= end - off - names, "invalid ELF note");
++                if(note.n_type == NT_GNU_BUILD_ID && note.n_namesz == 4 &&
++                   memcmp(f.bytes.data() + off, "GNU", 4) == 0) {
++                    require(build_id.empty() && note.n_descsz > 0, "ambiguous ELF build ID");
++                    std::ostringstream out;
++                    for(unsigned j = 0; j < note.n_descsz; ++j)
++                        out << std::hex << std::setw(2) << std::setfill('0')
++                            << unsigned(f.bytes[off + names + j]);
++                    build_id = out.str();
++                }
++                off += names + desc;
++            }
++        }
++        require(!loads.empty() && !build_id.empty(), "missing ELF load segments or build ID");
++    }
++    uint64_t symbol(const char* wanted) const {
++        require(header.e_shentsize == sizeof(Elf64_Shdr) && header.e_shnum > 0,
++                "missing ELF symbol sections");
++        uint64_t value = 0; unsigned count = 0;
++        for(unsigned i = 0; i < header.e_shnum; ++i) {
++            auto s = file.object<Elf64_Shdr>(header.e_shoff + uint64_t(i) * sizeof(Elf64_Shdr));
++            if(s.sh_type != SHT_DYNSYM) continue;
++            require(s.sh_link < header.e_shnum && s.sh_entsize == sizeof(Elf64_Sym) &&
++                    s.sh_size % sizeof(Elf64_Sym) == 0 && s.sh_size <= file.bytes.size(),
++                    "malformed dynamic symbols");
++            auto names = file.object<Elf64_Shdr>(header.e_shoff + uint64_t(s.sh_link) * sizeof(Elf64_Shdr));
++            require(names.sh_offset <= file.bytes.size() && names.sh_size <= file.bytes.size() - names.sh_offset,
++                    "malformed symbol names");
++            for(uint64_t j = 0; j < s.sh_size / sizeof(Elf64_Sym); ++j) {
++                auto sym = file.object<Elf64_Sym>(s.sh_offset + j * sizeof(Elf64_Sym));
++                require(sym.st_name < names.sh_size, "invalid symbol name offset");
++                const char* name = reinterpret_cast<const char*>(file.bytes.data() + names.sh_offset + sym.st_name);
++                require(memchr(name, 0, names.sh_size - sym.st_name) != nullptr, "unterminated symbol name");
++                if(strcmp(name, wanted) != 0 || sym.st_shndx == SHN_UNDEF) continue;
++                require(ELF64_ST_TYPE(sym.st_info) == STT_FUNC &&
++                        (ELF64_ST_BIND(sym.st_info) == STB_GLOBAL || ELF64_ST_BIND(sym.st_info) == STB_WEAK),
++                        "unsupported registration symbol");
++                bool executable = false;
++                for(auto p : loads) if((p.p_flags & PF_X) && sym.st_value >= p.p_vaddr &&
++                    sym.st_value - p.p_vaddr < p.p_memsz) executable = true;
++                require(executable, "registration symbol outside executable segment");
++                value = sym.st_value; ++count;
++            }
++        }
++        require(count == 1, "missing or ambiguous registration symbol");
++        return value;
++    }
++};
++struct Map {
++    uint64_t begin, end, offset, inode;
++    unsigned major, minor;
++    std::string path, permissions;
++};
++inline std::vector<Map> maps(int proc, const char* basename) {
++    std::istringstream lines(text_at(proc, "maps"));
++    std::vector<Map> result;
++    std::string line;
++    while(std::getline(lines, line)) {
++        Map m{}; char perms[5]; int consumed = 0;
++        unsigned long long begin, end, offset, inode;
++        require(sscanf(line.c_str(), "%llx-%llx %4s %llx %x:%x %llu %n",
++                       &begin, &end, perms, &offset, &m.major, &m.minor, &inode, &consumed) == 7,
++                "malformed process mapping");
++        m.begin = begin; m.end = end; m.offset = offset; m.inode = inode;
++        m.permissions = perms;
++        m.path = line.substr(consumed);
++        auto filename = fs::path(m.path).filename().string();
++        if(filename != basename && filename.rfind(std::string(basename) + ".", 0) != 0 &&
++           filename != std::string(basename) + " (deleted)") continue;
++        require(m.path.find(" (deleted)") == std::string::npos && m.path[0] == '/' &&
++                m.inode > 0 && m.end > m.begin, "deleted or invalid mapped object");
++        result.push_back(m);
++    }
++    require(!result.empty(), "required object is not mapped");
++    return result;
++}
++struct Object {
++    std::vector<Map> mappings;
++    File file;
++    Elf elf;
++    uint64_t bias = 0;
++    static int open_file(int proc, const std::vector<Map>& m) {
++        return openat(proc, ("root" + m.front().path).c_str(), O_RDONLY | O_CLOEXEC);
++    }
++    static void require_map(bool ok, const Map& m, const char* reason) {
++        if(ok) return;
++        std::ostringstream out;
++        out << reason << ": object=" << m.path << " map=" << std::hex << m.begin
++            << '-' << m.end << " permissions=" << m.permissions << " offset=" << m.offset;
++        throw std::runtime_error(out.str());
++    }
++    Object(int proc, const char* name): mappings(maps(proc, name)), file(open_file(proc, mappings)), elf(file) {
++        const long system_page = sysconf(_SC_PAGESIZE);
++        require(system_page > 0, "invalid system page size");
++        const uint64_t page = system_page;
++        auto floor = [page](uint64_t n) { return n - n % page; };
++        auto add = [](uint64_t a, uint64_t b) {
++            require(b <= UINT64_MAX - a, "ELF allocation arithmetic overflow");
++            return a + b;
++        };
++        auto ceil = [&](uint64_t n) { return add(n, (page - n % page) % page); };
++        std::set<uint64_t> candidates;
++        for(const auto& m : mappings) {
++            require_map(m.inode == file.stat.st_ino && makedev(m.major, m.minor) == file.stat.st_dev, m,
++                    "ambiguous or replaced mapped backing file");
++            for(auto p : elf.loads) if(m.offset == floor(p.p_offset) && m.begin >= floor(p.p_vaddr))
++                candidates.insert(m.begin - floor(p.p_vaddr));
++        }
++        std::set<uint64_t> instances;
++        for(auto candidate : candidates) {
++            bool all_loads = true;
++            for(auto p : elf.loads) {
++                if(!p.p_filesz) continue;
++                bool found = false;
++                for(auto m : mappings)
++                    if(m.begin <= candidate + floor(p.p_vaddr) && m.end > candidate + floor(p.p_vaddr) &&
++                       m.offset + candidate + floor(p.p_vaddr) - m.begin == floor(p.p_offset)) found = true;
++                all_loads &= found;
++            }
++            if(all_loads) instances.insert(candidate);
++        }
++        require(instances.size() == 1, "ambiguous ELF load instances");
++        bias = *instances.begin();
++        // Every file-backed byte must remain mapped at its ELF offset. Segment
++        // starts alone miss holes later in a multi-page executable segment.
++        for(auto p : elf.loads) {
++            require(p.p_vaddr <= UINT64_MAX - bias && p.p_filesz <= UINT64_MAX - bias - p.p_vaddr,
++                    "ELF load address overflow");
++            uint64_t cursor = bias + p.p_vaddr, end = cursor + p.p_filesz;
++            while(cursor < end) {
++                uint64_t next = cursor;
++                for(const auto& m : mappings)
++                    if(m.begin <= cursor && cursor < m.end &&
++                       m.offset + cursor - m.begin == p.p_offset + cursor - bias - p.p_vaddr)
++                        next = std::min(end, m.end);
++                require(next > cursor, "incomplete mapped ELF segment");
++                cursor = next;
++            }
++        }
++        // glibc-2.39 elf/dl-map-segments.h:75-111 reserves from the first
++        // load's file offset. Allocation tails (135-173) are not holes.
++        std::vector<std::pair<uint64_t, uint64_t>> allocations;
++        for(auto p : elf.loads) {
++            require(p.p_filesz <= p.p_memsz, "ELF file bytes exceed allocation");
++            allocations.emplace_back(add(bias, floor(p.p_vaddr)),
++                                     add(bias, ceil(add(p.p_vaddr, p.p_memsz))));
++        }
++        const uint64_t first = allocations.front().first;
++        const uint64_t first_offset = floor(elf.loads.front().p_offset);
++        for(auto m : mappings) {
++            bool covered = false;
++            for(auto p : elf.loads) {
++                uint64_t end = add(bias, ceil(add(p.p_vaddr, p.p_filesz)));
++                if(m.begin >= bias + floor(p.p_vaddr) && m.end <= end &&
++                   m.offset == floor(p.p_offset) + m.begin - bias - floor(p.p_vaddr)) covered = true;
++            }
++            bool right = false, overlap = false;
++            for(auto allocation : allocations) {
++                right |= allocation.first >= m.end;
++                overlap |= m.begin < allocation.second && m.end > allocation.first;
++            }
++            const bool reservation = m.permissions == "---p" &&
++                m.begin % page == 0 && m.end % page == 0 &&
++                right && !overlap && m.begin >= allocations.front().second &&
++                m.offset == add(first_offset, m.begin - first);
++            require_map(covered || reservation, m, "unaccounted mapped load instance");
++        }
++    }
++    void executable_symbol(uint64_t offset) const {
++        require(offset <= UINT64_MAX - bias, "registration address overflow");
++        auto address = bias + offset;
++        bool found = false;
++        for(auto p : elf.loads) if((p.p_flags & PF_X) && offset >= p.p_vaddr && offset - p.p_vaddr < p.p_filesz)
++            for(const auto& m : mappings)
++                if(m.begin <= address && address < m.end && m.permissions.size() == 4 &&
++                   m.permissions[2] == 'x' &&
++                   m.offset + address - m.begin == p.p_offset + offset - p.p_vaddr) found = true;
++        require(found, "registration address is not in an executable mapping");
++    }
++    void recheck(int proc, const char* name) const {
++        Object now(proc, name);
++        require(same_stat(file.stat, now.file.stat) && file.bytes == now.file.bytes && bias == now.bias &&
++                mappings.size() == now.mappings.size(), "mapped object identity changed");
++        for(size_t i = 0; i < mappings.size(); ++i)
++            require(mappings[i].begin == now.mappings[i].begin && mappings[i].end == now.mappings[i].end &&
++                    mappings[i].offset == now.mappings[i].offset && mappings[i].path == now.mappings[i].path &&
++                    mappings[i].permissions == now.mappings[i].permissions,
++                    "mapped segments changed");
++        file.recheck();
++    }
++};
++inline std::string quote(const std::string& s) {
++    std::ostringstream out; out << '"';
++    for(unsigned char c : s) {
++        if(c == '"' || c == '\\') out << '\\' << c;
++        else if(c < 32) out << "\\u" << std::hex << std::setw(4) << std::setfill('0') << unsigned(c);
++        else out << c;
++    }
++    out << '"'; return out.str();
++}
++inline std::string report_object(const Object& o) {
++    return "{\"path\":" + quote(o.mappings.front().path) + ",\"sha256\":" + quote(o.file.hash()) +
++           ",\"build_id\":" + quote(o.elf.build_id) + ",\"load_bias\":" + std::to_string(o.bias) + "}";
++}
++} // namespace identity
++
++class IdentityGuard {
++    identity::Fd proc, self, pidfd;
++    std::string start;
++    void* handle = nullptr;
++    std::unique_ptr<identity::Object> local, target, sdk;
++public:
++    uint64_t attach_address = 0, detach_address = 0;
++    uint64_t attach_offset = 0, detach_offset = 0;
++    explicit IdentityGuard(uint32_t pid):
++        proc(open(("/proc/" + std::to_string(pid)).c_str(), O_DIRECTORY | O_CLOEXEC)),
++        self(open("/proc/self", O_DIRECTORY | O_CLOEXEC)),
++        pidfd(syscall(SYS_pidfd_open, pid, 0)) {
++        using namespace identity;
++        require(pid > 0 && pid <= INT_MAX && proc.value >= 0 && self.value >= 0 && pidfd.value >= 0,
++                "invalid or unavailable process identity");
++        start = start_time(proc.value);
++        handle = get_library_handle("librocprofiler-register.so");
++        require(handle != nullptr, "controller registration loader failed");
++        try {
++            local = std::make_unique<Object>(self.value, "librocprofiler-register.so");
++            target = std::make_unique<Object>(proc.value, "librocprofiler-register.so");
++            sdk = std::make_unique<Object>(proc.value, "librocprofiler-sdk.so");
++            require(local->file.bytes == target->file.bytes, "controller and target registration bytes differ");
++            auto resolve = [&](const char* name) {
++                void* address = dlsym(handle, name); Dl_info info{};
++                link_map* loaded = nullptr; link_map* owner = nullptr;
++                require(dlinfo(handle, RTLD_DI_LINKMAP, &loaded) == 0 && loaded && address &&
++                        dladdr1(address, &info, reinterpret_cast<void**>(&owner), RTLD_DL_LINKMAP) != 0 &&
++                        owner == loaded && uint64_t(loaded->l_addr) == local->bias,
++                        "registration symbol resolved from a different object");
++                auto offset = reinterpret_cast<uint64_t>(address) - local->bias;
++                require(offset == local->elf.symbol(name) && offset == target->elf.symbol(name),
++                        "registration symbol offsets differ");
++                local->executable_symbol(offset);
++                target->executable_symbol(offset);
++                return offset;
++            };
++            attach_offset = resolve("rocprofiler_register_attach");
++            detach_offset = resolve("rocprofiler_register_detach");
++            attach_address = target->bias + attach_offset;
++            detach_address = target->bias + detach_offset;
++            recheck();
++        } catch(...) { dlclose(handle); handle = nullptr; throw; }
++    }
++    ~IdentityGuard() { if(handle) dlclose(handle); }
++    void recheck() const {
++        using namespace identity;
++        require(start_time(proc.value) == start, "process identity changed");
++        local->recheck(self.value, "librocprofiler-register.so");
++        target->recheck(proc.value, "librocprofiler-register.so");
++        sdk->recheck(proc.value, "librocprofiler-sdk.so");
++        require(start_time(proc.value) == start, "process identity changed during validation");
++    }
++    std::string report(uint32_t pid) const {
++        return "{\"status\":\"PASS\",\"target_mutated\":false,\"pid\":" + std::to_string(pid) +
++               ",\"start_time\":" + identity::quote(start) + ",\"controller\":" + identity::report_object(*local) +
++               ",\"target\":" + identity::report_object(*target) + ",\"sdk\":" + identity::report_object(*sdk) +
++               ",\"attach_offset\":" + std::to_string(attach_offset) +
++               ",\"detach_offset\":" + std::to_string(detach_offset) + "}\n";
++    }
++};
++}} // namespace rocprofiler::attach
+diff --git a/source/lib/rocprofv3-attach/ptrace_session.cpp b/source/lib/rocprofv3-attach/ptrace_session.cpp
+index d2579dbeb..accb61a66 100644
+--- a/source/lib/rocprofv3-attach/ptrace_session.cpp
++++ b/source/lib/rocprofv3-attach/ptrace_session.cpp
+@@ -239,6 +239,8 @@ get_library_handle(std::string_view _lib_name)
+
+ }  // namespace
+
++#include "identity_guard.hpp"
++
+ namespace rocprofiler
+ {
+ namespace attach
+@@ -247,6 +249,50 @@ PTraceSession::PTraceSession(int _pid)
+ : m_pid{_pid}
+ {}
+
++int controller_preflight(uint32_t pid, int report_fd)
++{
++    try
++    {
++        IdentityGuard guard(pid);
++        guard.recheck();
++        auto report = guard.report(pid);
++        size_t sent = 0;
++        while(sent < report.size())
++        {
++            auto n = ::write(report_fd, report.data() + sent, report.size() - sent);
++            identity::require(n > 0, "preflight report write failed");
++            sent += n;
++        }
++        return 0;
++    }
++    catch(const std::exception& error)
++    {
++        ROCP_ERROR << "Preflight rejected: " << error.what() << '\n';
++        return 1;
++    }
++}
++
++bool PTraceSession::prepare_identity()
++{
++    try { m_identity = std::make_unique<IdentityGuard>(m_pid); return true; }
++    catch(const std::exception& error) {
++        ROCP_ERROR << "Attachment rejected before seizure: " << error.what() << '\n';
++        return false;
++    }
++}
++
++bool PTraceSession::recheck_identity() const
++{
++    try {
++        identity::require(bool(m_identity), "missing attachment identity guard");
++        m_identity->recheck(); return true;
++    } catch(const std::exception& error) {
++        ROCP_ERROR << "Attachment identity recheck rejected (seized=" << m_attached
++                   << "): " << error.what() << '\n';
++        return false;
++    }
++}
++
+ PTraceSession::~PTraceSession()
+ {
+     if(m_attached)
+@@ -258,9 +304,16 @@ PTraceSession::~PTraceSession()
+ bool
+ PTraceSession::attach()
+ {
++    if(!recheck_identity()) return false;
+     PTRACE_CALL(PTRACE_SEIZE, m_pid, NULL, NULL);
+     ROCP_INFO << "Successfully attached to pid " << m_pid;
+     m_attached = true;
++    if(!recheck_identity())
++    {
++        // PTRACE_DETACH requires a ptrace stop. No target memory or registers are written.
++        if(stop()) detach();
++        return false;
++    }
+     return true;
+ }
+
+@@ -750,6 +803,16 @@ PTraceSession::find_library(void*& addr, int inpid, const std::string& library)
+ bool
+ PTraceSession::find_symbol(void*& addr, const std::string& library, const std::string& symbol)
+ {
++    if(library == "librocprofiler-register.so")
++    {
++        if(!recheck_identity()) return false;
++        if(symbol == "rocprofiler_register_attach")
++            addr = reinterpret_cast<void*>(m_identity->attach_address);
++        else if(symbol == "rocprofiler_register_detach")
++            addr = reinterpret_cast<void*>(m_identity->detach_address);
++        else return false;
++        return true;
++    }
+     auto searchname = std::stringstream{};
+     searchname << library << "::" << symbol;
+     if(auto itr = m_target_symbol_addrs.find(searchname.str()); itr != m_target_symbol_addrs.end())
+diff --git a/source/lib/rocprofv3-attach/ptrace_session.hpp b/source/lib/rocprofv3-attach/ptrace_session.hpp
+index fe7e4eaad..85bdbf283 100644
+--- a/source/lib/rocprofv3-attach/ptrace_session.hpp
++++ b/source/lib/rocprofv3-attach/ptrace_session.hpp
+@@ -32,11 +32,14 @@
+ #include <thread>
+ #include <unordered_map>
+ #include <vector>
++#include <memory>
+
+ namespace rocprofiler
+ {
+ namespace attach
+ {
++class IdentityGuard;
++int controller_preflight(uint32_t pid, int report_fd);
+ class PTraceSession
+ {
+ public:
+@@ -44,6 +47,8 @@ public:
+     ~PTraceSession();
+
+     bool attach();
++    bool prepare_identity();
++    bool recheck_identity() const;
+     bool detach();
+     bool simple_mmap(void*& addr, size_t length) const;
+     bool simple_munmap(void*& addr, size_t length) const;
+@@ -72,6 +77,7 @@ public:
+     std::atomic<rocprofiler_status_t> m_setup_status = ROCPROFILER_STATUS_SUCCESS;
+
+ private:
++    std::unique_ptr<IdentityGuard> m_identity;
+     static bool find_library(void*& addr, int inpid, const std::string& library);
+     bool        find_symbol(void*& addr, const std::string& library, const std::string& symbol);
+
+diff --git a/source/lib/rocprofv3-attach/rocprofv3_attach.cpp b/source/lib/rocprofv3-attach/rocprofv3_attach.cpp
+index 49e19af67..35ca64023 100644
+--- a/source/lib/rocprofv3-attach/rocprofv3_attach.cpp
++++ b/source/lib/rocprofv3-attach/rocprofv3_attach.cpp
+@@ -48,6 +48,8 @@ attach(uint32_t pid) ROCPROFILER_EXPORT;
+
+ int
+ detach() ROCPROFILER_EXPORT;
++int
++preflight(uint32_t pid, int report_fd) ROCPROFILER_EXPORT;
+ ROCPROFILER_EXTERN_C_FINI
+
+ void
+@@ -144,12 +146,24 @@ build_environment_buffer()
+
+ ROCPROFILER_EXTERN_C_INIT
+
++int
++preflight(uint32_t pid, int report_fd)
++{
++    return rocprofiler::attach::controller_preflight(pid, report_fd);
++}
++
+ void
+ handle_ptrace_operations(uint32_t pid)
+ {
+     // Setup attachement for rocprofiler
+     ROCP_TRACE << "Attachment library called for pid " << pid;
+     ptrace_session = std::make_unique<rocprofiler::attach::PTraceSession>(pid);
++    if(!ptrace_session->prepare_identity())
++    {
++        ptrace_session->m_setup_status.store(ROCPROFILER_STATUS_ERROR_INVALID_ARGUMENT);
++        finished_setup.store(true);
++        return;
++    }
+     ROCP_TRACE << "Attempting attachment to pid " << pid;
+     if(!ptrace_session->attach())
+     {

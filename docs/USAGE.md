@@ -12,6 +12,71 @@ instructions.
 The examples use `/path/to/model` for a local model directory. Replace that
 path with a compatible checkpoint for the workflow you select.
 
+## Diagnose Strix adapter lifecycle
+
+Run the lifecycle diagnostic only inside an exclusive `strix:gpu0` lease.
+It performs one six-request c4 warmup and checks normal shutdown, owned-child
+evidence, process-group absence, restoration, and unchanged artifact bindings.
+It does not establish token parity or accept throughput.
+
+```sh
+python3 tools/bench/strix_four_engine/lifecycle_diagnostic.py \
+  --source /local/reviewed-controller.tar \
+  --source-sha256 EXPECTED_ARCHIVE_SHA256 \
+  --source-revision EXPECTED_SOURCE_REVISION \
+  --manifest /local/bound-diagnostic-manifest.json \
+  --manifest-sha256 EXPECTED_MANIFEST_SHA256 \
+  --output /local/new-lifecycle-output \
+  --engine vLLM
+```
+
+Replace expected values with independently reviewed bindings, not values
+derived from the artifacts being checked. The flat Git archive must retain
+its revision in the PAX comment. It supplies compatible six-request c4
+`qualify`, `child_lifecycle`, and `audit` modules; the command verifies their
+origins and records source and driver provenance. Use the existing schema-1
+qualification manifest with all four model/engine/environment bindings, even
+when selecting one engine. This diagnostic does not adopt the separate v2
+c1/c4/c32 workload.
+
+Repeat `--engine` to select engines in order. Valid names are `vLLM`,
+`patched SGLang`, `vllm.cpp`, and `llama.cpp`; quote names containing spaces.
+Without `--engine`, the command uses that order. It stops before another
+engine launches after an engine or engine-publication failure.
+In ordinary c4 mode, the first selected engine must be `vLLM` or `patched SGLang`,
+which establishes canonical token IDs. Other first-engine selections are refused before launch.
+
+For the native first-c1 control, add these arguments to the command and omit `--engine vLLM`:
+
+```sh
+  --native-first-c1 \
+  --canonical-reference /local/retained-qualification/result.json \
+  --canonical-reference-sha256 EXPECTED_REFERENCE_SHA256
+```
+
+This mode selects only `vllm.cpp`. An explicit `--engine vllm.cpp` is allowed.
+Other selections and duplicate selections are refused before launch.
+The reference must be a bound schema-1 qualification result with the identical manifest,
+pinned vLLM configuration, six canonical prompt arrays, and matching workload hash.
+The reference supplies input tokenization. Its output-token acceptance status grants no tolerance.
+The command verifies the reference hash before parsing and after execution.
+It configures native with those IDs and runs one c1 qualification corpus at repetition 0.
+The corpus retains the six prompts, 128 tokens, greedy sampling, and four-slot configuration.
+There is no warmup, second corpus, or preceding Python engine launch.
+The result identifies `native-first-c1` and retains the reference identity, prompt arrays, commands, and replies, including shutdown.
+Each configure and run exchange has a 180-second cap or the stricter manifest timeout.
+The exchange cap is not a whole-job deadline. Bound the resource-controller job to 15 minutes, including binding verification.
+Retain kernel messages before and after the control. Stop after a fault without an automatic retry or device reset.
+A successful control establishes execution, structure, teardown, and unchanged bindings only.
+It does not establish fault cause, token parity, repaired inference, or a performance advantage.
+
+Each engine writes one finalized `<engine>/result.json`; spaces in the
+directory name become hyphens. One terminal `result.json` contains those same
+records. Exit 0 requires all selected engines and final publication to pass.
+Publication never replaces an existing result. Inspect stderr if publication
+fails and retain previous evidence. Any separately authorized run needs a fresh output directory.
+The command installs nothing and requires the compatible artifacts in advance.
+
 ## Run a local completion
 
 Run one completion with `vllm-cli`:

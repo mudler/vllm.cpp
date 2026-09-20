@@ -231,6 +231,7 @@ SUITES=(
   test_ci_walk_base
   test_rc_stage_checkpoint
   test_sglang_lease_identity
+  test_rocprof_attach_preflight
   # #2877. Registered in TWO places -- here and in `.github/workflows/ci.yml` --
   # and pinned in `REQUIRED_SUITE_REGISTRATIONS`, so neither registration is
   # deletable at rc=0. It landed on NO lane at all: absent from this array and

@@ -1,0 +1,30 @@
+name: Strix conversion audit
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  exact-conversion:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: 10bf611e533d81f739128304991c5e133c6aebd8
+          path: .audit-llama
+      - name: Install the locked CPU test dependencies
+        run: |
+          python -m venv .audit-venv
+          .audit-venv/bin/python -m pip install -r tests/bench/requirements-strix-audit.txt
+          .audit-venv/bin/python -m pip check
+      - name: Run the real-format audit tests
+        env:
+          STRIX_AUDIT_CONVERTER: ${{ github.workspace }}/.audit-llama
+        run: .audit-venv/bin/python tests/bench/test_strix_four_engine_audit.py

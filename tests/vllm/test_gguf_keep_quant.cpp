@@ -3283,50 +3283,60 @@ TEST_CASE("packed V-row reorder equals the element-level reorder (W4d W4)") {
   }
 }
 
-// ── BACKEND-TENSTORRENT: BFP8 weight residency route ───────────────────────
-// spec .agents/specs/tenstorrent-bfp-weight-residency.md. VT_TT_BFP8_WEIGHTS=1
+// ── BACKEND-TENSTORRENT: weight residency route ────────────────────────────
+// spec .agents/specs/tenstorrent-bfp-weight-residency.md. VT_TT_WEIGHT_RESIDENCY=bfp8
 // admits an UNQUANTIZED (ggml F32/BF16) GEMM/expert weight as kBfp8Device on a
 // load the engine resolved onto kTENSTORRENT; every other role/encoding/device
 // refuses by fall-through, and the DEFAULT OFF policy never elects the arm at
 // all (the inertness pin below). The loader-side product of kBfp8Device is the
 // bf16 expansion — admission decides only whether the Tenstorrent staging seam
 // converts the weight to device-resident BFLOAT8_B.
-TEST_CASE("BFP8 weight residency route: VT_TT_BFP8_WEIGHTS=1 admits an "
+TEST_CASE("BFP8 weight residency route: VT_TT_WEIGHT_RESIDENCY=bfp8 admits an "
           "unquantized GEMM weight on Tenstorrent; default OFF stays inert") {
-  ::unsetenv("VT_TT_BFP8_WEIGHTS");
+  ::unsetenv("VT_TT_WEIGHT_RESIDENCY");
   ::unsetenv("VT_CPU_REF");
   vllm::GgufTensorInfo f32_w;
   f32_w.name = "blk.0.attn_q.weight";
   f32_w.ggml_type = 0;  // GGML_TYPE_F32
   f32_w.shape = {512, 512};
 
-  // DEFAULT OFF: unset AND explicit "0" never elect the arm, on any device.
-  for (const char* env_val : {(const char*)nullptr, "0"}) {
-    if (env_val != nullptr) ::setenv("VT_TT_BFP8_WEIGHTS", env_val, 1);
+  // Parser: off (unset/empty/"off"/"0"), bfp8, bfp4 (reserved value parses;
+  // the refusal to ACT on it is named where it is consumed).
+  CHECK(vllm::ParseTtWeightResidency(nullptr) ==
+        vllm::TtWeightResidency::kOff);
+  CHECK(vllm::ParseTtWeightResidency("") == vllm::TtWeightResidency::kOff);
+  CHECK(vllm::ParseTtWeightResidency("off") == vllm::TtWeightResidency::kOff);
+  CHECK(vllm::ParseTtWeightResidency("0") == vllm::TtWeightResidency::kOff);
+  CHECK(vllm::ParseTtWeightResidency("bfp8") == vllm::TtWeightResidency::kBfp8);
+  CHECK(vllm::ParseTtWeightResidency("bfp4") == vllm::TtWeightResidency::kBfp4);
+
+  // DEFAULT OFF: unset AND explicit "off" never elect the arm, on any device.
+  for (const char* env_val : {(const char*)nullptr, "off"}) {
+    if (env_val != nullptr) ::setenv("VT_TT_WEIGHT_RESIDENCY", env_val, 1);
     for (auto dev : {vt::DeviceType::kCPU, vt::DeviceType::kTENSTORRENT}) {
       const vllm::GgufLoadPolicy p = vllm::GgufLoadPolicy::FromEnv(dev);
-      CHECK(p.bfp8_weights == false);
+      CHECK(p.tt_weight_residency == vllm::TtWeightResidency::kOff);
       CHECK(p.Route(f32_w, vllm::GgufTensorRole::kMatmulWeight) ==
             vllm::GgufResidency::kExpandBf16);
     }
   }
-  ::unsetenv("VT_TT_BFP8_WEIGHTS");
+  ::unsetenv("VT_TT_WEIGHT_RESIDENCY");
 
-  // Env ON but the load resolved onto the CPU: refused (no consumer there).
-  ::setenv("VT_TT_BFP8_WEIGHTS", "1", 1);
+  // Lever ON but the load resolved onto the CPU: refused (no consumer there).
+  ::setenv("VT_TT_WEIGHT_RESIDENCY", "bfp8", 1);
   {
     const vllm::GgufLoadPolicy cpu = vllm::GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
-    CHECK(cpu.bfp8_weights == false);
+    CHECK(cpu.tt_weight_residency == vllm::TtWeightResidency::kOff);
     CHECK(cpu.Route(f32_w, vllm::GgufTensorRole::kMatmulWeight) ==
           vllm::GgufResidency::kExpandBf16);
   }
 
-  // Env ON and the load resolved onto kTENSTORRENT: admitted, both verbatim
+  // Lever ON and the load resolved onto kTENSTORRENT: admitted, both verbatim
   // roles, both unquantized encodings.
   {
     const vllm::GgufLoadPolicy tt =
         vllm::GgufLoadPolicy::FromEnv(vt::DeviceType::kTENSTORRENT);
-    CHECK(tt.bfp8_weights == true);
+    CHECK(tt.tt_weight_residency == vllm::TtWeightResidency::kBfp8);
     CHECK(tt.Route(f32_w, vllm::GgufTensorRole::kMatmulWeight) ==
           vllm::GgufResidency::kBfp8Device);
     vllm::GgufTensorInfo bf16_w;
@@ -3364,15 +3374,28 @@ TEST_CASE("BFP8 weight residency route: VT_TT_BFP8_WEIGHTS=1 admits an "
           vllm::GgufResidency::kBfp8Device);
   }
 
+  // The RESERVED bfp4 value parses, rides the policy on a TT load, and the
+  // route refuses it BY FALL-THROUGH (never kBfp8Device) until it is
+  // implemented — the staging seam is what names it in its refusal message.
+  ::setenv("VT_TT_WEIGHT_RESIDENCY", "bfp4", 1);
+  {
+    const vllm::GgufLoadPolicy tt =
+        vllm::GgufLoadPolicy::FromEnv(vt::DeviceType::kTENSTORRENT);
+    CHECK(tt.tt_weight_residency == vllm::TtWeightResidency::kBfp4);
+    CHECK(tt.Route(f32_w, vllm::GgufTensorRole::kMatmulWeight) ==
+          vllm::GgufResidency::kExpandBf16);
+  }
+  ::unsetenv("VT_TT_WEIGHT_RESIDENCY");
+
   // The oracle switch forces the arm off, like every other residency.
   ::setenv("VT_CPU_REF", "1", 1);
   {
     const vllm::GgufLoadPolicy oracle =
         vllm::GgufLoadPolicy::FromEnv(vt::DeviceType::kTENSTORRENT);
-    CHECK(oracle.bfp8_weights == false);
+    CHECK(oracle.tt_weight_residency == vllm::TtWeightResidency::kOff);
     CHECK(oracle.Route(f32_w, vllm::GgufTensorRole::kMatmulWeight) ==
           vllm::GgufResidency::kExpandBf16);
   }
   ::unsetenv("VT_CPU_REF");
-  ::unsetenv("VT_TT_BFP8_WEIGHTS");
+  ::unsetenv("VT_TT_WEIGHT_RESIDENCY");
 }

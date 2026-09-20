@@ -139,6 +139,16 @@ const char* Name(GgufResidency residency) {
 // ggml type id 1 is F16 (IEEE half); see gguf_dequant.cpp case 1.
 bool KeepF16DType(uint32_t ggml_type) { return ggml_type == 1; }
 
+bool GgufResidencyKeepsBlockWeights(GgufResidency residency) {
+  return residency == GgufResidency::kKeepQuant ||
+         residency == GgufResidency::kKeepF16;
+}
+
+bool GgufResidencyExpandsBf16(GgufResidency residency) {
+  return residency == GgufResidency::kExpandBf16 ||
+         residency == GgufResidency::kBfp8Device;
+}
+
 // ggml type id 40 is the NVFP4 fork extension; see gguf_dequant.cpp case 40.
 bool KeepNvfp4DType(uint32_t ggml_type) { return ggml_type == 40; }
 
@@ -292,7 +302,7 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
                               const std::vector<int64_t>& shape,
                               vt::DeviceType dev,
                               std::optional<vt::DType> weight_value_dtype,
-                              bool bfp8_weights) {
+                              TtWeightResidency tt_residency) {
   // The oracle switch wins over everything (spec gate 2).
   if (cpu_ref) return GgufResidency::kExpandBf16;
 
@@ -365,7 +375,7 @@ GgufResidency RouteGgufTensor(bool keep_quant, bool keep_f16, bool nvfp4_fp4,
   // loader expands kBfp8Device exactly like kExpandBf16 — admission here
   // decides only whether the Tenstorrent staging seam converts the staged
   // weight to device-resident BFLOAT8_B.
-  if (bfp8_weights && shape.size() >= 2 &&
+  if (tt_residency == TtWeightResidency::kBfp8 && shape.size() >= 2 &&
       (role == GgufTensorRole::kMatmulWeight ||
        role == GgufTensorRole::kStackedExpertWeight) &&
       (ggml_type == 0 /* F32 */ || ggml_type == 30 /* BF16 */) &&
@@ -471,14 +481,17 @@ GgufLoadPolicy GgufLoadPolicy::FromEnv(
   // what the sibling compressed-tensors container of the same model runs, and
   // the GGUFs carry the `<stem>.input_scale` activation sidecars it needs.
   p.nvfp4_w4a4 = EnvOnOr("VT_GGUF_NVFP4_W4A4", true) && p.nvfp4_fp4;
-  // BACKEND-TENSTORRENT BFP weight residency — DEFAULT OFF, opt in with
-  // VT_TT_BFP8_WEIGHTS=1, and only on a load the ENGINE resolved onto
+  // BACKEND-TENSTORRENT weight residency — DEFAULT OFF, opt in with
+  // VT_TT_WEIGHT_RESIDENCY=bfp8 (bfp4 is reserved and refused by name at the
+  // staging seam), and only on a load the ENGINE resolved onto
   // kTENSTORRENT (the residency has no consumer on any other device, so
   // electing it there would change the load for nothing). Forced off by the
   // oracle switch like every other residency, so VT_CPU_REF=1 reproduces the
   // historical bf16 load byte for byte.
-  p.bfp8_weights = EnvOn("VT_TT_BFP8_WEIGHTS") &&
-                   dev == vt::DeviceType::kTENSTORRENT && !p.cpu_ref;
+  p.tt_weight_residency =
+      dev == vt::DeviceType::kTENSTORRENT && !p.cpu_ref
+          ? ParseTtWeightResidency(std::getenv("VT_TT_WEIGHT_RESIDENCY"))
+          : TtWeightResidency::kOff;
   // L5. Both ride the same availability condition as the residency they refine,
   // and both are forced off by the oracle switch, so VT_CPU_REF=1 keeps
   // reproducing the historical load byte for byte and allocation for allocation.
@@ -575,7 +588,7 @@ GgufResidency GgufLoadPolicy::Route(const GgufTensorInfo& tensor,
   const GgufResidency r = RouteGgufTensor(
       keep_quant, keep_f16, nvfp4_fp4, cpu_ref, role, tensor.ggml_type,
       tensor.shape, ComputeDeviceFor(tensor.name, role), weight_value_dtype,
-      bfp8_weights);
+      tt_weight_residency);
   if (audit) audit(tensor.name, role, r);
   return r;
 }
@@ -597,7 +610,8 @@ GgufResidency PeekRoute(const GgufLoadPolicy& policy, const GgufTensorInfo& tens
   return RouteGgufTensor(policy.keep_quant, policy.keep_f16, policy.nvfp4_fp4,
                          policy.cpu_ref, role, tensor.ggml_type, tensor.shape,
                          policy.ComputeDeviceFor(tensor.name, role),
-                         policy.weight_value_dtype, policy.bfp8_weights);
+                         policy.weight_value_dtype,
+                         policy.tt_weight_residency);
 }
 
 }  // namespace vllm

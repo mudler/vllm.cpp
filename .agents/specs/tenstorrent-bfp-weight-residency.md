@@ -108,7 +108,11 @@ not silently.
 
 **Decode stack interaction.** `VT_TT_AFFINE_F32` and the f32-exact decode
 levers stay default for the non-BFP arms. The BFP arms opt in by residency
-selection; whether they land default-on or behind a lever follows the
+selection behind ONE general lever, `VT_TT_WEIGHT_RESIDENCY`
+(`off` default | `bfp8` | `bfp4` reserved and refused by name until
+implemented; parser: include/vllm/config/tt_weight_residency.h), so a new
+variant is a new VALUE, not a new flag. Whether an arm lands default-on or
+behind the lever follows the
 `VT_TT_KEEPQUANT_INT8DOT` precedent (land default-off when the e2e anchor
 band fails, decide in the Outcome, never inferred) and is recorded in the
 row's Outcome.

@@ -389,7 +389,7 @@ OwnedTensor LoadStackedExperts(const GgufFile& g, const GgufLoadPolicy& pol,
   // (one bad tower disqualifies all 228). Refusing HERE names the tensor;
   // letting it through would put 24.000 GiB of bf16 where 6.375 GiB of blocks
   // belong and drop the whole arm out of streaming with no message at all.
-  VT_CHECK(r == GgufResidency::kKeepQuant || r == GgufResidency::kKeepF16,
+  VT_CHECK(GgufResidencyKeepsBlockWeights(r),
            "glm-dsa gguf: " + name +
                " routed to an EXPAND residency. A routed-expert tower that "
                "expands leaves the streaming lane entirely — "

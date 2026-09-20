@@ -618,7 +618,7 @@ OwnedTensor OwnMatmulWeight(const GgufFile& g, const std::string& name,
            "qwen3_5 gguf: " + name +
                " routed to the fp4 residency but this call site builds a bf16 "
                "OwnedTensor; use OwnGgufNvfp4 or NoNvfp4()");
-  if (r == GgufResidency::kKeepQuant || r == GgufResidency::kKeepF16) {
+  if (GgufResidencyKeepsBlockWeights(r)) {
     // keep-quant blocks OR keep-f16, both in the file's own [N, K] order.
     VT_CHECK(t.shape.size() == 2, "qwen3_5 gguf: expected 2-D weight " + name);
     return OwnGgufKeptSlice(g, pol, t, r, t.shape[0], t.shape[1], 0);
@@ -1162,7 +1162,7 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
     const GgufResidency r = pol.Route(
         g.Get(nm),
         packed_reorder ? GgufTensorRole::kMatmulWeight : proj_role);
-    if (r == GgufResidency::kKeepQuant || r == GgufResidency::kKeepF16) {
+    if (GgufResidencyKeepsBlockWeights(r)) {
       const GgufTensorInfo& ti = g.Get(nm);
       gdn.in_proj_qkv =
           OwnGgufKeptSlice(g, pol, ti, r, ti.shape[0], ti.shape[1], 0);
@@ -1200,7 +1200,7 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
     const GgufResidency r = pol.Route(
         g.Get(nm),
         packed_reorder_z ? GgufTensorRole::kMatmulWeight : proj_role);
-    if (r == GgufResidency::kKeepQuant || r == GgufResidency::kKeepF16) {
+    if (GgufResidencyKeepsBlockWeights(r)) {
       const GgufTensorInfo& ti = g.Get(nm);
       gdn.in_proj_z =
           OwnGgufKeptSlice(g, pol, ti, r, ti.shape[0], ti.shape[1], 0);
@@ -1227,7 +1227,7 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
     const std::string nm =
         Blk(il, pr == &gdn.in_proj_b ? "ssm_beta.weight" : "ssm_alpha.weight");
     const GgufResidency r = pol.Route(g.Get(nm), proj_role);
-    if (r == GgufResidency::kKeepQuant || r == GgufResidency::kKeepF16) {
+    if (GgufResidencyKeepsBlockWeights(r)) {
       const GgufTensorInfo& ti = g.Get(nm);
       *pr = OwnGgufKeptSlice(g, pol, ti, r, ti.shape[0], ti.shape[1], 0);
       continue;
@@ -1259,7 +1259,7 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
   {
     const std::string nm = Blk(il, "ssm_out.weight");
     const GgufResidency r = pol.Route(g.Get(nm), proj_role);
-    if (r == GgufResidency::kKeepQuant || r == GgufResidency::kKeepF16) {
+    if (GgufResidencyKeepsBlockWeights(r)) {
       const GgufTensorInfo& ti = g.Get(nm);
       gdn.out_proj =
           OwnGgufKeptSlice(g, pol, ti, r, ti.shape[0], ti.shape[1], 0);
@@ -1352,7 +1352,7 @@ std::vector<OwnedTensor> LoadExpertsT(const GgufFile& g, int64_t il,
   experts.reserve(static_cast<size_t>(num_experts));
 
   const GgufResidency r = pol.Route(ti, GgufTensorRole::kStackedExpertWeight);
-  if (r == GgufResidency::kKeepQuant || r == GgufResidency::kKeepF16) {
+  if (GgufResidencyKeepsBlockWeights(r)) {
     // keep-quant blocks OR keep-f16. Each expert occupies `out_dim` WHOLE rows,
     // i.e. a whole number of blocks (and any whole number of f16 rows), so the
     // split is a byte range and no block is ever cut.
@@ -1390,7 +1390,7 @@ OwnedTensor LoadExpertsStackedKq(const GgufFile& g, int64_t il, const std::strin
   const int64_t in_dim = ti.shape[2];
   const GgufResidency r =
       pol.Route(ti, GgufTensorRole::kStackedExpertWeight);  // ONE audit event
-  VT_CHECK(r == GgufResidency::kKeepQuant || r == GgufResidency::kKeepF16,
+  VT_CHECK(GgufResidencyKeepsBlockWeights(r),
            "qwen3_5 gguf A3: LoadExpertsStackedKq for a non-keep residency on " + name);
   // Each expert = out_dim WHOLE rows, so E*out_dim rows never cuts a block/f16 row.
   return OwnGgufKeptSlice(g, pol, ti, r, num_experts * out_dim, in_dim,
@@ -1414,8 +1414,7 @@ void LoadExpertsOrNvfp4(const GgufFile& g, int64_t il, const std::string& stem,
     *fp4 = OwnGgufNvfp4Experts(g, name, num_experts, pol);
     return;
   }
-  if (peek == GgufResidency::kExpandBf16 ||
-      peek == GgufResidency::kBfp8Device) {
+  if (GgufResidencyExpandsBf16(peek)) {
     *bf16 = LoadExpertsT(g, il, stem, num_experts, pol);  // per-expert transposed; audits
     return;
   }

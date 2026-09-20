@@ -688,7 +688,7 @@ struct LagunaGgufCtx {
     auto [g, t] = Take(name);
     VT_CHECK(t->shape.size() == 2, "laguna gguf: expected 2-D MW " + name);
     const GgufResidency r = pol.Route(*t, GgufTensorRole::kMatmulWeight);
-    if (r == GgufResidency::kKeepQuant || r == GgufResidency::kKeepF16)
+    if (GgufResidencyKeepsBlockWeights(r))
       return OwnGgufQuantBlocks(*t, t->shape[0], t->shape[1], /*row_offset=*/0,
                                 pol.mmap_residency ? g : nullptr, pol.quant_repack);
     return MakeBf16Owned(
@@ -704,7 +704,7 @@ struct LagunaGgufCtx {
     const int64_t rows = t->shape[0] * t->shape[1];  // E*out
     const int64_t k = t->shape[2];                   // in
     const GgufResidency r = pol.Route(*t, GgufTensorRole::kStackedExpertWeight);
-    if (r == GgufResidency::kKeepQuant || r == GgufResidency::kKeepF16)
+    if (GgufResidencyKeepsBlockWeights(r))
       return OwnGgufQuantBlocks(*t, rows, k, /*row_offset=*/0,
                                 pol.mmap_residency ? g : nullptr, pol.quant_repack);
     return MakeBf16Owned(DequantGgufRowToBf16(t->ggml_type, t->data, rows * k),

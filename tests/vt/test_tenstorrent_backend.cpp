@@ -9509,7 +9509,7 @@ TEST_CASE("kTENSTORRENT single-chunk keep-quant decode keeps the word shadow res
 
 // ── BFP8 weight residency (spec .agents/specs/tenstorrent-bfp-weight-
 // residency.md) ─────────────────────────────────────────────────────────────
-// VT_TT_BFP8_WEIGHTS=1 converts a bf16 matmul WEIGHT to a device-resident
+// VT_TT_WEIGHT_RESIDENCY=1 converts a bf16 matmul WEIGHT to a device-resident
 // BFLOAT8_B operand at first staging and the NATIVE ttnn::matmul consumes it
 // (bf16 activation x BFP8 weight — ttnn/operations/matmul/matmul.cpp:521-532).
 // The f32-exact SFPU floor is not involved. BFLOAT8_B packs 1 sign + 7
@@ -9589,15 +9589,15 @@ std::vector<float> RunMatmulBTBF16(Backend& backend, Queue& q, uint32_t M,
 
 struct ScopedEnv {
   explicit ScopedEnv(const char* v) {
-    const char* old = std::getenv("VT_TT_BFP8_WEIGHTS");
+    const char* old = std::getenv("VT_TT_WEIGHT_RESIDENCY");
     had_ = old != nullptr;
     if (had_) old_ = old;
-    if (v != nullptr) ::setenv("VT_TT_BFP8_WEIGHTS", v, 1);
-    else ::unsetenv("VT_TT_BFP8_WEIGHTS");
+    if (v != nullptr) ::setenv("VT_TT_WEIGHT_RESIDENCY", v, 1);
+    else ::unsetenv("VT_TT_WEIGHT_RESIDENCY");
   }
   ~ScopedEnv() {
-    if (had_) ::setenv("VT_TT_BFP8_WEIGHTS", old_.c_str(), 1);
-    else ::unsetenv("VT_TT_BFP8_WEIGHTS");
+    if (had_) ::setenv("VT_TT_WEIGHT_RESIDENCY", old_.c_str(), 1);
+    else ::unsetenv("VT_TT_WEIGHT_RESIDENCY");
   }
   bool had_ = false;
   std::string old_;
@@ -9605,16 +9605,16 @@ struct ScopedEnv {
 
 }  // namespace
 
-TEST_CASE("kTENSTORRENT VT_TT_BFP8_WEIGHTS default OFF leaves kMatmulBT "
+TEST_CASE("kTENSTORRENT VT_TT_WEIGHT_RESIDENCY default OFF leaves kMatmulBT "
           "inert (no BFP8 resident, no use)") {
   if (!TenstorrentPresent()) {
     MESSAGE("SKIPPED: no Tenstorrent device on this box");
     return;
   }
-  // Both the unset default AND the explicit "0" opt-out must leave every
+  // Both the unset default AND the explicit "off" opt-out must leave every
   // existing path untouched: no conversion, no BFP8 operand consumed, and a
   // result inside the plain bf16 matmul envelope.
-  for (const char* env_val : {(const char*)nullptr, "0"}) {
+  for (const char* env_val : {(const char*)nullptr, "off"}) {
     ScopedEnv guard(env_val);
     Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
     Queue q = backend.CreateQueue();
@@ -9643,14 +9643,14 @@ TEST_CASE("kTENSTORRENT VT_TT_BFP8_WEIGHTS default OFF leaves kMatmulBT "
   }
 }
 
-TEST_CASE("kTENSTORRENT VT_TT_BFP8_WEIGHTS=1 stages the weight as a "
+TEST_CASE("kTENSTORRENT VT_TT_WEIGHT_RESIDENCY=bfp8 stages the weight as a "
           "device-resident BFLOAT8_B operand consumed by the native matmul "
           "(quantize-then-compare gate)") {
   if (!TenstorrentPresent()) {
     MESSAGE("SKIPPED: no Tenstorrent device on this box");
     return;
   }
-  ScopedEnv guard("1");
+  ScopedEnv guard("bfp8");
   Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
   Queue q = backend.CreateQueue();
   constexpr uint32_t M = 32, K = 64, N = 32;
@@ -9711,13 +9711,13 @@ TEST_CASE("kTENSTORRENT VT_TT_BFP8_WEIGHTS=1 stages the weight as a "
     }
 }
 
-TEST_CASE("kTENSTORRENT VT_TT_BFP8_WEIGHTS=1 refuses a non-TILE-aligned "
+TEST_CASE("kTENSTORRENT VT_TT_WEIGHT_RESIDENCY=bfp8 refuses a non-TILE-aligned "
           "weight BY NAME and falls through to the bf16 arm") {
   if (!TenstorrentPresent()) {
     MESSAGE("SKIPPED: no Tenstorrent device on this box");
     return;
   }
-  ScopedEnv guard("1");
+  ScopedEnv guard("bfp8");
   Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
   Queue q = backend.CreateQueue();
   constexpr uint32_t M = 32, K = 33, N = 32;  // K=33 is not TILE-aligned
@@ -9731,6 +9731,43 @@ TEST_CASE("kTENSTORRENT VT_TT_BFP8_WEIGHTS=1 refuses a non-TILE-aligned "
   CHECK(vt::tenstorrent::Bfp8Refusals() > refusals_before);
   CHECK(std::string(vt::tenstorrent::Bfp8LastRefusal())
             .find("TILE-aligned") != std::string::npos);
+  // The fall-through is still CORRECT (bf16 envelope vs the f32 reference).
+  float max_abs = 0.0f;
+  for (uint32_t i = 0; i < M; ++i)
+    for (uint32_t j = 0; j < N; ++j) {
+      float ref = 0.0f;
+      for (uint32_t k = 0; k < K; ++k)
+        ref += Bf16BitsToFloat(F32ToBf16Bits(host_a[i * K + k])) *
+               Bf16BitsToFloat(F32ToBf16Bits(host_b[j * K + k]));
+      max_abs = std::max(max_abs, std::fabs(out[i * N + j] - ref));
+    }
+  CHECK(max_abs < 0.5f);
+}
+
+TEST_CASE("kTENSTORRENT VT_TT_WEIGHT_RESIDENCY=bfp4 refuses BY NAME "
+          "(not implemented) and falls through to the bf16 arm") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  ScopedEnv guard("bfp4");
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+  constexpr uint32_t M = 32, K = 64, N = 32;
+  std::vector<float> host_a(static_cast<size_t>(M) * K),
+      host_b(static_cast<size_t>(N) * K);
+  for (size_t i = 0; i < host_a.size(); ++i) host_a[i] = 0.25f * static_cast<float>(i % 5);
+  for (size_t i = 0; i < host_b.size(); ++i) host_b[i] = 0.5f * static_cast<float>(i % 3);
+
+  const uint64_t refusals_before = vt::tenstorrent::Bfp8Refusals();
+  const std::vector<float> out = RunMatmulBTBF16(backend, q, M, K, N, host_a, host_b);
+  // bfp4 is a RESERVED lever value: the staging seam refuses it by name, and
+  // no BFP8 conversion happens (the resident counter must not move).
+  CHECK(vt::tenstorrent::Bfp8Refusals() > refusals_before);
+  CHECK(std::string(vt::tenstorrent::Bfp8LastRefusal())
+            .find("bfp4") != std::string::npos);
+  CHECK(std::string(vt::tenstorrent::Bfp8LastRefusal())
+            .find("not implemented") != std::string::npos);
   // The fall-through is still CORRECT (bf16 envelope vs the f32 reference).
   float max_abs = 0.0f;
   for (uint32_t i = 0; i < M; ++i)
@@ -9761,7 +9798,7 @@ TEST_CASE("kTENSTORRENT BFP8 vs bf16 resident-weight matmul timing (VT_TT_BFP8_B
       host_b(static_cast<size_t>(N) * K);
   for (size_t i = 0; i < host_b.size(); ++i)
     host_b[i] = 0.125f * static_cast<float>(i % 13);
-  for (const char* env_val : {(const char*)nullptr, "1"}) {
+  for (const char* env_val : {(const char*)nullptr, "bfp8"}) {
     ScopedEnv guard(env_val);
     // Warm the staging (first call converts/uploads), then time eager calls.
     (void)RunMatmulBTBF16(backend, q, M, K, N, host_a, host_b);
@@ -9774,7 +9811,7 @@ TEST_CASE("kTENSTORRENT BFP8 vs bf16 resident-weight matmul timing (VT_TT_BFP8_B
     // as an upper bound on the GEMM delta.
     const double us_per_call =
         std::chrono::duration<double, std::micro>(t1 - t0).count() / kIters;
-    MESSAGE("VT_TT_BFP8_WEIGHTS=", env_val == nullptr ? "unset(bf16)" : "1",
+    MESSAGE("VT_TT_WEIGHT_RESIDENCY=", env_val == nullptr ? "unset(bf16)" : "bfp8",
             ": ", us_per_call, " us/call whole-op (M=", M, ",K=", K, ",N=", N,
             "), Bfp8MatmulUses=", vt::tenstorrent::Bfp8MatmulUses());
   }

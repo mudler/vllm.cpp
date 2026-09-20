@@ -3,6 +3,10 @@
 // in tenstorrent_internal.h.
 #include "vt/tenstorrent/tenstorrent_internal.h"
 
+#include <cstdlib>
+
+#include "vllm/config/tt_weight_residency.h"
+
 namespace vt::tenstorrent {
 
 ttnn::Tensor ZeroCacheGet(const ttnn::Shape& shape, ttnn::DataType dt,
@@ -463,16 +467,29 @@ ttnn::Tensor EnsureWeightViewDevice(const Tensor& t, MeshDevice& device) {
 // interior views get the persistent shadow instead of the per-call anonymous
 // staging.
 ttnn::Tensor EnsureMatmulWeightDevice(const Tensor& b, MeshDevice& device) {
-  if (Bfp8WeightsEnabled()) return EnsureBfp8WeightDevice(b, device);
+  // One lever selects the residency; a future variant is a new VALUE of
+  // VT_TT_WEIGHT_RESIDENCY, not a new flag.
+  switch (vllm::ParseTtWeightResidency(
+      std::getenv("VT_TT_WEIGHT_RESIDENCY"))) {
+    case vllm::TtWeightResidency::kBfp8:
+      return EnsureBfp8WeightDevice(b, device);
+    case vllm::TtWeightResidency::kBfp4:
+      NoteBfp8Refusal("VT_TT_WEIGHT_RESIDENCY=bfp4: not implemented; staged "
+                      "bf16");
+      break;
+    case vllm::TtWeightResidency::kOff:
+      break;
+  }
   if (b.dtype == DType::kBF16 && !IsTrackedBase2D(b))
     return EnsureWeightViewDevice(b, device);
   return EnsureDevice2D(b, device);
 }
 
-// ---- BFP8 weight residency ----------------------------------------------
+// ---- Weight residency ----------------------------------------------------
 // spec .agents/specs/tenstorrent-bfp-weight-residency.md. DEFAULT OFF
-// (VT_TT_BFP8_WEIGHTS=0 / unset leaves the byte-identical bf16 staging path —
-// the inertness gate pins that). When on, a bf16 matmul weight uploads once in
+// (VT_TT_WEIGHT_RESIDENCY=off / unset leaves the byte-identical bf16 staging
+// path —
+// the inertness gate pins that). When bfp8, a bf16 matmul weight uploads once in
 // bf16, is TYPECAST on device to BFLOAT8_B (BFP8: 1 sign + 7 shared-group
 // mantissa bits per element, one 8-bit exponent per 16-element group —
 // tt_metal/impl/data_format/blockfloat_common.cpp `convert_bfp_to_u32`,
@@ -494,8 +511,8 @@ std::string& Bfp8RefusalMsg() {
 }
 
 bool Bfp8WeightsEnabled() {
-  const char* e = std::getenv("VT_TT_BFP8_WEIGHTS");
-  return e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0;
+  return vllm::ParseTtWeightResidency(std::getenv("VT_TT_WEIGHT_RESIDENCY")) ==
+         vllm::TtWeightResidency::kBfp8;
 }
 uint64_t Bfp8ResidentWeights() { return g_bfp8_resident.load(std::memory_order_relaxed); }
 uint64_t Bfp8MatmulUses() { return g_bfp8_uses.load(std::memory_order_relaxed); }

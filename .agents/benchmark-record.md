@@ -19,6 +19,48 @@ from relative link targets repointed for this file's location.
 
 # Benchmarks
 
+## BACKEND-TENSTORRENT 27B APEX f32-exact decode: 0.028 tok/s token-exact, and the ~1800x gap to the native BFP4 format is a FORMAT difference, not a tuning difference (2026-09-13, P150, main @ the f32-exact-decode stack, #3230)
+
+Model: `Qwen3.8-27B-APEX-I-Nano` GGUF (IQ mix;
+`mudler-qwen3.8-27B-APEX-gguf`), Tenstorrent Blackhole P150, file mutex
+`$HOME/gpu.lock` held, `~/Sources/tt/luwen/target/release/reset` before every
+run. Env: `VT_TT_AFFINE_F32=1 VT_TT_NORM_PAD=1 VT_TT_PROGRAM_CACHE=1`.
+
+**Correctness.** B2 is token-exact: all 64 generated tokens match the
+llama.cpp `b10451` greedy oracle. The f32-exact decode floor holds.
+
+| Run | Config | TTFT (s) | TPOT mean/median/p99 (s) | Decode tok/s | JIT hits |
+|---|---|---:|---|---:|---|
+| B1 | 1×128→64, cold JIT | 1106.5 | 40.7 / 40.7 / 40.7 | ~0.025 | 747/1751 (42.7%) |
+| B2 | 1×128→64, warm JIT | 695.1 | 35.3 / 35.3 / 36.5 | ~0.028 | 1751/1751 (100%) |
+| M=2 | 2×128→32, cc=2 | — | unmeasured | — | — |
+
+TTFT is load+JIT dominated on both legs (B1's cold-JIT penalty alone is
+~411 s). M=2 prefill hit a `TT_FATAL: MeshBuffer must be large enough to
+hold the tensor` fatal at M>1 — fixed by the batched paged-attention decode
+fix (`3fca8e541`, #3230 lineage); post-fix end-to-end runs complete clean
+(RC=0), but batched TPOT was not measured in this campaign.
+
+**Unpulled levers on this stack.** (1) every decode GEMM runs the SFPU
+f32-exact path, because `ttnn` matmul truncates f32 operands to tf32 on
+Blackhole (measured; `ComputeConfig` does not lift it); (2) no concurrency
+in this bench; (3) no native BFP formats — weights stay GGUF blocks expanded
+or kept-quant and decoded on-core, never resident as `BFLOAT4_B`/`BFLOAT8_B`
+tensors under tensor-core matmul.
+
+**The gap.** Tenstorrent's native tt-metal pipeline reports ~50 tok/s on
+Qwen3.8-27B on a single P150A with BFP4 weights / BFP8 KV / BF16 deltaNet
+state — ~1800× this stack's decode. The root difference is FORMAT, not
+tuning: tensor-core BFP matmul where BFP precision is the hardware's
+precision contract, versus GGUF block-dequant plus SFPU f32-exact matmul.
+No tuning pass on the f32-exact stack can close a 1800× format gap. Named
+next lever: the native BFP4/BFP8 weight-residency row
+(`.agents/specs/tenstorrent-bfp-weight-residency.md`,
+`ISSUE-LOCAL-01M2YXN1QEMAEY5W8QCKH76HTS`).
+
+Logs: `/tmp/bench_b1.log`, `/tmp/bench_b2.log` (B2, warm), `/tmp/bench_b3.log`
+(M=2 pre-fix fatal).
+
 ## ENG-EXPERT-STREAM-DEVICE W0h branch force: the CUDA arm's degenerate continuation belongs to the BRANCH and not to the arm, and the W0f divergence point was transcribed wrong (2026-08-23, `dgx:gpu0`, source `ff8f728071bd5`, #1783, #1124, #1736)
 
 **Placement.** Newest-first. This sits above `QUANT-QWEN38-27B-GGUF-ARM W3`,

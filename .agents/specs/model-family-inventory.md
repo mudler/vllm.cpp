@@ -26,7 +26,7 @@ does not claim that shared layers make a model supported.
 ## Our baseline
 
 The local factory accepts only the Qwen3.5 MoE wrapper at
-`src/vllm/model_executor/models/registry.cpp:10-20`; the function type at
+`src/vllm/model_executor/models/model_registry.cpp:1-12`; the function type at
 `include/vllm/model_executor/models/registry.h:18-21` is model-specific.
 `LoadedEngine::IsDenseArch` at
 `src/vllm/entrypoints/model_loader.cpp:232-237,266-277` can classify an unknown

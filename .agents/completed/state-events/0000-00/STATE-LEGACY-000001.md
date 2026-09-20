@@ -28159,7 +28159,7 @@ benchmark rows. All record checkers rc=0. `benchmark_binding=false`.
 **What.** Ported the named SW1 residual (`ENG-SGLANG-BEHAVIOR-FLAG` SW2) on base
 local `main` `cc5d2348` (confirmed via `git rev-parse HEAD`), isolated worktree
 `.claude/worktrees/agent-afeedca484fb784ed`. Extends the `kLPM` reorder
-(`maybe_reorder_waiting_for_lpm`, `src/vllm/v1/core/sched/scheduler.cpp:183-243`):
+(`maybe_reorder_waiting_for_lpm`, `src/vllm/v1/core/sched/scheduler.cpp:384`):
 walks the pre-sort (arrival) waiting queue building an ephemeral seen-set of OUR
 block-hash APC keys (`Request::block_hashes` — NOT a second trie), and
 de-prioritizes a later request whose in-batch prefix match ≥

@@ -48,7 +48,7 @@ NOT owed by W1.
 
 ## Our baseline
 
-- `hash_block_size` is ALREADY plumbed as a parameter through `get_request_block_hasher(int hash_block_size, ...)` (`src/vllm/v1/core/kv_cache_utils.cpp:577`), `KVCacheManager` / `BlockPool` (`src/vllm/v1/core/block_pool.cpp:43`), and the `Scheduler` ctor (`src/vllm/v1/core/sched/scheduler.cpp:83`) — but the scheduler HARDCODES `hash_block_size = block_size`.
+- `hash_block_size` is ALREADY plumbed as a parameter through `get_request_block_hasher(int hash_block_size, ...)` (`src/vllm/v1/core/kv_cache_utils.cpp:580`), `KVCacheManager` / `BlockPool` (`src/vllm/v1/core/block_pool.cpp:43`), and the `Scheduler` ctor (`src/vllm/v1/core/sched/scheduler.cpp:83`) — but the scheduler HARDCODES `hash_block_size = block_size`.
 - No `resolve_kv_cache_block_sizes` and no `prefix_match_unit` config field exist yet.
 - The fine-grained path (`block_size != hash_block_size`) is explicitly DEFERRED and throws in `src/vllm/v1/core/block_pool.cpp:93,220` (guarded by `include/vllm/v1/core/block_pool.h`). `alignment_tokens` machinery is partly ported in `single_type_kv_cache_manager.cpp`.
 

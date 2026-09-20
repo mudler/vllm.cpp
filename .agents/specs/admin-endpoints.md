@@ -43,9 +43,9 @@ No admin/control route existed yet.
 ## Port map
 
 - `handle_abort_requests(request_body)`
-  (`src/vllm/entrypoints/openai/api_server.cpp:488`) parses `{request_ids:[...]}`
+  (`src/vllm/entrypoints/openai/api_server.cpp:1611`) parses `{request_ids:[...]}`
   and forwards the (possibly empty) id list to an injected abort callback
-  (`set_abort_requests`, `include/vllm/entrypoints/openai/api_server.h:156`)
+  (`set_abort_requests`, `include/vllm/entrypoints/openai/api_server.h:350`)
   returning the number aborted. The callback is wired to
   `AsyncLLM::abort(const std::vector<std::string>&)`
   (`include/vllm/v1/engine/async_llm.h:115`).

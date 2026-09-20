@@ -94,7 +94,7 @@ Our Automatic Prefix Caching is vLLM's **block-hash chain**, ported and shipped:
   prevent cross-tenant false hits (`KV-PREFIX-CACHE` W2, `CLAIM-ROADMAP-D4APC`).
 - **Eviction** — LRU over the free block pool (vLLM's block-level LRU), plus the
   `lock`/ref-count equivalent that keeps in-use blocks resident.
-- **Toggle** — `--[no-]enable-prefix-caching` (`examples/server/main.cpp:185`);
+- **Toggle** — `--[no-]enable-prefix-caching` (`src/vllm/entrypoints/openai/server_main.cpp:618`);
   `EngineParams::enable_prefix_caching` tri-state
   (`include/vllm/entrypoints/model_loader.h:76`), resolved against the model
   default (dense = ON, hybrid/attention-free = OFF), mirroring vLLM.
@@ -317,7 +317,7 @@ already ship.
   `--no-enable-prefix-caching` (mirrors SGLang's `--disable-radix-cache`).
 - **Surface:**
   - CLI: add the alias next to `--[no-]enable-prefix-caching`
-    (`examples/server/main.cpp:185`). Pure argument aliasing; sets the same
+    (`src/vllm/entrypoints/openai/server_main.cpp:618`). Pure argument aliasing; sets the same
     `EngineParams::enable_prefix_caching` tri-state.
   - C-ABI: `vllm_model_params` (`include/vllm.h:100`) currently has NO
     prefix-caching field (it exposes `block_size`/`num_blocks` only). Add a
@@ -517,7 +517,7 @@ APC (block-hash chain, longest-match, LRU, ref-count, extra-keys) is `DONE` dens
 (`KV-PREFIX-CACHE`). Scheduler admits from an FCFS/priority waiting queue
 (`src/vllm/v1/core/sched/scheduler.cpp`, `request_queue.cpp`) with NO cache-hit
 ordering. APC toggle `EngineParams::enable_prefix_caching`
-(`include/vllm/entrypoints/model_loader.h:76`), server `examples/server/main.cpp:185`;
+(`include/vllm/entrypoints/model_loader.h:76`), server `src/vllm/entrypoints/openai/server_main.cpp:618`;
 the C-ABI `vllm_model_params` had NO prefix-caching field.
 
 ### Port map

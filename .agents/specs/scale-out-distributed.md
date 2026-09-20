@@ -194,7 +194,7 @@ single-device-by-construction.
 
 | Seam | vLLM anchor | Our seam (`file:line`) | Reuse vs new |
 |---|---|---|---|
-| Collective abstraction (`vt::Communicator`/process-group) | `base_device_communicator.py:147`; `parallel_state.py:358` | NEW sibling of `vt::Queue` (`include/vt/device.h:50`); new `OpId::kAllReduce/kAllGather/kSend/kRecv` via `OpProvider` (`include/vt/op_provider.h:108`); stream-order hooks EXIST (`include/vt/backend.h:87-104` `RecordEvent`/`QueueWaitEvent`) | ~90% new; the dispatch table + stream-event ordering are reused |
+| Collective abstraction (`vt::Communicator`/process-group) | `base_device_communicator.py:147`; `parallel_state.py:358` | NEW sibling of `vt::Queue` (`include/vt/device.h:131`); new `OpId::kAllReduce/kAllGather/kSend/kRecv` via `OpProvider` (`include/vt/op_provider.h:108`); stream-order hooks EXIST (`include/vt/backend.h:87-104` `RecordEvent`/`QueueWaitEvent`) | ~90% new; the dispatch table + stream-event ordering are reused |
 | Multi-device backend registry | executor spawns 1 worker/GPU (`multiproc_executor.py:176`) | `src/vt/backend.cpp:42-77` is ONE `Backend*` per DeviceType; CUDA registrar hardcodes device 0 (`cuda_backend.cu:297-299`, no `cudaSetDevice`). `DeviceResourceOps` free-fns (`backend.h:140-155`) are the index-aware replacement, but `Backend::{Alloc,CreateQueue}` are "index-0 migration shims" (`backend.cpp:83,101`) | ~60% new (per-index backends); the index-aware free-fn layer is half-built |
 | TP-sharded linears + all-reduce | `linear.py:418/1612/1766` | dense forward already tags Column/Row parallel: QKV `dense_attn_block.h:342-378`, o_proj RowParallel `:513-530` (all-reduce goes right after `:530`), MLP gate_up/down `qwen3.cpp:83-90` (all-reduce after `:90`) | ~70% new logic, but insertion points are UNAMBIGUOUS (structure preserved) |
 | TP-sharded weight load | `linear.py:569-572` (col), `:1725-1728` (row) | SINGLE chokepoint `include/vllm/model_executor/models/dense_weight_loaders.h:131-138` (the merged-weight memcpy); MoE per-expert loop `qwen3_moe_weights.cpp:35-38` | ~50% new; one header slices row/col ranges, one loop selects the EP expert subset |
@@ -212,7 +212,7 @@ single-device-by-construction.
 ONE abstraction, three transports — mirroring vLLM's `device_communicators`:
 
 - **`vt::Communicator`** (a.k.a. process-group): bound to a `vt::Device`, a sibling
-  of `vt::Queue` (`include/vt/device.h:50`). Carries `rank()`/`world_size()`
+  of `vt::Queue` (`include/vt/device.h:131`). Carries `rank()`/`world_size()`
   (mirror `GroupCoordinator`/`DeviceCommunicatorBase`). `world_size == 1` ⇒ every
   method is a no-op (byte-identical single-GPU path).
 - **Collective ops** as new `OpId`s (`kAllReduce`, `kAllGather`, `kReduceScatter`,

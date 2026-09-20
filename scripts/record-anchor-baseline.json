@@ -12,9 +12,9 @@
     "of this file on purpose: pinning it would make every change that adds or",
     "removes a citation rewrite this file, which is a lock, not a ratchet."
   ],
-  "total": 33,
+  "total": 3,
   "buckets": {
-    "stale": 28,
-    "broken": 5
+    "stale": 3,
+    "broken": 0
   }
 }

@@ -2,7 +2,7 @@
 
 Row: `MODEL-MM-QWEN4-EXP`
 Issues: `ISSUE-LOCAL-01M2BZ5DZ2710201WMH9TNSVH3` (the defect),
-`ISSUE-LOCAL-01M2BZ5QK4XRETK48CXKSHKRDW` (owed: chunked H2D),
+`ISSUE-LOCAL-01M2BZ5QK4XRETK48CXKSHKRDW` (CLOSED: chunked H2D, resolved 2026-09-13),
 `ISSUE-LOCAL-01M2CCNA0S74WT5WBV50B3VD0W` (owed: two ungated helper terms),
 `ISSUE-LOCAL-01M2CKN5516AKE7W2JVDV86Z8X` (owed: the four other families that
 execute this seam are uncovered),
@@ -444,6 +444,19 @@ suspect and `ISSUE-LOCAL-01M2BZ5QK4XRETK48CXKSHKRDW` (chunked H2D through a
 pinned bounce buffer) is required, not optional. No throughput, latency or
 prefill number is recorded, because no token was produced.
 
+**UPDATE, 2026-09-13 (same day).** The owed change was built and measured
+and it resolved the stall. `.agents/specs/rocm-chunked-pinned-h2d.md` §7
+records the A/B: the same binary, one boot, one knob read at runtime.
+With the pinned ring on (arm A, CIFS source), the 67.56 GiB checkpoint
+produced 3 x 32 tokens in 771 s, reached 71.96 GiB of device memory, and
+showed 0 `svm_range_set_attr` samples in 122. With
+`VT_ROCM_PINNED_H2D_MIB=0` (arm B), the same binary reproduced this
+section's failure to within noise: no token, killed at 1200 s, 135 of 197
+samples in `svm_range_set_attr`. A third arm (C) copied the shards to
+local disk and completed in 62 s. The issue
+`ISSUE-LOCAL-01M2BZ5QK4XRETK48CXKSHKRDW` is CLOSED. The ring is the
+default path; `VT_ROCM_PINNED_H2D_MIB=0` disables it for the A/B.
+
 ## 7. Risks
 
 - **A released page that something still reads.** The borrow stays valid, so a
@@ -483,12 +496,12 @@ owns both.
   not override `Synchronize`, so no case in this tree can express a DMA still
   reading the source pages. Convicting it needs a backend whose `Copy` defers.
 
-## Deferred, with an issue
+## Resolved, with an issue
 
-- `ISSUE-LOCAL-01M2BZ5QK4XRETK48CXKSHKRDW` (row-owned, not started) covers chunked H2D through a pinned bounce
-  buffer, llama.cpp's 4 x 64 MiB shape. Needed only if the stall survives fixes 1
-  and 2. Medium-size and touches every staged weight on every backend, so it gets
-  its own row, spec and measurement.
+- `ISSUE-LOCAL-01M2BZ5QK4XRETK48CXKSHKRDW` (row-owned, CLOSED) covered chunked H2D through a pinned bounce
+  buffer, llama.cpp's 4 x 64 MiB shape. It was needed because the stall survived
+  fixes 1 and 2, and it resolved the stall. `.agents/specs/rocm-chunked-pinned-h2d.md`
+  §7 records the A/B measurement; the UPDATE paragraph in §6a records the summary.
 
 ## 8. Stop conditions
 

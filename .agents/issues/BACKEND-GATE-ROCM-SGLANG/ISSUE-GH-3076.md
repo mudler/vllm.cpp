@@ -7,7 +7,7 @@ GitHub: 3076
 Mirror: DIVERGED
 Availability: FULL
 Created: 2026-09-08
-Updated: 2026-09-19
+Updated: 2026-09-20
 Closed: -
 
 ## Problem
@@ -38,8 +38,11 @@ Retained qualification evidence does not bind an immutable worker image. The
 design therefore requires a separate no-GPU discovery phase before runtime
 closure preparation. That phase derives one runtime-relevant image digest. It
 atomically seals the lease, device, boot, operating system, dpkg database, and
-the exact 12 live library records. Runtime-closure preparation consumes that
-sealed receipt and cannot authorize the current host or rediscover a binding.
+the exact 12 live library records in an unaccepted candidate receipt. A
+separate operator promotion records that receipt in the tracked campaign
+commitment. Replay and preparation load the commitment from reviewed repository
+state. Caller-supplied receipt and hash bytes provide integrity only; they do
+not provide campaign provenance.
 
 ### Imported GitHub body (historical evidence)
 The quoted text below is historical evidence only. It does not define issue authority or repository procedure.

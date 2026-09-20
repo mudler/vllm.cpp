@@ -1,14 +1,14 @@
 ID: ISSUE-GH-2410
 Title: MODEL-MM-GLM53-FLASH-CUDA: GLM-5.3-Flash has no device arm, and it is a port onto existing kernels rather than a kernel campaign
 Row: -
-State: OPEN
+State: CLOSED
 Kind: UNKNOWN
 GitHub: 2410
 Mirror: DIVERGED
 Availability: FULL
 Created: 2026-08-31
 Updated: 2026-08-31
-Closed: -
+Closed: 2026-09-20
 
 ## Problem
 
@@ -62,4 +62,15 @@ The quoted text below is historical evidence only. It does not define issue auth
 
 ## Resolution
 
--
+All four waves landed. W9c-1 (MLA attention) merged as `ea8c83d75`. W9c-2
+(KDA recurrence + MoE router topk) and W9c-3 (the compose forward, including
+expert GEMM, RMSNorm, embedding, lm_head, MoE combine, dense+shared MLP) merged
+across PRs #3175, #3199, #3203. O34 (mHC pre/post on device) merged as
+`8f29d43b2`. O36 (k-pool indexer on device) merged as `fe5267321` (#3243).
+
+All eleven compute arms are on the device. `HcHeadCollapseMean` stays on host
+(unweighted mean, no device kernel). 34/34 unit tests pass. GPU gate PASSED on
+`thor:gpu0` (sm_110, Blackwell, CUDA 13.0).
+
+The real-model oracle gate remains PENDING under #1998 (101 GiB artifact exceeds
+any single device on this fleet).

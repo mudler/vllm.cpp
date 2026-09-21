@@ -674,6 +674,9 @@ std::string GetInstructions(const nlohmann::json& qj) {
 // r2(x) — round to 2 decimal places (kev/api.py:r2).
 double R2(double x) { return std::round(x * 100.0) / 100.0; }
 
+// r4(x) — round to 4 decimal places. Used by the cua-s1 score path.
+double R4(double x) { return std::round(x * 10000.0) / 10000.0; }
+
 // choice_confidence(p) — normalized margin (kev/api.py:choice_confidence).
 double ChoiceConfidence(const std::vector<float>& p) {
   size_t k = p.size();
@@ -969,6 +972,79 @@ ApiServer::DispatchResult ApiServer::handle_ner(
        {"usage",
         nlohmann::json{{"prompt_tokens", result.prompt_tokens},
                        {"total_tokens", result.prompt_tokens}}},
+    }.dump();
+    return r;
+  } catch (const std::exception& e) {
+    return MakeError(500, "InternalServerError", e.what());
+  }
+}
+
+ApiServer::DispatchResult ApiServer::handle_score(
+    const std::string& request_body) const {
+  if (!score_) {
+    return MakeError(500, "InternalServerError",
+                    "The model does not support scoring");
+  }
+  nlohmann::json body;
+  try {
+    body = nlohmann::json::parse(request_body);
+  } catch (const std::exception& e) {
+    return MakeError(400, "BadRequestError",
+                    std::string("invalid JSON body: ") + e.what());
+  }
+  if (!body.is_object()) {
+    return MakeError(400, "BadRequestError", "request body must be an object");
+  }
+  // model: honoured like every other serving handler.
+  if (body.contains("model") && body["model"].is_string() &&
+     !models_.is_base_model(body["model"].get<std::string>())) {
+    return MakeError(404, "NotFoundError",
+                    "The model `" + body["model"].get<std::string>() +
+                        "` does not exist.");
+  }
+  // context: required string.
+  if (!body.contains("context") || !body["context"].is_string()) {
+    return MakeError(400, "BadRequestError",
+                    "context is required and must be a string");
+  }
+  const std::string context = body["context"].get<std::string>();
+  // options: required array of strings.
+  if (!body.contains("options") || !body["options"].is_array()) {
+    return MakeError(400, "BadRequestError",
+                    "options is required and must be an array of strings");
+  }
+  std::vector<std::string> options;
+  for (const auto& opt : body["options"]) {
+    if (!opt.is_string()) {
+      return MakeError(400, "BadRequestError",
+                      "each option must be a string");
+    }
+    options.push_back(opt.get<std::string>());
+  }
+  if (options.empty()) {
+    return MakeError(400, "BadRequestError",
+                    "options must not be empty");
+  }
+
+  auto start = std::chrono::steady_clock::now();
+  try {
+    ScoreResult result = score_(context, options);
+    auto end = std::chrono::steady_clock::now();
+    double latency_ms =
+        std::chrono::duration<double, std::milli>(end - start).count();
+    nlohmann::json probs = nlohmann::json::array();
+    for (float p : result.probabilities) {
+      probs.push_back(R4(p));
+    }
+    DispatchResult r;
+    r.body = nlohmann::json{
+        {"model", models_.model_name()},
+        {"probabilities", std::move(probs)},
+        {"winner", result.winner},
+        {"confidence", R4(result.confidence)},
+        {"usage", nlohmann::json{{"input_tokens", result.prompt_tokens},
+                                 {"output_tokens", 0}}},
+        {"latency_ms", R2(latency_ms)},
     }.dump();
     return r;
   } catch (const std::exception& e) {
@@ -1814,6 +1890,17 @@ void ApiServer::register_routes() {
                 [this, write](const httplib::Request& req,
                               httplib::Response& res) {
                   write(handle_systemone_separate(req.body), res);
+                });
+  }
+
+  if (score_) {
+    // cua-s1-forms score (MODEL-CUA-S1-FORMS). Registered ONLY when a score
+    // callback is attached, so a non-cua-s1 server answers 404 at the route
+    // table.
+    server.Post("/v1/score",
+                [this, write](const httplib::Request& req,
+                              httplib::Response& res) {
+                  write(handle_score(req.body), res);
                 });
   }
 

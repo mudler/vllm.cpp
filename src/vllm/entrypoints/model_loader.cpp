@@ -3231,7 +3231,15 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
   if (!fs::exists(dir) || !fs::is_directory(dir)) {
     throw std::runtime_error("model path is not a directory: " + model_dir);
   }
-  const std::string config_path = (dir / "config.json").string();
+  std::string config_path = (dir / "config.json").string();
+  // cua-s1-forms models (MODEL-CUA-S1-FORMS) ship cua-s1-forms.json instead
+  // of config.json. Fall back so the standard loading path can resolve it.
+  if (!fs::exists(config_path)) {
+    const std::string cuas1_path = (dir / "cua-s1-forms.json").string();
+    if (fs::exists(cuas1_path)) {
+      config_path = cuas1_path;
+    }
+  }
   const std::string tokenizer_path = (dir / "tokenizer.json").string();
 
   // Refuse-by-task (ARCH-ONE-SURFACE ROW 1), BEFORE the full HfConfig parse: a

@@ -93,6 +93,7 @@
 #include "vllm/transformers_utils/hf_config.h"
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/gliner2_ner.h"  // Gliner2NerInference (MODEL-GLINER25)
+#include "vllm/model_executor/models/cua_s1_inference.h"  // CuaS1ScoreInference (MODEL-CUA-S1-FORMS)
 #include "vllm/multimodal/minimax_h3_video.h"
 #include "vllm/multimodal/parakeet_transcription.h"
 #include "vllm/multimodal/video_engine.h"
@@ -1048,7 +1049,17 @@ int VllmServerMain(int argc, char** argv) {
     }
 
     const fs::path dir = NativeUtf8Path(args.model_dir);
-    const std::string config_path = PathUtf8(dir / "config.json");
+    std::string config_path = PathUtf8(dir / "config.json");
+    // cua-s1-forms models (MODEL-CUA-S1-FORMS) ship cua-s1-forms.json
+    // instead of config.json. Fall back so the dispatch and loader can
+    // resolve it.
+    if (!fs::exists(config_path)) {
+      const std::string cuas1_path =
+          PathUtf8(dir / "cua-s1-forms.json");
+      if (fs::exists(cuas1_path)) {
+        config_path = cuas1_path;
+      }
+    }
     const std::string tokenizer_path = PathUtf8(dir / "tokenizer.json");
     const std::string tokenizer_config_path =
         args.tokenizer_config.empty()
@@ -1198,6 +1209,73 @@ int VllmServerMain(int argc, char** argv) {
         vllm::platform::ConsoleShutdown shutdown_on_signal(
             [&]() { ner_server.stop(); });
         if (!ner_server.listen(args.host, args.port)) {
+          std::cerr << "server: failed to bind " << args.host << ":"
+                    << args.port << "\n";
+          return 1;
+        }
+        return 0;
+      }
+
+      // ── CUA-S1-FORMS SCORE DISPATCH (MODEL-CUA-S1-FORMS): a model dir
+      // whose architectures resolve to "CuaS1Forms" serves /v1/score
+      // through the score callback (CuaS1ScoreInference — the same path
+      // the C ABI will drive) and registers NO generate, embedding, NER,
+      // or systemone routes. This check runs BEFORE the pooling_model check
+      // because CuaS1Forms IS a pooling model (is_pooling_model = true),
+      // but it needs the score server, not the embedding server.
+      bool cuas1_model = false;
+      if (!archs.empty()) {
+        try {
+          cuas1_model =
+              vllm::ModelRegistry::Resolve(std::span<const std::string>(archs))
+                  .architecture == "CuaS1Forms";
+        } catch (const std::exception&) {
+          cuas1_model = false;
+        }
+      }
+      if (cuas1_model) {
+        std::cerr << "server: cua-s1-forms model (" << archs[0]
+                  << "); serving /v1/score\n";
+        vllm::entrypoints::EngineParams score_params;
+        score_params.block_size = args.block_size;
+        score_params.num_blocks = args.num_blocks;
+        score_params.gpu_memory_utilization = args.gpu_memory_utilization;
+        score_params.kv_cache_memory_bytes = args.kv_cache_memory_bytes;
+        score_params.max_model_len = args.max_model_len;
+        score_params.max_num_seqs = args.max_num_seqs;
+        score_params.max_num_batched_tokens = args.max_num_batched_tokens;
+        score_params.enable_prefix_caching = args.enable_prefix_caching;
+        score_params.offload_config = parsed_offload_config;
+        score_params.weight_residency = parsed_weight_residency;
+        auto loaded_score = std::shared_ptr<vllm::entrypoints::LoadedEngine>(
+            vllm::entrypoints::LoadedEngine::FromModelDir(args.model_dir,
+                                                          score_params));
+        namespace oai = vllm::entrypoints::openai;
+        oai::OpenAIServingModels score_models(served_model_name);
+        oai::ApiServer score_server(score_models, vllm::Version());
+        auto score_mutex = std::make_shared<std::mutex>();
+        score_server.set_score(
+            [loaded_score, score_mutex](
+                const std::string& context,
+                const std::vector<std::string>& options)
+                -> oai::ApiServer::ScoreResult {
+              std::lock_guard<std::mutex> lock(*score_mutex);
+              const vllm::LoadedModel& model =
+                  loaded_score->loaded_model();
+              vllm::cua_s1::CuaS1ScoreResult result =
+                  vllm::CuaS1ScoreInference(model, context, options);
+              oai::ApiServer::ScoreResult out;
+              out.probabilities = std::move(result.probabilities);
+              out.winner = result.winner;
+              out.confidence = result.confidence;
+              out.prompt_tokens = result.prompt_tokens;
+              return out;
+            });
+        std::cerr << "server: listening on http://" << args.host << ":"
+                  << args.port << "\n";
+        vllm::platform::ConsoleShutdown shutdown_on_signal(
+            [&]() { score_server.stop(); });
+        if (!score_server.listen(args.host, args.port)) {
           std::cerr << "server: failed to bind " << args.host << ":"
                     << args.port << "\n";
           return 1;

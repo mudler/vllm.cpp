@@ -179,6 +179,11 @@ class ApiServer {
   DispatchResult handle_systemone_separate(
       const std::string& request_body) const;
 
+  // POST /v1/score (MODEL-CUA-S1-FORMS). Takes a context string + a list of
+  // option strings, returns per-option probabilities + winner. Registered ONLY
+  // when a score callback is attached, so a non-cua-s1 server answers 404.
+  DispatchResult handle_score(const std::string& request_body) const;
+
   // POST /v1/audio/speech (W6 of #672). OpenAI's createSpeech spelling, with
   // the two MUSIC inputs (`lyrics`, `description`) as ADDITIONAL named fields
   // — see speech_api.h for why they are not one `input` behind a separator.
@@ -300,6 +305,23 @@ class ApiServer {
       float threshold, int64_t max_width)>;
   void set_ner(NerFn ner) { ner_ = std::move(ner); }
 
+  // Attach the score seam backing POST /v1/score for a cua-s1-forms model
+  // (MODEL-CUA-S1-FORMS, Phase 4). ADDITIVE and OPT-IN like ner_ above:
+  // absent => the /v1/score route is not registered (404). When set, the
+  // handler runs one forward (context + options → probabilities) and returns
+  // the per-option distribution + winner. The callback wraps the ONE library
+  // seam (CuaS1ScoreInference) so HTTP and FFI cannot drift.
+  struct ScoreResult {
+    std::vector<float> probabilities;  // per-option probability
+    int64_t winner = 0;               // argmax index
+    float confidence = 0.0F;          // winner probability
+    int64_t prompt_tokens = 0;
+  };
+  using ScoreFn = std::function<ScoreResult(
+      const std::string& context,
+      const std::vector<std::string>& options)>;
+  void set_score(ScoreFn score) { score_ = std::move(score); }
+
   // Attach the speech/music synthesis seam backing POST /v1/audio/speech (W6 of
   // #672). ADDITIVE and OPT-IN like the embedder above: absent => route
   // unregistered => 404, byte-identical to a server without a speech model. The
@@ -394,6 +416,7 @@ class ApiServer {
   TranscribeFn transcriber_;
   EmbedFn embedder_;
   NerFn ner_;
+  ScoreFn score_;
   SynthesizeFn synthesizer_;
   ::vllm::openai::SpeechCapabilities speech_capabilities_;
   mutable ::vllm::openai::VideoJobStore video_jobs_;

@@ -109,4 +109,25 @@ std::vector<float> ForwardHost(
     const std::vector<uint8_t>& option_mask);
 
 }  // namespace cua_s1
+
+// Forward declarations for the production weight loader (defined in
+// cua_s1_weights.cpp). The full types live in safetensors_reader.h and
+// hf_config.h, which are not included here to keep this header lightweight.
+class SafetensorsFile;
+struct HfConfig;
+
+// Combined model weights: parsed params + loaded weight tensors. Materialized
+// from a safetensors checkpoint by LoadCuaS1Weights and owned by
+// CuaS1LoadedModel.
+struct CuaS1ModelWeights {
+  cua_s1::Params params;
+  cua_s1::Weights weights;
+};
+
+// Production weight loader: reads all F32 tensors from the safetensors
+// shards, parses the model params from config.raw (the unwrapped
+// cua-s1-forms.json config envelope), and calls cua_s1::Load.
+CuaS1ModelWeights LoadCuaS1Weights(
+    const std::vector<SafetensorsFile>& shards, const HfConfig& config);
+
 }  // namespace vllm

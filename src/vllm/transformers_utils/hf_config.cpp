@@ -331,7 +331,17 @@ std::vector<std::string> PeekHfArchitectures(const std::string& path) {
                                              /*allow_exceptions=*/false);
   if (doc.is_discarded() || !doc.is_object()) return {};
   const auto it = doc.find("architectures");
-  if (it == doc.end() || !it->is_array()) return {};
+  if (it == doc.end() || !it->is_array()) {
+    // cua-s1-forms models (MODEL-CUA-S1-FORMS) ship cua-s1-forms.json
+    // with a "config" envelope wrapping width/layers/heads and no
+    // architectures field. Detect by the envelope signature and synthesize
+    // the architecture so the registry can resolve it.
+    if (doc.contains("config") && doc["config"].is_object() &&
+        doc["config"].contains("width") && doc["config"].contains("layers")) {
+      return {"CuaS1Forms"};
+    }
+    return {};
+  }
   std::vector<std::string> archs;
   for (const auto& a : *it) {
     if (!a.is_string()) return {};
@@ -425,6 +435,21 @@ HfConfig ParseHfConfigDoc(nlohmann::json doc, const std::string& path,
                              path);
   }
 
+  // cua-s1-forms models (MODEL-CUA-S1-FORMS) ship cua-s1-forms.json with
+  // a "config" envelope wrapping the model params (width, layers, heads,
+  // context_tokens, option_tokens, rank) and no model_type or architectures
+  // field. Unwrap the envelope, inject the identity, and skip the
+  // required-field checks (params are parsed from config.raw in
+  // cua_s1_weights.cpp). Done before ResolveTextConfig so the reference is
+  // taken on the unwrapped doc.
+  if (!doc.contains("model_type") && doc.contains("config") &&
+      doc["config"].is_object() && doc["config"].contains("width") &&
+      doc["config"].contains("layers")) {
+    doc = doc["config"];
+    doc["model_type"] = "cua_s1_forms";
+    doc["architectures"] = nlohmann::json::array({"CuaS1Forms"});
+  }
+
   // Resolve the effective text config: for multimodal wrapper configs (e.g.
   // Qwen3_5MoeForConditionalGeneration) the text-model fields are nested under
   // `text_config`; for plain dense configs `text` aliases `doc`. `architectures`
@@ -436,8 +461,11 @@ HfConfig ParseHfConfigDoc(nlohmann::json doc, const std::string& path,
   // GLiNER2.5 configs (model_type "extractor") carry no encoder fields —
   // hidden_size and num_hidden_layers are inferred from weight shapes in
   // gliner2_weights.cpp::InferEncoderParams, so skip the requirement here.
+  // cua-s1-forms configs (model_type "cua_s1_forms") are the same: params are
+  // parsed from config.raw in cua_s1_weights.cpp.
   const bool is_extractor = GetString(doc, "model_type") == "extractor";
-  if (!is_extractor) {
+  const bool is_cua_s1 = GetString(doc, "model_type") == "cua_s1_forms";
+  if (!is_extractor && !is_cua_s1) {
     RequireKey(text, "hidden_size", path);
     RequireKey(text, "num_hidden_layers", path);
   }

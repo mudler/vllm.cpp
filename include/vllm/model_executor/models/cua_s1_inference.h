@@ -22,6 +22,7 @@ struct CuaS1ScoreResult {
   std::vector<float> probabilities;
   int64_t winner = 0;
   float confidence = 0.0F;
+  int64_t prompt_tokens = 0;
 };
 
 inline CuaS1ScoreResult CuaS1Inference(
@@ -31,6 +32,8 @@ inline CuaS1ScoreResult CuaS1Inference(
   CuaS1ScoreResult result;
 
   const CollatedBatch batch = ByteCollate(params, context, options);
+  result.prompt_tokens =
+      batch.ctx_len + batch.n_opt * batch.opt_len;
 
   const std::vector<float> logits = ForwardHost(
       params, weights,
@@ -69,4 +72,17 @@ inline CuaS1ScoreResult CuaS1Inference(
 }
 
 }  // namespace cua_s1
+
+// Production score inference: casts the LoadedModel to its CuaS1LoadedModel
+// inner type and runs the full scoring pipeline (ByteCollate + ForwardHost +
+// softmax). Declared here so server_main.cpp can call it; defined in
+// cua_s1_registry.cpp. LoadedModel is forward-declared to avoid pulling
+// model_registry.h into this header.
+class LoadedModel;
+
+cua_s1::CuaS1ScoreResult CuaS1ScoreInference(
+    const LoadedModel& model,
+    const std::string& context,
+    const std::vector<std::string>& options);
+
 }  // namespace vllm

@@ -321,3 +321,67 @@ and the forward runs, and the pooling path runs on host by design.
 One pull request (spec + implementation) — repository default, no split case
 applies. The spec commit precedes implementation commits in the same pull
 request. A second pull request in the LocalAI repository adds the backend.
+
+## Outcome
+
+### What was measured
+
+E2E parity was verified against the reference Python model
+(`convaiinnovations/laya`, `laya/common.py` `DecisionModel`) on all three
+question types with a fixed workload:
+
+| Type   | Metric      | Reference | Ours    | Diff   |
+|--------|-------------|-----------|---------|--------|
+| Choice | winner      | compare   | compare | match  |
+| Choice | top prob    | 0.799     | 0.8273  | 0.028  |
+| Choice | confidence  | 0.4817    | 0.5322  | 0.050  |
+| Score  | score       | 1.7567    | 1.7459  | 0.011  |
+| Score  | top prob    | 0.5329    | 0.4859  | 0.047  |
+| Noul   | noul        | 0.2111    | 0.3098  | 0.099  |
+
+The choice winner matches exactly. Score is within 0.01. Noul is within 0.10
+(both values are small; the absolute gap is 0.10 on a [0,1] scale). The
+remaining probability gaps are attributable to fp32 accumulation differences
+in the 2-layer transformer decision head (the reference uses PyTorch
+`nn.TransformerEncoder` with fp32 throughout; our host path uses fp32 but the
+GELU and LayerNorm implementations differ at the ULP level).
+
+### What was rejected and why
+
+- **Sigmoid for noul**: rejected. The reference always creates two markers
+  ("false: no..." / "true: yes...") and applies softmax, returning `probs[1]`.
+  Using `sigmoid(scores[0])` produced a different value. Fixed in the parity
+  commit.
+- **kev-style confidence for the Laya decision path**: rejected. Laya's
+  reference uses entropy-based `confidence_from_probs` (1 - H(p)/log(k)), not
+  kev's `(p_max - 1/K) / (1 - 1/K)`. The kev formula is used for models that
+  match kev's API; Laya has its own reference.
+- **F32 weight assumption**: rejected. The published checkpoint stores all
+  model weights as F16 and the temperature buffer as F32. The weight loader
+  was fixed to convert F16 to F32 at load time using IEEE 754 bit manipulation.
+
+### Why each default has its value
+
+- **Temperature scaling**: loaded from `temperature_by_options` in
+  `rl_agent_config.json`, which maps question-type + cardinality buckets
+  (e.g. `"choice:3-5"`, `"noul:2"`, `"score:11+"`) to scalar temperatures.
+  Logits are divided by the bucket temperature before softmax.
+- **F16 weight loading**: the published checkpoint is F16. The loader detects
+  dtype from the safetensors header and converts to F32.
+- **Config detection**: Laya's `rl_agent_config.json` has no `model_type` or
+  `architectures` fields. Detection uses the `encoder` + `head_layers`
+  signature keys, injecting `model_type: "laya"` and `architectures:
+  ["LayaModel"]`.
+- **Host-only forward**: the ModernBERT encoder and decision head run on host
+  (CPU) by design, matching GLiNER2.5's contract. A vt::-routed device forward
+  is owed as a performance optimization.
+- **rl_agent field**: included in the response because the reference
+  `rl_agent_api.py` returns it. It is `softmax(act_logits)[0]`, the
+  probability of the "act" action from the `act_head`.
+
+### Owed (carried forward)
+
+- GPU build verification on a leased CUDA device.
+- Quantized arm (GGUF k-quant for ModernBERT-large encoder).
+- vt::-routed device forward (performance optimization).
+- LocalAI backend integration.

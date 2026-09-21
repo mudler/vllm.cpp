@@ -674,9 +674,22 @@ std::string GetInstructions(const nlohmann::json& qj) {
 // r2(x) — round to 2 decimal places (kev/api.py:r2).
 double R2(double x) { return std::round(x * 100.0) / 100.0; }
 
-// r4(x) — round to 4 decimal places. Used by the cua-s1 score path.
+// r4(x) — round to 4 decimal places. Used by the cua-s1 score path
+// (rl_agent_api.py:round(float(v), 4)).
 double R4(double x) { return std::round(x * 10000.0) / 10000.0; }
 
+// confidence_from_probs(p, k) — 1 - normalized Shannon entropy
+// (rl_common.py:confidence_from_probs). Used by the Laya decision path.
+double ConfidenceFromProbs(const std::vector<float>& p) {
+  size_t k = p.size();
+  if (k < 2) return 1.0;
+  double ent = 0.0;
+  for (float v : p) {
+    double pv = std::max(static_cast<double>(v), 1e-12);
+    ent -= pv * std::log(pv);
+  }
+  return 1.0 - ent / std::log(static_cast<double>(k));
+}
 // choice_confidence(p) — normalized margin (kev/api.py:choice_confidence).
 double ChoiceConfidence(const std::vector<float>& p) {
   size_t k = p.size();
@@ -895,21 +908,24 @@ nlohmann::json BuildSystemOneAnswer(
 // Build one kev answer from decision scores (MODEL-LAYA). Mirrors
 // BuildSystemOneAnswer but takes per-option logits directly from the decision
 // head instead of extracting NER confidences.
+//
+// Temperature scaling is already applied inside LayaInference (matching
+// reference rl_agent_api.py: z = logits / temp_bucket(qt, k)). Here we just
+// softmax the scaled logits and format the answer.
 nlohmann::json BuildSystemOneAnswerDecision(
     const SystemOneQuestion& q, const ApiServer::DecisionResult& result) {
-  std::vector<float> scores = result.scores;
-  std::vector<float> probs;
+  // Softmax the temperature-scaled logits for all question types.
+  std::vector<float> probs = Softmax(result.scores);
+
+  // act_probability: softmax(act_logits)[0] (rl_agent_api.py:ext).
+  std::vector<float> act_probs = Softmax(result.act_logits);
+  float act_prob = act_probs.empty() ? 0.0F : act_probs[0];
+  nlohmann::json rl_agent = {{"act_probability", R4(act_prob)}};
+
   if (q.type == "noul") {
-    // noul: 1 score -> sigmoid -> yes probability.
-    float p = 1.0F / (1.0F + std::exp(-scores[0]));
-    probs = {1.0F - p, p};
-  } else {
-    probs = Softmax(scores);
-  }
-  if (q.type == "noul") {
-    // No entity spans from a decision model -- Laya scores presence, not spans.
-    return nlohmann::json{{"type", "noul"}, {"noul", R2(probs[1])},
-                          {"entities", nlohmann::json::array()}};
+    // Reference: {"type": "noul", "noul": round(p[1], 4), "rl_agent": ext}
+    return nlohmann::json{{"type", "noul"}, {"noul", R4(probs[1])},
+                          {"rl_agent", std::move(rl_agent)}};
   }
   if (q.type == "choice") {
     size_t argmax = 0;
@@ -918,11 +934,12 @@ nlohmann::json BuildSystemOneAnswerDecision(
     }
     nlohmann::json dist = nlohmann::json::object();
     for (size_t i = 0; i < q.keys.size(); ++i) {
-      dist[q.keys[i]] = R2(probs[i]);
+      dist[q.keys[i]] = R4(probs[i]);
     }
     return nlohmann::json{{"type", "choice"}, {"choice", q.keys[argmax]},
-                          {"confidence", R2(ChoiceConfidence(probs))},
-                          {"probabilities", std::move(dist)}};
+                          {"probabilities", std::move(dist)},
+                          {"confidence", R4(ConfidenceFromProbs(probs))},
+                          {"rl_agent", std::move(rl_agent)}};
   }
   // score
   double score = 0.0;
@@ -933,12 +950,34 @@ nlohmann::json BuildSystemOneAnswerDecision(
   nlohmann::json dist = nlohmann::json::object();
   for (size_t i = 0; i < q.keys.size(); ++i) {
     legend[std::to_string(i)] = q.keys[i];
-    dist[std::to_string(i)] = R2(probs[i]);
+    dist[std::to_string(i)] = R4(probs[i]);
   }
-  return nlohmann::json{{"type", "score"}, {"score", R2(score)},
+  return nlohmann::json{{"type", "score"}, {"score", R4(score)},
                         {"legend", std::move(legend)},
                         {"probabilities", std::move(dist)},
-                        {"confidence", R2(ScoreConfidence(probs))}};
+                        {"confidence", R4(ConfidenceFromProbs(probs))},
+                        {"rl_agent", std::move(rl_agent)}};
+}
+
+// Render option texts for the Laya decision path, matching
+// rl_common.py:render_options. The GLiNER NER path uses q.labels directly
+// (kev format); the Laya decision path needs the reference option format.
+std::vector<std::string> RenderDecisionOptions(const SystemOneQuestion& q) {
+  if (q.type == "noul") {
+    // Reference: always 2 options — false / true.
+    return {"false: no, the statement does not hold",
+            "true: yes, the statement holds"};
+  }
+  if (q.type == "score") {
+    // Reference: "level %d: %s" % (i, c)
+    std::vector<std::string> opts;
+    for (size_t i = 0; i < q.keys.size(); ++i) {
+      opts.push_back("level " + std::to_string(i) + ": " + q.keys[i]);
+    }
+    return opts;
+  }
+  // choice: q.labels already has the right format (key or "key: desc").
+  return q.labels;
 }
 
 }  // namespace
@@ -1128,7 +1167,7 @@ ApiServer::DispatchResult ApiServer::handle_systemone(
       int64_t total_tokens = 0;
       for (const auto& q : parsed.questions) {
         auto result = decision_(parsed.text, q.type, q.instructions,
-                                q.labels);
+                                  RenderDecisionOptions(q));
         total_tokens += result.prompt_tokens;
         answers[q.id] = BuildSystemOneAnswerDecision(q, result);
       }
@@ -1321,7 +1360,8 @@ ApiServer::DispatchResult ApiServer::handle_systemone_separate(
     int64_t total_tokens = 0;
     for (const auto& q : parsed.questions) {
      if (decision_) {
-       auto dr = decision_(parsed.text, q.type, q.instructions, q.labels);
+       auto dr = decision_(parsed.text, q.type, q.instructions,
+                           RenderDecisionOptions(q));
        total_tokens += dr.prompt_tokens;
        answers[q.id] = BuildSystemOneAnswerDecision(q, dr);
      } else {

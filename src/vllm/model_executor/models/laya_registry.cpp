@@ -259,6 +259,29 @@ LayaDecisionResult LayaInference(
   result.scores = std::move(head_out.logits);
   result.act_logits = std::move(head_out.act_logits);
   result.prompt_tokens = seq_len;
+
+  // Apply temperature scaling before softmax (matches reference:
+  //   z = logits[:k] / temperature_by_options.get(temp_bucket(qt, k),
+  //                                                 temperature[qt])
+  // Without this the probability distributions are far too peaked.
+  {
+    const int k = static_cast<int>(result.scores.size());
+    const int qt_i = static_cast<int>(qt);
+    static const char* kQTypeNames[] = {"choice", "score", "noul"};
+    std::string bucket = kQTypeNames[qt_i];
+    bucket += ":";
+    if (k <= 2) bucket += "2";
+    else if (k <= 5) bucket += "3-5";
+    else if (k <= 10) bucket += "6-10";
+    else bucket += "11+";
+
+    float temp = w.head_weights.temperature[qt_i];
+    auto it = w.temperature_by_options.find(bucket);
+    if (it != w.temperature_by_options.end()) temp = it->second;
+
+    for (float& s : result.scores) s /= temp;
+  }
+
   return result;
 }
 

@@ -145,6 +145,10 @@ struct LayaModelWeights {
   modernbert::Weights encoder_weights;
   laya::Params head_params;
   laya::Weights head_weights;
+  // Per-cardinality temperature map from rl_agent_config.json
+  // (keys like "choice:3-5", "noul:2"). Used to scale logits before softmax,
+  // matching reference temp_bucket() lookup.
+  std::map<std::string, float> temperature_by_options;
 };
 
 // Production weight loader: reads all F32 tensors from the safetensors

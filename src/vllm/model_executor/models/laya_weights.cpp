@@ -27,24 +27,62 @@
 namespace vllm {
 namespace {
 
-// Copy one F32 StTensor into a CheckpointTensors map. Throws if the tensor
-// is not F32 — the checkpoint carries only F32, so any other dtype is a
-// format mismatch the loader should surface. Templated because
+// Convert one IEEE 754 half-precision value to float.
+inline float F16ToF32(uint16_t h) {
+  uint32_t sign = (h >> 15) & 0x1;
+  uint32_t exp = (h >> 10) & 0x1F;
+  uint32_t mant = h & 0x3FF;
+  uint32_t f;
+  if (exp == 0) {
+    if (mant == 0) {
+      f = sign << 31;
+    } else {
+      while (!(mant & 0x400)) {
+        mant <<= 1;
+        --exp;
+      }
+      mant &= 0x3FF;
+      f = (sign << 31) | ((127 + exp - 15) << 23) | (mant << 13);
+    }
+  } else if (exp == 31) {
+    f = (sign << 31) | (0xFFu << 23) | (mant << 13);
+  } else {
+    f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+  }
+  float result;
+  std::memcpy(&result, &f, sizeof(result));
+  return result;
+}
+
+// Copy one StTensor into a CheckpointTensors map as F32. The published
+// checkpoint stores weights in F16 and the temperature buffer in F32; both
+// are upcast to F32 for the host reference path. Templated because
 // modernbert::CheckpointTensors and laya::CheckpointTensors are distinct
 // types with the same Set/Get/Shape/Has interface.
 template <typename CheckpointT>
-void LoadF32Tensor(const StTensor& t, const std::string& name,
-                   CheckpointT& out) {
-  VT_CHECK(t.dtype == "F32",
-           "laya: tensor '" + name + "' has dtype " + t.dtype +
-               ", expected F32");
+void LoadTensor(const StTensor& t, const std::string& name,
+                CheckpointT& out) {
   VT_CHECK(t.data != nullptr,
            "laya: tensor '" + name + "' has null data");
-  VT_CHECK(t.nbytes % sizeof(float) == 0,
-           "laya: tensor '" + name + "' nbytes not a multiple of 4");
-  size_t numel = t.nbytes / sizeof(float);
-  const float* ptr = reinterpret_cast<const float*>(t.data);
-  std::vector<float> data(ptr, ptr + numel);
+  std::vector<float> data;
+  if (t.dtype == "F32") {
+    VT_CHECK(t.nbytes % sizeof(float) == 0,
+             "laya: tensor '" + name + "' nbytes not a multiple of 4");
+    size_t numel = t.nbytes / sizeof(float);
+    const float* ptr = reinterpret_cast<const float*>(t.data);
+    data.assign(ptr, ptr + numel);
+  } else if (t.dtype == "F16") {
+    VT_CHECK(t.nbytes % sizeof(uint16_t) == 0,
+             "laya: tensor '" + name + "' nbytes not a multiple of 2");
+    size_t numel = t.nbytes / sizeof(uint16_t);
+    const uint16_t* ptr =
+        reinterpret_cast<const uint16_t*>(t.data);
+    data.reserve(numel);
+    for (size_t i = 0; i < numel; ++i) data.push_back(F16ToF32(ptr[i]));
+  } else {
+    throw std::runtime_error(
+        "laya: tensor '" + name + "' has unsupported dtype " + t.dtype);
+  }
   std::vector<int64_t> shape(t.shape.begin(), t.shape.end());
   out.Set(name, std::move(shape), std::move(data));
 }
@@ -182,8 +220,8 @@ LayaModelWeights LoadLayaWeights(
     const StTensor& t = shard_ptr->Get(name);
     // Every tensor goes into both — the Load functions look up by name, so
     // tensors the other side does not need are simply ignored.
-    LoadF32Tensor(t, name, enc_tensors);
-    LoadF32Tensor(t, name, head_tensors);
+    LoadTensor(t, name, enc_tensors);
+    LoadTensor(t, name, head_tensors);
   }
 
   // Infer encoder params from weight shapes + config.
@@ -197,9 +235,23 @@ LayaModelWeights LoadLayaWeights(
   modernbert::Weights enc_weights = modernbert::Load(enc_params, enc_tensors);
   laya::Weights head_weights = laya::Load(head_params, head_tensors);
 
+  // Extract per-cardinality temperature overrides from rl_agent_config.json.
+  // The reference (rl_agent_api.py) scales logits by
+  //   temperature_by_options.get(temp_bucket(qt, k), temperature[qt])
+  // before softmax. Without this, distributions are far too peaked.
+  std::map<std::string, float> temp_by_opts;
+  if (config.raw.contains("temperature_by_options") &&
+      config.raw["temperature_by_options"].is_object()) {
+    for (auto it = config.raw["temperature_by_options"].begin();
+         it != config.raw["temperature_by_options"].end(); ++it) {
+      temp_by_opts[it.key()] = it.value().get<float>();
+    }
+  }
+
   return LayaModelWeights{
       std::move(enc_params), std::move(enc_weights),
-      std::move(head_params), std::move(head_weights)};
+      std::move(head_params), std::move(head_weights),
+      std::move(temp_by_opts)};
 }
 
 }  // namespace vllm

@@ -870,6 +870,7 @@ struct GdnLayerWeights {
   OwnedTensor dt_bias;        // f32  [Hv]
   OwnedTensor norm_weight;    // bf16 [Dv]           (RMSNormGated)
   OwnedTensor out_proj;       // bf16 [value_dim, H] (FP8 dequant + T)
+  bool out_proj_tiled = false;  // T25: weight kept in tiled Q5_K order; permute input at runtime
 
   // ── DEFERRED V-HEAD PERMUTATION (MODEL-MM-QWEN4-EXP,
   //    ISSUE-LOCAL-01M2ENTH6YA5FWEDY6CFHF4NAM) ───────────────────────────────

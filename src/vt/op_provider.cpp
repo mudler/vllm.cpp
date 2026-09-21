@@ -430,6 +430,8 @@ const char* OpNameImpl(OpId op) {
       return "CastF16";
     case OpId::kCastF32:
       return "CastF32";
+    case OpId::kPermuteVHeads:
+      return "PermuteVHeads";
     case OpId::kMulColVecF32:
       return "MulColVecF32";
     case OpId::kAttnGateSplit:

@@ -2497,3 +2497,20 @@ class KeepquantBackendRowBacksTheRatchet(unittest.TestCase):
         self.assertIn("#2959", row)
         self.assertIn("tenstorrent-keepquant.md", row)
         self.assertIn("CLAIM-BACKEND-TENSTORRENT-KEEPQUANT", row)
+
+
+class LayaModelRowIsCounted(unittest.TestCase):
+    """Mutation evidence for the model-inventory count bump in check-agent-record.py.
+
+    Adding MODEL-LAYA to model-matrix.md increments rows/memberships/architectures/
+    targets/modules by one each. The checker's expected inventory was updated to
+    match. This test calls check_model_invariants and asserts zero errors: it
+    passes against HEAD (expected=325) and fails against BASE (expected=324),
+    proving the count change is semantic, not cosmetic.
+    """
+
+    def test_model_inventory_invariants_hold(self) -> None:
+        errors: list[str] = []
+        agent_record.check_model_invariants(errors)
+        self.assertEqual(errors, [], f"model inventory invariant failed: {errors}")
+

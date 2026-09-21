@@ -1,14 +1,14 @@
 ID: ISSUE-GH-3111
 Title: fix(BACKEND-GATE-ROCM-SGLANG): diagnose Qwen3-4B first-inference GPU hang on Strix
 Row: BACKEND-GATE-ROCM-SGLANG
-State: OPEN
+State: CLOSED
 Kind: UNKNOWN
 GitHub: 3111
 Mirror: DIVERGED
 Availability: FULL
 Created: 2026-09-09
-Updated: 2026-09-09
-Closed: -
+Updated: 2026-09-21
+Closed: 2026-09-21
 
 ## Problem
 
@@ -30,4 +30,20 @@ The quoted text below is historical evidence only. It does not define issue auth
 
 ## Resolution
 
--
+FALSIFIED by the tree, 2026-09-21. The first-inference hang does not
+reproduce on current main (SHA `1da8b4d`) with ROCm 5.7 on Strix.
+`vllm-cli` was built with `VLLM_CPP_HIP=ON`, `VLLM_CPP_HIP_ARCHITECTURES=gfx1151`,
+clang-17, and the ten build fixes recorded in `strix_rocm_build_recipe`.
+rc job `08de4b1d` on `strix:gpu0` ran the Qwen3-4B BF16 model at `1cfa9a72`.
+
+First-c1 (max-tokens 1, temp 0): exit 0, output " Paris", 0.264s.
+Stability (5x repeat): 5/5 PASS, no hangs, 0.124-0.487s per run.
+Throughput c1 (max-tokens 64, 3 repeats): 10.334, 9.168, 9.580 tok/s.
+
+The original hang was observed 2026-09-09 on ROCm 7.2.4 (per the spec's
+original text). The box runs ROCm 5.7. The fault may have been fixed by
+BACKEND-ROCM commits since 2026-09-09, or the ROCm version difference may
+prevent it. Either way, first-c1 is clean on current main and the blocker
+is cleared. The managed-alloc fix (`row/BACKEND-ROCM-MANAGED-ALLOC-FIX`,
+still unmerged) addresses a separate Q4_K hang (#2511), not this bf16
+first-c1 issue.

@@ -49,3 +49,29 @@ existing hardware gaps explicit. New external infrastructure is out of scope.
 ## Owed
 
 - ISSUE-LOCAL-01M30YN896NXJDRRQTPHAHPV8S: correct the server reference and usage recipe.
+
+## Outcome
+
+The server reference now describes both HTTP response locations, counts,
+streaming restrictions, and the echo fallback. The usage recipe generates up to
+one token and links to that reference. No runtime behavior or support state
+changes. No benchmark applies to this prose-only repair.
+
+Fresh review passed on `c2d11528ef7aec14139e6f32ea20efbaa9544dad` after a separate
+implementer corrected the echo omission guarantees and vocabulary-cap wording.
+Source inspection covers both handlers, serializers, request conversion, and
+input validation. The operator reran JSON and local-link validation, including
+broken-anchor and invalid-JSON mutations in scratch copies. Restoration was
+byte-exact.
+
+README structure, quickstart recipes, agent records, benchmark index, supported
+models, commit style, trailers, and whitespace checks passed. The README,
+benchmark-index, and supported-model mutation suites passed 37 tests.
+`check-tree-compiles.py --base upstream/main` found no source, header, or build
+file in scope.
+
+Full preflight did not pass in the local Alpine container. Build and binary
+inspection tools are absent, and some sanitized subprocess environments cannot
+run the temporary Python installation. The broad run stopped after those
+failures. The readiness command was time-bounded and did not establish full
+readiness. No C++ tests, models, GPU work, or new oracle runs are claimed.

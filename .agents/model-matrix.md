@@ -433,6 +433,7 @@ Transformers compatibility is capability-driven and excluded from finite counts.
 | `MODEL-SEQCLS-roberta-roberta-for-sequence-classification` | `RobertaForSequenceClassification`, `XLMRobertaForSequenceClassification` | `registry.py:318-322`; `vllm/model_executor/models/roberta.py::RobertaForSequenceClassification` | sequence classification / text or multimodal | backbone; sequence pooler/head | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-SEQCLS-jina-vl-jina-vlfor-sequence-classification` | `JinaVLForRanking` | `registry.py:324`; `vllm/model_executor/models/jina_vl.py::JinaVLForSequenceClassification` | sequence classification / image+text | backbone; sequence pooler/head | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-SEQCLS-nemotron-vl-llama-nemotron-vlfor-sequence-classification` | `LlamaNemotronVLForSequenceClassification` | `registry.py:325-328`; `vllm/model_executor/models/nemotron_vl.py::LlamaNemotronVLForSequenceClassification` | sequence classification / image+text | backbone; sequence pooler/head | ☐ required | `INVENTORIED` | none | unassigned |
+| `MODEL-CUA-S1-FORMS` | `TinyTransformerScorer` (byte-level encoder + cross-attention scorer) | not in vLLM registry; `trycua/cua` `libs/cua-s1/` @ `main` | option scoring / text | byte-level tokenization; 2-layer transformer encoder; cross-attention scoring head | [cua-s1-forms](specs/cua-s1-forms.md) | `SPIKE` | none | `CLAIM-MODEL-CUA-S1-FORMS` |
 
 ## MODEL-MM - Multimodal
 

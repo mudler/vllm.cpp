@@ -73,4 +73,33 @@ inline constexpr float kLogits2[] = {
 
 inline constexpr int64_t kNumOptions2 = 2;
 
+// Test case 3: ByteCollator + full pipeline (string inputs).
+inline constexpr int64_t kContextIds3[] = {
+    105, 106, 
+};
+
+inline constexpr uint8_t kContextMask3[] = {
+    1, 1, 
+};
+
+inline constexpr int64_t kOptionIds3[] = {
+    98, 0, 99, 100, 
+};
+
+inline constexpr uint8_t kOptionTokMask3[] = {
+    1, 0, 1, 1, 
+};
+
+inline constexpr uint8_t kOptionMask3[] = {
+    1, 1, 
+};
+
+inline constexpr float kProbs3[] = {
+    5.021439791e-01F, 4.978560805e-01F, 
+};
+
+inline constexpr int64_t kNumOptions3 = 2;
+inline constexpr int64_t kCtxLen3 = 2;
+inline constexpr int64_t kOptLen3 = 2;
+
 }  // namespace cua_s1_goldens

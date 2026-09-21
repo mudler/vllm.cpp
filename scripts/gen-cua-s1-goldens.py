@@ -192,6 +192,61 @@ def load_state_dict(model: nn.Module) -> None:
     model.load_state_dict(sd)
 
 
+# ── ByteCollator (ported from model.py:48-99) ────────────────────────
+
+
+def _byte_ids(text: str, length: int) -> list[int]:
+    return [byte + 1 for byte in text.encode("utf-8", errors="replace")[:length]]
+
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ChoiceExample:
+    context: str
+    options: tuple[str, ...]
+    label: int
+
+
+class ByteCollator:
+    def __init__(self, context_tokens: int, option_tokens: int) -> None:
+        self.context_tokens = context_tokens
+        self.option_tokens = option_tokens
+
+    def __call__(self, examples):
+        contexts = [_byte_ids(item.context, self.context_tokens) for item in examples]
+        option_rows = [
+            [_byte_ids(opt, self.option_tokens) for opt in item.options] for item in examples
+        ]
+        return _tensor_batch(examples, contexts, option_rows, pad_id=0)
+
+
+def _tensor_batch(examples, contexts, option_rows, pad_id):
+    batch = len(examples)
+    max_context = max(1, max(map(len, contexts)))
+    max_options = max(len(row) for row in option_rows)
+    max_option_tokens = max(1, max(len(tokens) for row in option_rows for tokens in row))
+    context_ids = torch.full((batch, max_context), pad_id, dtype=torch.long)
+    option_ids = torch.full((batch, max_options, max_option_tokens), pad_id, dtype=torch.long)
+    option_mask = torch.zeros((batch, max_options), dtype=torch.bool)
+    for row, tokens in enumerate(contexts):
+        if tokens:
+            context_ids[row, : len(tokens)] = torch.tensor(tokens, dtype=torch.long)
+    for row, options in enumerate(option_rows):
+        option_mask[row, : len(options)] = True
+        for column, tokens in enumerate(options):
+            if tokens:
+                option_ids[row, column, : len(tokens)] = torch.tensor(tokens, dtype=torch.long)
+    return {
+        "context_ids": context_ids,
+        "context_mask": context_ids.ne(pad_id),
+        "option_ids": option_ids,
+        "option_token_mask": option_ids.ne(pad_id),
+        "option_mask": option_mask,
+    }
+
+
 def emit_f32(out, name: str, values) -> None:
     flat = np.asarray(values, dtype=np.float32).ravel()
     out.append(f"inline constexpr float {name}[] = {{")
@@ -303,6 +358,32 @@ def main() -> int:
     emit_u8(out, "kOptionMask2", option_mask_2.numpy())
     emit_f32(out, "kLogits2", logits_2.numpy())
     out.append(f"inline constexpr int64_t kNumOptions2 = {logits_2.shape[0]};\n\n")
+
+    # ── Phase 2: ByteCollator + full pipeline ───────────────────────────
+    #
+    # Test case 3: string inputs through ByteCollator → model → softmax.
+    # Verifies the full inference path: text → byte ids → tensors → logits → probs.
+    context_str_3 = "hi"
+    options_str_3 = ["a", "bc"]
+
+    collator = ByteCollator(CONTEXT_TOKENS, OPTION_TOKENS)
+    example_3 = ChoiceExample(context=context_str_3, options=tuple(options_str_3), label=0)
+    batch_3 = collator([example_3])
+    with torch.no_grad():
+        logits_3 = model(batch_3).squeeze(0)
+        probs_3 = torch.softmax(logits_3, dim=-1)
+
+    # Emit the collated tensors so the C++ ByteCollator test can compare.
+    out.append("// Test case 3: ByteCollator + full pipeline (string inputs).\n")
+    emit_i64(out, "kContextIds3", batch_3["context_ids"].numpy())
+    emit_u8(out, "kContextMask3", batch_3["context_mask"].numpy())
+    emit_i64(out, "kOptionIds3", batch_3["option_ids"].numpy())
+    emit_u8(out, "kOptionTokMask3", batch_3["option_token_mask"].numpy())
+    emit_u8(out, "kOptionMask3", batch_3["option_mask"].numpy())
+    emit_f32(out, "kProbs3", probs_3.numpy())
+    out.append(f"inline constexpr int64_t kNumOptions3 = {probs_3.shape[0]};\n")
+    out.append(f"inline constexpr int64_t kCtxLen3 = {batch_3['context_ids'].shape[1]};\n")
+    out.append(f"inline constexpr int64_t kOptLen3 = {batch_3['option_ids'].shape[2]};\n\n")
 
     out.append("}  // namespace cua_s1_goldens\n")
 

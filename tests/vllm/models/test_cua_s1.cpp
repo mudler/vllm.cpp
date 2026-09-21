@@ -17,6 +17,8 @@
 
 #include "cua_s1_goldens.inc"
 #include "vllm/model_executor/models/cua_s1.h"
+#include "vllm/model_executor/models/cua_s1_collator.h"
+#include "vllm/model_executor/models/cua_s1_inference.h"
 
 namespace {
 
@@ -283,4 +285,111 @@ TEST_CASE("cua_s1 different options produce different logits") {
   CHECK(cross_diff_1 < 2e-5);
   CHECK(same_diff_0 > 1e-4);
   CHECK(same_diff_1 > 1e-4);
+}
+
+// ── Phase 2: ByteCollator + inference pipeline ────────────────────────────
+
+TEST_CASE("cua_s1 ByteCollator tokenizes and pads correctly") {
+  const vllm::cua_s1::Params p = GoldenParams();
+
+  // "hi" → bytes [104, 105] → ids [105, 106]
+  // options: "a" → [98], "bc" → [99, 100]
+  // max_option_tokens = 2, so "a" pads to [98, 0]
+  const vllm::cua_s1::CollatedBatch b =
+      vllm::cua_s1::ByteCollate(p, "hi", {"a", "bc"});
+
+  REQUIRE(b.ctx_len == 2);
+  REQUIRE(b.n_opt == 2);
+  REQUIRE(b.opt_len == 2);
+
+  // Context ids and mask.
+  REQUIRE(b.context_ids.size() == 2);
+  CHECK(b.context_ids[0] == 105);  // 'h' + 1
+  CHECK(b.context_ids[1] == 106);  // 'i' + 1
+  CHECK(b.context_mask[0] == 1);
+  CHECK(b.context_mask[1] == 1);
+
+  // Option ids (flattened): [98, 0, 99, 100]
+  REQUIRE(b.option_ids.size() == 4);
+  CHECK(b.option_ids[0] == 98);   // 'a' + 1
+  CHECK(b.option_ids[1] == 0);    // padding
+  CHECK(b.option_ids[2] == 99);   // 'b' + 1
+  CHECK(b.option_ids[3] == 100);  // 'c' + 1
+
+  // Option token mask.
+  CHECK(b.option_tok_mask[0] == 1);
+  CHECK(b.option_tok_mask[1] == 0);
+  CHECK(b.option_tok_mask[2] == 1);
+  CHECK(b.option_tok_mask[3] == 1);
+
+  // Option mask (all valid).
+  CHECK(b.option_mask[0] == 1);
+  CHECK(b.option_mask[1] == 1);
+}
+
+TEST_CASE("cua_s1 ByteCollator truncates long inputs") {
+  const vllm::cua_s1::Params p = GoldenParams();
+  // context_tokens = 8, option_tokens = 4.
+  // 10-byte context truncated to 8, 5-byte option truncated to 4.
+  const vllm::cua_s1::CollatedBatch b =
+      vllm::cua_s1::ByteCollate(p, "abcdefghij", {"ABCDE"});
+
+  REQUIRE(b.ctx_len == 8);
+  REQUIRE(b.opt_len == 4);
+  REQUIRE(b.context_ids.size() == 8);
+  // 'a'=97+1=98 ... 'h'=104+1=105
+  CHECK(b.context_ids[0] == 98);
+  CHECK(b.context_ids[7] == 105);
+  // All 8 positions valid (no padding after truncation).
+  CHECK(b.context_mask[0] == 1);
+  CHECK(b.context_mask[7] == 1);
+
+  // 'A'=65+1=66, 'B'=66+1=67, 'C'=67+1=68, 'D'=68+1=69, truncated to 4.
+  REQUIRE(b.option_ids.size() == 4);
+  CHECK(b.option_ids[0] == 66);
+  CHECK(b.option_ids[3] == 69);
+}
+
+TEST_CASE("cua_s1 ByteCollator handles UTF-8 multibyte") {
+  // 'é' = 0xC3 0xA9 in UTF-8 → ids [0xC3+1, 0xA9+1] = [196, 170]
+  const auto ids = vllm::cua_s1::ByteIds("\xc3\xa9", 8);
+  REQUIRE(ids.size() == 2);
+  CHECK(ids[0] == 196);
+  CHECK(ids[1] == 170);
+}
+
+TEST_CASE("cua_s1 full pipeline reproduces upstream probabilities") {
+  const vllm::cua_s1::Params p = GoldenParams();
+  const vllm::cua_s1::Weights w =
+      vllm::cua_s1::Load(p, GoldenCheckpoint(p));
+
+  const vllm::cua_s1::CuaS1ScoreResult result =
+      vllm::cua_s1::CuaS1Inference(p, w, "hi", {"a", "bc"});
+
+  const size_t n = static_cast<size_t>(cua_s1_goldens::kNumOptions3);
+  REQUIRE(result.probabilities.size() == n);
+
+  double worst = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    worst = std::max(worst, std::fabs(
+        static_cast<double>(result.probabilities[i]) -
+        static_cast<double>(cua_s1_goldens::kProbs3[i])));
+  }
+  INFO("max abs diff vs upstream probabilities: ", worst);
+  CHECK(worst < 2e-5);
+
+  // Probabilities sum to 1.
+  double psum = 0.0;
+  for (size_t i = 0; i < n; ++i) psum += result.probabilities[i];
+  CHECK(std::fabs(psum - 1.0) < 1e-5);
+
+  // Winner is argmax.
+  const int64_t expected_winner =
+      cua_s1_goldens::kProbs3[0] > cua_s1_goldens::kProbs3[1] ? 0 : 1;
+  CHECK(result.winner == expected_winner);
+
+  // Confidence is the winning probability.
+  const float expected_conf =
+      std::max(cua_s1_goldens::kProbs3[0], cua_s1_goldens::kProbs3[1]);
+  CHECK(std::fabs(static_cast<double>(result.confidence - expected_conf)) < 2e-5);
 }

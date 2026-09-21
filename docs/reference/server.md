@@ -117,30 +117,51 @@ A chat template can refuse the request itself, through an unknown message role
 or a kwarg value the template rejects. That answers **HTTP 400**, not 500, on
 both `/v1/chat/completions` and `/tokenize`.
 
-`prompt_logprobs` is accepted on `/v1/completions` and `/v1/chat/completions`
-and the engine computes it, every prompt position is scored against the token
-that followed it, accumulated across chunked prefill, but the **response body
-does not carry it yet**: emitting it needs the OpenAI `echo` wiring, which is
-not done. Until then it is reachable through the library
-(`RequestOutput.prompt_logprobs`), not over HTTP. `logprobs`/`top_logprobs` on
-GENERATED tokens are emitted normally.
-
-That computation is gated on the **CPU** backend only. A step that owes prompt
-logits takes the full-logits route, and on that route the sampler is handed a
-host-resident logits buffer carrying the accelerator's device label, sound on
-unified memory, and **not yet verified on CUDA at all, discrete or otherwise**.
-Treat `prompt_logprobs` on a GPU build as unverified until that gate runs; the
-mechanism and the exact owed invocation are in
-[`.agents/specs/prompt-logprobs.md`](../../.agents/specs/prompt-logprobs.md)
-(risk 4 and the `PENDING` CUDA smoke gate). Requests that do NOT set it are
-unaffected on every backend, the route is only taken for a step where some
-request asked.
-
 The four `/v1/videos` routes are registered **only** when the server was started
 with `--video-dit`; without it they are absent (404) and the server is identical
 to one built without video support. Use the
 [MiniMax-H3 recipe](../models/minimax-h3.md) for the combined video and audio
 workflow.
+
+## Prompt log probabilities
+
+Set `prompt_logprobs` on `/v1/completions` or `/v1/chat/completions` to score
+prompt tokens from their preceding context. Non-streaming responses return the
+scores in these fields:
+
+| Endpoint | Response field |
+|---|---|
+| `/v1/completions` | `choices[i].prompt_logprobs` on every choice |
+| `/v1/chat/completions` | Top-level `prompt_logprobs`, for the rendered chat prompt |
+
+The array has one entry per prompt token. The first entry is `null` because the
+first token has no preceding context. Each later entry maps decimal token IDs
+to objects with `logprob`, `rank`, and `decoded_token` fields. Rank 1 is the most
+likely token. When you omit `prompt_logprobs`, the response field is `null`.
+
+| Request value | Scores returned per position after the first |
+|---|---|
+| `0` | The actual prompt token, without top alternatives |
+| Positive integer | The actual prompt token and the requested number of top alternatives |
+| `-1` | The whole vocabulary |
+
+The server limits positive counts to the vocabulary size. It has no separate
+`max_logprobs` setting. Other negative values, strings, arrays, and objects
+return HTTP 400. With `stream: true`, positive counts and
+`-1` return HTTP 400. A count of `0` is accepted with streaming, but stream
+chunks do not carry `prompt_logprobs`.
+
+Prompt scores do not require `echo`. Completion `echo` behavior remains
+unfinished: the server does not prepend prompt text or merge prompt scores into
+`choices[i].logprobs`. Generated-token scores use `logprobs` for completions,
+or `logprobs` with `top_logprobs` for chat.
+
+**CUDA verification remains pending.** The recorded computation tests cover the
+CPU backend. The full-logits path used for prompt scoring still has a recorded pending
+CUDA smoke gate, including unified-memory devices. See the
+[CUDA smoke gate](../../.agents/specs/prompt-logprobs.md#pending--cuda-smoke-gate-risk-4)
+for the buffer risk and required check. Requests without `prompt_logprobs` do
+not select this path for prompt scoring.
 
 ## `max_tokens`: what a non-positive value means
 

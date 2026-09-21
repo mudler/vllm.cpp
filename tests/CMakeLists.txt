@@ -195,6 +195,8 @@ target_compile_definitions(test_gliner2_e2e PRIVATE
 vllm_cpp_add_test(test_gliner2_ner vllm/models/test_gliner2_ner.cpp)
 vllm_cpp_add_test(test_cua_s1 vllm/models/test_cua_s1.cpp)
 target_include_directories(test_cua_s1 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
+vllm_cpp_add_test(test_modernbert vllm/models/test_modernbert.cpp)
+target_include_directories(test_modernbert PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_minimax_h3 vllm/models/test_minimax_h3.cpp)
 # VT-CONV1D-MODEL-BLOCK (#1684): the time-block case reads `Conv1dTimeBlock` so
 # it asserts the geometry it claims. Same reach as test_vocoder1d.

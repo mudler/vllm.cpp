@@ -1,9 +1,13 @@
-# Tenstorrent tt-forge — the only reference for Tenstorrent execution
+# Tenstorrent tt-forge — the fallback reference for Tenstorrent execution
 
-vLLM has no Tenstorrent platform anywhere
-([`../porting-inventory.md`](../porting-inventory.md) §15), so `BACKEND-TENSTORRENT`
-is an extension with no upstream analog to mirror. That is the strongest form of
-the fallback case: not "vLLM disagrees", but "vLLM has nothing to say".
+CORRECTION 2026-09-21: vLLM gained a Tenstorrent platform on 2026-09-07 —
+[`vllm-tt-plugin.md`](vllm-tt-plugin.md), the `tenstorrent/vllm-tt-plugin`
+platform plugin with `TTQwen3_5ForConditionalGeneration` among its registered
+architectures. The premise below ("vLLM has no Tenstorrent platform anywhere")
+is historical. tt-forge keeps a role only where the plugin does not serve:
+the plugin's models are hand-written TTNN implementations reached from HF
+checkpoints, so tt-forge's three-frontends stack remains a candidate reference
+for executions and encodings the plugin does not reach.
 
 **It qualifies as an oracle because it executes, not merely compiles.** tt-forge
 is an end-to-end stack over TT-Metalium with three frontends (TT-XLA for

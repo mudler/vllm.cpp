@@ -107,7 +107,7 @@ token-verified, when this row is done.
 - In-tree precedent for the pattern: waves 1-3 of
   QUANT-GGUF-IQ-TENSTORRENT (each wave = one `enc_sel`, one header decode,
   one predicate line, one sweep case, one golden header).
-- vLLM has no TT backend; the llama.cpp k-quant/i-quant oracle registry row
+- vLLM's TT backend now exists ([`vllm-tt-plugin`](../oracles/vllm-tt-plugin.md), 2026-09-07, qwen35 registered) but serves HF weights only, so the llama.cpp k-quant/i-quant oracle registry row
   `llama-cpp` (pin b10451, gateable) is the secondary oracle for these
   decodes, and the b10451 greedy dump is the token denominator.
 

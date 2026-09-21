@@ -1008,9 +1008,11 @@ Examples: `examples/cli` ✅ (C-API client), `examples/server` ✅ (OpenAI serve
     evidence PENDING.
 15. **Extension platform: Tenstorrent Blackhole (`BACKEND-TENSTORRENT`,
     `DeviceType::kTENSTORRENT` — deliberately not `kBLACKHOLE`, which collides
-    with this codebase's pervasive NVIDIA Blackwell/GB10 references).** No
-    upstream analog: vLLM has no Tenstorrent platform anywhere, so this is an
-    extension platform in the same sense as item 8's Metal/Vulkan — added
+    with this codebase's pervasive NVIDIA Blackwell/GB10 references).** No longer true
+    that vLLM has no Tenstorrent platform: `vllm-tt-plugin` (2026-09-07,
+    [`oracles/vllm-tt-plugin.md`](oracles/vllm-tt-plugin.md)) registers
+    `TTQwen3_5ForConditionalGeneration`. This backend predates that plugin
+    and remains an extension platform in the sense of item 8's Metal/Vulkan — added
     through the mirrored Platform/vt-op seams so it behaves as a vLLM platform
     would. Strategy: mirror decision E1 ([backends.md](backends.md)) rather
     than E2 — Tenstorrent's Tensix cores are a dataflow multicore chip, not a

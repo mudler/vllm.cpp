@@ -280,7 +280,8 @@ only when it appears in this table and has a recorded pin:
 | `ggml-org/llama.cpp` PR #27752 | `llama-cpp-glm5next` | the `glm5next` TEXT architecture, its GGUF conversion and its graph, which no released llama.cpp defines either; it is the head whose architecture string matches the published artifact, and it carries no vision tower |
 | turboderp-org `exllamav3` | `exllamav3` | the EXL3 trellis quantization format and its kernels, and the DeepSeek-V4 support the pinned HEAD carries, which neither vLLM nor vLLM-Omni implements |
 | `vllm-project/vllm-gguf-plugin` | `vllm-gguf-plugin` | GGUF, which the pinned vLLM carries no in-tree support for: it was deprecated in `vllm#39583` and moved to this first-party repository, so a GGUF path it serves is a path the PRIMARY oracle serves. `gateable = yes` since 2026-09-10 (emitted byte-identical tokens on gfx1151); the CUDA `sm_110` forward gap ([#2624](https://github.com/mudler/vllm.cpp/issues/2624)) is a vLLM wheel arch issue, not a plugin defect |
-| Tenstorrent tt-forge | `tt-forge` | Tenstorrent hardware, for which vLLM has no backend |
+| Tenstorrent tt-forge | `tt-forge` | Tenstorrent execution where vLLM has no implementation; vLLM's TT backend now exists as [`vllm-tt-plugin`](.agents/oracles/vllm-tt-plugin.md), which takes precedence where it serves |
+| vLLM TT plugin | `vllm-tt-plugin` | the qwen35 and other TT-prefixed architectures on Tenstorrent mesh devices, from HF weights — vLLM's own TT platform plugin (blog 2026-09-07); NOT a GGUF-decode reference |
 | `ddickmann/vllm-factory` | `vllm-factory` | GLiNER2.5 on vLLM (DeBERTa v2 encoder with disentangled attention + GLiNER2 pooler head + IO processor), which vLLM does not implement at the pin; no DeBERTa, no disentangled attention, and no GLiNER pooler exists in-tree or upstream |
 
 <!-- oracle-registry:end -->

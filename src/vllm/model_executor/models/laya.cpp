@@ -390,5 +390,23 @@ ForwardOutput ForwardHost(
   return out;
 }
 
+float TemperatureFor(
+    int qtype, int k,
+    const std::vector<float>& temperature,
+    const std::map<std::string, float>& temperature_by_options) {
+  static const char* kQTypeNames[] = {"choice", "score", "noul"};
+  std::string bucket = kQTypeNames[qtype];
+  bucket += ":";
+  if (k <= 2) bucket += "2";
+  else if (k <= 5) bucket += "3-5";
+  else if (k <= 10) bucket += "6-10";
+  else bucket += "11+";
+
+  float temp = temperature[static_cast<size_t>(qtype)];
+  auto it = temperature_by_options.find(bucket);
+  if (it != temperature_by_options.end()) temp = it->second;
+  return temp;
+}
+
 }  // namespace laya
 }  // namespace vllm

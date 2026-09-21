@@ -365,3 +365,75 @@ TEST_CASE("laya sequence: mask string in input text is replaced") {
   }
   CHECK(!has_lt);
 }
+
+// --- Long option truncation tests (Finding 2) ---
+// The 48-token option truncation (laya_sequence.cpp:92) was untested. These
+// tests use options longer than 48 tokens (60 chars = 61 tokens with the
+// leading space) and verify the truncation, max_len compliance, and marker
+// positions.
+
+TEST_CASE("laya sequence: long option truncated to 48 tokens") {
+  // 60 'a' chars → " " + 60 'a' = 61 tokens. The 48-token limit cuts it to
+  // 48. With MASK prepended the option segment is 49 tokens.
+  const auto& tok = FixtureTokenizer();
+  const auto sp = FixtureSpecial();
+  vllm::laya::Question q;
+  q.type = vllm::laya::QType::kChoice;
+  q.instructions = "which color";
+  q.options = {std::string(60, 'a')};
+  q.state = "ctx";
+  const auto out = vllm::laya::BuildSequence(tok, sp, q, 512, 192);
+
+  // Total sequence must not exceed max_len.
+  CHECK(static_cast<int>(out.ids.size()) <= 512);
+
+  // One option → one marker.
+  REQUIRE(out.markers.size() == 1);
+  const int m = out.markers[0];
+
+  // Marker points to a MASK token.
+  CHECK(out.ids[static_cast<size_t>(m)] == sp.mask_id);
+
+  // The option segment is MASK + 48 truncated tokens = 49 tokens.
+  // The token right after is the SEP that closes the options section.
+  REQUIRE(static_cast<int>(out.ids.size()) > m + 49);
+  CHECK(out.ids[static_cast<size_t>(m + 49)] == sp.sep_id);
+
+  // The 48 truncated tokens are the first 48 of " " + 60 'a's:
+  // space (32) + 47 'a' (97).
+  CHECK(out.ids[static_cast<size_t>(m + 1)] == 32);  // space
+  for (int i = 2; i <= 48; ++i) {
+    CHECK(out.ids[static_cast<size_t>(m + i)] == 97);  // 'a'
+  }
+}
+
+TEST_CASE("laya sequence: mixed long and short options have correct markers") {
+  // Option 0: 60 chars → truncated to 48 (segment = MASK + 48 = 49).
+  // Option 1: "red" → " red" = 4 tokens, not truncated (segment = MASK + 4 = 5).
+  const auto& tok = FixtureTokenizer();
+  const auto sp = FixtureSpecial();
+  vllm::laya::Question q;
+  q.type = vllm::laya::QType::kChoice;
+  q.instructions = "which color";
+  q.options = {std::string(60, 'a'), "red"};
+  q.state = "ctx";
+  const auto out = vllm::laya::BuildSequence(tok, sp, q, 512, 192);
+
+  CHECK(static_cast<int>(out.ids.size()) <= 512);
+
+  REQUIRE(out.markers.size() == 2);
+  const int m0 = out.markers[0];
+  const int m1 = out.markers[1];
+
+  // Both markers point to MASK tokens.
+  CHECK(out.ids[static_cast<size_t>(m0)] == sp.mask_id);
+  CHECK(out.ids[static_cast<size_t>(m1)] == sp.mask_id);
+
+  // Option 0 segment: MASK + 48 truncated = 49 tokens.
+  CHECK(m1 - m0 == 49);
+
+  // Option 1 segment: MASK + " red" (4 tokens) = 5 tokens.
+  // The token after is the SEP closing the options section.
+  REQUIRE(static_cast<int>(out.ids.size()) > m1 + 5);
+  CHECK(out.ids[static_cast<size_t>(m1 + 5)] == sp.sep_id);
+}

@@ -129,6 +129,20 @@ ForwardOutput ForwardHost(
     const std::vector<int64_t>& marker_mask,
     int64_t qtype);
 
+// Resolve the temperature for a given question type and option count.
+//
+// Mirrors reference temp_bucket(): builds a bucket key like "choice:3-5"
+// from the qtype name and the option count k, looks it up in
+// temperature_by_options, and falls back to temperature[qtype] when no
+// bucket matches. The returned value divides logits before softmax.
+//
+//   qtype: 0=choice, 1=score, 2=noul
+//   k:     number of options (logits)
+float TemperatureFor(
+    int qtype, int k,
+    const std::vector<float>& temperature,
+    const std::map<std::string, float>& temperature_by_options);
+
 }  // namespace laya
 
 // ── Production model (Phase 4: registration) ────────────────────────────

@@ -226,22 +226,14 @@ LayaDecisionResult LayaInference(
       modernbert::ForwardHost(w.encoder_params, w.encoder_weights, input_ids);
 
   const int64_t seq_len = static_cast<int64_t>(input_ids.size());
-  const int64_t H = w.encoder_params.hidden_size;
-
-  // 4. Add type_emb to all positions: h[i, :] += type_emb[qtype][:].
   const int64_t qt = static_cast<int64_t>(question.type);
-  const std::vector<float>& type_emb = w.head_weights.type_emb;  // [3, H]
-  for (int64_t i = 0; i < seq_len; ++i) {
-    for (int64_t j = 0; j < H; ++j) {
-      hidden[static_cast<size_t>(i * H + j)] +=
-          type_emb[static_cast<size_t>(qt * H + j)];
-    }
-  }
 
-  // 5. Build attention_mask (all 1s — no padding in a single sequence).
+  // 4. Build attention_mask (all 1s — no padding in a single sequence).
+  //    type_emb is added inside ForwardHost (laya.cpp), mirroring upstream
+  //    DecisionModel.forward. Do NOT add it here — that double-adds it.
   std::vector<int64_t> attention_mask(seq_len, 1);
 
-  // 6. Build marker_pos and marker_mask from the SequenceOutput.
+  // 5. Build marker_pos and marker_mask from the SequenceOutput.
   std::vector<int64_t> marker_pos;
   std::vector<int64_t> marker_mask;
   marker_pos.reserve(seq.markers.size());
@@ -251,7 +243,7 @@ LayaDecisionResult LayaInference(
     marker_mask.push_back(1);
   }
 
-  // 7. Run the Laya decision head forward.
+  // 6. Run the Laya decision head forward.
   laya::ForwardOutput head_out = laya::ForwardHost(
       w.head_params, w.head_weights, hidden, attention_mask,
       marker_pos, marker_mask, qt);
@@ -267,18 +259,8 @@ LayaDecisionResult LayaInference(
   {
     const int k = static_cast<int>(result.scores.size());
     const int qt_i = static_cast<int>(qt);
-    static const char* kQTypeNames[] = {"choice", "score", "noul"};
-    std::string bucket = kQTypeNames[qt_i];
-    bucket += ":";
-    if (k <= 2) bucket += "2";
-    else if (k <= 5) bucket += "3-5";
-    else if (k <= 10) bucket += "6-10";
-    else bucket += "11+";
-
-    float temp = w.head_weights.temperature[qt_i];
-    auto it = w.temperature_by_options.find(bucket);
-    if (it != w.temperature_by_options.end()) temp = it->second;
-
+    const float temp = laya::TemperatureFor(
+        qt_i, k, w.head_weights.temperature, w.temperature_by_options);
     for (float& s : result.scores) s /= temp;
   }
 

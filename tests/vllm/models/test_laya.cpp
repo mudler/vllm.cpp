@@ -11,6 +11,7 @@
 // Perturbation tests verify each feature changes the output.
 #include <cmath>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -257,4 +258,60 @@ TEST_CASE("laya head layers change the output") {
   }
   INFO("max abs diff with vs without head layers: ", worst);
   CHECK(worst > 1e-4);
+}
+
+// --- Temperature scaling tests (Finding 3) ---
+
+TEST_CASE("laya temperature: bucket lookup returns the mapped value") {
+  const std::vector<float> temperature = {1.0F, 1.0F, 1.0F};
+  const std::map<std::string, float> temperature_by_options = {
+      {"choice:3-5", 0.8F},
+      {"noul:2", 1.2F},
+  };
+
+  // k=4 → bucket "choice:3-5" → 0.8
+  CHECK(vllm::laya::TemperatureFor(0 /*choice*/, 4, temperature,
+                                    temperature_by_options) == doctest::Approx(0.8F));
+  // k=2 → bucket "noul:2" → 1.2
+  CHECK(vllm::laya::TemperatureFor(2 /*noul*/, 2, temperature,
+                                    temperature_by_options) == doctest::Approx(1.2F));
+}
+
+TEST_CASE("laya temperature: falls back to per-type temperature when no bucket matches") {
+  const std::vector<float> temperature = {0.5F, 0.7F, 0.9F};
+  const std::map<std::string, float> temperature_by_options = {
+      {"choice:3-5", 0.8F},  // only choice:3-5 is mapped
+  };
+
+  // k=4 with noul → no "noul:3-5" bucket → fallback to temperature[2]=0.9
+  CHECK(vllm::laya::TemperatureFor(2 /*noul*/, 4, temperature,
+                                    temperature_by_options) == doctest::Approx(0.9F));
+  // k=11 with choice → no "choice:11+" bucket → fallback to temperature[0]=0.5
+  CHECK(vllm::laya::TemperatureFor(0 /*choice*/, 11, temperature,
+                                    temperature_by_options) == doctest::Approx(0.5F));
+  // k=2 with score → no "score:2" bucket → fallback to temperature[1]=0.7
+  CHECK(vllm::laya::TemperatureFor(1 /*score*/, 2, temperature,
+                                    temperature_by_options) == doctest::Approx(0.7F));
+}
+
+TEST_CASE("laya temperature: bucket boundaries are correct") {
+  const std::vector<float> temperature = {1.0F, 1.0F, 1.0F};
+  const std::map<std::string, float> temperature_by_options = {
+      {"choice:2", 0.2F},
+      {"choice:3-5", 0.4F},
+      {"choice:6-10", 0.6F},
+      {"choice:11+", 0.8F},
+  };
+
+  // k <= 2 → "choice:2"
+  CHECK(vllm::laya::TemperatureFor(0, 1, temperature, temperature_by_options) == doctest::Approx(0.2F));
+  CHECK(vllm::laya::TemperatureFor(0, 2, temperature, temperature_by_options) == doctest::Approx(0.2F));
+  // 3 <= k <= 5 → "choice:3-5"
+  CHECK(vllm::laya::TemperatureFor(0, 3, temperature, temperature_by_options) == doctest::Approx(0.4F));
+  CHECK(vllm::laya::TemperatureFor(0, 5, temperature, temperature_by_options) == doctest::Approx(0.4F));
+  // 6 <= k <= 10 → "choice:6-10"
+  CHECK(vllm::laya::TemperatureFor(0, 6, temperature, temperature_by_options) == doctest::Approx(0.6F));
+  CHECK(vllm::laya::TemperatureFor(0, 10, temperature, temperature_by_options) == doctest::Approx(0.6F));
+  // k > 10 → "choice:11+"
+  CHECK(vllm::laya::TemperatureFor(0, 11, temperature, temperature_by_options) == doctest::Approx(0.8F));
 }

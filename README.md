@@ -37,6 +37,9 @@
 
 ## News
 
+- **2026-09** **GLiNER2.5 extracts entities from text.** Supply your own entity types through
+  `POST /v1/ner` or the C ABI 27 function `vllm_gliner_ner`. The current implementation runs on CPU.
+  See the [GLiNER usage guide](docs/USAGE.md#run-zero-shot-ner-and-structured-extraction-gliner25).
 - **2026-09** **Quantized Qwen completes smoke runs on Tenstorrent.** Qwen3.8-27B and
   Qwen3.5-0.8B Q4_K_M completed two prompts each on a Blackhole P150 with
   `VT_TT_KEEPQUANT_INT8DOT=1`. These runs establish completion only.
@@ -226,7 +229,7 @@ configs, token-for-token the same output. Switching to it should be boring. Ever
 you get on top, most of it borrowed from whichever engine does it best:
 
 - **One 66 MiB binary instead of a 9.1 GiB install.** A flat, exception-free, llama.cpp-style C ABI
-  ([`include/vllm.h`](include/vllm.h), ABI v26) for C, C++, Go, or Rust. No Python
+  ([`include/vllm.h`](include/vllm.h), ABI v27) for C, C++, Go, or Rust. No Python
   interpreter in the process.
 - **GGUF as a first-class citizen.** Load the same quantized files llama.cpp uses, and on CPU
   **compute directly on the compressed blocks** (Q4_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XS,
@@ -445,7 +448,7 @@ behind a model gallery, multi-model serving, the full OpenAI API surface, auth, 
 ## Use it as a library (C API)
 
 Link `libvllm` and include [`include/vllm.h`](include/vllm.h): a flat, exception-free,
-llama.cpp-style C ABI (currently `VLLM_ABI_VERSION 26`) suitable for `dlopen` / FFI. Check the
+llama.cpp-style C ABI (currently `VLLM_ABI_VERSION 27`) suitable for `dlopen` / FFI. Check the
 header for the version that your build provides.
 
 ```c

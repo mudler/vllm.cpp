@@ -407,12 +407,10 @@ The regression resolves this pinned snapshot through the local HuggingFace cache
 ## Run zero-shot NER and structured extraction (GLiNER2.5)
 
 GLiNER2.5 (`fastino/gliner2.5-multi-v1`, architecture `BoundaryExtractor`)
-is a zero-shot named-entity-recognition model. It extracts spans for
-entity types you supply at inference time — there are no fixed labels
-baked into the checkpoint. It is not a generation model; it has no
-vocabulary head and never produces tokens. A forward pass runs the
-DeBERTa v2 encoder with disentangled attention, a GLiNER2 boundary head,
-and a candidate decoder, and the result is a list of entity spans.
+extracts entity spans for labels you supply with each request. This is
+zero-shot named entity recognition (NER). The model uses a DeBERTa v2 encoder,
+a GLiNER2 boundary head, and a candidate decoder. It returns spans instead of
+generating text.
 
 Point the server at a GLiNER2.5 checkpoint directory:
 

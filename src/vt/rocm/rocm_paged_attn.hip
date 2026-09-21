@@ -1301,7 +1301,7 @@ __global__ void PagedAttnDecodeSplitKvStage1(
 template <int EPL>
 __global__ void PagedAttnDecodeSplitKvReduce(
     __hip_bfloat16* out, const float* attn_logits,
-    int64_t total_q, int64_t hq, int64_t num_kv_heads, int64_t d, int64_t num_splits) {
+    int64_t total_q, int64_t hq, int64_t /*num_kv_heads*/, int64_t d, int64_t num_splits) {
   constexpr int kEpl = EPL;
   constexpr int d_expect = kEpl * 32;
   const int64_t t = blockIdx.x;
@@ -1309,8 +1309,6 @@ __global__ void PagedAttnDecodeSplitKvReduce(
   const int lane = static_cast<int>(threadIdx.x);
 
   if (h >= hq || d != d_expect || t >= total_q) return;
-
-  const int64_t g = h / (hq / num_kv_heads);
 
   // Gather partial results from all splits
   float o_acc[kEpl];
@@ -1329,8 +1327,7 @@ __global__ void PagedAttnDecodeSplitKvReduce(
   // Second pass: merge with online softmax
   for (int64_t split = 0; split < num_splits; split++) {
     const int64_t base = ((t * hq + h) * num_splits + split) * (kEpl + 1);
-    
-    float m_split = -INFINITY;
+
     #pragma unroll
     for (int ii = 0; ii < kEpl; ii++) {
       float v = attn_logits[base + ii];

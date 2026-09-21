@@ -182,7 +182,7 @@ bool DeviceKeepQuantSupported(vt::DType dt, vt::DeviceType dev) {
              dt == vt::DType::kIQ2_XXS || dt == vt::DType::kIQ3_XXS ||
              dt == vt::DType::kQ2_K || dt == vt::DType::kQ3_K ||
              dt == vt::DType::kIQ2_S || dt == vt::DType::kIQ1_S ||
-             dt == vt::DType::kIQ1_XXXS || dt == vt::DType::kIQ4_XS;
+             dt == vt::DType::kIQ1_XXXS;
     case vt::DeviceType::kTENSTORRENT:
       // KEEPQUANT W3: the P150 is discrete with no CPU fallback tier, so this
       // arm admits exactly what src/vt/tenstorrent/tenstorrent_ops.cpp has a

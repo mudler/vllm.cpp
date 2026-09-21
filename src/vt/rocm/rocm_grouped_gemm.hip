@@ -53,7 +53,6 @@
 // the vt::cuda tables its own dots actually index (KERNEL-QUANT-CIQ-GEMM-
 // ROCM-IQUANT, #1940); this file's copy of the IQ2/IQ3 tables has no
 // remaining reader and no seal of its own.
-#include "vt/rocm/rocm_quant_iq_tables.h"
 
 namespace vt::rocm {
 namespace {

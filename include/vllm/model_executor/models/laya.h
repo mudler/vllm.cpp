@@ -28,6 +28,8 @@
 #include <string>
 #include <vector>
 
+#include "vllm/model_executor/models/modernbert.h"
+
 namespace vllm {
 namespace laya {
 
@@ -128,4 +130,28 @@ ForwardOutput ForwardHost(
     int64_t qtype);
 
 }  // namespace laya
+
+// ── Production model (Phase 4: registration) ────────────────────────────
+// Forward declarations to keep this header free of the safetensors and
+// config includes.
+class SafetensorsFile;
+struct HfConfig;
+
+// Combined model weights: the ModernBERT encoder + the Laya decision head,
+// with their parsed configs. Materialized from a safetensors checkpoint by
+// LoadLayaWeights and owned by LayaLoadedModel.
+struct LayaModelWeights {
+  modernbert::Params encoder_params;
+  modernbert::Weights encoder_weights;
+  laya::Params head_params;
+  laya::Weights head_weights;
+};
+
+// Production weight loader: reads all F32 tensors from the safetensors
+// shards, infers the ModernBERT encoder config from weight shapes, reads
+// the Laya head config from config.raw (rl_agent_config.json fields), and
+// calls modernbert::Load + laya::Load.
+LayaModelWeights LoadLayaWeights(
+    const std::vector<SafetensorsFile>& shards, const HfConfig& config);
+
 }  // namespace vllm

@@ -3242,6 +3242,14 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       config_path = cuas1_path;
     }
   }
+  // Laya models (MODEL-LAYA) ship rl_agent_config.json instead of
+  // config.json. Fall back so the standard loading path can resolve it.
+  if (!fs::exists(config_path)) {
+    const std::string rl_path = (dir / "rl_agent_config.json").string();
+    if (fs::exists(rl_path)) {
+      config_path = rl_path;
+    }
+  }
   const std::string tokenizer_path = (dir / "tokenizer.json").string();
 
   // Refuse-by-task (ARCH-ONE-SURFACE ROW 1), BEFORE the full HfConfig parse: a

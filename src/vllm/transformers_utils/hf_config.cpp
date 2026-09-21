@@ -340,6 +340,12 @@ std::vector<std::string> PeekHfArchitectures(const std::string& path) {
         doc["config"].contains("width") && doc["config"].contains("layers")) {
       return {"CuaS1Forms"};
     }
+    // Laya models (MODEL-LAYA) ship rl_agent_config.json with no
+    // architectures field. Detect by the encoder + head_layers signature
+    // and synthesize the architecture so the registry can resolve it.
+    if (doc.contains("encoder") && doc.contains("head_layers")) {
+      return {"LayaModel"};
+    }
     return {};
   }
   std::vector<std::string> archs;
@@ -456,6 +462,16 @@ HfConfig ParseHfConfigDoc(nlohmann::json doc, const std::string& path,
   // and `model_type` are always read from the top-level wrapper doc.
   const nlohmann::json& text = ResolveTextConfig(doc);
 
+  // Laya models (MODEL-LAYA) ship rl_agent_config.json with no model_type.
+  // Detect by the encoder + head_layers signature and inject the identity
+  // so the registry can resolve it. The encoder params are inferred from
+  // weight shapes in laya_weights.cpp, so no hidden_size/num_hidden_layers.
+  if (!doc.contains("model_type") && doc.contains("encoder") &&
+      doc.contains("head_layers")) {
+    doc["model_type"] = "laya";
+    doc["architectures"] = nlohmann::json::array({"LayaModel"});
+  }
+
   RequireKey(doc, "model_type", path);
 
   // GLiNER2.5 configs (model_type "extractor") carry no encoder fields —
@@ -463,9 +479,11 @@ HfConfig ParseHfConfigDoc(nlohmann::json doc, const std::string& path,
   // gliner2_weights.cpp::InferEncoderParams, so skip the requirement here.
   // cua-s1-forms configs (model_type "cua_s1_forms") are the same: params are
   // parsed from config.raw in cua_s1_weights.cpp.
+  // Laya configs (model_type "laya") are the same: inferred from weight shapes.
   const bool is_extractor = GetString(doc, "model_type") == "extractor";
   const bool is_cua_s1 = GetString(doc, "model_type") == "cua_s1_forms";
-  if (!is_extractor && !is_cua_s1) {
+  const bool is_laya = GetString(doc, "model_type") == "laya";
+  if (!is_extractor && !is_cua_s1 && !is_laya) {
     RequireKey(text, "hidden_size", path);
     RequireKey(text, "num_hidden_layers", path);
   }

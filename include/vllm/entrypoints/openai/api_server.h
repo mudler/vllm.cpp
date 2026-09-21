@@ -321,6 +321,22 @@ class ApiServer {
       const std::string& context,
       const std::vector<std::string>& options)>;
   void set_score(ScoreFn score) { score_ = std::move(score); }
+  // Attach the decision seam backing POST /v1/systemone for a Laya model
+  // (MODEL-LAYA, Phase 4). ADDITIVE and OPT-IN like ner_ above: absent => the
+  // SystemOne handler routes to ner_ (GLiNER2.5) or 404. When set, the
+  // SystemOne handler runs one decision forward per question and returns
+  // per-option scores + escalate logits instead of NER entities. The callback
+  // wraps the ONE library seam (LayaInference) so HTTP and FFI cannot drift.
+  struct DecisionResult {
+    std::vector<float> scores;       // per-option raw logits
+    std::vector<float> act_logits;   // [n_act] escalate decision
+    int64_t prompt_tokens = 0;
+  };
+  using DecisionFn = std::function<DecisionResult(
+      const std::string& state, const std::string& qtype,
+      const std::string& instructions,
+      const std::vector<std::string>& options)>;
+  void set_decision(DecisionFn decision) { decision_ = std::move(decision); }
 
   // Attach the speech/music synthesis seam backing POST /v1/audio/speech (W6 of
   // #672). ADDITIVE and OPT-IN like the embedder above: absent => route
@@ -417,6 +433,7 @@ class ApiServer {
   EmbedFn embedder_;
   NerFn ner_;
   ScoreFn score_;
+  DecisionFn decision_;
   SynthesizeFn synthesizer_;
   ::vllm::openai::SpeechCapabilities speech_capabilities_;
   mutable ::vllm::openai::VideoJobStore video_jobs_;

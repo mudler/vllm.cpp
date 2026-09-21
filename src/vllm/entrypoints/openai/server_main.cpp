@@ -94,6 +94,7 @@
 #include "vllm/model_executor/models/model_registry.h"
 #include "vllm/model_executor/models/gliner2_ner.h"  // Gliner2NerInference (MODEL-GLINER25)
 #include "vllm/model_executor/models/cua_s1_inference.h"  // CuaS1ScoreInference (MODEL-CUA-S1-FORMS)
+#include "vllm/model_executor/models/laya_inference.h"  // LayaInference (MODEL-LAYA)
 #include "vllm/multimodal/minimax_h3_video.h"
 #include "vllm/multimodal/parakeet_transcription.h"
 #include "vllm/multimodal/video_engine.h"
@@ -1060,6 +1061,15 @@ int VllmServerMain(int argc, char** argv) {
         config_path = cuas1_path;
       }
     }
+    // Laya models (MODEL-LAYA) ship rl_agent_config.json instead of
+    // config.json. Fall back so the dispatch and loader can resolve it.
+    if (!fs::exists(config_path)) {
+      const std::string rl_path =
+          PathUtf8(dir / "rl_agent_config.json");
+      if (fs::exists(rl_path)) {
+        config_path = rl_path;
+      }
+    }
     const std::string tokenizer_path = PathUtf8(dir / "tokenizer.json");
     const std::string tokenizer_config_path =
         args.tokenizer_config.empty()
@@ -1276,6 +1286,77 @@ int VllmServerMain(int argc, char** argv) {
         vllm::platform::ConsoleShutdown shutdown_on_signal(
             [&]() { score_server.stop(); });
         if (!score_server.listen(args.host, args.port)) {
+          std::cerr << "server: failed to bind " << args.host << ":"
+                    << args.port << "\n";
+          return 1;
+        }
+        return 0;
+      }
+
+      // ── LAYA DECISION TASK DISPATCH (MODEL-LAYA): a model dir whose
+      // architectures resolve to "LayaModel" serves /v1/systemone through the
+      // decision callback (LayaInference — the same path the C ABI will drive)
+      // and registers NO generate, embedding, or NER routes. This check runs
+      // BEFORE the pooling_model check because LayaModel IS a pooling model
+      // (is_pooling_model = true), but it needs the decision server, not the
+      // embedding server.
+      bool laya_model = false;
+      if (!archs.empty()) {
+        try {
+          laya_model =
+              vllm::ModelRegistry::Resolve(std::span<const std::string>(archs))
+                  .architecture == "LayaModel";
+        } catch (const std::exception&) {
+          laya_model = false;
+        }
+      }
+      if (laya_model) {
+        std::cerr << "server: Laya decision model (" << archs[0]
+                  << "); serving /v1/systemone\n";
+        vllm::entrypoints::EngineParams decision_params;
+        decision_params.block_size = args.block_size;
+        decision_params.num_blocks = args.num_blocks;
+        decision_params.gpu_memory_utilization = args.gpu_memory_utilization;
+        decision_params.kv_cache_memory_bytes = args.kv_cache_memory_bytes;
+        decision_params.max_model_len = args.max_model_len;
+        decision_params.max_num_seqs = args.max_num_seqs;
+        decision_params.max_num_batched_tokens = args.max_num_batched_tokens;
+        decision_params.enable_prefix_caching = args.enable_prefix_caching;
+        decision_params.offload_config = parsed_offload_config;
+        decision_params.weight_residency = parsed_weight_residency;
+        auto loaded_decision = std::shared_ptr<vllm::entrypoints::LoadedEngine>(
+            vllm::entrypoints::LoadedEngine::FromModelDir(args.model_dir,
+                                                          decision_params));
+        namespace oai = vllm::entrypoints::openai;
+        oai::OpenAIServingModels decision_models(served_model_name);
+        oai::ApiServer decision_server(decision_models, vllm::Version());
+        auto decision_mutex = std::make_shared<std::mutex>();
+        decision_server.set_decision(
+            [loaded_decision, decision_mutex](
+                const std::string& state,
+                const std::string& qtype,
+                const std::string& instructions,
+                const std::vector<std::string>& options)
+                -> oai::ApiServer::DecisionResult {
+              std::lock_guard<std::mutex> lock(*decision_mutex);
+              const vllm::LoadedModel& model =
+                  loaded_decision->loaded_model();
+              const vllm::tok::Tokenizer& tokenizer =
+                  loaded_decision->tokenizer();
+              vllm::LayaDecisionResult result =
+                  vllm::LayaInference(model, tokenizer, state, qtype,
+                                      instructions, options);
+              oai::ApiServer::DecisionResult out;
+              out.scores = std::move(result.scores);
+              out.act_logits = std::move(result.act_logits);
+              out.prompt_tokens = result.prompt_tokens;
+              return out;
+            });
+        std::cerr << "server: listening on http://" << args.host << ":"
+                  << args.port << "\n";
+        vllm::platform::ConsoleShutdown shutdown_on_signal(
+            [&]() { decision_server.stop(); });
+        if (!decision_server.listen(args.host, args.port)) {
           std::cerr << "server: failed to bind " << args.host << ":"
                     << args.port << "\n";
           return 1;

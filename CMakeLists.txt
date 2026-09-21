@@ -903,6 +903,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/cua_s1_weights.cpp
   src/vllm/model_executor/models/cua_s1_registry.cpp
   src/vllm/model_executor/models/modernbert.cpp
+  src/vllm/model_executor/models/laya.cpp
   src/vllm/multimodal/speech_engine.cpp
   src/vllm/model_executor/models/indextts2.cpp
   src/vllm/model_executor/models/campplus.cpp

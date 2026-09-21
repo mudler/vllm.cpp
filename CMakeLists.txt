@@ -898,6 +898,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/gliner2_weights.cpp
   src/vllm/model_executor/models/gliner2_registry.cpp
   src/vllm/model_executor/models/gliner2_ner.cpp
+  src/vllm/model_executor/models/cua_s1.cpp
   src/vllm/multimodal/speech_engine.cpp
   src/vllm/model_executor/models/indextts2.cpp
   src/vllm/model_executor/models/campplus.cpp

@@ -1998,11 +1998,11 @@ def check_model_invariants(errors: list[str]) -> None:
     # `vllm/model_executor/models/transformers/__init__.py`, a module the matrix
     # already cited. Net: 19 targets out, 18 in; 18 modules out, 2 in.
     expected = {
-        "rows": 324,
-        "memberships": 373,
-        "architectures": 356,
-        "targets": 309,
-        "modules": 245,
+        "rows": 325,
+        "memberships": 374,
+        "architectures": 357,
+        "targets": 310,
+        "modules": 246,
     }
     if actual != expected:
         errors.append(f"{path.relative_to(ROOT)}: model inventory {actual}, expected {expected}")

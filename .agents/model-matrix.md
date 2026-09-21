@@ -19,8 +19,8 @@ a practical unit that one agent can spike without silently dropping aliases.
 ## Architecture-support checklist
 
 At-a-glance view of which architectures we have actually engaged, and how far.
-**356 architecture rows are inventoried at the pin, plus 22 rows that the pinned
-registry does not contain = 378 architecture rows.** Those 22 are, by why they
+**356 architecture rows are inventoried at the pin, plus 23 rows that the pinned
+registry does not contain = 379 architecture rows.** Those 23 are, by why they
 are not at the pin: `KimiK3ForConditionalGeneration` and
 `MuseGlimmerForConditionalGeneration`, both released after the pin;
 `Qwen3_5ForCausalLM` and `Qwen3_5MoeForCausalLM`, the text-only Qwen3.5 arms
@@ -55,13 +55,16 @@ registered on vLLM `main` at `e77daef89e` on 2026-09-11 and absent at the pin,
 566 commits away ([deepseek-v4-1-flash](specs/deepseek-v4-1-flash.md));
 and `GLiNER2VLLMModel`, which is not in vLLM at all (it is a
 `ddickmann/vllm-factory` plugin model, reached through the `vllm-factory`
-secondary oracle; [gliner2.5](specs/gliner2.5.md)).
+secondary oracle; [gliner2.5](specs/gliner2.5.md));
+and `DecisionModel`, which is not in vLLM at all (it is a Laya model,
+reached through the Laya source code as a secondary oracle;
+[laya](specs/laya.md)).
 
 **`Qwen4ExpForConditionalGeneration` is in the at-the-pin bucket, and the
 reconciliation that put it there is the reason the first count above reads 356.**
 Both it and `Glm5NextForConditionalGeneration` have carried their own rows since
 2026-08-26 without being counted in this sentence, which said 18 while the table
-said 379; the two were never the same accounting. The `plus 22 rows` split at
+said 379; the two were never the same accounting. The `plus 23 rows` split at
 the top of this file is that correction as it now stands, and it is the split
 AFTER qwen4exp moved back: the reconciliation first placed BOTH architectures in
 the non-pin bucket on the premise that vLLM registers neither at any revision.
@@ -75,7 +78,7 @@ commit IS `[Model] Support Qwen3.8-Flash-Next (#53896)`:
 `git show e126687a9a:vllm/model_executor/models/registry.py` gives
 `"Qwen4ExpForConditionalGeneration"` at line 580, `"Qwen4ExpForCausalLM"` at
 114 and `"Qwen4ExpMTP"` at 670. So qwen4exp is an AT-THE-PIN row, the split is
-356 + 22, and the totals below — 379 architecture rows, 383 rollup rows, 59
+356 + 23, and the totals below — 379 architecture rows, 383 rollup rows, 59
 engaged, 324 inventoried — are unchanged by the move.
 
 The rollup below counts **383 rows**, which is those 379 plus the four that are
@@ -180,6 +183,7 @@ Engaged architectures (the 59 non-`INVENTORIED` rows):
 | 📋 | `Gemma4UnifiedForConditionalGeneration` | Gemma-4 unified multimodal (encoder-free) | Scoped in the [Gemma-4 mm + audio track](specs/gemma4-multimodal.md) — **GATEABLE (W0 2026-07-28, `CLAIM-GEMMA4-W0`):** the sibling `Gemma4ForConditionalGeneration` W0 RUN-VERIFIED on vLLM 0.25.0 proves the shared registered mm path loads+runs+generates; the ungated `unsloth/gemma-4-12b-it` (23.92 GB) IS this encoder-free variant (`Gemma4UnifiedVisionEmbedder`, no SigLIP/audio `AutoModel` tower) and fits GB10 (no HF token needed). Oracle block RETIRED; IMPLEMENTATION-blocked only, staged behind the Gemma-4 backbone. Row stays `SPIKE`, not implemented | `MODEL-MM-gemma4-unified-gemma4-unified-for-conditional-generation` |
 | 📋 | `GLiNER2VLLMModel` (DeBERTa v2 + GLiNER2 pooler) | GLiNER2.5 zero-shot NER / structured extraction (`fastino/gliner2.5-multi-v1`) | **SPIKE** — spec committed; not implemented. First encoder-only (BERT-class) model in the tree; requires native DeBERTa disentangled attention. Oracle: `vllm-factory` plugin `ddickmann/vllm-factory@7d6ff68` (gateable=no, #3216). Targets `PoolingTask::kPlugin`. | `MODEL-GLINER25` |
 | 📋 | `TinyTransformerScorer` (byte-level encoder + cross-attention scorer) | cua-s1-forms option scoring (not in vLLM; `trycua/cua`) | **SPIKE** — spec committed; Phases 1-4 implemented (ByteCollator, inference pipeline, registration, `/v1/score` server dispatch); PR #3265. | `MODEL-CUA-S1-FORMS` |
+| 📋 | `DecisionModel` (ModernBERT-large encoder + transformer decision head) | Laya System 1 decision model (choice/score/noul) (`convaiinnovations/laya`) | **SPIKE** — spec committed; not implemented. Second SystemOne-class model (reuses `/v1/systemone` API from GLiNER2.5). ModernBERT-large backbone: dual-RoPE (local θ=10000, global θ=160000), sliding window (128), GeGLU MLP, no biases. Decision head: type_emb + 2-layer transformer encoder + scorer + act_head. Oracle: vLLM `modernbert.py` @ pin (encoder) + Laya source (head). | `MODEL-LAYA` |
 
 ## Row contract
 
@@ -420,6 +424,7 @@ Transformers compatibility is capability-driven and excluded from finite counts.
 | `MODEL-TOKCLS-openai-privacy-filter-open-aiprivacy-filter-for-token-classification` | `OpenAIPrivacyFilterForTokenClassification` | `registry.py:292-295`; `vllm/model_executor/models/openai_privacy_filter.py::OpenAIPrivacyFilterForTokenClassification` | token classification / text or audio alignment | encoder attention; token head/pooler; sliding-window attention | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-TOKCLS-qwen3-asr-forced-aligner-qwen3-asrforced-aligner-for-token-classification` | `Qwen3ASRForcedAlignerForTokenClassification` | `registry.py:296-299`; `vllm/model_executor/models/qwen3_asr_forced_aligner.py::Qwen3ASRForcedAlignerForTokenClassification` | token classification / text or audio alignment | encoder attention; token head/pooler | ☐ required | `INVENTORIED` | none | unassigned |
 | `MODEL-GLINER25` | `GLiNER2VLLMModel` (DeBERTa v2 encoder + GLiNER2 pooler) | not in vLLM registry; `ddickmann/vllm-factory` `plugins/deberta_gliner2/model.py` @ `7d6ff68` | token classification (span/NER) / text | disentangled attention; GLiNER2 pooler head; `PoolingTask::kPlugin` | [gliner2.5](specs/gliner2.5.md) | `SPIKE` | none | `CLAIM-MODEL-GLINER25` |
+| `MODEL-LAYA` | `DecisionModel` (ModernBERT-large encoder + transformer decision head) | `convaiinnovations/laya`; encoder: vLLM `modernbert.py::ModernBertModel` @ pin; head: Laya `model.py` (not in vLLM) | System 1 decision (choice/score/noul) / text | ModernBERT sliding-window + dual-RoPE; transformer head; scorer; act_head; `/v1/systemone` API | [laya](specs/laya.md) | `SPIKE` | none | `CLAIM-MODEL-LAYA` |
 
 ## MODEL-SEQCLS - Sequence classification
 

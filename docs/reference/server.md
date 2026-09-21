@@ -137,7 +137,8 @@ scores in these fields:
 The array has one entry per prompt token. The first entry is `null` because the
 first token has no preceding context. Each later entry maps decimal token IDs
 to objects with `logprob`, `rank`, and `decoded_token` fields. Rank 1 is the most
-likely token. When you omit `prompt_logprobs`, the response field is `null`.
+likely token. With `prompt_logprobs` omitted and `echo` false, the response field
+is `null`.
 
 | Request value | Scores returned per position after the first |
 |---|---|
@@ -145,13 +146,15 @@ likely token. When you omit `prompt_logprobs`, the response field is `null`.
 | Positive integer | The actual prompt token and the requested number of top alternatives |
 | `-1` | The whole vocabulary |
 
-The server limits positive counts to the vocabulary size. It has no separate
+The server rejects positive counts greater than the vocabulary size. It has no separate
 `max_logprobs` setting. Other negative values, strings, arrays, and objects
 return HTTP 400. With `stream: true`, positive counts and
 `-1` return HTTP 400. A count of `0` is accepted with streaming, but stream
 chunks do not carry `prompt_logprobs`.
 
-Prompt scores do not require `echo`. Completion `echo` behavior remains
+Prompt scores do not require `echo`. If `prompt_logprobs` is omitted and `echo`
+is true, completions use `logprobs` as the prompt-score count. Chat uses
+`top_logprobs` instead. Completion `echo` behavior remains
 unfinished: the server does not prepend prompt text or merge prompt scores into
 `choices[i].logprobs`. Generated-token scores use `logprobs` for completions,
 or `logprobs` with `top_logprobs` for chat.
@@ -160,8 +163,8 @@ or `logprobs` with `top_logprobs` for chat.
 CPU backend. The full-logits path used for prompt scoring still has a recorded pending
 CUDA smoke gate, including unified-memory devices. See the
 [CUDA smoke gate](../../.agents/specs/prompt-logprobs.md#pending--cuda-smoke-gate-risk-4)
-for the buffer risk and required check. Requests without `prompt_logprobs` do
-not select this path for prompt scoring.
+for the buffer risk and required check. Requests with `prompt_logprobs` omitted
+and `echo` false do not select this path for prompt scoring.
 
 ## `max_tokens`: what a non-positive value means
 

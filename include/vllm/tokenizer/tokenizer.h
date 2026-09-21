@@ -65,6 +65,11 @@ class Tokenizer {
   // tokenizer.ggml.pre is a recognized pre-tokenizer name.
   static Tokenizer FromGguf(const GgufFile& f);
 
+  // An empty tokenizer for models that do not use a standard HF/GGUF tokenizer
+  // (e.g. cua-s1-forms, which uses byte-level ByteCollator). Encode/Decode are
+  // unsafe on the result; the caller must never call them.
+  static Tokenizer Empty() { return Tokenizer{}; }
+
   // Encodes UTF-8 text. No BOS/EOS added (caller policy). Added tokens are
   // matched leftmost-longest against the raw text before pretokenization.
   std::vector<int32_t> Encode(std::string_view text) const;

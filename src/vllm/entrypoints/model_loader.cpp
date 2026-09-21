@@ -3291,7 +3291,12 @@ std::unique_ptr<LoadedEngine> LoadedEngine::FromModelDir(
       registration.architecture,
       registration.factory != nullptr &&
           registration.factory->supports_weight_offload);
-  tok::Tokenizer tokenizer = tok::Tokenizer::FromHfJson(tokenizer_path);
+  // Models without a standard tokenizer (e.g. cua-s1-forms, which uses
+  // ByteCollator) ship no tokenizer.json. Empty() returns a Tokenizer whose
+  // Encode/Decode are never called for those models.
+  tok::Tokenizer tokenizer = fs::exists(tokenizer_path)
+      ? tok::Tokenizer::FromHfJson(tokenizer_path)
+      : tok::Tokenizer::Empty();
 
   // Shared ownership so a loader may retain the mmap'd shards past the load: the
   // Qwen3.6-35B MoE loader defers its routed-expert host copies and streams them

@@ -95,5 +95,73 @@ std::vector<float> MergeLoraDelta(
 float Bf16ToF32(uint16_t b);
 uint16_t F32ToBf16(float f);
 
+// ── Phase 4: sequence construction + readout ─────────────────────────
+//
+// Ported from jaredpalmer/kev kev/model.py::encode() and
+// kev/model.py::DecisionModel._readout() / PointerHead.forward().
+//
+// The encoding packs one question as a causal row:
+//   [<|fim_prefix|>] state_tokens [<|fim_middle|>] instr_tokens
+//   [<|box_start|>] opt0 [<|box_end|>] [<|box_start|>] opt1 [<|box_end|>]
+//   ... [<|fim_suffix|>]
+// The positions are continuous (0, 1, 2, ...).  decide_idx points at
+// the <|fim_suffix|> token (the pointer query).  opt_idx[k] points at
+// the <|box_end|> token of option k (the pointer key).
+//
+// THE THINGS THIS ENCODER GETS WRONG QUIETLY are: (1) swapping the
+// special token roles -- the model still runs but the pointer reads the
+// wrong positions; (2) discontinuous positions -- DeltaNet recurrence
+// silently shifts; (3) pointing opt_idx at <|box_start|> instead of
+// <|box_end|> -- the key vector is one token off.  Each is gated by a
+// perturbation test.
+
+// Qwen special-token IDs used as delimiters.  These reuse existing
+// rarely-used Qwen tokens so no embedding rows are added (model.py:18).
+struct KevSpecialTokens {
+  int32_t fim_prefix_id = 0;  // <|fim_prefix|>  -- state start
+  int32_t fim_middle_id = 0;  // <|fim_middle|>  -- question start
+  int32_t box_start_id = 0;  // <|box_start|>   -- option start
+  int32_t box_end_id = 0;    // <|box_end|>     -- option end
+  int32_t fim_suffix_id = 0;  // <|fim_suffix|>  -- decide token
+};
+
+// Encoded question: token IDs, positions, and readout indices.
+struct KevEncoded {
+  std::vector<int32_t> token_ids;
+  std::vector<int32_t> positions;
+  int32_t decide_idx = 0;          // absolute index of <|fim_suffix|>
+  std::vector<int32_t> opt_idx;    // absolute indices of <|box_end|> per option
+};
+
+// Encode one question as a causal row (model.py::encode, rows_of form).
+//
+//   special:       the five delimiter token IDs
+//   state_tokens:  pre-tokenized state text (NO <|fim_prefix|>)
+//   instr_tokens:  pre-tokenized instruction text (NO <|fim_middle|>)
+//   option_tokens: pre-tokenized option texts, one vector per option
+//
+// Returns token_ids, positions (continuous from 0), decide_idx, opt_idx.
+KevEncoded KevEncodeQuestion(
+    const KevSpecialTokens& special,
+    const std::vector<int32_t>& state_tokens,
+    const std::vector<int32_t>& instr_tokens,
+    const std::vector<std::vector<int32_t>>& option_tokens);
+
+// Readout: extract hidden states from a ForwardHidden output and apply
+// PointerHead + softmax to get per-option probabilities.
+//
+//   hidden:      [n_indices, D] f32, row-major.  Row 0 = h_decide
+//                (at <|fim_suffix|>), rows 1..K = h_opts (at <|box_end|>).
+//   D:           hidden dimension (must match params.hidden_size)
+//   n_options:   K (number of options)
+//   temperature: calibration scalar (1.0 = raw; the fitted value divides
+//                logits before softmax, matching PointerHead.forward eval)
+//
+// Returns: [K] probabilities.
+std::vector<float> KevReadout(
+    const HeadParams& params, const HeadWeights& weights,
+    const std::vector<float>& hidden,
+    int64_t D, int64_t n_options, float temperature = 1.0f);
+
 }  // namespace kev
 }  // namespace vllm

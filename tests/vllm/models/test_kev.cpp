@@ -9,9 +9,11 @@
 // quietly: (1) the q/k projection order, (2) omitting bias terms,
 // (3) the wrong scale factor.  Each is detected by a mutation that still
 // runs but produces wrong logits.
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <doctest/doctest.h>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -348,4 +350,253 @@ TEST_CASE("kev.Bf16.roundtrip_within_precision") {
     float back = vllm::kev::Bf16ToF32(bf16);
     CHECK(std::abs(back - v) <= std::abs(v) * 0.01f + 1e-3f);
   }
+}
+
+// ── Phase 4: encoding + readout ────────────────────────────────────────
+
+TEST_CASE("kev.Encode.simple_2_options") {
+  vllm::kev::KevSpecialTokens sp;
+  sp.fim_prefix_id = 100;
+  sp.fim_middle_id = 101;
+  sp.box_start_id = 102;
+  sp.box_end_id = 103;
+  sp.fim_suffix_id = 104;
+
+  std::vector<int32_t> state = {10, 11};
+  std::vector<int32_t> instr = {20, 21};
+  std::vector<std::vector<int32_t>> opts = {{30}, {40}};
+
+  auto enc = vllm::kev::KevEncodeQuestion(sp, state, instr, opts);
+
+  // [fim_prefix, 10, 11, fim_middle, 20, 21,
+  //  box_start, 30, box_end, box_start, 40, box_end, fim_suffix]
+  std::vector<int32_t> expected_ids = {100, 10, 11, 101, 20, 21,
+                                       102, 30, 103, 102, 40, 103, 104};
+  CHECK(enc.token_ids == expected_ids);
+
+  // Positions are continuous from 0.
+  std::vector<int32_t> expected_pos(expected_ids.size());
+  std::iota(expected_pos.begin(), expected_pos.end(), 0);
+  CHECK(enc.positions == expected_pos);
+
+  // decide_idx = last token (fim_suffix at index 12).
+  CHECK(enc.decide_idx == 12);
+
+  // opt_idx = box_end positions: index 8 and 11.
+  REQUIRE(enc.opt_idx.size() == 2);
+  CHECK(enc.opt_idx[0] == 8);
+  CHECK(enc.opt_idx[1] == 11);
+
+  // The token at decide_idx IS fim_suffix.
+  CHECK(enc.token_ids[enc.decide_idx] == sp.fim_suffix_id);
+  // The token at opt_idx[k] IS box_end.
+  CHECK(enc.token_ids[enc.opt_idx[0]] == sp.box_end_id);
+  CHECK(enc.token_ids[enc.opt_idx[1]] == sp.box_end_id);
+}
+
+TEST_CASE("kev.Encode.empty_state") {
+  vllm::kev::KevSpecialTokens sp;
+  sp.fim_prefix_id = 100;
+  sp.fim_middle_id = 101;
+  sp.box_start_id = 102;
+  sp.box_end_id = 103;
+  sp.fim_suffix_id = 104;
+
+  std::vector<int32_t> state = {};
+  std::vector<int32_t> instr = {20};
+  std::vector<std::vector<int32_t>> opts = {{30}};
+
+  auto enc = vllm::kev::KevEncodeQuestion(sp, state, instr, opts);
+
+  // [fim_prefix, fim_middle, 20, box_start, 30, box_end, fim_suffix]
+  std::vector<int32_t> expected_ids = {100, 101, 20, 102, 30, 103, 104};
+  CHECK(enc.token_ids == expected_ids);
+  CHECK(enc.decide_idx == 6);
+  REQUIRE(enc.opt_idx.size() == 1);
+  CHECK(enc.opt_idx[0] == 5);
+}
+
+TEST_CASE("kev.Encode.multi_token_options") {
+  vllm::kev::KevSpecialTokens sp;
+  sp.fim_prefix_id = 100;
+  sp.fim_middle_id = 101;
+  sp.box_start_id = 102;
+  sp.box_end_id = 103;
+  sp.fim_suffix_id = 104;
+
+  std::vector<int32_t> state = {10, 11};
+  std::vector<int32_t> instr = {20, 21, 22};
+  std::vector<std::vector<int32_t>> opts = {{30, 31}, {40, 41, 42}, {50}};
+
+  auto enc = vllm::kev::KevEncodeQuestion(sp, state, instr, opts);
+
+  // [fim_prefix, 10, 11,
+  //  fim_middle, 20, 21, 22,
+  //  box_start, 30, 31, box_end,         <- opt 0
+  //  box_start, 40, 41, 42, box_end,    <- opt 1
+  //  box_start, 50, box_end,             <- opt 2
+  //  fim_suffix]
+  std::vector<int32_t> expected_ids = {100, 10, 11, 101, 20, 21, 22,
+                                       102, 30, 31, 103,
+                                       102, 40, 41, 42, 103,
+                                       102, 50, 103, 104};
+  CHECK(enc.token_ids == expected_ids);
+  CHECK(enc.decide_idx == 19);
+  REQUIRE(enc.opt_idx.size() == 3);
+  CHECK(enc.opt_idx[0] == 10);
+  CHECK(enc.opt_idx[1] == 15);
+  CHECK(enc.opt_idx[2] == 18);
+}
+
+TEST_CASE("kev.Encode.perturbation.opt_idx_at_box_end_not_box_start") {
+  // The box_end token (not box_start) must be the readout position,
+  // because the reference encode() points opt_idx at the </opt> token
+  // (model.py: cursor += len(sp); ends.append(cursor - 1)).
+  vllm::kev::KevSpecialTokens sp;
+  sp.fim_prefix_id = 100;
+  sp.fim_middle_id = 101;
+  sp.box_start_id = 102;
+  sp.box_end_id = 103;
+  sp.fim_suffix_id = 104;
+
+  std::vector<int32_t> state = {1};
+  std::vector<int32_t> instr = {2};
+  std::vector<std::vector<int32_t>> opts = {{3, 4}, {5}};
+
+  auto enc = vllm::kev::KevEncodeQuestion(sp, state, instr, opts);
+
+  // Each opt_idx[k] must point at a box_end (103), not box_start (102).
+  for (int32_t idx : enc.opt_idx) {
+    CHECK(enc.token_ids[idx] == sp.box_end_id);
+    CHECK(enc.token_ids[idx] != sp.box_start_id);
+  }
+}
+
+TEST_CASE("kev.Encode.perturbation.decide_idx_at_last_token") {
+  // The decide token must be the LAST token in the sequence.
+  vllm::kev::KevSpecialTokens sp;
+  sp.fim_prefix_id = 100;
+  sp.fim_middle_id = 101;
+  sp.box_start_id = 102;
+  sp.box_end_id = 103;
+  sp.fim_suffix_id = 104;
+
+  std::vector<int32_t> state = {1, 2, 3};
+  std::vector<int32_t> instr = {4, 5};
+  std::vector<std::vector<int32_t>> opts = {{6}, {7, 8}, {9}};
+
+  auto enc = vllm::kev::KevEncodeQuestion(sp, state, instr, opts);
+
+  CHECK(enc.decide_idx == static_cast<int32_t>(enc.token_ids.size()) - 1);
+  CHECK(enc.token_ids[enc.decide_idx] == sp.fim_suffix_id);
+}
+
+// ── Readout: hidden extraction + PointerHead + softmax ─────────────────
+
+TEST_CASE("kev.Readout.matches_pointerhead_2_options") {
+  const int64_t d = kev_head_goldens::kHiddenSize;
+  auto params = GoldenParams();
+  auto weights = GoldenWeights();
+
+  // Pack h_decide (row 0) + h_opts (rows 1..K) into one flat array.
+  std::vector<float> h_decide(kev_head_goldens::kHDecide1,
+                              kev_head_goldens::kHDecide1 + d);
+  std::vector<float> h_opts(kev_head_goldens::kHOpts1,
+                           kev_head_goldens::kHOpts1 + 2 * d);
+
+  std::vector<float> hidden(d * (1 + 2));
+  std::copy_n(h_decide.data(), d, hidden.data());
+  std::copy_n(h_opts.data(), 2 * d, hidden.data() + d);
+
+  // Reference: PointerHeadForward + Softmax
+  auto ref_logits = vllm::kev::PointerHeadForward(params, weights, h_decide, h_opts, 2);
+  auto ref_probs = vllm::kev::Softmax(ref_logits);
+
+  // KevReadout
+  auto probs = vllm::kev::KevReadout(params, weights, hidden, d, 2, 1.0f);
+
+  REQUIRE(probs.size() == 2);
+  CHECK(ApproxEqual(probs, ref_probs, 1e-5F));
+}
+
+TEST_CASE("kev.Readout.matches_pointerhead_3_options") {
+  const int64_t d = kev_head_goldens::kHiddenSize;
+  auto params = GoldenParams();
+  auto weights = GoldenWeights();
+
+  std::vector<float> h_decide(kev_head_goldens::kHDecide2,
+                              kev_head_goldens::kHDecide2 + d);
+  std::vector<float> h_opts(kev_head_goldens::kHOpts2,
+                           kev_head_goldens::kHOpts2 + 3 * d);
+
+  std::vector<float> hidden(d * (1 + 3));
+  std::copy_n(h_decide.data(), d, hidden.data());
+  std::copy_n(h_opts.data(), 3 * d, hidden.data() + d);
+
+  auto ref_logits = vllm::kev::PointerHeadForward(params, weights, h_decide, h_opts, 3);
+  auto ref_probs = vllm::kev::Softmax(ref_logits);
+
+  auto probs = vllm::kev::KevReadout(params, weights, hidden, d, 3, 1.0f);
+
+  REQUIRE(probs.size() == 3);
+  CHECK(ApproxEqual(probs, ref_probs, 1e-5F));
+}
+
+TEST_CASE("kev.Readout.temperature_divides_logits") {
+  const int64_t d = kev_head_goldens::kHiddenSize;
+  auto params = GoldenParams();
+  auto weights = GoldenWeights();
+
+  std::vector<float> h_decide(kev_head_goldens::kHDecide1,
+                              kev_head_goldens::kHDecide1 + d);
+  std::vector<float> h_opts(kev_head_goldens::kHOpts1,
+                           kev_head_goldens::kHOpts1 + 2 * d);
+
+  std::vector<float> hidden(d * (1 + 2));
+  std::copy_n(h_decide.data(), d, hidden.data());
+  std::copy_n(h_opts.data(), 2 * d, hidden.data() + d);
+
+  auto probs_t1 = vllm::kev::KevReadout(params, weights, hidden, d, 2, 1.0f);
+  auto probs_t2 = vllm::kev::KevReadout(params, weights, hidden, d, 2, 2.0f);
+
+  // Temperature > 1 flattens the distribution (less peaky).
+  float max_t1 = *std::max_element(probs_t1.begin(), probs_t1.end());
+  float max_t2 = *std::max_element(probs_t2.begin(), probs_t2.end());
+  CHECK(max_t2 < max_t1);
+
+  // Both still sum to 1.
+  float sum1 = 0, sum2 = 0;
+  for (float p : probs_t1) sum1 += p;
+  for (float p : probs_t2) sum2 += p;
+  CHECK(std::abs(sum1 - 1.0F) < 1e-5F);
+  CHECK(std::abs(sum2 - 1.0F) < 1e-5F);
+}
+
+TEST_CASE("kev.Readout.perturbation.row_order_matters") {
+  // Swapping the decide row (row 0) with an option row changes the result.
+  const int64_t d = kev_head_goldens::kHiddenSize;
+  auto params = GoldenParams();
+  auto weights = GoldenWeights();
+
+  std::vector<float> h_decide(kev_head_goldens::kHDecide1,
+                              kev_head_goldens::kHDecide1 + d);
+  std::vector<float> h_opts(kev_head_goldens::kHOpts1,
+                           kev_head_goldens::kHOpts1 + 2 * d);
+
+  // Correct layout: [h_decide | h_opt0 | h_opt1]
+  std::vector<float> hidden(d * 3);
+  std::copy_n(h_decide.data(), d, hidden.data());
+  std::copy_n(h_opts.data(), 2 * d, hidden.data() + d);
+
+  auto correct = vllm::kev::KevReadout(params, weights, hidden, d, 2, 1.0f);
+
+  // Swapped layout: [h_opt0 | h_decide | h_opt1]
+  std::vector<float> swapped(d * 3);
+  std::copy_n(h_opts.data(), d, swapped.data());               // row 0 = h_opt0
+  std::copy_n(h_decide.data(), d, swapped.data() + d);         // row 1 = h_decide
+  std::copy_n(h_opts.data() + d, d, swapped.data() + 2 * d);  // row 2 = h_opt1
+
+  auto mutated = vllm::kev::KevReadout(params, weights, swapped, d, 2, 1.0f);
+
+  CHECK_FALSE(ApproxEqual(correct, mutated, 1e-4F));
 }

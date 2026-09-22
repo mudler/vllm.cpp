@@ -125,5 +125,76 @@ uint16_t F32ToBf16(float f) {
   return static_cast<uint16_t>(bits >> 16);
 }
 
+// ── Phase 4: sequence construction + readout ──────────────────────────
+
+KevEncoded KevEncodeQuestion(
+    const KevSpecialTokens& special,
+    const std::vector<int32_t>& state_tokens,
+    const std::vector<int32_t>& instr_tokens,
+    const std::vector<std::vector<int32_t>>& option_tokens) {
+  KevEncoded enc;
+  std::vector<int32_t>& ids = enc.token_ids;
+  std::vector<int32_t>& pos = enc.positions;
+  int32_t p = 0;
+
+  // State: [<|fim_prefix|>] + state_tokens  (seg=0 in reference)
+  ids.push_back(special.fim_prefix_id);
+  pos.push_back(p++);
+  for (int32_t tok : state_tokens) {
+    ids.push_back(tok);
+    pos.push_back(p++);
+  }
+
+  // Question: [<|fim_middle|>] + instr_tokens
+  ids.push_back(special.fim_middle_id);
+  pos.push_back(p++);
+  for (int32_t tok : instr_tokens) {
+    ids.push_back(tok);
+    pos.push_back(p++);
+  }
+
+  // Options: [<|box_start|>] + opt_tokens + [<|box_end|>] per option
+  for (const auto& opt : option_tokens) {
+    ids.push_back(special.box_start_id);
+    pos.push_back(p++);
+    for (int32_t tok : opt) {
+      ids.push_back(tok);
+      pos.push_back(p++);
+    }
+    ids.push_back(special.box_end_id);
+    pos.push_back(p++);
+    enc.opt_idx.push_back(static_cast<int32_t>(ids.size()) - 1);
+  }
+
+  // Decide: [<|fim_suffix|>]
+  ids.push_back(special.fim_suffix_id);
+  pos.push_back(p++);
+  enc.decide_idx = static_cast<int32_t>(ids.size()) - 1;
+
+  return enc;
+}
+
+std::vector<float> KevReadout(
+    const HeadParams& params, const HeadWeights& weights,
+    const std::vector<float>& hidden,
+    int64_t D, int64_t n_options, float temperature) {
+  // Row 0 = h_decide, rows 1..K = h_opts
+  std::vector<float> h_decide(hidden.begin(), hidden.begin() + D);
+
+  std::vector<float> h_opts(static_cast<size_t>(n_options) * D);
+  for (int64_t k = 0; k < n_options; ++k) {
+    const float* src = hidden.data() + (k + 1) * D;
+    std::copy_n(src, D, h_opts.data() + k * D);
+  }
+
+  std::vector<float> logits = PointerHeadForward(params, weights, h_decide, h_opts, n_options);
+
+  if (temperature != 1.0f) {
+    for (float& z : logits) z /= temperature;
+  }
+
+  return Softmax(logits);
+}
+
 }  // namespace kev
 }  // namespace vllm

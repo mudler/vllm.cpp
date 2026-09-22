@@ -9411,6 +9411,49 @@ std::vector<float> Qwen3_5DenseModel::ForwardDense(
   return logits;
 }
 
+std::vector<float> Qwen3_5DenseModel::ForwardDenseHidden(
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const Qwen3_5DenseWeights& weights, const HfConfig& config,
+    vt::Queue& queue) {
+  // MODEL-KEV Phase 5a: mirrors ForwardDense through the embed + layer stack +
+  // final GemmaRMSNorm, then downloads [T, H] f32 hidden states with NO lm_head.
+  // The kev PointerHead readout is host-side, so the one Download is f32 here.
+  const int64_t T = static_cast<int64_t>(token_ids.size());
+  const int64_t H = config.hidden_size;
+  VT_CHECK(T > 0, "qwen3_5 dense forward hidden: empty token_ids");
+  VT_CHECK(static_cast<int64_t>(positions.size()) == T,
+           "qwen3_5 dense forward hidden: positions length must equal token count");
+  VT_CHECK(static_cast<int64_t>(weights.layers.size()) == config.num_hidden_layers,
+           "qwen3_5 dense forward hidden: weights.layers size must equal num_hidden_layers");
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const float eps = static_cast<float>(config.rms_norm_eps);
+
+  Tensor dtab =
+      Qwen3_5EmbeddingTable(d.b, d.q, weights.embed_tokens, config.vocab_size, H);
+  DBuf dids(d, DType::kI32, {T}, token_ids.data());
+  DBuf hidden(d, ActDType(d), {T, H});
+  vt::Embedding(d.q, hidden.t(), dtab, dids.t());
+
+  DBuf res(d, ResidualDType(d), {T, H});
+  res.Zero(d);
+
+  for (int64_t l = 0; l < config.num_hidden_layers; ++l)
+    RunDenseLayer(d, weights.layers[static_cast<size_t>(l)], config, hidden, res,
+                  positions, T);
+
+  // Final RMSNorm over the fused stream, then download hidden as f32 (no lm_head).
+  // Mirrors the return_hidden branch in DenseForwardLayers (Phase 3).
+  Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
+  DBuf dnorm(d, ActDType(d), {T, H});
+  vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
+
+  DBuf dhidden_f32(d, DType::kF32, {T, H});
+  vt::CastF32(d.q, dhidden_f32.t(), dnorm.t());
+  std::vector<float> hidden_f32(static_cast<size_t>(T) * static_cast<size_t>(H));
+  dhidden_f32.Download(d, hidden_f32.data());
+  return hidden_f32;
+}
+
 Qwen3_5MTPModel::Qwen3_5MTPModel(const Qwen3_5MTPWeights& weights,
                                  const Qwen3_5DenseWeights& target,
                                  const HfConfig& config)

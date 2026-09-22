@@ -457,6 +457,16 @@ class Qwen3_5DenseModel {
                                          const Qwen3_5DenseWeights& weights,
                                          const HfConfig& config,
                                          vt::Queue& queue);
+
+  // MODEL-KEV Phase 5a: single-sequence hidden-state forward. Mirrors
+  // ForwardDense but stops after the final GemmaRMSNorm (no lm_head) and
+  // returns [T, H] f32 hidden states for the kev PointerHead readout.
+  static std::vector<float> ForwardDenseHidden(
+      const std::vector<int32_t>& token_ids,
+      const std::vector<int32_t>& positions,
+      const Qwen3_5DenseWeights& weights,
+      const HfConfig& config,
+      vt::Queue& queue);
 };
 
 // M3-b — single-image, single-sequence GREEDY image->text generation on the

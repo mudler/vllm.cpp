@@ -99,6 +99,7 @@ void HeadLayerForward(const Params& params, const HeadLayerWeights& lw,
                       const std::vector<int64_t>& attention_mask,
                       std::vector<float>& h, int64_t seq) {
   const int64_t d = params.hidden_size;
+  if (seq <= 0 || d <= 0) return;
   const int64_t heads = params.num_heads;
   const int64_t hd = params.resolved_head_dim();
   const double eps = params.layer_norm_eps;

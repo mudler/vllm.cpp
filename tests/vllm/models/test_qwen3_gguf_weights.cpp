@@ -53,11 +53,11 @@ std::vector<uint64_t> GgmlDims(const std::vector<int64_t>& torch_shape) {
 
 float WFill(int64_t i) { return 0.05F * static_cast<float>((i % 13) - 6); }
 
-std::string F32Data(int64_t n) {
+std::string F32Data(int64_t n, int64_t offset = 0) {
   std::string s;
   s.reserve(static_cast<size_t>(n) * 4);
   for (int64_t i = 0; i < n; ++i) {
-    const float v = WFill(i);
+    const float v = WFill(offset + i);
     uint32_t bits = 0;
     std::memcpy(&bits, &v, 4);
     for (int k = 0; k < 4; ++k) s.push_back(static_cast<char>((bits >> (8 * k)) & 0xff));
@@ -70,9 +70,16 @@ std::string Blk(int64_t l, const std::string& s) {
 }
 
 void AddF32(GgufModelBuilder& b, const std::string& name,
-             const std::vector<int64_t>& shape) {
-  b.AddTensor(name, GgmlDims(shape), /*F32=*/0, F32Data(Prod(shape)));
+             const std::vector<int64_t>& shape, int64_t offset = 0) {
+  b.AddTensor(name, GgmlDims(shape), /*F32=*/0, F32Data(Prod(shape), offset));
 }
+
+// Per-tensor fill offsets. Tensors that share a shape (k/v, gate/up) get
+// distinct seeds so the merged concat order is provable: each component's
+// row-0 element is WFill(offset), and a k<->v or gate<->up swap moves the
+// wrong seed into a checked row and fails.
+const int64_t kQOff = 0, kKOff = 1, kVOff = 2;
+const int64_t kGateOff = 3, kUpOff = 4;
 
 std::string BuildGguf(const Dims& d, bool tied, bool with_qk_norm) {
   GgufModelBuilder b;
@@ -100,16 +107,16 @@ std::string BuildGguf(const Dims& d, bool tied, bool with_qk_norm) {
   for (int64_t l = 0; l < d.n_layer; ++l) {
     AddF32(b, Blk(l, "attn_norm.weight"), {d.H});
     AddF32(b, Blk(l, "post_attention_norm.weight"), {d.H});
-    AddF32(b, Blk(l, "attn_q.weight"), {q_rows, d.H});
-    AddF32(b, Blk(l, "attn_k.weight"), {kv_rows, d.H});
-    AddF32(b, Blk(l, "attn_v.weight"), {kv_rows, d.H});
+    AddF32(b, Blk(l, "attn_q.weight"), {q_rows, d.H}, kQOff);
+    AddF32(b, Blk(l, "attn_k.weight"), {kv_rows, d.H}, kKOff);
+    AddF32(b, Blk(l, "attn_v.weight"), {kv_rows, d.H}, kVOff);
     AddF32(b, Blk(l, "attn_output.weight"), {d.H, q_rows});
     if (with_qk_norm) {
       AddF32(b, Blk(l, "attn_q_norm.weight"), {d.head_dim});
       AddF32(b, Blk(l, "attn_k_norm.weight"), {d.head_dim});
     }
-    AddF32(b, Blk(l, "ffn_gate.weight"), {d.inter, d.H});
-    AddF32(b, Blk(l, "ffn_up.weight"), {d.inter, d.H});
+    AddF32(b, Blk(l, "ffn_gate.weight"), {d.inter, d.H}, kGateOff);
+    AddF32(b, Blk(l, "ffn_up.weight"), {d.inter, d.H}, kUpOff);
     AddF32(b, Blk(l, "ffn_down.weight"), {d.H, d.inter});
   }
   return b.Build();
@@ -257,24 +264,44 @@ TEST_CASE("LoadQwen3FromGguf: shapes, dtypes, nk, QKV/gate-up concat") {
     CHECK(vt::BF16ToF32(bf[0]) == doctest::Approx(WFill(0)).epsilon(0.01));
   }
 
-  // QKV concat boundary: row 0 (q, WFill(0)) and row q_rows (k, WFill(0))
-  // start from the same fill seed, so they match. Row 1 (WFill(H)) differs.
+  // QKV concat: each component has a distinct fill offset, so the row-0
+  // element of each block carries its own seed. Verifying the actual seeds at
+  // each boundary proves q|k|v order: a k<->v swap moves the wrong seed into the
+  // checked row and fails.
   {
     const auto& qkv = w.layers[0].attn.qkv_proj;
     const uint16_t* bf = reinterpret_cast<const uint16_t*>(qkv.bytes.data());
     const int64_t cols = d.H;
-    CHECK(bf[0] == bf[q_rows * cols]);
+    // Row 0 is q (kQOff), row q_rows is k (kKOff), row q_rows+kv_rows is v.
+    CHECK(vt::BF16ToF32(bf[0]) == doctest::Approx(WFill(kQOff)).epsilon(0.01));
+    CHECK(vt::BF16ToF32(bf[q_rows * cols]) ==
+          doctest::Approx(WFill(kKOff)).epsilon(0.01));
+    CHECK(vt::BF16ToF32(bf[(q_rows + kv_rows) * cols]) ==
+          doctest::Approx(WFill(kVOff)).epsilon(0.01));
+    // Adjacent rows within a component differ (fill advances by cols).
     CHECK(bf[cols] != bf[0]);
+    // The three component seeds are mutually distinct.
+    CHECK(bf[0] != bf[q_rows * cols]);
+    CHECK(bf[0] != bf[(q_rows + kv_rows) * cols]);
+    CHECK(bf[q_rows * cols] != bf[(q_rows + kv_rows) * cols]);
   }
 
-  // gate/up concat boundary: row 0 (gate, WFill(0)) and row inter (up,
-  // WFill(0)) match. Row 1 differs.
+  // gate/up concat: gate and up have distinct fill offsets, so the row-0
+  // element of each block carries its own seed. Verifying the actual seeds
+  // proves gate|up order: a swap moves the wrong seed and fails.
   {
     const auto& gu = w.layers[0].mlp.gate_up_proj;
     const uint16_t* bf = reinterpret_cast<const uint16_t*>(gu.bytes.data());
     const int64_t cols = d.H;
-    CHECK(bf[0] == bf[d.inter * cols]);
+    // Row 0 is gate (kGateOff), row d.inter is up (kUpOff).
+    CHECK(vt::BF16ToF32(bf[0]) ==
+          doctest::Approx(WFill(kGateOff)).epsilon(0.01));
+    CHECK(vt::BF16ToF32(bf[d.inter * cols]) ==
+          doctest::Approx(WFill(kUpOff)).epsilon(0.01));
+    // Adjacent rows within a component differ.
     CHECK(bf[cols] != bf[0]);
+    // The two component seeds are distinct.
+    CHECK(bf[0] != bf[d.inter * cols]);
   }
 }
 

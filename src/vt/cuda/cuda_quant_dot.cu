@@ -2010,6 +2010,75 @@ __global__ void QuantDotGemmGrouped32Kernel(OutT* __restrict__ out,
   }
 }
 
+// MULTI-COLUMN grouped 32-block variant. One warp computes C CONSECUTIVE output
+// columns (p, j0 .. j0+C-1) against ONE broadcast activation row, keeping C
+// separate accumulators and paying the 5-step warp reduction once for C results.
+//
+// WHY: at the released qwen4_exp shape the one-warp-per-output kernel above runs
+// `for (b = lane; b < 80; b += 32)` -- 2.50 iterations per lane -- then five
+// __shfl_down_sync steps, then 31 of 32 lanes idle while lane 0 writes one float.
+// It measured 41.6 GB/s, 15.2% of GB10's peak, the lowest row in the decode
+// bandwidth table (ISSUE-LOCAL-01M2TZ9AE416FW4GH23V09783Q). Widening the warp's
+// output tile amortises the reduction over C results and reads the broadcast
+// activation block ONCE per warp instead of once per output element.
+//
+// BIT-IDENTICAL to QuantDotGemmGrouped32Kernel, and this is not a tolerance: each
+// output element keeps its OWN accumulator and its OWN ascending block order
+// (b = lane, lane+32, ...), and the reduction tree is the same five steps in the
+// same order. Only the assignment of work to warps changes -- there is no
+// re-association anywhere. Asserted byte-for-byte in test_cuda_quant_dot.
+//
+// This generalises what QuantDotGemmGroupedFusedSwiGLU32Kernel below already does
+// at width 2 across the gate and up towers; here the C rows are consecutive
+// columns of ONE tower, so the weight rows the warp touches are contiguous.
+template <W32 W, typename OutT, int C>
+__global__ void QuantDotGemmGrouped32MultiColKernel(OutT* __restrict__ out,
+                                                    const uint8_t* __restrict__ weight,
+                                                    const BlockQ8_0* __restrict__ act,
+                                                    const int32_t* __restrict__ expert_ids,
+                                                    int64_t P, int64_t n, int64_t nb,
+                                                    size_t w_row_bytes, bool bcast) {
+  const int64_t warp = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  const int64_t njg = (n + C - 1) / C;
+  if (warp >= P * njg) return;
+  const int64_t p = warp / njg;
+  const int64_t j0 = (warp % njg) * C;
+  const int lane = threadIdx.x;
+  const int64_t e = expert_ids[p];
+  const uint8_t* w_base = weight + static_cast<size_t>(e * n + j0) * w_row_bytes;
+  const BlockQ8_0* a_row = act + (bcast ? 0 : p) * nb;
+  // The TAIL. n is not required to divide by C -- the released gate/up width is
+  // 640 and a fused-MoE mid width need not be either -- so the last group of the
+  // row runs short. Held in a register mask rather than recomputed per block.
+  const int cols = static_cast<int>(min(static_cast<int64_t>(C), n - j0));
+  float partial[C];
+#pragma unroll
+  for (int c = 0; c < C; ++c) partial[c] = 0.0f;
+  for (int64_t b = lane; b < nb; b += 32) {
+    const size_t off = static_cast<size_t>(b) * W32Bytes<W>();
+    const BlockQ8_0* a_blk = a_row + b;  // read ONCE for all C columns
+#pragma unroll
+    for (int c = 0; c < C; ++c) {
+      if (c < cols)
+        partial[c] = __fadd_rn(
+            partial[c], Dot32<W>(w_base + static_cast<size_t>(c) * w_row_bytes + off, a_blk));
+    }
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+    for (int c = 0; c < C; ++c) partial[c] += __shfl_down_sync(0xffffffffu, partial[c], off);
+  }
+  if (lane == 0) {
+#pragma unroll
+    for (int c = 0; c < C; ++c) {
+      if (c >= cols) continue;
+      if constexpr (sizeof(OutT) == 4) out[p * n + j0 + c] = partial[c];
+      else out[p * n + j0 + c] = DF32ToBF16(partial[c]);
+    }
+  }
+}
+
 // FUSED grouped gate+up+SwiGLU over the 32-block lane. One warp computes BOTH
 // towers' output (p,j) against the same broadcast Q8_0 activation and writes the
 // clamped-SwiGLU product, never spilling the gate/up intermediates to HBM. The
@@ -2089,14 +2158,77 @@ void LaunchGemm32(Tensor& out, const uint8_t* weight, const BlockQ8_0* act, int6
         static_cast<uint16_t*>(out.data), weight, act, m, n, nb, w_row_bytes);
 }
 
+// The grouped 32-block lane's output COLUMNS per warp. `VT_V4_W32_COLS` selects
+// 1, 2, 4 or 8; anything else -- including an unset variable -- takes
+// kW32ColsDefault. Read PER CALL, like the Q8_0 ILP and prefetch levers above, so
+// an in-process CUDA test and a captured decode graph both pick it up at
+// launch/capture time.
+//
+// kW32ColsDefault is MEASURED, not guessed. See the sweep recorded in
+// .agents/specs/qwen4-exp-flash-next.md.
+constexpr int kW32ColsDefault = 1;  // PROVISIONAL until the sweep runs; see below
+
+inline int W32Cols(const char* v) {
+  if (!v) return kW32ColsDefault;
+  if (v[1] != '\0') return kW32ColsDefault;
+  switch (v[0]) {
+    case '1': return 1;
+    case '2': return 2;
+    case '4': return 4;
+    case '8': return 8;
+    default: return kW32ColsDefault;
+  }
+}
+
+// The grouped 32-block lane's WARPS PER BLOCK. `VT_V4_W32_WARPS` selects 1, 2, 4
+// or 8; anything else takes kW32WarpsDefault, which is the 4 this lane has always
+// launched. Separate from the column width because the two answer different
+// questions: the width is how much work one warp does, this is how many warps a
+// block carries, and the second one is an OCCUPANCY question that the same sweep
+// can answer for free. It cannot move a float -- a warp's work does not depend on
+// which block it sits in -- and the byte-identity gate asserts that rather than
+// assuming it.
+constexpr int kW32WarpsDefault = 4;
+
+inline int W32Warps(const char* v) {
+  if (!v) return kW32WarpsDefault;
+  if (v[1] != '\0') return kW32WarpsDefault;
+  switch (v[0]) {
+    case '1': return 1;
+    case '2': return 2;
+    case '4': return 4;
+    case '8': return 8;
+    default: return kW32WarpsDefault;
+  }
+}
+
 template <W32 W>
 void LaunchGrouped32(Tensor& out, const uint8_t* weight, const BlockQ8_0* act,
                      const int32_t* expert_ids, int64_t P, int64_t n, int64_t nb, bool bcast,
                      cudaStream_t s) {
-  constexpr int kWarpsPerBlock = 4;
-  dim3 block(32, kWarpsPerBlock);
-  const int64_t grid = (P * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  const int kWarpsPerBlock = W32Warps(std::getenv("VT_V4_W32_WARPS"));
+  dim3 block(32, static_cast<unsigned>(kWarpsPerBlock));
   const size_t w_row_bytes = static_cast<size_t>(nb) * W32Bytes<W>();
+  const int cols = W32Cols(std::getenv("VT_V4_W32_COLS"));
+  if (cols > 1) {
+    const int64_t njg = (n + cols - 1) / cols;
+    const int64_t grid = (P * njg + kWarpsPerBlock - 1) / kWarpsPerBlock;
+#define VT_LAUNCH_W32_MULTICOL(OUT_T, C)                                                       \
+  QuantDotGemmGrouped32MultiColKernel<W, OUT_T, C><<<static_cast<unsigned>(grid), block, 0, s>>>( \
+      static_cast<OUT_T*>(out.data), weight, act, expert_ids, P, n, nb, w_row_bytes, bcast)
+    if (out.dtype == DType::kF32) {
+      if (cols == 2) VT_LAUNCH_W32_MULTICOL(float, 2);
+      else if (cols == 4) VT_LAUNCH_W32_MULTICOL(float, 4);
+      else VT_LAUNCH_W32_MULTICOL(float, 8);
+    } else {
+      if (cols == 2) VT_LAUNCH_W32_MULTICOL(uint16_t, 2);
+      else if (cols == 4) VT_LAUNCH_W32_MULTICOL(uint16_t, 4);
+      else VT_LAUNCH_W32_MULTICOL(uint16_t, 8);
+    }
+#undef VT_LAUNCH_W32_MULTICOL
+    return;
+  }
+  const int64_t grid = (P * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
   if (out.dtype == DType::kF32)
     QuantDotGemmGrouped32Kernel<W, float><<<static_cast<unsigned>(grid), block, 0, s>>>(
         static_cast<float*>(out.data), weight, act, expert_ids, P, n, nb, w_row_bytes, bcast);

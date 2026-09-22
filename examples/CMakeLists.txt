@@ -415,6 +415,21 @@ if(VLLM_CPP_VULKAN)
   vllm_cpp_set_warnings(vulkan-gemv-ab)
 endif()
 
+# w32-grouped-cols-ab: the MODEL-MM-QWEN4-EXP output-width sweep for the grouped
+# 32-block GEMV (ISSUE-LOCAL-01M2TZ9AE416FW4GH23V09783Q). Runs the released
+# qwen4_exp routed gate/up decode shape at VT_V4_W32_COLS 1/2/4/8 and
+# VT_V4_W32_WARPS 1/2/4/8, out of ONE binary, so the width can be chosen from a
+# measurement instead of an assumption -- and prints an FNV-1a hash of the whole
+# output per arm, because the width axis is required to be BIT-identical and a
+# fast arm that moved a float is void rather than interesting. CUDA-only and run
+# by hand, like vulkan-gemv-ab above.
+if(VLLM_CPP_CUDA)
+  add_executable(w32-grouped-cols-ab ${CMAKE_SOURCE_DIR}/benchmarks/w32_grouped_cols_ab.cpp)
+  target_link_libraries(w32-grouped-cols-ab PRIVATE vllm::vllm)
+  target_include_directories(w32-grouped-cols-ab PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  vllm_cpp_set_warnings(w32-grouped-cols-ab)
+endif()
+
 # parakeet-transcribe: the ASR example — a THIN client of the public C ABI
 # (include/vllm.h + vllm::shared ONLY, like vllm-cli), per the ONE SURFACE
 # directive. The pipeline it used to own privately lives in the library behind

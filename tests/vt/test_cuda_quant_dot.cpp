@@ -1562,6 +1562,136 @@ TEST_CASE("32-block keep-quant lane: crosses the lane stride, and takes K = 640"
   gpu.DestroyQueue(gq);
 }
 
+// The grouped 32-block lane assigned ONE WARP PER OUTPUT ELEMENT, so at the
+// released qwen4_exp shape (hidden 2560 -> nb = 80) its inner loop ran
+// `for (b = lane; b < 80; b += 32)` -- 2.50 iterations per lane -- and then paid a
+// five-step warp reduction to emit ONE float. It measured 41.6 GB/s, 15.2% of
+// peak, the lowest row in the decode bandwidth table
+// (ISSUE-LOCAL-01M2TZ9AE416FW4GH23V09783Q). VT_V4_W32_COLS=2|4|8 selects
+// QuantDotGemmGrouped32MultiColKernel, which gives one warp C CONSECUTIVE output
+// columns against ONE broadcast activation row.
+//
+// BYTE-IDENTITY is the RED-first anchor, and here it is genuinely reachable
+// rather than aspirational: every output element keeps its OWN accumulator and
+// its OWN ascending block order (b = lane, lane+32, ...), and the reduction tree
+// is the same five __shfl_down_sync steps. Only the warp->output map changes, so
+// NOTHING is re-associated. A wrong group stride, a mis-sized tail, or a
+// re-associated accumulate all diverge from the width-1 arm and fail hard here.
+//
+// The shapes are chosen for the tail, which is where a multi-column map breaks:
+// n = 5 and n = 13 divide by NONE of 2, 4, 8; n = 1 is a single-column row whose
+// group is short at every width; n = 64 divides all three. nb = 20 is the
+// released expert row (K = 640) and nb = 80 is the released hidden (K = 2560),
+// the shape this change exists for. Both broadcast polarities run, because
+// `bcast` picks the activation row inside the loop and a multi-column warp reads
+// that row C times.
+TEST_CASE("32-block grouped multi-COLUMN GEMV == one warp per output (byte-identical)") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend on this host; 32-block multi-column gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  Queue gq = gpu.CreateQueue();
+
+  const WeightCase k32[] = {
+      {DType::kIQ4_NL, 32, 18, 0, -1, "iq4_nl"},
+      {DType::kQ5_0, 32, 22, 0, -1, "q5_0"},
+      {DType::kQ4_0, 32, 18, 0, -1, "q4_0"},
+  };
+  constexpr int64_t kE = 5;
+  constexpr int64_t kP = 3;
+
+  int64_t combos = 0;
+  for (const WeightCase& c : k32) {
+    const std::string case_name(c.name);
+    for (int64_t nb : {int64_t{20}, int64_t{80}}) {
+      const int64_t k = nb * c.block_elems;
+      for (int64_t n : {int64_t{1}, int64_t{5}, int64_t{13}, int64_t{64}}) {
+        for (bool bcast : {false, true}) {
+          CAPTURE(case_name);
+          CAPTURE(nb);
+          CAPTURE(n);
+          CAPTURE(bcast);
+          ++combos;
+
+          const int64_t arows = bcast ? 1 : kP;
+          std::vector<uint8_t> wq = RandomBlocks(c, kE * n * nb, 0xC015U);
+          std::vector<float> a(static_cast<size_t>(arows * k));
+          GenerateData(1.0F, a.size(), a.data());
+          std::vector<int32_t> ids = ExpertIds(kP, kE);
+          const size_t outn = static_cast<size_t>(kP * n);
+
+          void* d_a = gpu.Alloc(a.size() * sizeof(float));
+          void* d_w = gpu.Alloc(wq.size());
+          void* d_e = gpu.Alloc(ids.size() * sizeof(int32_t));
+          gpu.Copy(gq, d_a, a.data(), a.size() * sizeof(float));
+          gpu.Copy(gq, d_w, wq.data(), wq.size());
+          gpu.Copy(gq, d_e, ids.data(), ids.size() * sizeof(int32_t));
+          gpu.Synchronize(gq);
+          Tensor at = DevTensor(d_a, DType::kF32, {arows, k});
+          Tensor wt = DevTensor(d_w, c.dtype, {kE * n, k});
+          Tensor et = DevTensor(d_e, DType::kI32, {kP});
+
+          auto run = [&](const char* flag, const char* warps) {
+            setenv("VT_V4_W32_COLS", flag, 1);
+            setenv("VT_V4_W32_WARPS", warps, 1);
+            void* d_o = gpu.Alloc(outn * sizeof(float));
+            // Poison, so an arm whose grid computed to zero blocks -- the exact
+            // way a wrong `njg` fails -- reads as a FAILURE and not as a buffer
+            // that happened to agree.
+            const std::vector<float> poison(outn, kPoison);
+            gpu.Copy(gq, d_o, poison.data(), poison.size() * sizeof(float));
+            Tensor ot = DevTensor(d_o, DType::kF32, {kP, n});
+            vt::MatmulBTQuantGrouped(gq, ot, at, wt, et);
+            std::vector<float> out(outn, 0.0F);
+            gpu.Copy(gq, out.data(), d_o, out.size() * sizeof(float));
+            gpu.Synchronize(gq);
+            gpu.Free(d_o);
+            return out;
+          };
+          // The baseline is the PRE-CHANGE launch exactly: one warp per output,
+          // four warps per block.
+          const std::vector<float> w1 = run("1", "4");
+          const std::vector<float> w2 = run("2", "4");
+          const std::vector<float> w4 = run("4", "4");
+          const std::vector<float> w8 = run("8", "4");
+          // The warps-per-block axis, which changes only how many warps share a
+          // block and must therefore move nothing. Run at BOTH ends: width 1 (the
+          // untouched kernel) and width 4 (the new one, where a tail group also
+          // has to survive a different grid).
+          const std::vector<float> b1 = run("1", "1");
+          const std::vector<float> b8 = run("4", "8");
+          unsetenv("VT_V4_W32_COLS");
+          unsetenv("VT_V4_W32_WARPS");
+
+          for (size_t i = 0; i < outn; ++i) {
+            REQUIRE(w1[i] != kPoison);
+            REQUIRE(w2[i] != kPoison);
+            REQUIRE(w4[i] != kPoison);
+            REQUIRE(w8[i] != kPoison);
+            REQUIRE(b1[i] != kPoison);
+            REQUIRE(b8[i] != kPoison);
+            REQUIRE(std::isfinite(w1[i]));
+            CHECK(w2[i] == w1[i]);  // byte-identical, NOT a tolerance
+            CHECK(w4[i] == w1[i]);
+            CHECK(w8[i] == w1[i]);
+            CHECK(b1[i] == w1[i]);
+            CHECK(b8[i] == w1[i]);
+          }
+          gpu.Free(d_a);
+          gpu.Free(d_w);
+          gpu.Free(d_e);
+        }
+      }
+    }
+  }
+  // doctest prints SUCCESS for a loop that ran nothing. Say how many it ran.
+  CAPTURE(combos);
+  CHECK(combos == static_cast<int64_t>(std::size(k32)) * 2 * 4 * 2);
+  CHECK(combos > 0);
+  gpu.DestroyQueue(gq);
+}
+
 TEST_CASE("Brick 12: CUDA Q8_0 PAIR == two separate matmuls (bit-identical)") {
   if (!HasCuda()) {
     MESSAGE("no CUDA backend on this host; Q8_0 pair gate skipped");

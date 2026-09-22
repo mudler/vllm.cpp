@@ -76,10 +76,16 @@ is 380 commits behind main and needs rebasing before it can merge.
 
 ## Gates
 
-- **Token gate:** `PENDING` — first-c1 is clean; token comparison can proceed
-  once a reference oracle runs on Strix.
-- **Throughput:** `PARTIAL` — vllm.cpp c1 measured at ~10 tok/s (64 tokens,
-  bf16, 3 repeats). Other engines not yet measured on Strix.
+- **Token gate:** `PARTIAL` — llama.cpp (Q4_K_M) vs vllm.cpp (BF16) partial
+  gate completed on 2026-09-22. All 6 prompts succeeded on both engines.
+  First generated token matches on 4 of 6. Not token-exact due to
+  quantization difference (BF16 vs Q4_K_M). A quant-matched comparison is
+  blocked because vllm.cpp does not support the `qwen3` GGUF arch.
+  vLLM/SGLang oracles are blocked on ROCm 5.7 (they need ROCm 7.2 + torch
+  2.13.0+rocm7.2).
+- **Throughput:** `PARTIAL` — vllm.cpp c1 ~9-10 tok/s (BF16, GPU); llama.cpp
+  ~21 tok/s (Q4_K_M, CPU). Different model formats, not directly comparable.
+  Other engines not yet measured on Strix.
 - **Memory:** `PENDING`.
 - **Correctness calibration:** `PENDING` (#3077 — SGLang's greedy decode is
   non-deterministic, so a distributional gate may be required).
@@ -101,6 +107,27 @@ is 380 commits behind main and needs rebasing before it can merge.
   - Throughput c1 (max-tokens 64, 3 repeats): 10.334, 9.168, 9.580 tok/s.
   - Non-fatal warning every run: "The GPU node has an unrecognized id."
     (ROCm 5.7 does not fully recognize gfx1151).
+- **Partial token gate (2026-09-22):** llama.cpp (Q4_K_M) vs vllm.cpp (BF16),
+  rc job `d9f5998d` on `strix:gpu0`. 6 prompts, max-tokens 128, temp 0,
+  seed 42. vllm-cli sha256
+  `f8ade18ef41bbcb06e1f221e29b04f6c456c4519c60275a470eea782382db74b`.
+  llama-cli sha256
+  `e66df178ef5f019ad94db768abd552466b7c10ae2846f5bbf3ecb00dfa8982bd`.
+  Model: Qwen3-4B at `1cfa9a72`.
+  - All 6 prompts completed on both engines with coherent, correct output.
+  - First generated token matches on 4 of 6 prompts (0, 3, 4, 5).
+  - Prompt 1 (primary colors): Q4_K_M gives subtractive (red/blue/yellow),
+    BF16 gives additive (red/green/blue) — both valid.
+  - Prompt 2 (boiling point): Q4_K_M gives 100C directly, BF16 gives 212F
+    then converts — both correct.
+  - Q4_K_M (llama.cpp) entered thinking mode (`[Start thinking]` blocks);
+    BF16 (vllm.cpp) did not.
+  - Not token-exact: quantization difference (BF16 vs Q4_K_M) explains
+    divergence. A quant-matched comparison requires vllm.cpp to support the
+    `qwen3` GGUF arch, which it does not (only qwen35/qwen35moe/qwen3next).
+  - vLLM and SGLang oracles cannot run on Strix: both need torch
+    2.13.0+rocm7.2 (ROCm 7.2), and Strix has ROCm 5.7 with no /opt/rocm.
+  - Full results persisted at `/tmp/vllmcpp_bf16_results.log` on Strix.
 
 ## Risks
 
@@ -112,6 +139,16 @@ is 380 commits behind main and needs rebasing before it can merge.
 - SGLang's greedy decode non-determinism means a strict token gate may not be
   achievable; a distributional gate needs ratification.
 - The 3111 branch is 380 commits stale; rebasing carries conflict risk.
+- vLLM and SGLang cannot run on Strix ROCm 5.7. Both require torch
+  2.13.0+rocm7.2 (ROCm 7.2), which has no ROCm 5.7 wheels. The vLLM oracle
+  worker hardcodes `/opt/rocm/bin/hipcc`. A previous lease installed ROCm 7.2.4
+  globally at `/opt/rocm`, but it was cleaned up. This blocks the primary
+  token gate and the full four-engine harness until ROCm 7.2 is restored or a
+  different device is used.
+- vllm.cpp does not support the `qwen3` GGUF arch (only qwen35/qwen35moe/
+  qwen3next), so a quant-matched llama.cpp vs vllm.cpp comparison is impossible
+  with this model. A different model or adding `qwen3` GGUF support is needed
+  for a token-exact C++-only gate.
 
 ## Stop conditions
 
@@ -124,14 +161,16 @@ is 380 commits behind main and needs rebasing before it can merge.
 
 ## Now
 
-`ACTIVE`. The first-c1 hard blocker (#3111) is cleared: vllm.cpp completes
-first-c1 inference on Strix with exit 0, 5/5 stability passes, and ~10 tok/s
-at c1 with 64 tokens. The ROCm version on the box is 5.7, not the 7.2.4 the
-spec was written for. The hang may have been fixed by code changes since
-2026-09-09 or may not reproduce on 5.7. The diagnostic harness is built and
-CPU-validated on the 3111 branch but not merged; the first-c1 result was
-obtained with the production binary. Next: establish the token gate against a
-reference oracle, then throughput at c4 and c32.
+`ACTIVE`. The first-c1 hard blocker (#3111) is cleared (2026-09-21). A
+partial token gate between llama.cpp (Q4_K_M) and vllm.cpp (BF16) completed
+on 2026-09-22: all 6 prompts succeeded on both engines, first token matches on
+4 of 6, not token-exact due to quantization difference. The primary token
+gate (against vLLM) and the full four-engine harness are blocked: vLLM and
+SGLang need ROCm 7.2 + torch 2.13.0+rocm7.2, and Strix has ROCm 5.7. The ROCm
+7.2.4 install a previous lease put at `/opt/rocm` was cleaned up. A quant-
+matched C++-only gate is also blocked: vllm.cpp does not support the `qwen3`
+GGUF arch. Next: restore ROCm 7.2 on Strix or find a device that can run
+vLLM/SGLang, then run the full four-engine harness.
 
 ## Git integration
 

@@ -78,7 +78,9 @@ TEST_CASE("registry_imports: every registered architecture has a complete factor
   // model (is_pooling_model=true) like `LlamaModel`, not a text-generation arch.
   // 46 -> 47 on MODEL-CUA-S1-FORMS: `CuaS1Forms`, a byte-level TinyTransformer
   // scorer ported from the `trycua/cua` reference. Also a POOLING model.
-  REQUIRE(registrations.size() == 47);
+  // 47 -> 48 on MODEL-LAYA: `LayaModel`, a ModernBERT-large backbone with a
+  // SystemOne decision head. Also a POOLING model (is_pooling_model=true).
+  REQUIRE(registrations.size() == 48);
 
   for (const ModelRegistration& registration : registrations) {
     CAPTURE(registration.architecture);
@@ -220,6 +222,7 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
       "KimiK3ForConditionalGeneration",
       "KimiLinearForCausalLM",
       "LagunaForCausalLM",
+      "LayaModel",
       "LlamaForCausalLM",
       "LlamaModel",
       "MiniCPM3ForCausalLM",
@@ -279,6 +282,19 @@ TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo")
       // registry.py:230, wrapped by as_embedding_model adapters.py:230) — a
       // POOLING model with NO text-generation path; the text entrypoints
       // refuse it by task and vllm_embed / /v1/embeddings serve it.
+      CHECK(registration.info.is_pooling_model);
+      CHECK_FALSE(registration.info.is_text_generation_model);
+      CHECK_FALSE(registration.info.supports_transcription);
+      CHECK_FALSE(registration.info.supports_transcription_only);
+      CHECK_FALSE(registration.info.is_hybrid);
+      CHECK_FALSE(registration.info.supports_multimodal);
+      continue;
+    }
+    if (registration.architecture == "LayaModel") {
+      // MODEL-LAYA: a POOLING model (ModernBERT-large backbone + SystemOne
+      // decision head) with NO text-generation path. Served via the
+      // /v1/systemone endpoint; the text entrypoints refuse by task. Ported
+      // from the convaiinnovations/laya reference (no vLLM precedent).
       CHECK(registration.info.is_pooling_model);
       CHECK_FALSE(registration.info.is_text_generation_model);
       CHECK_FALSE(registration.info.supports_transcription);
@@ -735,6 +751,7 @@ TEST_CASE("hf_registry_coverage: every registration has an example config fixtur
       "KimiK3ForConditionalGeneration",
       "KimiLinearForCausalLM",
       "LagunaForCausalLM",
+      "LayaModel",
       "LlamaForCausalLM",
       "LlamaModel",
       "MiniCPM3ForCausalLM",
@@ -838,7 +855,7 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "'Glm5NextForConditionalGeneration', 'GlmMoeDsaForCausalLM', 'GraniteForCausalLM', "
       "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', "
       "'KimiK3ForConditionalGeneration', 'KimiLinearForCausalLM', "
-      "'LagunaForCausalLM', "
+      "'LagunaForCausalLM', 'LayaModel', "
       "'LlamaForCausalLM', 'LlamaModel', "
       "'MiniCPM3ForCausalLM', 'MiniCPMForCausalLM', 'MistralForCausalLM', 'MuseGlimmerForCausalLM', 'MuseGlimmerForConditionalGeneration', "
       "'NemotronHForCausalLM', "
@@ -864,7 +881,7 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "'Glm5NextForConditionalGeneration', 'GlmMoeDsaForCausalLM', 'GraniteForCausalLM', "
       "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', "
       "'KimiK3ForConditionalGeneration', 'KimiLinearForCausalLM', "
-      "'LagunaForCausalLM', "
+      "'LagunaForCausalLM', 'LayaModel', "
       "'LlamaForCausalLM', 'LlamaModel', "
       "'MiniCPM3ForCausalLM', 'MiniCPMForCausalLM', 'MistralForCausalLM', 'MuseGlimmerForCausalLM', 'MuseGlimmerForConditionalGeneration', "
       "'NemotronHForCausalLM', "

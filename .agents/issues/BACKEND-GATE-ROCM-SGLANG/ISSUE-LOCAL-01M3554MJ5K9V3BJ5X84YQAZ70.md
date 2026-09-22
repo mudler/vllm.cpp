@@ -1,14 +1,14 @@
 ID: ISSUE-LOCAL-01M3554MJ5K9V3BJ5X84YQAZ70
 Title: qwen3 GGUF arch not supported in model_loader dispatch
 Row: BACKEND-GATE-ROCM-SGLANG
-State: OPEN
+State: CLOSED
 Kind: bug
 GitHub: -
 Mirror: PENDING
 Availability: FULL
 Created: 2026-09-22
 Updated: 2026-09-22
-Closed: -
+Closed: 2026-09-22
 
 ## Problem
 
@@ -16,4 +16,4 @@ The GGUF dispatch table in model_loader.cpp supports qwen35, qwen35moe, and qwen
 
 ## Resolution
 
--
+Fixed in PR #3274 (merged as 3c2fcca33). qwen3 GGUF arch support added: Qwen3HfConfigFromGguf, IsQwen3Gguf, LoadQwen3FromGguf in qwen3_gguf_weights.{h,cpp}. Dispatch entry {"qwen3", &Qwen3HfConfigFromGguf} in model_loader.cpp. kGguf branch in qwen3_dense.cpp LoadQwen3ForCausalLM. CPU build passes with -Werror. Tests: test_qwen3_gguf_weights 5/5 cases 117 assertions, test_model_loader_gguf 13/13, test_qwen3_5_gguf_mtp 4/4. Fresh reviewer mutation-tested 6 guarantees (5 caught immediately, 1 coverage gap found and fixed by fresh implementer).

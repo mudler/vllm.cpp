@@ -1,7 +1,7 @@
 // ROCm dense basic kernels — correctness-grade ports for discrete R9700 bring-up.
+#include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
 
 #include <cmath>
 #include <cstdint>

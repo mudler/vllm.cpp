@@ -9,10 +9,29 @@
 #define HIPBLAS_V2
 #endif
 
-#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
 #include <hipblas/hipblas.h>
+#ifdef VLLM_CPP_HAS_HIPBLASLT
 #include <hipblaslt/hipblaslt.h>
+#endif
+
+#ifndef HIPBLAS_COMPUTE_32F
+typedef hipblasDatatype_t hipblasComputeType_t;
+// ROCm <6 renames HIPBLAS_R_16BF to HIPBLAS_R_16B; alias for portability.
+#ifndef HIPBLAS_R_16BF
+#define HIPBLAS_R_16BF HIPBLAS_R_16B
+#endif
+#define HIPBLAS_COMPUTE_32F           HIPBLAS_R_32F
+#define HIPBLAS_COMPUTE_16F           HIPBLAS_R_16F
+#define HIPBLAS_COMPUTE_32F_FAST_16BF HIPBLAS_R_16BF
+#define HIPBLAS_COMPUTE_32F_FAST_16F  HIPBLAS_R_16F
+// ROCm <6: hipblasGemmEx takes hipblasDatatype_t, not hipDataType.
+// The underlying enum values are identical, so the cast is safe.
+#define VT_BLAS_DT(x) static_cast<hipblasDatatype_t>(x)
+#else
+#define VT_BLAS_DT(x) (x)
+#endif
 
 #include <cstdint>
 #include <cstdio>
@@ -314,6 +333,7 @@ void Bf16GemvBT(hipStream_t s, void* out, const void* a, const void* b, int N, i
   }
 }
 
+#ifdef VLLM_CPP_HAS_HIPBLASLT
 // VT_ROCM_HIPBLASLT=1 enables. Default OFF — heuristic path aborted on gfx1201 in lab.
 bool LtEnabled() {
   static const bool on = [] {
@@ -395,6 +415,7 @@ void* LtWorkspace(size_t need, hipStream_t stream) {
     return block;
   });
 }
+#endif  // VLLM_CPP_HAS_HIPBLASLT
 
 // Grow-only A/B/C pointer tables for hipblasGemmBatchedEx, one entry per DEVICE,
 // on the same bookkeeping as the workspace above (src/vt/grow_only_stream_scratch.h).
@@ -435,6 +456,7 @@ vt::GrowOnlyStreamTriple<int>::Tables EnsurePtrTables(int device, int batch) {
   return tables;
 }
 
+#ifdef VLLM_CPP_HAS_HIPBLASLT
 // C[M,N] row-major = alpha * A[M,K] @ B[N,K]^T + beta * C
 // Same col-major view as hipblasGemmEx(OP_T, OP_N, m=N, n=M, k=K, B, K, A, K, C, N).
 bool MatmulBTLt(hipStream_t stream, void* C, const void* A, const void* B, int M, int N, int K,
@@ -536,6 +558,12 @@ bool MatmulBTLt(hipStream_t stream, void* C, const void* A, const void* B, int M
   }
   return true;
 }
+#else  // !VLLM_CPP_HAS_HIPBLASLT
+// hipBLASLt not found: Lt path always fails, callers fall back to hipblasGemmEx.
+bool MatmulBTLt(hipStream_t, void*, const void*, const void*, int, int, int, float, float) {
+  return false;
+}
+#endif  // VLLM_CPP_HAS_HIPBLASLT
 
 }  // namespace
 
@@ -598,8 +626,8 @@ void MatmulKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
 
   auto ctx = GetBlas(q.device.index, s);
   const float alpha = 1.f, beta = 0.f;
-  const hipDataType at = ToBlasType(a.dtype);
-  const hipDataType ot = ToBlasType(out.dtype);
+  const auto at = VT_BLAS_DT(ToBlasType(a.dtype));
+  const auto ot = VT_BLAS_DT(ToBlasType(out.dtype));
 
   // C_rm = A_rm @ B_rm  <=>  treat as gemm(N,N) writing C with ld=N, dims n,m,k
   // A leading dim = a.stride[0] (row stride in elements)
@@ -708,8 +736,8 @@ void MatmulBTKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
 
   auto ctx = GetBlas(q.device.index, s);
   const float alpha = 1.f, beta = 0.f;
-  const hipDataType at = ToBlasType(a.dtype);
-  const hipDataType ot = ToBlasType(out.dtype);
+  const auto at = VT_BLAS_DT(ToBlasType(a.dtype));
+  const auto ot = VT_BLAS_DT(ToBlasType(out.dtype));
 
   // C = B^T @ A^T in row-major disguise:
   // gemm(OP_T, OP_N, N, M, K, B, ldb=K, A, lda=a_rs, C, ldc=N)
@@ -749,7 +777,7 @@ void MatmulBTAlphaBetaRocm(Queue& q, void* out, const void* a, const void* b, in
     return;
   }
   auto ctx = GetBlas(q.device.index, s);
-  const hipDataType at = ToBlasType(dtype);
+  const auto at = VT_BLAS_DT(ToBlasType(dtype));
   CheckBlas(hipblasGemmEx(ctx.handle, HIPBLAS_OP_T, HIPBLAS_OP_N,
                           /*m=*/N, /*n=*/M, /*k=*/K, &alpha, b, at, /*ldb=*/K, a, at,
                           /*lda=*/K, &beta, out, at, /*ldc=*/N, GemmCompute(dtype),
@@ -777,7 +805,7 @@ void MatmulBTStridedBatchFullKernelRocm(Queue& q, void* out, const void* a, cons
   }
   auto ctx = GetBlas(q.device.index, s);
   const float alpha = 1.f, beta = 0.f;
-  const hipDataType at = ToBlasType(dtype);
+  const auto at = VT_BLAS_DT(ToBlasType(dtype));
   const long long strideB = static_cast<long long>(N) * K;
   const long long strideC = static_cast<long long>(M) * N;
   CheckBlas(hipblasGemmStridedBatchedEx(
@@ -808,7 +836,7 @@ void MatmulBTPointerBatchKernelRocm(Queue& q, void** out_ptrs, const void* a,
   }
   auto ctx = GetBlas(q.device.index, s);
   const float alpha = 1.f, beta = 0.f;
-  const hipDataType at = ToBlasType(dtype);
+  const auto at = VT_BLAS_DT(ToBlasType(dtype));
 
   // Reuse device pointer tables (per-device, grows to max batch seen).
   const vt::GrowOnlyStreamTriple<int>::Tables tab = EnsurePtrTables(q.device.index, batch);
@@ -847,7 +875,7 @@ void MatmulBTPointerBatchABKernelRocm(Queue& q, void** out_ptrs, void** a_ptrs,
   }
   auto ctx = GetBlas(q.device.index, s);
   const float alpha = 1.f, beta = 0.f;
-  const hipDataType at = ToBlasType(dtype);
+  const auto at = VT_BLAS_DT(ToBlasType(dtype));
 
   const vt::GrowOnlyStreamTriple<int>::Tables tab = EnsurePtrTables(q.device.index, batch);
   const size_t psz = static_cast<size_t>(batch) * sizeof(void*);
@@ -922,8 +950,8 @@ void BatchedMatmulKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
 
   auto ctx = GetBlas(q.device.index, s);
   const float alpha = 1.f, beta = 0.f;
-  const hipDataType ab_t = ToBlasType(a.dtype);
-  const hipDataType c_t = ToBlasType(out.dtype);
+  const auto ab_t = VT_BLAS_DT(ToBlasType(a.dtype));
+  const auto c_t = VT_BLAS_DT(ToBlasType(out.dtype));
   CheckBlas(hipblasGemmStridedBatchedEx(
                 ctx.handle, HIPBLAS_OP_N, HIPBLAS_OP_N,
                 /*m=*/static_cast<int>(N), /*n=*/static_cast<int>(M),

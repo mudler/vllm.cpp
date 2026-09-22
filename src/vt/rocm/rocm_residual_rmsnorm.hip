@@ -3,8 +3,8 @@
 // e126687a9a828d513c01a07cd69f025f27d63280. The executing generated kernels
 // ckic6h6:33-52, ctj2x6:33-58, and c5slugd:33-56 fix the order and stores.
 // See .agents/specs/rocm-residual-norm.md for the measured compiled lifetime.
-#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
 
 #include <algorithm>
 #include <stdexcept>

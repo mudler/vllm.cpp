@@ -1,8 +1,8 @@
 // ROCm paged attention — port of cpu_paged_attn.cpp algebra + CUDA device-side
 // request lookup (cuda_paged_attn.cu). Online softmax; NHD KV via strides.
 // Supports bf16/f32 query x bf16/f32 KV (mixed allowed).
-#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
 
 #include "rocm_rdna3_attn_decode.h"
 #include "rocm_rdna3_dot2.h"
@@ -1330,7 +1330,6 @@ __global__ void PagedAttnDecodeSplitKvReduce(
   for (int64_t split = 0; split < num_splits; split++) {
     const int64_t base = ((t * hq + h) * num_splits + split) * (kEpl + 1);
     
-    float m_split = -INFINITY;
     #pragma unroll
     for (int ii = 0; ii < kEpl; ii++) {
       float v = attn_logits[base + ii];

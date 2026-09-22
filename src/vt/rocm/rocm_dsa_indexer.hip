@@ -149,9 +149,9 @@
 // primitive, and nothing in this file reads `warpSize`. MFMA is CDNA-only and
 // RDNA has no equivalent; upstream's own AMD arm reaches for no matrix unit
 // either, which is finding 1 above.
+#include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
 
 #include <cstdint>
 #include <stdexcept>

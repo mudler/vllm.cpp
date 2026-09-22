@@ -8,8 +8,8 @@
 // allocation, synchronization, or temporary device pointers are required.
 // The legacy and native gate/up modes share this implementation. Only the
 // explicit native mode rounds gate/up and SiLU through BF16 before multiplication.
-#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
 
 #include <cstdint>
 #include <stdexcept>

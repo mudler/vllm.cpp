@@ -8,8 +8,8 @@
 //   donor in_a (weight [N,K]) = our b;  donor in_b (x [M,K]) = our a;
 //   donor M_in = our N (output dim);  donor N_in = our M;  C[N_in,M_in] = out[M,N].
 
-#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
 
 #include <cstdint>
 #include <stdexcept>
@@ -50,63 +50,6 @@ inline int mindiv(int N, int div1, int div2) {
     if (rnds[0] == rnds[i]) return (div2 - i);
   return 0;
 }
-
-// gfx1151 detection (RDNA3.5) - matches vLLM's on_gfx1151()
-__device__ __forceinline__ bool on_gfx1151() {
-#if defined(__GFX11__)
-  // Runtime detection via hipDeviceGetAttribute
-  int arch = 0;
-  hipDeviceGetAttribute(&arch, hipDeviceAttributeGcnArch, 0);
-  // gfx1151 = 115100
-  return (arch >= 115100 && arch < 115200);
-#else
-  return false;
-#endif
-}
-
-// Donor's persistent-workgroup splitter (host-side in skinny_gemms.cu:1169).
-inline int mindiv(int N, int div1, int div2) {
-  int nPrRnd = div1 * div2;
-  int rnds[13];
-  for (int i = 0; i < 13; i++) {
-    rnds[i] = (N + nPrRnd - 1) / nPrRnd;
-    nPrRnd -= div1;
-  }
-  for (int i = 12; i >= 0; i--)
-    if (rnds[0] == rnds[i]) return (div2 - i);
-  return 0;
-}
-
-// gfx1151-specific dispatch config (mirrors vLLM's WVSPLIT_TILE logic)
-// Returns {YTILE, UNRL} pair based on K, N, and LDS fit
-struct YtileUnrl { int ytile; int unrl; };
-inline YtileUnrl SelectYtileUnrl(int K, int N, int M, int CuCount, bool fit_lds) {
-  // sYT = ceil(M / (CuCount * 4))
-  int sYT = (M + CuCount * 4 - 1) / (CuCount * 4);
-  
-  if (on_gfx1151()) {
-    // gfx1151-specific tuning (vLLM skinny_gemms.cu:1240-1258)
-    if (sYT <= 1) {
-      return {1, 4};
-    } else if ((K % 1024 == 512) && K >= 1536 && (sYT >= 40 || K >= 4096)) {
-      return {4, 1};
-    } else if (K < 1024) {
-      return {2, 4};
-    } else if (K <= 2048 && (N >= 2 || sYT <= 26)) {
-      return {1, 4};
-    } else if (N >= 2 && !fit_lds) {
-      return {1, 4};
-    } else if (N == 1) {
-      return {1, 2};
-    } else {
-      return {1, 1};
-    }
-  } else {
-    // Generic gfx1x fallback (YTILE=2, UNRL=2 as before)
-    return {2, 2};
-  }
-}
-
 
 // A (activation) fits LDS. N = decode batch (our M). bf16, f32 accum.
 // Output-store polymorphism: the adopted bf16 decode arm rounds the f32

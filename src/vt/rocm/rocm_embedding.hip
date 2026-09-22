@@ -6,8 +6,8 @@
 // checked contract as the original CUDA M0.6 shape (ops.h).
 //
 // Wavefront-agnostic: no warp primitives, only grid-stride over elements.
-#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
 
 #include <stdexcept>
 #include <string>

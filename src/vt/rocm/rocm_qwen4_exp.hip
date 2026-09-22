@@ -134,9 +134,9 @@
 // ONLY WAVE32 IS MEASURED. `strix:gpu0` (gfx1151, RDNA 3.5) is the only AMD part
 // in this fleet, so the wave64 path is REASONED and not run. The spec's
 // `## Owed` says so rather than letting the silence read as coverage.
+#include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
 
 #include <cstdint>
 #include <stdexcept>

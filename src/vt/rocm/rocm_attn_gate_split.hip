@@ -3,8 +3,8 @@
 // This copies the same values to the existing contiguous local destinations,
 // following cpu_ops.cpp:3985 and cuda_glue.cu:193. The gate remains F32 because
 // the shared SigmoidGateBf16 consumer requires that storage format.
-#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
 
 #include <cstdint>
 #include <stdexcept>

@@ -15,9 +15,9 @@
 // Gate: the recurrence case in test_backend_cross_device.cpp — NMSE <= 5e-4
 // vs the CPU oracle on out AND in-place state.
 
+#include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
 
 #include <cstdint>
 #include <cstddef>

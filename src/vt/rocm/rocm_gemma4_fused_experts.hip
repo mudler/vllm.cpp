@@ -1,8 +1,8 @@
 // Fused top-k ExpertGeGLU for Gemma-4 MoE decode (T=1).
 // Opt-in: VT_GEMMA4_FUSED_EXPERTS=1
 // Two-phase multi-block: (1) act[i]=gelu(gate)*up  (2) ysum += w * act@Wdn
-#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
 
 #include <cstdlib>
 

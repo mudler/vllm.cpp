@@ -14,9 +14,9 @@
 // outputs NMSE <= 5e-4 vs the CPU oracle (silu epilogue arithmetic), conv_state
 // write-back/roll BIT-EXACT (raw-x byte movement).
 
+#include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
 
 #include <cstdint>
 #include <stdexcept>

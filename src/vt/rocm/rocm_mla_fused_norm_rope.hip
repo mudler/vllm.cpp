@@ -42,8 +42,8 @@
 // Gate: the FusedNormRope arm of tests/vt/test_backend_cross_device.cpp (NMSE
 // <= 5e-4 against the CPU oracle, both rope styles, f32 and bf16), and the
 // GLM-5.3 e2e leg on `strix:gpu0` through `vllm-cli`.
-#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
 
 #include <cstdint>
 #include <stdexcept>

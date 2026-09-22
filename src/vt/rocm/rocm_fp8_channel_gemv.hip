@@ -4,8 +4,8 @@
 // M=1: fused Expert GeGLU (decode).
 // M>1: weight stays FP8 — one dequant of W row into LDS, then all M acts (prefill batch).
 // No host/device expand of full expert packs to BF16.
-#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
 #include <vector>
 
 #include <cstdint>

@@ -55,8 +55,8 @@
 // NO matrix cores, NO async copies, NO cooperative launch, and 3 KiB of LDS
 // against a 64 KiB budget. The blockers above are not worked around; they are
 // not encountered. Speed is a later row and this file offers none.
-#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 
 #include <cstdint>
 #include <mutex>

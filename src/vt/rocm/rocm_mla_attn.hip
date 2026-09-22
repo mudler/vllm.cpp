@@ -77,8 +77,8 @@
 // `rocm_paged_attn.hip:4-5`). Without it `__hip_bfloat16` and
 // `__float2bfloat16` are undeclared and the TU does not compile -- measured,
 // as five errors from one cause, on rc job 1e41b641.
-#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
 
 #include <algorithm>
 #include <cstdint>

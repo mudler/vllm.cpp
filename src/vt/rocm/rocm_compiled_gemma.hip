@@ -1,7 +1,7 @@
 // Gemma compiled fusion boundaries, vLLM e126687a9a828d513c01a07cd69f025f27d63280.
 // Generated cpjgc4x (embedding), cycnctz (sandwich), and cduy4zd (final norm).
-#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
 
 #include "vt/compiled_gemma.h"
 #include "vt/rocm/rocm_device_bind.h"

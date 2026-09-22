@@ -12,9 +12,10 @@
 // NMSE <= 5e-4 for the norm/preamble arithmetic; SigmoidGateBf16 bit-exact
 // (single multiply, same RNE store on both sides).
 
+#include <hip/hip_runtime.h>
+#include "vt/rocm/hip_shfl_compat.h"
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
 
 #include <cstdint>
 #include <cstdlib>

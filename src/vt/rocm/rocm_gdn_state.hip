@@ -11,9 +11,9 @@
 // bit-exact vs the CPU oracle (pure indexed data movement + boundary RNE
 // conversion both sides share).
 
+#include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
 
 #include <cstdint>
 #include <stdexcept>

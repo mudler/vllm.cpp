@@ -12,9 +12,10 @@
 // Covers the formats the target GDN-MoE GGUFs use (Q4_K / Q6_K / Q8_0). The
 // IQ2/IQ3/Q2_K/Q3_K/Q5_K superblocks port identically against this skeleton.
 
+#include <hip/hip_runtime.h>
+#include "vt/rocm/hip_shfl_compat.h"
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
 // The quantized fragment API supports measured gfx1100 and gfx1200/gfx1201.
 // Keep this device guard independent of the attention WMMA architecture gate.
 #if defined(__gfx1100__) || defined(__gfx1200__) || defined(__gfx1201__)

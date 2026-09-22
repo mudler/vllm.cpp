@@ -62,6 +62,7 @@ class QuantDotScratchPool {
 
 #ifndef VT_ROCM_QUANT_DOT_SCRATCH_TEST_ONLY
 #include <hip/hip_runtime.h>
+#include "vt/rocm/hip_shfl_compat.h"
 
 #include <cstdlib>
 #include <cstring>

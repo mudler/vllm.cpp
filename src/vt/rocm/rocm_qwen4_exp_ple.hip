@@ -74,9 +74,9 @@
 // `__syncthreads()`, which are wavefront-size agnostic. So the file carries no
 // gfx-family dependency, and in particular nothing that RDNA lacks: MFMA is
 // CDNA-only and nothing here would have reached for it.
+#include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
 
 // <math.h>, not <cmath>: the device math functions this file uses (`isnan`,
 // `fabs`, `sqrt`, `exp`) are declared in the GLOBAL namespace by the HIP math

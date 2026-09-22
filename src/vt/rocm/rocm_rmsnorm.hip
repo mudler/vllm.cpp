@@ -47,9 +47,9 @@
 // (cuda_ops.cu:421-437). They exist to be BIT-IDENTICAL to this kernel while
 // being faster on NVIDIA, they are tuned against sm_121a, and W0 is not a speed
 // milestone. RmsNormQuantFp8 and the gated variants are likewise out of scope.
+#include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
 
 #include <cstdlib>
 #include <string>

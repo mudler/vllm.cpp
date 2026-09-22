@@ -78,9 +78,9 @@
 // The kernel is a grid-stride loop over independent (row, group) pairs with no
 // cross-lane primitive of any kind, so it is wavefront-size agnostic and
 // carries no gfx-family dependency.
+#include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
 
 // <math.h>, not <cmath>: HIP's math headers declare the device functions this
 // file uses in the GLOBAL namespace, and spelling the include this way keeps

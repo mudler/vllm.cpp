@@ -1,6 +1,6 @@
 // ROCm ungrouped MoE router: softmax + greedy top-k (lowest-index tie-break).
-#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
 
 #include <cmath>
 #include <cstdint>

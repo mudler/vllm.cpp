@@ -1857,8 +1857,15 @@ if(VLLM_CPP_HIP)
   if(VLLM_CPP_HIPBLASLT_INCLUDE AND VLLM_CPP_HIPBLASLT_LIB)
     target_include_directories(vllm PUBLIC ${VLLM_CPP_HIPBLASLT_INCLUDE})
     target_link_libraries(vllm PUBLIC ${VLLM_CPP_HIPBLASLT_LIB})
+    target_compile_definitions(vllm PUBLIC VLLM_CPP_HAS_HIPBLASLT)
     message(STATUS "ROCm hipBLASLt: ${VLLM_CPP_HIPBLASLT_LIB}")
+  else()
+    message(STATUS "ROCm hipBLASLt: not found (hipBLASLt matmul path disabled)")
   endif()
+  # clang-17 / ROCm 5.7: __clang_hip_runtime_wrapper.h defines bfloat16 conversion
+  # functions as non-inline in every TU, causing multiple-definition link errors.
+  # The flag is harmless when there are no duplicate definitions.
+  target_link_options(vllm PRIVATE "LINKER:--allow-multiple-definition")
 else()
   # BIT-ROT GUARD (BACKEND-ROCM W0). The ROCm platform leg is deliberately plain
   # C++ with no HIP header, which means it CAN be compiled on a machine with no

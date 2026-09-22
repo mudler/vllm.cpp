@@ -1,7 +1,7 @@
 // Single-query Gemma attention, matching the pinned ROCm paged_attention_2d.
 // Two query heads share one KV head. Keep its key tiles and WMMA accumulation.
-#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
 
 #include <stdexcept>
 

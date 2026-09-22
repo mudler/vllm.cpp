@@ -11,9 +11,9 @@
 // test_backend_cross_device.cpp — NMSE <= 5e-4 vs the CPU oracle, padded a/b
 // row strides included.
 
+#include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
 
 #include <cstdint>
 #include <stdexcept>

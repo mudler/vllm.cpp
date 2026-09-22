@@ -9,8 +9,8 @@
 //   MoeCombineGate:   MoeCombine + the shared-expert sigmoid gate folded in
 //                     (rounded through bf16 exactly as the donor).
 
-#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
 
 #include <cstdint>
 #include <stdexcept>

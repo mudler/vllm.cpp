@@ -1,8 +1,8 @@
 // Gemma-4 MoE Expert GeGLU decode (T=1), custom RDNA4 HIP kernels.
 // VT_GEMMA4_CUSTOM_EXPERT=1 to use from gemma4_moe.cpp.
 // y = beta*y + alpha * Down(Gelu(Gate(x)) * Up(x))
-#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
+#include <hip/hip_bf16.h>
 
 #include <cstdint>
 

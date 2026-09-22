@@ -133,9 +133,9 @@
 // that reached for one would not build for gfx1151 at all; nothing here would
 // have reached for one, because the only tensor-shaped operation in the pair is
 // a `head_dim`-long dot that must stay in the host's sequential order anyway.
+#include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
 
 // <math.h>, not <cmath>: the device math functions this file uses (`expf`,
 // `sqrtf`, `fmaxf`) are declared in the GLOBAL namespace by the HIP math

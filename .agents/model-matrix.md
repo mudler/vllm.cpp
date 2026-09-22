@@ -75,15 +75,15 @@ commit IS `[Model] Support Qwen3.8-Flash-Next (#53896)`:
 `git show e126687a9a:vllm/model_executor/models/registry.py` gives
 `"Qwen4ExpForConditionalGeneration"` at line 580, `"Qwen4ExpForCausalLM"` at
 114 and `"Qwen4ExpMTP"` at 670. So qwen4exp is an AT-THE-PIN row, the split is
-356 + 22, and the totals below — 378 architecture rows, 382 rollup rows, 58
+356 + 22, and the totals below — 379 architecture rows, 383 rollup rows, 59
 engaged, 324 inventoried — are unchanged by the move.
 
-The rollup below counts **382 rows**, which is those 378 plus the four that are
+The rollup below counts **383 rows**, which is those 379 plus the four that are
 not architectures at all and say so in their own sections:
 `MODEL-FACTORY-registry` (the cross-cutting registry contract), the two
 `MODEL-AUDIO` encoder-component rows, and the one `MODEL-HFDYNAMIC` row (dynamic
 Transformers compatibility is capability-driven and excluded from finite counts).
-Of those 382, 58 are past `INVENTORIED` (engaged) and the remaining 324 are the
+Of those 383, 59 are past `INVENTORIED` (engaged) and the remaining 324 are the
 known-but-not-started long tail — the same two numbers the rollup table states,
 and the way to re-derive every count here is to re-run
 [`scripts/check-agent-record.py`](../scripts/check-agent-record.py)'s parser over
@@ -110,14 +110,14 @@ Rollup by lifecycle state (must equal the detailed per-state row counts):
 | INVENTORIED | 324 |
 | PARTIAL | 23 |
 | ACTIVE | 13 |
-| SPIKE | 10 |
+| SPIKE | 11 |
 | BLOCKED | 5 |
 | DONE | 3 |
 | READY | 3 |
 | GATING | 1 |
-| **Total** | **382** |
+| **Total** | **383** |
 
-Engaged architectures (the 58 non-`INVENTORIED` rows):
+Engaged architectures (the 59 non-`INVENTORIED` rows):
 
 | Support | Architecture | Family / example | Status | Row |
 |---|---|---|---|---|
@@ -179,6 +179,7 @@ Engaged architectures (the 58 non-`INVENTORIED` rows):
 | 🚧 | `Gemma4ForConditionalGeneration` | Gemma-4 multimodal (text STRICT; image mm e2e near-tie GREEN via the registered forward; vision+audio towers gated-in-isolation; audio e2e + STRICT-18/18 + speed pending) | **TEXT PATH STRICT 32/32 TOKEN-EXACT vs vLLM 0.25.0 (G1b LANDED 2026-07-28, `CLAIM-GEMMA4-G1B`).** `unsloth/gemma-4-E4B-it` loads through our engine + greedily emits the EXACT 32 golden token ids (`tests/parity/goldens/gemma4_e4b_text/gen_manifest.json`); gate `tests/parity/test_gemma4_paged_engine.cpp` (dgx CUDA, `flock`). The G1-named blocker is CLEARED: the runner now allocates a PER-LAYER KV head_dim (`KVCacheConfig::per_layer_attn_specs`, `runner.cpp` initialize_kv_cache) so Gemma-4's heterogeneous 256 (sliding) / 512 (global) heads each get a correctly-strided cache — BYTE-NEUTRAL for every uniform-KV model (empty ⇒ old path; full CPU runner/KV suite green + OLMo-2 SACRED GPU re-gate 16/16 UNCHANGED). Three additive loader gaps found+fixed on the way to the first-ever forward: nested per-layer `rope_parameters` (config loader), the Gemma `Replace(" "→"▁")` metaspace normalizer (tokenizer), and reading Gemma-4 scalars from `raw["text_config"]` not the full config (the real 256/512 head_dim source). Primitives grounded 1:1 in `gemma4.py`: PLAIN RMSNorm, PLE, YOCO KV-sharing, proportional partial-RoPE, GeGLU, per-layer scalar, final soft-cap 30, tied lm_head. **G2 IMAGE ORACLE + PORT MAP LANDED 2026-07-28 (`CLAIM-GEMMA4-G2`, honest partial):** the `unsloth/gemma-4-E4B-it` IMAGE→text greedy golden is captured **STRICT** (K=5 deterministic — same bar as Qwen3-VL image; 18 tokens → coherent gradient-image description, 256 soft tokens, `tests/parity/goldens/gemma4_e4b_image/`) with the four staged vision refs (proc/patch-embed/encoder/pooled/projected) for M2a-style unit-gating, and the SigLIP/NaFlex tower is fully port-mapped (spec §G2). ★ CORRECTION: the tower is a custom **NaFlex SigLIP2 WITH multidim vision-RoPE + q/k/v-norm + Gemma2 sandwich norms + learned-2D pos-embed + avg-pool-by-position pooler** — the earlier §0.1 "no vision-RoPE, simpler than Qwen3-VL" claim is REFUTED. **G2-impl LANDED 2026-07-28 (`CLAIM-GEMMA4-G2-IMPL`):** the C++ NaFlex SigLIP2 vision TOWER is implemented (additive `gemma4_vision.{h,cpp}`) and PASSES all four per-stage gates vs the transformers-eager refs (dgx CUDA `flock`): patch-embed relL2 2.15e-3, encoder 3.14e-2, pooled 1.36e-2, projected 1.85e-2 (220/220, compute-sanitizer 0). ★ Port-map correction: E4B `use_clipped_linears=True` with FINITE trained QAT clamps on the 7 encoder linears (implemented). Multidim vision-RoPE via 2× `vt::RopeFromCache` sharing one cache; attn scale 1.0; NO new vt op (reused MatmulBT/RmsNorm/RopeFromCache/AttentionDenseFlash/GeluAndMul). Text `test_gemma4_paged_engine` STRICT 32/32 UNCHANGED on the linking binary. **Image e2e NOT yet gated** — C++ NaFlex image processor + engine mm-plumbing (merge/hasher/encoder-cache/decode-fork) are the named residual. **G3 LANDED 2026-07-28 (`CLAIM-GEMMA4-G3`):** the C++ USM-Conformer AUDIO tower + audio projector are implemented (additive `gemma4_audio.{h,cpp}`) and PASS all 7 per-stage gates f32-exact vs the transformers-eager refs (host f32, 1256/1256): subsample 5.4e-7, posemb 8.9e-8, block0 4.2e-7, block_mid 3.8e-7, block_last 4.4e-6, output_proj 5.9e-6, projected 6.3e-6. Chunked-local attn (Transformer-XL rel-shift + softcap 50 + per_dim_scale softplus), GLU + depthwise causal conv (k5), half-step FFNs, FINITE QAT clamps; RED-first (wrong 13-key window → 2.8e-2, fixed 12-key → 1e-6); NO new vt op (host f32). Golden `tests/parity/goldens/gemma4_e4b_audio/`. Audio e2e (feature extractor + engine merge) is the named residual. **MM-IMAGE-E2E LANDED 2026-07-29 (`CLAIM-GEMMA4-MM-E2E`):** the SigLIP2 vision tower is FOLDED into the ENGINE registered forward (`supports_multimodal=true` + the mm branch in `gemma4_registry.cpp` → `Gemma4Model::ForwardMm`; projected soft tokens masked-scattered into the `<image>` rows via `ModelForwardInput.mm`, PLE image-rows→0). Image→text through `ModelRegistry::Forward` (driver `Gemma4GenerateGreedyViaRegistry`, `gemma4_mm.cpp`) is dgx-GREEN: **16/18 content tokens BIT-EXACT** vs the STRICT `gemma4_e4b_image` golden (the full sentence), the single divergence being the terminal "."↔"," at a bf16 NEAR-TIE (margin ~0.10-0.12 logit), INVARIANT to vision-input precision (live C++ bf16 tower AND committed f32 ref_projected diverge identically ⇒ backbone bf16-accumulation, not the fold). Text SACRED 32/32 UNCHANGED (inertness). Gate `tests/vllm/multimodal/test_gemma4_registry_e2e.cpp`. **Row `ACTIVE`:** text STRICT + image mm e2e (near-tie) gated + all three towers gated-in-isolation; residuals = STRICT-18/18 (bit-match vLLM prefill bf16), audio e2e (mel A1 + merge), speed | `MODEL-MM-gemma4-mm-gemma4-for-conditional-generation` |
 | 📋 | `Gemma4UnifiedForConditionalGeneration` | Gemma-4 unified multimodal (encoder-free) | Scoped in the [Gemma-4 mm + audio track](specs/gemma4-multimodal.md) — **GATEABLE (W0 2026-07-28, `CLAIM-GEMMA4-W0`):** the sibling `Gemma4ForConditionalGeneration` W0 RUN-VERIFIED on vLLM 0.25.0 proves the shared registered mm path loads+runs+generates; the ungated `unsloth/gemma-4-12b-it` (23.92 GB) IS this encoder-free variant (`Gemma4UnifiedVisionEmbedder`, no SigLIP/audio `AutoModel` tower) and fits GB10 (no HF token needed). Oracle block RETIRED; IMPLEMENTATION-blocked only, staged behind the Gemma-4 backbone. Row stays `SPIKE`, not implemented | `MODEL-MM-gemma4-unified-gemma4-unified-for-conditional-generation` |
 | 📋 | `GLiNER2VLLMModel` (DeBERTa v2 + GLiNER2 pooler) | GLiNER2.5 zero-shot NER / structured extraction (`fastino/gliner2.5-multi-v1`) | **SPIKE** — spec committed; not implemented. First encoder-only (BERT-class) model in the tree; requires native DeBERTa disentangled attention. Oracle: `vllm-factory` plugin `ddickmann/vllm-factory@7d6ff68` (gateable=no, #3216). Targets `PoolingTask::kPlugin`. | `MODEL-GLINER25` |
+| 📋 | `TinyTransformerScorer` (byte-level encoder + cross-attention scorer) | cua-s1-forms option scoring (not in vLLM; `trycua/cua`) | **SPIKE** — spec committed; Phases 1-4 implemented (ByteCollator, inference pipeline, registration, `/v1/score` server dispatch); PR #3265. | `MODEL-CUA-S1-FORMS` |
 
 ## Row contract
 
@@ -572,15 +573,15 @@ of their own and are NOT part of the architecture rows counted above. **This
 sentence stored `366` until 2026-09-12 and the count had moved twice under it.**
 The architecture-row count and the composition of the gap between it and the
 rollup are stated once in this file, in §"Architecture-support checklist" above
-— `378` architecture rows against `382` rollup rows, the difference being the
+— `379` architecture rows against `383` rollup rows, the difference being the
 four rows that are not architectures at all and say so in their own sections,
 namely `MODEL-FACTORY-registry`, these two `MODEL-AUDIO` rows, and the one
 `MODEL-HFDYNAMIC` row. **The numbers repeated in the next sentence are a dated
-derivation and not a second store**: re-derived on 2026-09-12,
+derivation and not a second store**: re-derived on 2026-09-21,
 [`scripts/check-agent-record.py`](../scripts/check-agent-record.py)'s parser
-over this file prints `MODEL=382` (full line:
-`agent record OK: ENGINE=179 MODEL=382 QUANT=88 KERNEL=60 BACKEND=90
-ANCHOR-ROT=33`), so the architecture rows are 382 − 4 = 378 — which agrees with
+over this file prints `MODEL=383` (full line:
+`agent record OK: ENGINE=179 MODEL=383 QUANT=88 KERNEL=60 BACKEND=90
+ANCHOR-ROT=0`), so the architecture rows are 383 − 4 = 379 — which agrees with
 §"Architecture-support checklist" and is how to check that it has not drifted.
 Expect the pair to move the next time a row is added; re-run the parser rather
 than trusting either copy.

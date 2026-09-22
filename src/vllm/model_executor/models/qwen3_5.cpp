@@ -9757,6 +9757,7 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
                                const std::vector<float>* mrope_cos_sin = nullptr,
                                const std::vector<int32_t>* aux_layer_ids = nullptr,
                                const Tensor* aux_out = nullptr,
+                               bool return_hidden = false,
                                StepDevInputs* persistent_sdi = nullptr) {
   const int64_t T = hidden_in.shape[0];
   const int64_t H = config.hidden_size;
@@ -9912,6 +9913,26 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
                  vt::SizeOf(DType::kBF16));
   }
 
+  // MODEL-KEV Phase 3: the pooling tail — stop after the final GemmaRMSNorm
+  // (+ optional gather) and return the [n_out, H] post-final-norm hidden rows
+  // upcast to f32, with NO lm_head. Mirrors Qwen3's return_hidden branch
+  // (qwen3.cpp:347-351). Never taken by any text caller (defaults false).
+  if (return_hidden) {
+    const bool do_gather = !logits_indices.empty() &&
+                           static_cast<int64_t>(logits_indices.size()) < T;
+    Tensor src = dnorm.t();
+    if (do_gather) {
+      const int64_t n_out = static_cast<int64_t>(logits_indices.size());
+      DBuf dgather(d, DType::kBF16, {n_out, H});
+      GatherRows(d, dgather.ptr(), dnorm.t(), logits_indices, H);
+      src = dgather.t();
+    }
+    const int64_t n_out = src.shape[0];
+    DBuf dhid(d, DType::kF32, {n_out, H});
+    vt::CastF32(d.q, dhid.t(), src);
+    return dhid;
+  }
+
   // Logits gather-before-lm_head (prefill/mixed): same semantics as the 35B path.
   // Both arms route through DenseLogitsF32D (PERF-27B-LMHEAD-FP4). Pure-decode /
   // graph replay pass empty indices (identity) → the full [T,vocab] path.
@@ -9963,7 +9984,8 @@ static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
                              const std::vector<int32_t>& logits_indices,
                              const Tensor* hidden_tap = nullptr,
                              const std::vector<int32_t>* aux_layer_ids = nullptr,
-                             const Tensor* aux_out = nullptr) {
+                             const Tensor* aux_out = nullptr,
+                             bool return_hidden = false) {
   CheckDensePagedForward(token_ids, positions, attn_meta, gdn_meta, attn_kv,
                          gdn_state, weights, config);
   const int64_t T = static_cast<int64_t>(token_ids.size());
@@ -9978,7 +10000,8 @@ static DBuf DenseForwardBody(Dev d, const std::vector<int32_t>& token_ids,
   DenseEmbedInto(d, hidden, token_ids, weights, config);
   return DenseForwardLayers(d, hidden.t(), positions, attn_meta, gdn_meta, attn_kv,
                             gdn_state, weights, config, logits_indices, hidden_tap,
-                            /*mrope_cos_sin=*/nullptr, aux_layer_ids, aux_out);
+                            /*mrope_cos_sin=*/nullptr, aux_layer_ids, aux_out,
+                            /*return_hidden=*/return_hidden);
 }
 
 std::vector<float> Qwen3_5DenseModel::Forward(
@@ -9996,6 +10019,34 @@ std::vector<float> Qwen3_5DenseModel::Forward(
   std::vector<float> logits(static_cast<size_t>(n_out) * config.vocab_size);
   dlogits.Download(d, logits.data());
   return logits;
+}
+
+ForwardLogits Qwen3_5DenseModel::ForwardHidden(
+    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
+    const CommonAttentionMetadata& attn_meta, const GDNAttentionMetadata& gdn_meta,
+    const std::vector<PagedKvCache>& attn_kv,
+    const std::vector<GdnStateCache>& gdn_state,
+    const Qwen3_5DenseWeights& weights, const HfConfig& config,
+    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
+  // MODEL-KEV Phase 3: the pooling forward — the same embed + layer stack as
+  // Forward, stopping after the final GemmaRMSNorm (+ gather) with NO lm_head,
+  // mirroring Qwen3DenseModel::ForwardHidden (qwen3.cpp:570-592). The
+  // [n_out, H] f32 rows are downloaded to the host carrier for the kev
+  // PointerHead readout, whose ops are host-side.
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  DBuf dhidden = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta,
+                                  attn_kv, gdn_state, weights, config,
+                                  logits_indices, /*hidden_tap=*/nullptr,
+                                  /*aux_layer_ids=*/nullptr, /*aux_out=*/nullptr,
+                                  /*return_hidden=*/true);
+  const int64_t n_out = dhidden.t().shape[0];
+  const int64_t H = config.hidden_size;
+  ForwardLogits fl;
+  fl.rows = n_out;
+  fl.vocab = H;
+  fl.host.resize(static_cast<size_t>(n_out) * static_cast<size_t>(H));
+  dhidden.Download(d, fl.host.data());
+  return fl;
 }
 
 // ── M3-b: the Qwen3.6-27B GDN-hybrid VL image->text greedy driver. ──────────

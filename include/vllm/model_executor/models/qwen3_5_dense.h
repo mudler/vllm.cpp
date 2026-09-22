@@ -389,6 +389,22 @@ class Qwen3_5DenseModel {
                                     const HfConfig& config, vt::Queue& queue,
                                     const std::vector<int32_t>& logits_indices = {});
 
+  // MODEL-KEV Phase 3: the pooling forward — the same embed + layer stack as
+  // Forward, stopping after the final GemmaRMSNorm (+ optional gather) with NO
+  // lm_head, mirroring Qwen3DenseModel::ForwardHidden (qwen3.cpp:570-592).
+  // The [n_out, H] f32 rows are downloaded to the host carrier for the kev
+  // PointerHead readout, whose ops are host-side.
+  static ForwardLogits ForwardHidden(
+      const std::vector<int32_t>& token_ids,
+      const std::vector<int32_t>& positions,
+      const v1::CommonAttentionMetadata& attn_meta,
+      const v1::GDNAttentionMetadata& gdn_meta,
+      const std::vector<PagedKvCache>& attn_kv,
+      const std::vector<GdnStateCache>& gdn_state,
+      const Qwen3_5DenseWeights& weights,
+      const HfConfig& config, vt::Queue& queue,
+      const std::vector<int32_t>& logits_indices = {});
+
   // DEVICE-resident variant of Forward (sampler-on-device hot path): same contract
   // as Forward but returns the lm_head output as a pool-backed DEVICE buffer
   // (ForwardLogits::device_*) with NO full-logits D2H. See

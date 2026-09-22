@@ -62,5 +62,38 @@ std::vector<float> PointerHeadForward(
 // Numerically stable softmax.
 std::vector<float> Softmax(const std::vector<float>& logits);
 
+// ── LoRA merge ───────────────────────────────────────────────────────
+//
+// Ported from the PEFT/LoRA merge formula used by jaredpalmer/kev:
+// the adapter is applied once at load time, not served at runtime.
+//   W' = W + scaling * (lora_B @ lora_A)
+// where lora_A is [rank, in], lora_B is [out, rank], W is [out, in].
+// All operands are row-major (PyTorch nn.Linear weight convention).
+//
+// THE THINGS THIS MERGE GETS WRONG QUIETLY are: (1) swapping the A/B
+// order -- A@B has the wrong shape and would crash for non-square
+// matrices, but for square matrices it silently produces wrong values;
+// (2) omitting the scaling factor -- the delta is off by a constant but
+// the model still runs; (3) using the wrong rank -- truncating the
+// rank-r sum drops terms and produces a partial delta.  Each is gated
+// by a perturbation test in test_kev.cpp.
+
+// Merge a rank-r LoRA delta into a base weight (all f32).
+//
+// base:    [out * in] base weights (f32, row-major [out, in])
+// lora_a:  [rank * in] (f32, row-major [rank, in])
+// lora_b:  [out * rank] (f32, row-major [out, rank])
+// Returns: [out * in] merged weights (f32)
+std::vector<float> MergeLoraDelta(
+    const std::vector<float>& base,
+    const std::vector<float>& lora_a,
+    const std::vector<float>& lora_b,
+    int64_t out, int64_t in, int64_t rank, float scaling);
+
+// bf16 conversion helpers (matching vt::BF16ToF32 / vt::F32ToBF16).
+// bf16 is the top 16 bits of f32; F32ToBf16 uses round-to-nearest-even.
+float Bf16ToF32(uint16_t b);
+uint16_t F32ToBf16(float f);
+
 }  // namespace kev
 }  // namespace vllm

@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "kev_head_goldens.inc"
+#include "kev_lora_goldens.inc"
 #include "vllm/model_executor/models/kev.h"
 
 namespace {
@@ -234,4 +235,117 @@ TEST_CASE("kev.PointerHead.perturbation.wrong_scale_detected") {
       wrong, weights, h_decide, h_opts, 5);
 
   CHECK_FALSE(ApproxEqual(correct, mutated, 1e-4F));
+}
+
+// ── LoRA merge: golden parity + perturbation gates ────────────────────
+
+TEST_CASE("kev.LoraMerge.goldens.case1") {
+  const int64_t out = kev_lora_goldens::kOut1;
+  const int64_t in = kev_lora_goldens::kIn1;
+  const int64_t rank = kev_lora_goldens::kRank1;
+  const float scaling = kev_lora_goldens::kScaling1;
+
+  auto base = Rand("lora_base_1", out * in, 0.3);
+  auto lora_a = Rand("lora_a_1", rank * in, 0.3);
+  auto lora_b = Rand("lora_b_1", out * rank, 0.3);
+
+  auto merged = vllm::kev::MergeLoraDelta(
+      base, lora_a, lora_b, out, in, rank, scaling);
+
+  std::vector<float> expected(
+      kev_lora_goldens::kMerged1,
+      kev_lora_goldens::kMerged1 + out * in);
+  CHECK(ApproxEqual(merged, expected, 1e-5F));
+}
+
+TEST_CASE("kev.LoraMerge.goldens.case2") {
+  const int64_t out = kev_lora_goldens::kOut2;
+  const int64_t in = kev_lora_goldens::kIn2;
+  const int64_t rank = kev_lora_goldens::kRank2;
+  const float scaling = kev_lora_goldens::kScaling2;
+
+  auto base = Rand("lora_base_2", out * in, 0.3);
+  auto lora_a = Rand("lora_a_2", rank * in, 0.3);
+  auto lora_b = Rand("lora_b_2", out * rank, 0.3);
+
+  auto merged = vllm::kev::MergeLoraDelta(
+      base, lora_a, lora_b, out, in, rank, scaling);
+
+  std::vector<float> expected(
+      kev_lora_goldens::kMerged2,
+      kev_lora_goldens::kMerged2 + out * in);
+  CHECK(ApproxEqual(merged, expected, 1e-5F));
+}
+
+TEST_CASE("kev.LoraMerge.perturbation.wrong_scaling_detected") {
+  const int64_t out = kev_lora_goldens::kOut1;
+  const int64_t in = kev_lora_goldens::kIn1;
+  const int64_t rank = kev_lora_goldens::kRank1;
+  const float scaling = kev_lora_goldens::kScaling1;
+
+  auto base = Rand("lora_base_1", out * in, 0.3);
+  auto lora_a = Rand("lora_a_1", rank * in, 0.3);
+  auto lora_b = Rand("lora_b_1", out * rank, 0.3);
+
+  auto correct = vllm::kev::MergeLoraDelta(
+      base, lora_a, lora_b, out, in, rank, scaling);
+  auto wrong = vllm::kev::MergeLoraDelta(
+      base, lora_a, lora_b, out, in, rank, scaling * 2.0f);
+
+  CHECK_FALSE(ApproxEqual(correct, wrong, 1e-5F));
+}
+
+TEST_CASE("kev.LoraMerge.perturbation.truncated_rank_detected") {
+  const int64_t out = kev_lora_goldens::kOut2;
+  const int64_t in = kev_lora_goldens::kIn2;
+  const int64_t rank = kev_lora_goldens::kRank2;
+  const float scaling = kev_lora_goldens::kScaling2;
+
+  auto base = Rand("lora_base_2", out * in, 0.3);
+  auto lora_a = Rand("lora_a_2", rank * in, 0.3);
+  auto lora_b = Rand("lora_b_2", out * rank, 0.3);
+
+  auto correct = vllm::kev::MergeLoraDelta(
+      base, lora_a, lora_b, out, in, rank, scaling);
+  auto truncated = vllm::kev::MergeLoraDelta(
+      base, lora_a, lora_b, out, in, rank - 1, scaling);
+
+  CHECK_FALSE(ApproxEqual(correct, truncated, 1e-5F));
+}
+
+TEST_CASE("kev.LoraMerge.perturbation.zero_delta_equals_base") {
+  const int64_t out = kev_lora_goldens::kOut1;
+  const int64_t in = kev_lora_goldens::kIn1;
+  const int64_t rank = kev_lora_goldens::kRank1;
+  const float scaling = kev_lora_goldens::kScaling1;
+
+  auto base = Rand("lora_base_1", out * in, 0.3);
+  std::vector<float> zero_a(static_cast<size_t>(rank * in), 0.0F);
+  auto lora_b = Rand("lora_b_1", out * rank, 0.3);
+
+  auto merged = vllm::kev::MergeLoraDelta(
+      base, zero_a, lora_b, out, in, rank, scaling);
+
+  CHECK(ApproxEqual(merged, base, 0.0F));
+}
+
+// ── bf16 conversion ───────────────────────────────────────────────────
+
+TEST_CASE("kev.Bf16.roundtrip_representable_values") {
+  const float values[] = {0.0f, 1.0f,  -1.0f, 2.0f,  -2.0f,
+                          0.5f, -0.5f, 3.0f,  -3.0f, 256.0f};
+  for (float v : values) {
+    uint16_t bf16 = vllm::kev::F32ToBf16(v);
+    float back = vllm::kev::Bf16ToF32(bf16);
+    CHECK(back == v);
+  }
+}
+
+TEST_CASE("kev.Bf16.roundtrip_within_precision") {
+  auto vals = Rand("bf16_test", 64, 10.0);
+  for (float v : vals) {
+    uint16_t bf16 = vllm::kev::F32ToBf16(v);
+    float back = vllm::kev::Bf16ToF32(bf16);
+    CHECK(std::abs(back - v) <= std::abs(v) * 0.01f + 1e-3f);
+  }
 }

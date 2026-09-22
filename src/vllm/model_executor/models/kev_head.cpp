@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace vllm {
 namespace kev {
@@ -80,6 +81,48 @@ std::vector<float> Softmax(const std::vector<float>& logits) {
     out[i] *= inv;
   }
   return out;
+}
+
+// ── LoRA merge ───────────────────────────────────────────────────────
+
+std::vector<float> MergeLoraDelta(
+    const std::vector<float>& base,
+    const std::vector<float>& lora_a,
+    const std::vector<float>& lora_b,
+    int64_t out, int64_t in, int64_t rank, float scaling) {
+  std::vector<float> merged(static_cast<size_t>(out * in), 0.0F);
+  for (int64_t j = 0; j < out; ++j) {
+    for (int64_t i = 0; i < in; ++i) {
+      // delta = scaling * sum_k(lora_b[j, k] * lora_a[k, i])
+      double delta = 0.0;
+      for (int64_t k = 0; k < rank; ++k) {
+        delta +=
+            static_cast<double>(lora_b[static_cast<size_t>(j * rank + k)]) *
+            static_cast<double>(lora_a[static_cast<size_t>(k * in + i)]);
+      }
+      merged[static_cast<size_t>(j * in + i)] =
+          base[static_cast<size_t>(j * in + i)] +
+          static_cast<float>(static_cast<double>(scaling) * delta);
+    }
+  }
+  return merged;
+}
+
+float Bf16ToF32(uint16_t b) {
+  uint32_t bits = static_cast<uint32_t>(b) << 16;
+  float f;
+  std::memcpy(&f, &bits, sizeof(f));
+  return f;
+}
+
+uint16_t F32ToBf16(float f) {
+  uint32_t bits;
+  std::memcpy(&bits, &f, sizeof(bits));
+  // Round to nearest even: add bias + LSB bit.
+  uint32_t lsb = (bits >> 16) & 1u;
+  uint32_t rounding_bias = 0x7FFFu + lsb;
+  bits += rounding_bias;
+  return static_cast<uint16_t>(bits >> 16);
 }
 
 }  // namespace kev

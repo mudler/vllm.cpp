@@ -75,3 +75,34 @@ the row's performance denominator opportunity: our ~1800×→~385× gap figures
 were computed against tt-metal's native qwen35 rate, and running OUR engine
 and THAT stack side by side on the same card is the comparison the
 benchmarking protocol has wanted all along.
+
+## Deadlock characterized (2026-09-22, faulthandler stack capture)
+
+Third attempt, with a faulthandler SIGUSR1 hook injected via
+`PYTHONPATH=/tmp/fhhook sitecustomize.py` so the SPAWNED EngineCore child
+registers it too. Stack dump at 27 minutes of silence:
+
+- The main thread is blocked inside `ttnn.as_tensor` called from
+  `models/demos/blackhole/qwen36/tt/gdn/weights.py:116 load_gdn_weights`
+  (the fused `qkv_proj.weight` [4096,8192] bf16 -> bfloat8_b TILE
+  conversion, `cache_file_name` set), during `initialize_vllm_model`.
+- EVERY thread of the EngineCore process is in `futex_do_wait` — a
+  tt-metal dispatch deadlock, not a slow compile. (Earlier "100% CPU"
+  readings were the lifetime average; instantaneous state is all-sleep.)
+- The deadlock point is NONDETERMINISTIC: attempt 1 got through weight
+  load and decode-trace compile and blocked in the 2048-token prefill
+  warmup; attempts 2 and 3 blocked earlier, during GDN weight load.
+- The tt-metal sysmem warning ("using regular pages; pre-allocate
+  hugepages") is present in every run.
+- CONTROL RESULT (evidence in the prior section): tt-metal's own
+  validated `traced_128` demo grinds identically (DEMO_EXIT=124 at 90
+  min), so the deadlock is in the tt-metal python stack on this
+  host/build — v0.79.0-dev20260911-82-g81f3bbf3b40, aarch64 — and NOT in
+  the plugin's serve path. Our own C++-dispatched engine runs the same
+  card without it.
+
+Practical consequence: #3261 stays blocked until either the tt-metal
+build is refreshed past the deadlock, hugepages are provisioned (needs
+root; the warning names it), or upstream (tenstorrent/vllm-tt-plugin or
+tt-metal) confirms a known fix. The stack capture above is the repro for
+that report.

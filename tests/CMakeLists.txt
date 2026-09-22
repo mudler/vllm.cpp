@@ -772,6 +772,8 @@ vllm_cpp_add_test(test_llama_embedding_fold
   vllm/models/test_llama_embedding_fold.cpp)
 target_compile_definitions(test_llama_embedding_fold PRIVATE
   LLAMA_EMBED_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/vllm/models/fixtures/llama_embed_e2e")
+vllm_cpp_add_test(test_kev vllm/models/test_kev.cpp)
+target_include_directories(test_kev PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models)
 vllm_cpp_add_test(test_mistral_forward vllm/models/test_mistral_forward.cpp)
 target_include_directories(test_mistral_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_gemma3_load vllm/models/test_gemma3_load.cpp)

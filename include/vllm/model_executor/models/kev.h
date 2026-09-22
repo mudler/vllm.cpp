@@ -1,0 +1,66 @@
+// kev PointerHead -- option scorer (MODEL-KEV).
+//
+// Ported from jaredpalmer/kev kev/model.py @ 19dcae9b6e3e1a48200c5825aad9fc200d31e20a:
+//   PointerHead  model.py:class PointerHead
+//
+// This is the HOST REFERENCE forward: a portable f32 implementation gated
+// against the PyTorch model before any device path exists. It is not wired
+// to the runner, the ABI or the server; that is Phase 3-5 of
+// .agents/specs/kev.md.
+//
+// THE THINGS THIS ARCHITECTURE GETS WRONG QUIETLY are: (1) swapping the
+// q/k projection order -- the dot product still produces a result but it is
+// numerically wrong; (2) omitting the bias terms -- the model still runs
+// on typical inputs; (3) using the wrong scale factor -- the logits are
+// off by a constant factor but softmax still produces a distribution. Each
+// is gated by a perturbation test.
+#pragma once
+
+#include <cmath>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace vllm {
+namespace kev {
+
+// PointerHead configuration.
+struct HeadParams {
+  int64_t hidden_size = 1024;  // d: backbone hidden dimension
+  int64_t head_dim = 256;      // dp: pointer dimension
+
+  double scale() const {
+    return 1.0 / std::sqrt(static_cast<double>(head_dim));
+  }
+};
+
+// PointerHead weights: two Linear layers (q and k), each [dp, d] + [dp].
+// Weight layout is row-major (PyTorch nn.Linear convention):
+//   weight[j * d + i]  -- maps input i to output j
+struct HeadWeights {
+  std::vector<float> q_weight;  // [dp, d]
+  std::vector<float> q_bias;    // [dp]
+  std::vector<float> k_weight;  // [dp, d]
+  std::vector<float> k_bias;    // [dp]
+};
+
+// Host-only f32 PointerHead forward.
+//
+// Computes: logits[k] = (k(h_opts[k]) . q(h_decide)) * scale
+//
+// h_decide:  [d]  -- hidden state at the <decide> token
+// h_opts:    [K*d] -- flattened option hidden states, row-major
+// n_options: K
+//
+// Returns logits [K] (pre-softmax).
+std::vector<float> PointerHeadForward(
+    const HeadParams& params, const HeadWeights& weights,
+    const std::vector<float>& h_decide,
+    const std::vector<float>& h_opts,
+    int64_t n_options);
+
+// Numerically stable softmax.
+std::vector<float> Softmax(const std::vector<float>& logits);
+
+}  // namespace kev
+}  // namespace vllm

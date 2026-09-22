@@ -856,6 +856,11 @@ vllm_cpp_add_test(test_laguna_gguf_load vllm/models/test_laguna_gguf_load.cpp)
 target_include_directories(test_laguna_gguf_load PRIVATE ${CMAKE_SOURCE_DIR}/src
                            ${CMAKE_CURRENT_SOURCE_DIR}/vllm)
 
+# The qwen3 GGUF loader (`Qwen3HfConfigFromGguf`, `LoadQwen3FromGguf`). Synthetic
+# GGUF via gguf_builder.h; no model file needed. Needs tests/vllm for gguf_builder.h.
+vllm_cpp_add_test(test_qwen3_gguf_weights vllm/models/test_qwen3_gguf_weights.cpp)
+target_include_directories(test_qwen3_gguf_weights PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vllm)
+
 # DeepSeek-V4-Flash W3: the NEW attention primitives (DSA Lightning-Indexer
 # top-k selection + 512-wide MLA attention sinks + grouped output-LoRA) unit-
 # gated vs hand-derived cases + double-precision references. Full-model gate is

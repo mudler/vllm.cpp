@@ -778,6 +778,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/dense_exl3_linear.cpp
   src/vllm/model_executor/models/qwen3_5_mtp.cpp
   src/vllm/model_executor/models/qwen3_5_gguf_weights.cpp
+  src/vllm/model_executor/models/qwen3_gguf_weights.cpp
   src/vllm/model_executor/models/qwen3_5.cpp
   src/vllm/model_executor/models/qwen3_5_common.cpp
   src/vllm/model_executor/models/qwen3_5_dense.cpp

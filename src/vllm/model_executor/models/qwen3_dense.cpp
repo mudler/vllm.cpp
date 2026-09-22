@@ -23,6 +23,7 @@
 #include "vllm/model_executor/models/qwen3_5.h"         // ForwardLogits (shared carrier)
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
 #include "vllm/model_executor/models/qwen3_5_internal.h"  // detail::DeviceTokenIdsScope
+#include "vllm/model_executor/models/qwen3_gguf_weights.h"  // GGUF arm
 #include "vllm/v1/kv_cache_dtype.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/dtype.h"
@@ -62,11 +63,23 @@ class Qwen3DenseLoadedModel final : public LoadedModel {
 std::unique_ptr<LoadedModel> LoadQwen3ForCausalLM(
     const ModelRegistration& registration, const HfConfig& config,
     const ModelSource& source) {
+  // GGUF arm: general.architecture = "qwen3". Mirrors qwen3_5_dense.cpp's
+  // GGUF branch. The policy defaults to expand-bf16 on CPU; keep-quant block
+  // concatenation for merged weights is a follow-up (spec §Risks).
+  if (source.kind == ModelSource::Kind::kGguf) {
+    if (source.gguf == nullptr) {
+      throw std::runtime_error("GGUF model source is empty");
+    }
+    const GgufLoadPolicy gguf_policy =
+        GgufLoadPolicy::FromEnv(source.device, detail::ActDType(source.device));
+    return std::make_unique<Qwen3DenseLoadedModel>(
+        registration, LoadQwen3FromGguf(*source.gguf, config, &gguf_policy));
+  }
   // W2: safetensors name map + tied lm_head. Qwen3 dense is text-only BF16
-  // safetensors (no GGUF path yet).
+  // safetensors.
   if (source.kind != ModelSource::Kind::kSafetensors) {
     throw std::runtime_error(
-        "Model architecture Qwen3ForCausalLM does not support GGUF weights");
+        "Model architecture Qwen3ForCausalLM does not support this weight source");
   }
   if (source.safetensors == nullptr) {
     throw std::runtime_error("safetensors model source is empty");

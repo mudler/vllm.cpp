@@ -151,6 +151,14 @@ fetched `--depth 1` into an empty directory, asserted `git status --porcelain`
 empty at 0 bytes, and recorded both sha256 values. `GGML_NATIVE=ON`, so a
 recorded binary sha256 identifies a build on a named host and never a tree.
 
+**`llama-cli` at `b10451` requires `-st` for a clean exit.** After
+generating `-n` tokens, `llama-cli` enters conversation mode and writes `>`
+prompts to stdout in a tight loop. `< /dev/null` does not prevent this.
+`--no-conversation` and `--simple-io` do not prevent it either. Only
+`-st`/`--single-turn` causes a clean exit after generation. Without it, one run
+on `strix:gpu0` produced a 6.2 GB log file before the process was killed. Assert
+`-st` on every `llama-cli` invocation at this pin.
+
 ```oracle-pin
 id = llama-cpp
 role = secondary

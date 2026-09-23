@@ -460,6 +460,13 @@ Qwen3DenseWeights LoadQwen3FromGguf(const GgufFile& gguf,
                                      const GgufLoadPolicy* policy) {
   const GgufLoadPolicy env_policy = GgufLoadPolicy::FromEnv(vt::DeviceType::kCPU);
   const GgufLoadPolicy& pol = policy != nullptr ? *policy : env_policy;
+  // Merged matmul weights (q/k/v -> qkv_proj, gate/up -> gate_up_proj) must
+  // expand to bf16 for concatenation. NoKeepQuant narrows the policy so
+  // RequireExpand sees kExpandBf16 for Q4_K matmul weights, which would
+  // otherwise route to kKeepQuant on CPU. o_proj and down_proj still use the
+  // original pol (they may keep quant). Same pattern as laguna_weights.cpp:726
+  // and deepseek_v4_weights.cpp:1644.
+  const GgufLoadPolicy expand_pol = NoKeepQuant(pol);
   const GgufPageReleaseScope page_release(
       gguf, pol.mmap_residency && EnvReleaseExpandedPages());
   VT_CHECK(config.num_hidden_layers > 0,
@@ -474,7 +481,7 @@ Qwen3DenseWeights LoadQwen3FromGguf(const GgufFile& gguf,
   LoadEmbedAndHead(gguf, pol, &w.embed_tokens, &w.lm_head);
 
   // Final norm: OwnBf16 (NO w+1 shift — Qwen3 does not shift norms).
-  RequireExpand(pol, gguf, "output_norm.weight",
+  RequireExpand(expand_pol, gguf, "output_norm.weight",
                 GgufTensorRole::kTransformedWeight);
   w.final_norm = OwnBf16(gguf, "output_norm.weight", {config.hidden_size});
 
@@ -483,11 +490,11 @@ Qwen3DenseWeights LoadQwen3FromGguf(const GgufFile& gguf,
     Qwen3DenseLayerWeights layer;
 
     // Norms: OwnBf16 (NO w+1 shift).
-    RequireExpand(pol, gguf, Blk(il, "attn_norm.weight"),
+    RequireExpand(expand_pol, gguf, Blk(il, "attn_norm.weight"),
                   GgufTensorRole::kTransformedWeight);
     layer.input_layernorm =
         OwnBf16(gguf, Blk(il, "attn_norm.weight"), {config.hidden_size});
-    RequireExpand(pol, gguf, Blk(il, "ffn_norm.weight"),
+    RequireExpand(expand_pol, gguf, Blk(il, "ffn_norm.weight"),
                   GgufTensorRole::kTransformedWeight);
     layer.post_attention_layernorm =
         OwnBf16(gguf, Blk(il, "ffn_norm.weight"),
@@ -498,17 +505,17 @@ Qwen3DenseWeights LoadQwen3FromGguf(const GgufFile& gguf,
     // weights in the initial implementation — the spec defers that).
     // Each source is forced to expand via RequireExpand, then OwnBf16
     // produces bf16 [out, in] in the file's own [N, K] order (nk=true).
-    RequireExpand(pol, gguf, Blk(il, "attn_q.weight"),
+    RequireExpand(expand_pol, gguf, Blk(il, "attn_q.weight"),
                   GgufTensorRole::kMatmulWeight);
     OwnedTensor q = OwnBf16(gguf, Blk(il, "attn_q.weight"),
                              gguf.Get(Blk(il, "attn_q.weight")).shape);
     q.nk = true;
-    RequireExpand(pol, gguf, Blk(il, "attn_k.weight"),
+    RequireExpand(expand_pol, gguf, Blk(il, "attn_k.weight"),
                   GgufTensorRole::kMatmulWeight);
     OwnedTensor k = OwnBf16(gguf, Blk(il, "attn_k.weight"),
                              gguf.Get(Blk(il, "attn_k.weight")).shape);
     k.nk = true;
-    RequireExpand(pol, gguf, Blk(il, "attn_v.weight"),
+    RequireExpand(expand_pol, gguf, Blk(il, "attn_v.weight"),
                   GgufTensorRole::kMatmulWeight);
     OwnedTensor v = OwnBf16(gguf, Blk(il, "attn_v.weight"),
                              gguf.Get(Blk(il, "attn_v.weight")).shape);
@@ -522,25 +529,25 @@ Qwen3DenseWeights LoadQwen3FromGguf(const GgufFile& gguf,
     // Per-head q/k norms: loaded when present, left empty when absent.
     // Qwen3-4B has them; Qwen3-0.6B does not. OwnBf16 (NO w+1 shift).
     if (HasTensor(gguf, Blk(il, "attn_q_norm.weight"))) {
-      RequireExpand(pol, gguf, Blk(il, "attn_q_norm.weight"),
+      RequireExpand(expand_pol, gguf, Blk(il, "attn_q_norm.weight"),
                     GgufTensorRole::kTransformedWeight);
       layer.attn.q_norm =
           OwnBf16(gguf, Blk(il, "attn_q_norm.weight"), {config.head_dim});
     }
     if (HasTensor(gguf, Blk(il, "attn_k_norm.weight"))) {
-      RequireExpand(pol, gguf, Blk(il, "attn_k_norm.weight"),
+      RequireExpand(expand_pol, gguf, Blk(il, "attn_k_norm.weight"),
                     GgufTensorRole::kTransformedWeight);
       layer.attn.k_norm =
           OwnBf16(gguf, Blk(il, "attn_k_norm.weight"), {config.head_dim});
     }
 
     // MLP: load gate/up separately, then merge into one gate_up_proj.
-    RequireExpand(pol, gguf, Blk(il, "ffn_gate.weight"),
+    RequireExpand(expand_pol, gguf, Blk(il, "ffn_gate.weight"),
                   GgufTensorRole::kMatmulWeight);
     OwnedTensor gate = OwnBf16(gguf, Blk(il, "ffn_gate.weight"),
                                 gguf.Get(Blk(il, "ffn_gate.weight")).shape);
     gate.nk = true;
-    RequireExpand(pol, gguf, Blk(il, "ffn_up.weight"),
+    RequireExpand(expand_pol, gguf, Blk(il, "ffn_up.weight"),
                   GgufTensorRole::kMatmulWeight);
     OwnedTensor up = OwnBf16(gguf, Blk(il, "ffn_up.weight"),
                               gguf.Get(Blk(il, "ffn_up.weight")).shape);

@@ -16,7 +16,11 @@
 #include <hipblaslt/hipblaslt.h>
 #endif
 
-#ifndef HIPBLAS_COMPUTE_32F
+// ROCm >=6 defines hipblasComputeType_t natively and uses hipDataType for
+// hipblasGemmEx. ROCm <6 uses hipblasDatatype_t and lacks the COMPUTE enums.
+// HIPBLAS_COMPUTE_32F is an enum value (not a macro) on ROCm >=6, so a
+// #ifndef check is unreliable — use the HIP version instead.
+#if HIP_VERSION_MAJOR < 6
 typedef hipblasDatatype_t hipblasComputeType_t;
 // ROCm <6 renames HIPBLAS_R_16BF to HIPBLAS_R_16B; alias for portability.
 #ifndef HIPBLAS_R_16BF

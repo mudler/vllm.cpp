@@ -163,6 +163,28 @@ TEST_CASE("Qwen3HfConfigFromGguf: tied (no output.weight)") {
   CHECK(c.raw.value("tie_word_embeddings", false) == true);
 }
 
+TEST_CASE("Qwen3HfConfigFromGguf: defaults rotary_dim to head_dim when absent") {
+  Dims d;
+  GgufModelBuilder b;
+  const std::string p = "qwen3.";
+  b.AddKv(StrKv("general.architecture", "qwen3"));
+  b.AddKv(U32Kv(p + "embedding_length", d.H));
+  b.AddKv(U32Kv(p + "block_count", d.n_layer));
+  b.AddKv(U32Kv(p + "attention.head_count", d.n_heads));
+  b.AddKv(U32Kv(p + "attention.head_count_kv", d.n_kv_heads));
+  b.AddKv(U32Kv(p + "attention.key_length", d.head_dim));
+  b.AddKv(U32Kv(p + "feed_forward_length", d.inter));
+  b.AddKv(U32Kv(p + "vocab_size", d.vocab));
+  b.AddKv(U32Kv(p + "context_length", d.context_len));
+  b.AddKv(F32Kv(p + "rope.freq_base", d.rope_theta));
+  b.AddKv(F32Kv(p + "attention.layer_norm_rms_epsilon", d.rms_eps));
+  // Deliberately omit rope.dimension_count — matches published Qwen3-4B GGUFs.
+  TempFile f(b.Build());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig c = vllm::Qwen3HfConfigFromGguf(g);
+  CHECK(c.rotary_dim == d.head_dim);
+}
+
 TEST_CASE("Qwen3HfConfigFromGguf: rejects wrong architecture") {
   GgufModelBuilder b;
   b.AddKv(StrKv("general.architecture", "llama"));

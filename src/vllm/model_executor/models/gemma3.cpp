@@ -576,7 +576,7 @@ ForwardLogits Gemma3DecodeGraph::Step(const ModelForwardInput& in) {
   }
   if (new_inputs) {
     s.Reset();
-    s.columns = std::max<int64_t>(in.attn_meta.block_table_num_cols, in.attn_kv.front().num_blocks);
+    s.columns = static_cast<int>(std::max<int64_t>(in.attn_meta.block_table_num_cols, in.attn_kv.front().num_blocks));
     s.cache = in.attn_kv;
     s.metadata = in.attn_meta;
     s.metadata.block_table_num_cols = s.columns;

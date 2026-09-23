@@ -1012,7 +1012,9 @@ HfConfig HfConfigFromGguf(const GgufFile& gguf) {
   // RoPE / norm / context.
   const GgufValue* freq = gguf.FindKv(p + "rope.freq_base");
   c.rope_theta = freq ? KvFloat(*freq, p + "rope.freq_base") : 10000.0;
-  c.rotary_dim = OptInt(gguf, p + "rope.dimension_count", 0);
+  // llama.cpp omits rope.dimension_count when it equals head_dim (full rotary).
+  // Qwen3.5 has no partial_rotary_factor, so default to head_dim.
+  c.rotary_dim = OptInt(gguf, p + "rope.dimension_count", c.head_dim);
   c.rms_norm_eps = ReqFloat(gguf, p + "attention.layer_norm_rms_epsilon");
   c.max_position_embeddings = OptInt(gguf, p + "context_length", 0);
   c.torch_dtype = "bfloat16";

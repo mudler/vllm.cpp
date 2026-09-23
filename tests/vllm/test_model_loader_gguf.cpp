@@ -233,7 +233,7 @@ TEST_CASE("FromModelDir rejects an unknown dense architecture before loading") {
       "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', 'Glm5NextForConditionalGeneration', "
       "'GlmMoeDsaForCausalLM', "
       "'GraniteForCausalLM', "
-      "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', "
+      "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', 'KevModel', "
       "'KimiK3ForConditionalGeneration', 'KimiLinearForCausalLM', "
       "'LagunaForCausalLM', 'LayaModel', "
       "'LlamaForCausalLM', 'LlamaModel', "

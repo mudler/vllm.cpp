@@ -80,7 +80,11 @@ TEST_CASE("registry_imports: every registered architecture has a complete factor
   // scorer ported from the `trycua/cua` reference. Also a POOLING model.
   // 47 -> 48 on MODEL-LAYA: `LayaModel`, a ModernBERT-large backbone with a
   // SystemOne decision head. Also a POOLING model (is_pooling_model=true).
-  REQUIRE(registrations.size() == 48);
+  // 48 -> 49 on MODEL-KEV: `KevModel`, its own additive TU. A POOLING model
+  // (is_pooling_model=true) built on a Qwen3.5 dense backbone + PointerHead
+  // readout, ported from jaredpalmer/kev. No vLLM registration; ported from
+  // scratch against the kev reference implementation.
+  REQUIRE(registrations.size() == 49);
 
   for (const ModelRegistration& registration : registrations) {
     CAPTURE(registration.architecture);
@@ -185,7 +189,7 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
   // with the kExampleConfigArchitectures ledger; adding a model appends its two
   // entries here.
   const std::vector<std::string_view> supported = ModelRegistry::SupportedArchs();
-  REQUIRE(supported.size() == 48);
+  REQUIRE(supported.size() == 49);
   CHECK(std::is_sorted(supported.begin(), supported.end()));
   // The full byte-order sequence. Note "MiniCPM3" < "MiniCPMF" and "Phi3" <
   // "PhiF" ('3' 0x33 < 'F' 0x46); "OPT" < "Olmo" ('P' 0x50 < 'l' 0x6C); and among
@@ -219,6 +223,7 @@ TEST_CASE("self_registration: every arch self-registers from its own TU") {
       "GraniteForCausalLM",
       "InternLM2ForCausalLM",
       "InternLM3ForCausalLM",
+      "KevModel",
       "KimiK3ForConditionalGeneration",
       "KimiLinearForCausalLM",
       "LagunaForCausalLM",
@@ -326,6 +331,19 @@ TEST_CASE("registry_model_property: Qwen registrations match pinned _ModelInfo")
       CHECK_FALSE(registration.info.supports_transcription);
       CHECK_FALSE(registration.info.supports_transcription_only);
       CHECK_FALSE(registration.info.is_hybrid);
+      CHECK_FALSE(registration.info.supports_multimodal);
+      continue;
+    }
+    if (registration.architecture == "KevModel") {
+      // MODEL-KEV: a POOLING model (Qwen3.5 dense backbone + PointerHead
+      // readout) with NO text-generation path — the same task-routing shape as
+      // LlamaModel above. Served by /v1/systemone; the text entrypoints refuse
+      // by task. No vLLM precedent (ported from scratch against jaredpalmer/kev).
+      CHECK(registration.info.is_pooling_model);
+      CHECK_FALSE(registration.info.is_text_generation_model);
+      CHECK_FALSE(registration.info.supports_transcription);
+      CHECK_FALSE(registration.info.supports_transcription_only);
+      CHECK(registration.info.is_hybrid);
       CHECK_FALSE(registration.info.supports_multimodal);
       continue;
     }
@@ -725,7 +743,7 @@ TEST_CASE("Qwen3.5 SSM cache dtype accepts upstream torch aliases exactly") {
 TEST_CASE("hf_registry_coverage: every registration has an example config fixture") {
   // C++ fixture registry for the currently implemented subset. Keep this list
   // alias-for-alias with the central ordered table, mirroring HF_EXAMPLE_MODELS.
-  constexpr std::array<std::string_view, 48> kExampleConfigArchitectures{
+  constexpr std::array<std::string_view, 49> kExampleConfigArchitectures{
       "BoundaryExtractor",
       "CohereForCausalLM",
       "CuaS1Forms",
@@ -748,6 +766,7 @@ TEST_CASE("hf_registry_coverage: every registration has an example config fixtur
       "GraniteForCausalLM",
       "InternLM2ForCausalLM",
       "InternLM3ForCausalLM",
+      "KevModel",
       "KimiK3ForConditionalGeneration",
       "KimiLinearForCausalLM",
       "LagunaForCausalLM",
@@ -853,7 +872,7 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "'Gemma4ForConditionalGeneration', 'Gemma4UnifiedForConditionalGeneration', 'GemmaForCausalLM', "
       "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', "
       "'Glm5NextForConditionalGeneration', 'GlmMoeDsaForCausalLM', 'GraniteForCausalLM', "
-      "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', "
+      "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', 'KevModel', "
       "'KimiK3ForConditionalGeneration', 'KimiLinearForCausalLM', "
       "'LagunaForCausalLM', 'LayaModel', "
       "'LlamaForCausalLM', 'LlamaModel', "
@@ -879,7 +898,7 @@ TEST_CASE("raise_for_unsupported: subset default message and order match oracle"
       "'Gemma4ForConditionalGeneration', 'Gemma4UnifiedForConditionalGeneration', 'GemmaForCausalLM', "
       "'Glm4ForCausalLM', 'Glm4MoeLiteForCausalLM', "
       "'Glm5NextForConditionalGeneration', 'GlmMoeDsaForCausalLM', 'GraniteForCausalLM', "
-      "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', "
+      "'InternLM2ForCausalLM', 'InternLM3ForCausalLM', 'KevModel', "
       "'KimiK3ForConditionalGeneration', 'KimiLinearForCausalLM', "
       "'LagunaForCausalLM', 'LayaModel', "
       "'LlamaForCausalLM', 'LlamaModel', "

@@ -154,6 +154,28 @@ TEST_CASE("gguf mtp: a head-less GGUF publishes no depth and keeps every block")
   CHECK(static_cast<int64_t>(c.layer_types.size()) == 24);
 }
 
+// llama.cpp's converter omits `rope.dimension_count` when it equals `head_dim`
+// (full rotary). Qwen3.5 has no `partial_rotary_factor`, so the loader must
+// default `rotary_dim` to `head_dim`; a default of 0 crashes RoPE. Mirrors the
+// qwen3 fix (qwen3_gguf_weights.cpp).
+TEST_CASE("gguf mtp: rotary_dim defaults to head_dim when rope.dimension_count is absent") {
+  gguf_test::GgufModelBuilder b;
+  b.AddKv(gguf_test::StrKv("general.architecture", "qwen35"));
+  b.AddKv(gguf_test::U32Kv("qwen35.embedding_length", 64));
+  b.AddKv(gguf_test::U32Kv("qwen35.block_count", 2));
+  b.AddKv(gguf_test::U32Kv("qwen35.attention.head_count", 4));
+  b.AddKv(gguf_test::U32Kv("qwen35.attention.head_count_kv", 2));
+  b.AddKv(gguf_test::U32Kv("qwen35.attention.key_length", 16));
+  b.AddKv(gguf_test::U32Kv("qwen35.vocab_size", 128));
+  b.AddKv(gguf_test::F32Kv("qwen35.attention.layer_norm_rms_epsilon", 1e-6F));
+  // Deliberately omit rope.dimension_count — llama.cpp omits it on full rotary.
+  gguf_test::TempFile f(b.Build());
+  const vllm::GgufFile g = vllm::GgufFile::Open(f.path());
+  const vllm::HfConfig c = vllm::HfConfigFromGguf(g);
+  CHECK(c.head_dim == 16);
+  CHECK(c.rotary_dim == c.head_dim);
+}
+
 TEST_CASE("gguf mtp: the head depth reaches config.raw") {
   const char* path = MtpGgufPath();
   if (path == nullptr) {

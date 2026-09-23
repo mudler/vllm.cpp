@@ -1868,8 +1868,11 @@ if(VLLM_CPP_HIP)
   endif()
   # clang-17 / ROCm 5.7: __clang_hip_runtime_wrapper.h defines bfloat16 conversion
   # functions as non-inline in every TU, causing multiple-definition link errors.
-  # The flag is harmless when there are no duplicate definitions.
-  target_link_options(vllm PRIVATE "LINKER:--allow-multiple-definition")
+  # PUBLIC (not PRIVATE) so the flag propagates to vllm_shared and every other
+  # target that links the vllm archive — vllm itself is STATIC, so a PRIVATE
+  # link option has no effect on it. The flag is harmless when there are no
+  # duplicate definitions.
+  target_link_options(vllm PUBLIC "LINKER:--allow-multiple-definition")
 else()
   # BIT-ROT GUARD (BACKEND-ROCM W0). The ROCm platform leg is deliberately plain
   # C++ with no HIP header, which means it CAN be compiled on a machine with no

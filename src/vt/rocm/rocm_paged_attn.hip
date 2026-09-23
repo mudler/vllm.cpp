@@ -1234,7 +1234,6 @@ __global__ void PagedAttnDecodeSplitKvStage1(
     float s_reg[BLOCK_N];
     float tile_max = -INFINITY;
     
-    #pragma unroll
     for (int idx = 0; idx < BLOCK_N; idx += 4) {
       const int64_t jj = j + idx;
       if (jj >= eff_end) break;

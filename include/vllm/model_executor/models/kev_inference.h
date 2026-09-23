@@ -13,15 +13,17 @@
 // scores from a ModernBERT encoder + Laya head, kev returns PointerHead
 // logits from a Qwen3.5 dense backbone. Both back the same /v1/systemone API
 // through the DecisionFn callback.
+//
+// The device queue is NOT a parameter: it is stored on the KevLoadedModel
+// during PrepareKev (the ModelFactory prepare callback), so KevInference
+// retrieves it from the model. This avoids exposing the queue through any
+// shared header (runner.h or model_loader.h) and keeps the change inside
+// kev-owned files.
 #pragma once
 
 #include <cstdint>
 #include <string>
 #include <vector>
-
-namespace vt {
-struct Queue;
-}
 
 namespace vllm {
 
@@ -41,7 +43,6 @@ struct KevDecisionResult {
 //
 //   model:         a Kev-loaded model (checked via ModelAs)
 //   tokenizer:     a loaded Qwen3.5 tokenizer
-//   queue:         the device queue (from LoadedEngine::queue())
 //   state:         text to analyze (the "state" in the sequence)
 //   qtype:         "choice", "score", or "noul"
 //   instructions:  question instructions (placed after <|fim_middle|>)
@@ -49,7 +50,6 @@ struct KevDecisionResult {
 KevDecisionResult KevInference(
     const LoadedModel& model,
     const tok::Tokenizer& tokenizer,
-    vt::Queue& queue,
     const std::string& state,
     const std::string& qtype,
     const std::string& instructions,

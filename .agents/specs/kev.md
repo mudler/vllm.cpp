@@ -185,9 +185,12 @@ Repository: `jaredpalmer/kev` @ `19dcae9b6e3e1a48200c5825aad9fc200d31e20a`.
 - Prefix caching optimization.
 - Server dispatch via `DecisionFn` callback (blocked on Laya PR #3263):
   `KevInference` is defined in `kev_registry.cpp` and compiles, but is not
-  yet called from `/v1/systemone`. The `queue()` accessors on
-  `GPUModelRunner` and `LoadedEngine` and the server dispatch code land when
-  Laya PR #3263 merges.
+  yet called from `/v1/systemone`. The device queue is stored on
+  `KevLoadedModel` during `PrepareKev` (the `ModelFactory::prepare`
+  callback, which already receives `vt::Queue&`) and retrieved by
+  `KevInference` from the model — no shared-header accessor needed.
+  Only the server dispatch code in `server_main.cpp` remains, blocked on
+  Laya PR #3263 landing the `DecisionFn` callback and `set_decision` API.
 
 ## Git integration
 

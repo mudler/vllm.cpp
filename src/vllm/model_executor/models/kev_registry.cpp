@@ -68,12 +68,18 @@ class KevLoadedModel final : public LoadedModel {
   float temperature() const { return temperature_; }
   const HfConfig& config() const { return config_; }
 
+  // Stored by PrepareKev (the ModelFactory prepare callback). KevInference
+  // retrieves it from here, avoiding any shared-header accessor.
+  void set_queue(vt::Queue q) { queue_ = q; }
+  vt::Queue queue() const { return queue_; }
+
  private:
   Qwen3_5DenseWeights weights_;
   kev::HeadWeights head_weights_;
   kev::HeadParams head_params_;
   float temperature_;
   HfConfig config_;
+  vt::Queue queue_;
 };
 
 // Load PointerHead weights (q.weight, q.bias, k.weight, k.bias) from
@@ -151,9 +157,8 @@ std::unique_ptr<LoadedModel> LoadKev(
 
 void PrepareKev(LoadedModel& model, const HfConfig& config,
                 vt::Queue& queue) {
-  (void)model;
   (void)config;
-  (void)queue;
+  ModelAs<KevLoadedModel>(model, "KevModel").set_queue(queue);
 }
 
 // The factory forward runs the Qwen3.5 dense backbone to post-final-norm
@@ -206,7 +211,6 @@ kev::KevSpecialTokens ResolveSpecialTokens(const tok::Tokenizer& tokenizer) {
 KevDecisionResult KevInference(
     const LoadedModel& model,
     const tok::Tokenizer& tokenizer,
-    vt::Queue& queue,
     const std::string& state,
     const std::string& qtype,
     const std::string& instructions,
@@ -219,6 +223,7 @@ KevDecisionResult KevInference(
   (void)qtype;
 
   const auto& m = ModelAs<KevLoadedModel>(model, "KevModel");
+  vt::Queue queue = m.queue();
 
   // 1. Resolve special tokens from the tokenizer.
   kev::KevSpecialTokens special = ResolveSpecialTokens(tokenizer);

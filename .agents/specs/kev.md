@@ -8,13 +8,13 @@ GPU (CUDA), OpenAI-compatible serving.
 
 ## Now
 
-`SPIKE` — spec written, model-matrix row added, roadmap row added. The gap is
-verified: no kev, no PointerHead, and no load-time LoRA merge exists in the
-tree. The Qwen3.5 dense backbone is fully implemented (`qwen3_5.cpp`,
-`qwen3_5_dense.cpp`) but lacks `ForwardHidden` (every path returns logits). The
-`/v1/systemone` API endpoints exist from GLiNER2.5 (merged `5058268d7`); the
-`DecisionFn` callback that lets a non-NER model back systemone is in the Laya
-PR (`row/MODEL-LAYA`, PR #3263) and merges first.
+`ACTIVE` — Phases 1-4 committed (sequence construction, readout, LoRA merge,
+PointerHead, golden-vector tests: 25 cases, 126 assertions). Phase 5a
+(`ForwardDenseHidden`) and Phase 5b (model registration, `convert-kev.py`,
+`REGISTER_VLLM_MODEL`) committed. Phase 5c inference pipeline (`KevInference`
+in `kev_registry.cpp`) defined and compiling but not yet wired to
+`/v1/systemone` — the server dispatch depends on the `DecisionFn` callback
+from Laya PR #3263, which has not merged. GPU build verification is owed.
 
 ## Scope
 
@@ -183,6 +183,11 @@ Repository: `jaredpalmer/kev` @ `19dcae9b6e3e1a48200c5825aad9fc200d31e20a`.
 - GPU (CUDA) build verification.
 - GGUF k-quant arm.
 - Prefix caching optimization.
+- Server dispatch via `DecisionFn` callback (blocked on Laya PR #3263):
+  `KevInference` is defined in `kev_registry.cpp` and compiles, but is not
+  yet called from `/v1/systemone`. The `queue()` accessors on
+  `GPUModelRunner` and `LoadedEngine` and the server dispatch code land when
+  Laya PR #3263 merges.
 
 ## Git integration
 

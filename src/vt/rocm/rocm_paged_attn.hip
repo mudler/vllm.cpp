@@ -1310,6 +1310,8 @@ __global__ void PagedAttnDecodeSplitKvReduce(
 
   if (h >= hq || d != d_expect || t >= total_q) return;
 
+  (void)num_kv_heads;
+
   // Gather partial results from all splits
   float o_acc[kEpl];
   #pragma unroll

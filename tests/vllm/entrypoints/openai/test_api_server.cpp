@@ -5461,14 +5461,14 @@ TEST_CASE("api_server: systemone malformed requests") {
         400);
 }
 
-TEST_CASE("api_server: systemone without a ner callback is a 500") {
+TEST_CASE("api_server: systemone without a ner or decision callback is a 500") {
   vllm::entrypoints::openai::OpenAIServingModels models{"m"};
   ApiServer server{models, "test-version"};
   ApiServer::DispatchResult r =
       server.handle_systemone(R"({"state":"x","questions":{"y":{"type":"noul"}}})");
   CHECK(r.status == 500);
   CHECK(json::parse(r.body).at("error").at("message") ==
-        "The model does not support NER");
+        "The model does not support SystemOne");
 }
 
 // ── kev full-compatibility: choice, score, permute, separate ─────────────────

@@ -487,10 +487,10 @@ Qwen3DenseWeights LoadQwen3FromGguf(const GgufFile& gguf,
                   GgufTensorRole::kTransformedWeight);
     layer.input_layernorm =
         OwnBf16(gguf, Blk(il, "attn_norm.weight"), {config.hidden_size});
-    RequireExpand(pol, gguf, Blk(il, "post_attention_norm.weight"),
+    RequireExpand(pol, gguf, Blk(il, "ffn_norm.weight"),
                   GgufTensorRole::kTransformedWeight);
     layer.post_attention_layernorm =
-        OwnBf16(gguf, Blk(il, "post_attention_norm.weight"),
+        OwnBf16(gguf, Blk(il, "ffn_norm.weight"),
                 {config.hidden_size});
 
     // Attention: load q/k/v separately, then merge into one qkv_proj.

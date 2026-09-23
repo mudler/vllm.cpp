@@ -106,7 +106,7 @@ std::string BuildGguf(const Dims& d, bool tied, bool with_qk_norm) {
 
   for (int64_t l = 0; l < d.n_layer; ++l) {
     AddF32(b, Blk(l, "attn_norm.weight"), {d.H});
-    AddF32(b, Blk(l, "post_attention_norm.weight"), {d.H});
+    AddF32(b, Blk(l, "ffn_norm.weight"), {d.H});
     AddF32(b, Blk(l, "attn_q.weight"), {q_rows, d.H}, kQOff);
     AddF32(b, Blk(l, "attn_k.weight"), {kv_rows, d.H}, kKOff);
     AddF32(b, Blk(l, "attn_v.weight"), {kv_rows, d.H}, kVOff);

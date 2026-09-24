@@ -110,11 +110,12 @@ class DeviceExpertSlotStore final : public ExpertSlotStore {
   void CommitSlot(int32_t slot, size_t bytes) override;
 
   // The DEVICE bytes of `slot`, for a kernel to read in place. Not host
-  // memory: only the backend may dereference it. Non-virtual here on purpose —
-  // making the read virtual on `ExpertSlotStore`, so that
-  // `Qwen35ExpertStream::Slice` stops reading the concrete
-  // `HostExpertSlotStore`, is W2's change and this wave does not pre-empt it.
-  uint8_t* SlotForRead(int32_t slot);
+  // memory: only the backend may dereference it.
+  //
+  // W2: this is now virtual on `ExpertSlotStore`, so `ExpertStreamLane::Slice`
+  // reads through the base pointer and the concrete store is selected from the
+  // platform without the lane knowing which one it holds.
+  uint8_t* SlotForRead(int32_t slot) override;
 
   // Device bytes held. The arena is allocated once and never grows, so this is
   // the whole device cost of the lane.
@@ -130,7 +131,7 @@ class DeviceExpertSlotStore final : public ExpertSlotStore {
   // streamer never hands out a slot it has not filled. Stated because
   // "byte-identical to the host store" is this row's gate and it is true over
   // the filled prefix rather than over the slot.
-  int64_t resident_bytes() const {
+  int64_t resident_bytes() const override {
     return static_cast<int64_t>(static_cast<size_t>(slots_) * slot_bytes_);
   }
 

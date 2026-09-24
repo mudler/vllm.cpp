@@ -47,6 +47,7 @@
 
 #include "vllm/model_executor/expert_slot_cache.h"
 #include "vllm/model_executor/expert_streamer.h"
+#include "vllm/model_executor/device_expert_slot_store.h"
 #include "vllm/model_executor/host_expert_slot_store.h"
 #include "vllm/model_executor/models/dense_device_glue.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"
@@ -101,7 +102,7 @@ class ExpertStreamLane {
   // The store, constructing it on first use. Refuses BY NAME when `slot_bytes`
   // exceeds the slot budget the store was built with, rather than falling back
   // to the mmap path and letting a streaming benchmark quietly measure it.
-  static ExpertStreamLane* Get(size_t slot_bytes);
+  static ExpertStreamLane* Get(Dev d, size_t slot_bytes);
 
   // The decode step boundary. Calling it is what clears per-step eviction
   // protection and advances the hotness clock; see the note on the RAII guard
@@ -137,7 +138,7 @@ class ExpertStreamLane {
   ~ExpertStreamLane();
 
  private:
-  explicit ExpertStreamLane(size_t slot_bytes);
+  explicit ExpertStreamLane(Dev d, size_t slot_bytes);
 
   static std::unique_ptr<ExpertStreamLane>& Slot();
   static std::mutex& Mutex();
@@ -150,7 +151,7 @@ class ExpertStreamLane {
 
   int32_t TowerId(uint64_t uid);
 
-  std::unique_ptr<HostExpertSlotStore> store_;
+  std::unique_ptr<ExpertSlotStore> store_;
   std::unique_ptr<ExpertSlotCache> cache_;
   std::unique_ptr<ExpertStreamer> streamer_;
   std::unordered_map<uint64_t, int32_t> tower_ids_;

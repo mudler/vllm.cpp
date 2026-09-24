@@ -86,7 +86,9 @@ class HostExpertSlotStore final : public ExpertSlotStore {
     return buf_.data() + static_cast<size_t>(slot) * slot_bytes_;
   }
 
-  int64_t resident_bytes() const {
+  uint8_t* SlotForRead(int32_t slot) override { return Slot(slot); }
+
+  int64_t resident_bytes() const override {
     return static_cast<int64_t>(buf_.size());
   }
 

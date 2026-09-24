@@ -23,6 +23,12 @@
 #include "vllm/platforms/interface.h"
 #include "vt/dtype.h"  // VT_CHECK
 
+// device_expert_slot_store.h is needed for the DeviceExpertSlotStore
+// construction in the constructor's platform-based selection. Not in the
+// header's includes to keep the header light for consumers that only use
+// the ExpertSlotStore interface.
+#include "vllm/model_executor/device_expert_slot_store.h"
+
 namespace vllm {
 namespace expert_stream {
 
@@ -92,7 +98,7 @@ void ExpertStreamLane::Reserve(size_t slot_bytes) {
   if (slot_bytes > Reserved()) Reserved() = slot_bytes;
 }
 
-ExpertStreamLane* ExpertStreamLane::Get(size_t slot_bytes) {
+ExpertStreamLane* ExpertStreamLane::Get(Dev d, size_t slot_bytes) {
   if (!StreamRequested()) return nullptr;
   ExpertStreamLane* inst = nullptr;
   {
@@ -109,7 +115,7 @@ ExpertStreamLane* ExpertStreamLane::Get(size_t slot_bytes) {
     std::lock_guard<std::mutex> lk(Mutex());
     std::unique_ptr<ExpertStreamLane>& slot = Slot();
     if (slot == nullptr) {
-      slot.reset(new ExpertStreamLane(std::max(slot_bytes, Reserved())));
+      slot.reset(new ExpertStreamLane(d, std::max(slot_bytes, Reserved())));
     }
     inst = slot.get();
   }
@@ -160,7 +166,7 @@ uint8_t* ExpertStreamLane::Slice(const uint8_t* base, uint64_t tower_uid,
       ++exhausted_;
       return nullptr;
     }
-    return store_->Slot(r.slot);
+    return store_->SlotForRead(r.slot);
   }
   // Ask the kernel for the WHOLE slice up front, before the copy touches it.
   //
@@ -216,7 +222,7 @@ uint8_t* ExpertStreamLane::Slice(const uint8_t* base, uint64_t tower_uid,
     ++exhausted_;
     return nullptr;
   }
-  return store_->Slot(r.slot);
+  return store_->SlotForRead(r.slot);
 }
 
 void ExpertStreamLane::EndStep() {
@@ -310,7 +316,7 @@ void ExpertStreamLane::PrintStatsLine(int64_t steps, int64_t hits,
                static_cast<long long>(advised));
 }
 
-ExpertStreamLane::ExpertStreamLane(size_t slot_bytes) {
+ExpertStreamLane::ExpertStreamLane(Dev d, size_t slot_bytes) {
   // ENG-RESIDENCY-CONFIG (#1110): both sizes resolve through the shared
   // resolvers, which hold env var > `--offload-config`'s
   // `vllm_cpp.expert_stream.{slots,slot_bytes}` > the default, and which keep
@@ -340,7 +346,14 @@ ExpertStreamLane::ExpertStreamLane(size_t slot_bytes) {
   // default would leave every existing suite green.
   NoteExpertStreamGeometry(static_cast<int64_t>(slots),
                            static_cast<int64_t>(slot_bytes));
-  store_ = std::make_unique<HostExpertSlotStore>(slots, slot_bytes);
+  const vllm::platforms::Platform& p =
+      vllm::platforms::GetPlatform(d.q.device.type);
+  const bool cpu = p.is_cpu();
+  if (cpu || p.host_memory_is_device_addressable()) {
+    store_ = std::make_unique<HostExpertSlotStore>(slots, slot_bytes);
+  } else {
+    store_ = std::make_unique<DeviceExpertSlotStore>(d.b, slots, slot_bytes);
+  }
   cache_ = std::make_unique<ExpertSlotCache>(slots);
   streamer_ = std::make_unique<ExpertStreamer>(*cache_, *store_);
   std::fprintf(stderr,
@@ -416,49 +429,41 @@ vt::Tensor ExpertSlice(Dev d, const OwnedTensor& w, int64_t N, int64_t K,
   const vllm::platforms::Platform& p =
       vllm::platforms::GetPlatform(d.q.device.type);
   const bool cpu = p.is_cpu();
-  // ENG-EXPERT-STREAM-DEVICE W0b/W0c (issue #1124). The lane serves slices out
-  // of HOST storage — `HostExpertSlotStore`'s arena is a `std::vector<uint8_t>`
-  // — so the question is not "is this the CPU" but "can this platform's kernels
-  // READ host storage". `is_cpu()` is one answer to that;
-  // `host_memory_is_device_addressable()` is the probed answer for the rest, and
-  // it is what lets a GB10 serve a 369.96 GiB checkpoint out of a 119.631 GiB
-  // pool instead of refusing the load.
-  //
-  // A DISCRETE device answers false, keeps falling through to the caller's
-  // resident slice, and therefore keeps hitting the #1123 load-time refusal.
-  // That is correct for it: a slot store it cannot read is not a lane, and
-  // giving it one is `ENG-EXPERT-STREAM-DEVICE` W2's job, not this branch's.
-  if (cpu || p.host_memory_is_device_addressable()) {
-    if (ExpertStreamLane* st = ExpertStreamLane::Get(bytes)) {
-      // Claim the tower for the lane BEFORE taking a slice, so the refusal in
-      // `ResidentWeight` covers the whole tower rather than only the slices
-      // that happened to be served. A tower the lane touched at all must never
-      // be staged.
-      w.expert_streamed = true;
-      const uint8_t* base = w.bytes.data();
-      if (uint8_t* slot = st->Slice(base, w.TowerUid(), expert,
-                                    static_cast<size_t>(row_off) * row_bytes,
-                                    bytes, w.mmap_fd, w.mmap_file_offset)) {
-        return HostSliceView(d, w, slot, N, K);
-      }
-      // The cache could not serve this slice. On CPU that falls through to the
-      // caller's unchanged resident slice below, which aliases the tower and is
-      // what every existing arm-comparison gate measures.
-      //
-      // On a host-addressable DEVICE it must NOT: the resident slice would
-      // stage the whole 1.1875 GiB tower, and this branch is not rare. Prefill
-      // takes it thousands of times by construction — the peak protected set
-      // for a T-token prompt is `93 x 3 x min(512, 10*T)` slices, which
-      // saturates at 331 GiB for any T >= 52, so no slot budget makes prefill
-      // fit. Reading the tower's own host bytes in place is exactly what the
-      // CPU arm does, costs nothing, and is correct precisely because this
-      // platform said its kernels can follow a host pointer.
-      if (!cpu) {
-        return HostSliceView(
-            d, w,
-            const_cast<uint8_t*>(base) + static_cast<size_t>(row_off) * row_bytes,
-            N, K);
-      }
+  // ENG-EXPERT-STREAM-DEVICE W2 (issue #2515). The lane is now entered for
+  // every platform when streaming is requested. The store type is selected
+  // from the platform in the constructor: host store on CPU and
+  // host-addressable devices, device store on discrete devices. The guard at
+  // `model_loader.cpp` still gates streaming itself; this function's job is
+  // to serve a slice from whatever store the lane holds.
+  if (ExpertStreamLane* st = ExpertStreamLane::Get(d, bytes)) {
+    w.expert_streamed = true;
+    const uint8_t* base = w.bytes.data();
+    if (uint8_t* slot = st->Slice(base, w.TowerUid(), expert,
+                                  static_cast<size_t>(row_off) * row_bytes,
+                                  bytes, w.mmap_fd, w.mmap_file_offset)) {
+      return HostSliceView(d, w, slot, N, K);
+    }
+    // The cache could not serve this slice. On CPU that falls through to the
+    // caller's unchanged resident slice below, which aliases the tower and is
+    // what every existing arm-comparison gate measures.
+    //
+    // On a host-addressable DEVICE it must NOT: the resident slice would
+    // stage the whole 1.1875 GiB tower, and this branch is not rare. Prefill
+    // takes it thousands of times by construction — the peak protected set
+    // for a T-token prompt is `93 x 3 x min(512, 10*T)` slices, which
+    // saturates at 331 GiB for any T >= 52, so no slot budget makes prefill
+    // fit. Reading the tower's own host bytes in place is exactly what the
+    // CPU arm does, costs nothing, and is correct precisely because this
+    // platform said its kernels can follow a host pointer.
+    //
+    // A DISCRETE device (pageableMemoryAccess=0) must NOT read host bytes in
+    // place: its kernels cannot dereference a host pointer. It falls through
+    // to the resident slice below, same as CPU.
+    if (!cpu && p.host_memory_is_device_addressable()) {
+      return HostSliceView(
+          d, w,
+          const_cast<uint8_t*>(base) + static_cast<size_t>(row_off) * row_bytes,
+          N, K);
     }
   }
   return resident_fallback(d, w, N, K, row_off);

@@ -86,6 +86,22 @@ class ExpertSlotStore {
   // that threw leaves nothing to publish, and the cache entry is invalidated
   // instead.
   virtual void CommitSlot(int32_t slot, size_t bytes) = 0;
+
+  // A READABLE pointer to `slot`'s bytes for the consumer that binds them into
+  // a GEMM. On a host store this is the slot itself; on a device store it is
+  // the device-side arena pointer a kernel can dereference. The two read sites
+  // in `ExpertStreamLane::Slice` go through this virtual so the concrete store
+  // is selected from the platform without the lane knowing which one it holds.
+  //
+  // Unlike `SlotForWrite` (which returns a host-writable staging buffer on a
+  // device store), `SlotForRead` returns the actual slot's resident bytes.
+  virtual uint8_t* SlotForRead(int32_t slot) = 0;
+
+  // Total bytes held by this store. Used for the startup banner and for
+  // diagnostics. Both concrete stores already expose this as a non-virtual;
+  // virtualizing it lets the lane print the banner without knowing the
+  // concrete type.
+  virtual int64_t resident_bytes() const = 0;
 };
 
 class ExpertStreamer {

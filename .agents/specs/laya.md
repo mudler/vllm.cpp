@@ -8,11 +8,10 @@ merged with GLiNER2.5. Laya uses a ModernBERT-large encoder
 
 ## Now
 
-`SPIKE` — spec written, issue open
-(ISSUE-LOCAL-01M31D3RBBN34F446RFV9KM66P), model-matrix row added, roadmap row
-added. Implementation not started. The gap is verified: no ModernBERT, no
-Laya, and no decision-head model exists in the tree. The `/v1/systemone` API
-and its server dispatch exist from the GLiNER2.5 work (merged at `5058268d7`).
+`DONE` — Phases 1-5 implemented and merged (closing commit `c0320715f`, PR #3263).
+ModernBERT-large encoder, Laya decision head, sequence construction, model
+registration, and `/v1/systemone` dispatch all land in the same PR. E2E tested
+through LocalAI `/v1/systemone` (choice/score/noul all pass).
 
 ## Scope
 
@@ -34,7 +33,7 @@ and its server dispatch exist from the GLiNER2.5 work (merged at `5058268d7`).
   server dispatch are already on `main`. Laya plugs in as an alternative model
   behind the same API, not a new endpoint.
 
-## Upstream anchors
+## Upstream chain
 
 ### Oracle: vLLM (ModernBERT encoder)
 
@@ -227,7 +226,7 @@ and the forward runs, and the pooling path runs on host by design.
 - **CPU**: the entire forward pass runs on CPU. This is the development and CI
   path.
 
-## Tests
+## Tests to port
 
 ### RED-first unit tests (CPU)
 
@@ -256,6 +255,48 @@ and the forward runs, and the pooling path runs on host by design.
 - The new model is additive. No existing model's forward path changes.
   Text-generation SACRED gates (27B, 35B, Coder) must stay byte-identical.
   GLiNER2.5 NER tests must stay green.
+
+## Our baseline
+
+Before this row: no ModernBERT encoder, no decision-head model, and no
+choice/score/noul inference existed in the tree. The `/v1/systemone` API
+endpoint, request/response structs, and server dispatch existed from the
+GLiNER2.5 work (merged at `5058268d7`). The ModernBERT sliding-window
+attention and dual-RoPE infrastructure did not exist; this row added it.
+
+## Port map
+
+- ModernBERT encoder: vLLM `modernbert.py::ModernBertModel` @ pin →
+  `src/vllm/model_executor/models/modernbert.{h,cpp}` (new files).
+- Laya decision head: Laya `model.py::DecisionModel` (not in vLLM) →
+  `src/vllm/model_executor/models/laya.{h,cpp}` (new files).
+- SystemOne dispatch: shared `src/vllm/entrypoints/openai/systemone.{h,cpp}`
+  (extracted from Laya PR, reused by kev).
+- C ABI: `vllm_decide` / `vllm_decide_free` in `include/vllm.h` /
+  `src/capi/vllm_c.cpp` (ABI v29; originally `vllm_systemone` at v28, unified
+  by PR #3301).
+- Registration: `src/vllm/model_executor/models/laya_registry.cpp` (new file,
+  self-registers via `REGISTER_VLLM_MODEL`).
+- Tests: `tests/vllm/models/test_laya.cpp` (new file).
+
+## Dependencies
+
+- The `/v1/systemone` API and server dispatch (landed in the GLiNER2.5 row at
+  `5058268d7`). This row added the Laya model that uses it.
+- The shared dense attention infrastructure (`vt::` ops, `dense_attn::AttnBlock`).
+- No new CUDA kernels — Laya routes through existing `vt::` ops.
+
+## Work breakdown
+
+- Phase 1: ModernBERT-large encoder (sliding-window + dual-RoPE, GeGLU MLP,
+  LayerNorm bias=false) — DONE.
+- Phase 2: Laya decision head (type_emb, 2-layer transformer encoder, scorer,
+  act_head) — DONE.
+- Phase 3: Sequence construction + tokenizer (build_sequence with marker
+  tracking, ModernBERT BPE) — DONE.
+- Phase 4: Registration + SystemOne integration (`REGISTER_VLLM_MODEL`,
+  `/v1/systemone` dispatch) — DONE.
+- Phase 5: CPU build + tests + E2E through LocalAI — DONE.
 
 ## Gates
 

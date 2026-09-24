@@ -8,13 +8,10 @@ GPU (CUDA), OpenAI-compatible serving.
 
 ## Now
 
-`ACTIVE` — Phases 1-4 committed (sequence construction, readout, LoRA merge,
-PointerHead, golden-vector tests: 25 cases, 126 assertions). Phase 5a
-(`ForwardDenseHidden`) and Phase 5b (model registration, `convert-kev.py`,
-`REGISTER_VLLM_MODEL`) committed. Phase 5c inference pipeline (`KevInference`
-in `kev_registry.cpp`) defined and compiling but not yet wired to
-`/v1/systemone` — the server dispatch depends on the `DecisionFn` callback
-from Laya PR #3263, which has not merged. GPU build verification is owed.
+`DONE` — Phases 1-6 implemented and merged (closing commit `4756d264c`, PR #3295).
+Convert-time LoRA merge, PointerHead readout, ForwardHidden backbone, sequence
+construction, model registration, and `/v1/systemone` dispatch all land in the
+same PR. E2E tested through LocalAI `/v1/systemone` (choice/score/noul all pass).
 
 ## Scope
 
@@ -37,7 +34,7 @@ from Laya PR #3263, which has not merged. GPU build verification is owed.
   and server dispatch from GLiNER2.5. The `DecisionFn` callback mechanism from
   Laya. The Qwen2 BPE tokenizer already supported in the tree.
 
-## Upstream anchors
+## Upstream chain
 
 ### Oracle: kev reference implementation
 
@@ -147,6 +144,66 @@ Repository: `jaredpalmer/kev` @ `19dcae9b6e3e1a48200c5825aad9fc200d31e20a`.
 - Compare outputs. Token-exact where possible; near-tie robust for bf16 paths.
 - Server E2E test through `/v1/systemone` HTTP endpoint.
 
+## Our baseline
+
+Before this row: no Qwen3.5 feature-extraction (ForwardHidden) path existed in
+the tree. The Qwen3.5 dense forward existed for causal LM generation, but not
+for hidden-state extraction. The `/v1/systemone` API and C ABI `vllm_decide`
+existed from the Laya work (merged at `c0320715f`; unified into `vllm_decide`
+at ABI v29 by PR #3301). No LoRA merge infrastructure
+and no PointerHead readout existed.
+
+## Port map
+
+- Qwen3.5 backbone ForwardHidden: vLLM `qwen3_5.py` @ pin (dense forward, no
+  LM Head) → `src/vllm/model_executor/models/qwen3_5.cpp` (ForwardDenseHidden
+  added to existing file).
+- PointerHead readout: kev source `jaredpalmer/kev` (not in vLLM) →
+  `src/vllm/model_executor/models/kev_registry.cpp` (new file).
+- LoRA merge: convert-time merge in `scripts/convert-kev.py` (new file, merges
+  rank-16 LoRA into base weights: W' = W + 2.0 * (B @ A)).
+- SystemOne dispatch: shared `src/vllm/entrypoints/openai/systemone.{h,cpp}`
+  (reused from Laya PR).
+- C ABI: `vllm_decide` / `vllm_decide_free` in `include/vllm.h` /
+  `src/capi/vllm_c.cpp` (ABI v29; originally `vllm_systemone` at v28, unified
+  by PR #3301).
+- Registration: `src/vllm/model_executor/models/kev_registry.cpp` (new file,
+  self-registers via `REGISTER_VLLM_MODEL`).
+- Tests: `tests/vllm/models/test_kev.cpp` (new file).
+
+## Tests to port
+
+No upstream vLLM tests exist for kev (not in vLLM registry). Tests are
+authored from the kev reference implementation:
+
+- PointerHead golden-vector tests: q/k projection, scaled dot-product attention,
+  pointer distribution — 25 cases, 126 assertions.
+- LoRA merge correctness: verify W' = W + scaling * (B @ A) for sample tensors.
+- ForwardHidden correctness: verify hidden-state extraction matches expected
+  shapes and values for synthetic input.
+- Sequence construction: verify marker-delimited sequence building with Qwen
+  special tokens.
+- Confidence formulas: choice `(max(p) - 1/K) / (1 - 1/K)`, score
+  `1 - E|level - mode| / (L - 1)`, noul `p(true)`.
+- E2E: choice/score/noul through `/v1/systemone` via LocalAI HTTP server.
+
+## Dependencies
+
+- The `/v1/systemone` API and C ABI (landed in the Laya row at `c0320715f`).
+  This row added the kev model that uses it.
+- The Qwen3.5 dense forward infrastructure (`src/vllm/model_executor/models/qwen3_5.cpp`).
+- The shared systemone helpers (`src/vllm/entrypoints/openai/systemone.{h,cpp}`).
+- No new CUDA kernels — kev routes through existing `vt::` ops.
+
+## Work breakdown
+
+- Phase 1: head.pt conversion + PointerHead host forward + golden tests — DONE.
+- Phase 2: LoRA merge at convert time (convert-kev.py) — DONE.
+- Phase 3: ForwardHidden for Qwen3.5 Dense — DONE.
+- Phase 4: Sequence construction + inference pipeline — DONE.
+- Phase 5: Registration, server dispatch, /v1/systemone endpoint — DONE.
+- Phase 6: E2E parity test vs reference — DONE.
+
 ## Risks
 
 - DeltaNet layers in Qwen3.5: the existing forward path may not expose the
@@ -203,3 +260,36 @@ implementation commits in the same pull request.
   — bf16, ~1.67 GB.
 - Adapter: `jaredpalmer/kev-0.8b` — `adapter_model.safetensors` (43.3 MB, F32
   LoRA), `head.pt` (2.1 MB, converted to `head.safetensors`), `tokenizer.json`.
+
+## Outcome
+
+### What was measured
+
+- PointerHead golden-vector tests: 25 cases, 126 assertions, all pass.
+- LoRA merge: 372 F32 tensors merged at convert time (186 module paths, r=16,
+  alpha=32, scaling=2.0). Merge formula W' = W + 2.0 * (B @ A) verified.
+- ForwardHidden: Qwen3.5-0.8B-Base backbone (18 DeltaNet + 6 full-attn layers,
+  hidden=1024) extracts hidden states correctly.
+- E2E through LocalAI `/v1/systemone`:
+  - choice: PASS — choice=sunny, confidence=0.2271
+  - score (5 levels): PASS — score=1.8216, confidence=0.7279
+  - noul (binary): PASS — noul=0.7097
+
+### What was rejected and why
+
+- Runtime LoRA merge: rejected in favor of convert-time merge. The base model
+  is frozen, so merging once at convert time is simpler and avoids runtime
+  overhead. The convert script (`scripts/convert-kev.py`) produces a
+  self-contained checkpoint.
+- Shared-header accessor for device queue: rejected. The device queue is stored
+  in `KevLoadedModel` during `PrepareKev` — no shared-header accessor needed.
+
+### Why each default has its value
+
+- LoRA merge at convert time (not load time): the base model is frozen, so a
+  one-time merge produces a self-contained checkpoint that any loader can use
+  without LoRA infrastructure.
+- Confidence formulas match the kev reference implementation exactly: choice
+  uses `(max(p) - 1/K) / (1 - 1/K)`, score uses
+  `1 - E|level - mode| / (L - 1)`, noul uses `p(true)`. Probabilities rounded
+  to 2 decimals.

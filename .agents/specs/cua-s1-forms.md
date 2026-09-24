@@ -9,11 +9,10 @@ model is tiny: 706,048 trainable parameters, 2.8 MB checkpoint. CPU + GPU
 
 ## Now
 
-`SPIKE` — spec written, issue open
-(ISSUE-LOCAL-01M32WZMKVRBP4PH21KPHEDS3V), model-matrix row added, roadmap row
-added, oracle pinned. Implementation not started. The gap is verified: no
-byte-level embedding model, no `TinyTransformerScorer`, and no option-scoring
-endpoint exists in the tree.
+`DONE` — Phases 1-5 implemented and merged (closing commit `53f018247`, PR #3265).
+TinyTransformerScorer model, ByteCollator tokenization, weight loading,
+registration, and `/v1/score` server dispatch all land in the same PR. E2E
+tested through LocalAI `/api/score` (2 and 3 candidate cases pass).
 
 ## Scope
 
@@ -38,7 +37,7 @@ endpoint exists in the tree.
   the server framework (`api_server.h`). The `/v1/score` endpoint is new; it
   does not reuse `/v1/systemone` because the input/output contract is different.
 
-## Upstream anchors
+## Upstream chain
 
 ### Oracle: trycua/cua (cua-s1-forms source)
 
@@ -359,7 +358,7 @@ quantization or mixed-precision concerns. Listed as owed, not a pre-PR gate.
    the signature (that is a Python-side integrity check), but it must read
    through the envelope to reach the `config` object.
 
-## Tests
+## Tests to port
 
 1. **Model forward golden** (Phase 1): construct a `TinyTransformerScorer`
    with the published checkpoint, run a forward pass on a fixed input, compare
@@ -380,6 +379,44 @@ quantization or mixed-precision concerns. Listed as owed, not a pre-PR gate.
 6. **Mutation tests**: for each guarantee, mutate the implementation (e.g., skip
    the safe mask, use `-inf` instead of `finfo.min`, swap Q/K split order) and
    verify the test fails.
+
+## Our baseline
+
+Before this row: no byte-level embedding model, no `TinyTransformerScorer`, and
+no option-scoring endpoint existed in the tree. The C ABI surface
+(`vllm.h` / `vllm_c.cpp`) had no scoring function. The `/v1/score` HTTP
+endpoint and its server dispatch did not exist. (The C ABI was later unified
+into `vllm_decide` at ABI v29 by PR #3301.)
+
+## Port map
+
+- TinyTransformerScorer: `trycua/cua` `libs/cua-s1/` (not in vLLM) →
+  `src/vllm/model_executor/models/cua_s1_registry.cpp` (new file).
+- ByteCollator (byte-level tokenization): `trycua/cua` `libs/cua-s1/` →
+  `src/vllm/model_executor/models/cua_s1_registry.cpp` (inline).
+- C ABI: `vllm_decide` / `vllm_decide_free` in `include/vllm.h` /
+  `src/capi/vllm_c.cpp` (ABI v29; originally `vllm_score` at v28, unified
+  by PR #3301).
+- Registration: `src/vllm/model_executor/models/cua_s1_registry.cpp` (new file,
+  self-registers via `REGISTER_VLLM_MODEL`).
+- Tests: `tests/vllm/models/test_cua_s1.cpp` (new file).
+
+## Dependencies
+
+- The C ABI infrastructure (`include/vllm.h`, `src/capi/vllm_c.cpp`).
+- The shared dense attention infrastructure (`vt::` ops).
+- No new CUDA kernels — cua-s1-forms routes through existing `vt::` ops.
+
+## Work breakdown
+
+- Phase 1: `TinyTransformerScorer` model (byte-level embedding, 2-layer context
+  encoder, 1-layer option encoder, AttentionHead cross-attention scorer) — DONE.
+- Phase 2: `ByteCollator` + inference pipeline (UTF-8 byte tokenization, padding,
+  masking) — DONE.
+- Phase 3: Registration, weight loading, config — DONE.
+- Phase 4: Server endpoint, reachability (`/v1/score` dispatch, C ABI
+  `vllm_decide`) — DONE.
+- Phase 5: CPU build + tests + E2E through LocalAI — DONE.
 
 ## Gates
 
@@ -414,3 +451,31 @@ quantization or mixed-precision concerns. Listed as owed, not a pre-PR gate.
 ## Git integration
 
 One pull request for spec + implementation, per developer preference.
+
+## Outcome
+
+### What was measured
+
+- TinyTransformerScorer: byte-level embedding (256 vocab), 2-layer transformer
+  context encoder, 1-layer option encoder, cross-attention scoring head — all
+  implemented and tested.
+- ByteCollator: UTF-8 byte tokenization with padding and masking — correct.
+- E2E through LocalAI `/api/score`:
+  - 2 candidates: PASS — log_prob=0 for winner, -999 (sentinel for log(0)) for
+    loser
+  - 3 candidates: PASS — neutral option wins as expected
+
+### What was rejected and why
+
+- No vLLM parity applicable — vLLM does not register this model. The oracle is
+  `trycua/cua` (secondary, per oracle registry).
+- The `-999.0` sentinel for `log(0)` is used because `encoding/json` cannot
+  marshal `math.Inf(-1)` or `math.NaN` in Go.
+
+### Why each default has its value
+
+- Byte-level tokenization: matches the upstream `trycua/cua` implementation
+  exactly. No BPE or SentencePiece — raw UTF-8 bytes are the vocabulary.
+- Cross-attention scoring: the context encoder produces hidden states that the
+  option encoder attends to, producing a score per option. This matches the
+  upstream architecture.

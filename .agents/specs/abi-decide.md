@@ -115,6 +115,27 @@ new library dependencies, no new model code.
 One pull request: spec + implementation in the same PR. The spec commit lands
 first, then the code commit, so commit order proves spec-before-code.
 
+## Outcome
+
+Merged as PR #3301 (squash `3abc69ffd`).
+
+**What shipped.** `vllm_systemone` / `vllm_systemone_free` and `vllm_score` /
+`vllm_score_free` (ABI v28) were replaced by `vllm_decide` /
+`vllm_decide_free` (ABI v29). The engine dispatches by architecture
+internally, matching the category-level pattern (`vllm_complete` for LLMs,
+`vllm_embed` for embeddings, `vllm_gliner_ner` for NER). The JSON
+request/response format is unchanged; only the C function name changed.
+
+**What was rejected.** Keeping a model-per-function ABI surface was rejected
+because it mirrors the model, not the capability category, and scales linearly
+with each new decision model. A single `vllm_decide` with a `question_type`
+field in the request JSON was chosen instead, because the HTTP layer already
+used `question_type` for routing and the C ABI only needed to match.
+
+**Defaults.** ABI version bumped v28 → v29. The `Assisted-by` trailer records
+`AGENT:regolo/glm5.2 [maki]`. LocalAI PR #12247 updates the purego bindings to
+ABI v29 in lockstep.
+
 ## Owed
 
 None.

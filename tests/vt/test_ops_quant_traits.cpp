@@ -303,9 +303,10 @@ TEST_CASE("the decode-only class is Q8_K and IQ3_S: exactly one FILE type expand
   // IQ1_M (ggml id 29) joined with BOTH a decoder and a dot kernel, so the
   // sweep count moved 17 -> 18 when it landed.
   // 18 -> 19 when IQ3_S gained its dot kernel with aa85e9484
-  // (tenstorrent-gsq-keepquant wave 1).
+  // (tenstorrent-gsq-keepquant wave 1). TQ1_0 and TQ2_0 moved it
+  // 19 -> 21 when their Q8_K dot kernels matched the Vulkan keep-quant path.
   CAPTURE(swept);
-  CHECK(swept == 19);
+  CHECK(swept == 21);
 
   // The decode-only FILE member, named and asserted in BOTH directions. Sizes
   // written out from llama.cpp @ b10451 ggml-common.h:413-422, NOT copied from

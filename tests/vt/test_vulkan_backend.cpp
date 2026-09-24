@@ -232,6 +232,10 @@ TEST_CASE("the committed SPIR-V table records each module's specialization const
       // hardware configuration this shader is written to, so they are not axes.
       REQUIRE(m.spec_id_count == 2);
       for (uint32_t want = 0; want < 2; ++want) CHECK(m.spec_ids[want] == want);
+    } else if (std::strcmp(m.name, "vt_matmul_tiled") == 0) {
+      // A dtype, B dtype, output dtype, and orientation.
+      REQUIRE(m.spec_id_count == 4);
+      for (uint32_t want = 0; want < 4; ++want) CHECK(m.spec_ids[want] == want);
     } else if (std::strcmp(m.name, "vt_matmul_vec") == 0) {
       // a dtype, b dtype, out dtype, the UNROLL factor, the rows-per-workgroup
       // count and the packed-load flag -- but NOT the orientation. This module is
@@ -670,7 +674,7 @@ TEST_CASE("cooperative-matrix capability is PROBED, and absent on llvmpipe") {
   }
 }
 
-TEST_CASE("bf16 GEMM takes the COOPMAT tactic where available, scalar where not") {
+TEST_CASE("bf16 GEMM takes COOPMAT where available, tiled GEMM where not") {
   if (!VulkanPresent()) return;
   auto& ctx = vt::vulkan::VulkanContext::Get();
   Backend& vk = vt::GetBackend(DeviceType::kVULKAN);
@@ -731,13 +735,14 @@ TEST_CASE("bf16 GEMM takes the COOPMAT tactic where available, scalar where not"
   // garbage rows were discarded by the bounds-checked store. See the ragged case
   // below, which asserts the tactic DECLINES rather than trying to be correct.
   const bool coop_expected = ctx.coopmat_bf16_f32() && ctx.subgroup_size() == 32;
-  const std::string tactic_line =
-      std::string("bf16 GEMM tactic: ") + (coop_expected ? "COOPMAT" : "scalar");
+  const char* expected_pipeline = coop_expected ? "vt_matmul_coopmat" : "vt_matmul_tiled";
+  const std::string tactic_line = std::string("bf16 GEMM tactic: ") + expected_pipeline;
   MESSAGE(tactic_line);
-  CHECK(ctx.PipelineExistsFor(coop_expected ? "vt_matmul_coopmat" : "vt_matmul"));
+  CHECK(ctx.PipelineExistsFor(expected_pipeline));
   if (!coop_expected) {
     // On a device without the configuration the coopmat module must NEVER be
-    // built -- selecting it there would fail at pipeline creation.
+    // built -- selecting it there would fail at pipeline creation. Dense prefill
+    // uses vt_matmul_tiled; vt_matmul_vec is the small/partial-M fallback.
     CHECK_FALSE(ctx.PipelineExistsFor("vt_matmul_coopmat"));
   }
 

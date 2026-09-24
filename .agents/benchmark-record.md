@@ -30030,3 +30030,43 @@ remaining per-layer decode cost against the llama.cpp-comparable floor
 stays the #1003 open axis.
 
 Logs: `/tmp/gdn_bench.log`, `/tmp/gdn_bench_chunked.log`.
+
+## BACKEND-TENSTORRENT: the 27B decode DRAM ledger — growth attributed (2026-09-24, P150) — DRAFT
+
+Row `BACKEND-TENSTORRENT`, spec
+`.agents/specs/tenstorrent-27b-dram-growth.md` (W1: attribute, don't fix),
+branch `row/TT-27B-DRAM-GROWTH` @ `eb30b1fb9`, tt-metal
+`81f3bbf3b405fc46bbff59894c3ee42fa48c9d5c`
+(`v0.79.0-dev20260911-82-g81f3bbf3b40`), model
+`Qwen3.8-27B-APEX-I-Nano.gguf` (11,240,605,152 B). Instrument:
+`VT_TT_ALLOC_TRACE=1` (`AllocTraceSnapshot` / `DumpSlotCensus`,
+`src/vt/tenstorrent/tenstorrent_capture.cpp:299-328`, `:415-464`), standing
+recipe `VT_TT_AFFINE_F32=1 VT_TT_NORM_PAD=1 VT_TT_PROGRAM_CACHE=1`,
+`--num-prompts 16 --output-len 16 --concurrency 1 --seed 0 --ignore-eos` on
+the committed sharegpt-64 fixture. Full ledger, anchors, and deviations:
+`docs/bench-evidence/tt-27b-dram-ledger-20260924.md`.
+
+**Verdict: per-REQUEST accumulation, triggered in the keepquant repair web,
+retained OUTSIDE our slot table.** Settled free DRAM per request:
+4.755 → 3.812 → 2.885 → 1.958 GiB (requests 1-4; **-950 MB/request**),
+OOM at request 5 with the spec's exact signature (~268 MB ask, 63.7 MB
+largest-free, `bank_manager.cpp:495`). Excluded: per-step growth (settled
+free flat across every step within a request), fragmentation (largest-free
+tracks total-free proportionally), our keyed slot caches (`DumpSlotCensus`
+flat: dev 10.529 GiB / 430 slots constant across four requests). The
+retained staircase (-283.9 MB / -651.8 MB steps) is tagged `kq-decode/repair`
+(`src/vt/tenstorrent/tenstorrent_keepquant.cpp:446`) and lands during each new
+request's FIRST decode step(s); no kernel compiles fire after request 1, so
+the retention owner is tt-metal-side cached device tensors (program/op cache
+under `VT_TT_PROGRAM_CACHE=1`), not new binaries and not `Slots()` entries.
+
+DEVIATIONS: (1) batch>1 GDN prefill asserts on this tt-metal revision
+(`chunk_gdn_phased_program_factory.cpp:137: BH <= ncores`, 480/192 vs 110
+cores), forcing concurrency 1 — its own row before any concurrency>1 27B leg.
+(2) The measured ~950 MB/request supersedes the spec's ~4-5 MB/request
+estimate, which was derived from death counts, not a ledger; the prior
+session's concurrency-4 legs died at ~request 14, so the rate's concurrency
+dependence is open and belongs to the follow-up row. Leg 2 (8-request repeat)
+skipped: the staircase is unambiguous and the OOM signature reproduced in-leg.
+
+Log: `/tmp/dram-leg1.log` (raw trace, ~125k lines).

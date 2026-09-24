@@ -1,6 +1,6 @@
 // SystemOne API helpers shared by the HTTP server (api_server.cpp) and the
 // C ABI (vllm_c.cpp). Extracted from the former anonymous namespace so
-// vllm_systemone / vllm_score can parse and format the same request/response
+// vllm_decide can parse and format the same request/response
 // shapes without going through the ApiServer callback layer.
 //
 // Ported from kev/api.py and rl_agent_api.py. The helpers live in a

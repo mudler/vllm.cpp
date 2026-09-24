@@ -1681,174 +1681,152 @@ VLLM_API void vllm_ner_result_free(vllm_ner_result* out) {
   out->n_entities = 0;
 }
 
-// ── SystemOne + Score (ABI v28, MODEL-KEV / MODEL-LAYA / MODEL-CUA-S1-FORMS) ──
-// Thin C wrappers over the ONE library seam. A kev engine (architecture
-// "KevModel") or a laya engine (architecture "LayaModel") runs the decision
-// forward and returns the full /v1/systemone JSON response. A cua-s1 engine
-// (architecture "CuaS1Forms") runs the score forward and returns the full
-// /v1/score JSON response. Both are BLOCKING, like vllm_gliner_ner: the
-// decision/score forward is a synchronous host-side pass.
+// ── Decision + Score (ABI v29, MODEL-KEV / MODEL-LAYA / MODEL-CUA-S1-FORMS) ──
+// Thin C wrapper over the ONE library seam. The engine architecture determines
+// the pipeline: a kev engine ("KevModel") or laya engine ("LayaModel") runs the
+// decision forward and returns the full /v1/systemone JSON response; a cua-s1
+// engine ("CuaS1Forms") runs the score forward and returns the full /v1/score
+// JSON response. BLOCKING, like vllm_gliner_ner: the decision/score forward is
+// a synchronous host-side pass.
 
-VLLM_API vllm_status vllm_systemone(vllm_engine* engine,
-                                     const char* request_json,
-                                     char** out_json) {
+VLLM_API vllm_status vllm_decide(vllm_engine* engine,
+                                  const char* request_json,
+                                  char** out_json) {
   if (out_json == nullptr) {
-    SetError("vllm_systemone: out_json is null");
+    SetError("vllm_decide: out_json is null");
     return VLLM_ERR_INVALID_ARGUMENT;
   }
   *out_json = nullptr;
   if (engine == nullptr || request_json == nullptr) {
-    SetError("vllm_systemone: engine or request_json is null");
+    SetError("vllm_decide: engine or request_json is null");
     return VLLM_ERR_INVALID_ARGUMENT;
   }
   if (engine->loaded == nullptr) {
     SetError(
-        "vllm_systemone: this engine was loaded from a transcription-only "
+        "vllm_decide: this engine was loaded from a transcription-only "
         "checkpoint (Parakeet); use vllm_transcribe");
     return VLLM_ERR_INVALID_ARGUMENT;
   }
   const std::string arch(engine->loaded->architecture());
   const bool is_kev = (arch == "KevModel");
   const bool is_laya = (arch == "LayaModel");
-  if (!is_kev && !is_laya) {
+  const bool is_cua_s1 = (arch == "CuaS1Forms");
+  if (!is_kev && !is_laya && !is_cua_s1) {
     SetError(
-        "vllm_systemone: this engine's architecture is '" + arch +
-        "', not 'KevModel' or 'LayaModel'; use vllm_complete / vllm_embed");
+        "vllm_decide: this engine's architecture is '" + arch +
+        "', not 'KevModel', 'LayaModel', or 'CuaS1Forms'; "
+        "use vllm_complete / vllm_embed");
     return VLLM_ERR_INVALID_ARGUMENT;
   }
   namespace so = vllm::entrypoints::openai::systemone;
-  nlohmann::ordered_json body;
-  try {
-    body = nlohmann::ordered_json::parse(request_json);
-  } catch (const std::exception& e) {
-    SetError(std::string("vllm_systemone: invalid JSON body: ") + e.what());
-    return VLLM_ERR_INVALID_ARGUMENT;
-  }
-  auto parsed = so::ParseSystemOneBody(body);
-  if (!parsed.ok) {
-    SetError("vllm_systemone: " + parsed.error_msg);
-    return VLLM_ERR_INVALID_ARGUMENT;
-  }
-  try {
-    std::lock_guard<std::mutex> lock(engine->embed_mutex);
-    const vllm::LoadedModel& model = engine->loaded->loaded_model();
-    const vllm::tok::Tokenizer& tokenizer = engine->loaded->tokenizer();
 
-    auto start = std::chrono::steady_clock::now();
-    nlohmann::json answers = nlohmann::json::object();
-    int64_t total_tokens = 0;
-    for (const auto& q : parsed.questions) {
-      std::vector<std::string> options = so::RenderDecisionOptions(q);
+  if (is_kev || is_laya) {
+    // ── Decision pipeline (kev / laya) ──
+    nlohmann::ordered_json body;
+    try {
+      body = nlohmann::ordered_json::parse(request_json);
+    } catch (const std::exception& e) {
+      SetError(std::string("vllm_decide: invalid JSON body: ") + e.what());
+      return VLLM_ERR_INVALID_ARGUMENT;
+    }
+    auto parsed = so::ParseSystemOneBody(body);
+    if (!parsed.ok) {
+      SetError("vllm_decide: " + parsed.error_msg);
+      return VLLM_ERR_INVALID_ARGUMENT;
+    }
+    try {
+      std::lock_guard<std::mutex> lock(engine->embed_mutex);
+      const vllm::LoadedModel& model = engine->loaded->loaded_model();
+      const vllm::tok::Tokenizer& tokenizer = engine->loaded->tokenizer();
 
-      so::DecisionResult dr;
-      if (is_kev) {
-        vllm::KevDecisionResult result =
-            vllm::KevInference(model, tokenizer, parsed.text,
-                                q.type, q.instructions, options);
-        dr.scores = std::move(result.scores);
-        dr.act_logits = std::move(result.act_logits);
-        dr.prompt_tokens = result.prompt_tokens;
-      } else {
-        vllm::LayaDecisionResult result =
-            vllm::LayaInference(model, tokenizer, parsed.text,
-                                q.type, q.instructions, options);
-        dr.scores = std::move(result.scores);
-        dr.act_logits = std::move(result.act_logits);
-        dr.prompt_tokens = result.prompt_tokens;
+      auto start = std::chrono::steady_clock::now();
+      nlohmann::json answers = nlohmann::json::object();
+      int64_t total_tokens = 0;
+      for (const auto& q : parsed.questions) {
+        std::vector<std::string> options = so::RenderDecisionOptions(q);
+
+        so::DecisionResult dr;
+        if (is_kev) {
+          vllm::KevDecisionResult result =
+              vllm::KevInference(model, tokenizer, parsed.text,
+                                  q.type, q.instructions, options);
+          dr.scores = std::move(result.scores);
+          dr.act_logits = std::move(result.act_logits);
+          dr.prompt_tokens = result.prompt_tokens;
+        } else {
+          vllm::LayaDecisionResult result =
+              vllm::LayaInference(model, tokenizer, parsed.text,
+                                  q.type, q.instructions, options);
+          dr.scores = std::move(result.scores);
+          dr.act_logits = std::move(result.act_logits);
+          dr.prompt_tokens = result.prompt_tokens;
+        }
+        total_tokens += dr.prompt_tokens;
+        answers[q.id] = so::BuildSystemOneAnswerDecision(q, dr);
       }
-      total_tokens += dr.prompt_tokens;
-      answers[q.id] = so::BuildSystemOneAnswerDecision(q, dr);
-    }
-    auto end = std::chrono::steady_clock::now();
-    double latency_ms =
-        std::chrono::duration<double, std::milli>(end - start).count();
+      auto end = std::chrono::steady_clock::now();
+      double latency_ms =
+          std::chrono::duration<double, std::milli>(end - start).count();
 
-    std::string model_name =
-        parsed.model.empty() ? engine->model_path : parsed.model;
-    std::string resp = nlohmann::json{
-        {"model", model_name},
-        {"answers", std::move(answers)},
-        {"usage", nlohmann::json{{"input_tokens", total_tokens},
-                                 {"output_tokens", 0}}},
-        {"latency_ms", so::R2(latency_ms)},
-    }.dump();
-    char* dup = DupString(resp);
-    if (dup == nullptr) {
-      SetError("vllm_systemone: out-of-memory allocating response");
+      std::string model_name =
+          parsed.model.empty() ? engine->model_path : parsed.model;
+      std::string resp = nlohmann::json{
+          {"model", model_name},
+          {"answers", std::move(answers)},
+          {"usage", nlohmann::json{{"input_tokens", total_tokens},
+                                   {"output_tokens", 0}}},
+          {"latency_ms", so::R2(latency_ms)},
+      }.dump();
+      char* dup = DupString(resp);
+      if (dup == nullptr) {
+        SetError("vllm_decide: out-of-memory allocating response");
+        return VLLM_ERR_RUNTIME;
+      }
+      *out_json = dup;
+      ClearError();
+      return VLLM_OK;
+    } catch (const std::exception& e) {
+      SetError(std::string("vllm_decide: ") + e.what());
       return VLLM_ERR_RUNTIME;
+    } catch (...) {
+      SetError("vllm_decide: unknown error");
+      return VLLM_ERR_UNKNOWN;
     }
-    *out_json = dup;
-    ClearError();
-    return VLLM_OK;
-  } catch (const std::exception& e) {
-    SetError(std::string("vllm_systemone: ") + e.what());
-    return VLLM_ERR_RUNTIME;
-  } catch (...) {
-    SetError("vllm_systemone: unknown error");
-    return VLLM_ERR_UNKNOWN;
   }
-}
 
-VLLM_API void vllm_systemone_free(char* json) { std::free(json); }
-
-VLLM_API vllm_status vllm_score(vllm_engine* engine,
-                                 const char* request_json,
-                                 char** out_json) {
-  if (out_json == nullptr) {
-    SetError("vllm_score: out_json is null");
-    return VLLM_ERR_INVALID_ARGUMENT;
-  }
-  *out_json = nullptr;
-  if (engine == nullptr || request_json == nullptr) {
-    SetError("vllm_score: engine or request_json is null");
-    return VLLM_ERR_INVALID_ARGUMENT;
-  }
-  if (engine->loaded == nullptr) {
-    SetError(
-        "vllm_score: this engine was loaded from a transcription-only "
-        "checkpoint (Parakeet); use vllm_transcribe");
-    return VLLM_ERR_INVALID_ARGUMENT;
-  }
-  const std::string arch(engine->loaded->architecture());
-  if (arch != "CuaS1Forms") {
-    SetError(
-        "vllm_score: this engine's architecture is '" + arch +
-        "', not 'CuaS1Forms'; use vllm_complete / vllm_embed");
-    return VLLM_ERR_INVALID_ARGUMENT;
-  }
+  // ── Score pipeline (cua-s1) ──
   nlohmann::json body;
   try {
     body = nlohmann::json::parse(request_json);
   } catch (const std::exception& e) {
-    SetError(std::string("vllm_score: invalid JSON body: ") + e.what());
+    SetError(std::string("vllm_decide: invalid JSON body: ") + e.what());
     return VLLM_ERR_INVALID_ARGUMENT;
   }
   if (!body.is_object()) {
-    SetError("vllm_score: request body must be an object");
+    SetError("vllm_decide: request body must be an object");
     return VLLM_ERR_INVALID_ARGUMENT;
   }
   if (!body.contains("context") || !body["context"].is_string()) {
-    SetError("vllm_score: context is required and must be a string");
+    SetError("vllm_decide: context is required and must be a string");
     return VLLM_ERR_INVALID_ARGUMENT;
   }
   const std::string context = body["context"].get<std::string>();
   if (!body.contains("options") || !body["options"].is_array()) {
-    SetError("vllm_score: options is required and must be an array of strings");
+    SetError("vllm_decide: options is required and must be an array of strings");
     return VLLM_ERR_INVALID_ARGUMENT;
   }
   std::vector<std::string> options;
   for (const auto& opt : body["options"]) {
     if (!opt.is_string()) {
-      SetError("vllm_score: each option must be a string");
+      SetError("vllm_decide: each option must be a string");
       return VLLM_ERR_INVALID_ARGUMENT;
     }
     options.push_back(opt.get<std::string>());
   }
   if (options.empty()) {
-    SetError("vllm_score: options must not be empty");
+    SetError("vllm_decide: options must not be empty");
     return VLLM_ERR_INVALID_ARGUMENT;
   }
-  namespace so = vllm::entrypoints::openai::systemone;
   try {
     std::lock_guard<std::mutex> lock(engine->embed_mutex);
     const vllm::LoadedModel& model = engine->loaded->loaded_model();
@@ -1879,22 +1857,22 @@ VLLM_API vllm_status vllm_score(vllm_engine* engine,
     }.dump();
     char* dup = DupString(resp);
     if (dup == nullptr) {
-      SetError("vllm_score: out-of-memory allocating response");
+      SetError("vllm_decide: out-of-memory allocating response");
       return VLLM_ERR_RUNTIME;
     }
     *out_json = dup;
     ClearError();
     return VLLM_OK;
   } catch (const std::exception& e) {
-    SetError(std::string("vllm_score: ") + e.what());
+    SetError(std::string("vllm_decide: ") + e.what());
     return VLLM_ERR_RUNTIME;
   } catch (...) {
-    SetError("vllm_score: unknown error");
+    SetError("vllm_decide: unknown error");
     return VLLM_ERR_UNKNOWN;
   }
 }
 
-VLLM_API void vllm_score_free(char* json) { std::free(json); }
+VLLM_API void vllm_decide_free(char* json) { std::free(json); }
 
 // ── Video+audio generation (ABI v12; generalized at v18) ────────────────────
 // Thin C wrappers over the ONE library seam — since v18 the ABSTRACT one

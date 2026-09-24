@@ -847,4 +847,15 @@ size_t DeviceMemoryTotalBytes(int index) noexcept {
   return tot_b;
 }
 
+size_t ManagedMemoryBudgetBytes(int index) noexcept {
+  // BACKEND-ROCM-BUDGET-MANAGED-CEILING, issue #2518. Same probe as
+  // DeviceMemoryTotalBytes, returns `free` not `total`. On a managed-alloc
+  // board (gfx1151), hipMallocManaged's ceiling is the free field, not the
+  // physical total. The 6 GiB gap is driver-reserved + KFD TTM + display.
+  if (hipSetDevice(index) != hipSuccess) return 0;
+  size_t free_b = 0, tot_b = 0;
+  if (hipMemGetInfo(&free_b, &tot_b) != hipSuccess) return 0;
+  return free_b;
+}
+
 }  // namespace vt::rocm

@@ -69,4 +69,15 @@ bool ManagedAllocActive(int index) noexcept;
 // refusal already reads as "do not decide", never as "nothing fits".
 size_t DeviceMemoryTotalBytes(int index) noexcept;
 
+// BACKEND-ROCM-BUDGET-MANAGED-CEILING, issue #2518. `hipMemGetInfo`'s
+// `free` for device `index`, in bytes; 0 when the device is absent or the
+// probe fails. This is the budget the device-weight fit check tests against:
+// on a managed-alloc board (Strix Halo gfx1151), every Backend::Alloc goes
+// through hipMallocManaged, whose ceiling is hipMemGetInfo's `free` — not
+// `total`, which overstates the managed ceiling by ~6 GiB on this board.
+// DeviceMemoryTotalBytes stays for callers that want the physical total
+// (DeviceMemoryInfo, --device-info). 0 == UNKNOWN, same contract as
+// DeviceMemoryTotalBytes.
+size_t ManagedMemoryBudgetBytes(int index) noexcept;
+
 }  // namespace vt::rocm

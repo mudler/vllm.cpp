@@ -31,12 +31,14 @@ namespace {
 
 class RocmPlatform final : public Platform {
  public:
-  // Issue #1934. `device_memory_total_bytes` is `vt::rocm::DeviceMemoryTotalBytes(0)`,
-  // probed once by the registrar below at static init, exactly mirroring how
-  // `CudaPlatform` threads its own `cudaMemGetInfo` probe through its
-  // constructor (`platforms/cuda.cpp`). 0 means the probe failed or no device
-  // is present; `residency_policy()` passes it through unexamined, and
-  // `gguf_device_fit.h` already reads 0 as UNKNOWN rather than "nothing fits".
+  // Issue #2518. `device_memory_total_bytes` is
+  // `vt::rocm::ManagedMemoryBudgetBytes(0)` (hipMemGetInfo's `free`), probed
+  // once by the registrar below at static init. On a managed-alloc board
+  // (gfx1151 / Strix Halo), every Backend::Alloc goes through
+  // hipMallocManaged whose ceiling is `free`, not `total`. 0 means the probe
+  // failed or no device is present; `residency_policy()` passes it through
+  // unexamined, and `gguf_device_fit.h` reads 0 as UNKNOWN rather than
+  // "nothing fits".
   explicit RocmPlatform(size_t device_memory_total_bytes)
       : device_memory_total_bytes_(device_memory_total_bytes) {}
 
@@ -273,13 +275,12 @@ class RocmPlatform final : public Platform {
 struct Registrar {
   Registrar() noexcept {
     if (!vt::rocm::DeviceAvailable()) return;
-    // Issue #1934. Device 0, matching this leg's other single-device probes
-    // (`host_memory_is_device_addressable()` above states the same choice).
-    // HIP-free free function, not `Backend::DeviceMemoryInfo`: the backend's
-    // OWN registrar (`rocm_backend.hip`) may not have run yet at this point —
-    // static-init order across TUs is unspecified, the same reason this
-    // registrar probes the device itself rather than trusting one.
-    static RocmPlatform platform(vt::rocm::DeviceMemoryTotalBytes(0));
+    // Issue #2518. Use ManagedMemoryBudgetBytes (hipMemGetInfo's `free`),
+    // not DeviceMemoryTotalBytes (`total`): on a managed-alloc board
+    // (gfx1151 / Strix Halo), every Backend::Alloc goes through
+    // hipMallocManaged whose ceiling is `free`, not `total`. The ~6 GiB gap
+    // was causing the fit check to pass loads that die at allocation.
+    static RocmPlatform platform(vt::rocm::ManagedMemoryBudgetBytes(0));
     RegisterPlatform(DeviceType::kROCM, &platform);
   }
 } registrar;

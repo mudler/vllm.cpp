@@ -164,6 +164,20 @@ const bool kHostProfile = [] {
   return v != nullptr && std::strcmp(v, "0") != 0;
 }();
 
+// FENCE STALL GUARD (BACKEND-VULKAN-FENCE-TIMEOUT). By default a dispatch that
+// never completes blocks in vkWaitForFences(.., UINT64_MAX) forever, holding the
+// host at ~100% CPU while a wedged GPU burns a core. VT_VK_FENCE_TIMEOUT_MS sets
+// a ceiling (ms); when it fires the process ABORTS with a loud message naming the last
+// dispatch instead of spinning until someone power-cycles the box. 0 = block forever
+// (stock behaviour, kept for correctness-identical runs).
+const int64_t kFenceTimeoutMs = [] {
+  const char* v = std::getenv("VT_VK_FENCE_TIMEOUT_MS");
+  if (v == nullptr) return int64_t(0);
+  char* end = nullptr;
+  int64_t ms = std::strtoll(v, &end, 10);
+  return (end != v && ms > 0) ? ms : int64_t(0);
+}();
+
 // Accumulators for the above. Every one of these is touched only under the
 // dispatch mutex, which Dispatch and FlushBatchLocked's caller already hold.
 struct HostProfile {
@@ -1561,7 +1575,19 @@ void VulkanContext::RetireSlotLocked(uint32_t s) {
   // Counted BEFORE the wait and only when the fence is genuinely unsignalled, so
   // the counter measures blocked retirements rather than retirements.
   if (vk.vkGetFenceStatus(device, fence) == VK_NOT_READY) ++fence_wait_count_;
-  Check(vk.vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+  if (kFenceTimeoutMs > 0) {
+    VkResult wr = vk.vkWaitForFences(device, 1, &fence, VK_TRUE,
+                                      static_cast<uint64_t>(kFenceTimeoutMs) * 1000000ull);
+    if (wr == VK_TIMEOUT) {
+      std::fprintf(stderr,
+        "[vt vulkan] FATAL: retired dispatch did not signal in %lld ms - GPU wedged, aborting "
+        "(VT_VK_FENCE_TIMEOUT_MS).\n",
+        static_cast<long long>(kFenceTimeoutMs));
+      std::fflush(stderr); std::abort();
+    }
+  } else {
+    Check(vk.vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+  }
   const uint64_t hp_t1 = kHostProfile ? NowNs() : 0;
 
   // Read the timestamps back, now that this slot has certainly completed.

@@ -1,0 +1,131 @@
+#version 450
+// Tiled dense GEMM for prefill (M > 1). Uses shared memory blocking to reuse
+// B tiles across output rows, giving 10-20x speedup over the scalar vt_matmul
+// at large M.
+//
+// TILE SIZES: BM=16, BN=64, BK=32. One workgroup per [BM, BN] output tile.
+// 128 lanes cooperatively load A[BM, BK] and B[BK, BN] tiles into shared memory,
+// then each lane accumulates 8 output elements (BM*BN/128 = 16*64/128 = 8).
+//
+// ORIENTATIONS:
+//   VT_MM_BT == 0 : b is [K,N] row-major — b[k*N + j]
+//   VT_MM_BT == 1 : b is [N,K] row-major — b[j*K + k] (torch Linear weight layout)
+//
+// BIT EXACTNESS: This kernel uses a DIFFERENT accumulation order than the scalar
+// vt_matmul (tiled K reduction vs. sequential). Results are not bit-identical but
+// are within f32 round-off tolerance. The scalar kernel remains the correctness
+// reference; this kernel is selected only for M > 1 (prefill).
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer Ab32 { uint v[]; } A32;
+layout(binding = 1) readonly buffer Ab16 { uint16_t v[]; } A16;
+layout(binding = 2) readonly buffer Bb32 { uint v[]; } B32;
+layout(binding = 3) readonly buffer Bb16 { uint16_t v[]; } B16;
+layout(binding = 4) buffer Db32 { uint v[]; } D32;
+layout(binding = 5) buffer Db16 { uint16_t v[]; } D16;
+
+layout(constant_id = 0) const uint VT_MM_A_DT = VT_DT_BF16;
+layout(constant_id = 1) const uint VT_MM_B_DT = VT_DT_BF16;
+layout(constant_id = 2) const uint VT_MM_OUT_DT = VT_DT_BF16;
+layout(constant_id = 3) const uint VT_MM_BT = 0u;
+
+layout(push_constant) uniform Params {
+  uint m;
+  uint n;
+  uint k;
+  uint a_off;
+  uint b_off;
+  uint out_off;
+} p;
+
+// Tile dimensions.
+#define BM 16u
+#define BN 64u
+#define BK 32u
+#define ACC_PER_LANE (BM * BN / 128u)  // 8
+
+shared float sm_a[BM * BK];   // 512 floats
+shared float sm_b[BK * BN];   // 2048 floats
+
+void main() {
+  const uint gid = gl_WorkGroupID.x;
+  const uint n_tiles = (p.n + BN - 1u) / BN;
+  const uint m_tiles = (p.m + BM - 1u) / BM;
+  const uint tile_m = gid / n_tiles;
+  const uint tile_n = gid % n_tiles;
+  if (tile_m >= m_tiles) return;
+
+  const uint m_off = tile_m * BM;
+  const uint n_off = tile_n * BN;
+  const uint tid = gl_LocalInvocationID.x;
+
+  // Lane -> output element mapping: lane t owns row t/(BN/ACC) and
+  // cols (t%(BN/ACC))*ACC .. +ACC-1. BN/ACC = 64/8 = 8.
+  const uint lane_row = tid / (BN / ACC_PER_LANE);       // 0..15
+  const uint lane_col_base = (tid % (BN / ACC_PER_LANE)) * ACC_PER_LANE;  // 0,8,...,56
+
+  float acc[ACC_PER_LANE];
+  for (uint i = 0u; i < ACC_PER_LANE; ++i) acc[i] = 0.0;
+
+  const uint k_tiles = (p.k + BK - 1u) / BK;
+
+  for (uint kt = 0u; kt < k_tiles; ++kt) {
+    const uint k_off = kt * BK;
+
+    // Cooperative load of A tile [BM, BK]: 512 elements, 128 lanes -> 4 per lane.
+    for (uint i = tid; i < BM * BK; i += 128u) {
+      const uint bm = i / BK;
+      const uint bk = i % BK;
+      const uint m_idx = m_off + bm;
+      const uint k_idx = k_off + bk;
+      float val = 0.0;
+      if (m_idx < p.m && k_idx < p.k) {
+        val = VT_LOAD(A32, A16, VT_MM_A_DT, p.a_off, m_idx * p.k + k_idx);
+      }
+      sm_a[i] = val;
+    }
+
+    // Cooperative load of B tile [BK, BN]: 2048 elements, 128 lanes -> 16 per lane.
+    for (uint i = tid; i < BK * BN; i += 128u) {
+      const uint bk = i / BN;
+      const uint bn = i % BN;
+      const uint k_idx = k_off + bk;
+      const uint n_idx = n_off + bn;
+      float val = 0.0;
+      if (k_idx < p.k && n_idx < p.n) {
+        uint b_elem;
+        if (VT_MM_BT == 0u) {
+          b_elem = k_idx * p.n + n_idx;   // B is [K, N]
+        } else {
+          b_elem = n_idx * p.k + k_idx;   // B is [N, K]
+        }
+        val = VT_LOAD(B32, B16, VT_MM_B_DT, p.b_off, b_elem);
+      }
+      sm_b[i] = val;
+    }
+
+    barrier();
+
+    // Compute partial products: each lane accumulates its 8 output elements.
+    for (uint bk = 0u; bk < BK; ++bk) {
+      const float a_val = sm_a[lane_row * BK + bk];
+      for (uint i = 0u; i < ACC_PER_LANE; ++i) {
+        acc[i] = fma(a_val, sm_b[bk * BN + lane_col_base + i], acc[i]);
+      }
+    }
+
+    barrier();
+  }
+
+  // Write output: each lane writes its 8 elements.
+  for (uint i = 0u; i < ACC_PER_LANE; ++i) {
+    const uint m_idx = m_off + lane_row;
+    const uint n_idx = n_off + lane_col_base + i;
+    if (m_idx < p.m && n_idx < p.n) {
+      VT_STORE(D32, D16, VT_MM_OUT_DT, p.out_off, m_idx * p.n + n_idx, acc[i]);
+    }
+  }
+}

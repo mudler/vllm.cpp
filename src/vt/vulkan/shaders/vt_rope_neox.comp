@@ -1,0 +1,127 @@
+#version 450
+// vt::RopeNeox — in-place partial NeoX rotary on q[T,Hq,D] and k[T,Hk,D].
+//
+// CPU oracle: RopeNeoxKernel + RopeRotateHead (src/vt/cpu/cpu_ops.cpp:1009-1038).
+// Sibling of vt_rope_from_cache.comp (the supplied-cache apply); this variant
+// computes the angle from `base` directly instead of gathering a cos|sin table,
+// which is what the dense_attn AttnBlock path uses.
+//
+// NUMERICS CONTRACT, SAME AS vt_rope_cos_sin_cache.comp: the frequency is
+// std::pow(base, -2i/rot) in f64 on the CPU; glslang 15.1/16.5 expose no f64
+// pow/trig builtins. The angle ACCUMULATION stays f64 (position * freq) — that
+// is where long-position precision would be lost — while the pow and the final
+// trig run in f32 after an exact-in-f32 range reduction. Tracked exception,
+// mirrors the rope-cache kernel's comment; revisit if 128K-ctx quality drifts.
+//
+// GRID: one invocation per (token, pair, head) over hq+hk heads — identical
+// decomposition to vt_rope_from_cache.comp so the two applies stay comparable.
+#extension GL_GOOGLE_include_directive : require
+#include "vt_common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) buffer Qb32 { uint v[]; } Q32;
+layout(binding = 1) buffer Qb16 { uint16_t v[]; } Q16;
+layout(binding = 2) buffer Kb32 { uint v[]; } K32;
+layout(binding = 3) buffer Kb16 { uint16_t v[]; } K16;
+layout(binding = 4) readonly buffer Pb { uint v[]; } P;  // positions, i32 or i64
+
+#define VT_POS_I32 0u
+#define VT_POS_I64 1u
+
+layout(constant_id = 0) const uint VT_ROPE_Q_DT = VT_DT_F32;
+layout(constant_id = 1) const uint VT_ROPE_K_DT = VT_DT_F32;
+layout(constant_id = 2) const uint VT_ROPE_POS_DT = VT_POS_I32;
+layout(constant_id = 3) const uint VT_ROPE_LLAMA3 = 0u;
+layout(constant_id = 4) const uint VT_ROPE_Q_HD = 0u;   // q head_dim (0 => == rotary_dim)
+layout(constant_id = 5) const uint VT_ROPE_K_HD = 0u;   // k head_dim (0 => == rotary_dim)
+
+layout(push_constant) uniform Params {
+  uint tokens;
+  uint half_dim;    // rotary_dim / 2
+  uint rotary_dim;
+  uint hq;
+  uint hk;
+  uint q_off, k_off, p_off;
+  double base;
+  double l3_sf, l3_lo, l3_hi, l3_omax;
+} p;
+
+// Llama-3 frequency rescaling, cpu_ops.cpp:987-1005. No-op unless enabled.
+double VtLlama3ScaleFreq(double freq) {
+  const double kTwoPi = 6.283185307179586476925286766559LF;
+  const double low_freq_wavelen = p.l3_omax / p.l3_lo;
+  const double high_freq_wavelen = p.l3_omax / p.l3_hi;
+  const double wave_len = kTwoPi / freq;
+  double smth = 0.0LF;
+  if (p.l3_lo != p.l3_hi) {
+    smth = (p.l3_omax / wave_len - p.l3_lo) / (p.l3_hi - p.l3_lo);
+  }
+  if (wave_len < high_freq_wavelen) return freq;
+  if (wave_len > low_freq_wavelen) return freq / p.l3_sf;
+  return (1.0LF - smth) * freq / p.l3_sf + smth * freq;
+}
+
+// Exact f64 reduction of `angle` into [-pi, pi], then f32 trig. The reduction
+// division/floor are the only extra roundings vs the CPU's direct f64 trig;
+// at gate depths the total phase error sits far below what the f32 store of
+// the rotated elements already implies.
+float VtSin(double angle) {
+  const double kTwoPi = 6.283185307179586476925286766559LF;
+  double reduced = angle - kTwoPi * floor(angle / kTwoPi);
+  return sin(float(reduced));
+}
+float VtCos(double angle) {
+  const double kTwoPi = 6.283185307179586476925286766559LF;
+  double reduced = angle - kTwoPi * floor(angle / kTwoPi);
+  return cos(float(reduced));
+}
+
+void main() {
+  uint gid = gl_GlobalInvocationID.x;
+  uint heads = p.hq + p.hk;
+  uint per_token = p.half_dim * heads;
+  if (gid >= p.tokens * per_token) { return; }
+
+  uint token = gid / per_token;
+  uint rem = gid % per_token;
+  uint pair = rem / heads;
+  uint head = rem % heads;
+
+  uint pbase = p.p_off >> 2;
+  uint position =
+      VT_ROPE_POS_DT == VT_POS_I64 ? P.v[pbase + 2u * token] : P.v[pbase + token];
+
+  // cpu_ops.cpp:1013-1014. TRACKED EXCEPTION (see header): f32 pow, tracked in
+  // the shader comment above and in .agents/VK4-NOTES.md.
+  float freq_f = pow(float(p.base), -2.0 * float(pair) / float(p.rotary_dim));
+  double freq = double(freq_f);
+  if (VT_ROPE_LLAMA3 == 1u) { freq = VtLlama3ScaleFreq(freq); }
+  double angle = double(position) * freq;
+  float c = VtCos(angle);
+  float s = VtSin(angle);
+
+  // cpu_ops.cpp:1018-1021: NeoX half-split rotate. This op IS the NeoX form,
+  // no GPT-J specialization needed (RopeFromCache carries that flag instead).
+  uint first = pair;
+  uint second = pair + p.half_dim;
+
+  if (head < p.hq) {
+    const uint qhd = VT_ROPE_Q_HD != 0u ? VT_ROPE_Q_HD : p.rotary_dim;
+    uint off = token * p.hq * qhd + head * qhd;   // stride by HEAD DIM, not rotary:
+                                                  // partial rotary (rot<d) keeps the
+                                                  // un-rotated tail intact in place.
+    float x = VT_LOAD(Q32, Q16, VT_ROPE_Q_DT, p.q_off, off + first);
+    float y = VT_LOAD(Q32, Q16, VT_ROPE_Q_DT, p.q_off, off + second);
+    VT_STORE(Q32, Q16, VT_ROPE_Q_DT, p.q_off, off + first, x * c - y * s);
+    VT_STORE(Q32, Q16, VT_ROPE_Q_DT, p.q_off, off + second, x * s + y * c);
+  } else {
+    const uint khd = VT_ROPE_K_HD != 0u ? VT_ROPE_K_HD : p.rotary_dim;
+    uint kh = head - p.hq;
+    uint off = token * p.hk * khd + kh * khd;
+    float x = VT_LOAD(K32, K16, VT_ROPE_K_DT, p.k_off, off + first);
+    float y = VT_LOAD(K32, K16, VT_ROPE_K_DT, p.k_off, off + second);
+    VT_STORE(K32, K16, VT_ROPE_K_DT, p.k_off, off + first, x * c - y * s);
+    VT_STORE(K32, K16, VT_ROPE_K_DT, p.k_off, off + second, x * s + y * c);
+  }
+}

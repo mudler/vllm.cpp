@@ -358,7 +358,13 @@ extern "C" {
  * entities with character offsets. The entry point is additive: a
  * non-GLiNER2 engine is refused by name, and every existing struct and call is
  * byte-identical. */
-#define VLLM_ABI_VERSION 27
+/* v28 — vllm_systemone / vllm_score: SystemOne decision API and cua-s1 score
+ * API through the ONE surface. A kev/laya engine (architecture "KevModel" or
+ * "LayaModel") runs the decision forward and returns a JSON response string;
+ * a cua-s1 engine (architecture "CuaS1Forms") runs the score forward. Both are
+ * additive: non-matching architectures are refused by name, and every existing
+ * struct and call is byte-identical. */
+#define VLLM_ABI_VERSION 28
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -1164,6 +1170,35 @@ VLLM_API vllm_status vllm_gliner_ner(vllm_engine* engine, const char* text,
 
 /* Free the owned members of a NER result and zero the struct. NULL is a no-op. */
 VLLM_API void vllm_ner_result_free(vllm_ner_result* out);
+
+
+/* ── SystemOne + Score (ABI v28, MODEL-KEV / MODEL-LAYA / MODEL-CUA-S1-FORMS) ──
+ *
+ * vllm_systemone runs the kev/laya decision pipeline and returns the full
+ * JSON response as a library-allocated string. The caller frees the string with
+ * vllm_systemone_free. A kev engine (architecture "KevModel") or a laya engine
+ * (architecture "LayaModel") is required; other architectures are refused by
+ * name. The request_json is the raw body of the POST /v1/systemone request.
+ *
+ * On success *out_json is a heap-allocated NUL-terminated string (caller frees).
+ * On any non-OK status *out_json is NULL and vllm_last_error() carries detail.
+ *
+ * vllm_score runs the cua-s1-forms scoring pipeline. A cua-s1 engine
+ * (architecture "CuaS1Forms") is required. Same ownership semantics. */
+VLLM_API vllm_status vllm_systemone(vllm_engine* engine,
+                                     const char* request_json,
+                                     char** out_json);
+
+/* Free a string returned by vllm_systemone. NULL is a no-op. */
+VLLM_API void vllm_systemone_free(char* json);
+
+/* Run cua-s1-forms scoring. request_json is the raw body of POST /v1/score. */
+VLLM_API vllm_status vllm_score(vllm_engine* engine,
+                                 const char* request_json,
+                                 char** out_json);
+
+/* Free a string returned by vllm_score. NULL is a no-op. */
+VLLM_API void vllm_score_free(char* json);
 
 
 /* ── Video+audio generation (ABI v12, MiniMax-H3) ────────────────────────────

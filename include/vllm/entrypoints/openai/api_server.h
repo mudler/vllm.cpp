@@ -36,6 +36,7 @@
 #include "vllm/entrypoints/openai/serving_chat.h"
 #include "vllm/entrypoints/openai/serving_completion.h"
 #include "vllm/entrypoints/openai/serving_models.h"
+#include "vllm/entrypoints/openai/systemone.h"
 #include "vllm/entrypoints/openai/video_api.h"
 #include "vllm/entrypoints/openai/speech_api.h"
 #include "vllm/multimodal/parakeet_transcription.h"
@@ -289,17 +290,10 @@ class ApiServer {
   // (Gliner2NerInference) — the SAME path vllm_gliner_ner drives — so HTTP
   // and FFI cannot drift. Returns extracted entities + prompt token count;
   // throws to fail the request (-> 500).
-  struct NerEntity {
-    std::string label;
-    std::string text;
-    int64_t start;
-    int64_t end;
-    float confidence;
-  };
-  struct NerResult {
-    std::vector<NerEntity> entities;
-    int64_t prompt_tokens = 0;
-  };
+  // Result types are defined in systemone.h and aliased here so the
+  // callback typedefs and server_main.cpp keep their existing names.
+  using NerEntity = systemone::NerEntity;
+  using NerResult = systemone::NerResult;
   using NerFn = std::function<NerResult(
       const std::string& text, const std::vector<std::string>& labels,
       float threshold, int64_t max_width)>;
@@ -311,12 +305,7 @@ class ApiServer {
   // handler runs one forward (context + options → probabilities) and returns
   // the per-option distribution + winner. The callback wraps the ONE library
   // seam (CuaS1ScoreInference) so HTTP and FFI cannot drift.
-  struct ScoreResult {
-    std::vector<float> probabilities;  // per-option probability
-    int64_t winner = 0;               // argmax index
-    float confidence = 0.0F;          // winner probability
-    int64_t prompt_tokens = 0;
-  };
+  using ScoreResult = systemone::ScoreResult;
   using ScoreFn = std::function<ScoreResult(
       const std::string& context,
       const std::vector<std::string>& options)>;
@@ -327,11 +316,7 @@ class ApiServer {
   // SystemOne handler runs one decision forward per question and returns
   // per-option scores + escalate logits instead of NER entities. The callback
   // wraps the ONE library seam (LayaInference) so HTTP and FFI cannot drift.
-  struct DecisionResult {
-    std::vector<float> scores;       // per-option raw logits
-    std::vector<float> act_logits;   // [n_act] escalate decision
-    int64_t prompt_tokens = 0;
-  };
+  using DecisionResult = systemone::DecisionResult;
   using DecisionFn = std::function<DecisionResult(
       const std::string& state, const std::string& qtype,
       const std::string& instructions,

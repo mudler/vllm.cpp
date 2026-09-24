@@ -89,6 +89,12 @@ kev::HeadWeights LoadHeadWeights(const std::vector<SafetensorsFile>& shards) {
   kev::HeadWeights hw;
   for (const SafetensorsFile& shard : shards) {
     for (const std::string& name : shard.Names()) {
+      // Only load the four PointerHead tensors; skip base model tensors
+      // (model.safetensors carries BF16 Qwen3.5 weights).
+      if (name != "q.weight" && name != "q.bias" &&
+          name != "k.weight" && name != "k.bias") {
+        continue;
+      }
       const StTensor& t = shard.Get(name);
       if (t.dtype != "F32") {
         throw std::runtime_error(
@@ -149,7 +155,6 @@ std::unique_ptr<LoadedModel> LoadKev(
   if (config.raw.contains("kev_temperature")) {
     temperature = config.raw["kev_temperature"].get<float>();
   }
-
   return std::make_unique<KevLoadedModel>(
       registration, std::move(weights), std::move(head_weights),
       head_params, temperature, config);

@@ -1764,6 +1764,11 @@ void L2NormKernel(Queue&, Tensor& out, const Tensor& x, const L2NormArgs& args) 
   });
 }
 
+// Round to bf16 and widen back. Upstream stores bf16 and reloads it as an
+// operand; our CPU arm has no bf16 arithmetic, so every site below is
+// round-then-widen, which is what Triton does too (f32 accumulate, bf16 store).
+inline float Bf16(float v) { return BF16ToF32(F32ToBF16(v)); }
+
 // §5 RMSNormGated (norm_before_gate=True, group_size=None):
 // out = x * rsqrt(mean(x^2) + eps) * w * act(gate); act = silu or sigmoid.
 void RmsNormGatedKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& gate,
@@ -1776,6 +1781,12 @@ void RmsNormGatedKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& gate
   // degenerates to i*gate.stride[0] == i*d (group == 1), byte-identical.
   const int64_t gate_group = gate.rank == 3 ? gate.shape[1] : 1;
   const int64_t gate_outer = gate.stride[0];
+  // Match the Python fallback Qwen3_5RMSNormGated (modeling_qwen3_5.py:271):
+  // when the operands are bf16, the norm is cast to bf16 before the weight
+  // multiply, and the weight*norm product is cast to bf16 before the gate.
+  // The f32 arm (VT_GDN_BF16=0) is unchanged — input_dtype=f32 makes the
+  // .to(input_dtype) casts no-ops. StoreF32 applies the final .to(input_dtype).
+  const bool bf16 = (x.dtype == DType::kBF16);
   ForRows(t, [&](int64_t r0, int64_t r1) {
   for (int64_t i = r0; i < r1; ++i) {
     float sumsq = 0.0f;
@@ -1788,7 +1799,13 @@ void RmsNormGatedKernel(Queue&, Tensor& out, const Tensor& x, const Tensor& gate
     for (int64_t j = 0; j < d; ++j) {
       const float z = LoadF32(gate, gbase + j);
       const float act = args.sigmoid_gate ? 1.0f / (1.0f + std::exp(-z)) : Silu(z);
-      StoreF32(out, i * d + j, LoadF32(x, i * d + j) * inv * LoadF32(w, j) * act);
+      if (bf16) {
+        const float norm = Bf16(LoadF32(x, i * d + j) * inv);
+        const float weighted = Bf16(LoadF32(w, j) * norm);
+        StoreF32(out, i * d + j, weighted * act);
+      } else {
+        StoreF32(out, i * d + j, LoadF32(x, i * d + j) * inv * LoadF32(w, j) * act);
+      }
     }
   }
   });
@@ -1978,11 +1995,6 @@ struct GdnChunkScratch {
 // every reduction is inside one work item, and the cross-chunk state recurrence
 // stays sequential within it (R4/T6).
 constexpr int64_t kGdnChunk = 64;  // FLA_CHUNK_SIZE (utils.py:31), == cuda_gdn.cu:169 kChunk
-
-// Round to bf16 and widen back. Upstream stores bf16 and reloads it as an
-// operand; our CPU arm has no bf16 arithmetic, so every site below is
-// round-then-widen, which is what Triton does too (f32 accumulate, bf16 store).
-inline float Bf16(float v) { return BF16ToF32(F32ToBF16(v)); }
 
 // One (sequence, value-head) work item: the chunk loop, carrying `h` forward.
 // `h` is the [Dv,Dk] f32 state block, updated in place (chunk_delta_h.py:353-355

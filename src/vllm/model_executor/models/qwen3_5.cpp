@@ -3957,13 +3957,23 @@ GdnBaOutput ProjectGdnBARaw(Dev d, const GdnLayerWeights& weights,
 
     Tensor b_weight = packed_weight.Slice(0, 0, value_heads);
     Tensor a_weight = packed_weight.Slice(0, value_heads, 2 * value_heads);
-    out.b_owner.emplace(MatmulBTRawD(d, hidden, b_weight, DType::kF32));
-    out.a_owner.emplace(MatmulBTRawD(d, hidden, a_weight, DType::kF32));
+    // HF transformers' nn.Linear outputs the model dtype (BF16) for a/b.
+    // The merged-CUDA arm keeps F32 (FLA's split), but the split arm is
+    // CPU-only and must round to match the reference.
+    const DType ba_dt = GdnInDType();
+    out.b_owner.emplace(MatmulBTRawD(d, hidden, b_weight, ba_dt));
+    out.a_owner.emplace(MatmulBTRawD(d, hidden, a_weight, ba_dt));
   } else {
     VT_CHECK(!weights.in_proj_b.Empty() && !weights.in_proj_a.Empty(),
              "qwen3_5 GDN BA: packed or both split weights are required");
-    out.b_owner.emplace(MatmulF32D(d, hidden, weights.in_proj_b));
-    out.a_owner.emplace(MatmulF32D(d, hidden, weights.in_proj_a));
+    // HF transformers' nn.Linear outputs BF16 for a/b in BF16 mode.
+    const DType ba_dt = GdnInDType();
+    out.b_owner.emplace(ba_dt == DType::kBF16
+                            ? MatmulBf16D(d, hidden, weights.in_proj_b)
+                            : MatmulF32D(d, hidden, weights.in_proj_b));
+    out.a_owner.emplace(ba_dt == DType::kBF16
+                            ? MatmulBf16D(d, hidden, weights.in_proj_a)
+                            : MatmulF32D(d, hidden, weights.in_proj_a));
   }
   out.b = out.b_owner->t();
   out.a = out.a_owner->t();
@@ -9437,9 +9447,31 @@ std::vector<float> Qwen3_5DenseModel::ForwardDenseHidden(
   DBuf res(d, ResidualDType(d), {T, H});
   res.Zero(d);
 
-  for (int64_t l = 0; l < config.num_hidden_layers; ++l)
+  for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     RunDenseLayer(d, weights.layers[static_cast<size_t>(l)], config, hidden, res,
                   positions, T);
+    if (std::getenv("VT_KEV_LAYER_DUMP")) {
+      DBuf dh32(d, DType::kF32, {T, H});
+      vt::CastF32(d.q, dh32.t(), hidden.t());
+      std::vector<float> hf(static_cast<size_t>(T) * static_cast<size_t>(H));
+      dh32.Download(d, hf.data());
+      DBuf dr32(d, DType::kF32, {T, H});
+      vt::CastF32(d.q, dr32.t(), res.t());
+      std::vector<float> rf(static_cast<size_t>(T) * static_cast<size_t>(H));
+      dr32.Download(d, rf.data());
+      int dump_pos[] = {0, 3, static_cast<int>(T) - 1};
+      for (int dp : dump_pos) {
+        if (dp < 0 || dp >= T) continue;
+        std::fprintf(stderr, "LAYER %2lld pos %3d:", (long long)l, dp);
+        for (int i = 0; i < 10 && i < H; ++i) {
+          size_t idx = static_cast<size_t>(dp) * static_cast<size_t>(H) +
+                        static_cast<size_t>(i);
+          std::fprintf(stderr, " %.6f", hf[idx] + rf[idx]);
+        }
+        std::fprintf(stderr, "\n");
+      }
+    }
+  }
 
   // Final RMSNorm over the fused stream, then download hidden as f32 (no lm_head).
   // Mirrors the return_hidden branch in DenseForwardLayers (Phase 3).

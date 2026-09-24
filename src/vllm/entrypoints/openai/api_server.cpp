@@ -616,7 +616,7 @@ namespace {
 
 // render(v, indent) — flatten JSON content into text. Ported from
 // kev/api.py:render. Field names are kept as labels.
-std::string RenderJson(const nlohmann::json& v, int indent = 0) {
+std::string RenderJson(const nlohmann::ordered_json& v, int indent = 0) {
   if (v.is_null()) return "";
   if (v.is_string()) return v.get<std::string>();
   if (v.is_boolean()) return v.get<bool>() ? "true" : "false";
@@ -651,7 +651,7 @@ std::string RenderJson(const nlohmann::json& v, int indent = 0) {
 
 // option_text(name, desc) — kev/api.py:option_text. "name" if desc is
 // null/empty, else "name: rendered_desc".
-std::string OptionText(const std::string& name, const nlohmann::json& desc) {
+std::string OptionText(const std::string& name, const nlohmann::ordered_json& desc) {
   if (desc.is_null()) return name;
   std::string rendered = RenderJson(desc);
   if (rendered.empty()) return name;
@@ -659,7 +659,7 @@ std::string OptionText(const std::string& name, const nlohmann::json& desc) {
 }
 
 // GetInstructions(qj) — kev uses "instructions"; accept "instr" as alias.
-std::string GetInstructions(const nlohmann::json& qj) {
+std::string GetInstructions(const nlohmann::ordered_json& qj) {
   if (qj.contains("instructions")) return RenderJson(qj["instructions"]);
   if (qj.contains("instr")) return RenderJson(qj["instr"]);
   return "";
@@ -672,18 +672,6 @@ double R2(double x) { return std::round(x * 100.0) / 100.0; }
 // (rl_agent_api.py:round(float(v), 4)).
 double R4(double x) { return std::round(x * 10000.0) / 10000.0; }
 
-// confidence_from_probs(p, k) — 1 - normalized Shannon entropy
-// (rl_common.py:confidence_from_probs). Used by the Laya decision path.
-double ConfidenceFromProbs(const std::vector<float>& p) {
-  size_t k = p.size();
-  if (k < 2) return 1.0;
-  double ent = 0.0;
-  for (float v : p) {
-    double pv = std::max(static_cast<double>(v), 1e-12);
-    ent -= pv * std::log(pv);
-  }
-  return 1.0 - ent / std::log(static_cast<double>(k));
-}
 // choice_confidence(p) — normalized margin (kev/api.py:choice_confidence).
 double ChoiceConfidence(const std::vector<float>& p) {
   size_t k = p.size();
@@ -752,7 +740,7 @@ struct ParsedSystemOne {
   std::string error_msg;
 };
 
-ParsedSystemOne ParseSystemOneBody(const nlohmann::json& body) {
+ParsedSystemOne ParseSystemOneBody(const nlohmann::ordered_json& body) {
   ParsedSystemOne r;
   if (!body.is_object()) {
     r.ok = false;
@@ -798,10 +786,18 @@ ParsedSystemOne ParseSystemOneBody(const nlohmann::json& body) {
     std::string instr = GetInstructions(qj);
     q.instructions = instr;
     if (q.type == "noul") {
-      // kev/api.py: noul -> instruction is the NER label; criteria is
-      // optional {"false": ..., "true": ...} for option text.
-      q.labels = {instr};
-      q.keys = {"no", "yes"};
+      // kev/api.py: noul -> 2 options [false, true] rendered as
+      // option_text("no", c.get("false")), option_text("yes", c.get("true"))
+      // where c = criteria or {}. When no criteria, options are "no"/"yes".
+      nlohmann::ordered_json false_desc = nullptr, true_desc = nullptr;
+      if (qj.contains("criteria") && qj["criteria"].is_object()) {
+        if (qj["criteria"].contains("false"))
+          false_desc = qj["criteria"]["false"];
+        if (qj["criteria"].contains("true"))
+          true_desc = qj["criteria"]["true"];
+      }
+      q.labels = {OptionText("no", false_desc), OptionText("yes", true_desc)};
+      q.keys = {"false", "true"};
     } else if (q.type == "choice") {
       if (!qj.contains("criteria") || !qj["criteria"].is_object() ||
           qj["criteria"].empty()) {
@@ -932,7 +928,7 @@ nlohmann::json BuildSystemOneAnswerDecision(
     }
     return nlohmann::json{{"type", "choice"}, {"choice", q.keys[argmax]},
                           {"probabilities", std::move(dist)},
-                          {"confidence", R4(ConfidenceFromProbs(probs))},
+                          {"confidence", R4(ChoiceConfidence(probs))},
                           {"rl_agent", std::move(rl_agent)}};
   }
   // score
@@ -949,7 +945,7 @@ nlohmann::json BuildSystemOneAnswerDecision(
   return nlohmann::json{{"type", "score"}, {"score", R4(score)},
                         {"legend", std::move(legend)},
                         {"probabilities", std::move(dist)},
-                        {"confidence", R4(ConfidenceFromProbs(probs))},
+                        {"confidence", R4(ScoreConfidence(probs))},
                         {"rl_agent", std::move(rl_agent)}};
 }
 
@@ -957,20 +953,9 @@ nlohmann::json BuildSystemOneAnswerDecision(
 // rl_common.py:render_options. The GLiNER NER path uses q.labels directly
 // (kev format); the Laya decision path needs the reference option format.
 std::vector<std::string> RenderDecisionOptions(const SystemOneQuestion& q) {
-  if (q.type == "noul") {
-    // Reference: always 2 options — false / true.
-    return {"false: no, the statement does not hold",
-            "true: yes, the statement holds"};
-  }
-  if (q.type == "score") {
-    // Reference: "level %d: %s" % (i, c)
-    std::vector<std::string> opts;
-    for (size_t i = 0; i < q.keys.size(); ++i) {
-      opts.push_back("level " + std::to_string(i) + ": " + q.keys[i]);
-    }
-    return opts;
-  }
-  // choice: q.labels already has the right format (key or "key: desc").
+  // kev/api.py:to_record renders options as option_text(name, desc) for
+  // noul/choice, and render(criterion) for score. q.labels already carries
+  // the correct text for all three types after ParseSystemOneBody.
   return q.labels;
 }
 
@@ -1142,9 +1127,9 @@ ApiServer::DispatchResult ApiServer::handle_systemone(
     return MakeError(500, "InternalServerError",
                     "The model does not support SystemOne");
   }
-  nlohmann::json body;
+  nlohmann::ordered_json body;
   try {
-    body = nlohmann::json::parse(request_body);
+    body = nlohmann::ordered_json::parse(request_body);
   } catch (const std::exception& e) {
     return MakeError(400, "BadRequestError",
                     std::string("invalid JSON body: ") + e.what());
@@ -1216,9 +1201,9 @@ ApiServer::DispatchResult ApiServer::handle_systemone_permute(
     return MakeError(500, "InternalServerError",
                     "The model does not support SystemOne");
   }
-  nlohmann::json body;
+  nlohmann::ordered_json body;
   try {
-    body = nlohmann::json::parse(request_body);
+    body = nlohmann::ordered_json::parse(request_body);
   } catch (const std::exception& e) {
     return MakeError(400, "BadRequestError",
                     std::string("invalid JSON body: ") + e.what());
@@ -1337,9 +1322,9 @@ ApiServer::DispatchResult ApiServer::handle_systemone_separate(
     return MakeError(500, "InternalServerError",
                     "The model does not support SystemOne");
   }
-  nlohmann::json body;
+  nlohmann::ordered_json body;
   try {
-    body = nlohmann::json::parse(request_body);
+    body = nlohmann::ordered_json::parse(request_body);
   } catch (const std::exception& e) {
     return MakeError(400, "BadRequestError",
                     std::string("invalid JSON body: ") + e.what());

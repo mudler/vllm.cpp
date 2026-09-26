@@ -53,10 +53,12 @@ layer every 6th layer (indices 0, 6, 12, 18, 24, 30, 36, 42), the rest SWA.
 
 `add_swa_attention_sink_bias = true`, `add_full_attention_sink_bias = false`:
 SWA layers carry an `attention_sink_bias` parameter (shape
-`[num_key_value_heads, head_dim]` = `[8, 192]`); full-attention layers do
-not. This is a learned additive bias on the attention sink position, not the
-DeepSeek-V4 attention-sink cache mechanism — it is a plain `nn.Parameter`
-added to the sink-token logits before softmax.
+`[num_attention_heads]` = `[64]`); full-attention layers do not. This is a
+learned per-head scalar appended as an extra key column before softmax (the
+gpt-oss "attention sink bias" mechanism). After softmax the sink's
+probability mass is discarded — it absorbs probability but contributes nothing
+to the value-weighted sum. It is not the DeepSeek-V4 attention-sink cache
+mechanism.
 
 `partial_rotary_factor = 0.334` means `rotary_dim = floor(192 * 0.334) = 64`.
 The first 64 channels of each head get RoPE; the last 128 are passthrough.
@@ -91,14 +93,16 @@ method (from DeepSeek-V2) adds a bias correction term to the top-k selection:
 `correction_bias` is the mean score of the top-k candidates. This is the same
 routing used by Qwen3-MoE and DeepSeek-V2, already implemented in the tree.
 
-### MTP — 3 nextn predict layers
+### MTP — 3 nextn predict layers (not implemented upstream)
 
-`num_nextn_predict_layers = 3`. The MTP draft model shares the embedding and
-has its own per-layer weights (`model.mtp.{0,1,2}.*`). The modeling code
-registers `model.mtp.*` in the weight map cleanup regex. This is the same MTP
-pattern as DeepSeek-V4 / Dots3-Note / GLM5 — the existing MTP infra applies,
-but the per-layer composition (shared embedding + per-layer transformer block +
-shared lm_head) must be wired for MiMoV2's geometry.
+`num_nextn_predict_layers = 3`. The checkpoint carries `model.mtp.{0,1,2}.*`
+weights, but the upstream reference code **explicitly discards them** on load
+(`_keys_to_ignore_on_load_unexpected = [r"model\.mtp\..*"]`). No MTP class or
+forward exists in either the remote or the in-tree modeling code. For a
+text-generation parity port, ignore MTP and allowlist `model.mtp.*` as
+unexpected keys, exactly as upstream does. If MTP support is needed later it
+must be written from scratch — there is no reference forward to validate
+against. W4 is deferred until a reference implementation exists.
 
 ### Multimodal — out of scope for this row
 
@@ -124,8 +128,11 @@ sigmoid MoE, partial rotary). The deltas:
    type. The fused QKV projection must be aware of which geometry the layer
    uses.
 
-3. **`attention_sink_bias` on SWA layers.** A learned additive bias on the
-   sink position, present only on SWA layers. No existing model has this.
+3. **`attention_sink_bias` on SWA layers.** A learned per-head scalar
+   (shape `[num_attention_heads]` = `[64]`) appended as an extra key
+   column before softmax; its probability mass is discarded after softmax
+   (gpt-oss "attention sink bias" mechanism). Present only on SWA layers.
+   No existing model has this.
 
 4. **`attention_value_scale = 0.707`.** V projection output is scaled by
    sqrt(0.5) before the attention computation. This is a post-projection
@@ -274,11 +281,12 @@ sigmoid MoE, partial rotary). The deltas:
 - lm_head (untied).
 - Tests: forward parity against upstream reference.
 
-### W4 — MTP wiring
+### W4 — MTP wiring (deferred)
 
-- Wire the 3 nextn layers into the existing MTP infra.
-- Shared embedding, shared lm_head, per-layer transformer block.
-- Tests: MTP draft logits parity.
+- **Deferred.** The upstream reference code discards `model.mtp.*` weights on
+  load and does not implement an MTP forward. There is no reference to
+  validate against. Defer until a reference implementation exists. Allowlist
+  `model.mtp.*` as unexpected keys in the loader.
 
 ### W5 — parity gate
 
@@ -287,10 +295,15 @@ sigmoid MoE, partial rotary). The deltas:
 
 ## Risks / decisions
 
-1. **`attention_sink_bias` semantics.** The upstream code adds it to the
-   sink position before softmax. We must confirm the exact position in the
-   attention computation (after QK^T, before softmax, at the sink index
-   only). This is a new mechanism — no existing model has it.
+1. **`attention_sink_bias` semantics.** RESOLVED: the upstream code adds a
+   per-head scalar (shape `[num_attention_heads]` = `[64]`) as an extra key
+   column to the attention weights before softmax (after QK^T · scaling,
+   after the causal mask). After softmax, the sink's probability mass is
+   discarded (the last column is stripped) before the value-weighted sum. The
+   sink contributes zero to the output — it is a regularizer that absorbs
+   probability mass. This is the gpt-oss "attention sink bias" mechanism,
+   not a DeepSeek-V4 cache sink token. SDPA is unsupported when sinks are
+   present (upstream falls back to eager). SWA layers only.
 
 2. **Fused QKV with per-layer KV geometry.** Full-attention layers have
    `num_key_value_heads=4`; SWA layers have `num_key_value_heads=8`. The fused
@@ -302,31 +315,17 @@ sigmoid MoE, partial rotary). The deltas:
 
 3. **`v_head_dim != head_dim`.** `head_dim=192` but `v_head_dim=128`. The V
    projection produces 128-dim heads; the attention score is computed on
-   `head_dim=192` (Q·K) but the value is 128-dim. This is unusual — most
-   models have `v_head_dim == head_dim`. The O projection maps
-   `num_heads × v_head_dim = 64 × 128 = 8192` back to `hidden_size=4096`.
+   `head_dim=192` (Q·K) but the value is 128-dim. The attention output per
+   head is 128-dim, reshaped to `[batch, seq, 8192]`, then O proj maps
+   `8192 → 4096`. This is a NEW pattern not present in any existing model.
 
-   Wait — that does not work: `64 × 128 = 8192 ≠ 4096`. Let me re-check.
-   Actually `v_head_dim=128` and `num_attention_heads=64`:
-   `64 × 128 = 8192`. The O projection input is `8192` → `4096`. That is a
-   valid matmul. The attention output is `[batch, num_heads, seq, v_head_dim]`
-   reshaped to `[batch, seq, 8192]`, then O proj maps to 4096.
+4. **SWA vs full geometry.** Both use `head_dim=192`, `v_head_dim=128`. The
+   difference is only in KV head count (4 vs 8) and rope_theta (10M vs 10K).
 
-   But the attention score is `Q @ K^T` where Q is `[64, 192]` and K is
-   `[kv_heads, 192]` — the score is on `head_dim=192`. The value is 128-dim.
-   So the attention output per head is 128-dim, not 192-dim. This is a
-   non-standard split: Q/K use `head_dim=192`, V uses `v_head_dim=128`.
-
-   This is a NEW pattern not present in any existing model. It must be
-   handled explicitly in the attention forward.
-
-4. **SWA `v_head_dim=128` vs full `v_head_dim=128`.** Both are 128, so V
-   is consistent. But `head_dim=192` for Q/K in both. The difference is
-   only in KV head count (4 vs 8) and rope_theta (10M vs 10K).
-
-5. **`moe_router_dtype = bfloat16`.** The router runs in bf16, not float32.
-   Some existing MoE implementations upcast the router to fp32 — we must
-   not do that here, or confirm parity allows it.
+5. **`moe_router_dtype = bfloat16`.** Config says bf16, but the upstream gate
+   forces fp32 for the router logits (`F.linear(hidden.type(torch.float32),
+   self.weight.type(torch.float32))`). We must match this: compute router
+   logits in fp32 despite the config dtype.
 
 ## Stop conditions
 

@@ -9376,6 +9376,51 @@ std::vector<float> Qwen3_5Model::ForwardDense(const std::vector<int32_t>& token_
   return logits;
 }
 
+std::vector<float> Qwen3_5Model::ForwardMoeHidden(
+    const std::vector<int32_t>& token_ids,
+    const std::vector<int32_t>& positions,
+    const Qwen3_5MoeWeights& weights,
+    const HfConfig& config, vt::Queue& queue) {
+  // MODEL-XOR Phase 1: mirrors ForwardDense (MoE) through the embed + layer
+  // stack + final GemmaRMSNorm, then downloads [T, H] f32 hidden states with
+  // NO lm_head. Same as ForwardDenseHidden (dense) but calls RunLayer (MoE)
+  // instead of RunDenseLayer.
+  const int64_t T = static_cast<int64_t>(token_ids.size());
+  const int64_t H = config.hidden_size;
+  VT_CHECK(T > 0, "qwen3_5 moe forward hidden: empty token_ids");
+  VT_CHECK(static_cast<int64_t>(positions.size()) == T,
+           "qwen3_5 moe forward hidden: positions length must equal token count");
+  VT_CHECK(static_cast<int64_t>(weights.layers.size()) == config.num_hidden_layers,
+           "qwen3_5 moe forward hidden: weights.layers size must equal num_hidden_layers");
+  const Qwen35ExpertStreamStep expert_stream_step;
+  Dev d{vt::GetBackend(queue.device.type), queue};
+  const float eps = static_cast<float>(config.rms_norm_eps);
+
+  Tensor dtab =
+      Qwen3_5EmbeddingTable(d.b, d.q, weights.embed_tokens, config.vocab_size, H);
+  DBuf dids(d, DType::kI32, {T}, token_ids.data());
+  DBuf hidden(d, ActDType(d), {T, H});
+  vt::Embedding(d.q, hidden.t(), dtab, dids.t());
+
+  DBuf res(d, ResidualDType(d), {T, H});
+  res.Zero(d);
+
+  for (int64_t l = 0; l < config.num_hidden_layers; ++l)
+    RunLayer(d, weights.layers[static_cast<size_t>(l)], config, hidden, res,
+             positions, T, /*layer_index=*/l);
+
+  // Final RMSNorm over the fused stream, then download hidden as f32 (no lm_head).
+  Tensor dfn = ResidentWeight(d, weights.final_norm, {H});
+  DBuf dnorm(d, ActDType(d), {T, H});
+  vt::RmsNorm(d.q, dnorm.t(), hidden.t(), dfn, vt::RmsNormArgs{eps, true}, &res.t());
+
+  DBuf dhidden_f32(d, DType::kF32, {T, H});
+  vt::CastF32(d.q, dhidden_f32.t(), dnorm.t());
+  std::vector<float> hidden_f32(static_cast<size_t>(T) * static_cast<size_t>(H));
+  dhidden_f32.Download(d, hidden_f32.data());
+  return hidden_f32;
+}
+
 std::vector<float> Qwen3_5DenseModel::ForwardDense(
     const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
     const Qwen3_5DenseWeights& weights, const HfConfig& config,

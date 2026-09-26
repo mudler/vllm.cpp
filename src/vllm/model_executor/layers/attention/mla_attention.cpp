@@ -639,7 +639,7 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
       // portable reference tier would have served the op. That is what #2564
       // measured on `gfx1151` with GLM-5.3, and a reader sent looking for an
       // unset variable finds nothing.
-      if (vt::IsBlockQuant(w_kva.dtype)) {
+      if (vt::IsBlockQuant(w_kva.dtype) && R > 0) {
         const bool env_off = !MlaFusedNormRopeEnabled();
         std::string why =
             env_off ? "VT_MLA_FUSED_NORM_ROPE=0 is set, which disables the fused op"
@@ -661,7 +661,10 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
                        "model with an expanded residency"));
       }
       Tensor kv_c_t = kv_c.t(), k_pe_t = k_pe.t();
-      vt::MatmulBT(d.q, kv_c_t, hidden, w_kva.Slice(0, 0, L));
+      // When R=0 (NoPE), w_kva is [L, H] — Slice(0,0,L) is the full
+      // tensor, but block-quantized weights have no row slice. Skip it.
+      vt::MatmulBT(d.q, kv_c_t, hidden,
+                   R > 0 ? w_kva.Slice(0, 0, L) : w_kva);
       // NoPE (W3, #2213): with no rope slice there are no rope ROWS in the
       // A-projection either — `fused_qkv_a_proj` is [q_lora + kv_lora, hidden]
       // — so the second GEMM is NOT LAUNCHED rather than issued at width 0,

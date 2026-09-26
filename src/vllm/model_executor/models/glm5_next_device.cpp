@@ -130,8 +130,8 @@ void DeviceRmsNorm(const Dev& d, float* out, const float* in,
                    int64_t T, int64_t H, float eps) {
   DBuf din(d, DType::kF32, {T, H}, in);
   DBuf dout(d, DType::kF32, {T, H});
-  Tensor w = WF32(d, weight, {H});
-  vt::RmsNorm(d.q, dout.t(), din.t(), w, vt::RmsNormArgs{eps, /*gemma=*/false});
+  DBuf dw(d, DType::kF32, {H}, weight.data());
+  vt::RmsNorm(d.q, dout.t(), din.t(), dw.t(), vt::RmsNormArgs{eps, /*gemma=*/false});
   dout.Download(d, out);
 }
 
@@ -150,16 +150,16 @@ std::vector<float> DeviceDenseMlpForward(
             stacked.begin() + static_cast<size_t>(I * H));
 
   DBuf dh(d, DType::kF32, {T, H}, normed.data());
-  Tensor sw = WF32(d, stacked, {2 * I, H});
+  DBuf dsw(d, DType::kF32, {2 * I, H}, stacked.data());
   DBuf dgu(d, DType::kF32, {T, 2 * I});
-  vt::MatmulBT(d.q, dgu.t(), dh.t(), sw);
+  vt::MatmulBT(d.q, dgu.t(), dh.t(), dsw.t());
 
   DBuf da(d, DType::kF32, {T, I});
   vt::ClampedSwiGLU(d.q, da.t(), dgu.t(), limit);
 
-  Tensor dw = WF32(d, w.down_proj, {H, I});
+  DBuf ddw(d, DType::kF32, {H, I}, w.down_proj.data());
   DBuf dout(d, DType::kF32, {T, H});
-  vt::MatmulBT(d.q, dout.t(), da.t(), dw);
+  vt::MatmulBT(d.q, dout.t(), da.t(), ddw.t());
 
   std::vector<float> out(static_cast<size_t>(T * H));
   dout.Download(d, out.data());
@@ -277,9 +277,9 @@ std::vector<float> Glm5NextDeviceForward(
   std::vector<float> embeds(static_cast<size_t>(T * H));
   {
     DBuf dids(d, DType::kI32, {T}, token_ids.data());
-    Tensor ttab = WF32(d, embed_table, {V, H});
+    DBuf dtab(d, DType::kF32, {V, H}, embed_table.data());
     DBuf demb(d, DType::kF32, {T, H});
-    vt::Embedding(d.q, demb.t(), ttab, dids.t());
+    vt::Embedding(d.q, demb.t(), dtab.t(), dids.t());
     demb.Download(d, embeds.data());
   }
 
@@ -741,9 +741,9 @@ std::vector<float> Glm5NextDeviceForward(
                    gathered.data() + static_cast<size_t>(r) * H);
     }
     DBuf dhid(d, DType::kF32, {n_out, H}, gathered.data());
-    Tensor lm = WF32(d, head_f32, {V, H});
+    DBuf dlm(d, DType::kF32, {V, H}, head_f32.data());
     DBuf dlog(d, DType::kF32, {n_out, V});
-    vt::MatmulBT(d.q, dlog.t(), dhid.t(), lm);
+    vt::MatmulBT(d.q, dlog.t(), dhid.t(), dlm.t());
     dlog.Download(d, logits.data());
   }
 

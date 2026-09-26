@@ -12526,6 +12526,7 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
       StepPhaseEmit(sph, "replay");
     }
     ++s.replays;
+    ++s.expected_cur_pos;  // the replay's in-trace plus_one advanced cur_pos
     ++impl_->replays;
     publish_aux();
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);
@@ -12790,6 +12791,7 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     }
     record_staged();
     s.replays = 1;
+    ++s.expected_cur_pos;  // the capture step's launch ran the trace once
     ++impl_->replays;
     publish_aux();
     return ViewDeviceLogits(s.logits->ptr(), d.q.device, B, vocab);

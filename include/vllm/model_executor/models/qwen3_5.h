@@ -293,6 +293,16 @@ class Qwen3_5Model {
                                          const Qwen3_5MoeWeights& weights,
                                          const HfConfig& config, vt::Queue& queue);
 
+  // MODEL-XOR Phase 1: MoE single-sequence hidden forward. Mirrors
+  // ForwardDense but stops BEFORE lm_head and returns [T, H] f32 post-final-
+  // norm hidden states. Same as ForwardDenseHidden (dense) but calls RunLayer
+  // (MoE) instead of RunDenseLayer.
+  static std::vector<float> ForwardMoeHidden(
+      const std::vector<int32_t>& token_ids,
+      const std::vector<int32_t>& positions,
+      const Qwen3_5MoeWeights& weights,
+      const HfConfig& config, vt::Queue& queue);
+
   // Eager (load-time) Marlin NVFP4 repack of every layer's routed experts +
   // dense shared-expert/lm_head projections, so the first request pays no
   // first-touch repack (previously a TTFT spike). No-op unless the build has

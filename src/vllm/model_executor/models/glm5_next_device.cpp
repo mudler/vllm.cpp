@@ -104,7 +104,7 @@ using vt::Tensor;
 // namespace, so it is not visible here). Double accumulation matches the host
 // indexer reference; the device k-pool path feeds `wq_b(q_resid)` and
 // `weights_proj(hidden)` through it before uploading (the "island" pattern).
-void Linear(const float* w, const float* x, int64_t out_features,
+[[maybe_unused]] void Linear(const float* w, const float* x, int64_t out_features,
             int64_t in_features, float* out) {
   for (int64_t o = 0; o < out_features; ++o) {
     const float* row = w + o * in_features;

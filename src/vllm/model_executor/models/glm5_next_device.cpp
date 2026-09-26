@@ -458,6 +458,8 @@ std::vector<float> Glm5NextDeviceForward(
       // device; only the attention arm runs on host.
       const IndexerRole role = IndexerRoleFor(p, i);
       const IndexerWeights iw = w.dsa.IndexerView();
+      LayerCache* lc =
+          caches != nullptr ? &(*caches)[static_cast<size_t>(i)] : nullptr;
       const AttentionResult a = Attention(
           mla_md, w.dsa.mla, indexer_dims,
           role.skip_topk ? nullptr : &iw, role,

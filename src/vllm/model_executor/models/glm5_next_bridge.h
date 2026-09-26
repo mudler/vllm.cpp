@@ -115,9 +115,10 @@
 namespace vllm::glm5_next {
 
 // One gibibyte. See the O19 section above for why the value is here and not
-// higher or lower: 4x above the largest legitimate tensor and 9x below the
-// smallest expert bank.
-inline constexpr int64_t kBridgeTensorF32ByteCeiling = int64_t{1} << 30;
+// See the O19 section above for the original 1 GiB rationale. Bumped to 8 GiB
+// for Strix Halo: the embedding table (2.5 GiB) and tied lm_head (~4 GiB) both
+// exceed 1 GiB, and the board has 96 GiB of unified memory.
+inline constexpr int64_t kBridgeTensorF32ByteCeiling = int64_t{8} << 30;
 
 // The f32 host mirror of `t`, in BYTES, computed from the shape ALONE — no
 // decode, no allocation. This is the number a caller budgets with, and it is

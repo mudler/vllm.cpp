@@ -383,7 +383,7 @@ std::vector<float> Glm5NextDeviceForward(
   // block's `reuse_selection` branch never reaches.
   DBuf sel_idx, sel_cnt;
   mla::MlaSharedSelection shared{};
-  mla::MlaSharedSelection* shared_ptr = nullptr;
+  [[maybe_unused]] mla::MlaSharedSelection* shared_ptr = nullptr;
   if (sparse_active) {
     sel_idx = DBuf(d, DType::kI32, {T, output_width});
     sel_cnt = DBuf(d, DType::kI32, {T});

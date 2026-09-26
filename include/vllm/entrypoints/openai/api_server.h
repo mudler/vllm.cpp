@@ -40,6 +40,9 @@
 #include "vllm/entrypoints/openai/video_api.h"
 #include "vllm/entrypoints/openai/speech_api.h"
 #include "vllm/multimodal/parakeet_transcription.h"
+#ifdef VLLM_WITH_DIARIZATION
+#include "vllm/multimodal/diarization.h"
+#endif
 
 namespace vllm::tok {
 class Tokenizer;
@@ -267,6 +270,27 @@ class ApiServer {
     transcriber_ = std::move(transcriber);
   }
 
+#ifdef VLLM_WITH_DIARIZATION
+  // Attach the diarization seam backing POST /v1/audio/diarizations (ABI v30).
+  // ADDITIVE and OPT-IN: absent => route unregistered => 404, byte-identical to
+  // a server without diarization. The callback wraps the parakeet.cpp C-API.
+  using DiarizeFn =
+      std::function<std::vector<vllm::multimodal::SpeakerSegment>(
+          const uint8_t* wav_bytes, size_t num_bytes)>;
+  void set_diarizer(DiarizeFn diarizer) {
+    diarizer_ = std::move(diarizer);
+  }
+
+  // Attach the SAS seam backing POST /v1/audio/sas (speaker-attributed ASR).
+  // Runs both ASR and diarization on the same audio and merges the results.
+  using SasFn =
+      std::function<vllm::multimodal::SpeakerAttributedASR(
+          const uint8_t* wav_bytes, size_t num_bytes)>;
+  void set_sas(SasFn sas) {
+    sas_ = std::move(sas);
+  }
+#endif
+
   // Attach the embedding seam backing POST /v1/embeddings (ARCH-ONE-SURFACE
   // ROW 6). ADDITIVE and OPT-IN like the transcriber above: absent => route
   // unregistered => 404, byte-identical to a server without pooling. The
@@ -402,6 +426,12 @@ class ApiServer {
   // or zero when the diagnostic legacy-dynamic mode is selected.
   size_t http_worker_count() const;
 
+  // Expose the diarizer and SAS callbacks for the route handlers.
+#ifdef VLLM_WITH_DIARIZATION
+  DiarizeFn diarizer_callback() const { return diarizer_; }
+  SasFn sas_callback() const { return sas_; }
+#endif
+
  private:
   // Null in the serving-less (transcription-only) construction: the generate
   // routes are then not registered, and direct handler dispatch reports the
@@ -415,6 +445,10 @@ class ApiServer {
   const v1::metrics::PrometheusStatLogger* metrics_ = nullptr;
   ::vllm::openai::VideoRunner video_runner_;
   TranscribeFn transcriber_;
+#ifdef VLLM_WITH_DIARIZATION
+  DiarizeFn diarizer_;
+  SasFn sas_;
+#endif
   EmbedFn embedder_;
   NerFn ner_;
   ScoreFn score_;

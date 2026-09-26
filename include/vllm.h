@@ -369,7 +369,7 @@ extern "C" {
  * KevModel/LayaModel runs the decision forward, CuaS1Forms runs the score
  * forward. Non-matching architectures are refused by name. Every existing
  * struct and call is byte-identical. */
-#define VLLM_ABI_VERSION 29
+#define VLLM_ABI_VERSION 30
 
 /* ── Export macro ─────────────────────────────────────────────────────────────
  * Marks the symbols that make up the stable ABI. Default visibility now; Task 3
@@ -1094,6 +1094,83 @@ VLLM_API vllm_status vllm_transcribe(vllm_engine* engine,
 /* Free the owned members of a transcription result and zero the struct. The
  * struct itself is caller storage. NULL is a no-op. */
 VLLM_API void vllm_transcription_free(vllm_transcription* out);
+
+
+/* ── Speaker diarization (ABI v30) ───────────────────────────────────────────
+ * When the library is built with VLLM_CPP_WITH_DIARIZATION=ON (the default),
+ * a second engine handle can be loaded from a Nemotron-3-Diarization GGUF
+ * file. The diarization engine identifies who spoke when in a mono 16 kHz
+ * audio stream. It is independent of the ASR (Parakeet) engine — the two
+ * can be combined via vllm_transcribe_and_diarize.
+ *
+ * When VLLM_CPP_WITH_DIARIZATION=OFF, every function below returns
+ * VLLM_ERR_INVALID_ARGUMENT with a "not compiled in" message. */
+
+/* One speaker segment. */
+typedef struct vllm_speaker_segment {
+  int32_t speaker;   /* 0-indexed speaker ID */
+  float start;       /* seconds from audio start */
+  float end;
+} vllm_speaker_segment;
+
+/* Diarization result. OWNERSHIP: free with vllm_diarization_free. */
+typedef struct vllm_diarization {
+  vllm_speaker_segment* segments;
+  int32_t n_segments;
+} vllm_diarization;
+
+/* Load a diarization GGUF file. Returns NULL on error
+ * (vllm_last_error carries the detail). */
+VLLM_API vllm_engine* vllm_diarization_load(const char* gguf_path);
+
+/* Diarize a WAV file. Returns VLLM_OK on success. */
+VLLM_API vllm_status vllm_diarize_path(vllm_engine* diar_engine,
+                                       const char* wav_path,
+                                       vllm_diarization* out);
+
+/* Diarize raw PCM (mono float32, 16 kHz). */
+VLLM_API vllm_status vllm_diarize_pcm(vllm_engine* diar_engine,
+                                      const float* pcm, int64_t n_samples,
+                                      int32_t sample_rate,
+                                      vllm_diarization* out);
+
+/* Free a diarization result. NULL is a no-op. */
+VLLM_API void vllm_diarization_free(vllm_diarization* out);
+
+
+/* ── Speaker-attributed ASR (ABI v30) ───────────────────────────────────────
+ * Combined transcription + diarization: runs both models on the same audio
+ * and merges word timestamps with speaker segments. The ASR engine must be
+ * a Parakeet checkpoint; the diarization engine must be a GGUF loaded with
+ * vllm_diarization_load. */
+
+typedef struct vllm_speaker_utterance {
+  int32_t speaker;
+  char* text;
+  float start;
+  float end;
+  float conf;
+} vllm_speaker_utterance;
+
+typedef struct vllm_sas_result {
+  vllm_speaker_utterance* utterances;
+  int32_t n_utterances;
+} vllm_sas_result;
+
+/* Run combined ASR + diarization on a WAV file. */
+VLLM_API vllm_status vllm_transcribe_and_diarize(
+    vllm_engine* asr_engine, vllm_engine* diar_engine,
+    const char* wav_path,
+    vllm_sas_result* out);
+
+/* Run combined ASR + diarization on raw PCM. */
+VLLM_API vllm_status vllm_transcribe_and_diarize_pcm(
+    vllm_engine* asr_engine, vllm_engine* diar_engine,
+    const float* pcm, int64_t n_samples, int32_t sample_rate,
+    vllm_sas_result* out);
+
+/* Free a SAS result. Each utterance's .text is freed, then the array. */
+VLLM_API void vllm_sas_result_free(vllm_sas_result* out);
 
 
 /* ── Embeddings (ABI v15) ─────────────────────────────────────────────────────

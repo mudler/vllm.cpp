@@ -57,6 +57,10 @@
 #include "vllm/entrypoints/openai/systemone.h"  // shared SystemOne helpers (v28)
 #include "vllm/model_executor/models/minimax_h3.h"    // mux argv (v12)
 #include "vllm/multimodal/parakeet_transcription.h"     // vllm_transcribe (v11)
+#ifdef VLLM_WITH_DIARIZATION
+#include "parakeet_capi.h"           // parakeet_ctx, parakeet_capi_* (v30)
+#include "vllm/multimodal/diarization.h"  // Diarizer, TranscribeAndDiarize (v30)
+#endif
 #include "vllm/multimodal/minimax_h3_video.h"          // vllm_video_* (v12)
 #include "vllm/multimodal/video_engine.h"              // the v18 family registry
 #include "vllm/multimodal/speech_engine.h"             // vllm_speech_* (v20)
@@ -80,6 +84,13 @@ struct vllm_engine {
   // ABI v11 transcription stack (the ONE library seam the server route and the
   // parakeet-transcribe example also drive). Null for text engines.
   std::unique_ptr<vllm::multimodal::ParakeetTranscriber> transcriber;
+#ifdef VLLM_WITH_DIARIZATION
+  // ABI v30 diarization: a parakeet_ctx loaded from a diarization GGUF.
+  parakeet_ctx* diarizer_ctx = nullptr;
+  // A parakeet_ctx for the ASR model (for SAS composition).
+  parakeet_ctx* parakeet_asr_ctx = nullptr;
+  std::unique_ptr<vllm::multimodal::Diarizer> diarizer;
+#endif
   // Monotonic per-handle request-id source. Each vllm_complete[_stream] call
   // uses a FRESH id so a request left in-flight by a mid-call exception can never
   // collide with a later call's id — a collision would make LLMEngine.add_request
@@ -824,6 +835,10 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
                 vllm::multimodal::ParakeetTranscriber::FromDir(
                     params->model_path));
         handle->model_path = params->model_path;
+#ifdef VLLM_WITH_DIARIZATION
+        // Also load a parakeet_ctx for SAS composition
+        handle->parakeet_asr_ctx = parakeet_capi_load(params->model_path);
+#endif
         *out = handle;
         ClearError();
         return VLLM_OK;
@@ -853,7 +868,14 @@ VLLM_API vllm_status vllm_engine_load(const vllm_model_params* params,
   }
 }
 
-VLLM_API void vllm_engine_free(vllm_engine* engine) { delete engine; }
+VLLM_API void vllm_engine_free(vllm_engine* engine) {
+  if (engine == nullptr) return;
+#ifdef VLLM_WITH_DIARIZATION
+  if (engine->diarizer_ctx) parakeet_capi_free(engine->diarizer_ctx);
+  if (engine->parakeet_asr_ctx) parakeet_capi_free(engine->parakeet_asr_ctx);
+#endif
+  delete engine;
+}
 
 // ABI v25 (row `SPEC-DFLASH2`, issue #2832): the engine's own speculative
 // acceptance counters, read back. THIS FUNCTION COMPUTES NOTHING. All three
@@ -1437,6 +1459,287 @@ VLLM_API void vllm_transcription_free(vllm_transcription* out) {
   out->token_ids = nullptr;
   out->n_token_ids = 0;
   out->has_text = 0;
+}
+
+// ── Speaker diarization (ABI v30) ──────────────────────────────────────────
+
+#ifdef VLLM_WITH_DIARIZATION
+VLLM_API vllm_engine* vllm_diarization_load(const char* gguf_path) {
+  if (gguf_path == nullptr) {
+    SetError("vllm_diarization_load: gguf_path is null");
+    return nullptr;
+  }
+  parakeet_ctx* diar_ctx = parakeet_capi_load(gguf_path);
+  if (diar_ctx == nullptr) {
+    SetError(std::string("vllm_diarization_load: parakeet_capi_load failed: ")
+             + gguf_path);
+    return nullptr;
+  }
+  auto* handle = new vllm_engine;
+  handle->diarizer = std::unique_ptr<vllm::multimodal::Diarizer>(
+      new vllm::multimodal::Diarizer());
+  // Steal the ctx into the Diarizer wrapper
+  handle->diarizer_ctx = diar_ctx;
+  handle->model_path = gguf_path;
+  ClearError();
+  return handle;
+}
+
+VLLM_API vllm_status vllm_diarize_path(vllm_engine* diar_engine,
+                                       const char* wav_path,
+                                       vllm_diarization* out) {
+  if (out == nullptr) {
+    SetError("vllm_diarize_path: out is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  out->segments = nullptr;
+  out->n_segments = 0;
+  if (diar_engine == nullptr || wav_path == nullptr) {
+    SetError("vllm_diarize_path: engine or wav_path is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+#ifdef VLLM_WITH_DIARIZATION
+  if (diar_engine->diarizer_ctx == nullptr) {
+    SetError("vllm_diarize_path: engine is not a diarization engine");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    parakeet_diarization_result* result =
+        parakeet_capi_diarize_path(diar_engine->diarizer_ctx, wav_path);
+    if (result == nullptr) {
+      SetError("vllm_diarize_path: diarize returned null");
+      return VLLM_ERR_RUNTIME;
+    }
+    int n = result->n_segments;
+    auto* segs = static_cast<vllm_speaker_segment*>(
+        std::malloc(n * sizeof(vllm_speaker_segment)));
+    if (segs == nullptr && n > 0) {
+      parakeet_capi_free_diarization_result(result);
+      SetError("vllm_diarize_path: out-of-memory");
+      return VLLM_ERR_RUNTIME;
+    }
+    for (int i = 0; i < n; ++i) {
+      segs[i].speaker = result->segments[i].speaker;
+      segs[i].start = result->segments[i].start;
+      segs[i].end = result->segments[i].end;
+    }
+    parakeet_capi_free_diarization_result(result);
+    out->segments = segs;
+    out->n_segments = n;
+    ClearError();
+    return VLLM_OK;
+  } catch (const std::exception& e) {
+    SetError(std::string("vllm_diarize_path: ") + e.what());
+    return VLLM_ERR_RUNTIME;
+  }
+#else
+  SetError("vllm_diarize_path: diarization not compiled in");
+  return VLLM_ERR_INVALID_ARGUMENT;
+#endif
+}
+
+VLLM_API vllm_status vllm_diarize_pcm(vllm_engine* diar_engine,
+                                      const float* pcm, int64_t n_samples,
+                                      int32_t sample_rate,
+                                      vllm_diarization* out) {
+  if (out == nullptr) {
+    SetError("vllm_diarize_pcm: out is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  out->segments = nullptr;
+  out->n_segments = 0;
+  if (diar_engine == nullptr || pcm == nullptr || n_samples <= 0) {
+    SetError("vllm_diarize_pcm: invalid arguments");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+#ifdef VLLM_WITH_DIARIZATION
+  if (diar_engine->diarizer_ctx == nullptr) {
+    SetError("vllm_diarize_pcm: engine is not a diarization engine");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    parakeet_diarization_result* result = parakeet_capi_diarize_pcm(
+        diar_engine->diarizer_ctx, pcm, (int)n_samples, sample_rate);
+    if (result == nullptr) {
+      SetError("vllm_diarize_pcm: diarize returned null");
+      return VLLM_ERR_RUNTIME;
+    }
+    int n = result->n_segments;
+    auto* segs = static_cast<vllm_speaker_segment*>(
+        std::malloc(n * sizeof(vllm_speaker_segment)));
+    if (segs == nullptr && n > 0) {
+      parakeet_capi_free_diarization_result(result);
+      SetError("vllm_diarize_pcm: out-of-memory");
+      return VLLM_ERR_RUNTIME;
+    }
+    for (int i = 0; i < n; ++i) {
+      segs[i].speaker = result->segments[i].speaker;
+      segs[i].start = result->segments[i].start;
+      segs[i].end = result->segments[i].end;
+    }
+    parakeet_capi_free_diarization_result(result);
+    out->segments = segs;
+    out->n_segments = n;
+    ClearError();
+    return VLLM_OK;
+  } catch (const std::exception& e) {
+    SetError(std::string("vllm_diarize_pcm: ") + e.what());
+    return VLLM_ERR_RUNTIME;
+  }
+#else
+  SetError("vllm_diarize_pcm: diarization not compiled in");
+  return VLLM_ERR_INVALID_ARGUMENT;
+#endif
+}
+
+VLLM_API void vllm_diarization_free(vllm_diarization* out) {
+  if (out == nullptr) return;
+  std::free(out->segments);
+  out->segments = nullptr;
+  out->n_segments = 0;
+}
+
+// ── Speaker-attributed ASR (ABI v30) ────────────────────────────────────────
+
+VLLM_API vllm_status vllm_transcribe_and_diarize(
+    vllm_engine* asr_engine, vllm_engine* diar_engine,
+    const char* wav_path,
+    vllm_sas_result* out) {
+  if (out == nullptr) {
+    SetError("vllm_transcribe_and_diarize: out is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  out->utterances = nullptr;
+  out->n_utterances = 0;
+  if (asr_engine == nullptr || diar_engine == nullptr || wav_path == nullptr) {
+    SetError("vllm_transcribe_and_diarize: null argument");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+#ifdef VLLM_WITH_DIARIZATION
+  if (asr_engine->transcriber == nullptr) {
+    SetError("vllm_transcribe_and_diarize: asr_engine is not a transcription engine");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  if (diar_engine->diarizer_ctx == nullptr) {
+    SetError("vllm_transcribe_and_diarize: diar_engine is not a diarization engine");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    // Read WAV into PCM
+    auto pcm = vllm::multimodal::ReadWavPcm16Mono(wav_path);
+    int n_sas = 0;
+    parakeet_sas_result* sas = parakeet_capi_transcribe_and_diarize(
+        asr_engine->parakeet_asr_ctx, diar_engine->diarizer_ctx,
+        pcm.data(), (int)pcm.size(), 16000, &n_sas);
+    if (sas == nullptr || n_sas == 0) {
+      ClearError();
+      return VLLM_OK;
+    }
+    auto* utts = static_cast<vllm_speaker_utterance*>(
+        std::malloc(n_sas * sizeof(vllm_speaker_utterance)));
+    if (utts == nullptr) {
+      for (int i = 0; i < n_sas; ++i)
+        if (sas[i].text) parakeet_capi_free_string(sas[i].text);
+      parakeet_capi_free_sas_results(sas);
+      SetError("vllm_transcribe_and_diarize: out-of-memory");
+      return VLLM_ERR_RUNTIME;
+    }
+    for (int i = 0; i < n_sas; ++i) {
+      utts[i].speaker = sas[i].speaker;
+      utts[i].text = sas[i].text ? DupString(sas[i].text) : nullptr;
+      utts[i].start = sas[i].start;
+      utts[i].end = sas[i].end;
+      utts[i].conf = sas[i].conf;
+      if (sas[i].text) parakeet_capi_free_string(sas[i].text);
+    }
+    parakeet_capi_free_sas_results(sas);
+    out->utterances = utts;
+    out->n_utterances = n_sas;
+    ClearError();
+    return VLLM_OK;
+  } catch (const std::exception& e) {
+    SetError(std::string("vllm_transcribe_and_diarize: ") + e.what());
+    return VLLM_ERR_RUNTIME;
+  }
+#else
+  SetError("vllm_transcribe_and_diarize: diarization not compiled in");
+  return VLLM_ERR_INVALID_ARGUMENT;
+#endif
+}
+
+VLLM_API vllm_status vllm_transcribe_and_diarize_pcm(
+    vllm_engine* asr_engine, vllm_engine* diar_engine,
+    const float* pcm, int64_t n_samples, int32_t sample_rate,
+    vllm_sas_result* out) {
+  if (out == nullptr) {
+    SetError("vllm_transcribe_and_diarize_pcm: out is null");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  out->utterances = nullptr;
+  out->n_utterances = 0;
+  if (asr_engine == nullptr || diar_engine == nullptr ||
+      pcm == nullptr || n_samples <= 0) {
+    SetError("vllm_transcribe_and_diarize_pcm: invalid arguments");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+#ifdef VLLM_WITH_DIARIZATION
+  if (asr_engine->transcriber == nullptr) {
+    SetError("vllm_transcribe_and_diarize_pcm: asr_engine is not a transcription engine");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  if (diar_engine->diarizer_ctx == nullptr) {
+    SetError("vllm_transcribe_and_diarize_pcm: diar_engine is not a diarization engine");
+    return VLLM_ERR_INVALID_ARGUMENT;
+  }
+  try {
+    int n_sas = 0;
+    parakeet_sas_result* sas = parakeet_capi_transcribe_and_diarize(
+        asr_engine->parakeet_asr_ctx, diar_engine->diarizer_ctx,
+        pcm, (int)n_samples, sample_rate, &n_sas);
+    if (sas == nullptr || n_sas == 0) {
+      ClearError();
+      return VLLM_OK;
+    }
+    auto* utts = static_cast<vllm_speaker_utterance*>(
+        std::malloc(n_sas * sizeof(vllm_speaker_utterance)));
+    if (utts == nullptr) {
+      for (int i = 0; i < n_sas; ++i)
+        if (sas[i].text) parakeet_capi_free_string(sas[i].text);
+      parakeet_capi_free_sas_results(sas);
+      SetError("vllm_transcribe_and_diarize_pcm: out-of-memory");
+      return VLLM_ERR_RUNTIME;
+    }
+    for (int i = 0; i < n_sas; ++i) {
+      utts[i].speaker = sas[i].speaker;
+      utts[i].text = sas[i].text ? DupString(sas[i].text) : nullptr;
+      utts[i].start = sas[i].start;
+      utts[i].end = sas[i].end;
+      utts[i].conf = sas[i].conf;
+      if (sas[i].text) parakeet_capi_free_string(sas[i].text);
+    }
+    parakeet_capi_free_sas_results(sas);
+    out->utterances = utts;
+    out->n_utterances = n_sas;
+    ClearError();
+    return VLLM_OK;
+  } catch (const std::exception& e) {
+    SetError(std::string("vllm_transcribe_and_diarize_pcm: ") + e.what());
+    return VLLM_ERR_RUNTIME;
+  }
+#else
+  SetError("vllm_transcribe_and_diarize_pcm: diarization not compiled in");
+  return VLLM_ERR_INVALID_ARGUMENT;
+#endif
+}
+
+VLLM_API void vllm_sas_result_free(vllm_sas_result* out) {
+  if (out == nullptr) return;
+  for (int i = 0; i < out->n_utterances; ++i) {
+    std::free(out->utterances[i].text);
+  }
+  std::free(out->utterances);
+  out->utterances = nullptr;
+  out->n_utterances = 0;
 }
 
 // ── Embeddings (ABI v15, ARCH-ONE-SURFACE ROW 6) ────────────────────────────

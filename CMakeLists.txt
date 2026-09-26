@@ -1156,6 +1156,9 @@ add_library(vllm STATIC
   # Parakeet head archs so config.json RESOLVES (SupportsTranscription mirror).
   src/vllm/multimodal/parakeet_transcription.cpp
   src/vllm/model_executor/models/parakeet_registry.cpp
+  # Diarization seam (wraps parakeet.cpp's C-API). Gated by
+  # VLLM_CPP_WITH_DIARIZATION; the .cpp compiles as stubs when disabled.
+  src/vllm/multimodal/diarization.cpp
   # The ONE video-generation seam every consumer drives (C ABI vllm_video_*,
   # the server's /v1/videos, the minimax-h3-gen example) — ARCH-ONE-SURFACE
   # ROW 2: absorbs the assembly pipeline examples/minimax_h3_gen and the
@@ -1566,6 +1569,35 @@ target_compile_definitions(blake3_vendored PRIVATE
 target_include_directories(blake3_vendored PUBLIC third_party/blake3)
 set_target_properties(blake3_vendored PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(vllm PUBLIC blake3_vendored)
+
+# --- Parakeet.cpp dependency (diarization + SAS) -----------------------------
+# parakeet.cpp provides the Nemotron-3-Diarization Sortformer encoder, speaker
+# head, streaming diarization (AOSC), and speaker-attributed ASR (SAS) merge.
+# vllm.cpp's own ParakeetTranscriber handles ASR; this adds the diarization
+# side through parakeet.cpp's C-API (parakeet_capi.h).
+option(VLLM_CPP_WITH_DIARIZATION "Enable diarization support via parakeet.cpp" ON)
+if(VLLM_CPP_WITH_DIARIZATION)
+  set(VLLM_CPP_PARAKEET_CPP_DIR "" CACHE PATH
+    "Path to a parakeet.cpp source tree. If empty, FetchContent from GitHub.")
+  if(VLLM_CPP_PARAKEET_CPP_DIR)
+    set(parakeet_cpp_SOURCE_DIR "${VLLM_CPP_PARAKEET_CPP_DIR}")
+  else()
+    include(FetchContent)
+    FetchContent_Declare(parakeet_cpp
+      GIT_REPOSITORY https://github.com/mudler/parakeet.cpp.git
+      GIT_TAG        main
+      GIT_SHALLOW    ON)
+    # parakeet.cpp builds its own ggml; we only need libparakeet.a and the
+    # headers. Suppress its tests/examples to keep the build lean.
+    set(PARAKEET_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(PARAKEET_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(parakeet_cpp)
+  endif()
+  target_include_directories(vllm PUBLIC
+    ${parakeet_cpp_SOURCE_DIR}/include)
+  target_link_libraries(vllm PUBLIC parakeet)
+  target_compile_definitions(vllm PUBLIC VLLM_WITH_DIARIZATION=1)
+endif()
 if(WIN32)
   target_link_libraries(vllm PUBLIC ws2_32)
 endif()

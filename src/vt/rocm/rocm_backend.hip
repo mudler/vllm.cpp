@@ -841,6 +841,10 @@ size_t DeviceMemoryTotalBytes(int index) noexcept {
   // NOT calling it: this is a HIP-free, backend-registration-independent
   // free function meant for the platform registrar (see the declaration),
   // where `GetBackend(kROCM)` may not have run yet.
+  // hipInit is required before any hip* call at static-init time; without it
+  // hipSetDevice/hipMemGetInfo silently fail and return 0, which makes the fit
+  // check see an UNKNOWN budget and place nothing on device.
+  (void)hipInit(0);
   if (hipSetDevice(index) != hipSuccess) return 0;
   size_t free_b = 0, tot_b = 0;
   if (hipMemGetInfo(&free_b, &tot_b) != hipSuccess) return 0;
@@ -852,6 +856,7 @@ size_t ManagedMemoryBudgetBytes(int index) noexcept {
   // DeviceMemoryTotalBytes, returns `free` not `total`. On a managed-alloc
   // board (gfx1151), hipMallocManaged's ceiling is the free field, not the
   // physical total. The 6 GiB gap is driver-reserved + KFD TTM + display.
+  (void)hipInit(0);
   if (hipSetDevice(index) != hipSuccess) return 0;
   size_t free_b = 0, tot_b = 0;
   if (hipMemGetInfo(&free_b, &tot_b) != hipSuccess) return 0;

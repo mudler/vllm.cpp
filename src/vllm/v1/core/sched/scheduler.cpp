@@ -646,6 +646,15 @@ SchedulerOutput Scheduler::schedule() {
   const bool priority_policy =
       scheduler_config_.policy == SchedulerPolicy::kPriority;
 
+  // `long_prefill_token_threshold` exists to stop a long prefill from
+  // starving other requests of the token budget. When it is the only
+  // request there is nobody to starve, so let it use the whole budget.
+  // (scheduler.py:602-607, upstream commit c64b15cde5)
+  const int long_prefill_threshold =
+      (running.size() + waiting->size() > 1)
+          ? long_prefill_token_threshold_
+          : 0;
+
   // First, schedule the RUNNING requests. req_index is a signed int so the
   // priority-preemption `req_index -= 1` fix-up (upstream scheduler.py:570) is
   // well-defined.
@@ -680,9 +689,9 @@ SchedulerOutput Scheduler::schedule() {
     int num_new_tokens = request->NumTokensWithSpec() +
                          request->num_output_placeholders -
                          request->num_computed_tokens;
-    if (0 < long_prefill_token_threshold_ &&
-        long_prefill_token_threshold_ < num_new_tokens) {
-      num_new_tokens = long_prefill_token_threshold_;
+    if (0 < long_prefill_threshold &&
+        long_prefill_threshold < num_new_tokens) {
+      num_new_tokens = long_prefill_threshold;
     }
     num_new_tokens = std::min(num_new_tokens, token_budget);
     // Do not let the input position exceed the max model len.
@@ -899,9 +908,9 @@ SchedulerOutput Scheduler::schedule() {
 
       // Number of tokens to schedule (num_tokens covers resumed reqs' output).
       int num_new_tokens = request->NumTokens() - num_computed_tokens;
-      if (0 < long_prefill_token_threshold_ &&
-          long_prefill_token_threshold_ < num_new_tokens) {
-        num_new_tokens = long_prefill_token_threshold_;
+      if (0 < long_prefill_threshold &&
+          long_prefill_threshold < num_new_tokens) {
+        num_new_tokens = long_prefill_threshold;
       }
       // With chunked prefill disabled, we cannot split -> stop scheduling here.
       if (!enable_chunked_prefill_ && num_new_tokens > token_budget) {

@@ -98,10 +98,10 @@ as part of a sync cycle, from a measured oracle, never by transcribing a version
 number.
 
 ```parity-pin
-vllm_commit = e126687a9a828d513c01a07cd69f025f27d63280
-vllm_runtime_version = 0.28.1rc1.dev132+ge126687a9
-vllm_distribution_version = 0.28.1rc1.dev132+ge126687a9
-flashinfer_version = 0.6.18
+vllm_commit = a7c23ac96d7806e7c7e7d862eadbce5a33529b94
+vllm_runtime_version = 0.3.0.dev267+ga7c23ac96d
+vllm_distribution_version = 0.3.0.dev267+ga7c23ac96d
+flashinfer_version = 0.6.15.post1
 ```
 
 **This field now records the SOURCE build, corrected 2026-09-04 on developer

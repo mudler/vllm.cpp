@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <memory>
 #include <vector>
 
 #include "vllm/model_executor/model_loader/gguf_keep_quant.h"
@@ -669,30 +670,76 @@ std::vector<float> MoeForward(const MoeDims& d, const MoeLayerWeights& w,
   // the routed output.
   std::vector<float> shared;
   if (d.n_shared_experts > 0) {
-    shared = DenseMlpForward(w.shared, hidden, H, d.shared_intermediate_size(),
-                             num_tokens, d.swiglu_limit);
+    if (dev != nullptr) {
+      // Device path: stack gate_proj [I,H] + up_proj [I,H] into [2I,H], one
+      // MatmulBT produces the fused gate|up [T, 2I], ClampedSwiGLU applies the
+      // clamped-silu activation, then MatmulBT with down_proj [H,I] produces
+      // [T, H].  All operands go through DBuf so the backend uploads host
+      // memory to device — WF32/MakeTensor would alias host pointers, which
+      // ROCm (pageableMemoryAccess: 0) cannot dereference.
+      const int64_t Is = d.shared_intermediate_size();
+      std::vector<float> stacked(static_cast<size_t>(2 * Is * H));
+      std::copy(w.shared.gate_proj.begin(), w.shared.gate_proj.end(),
+                stacked.begin());
+      std::copy(w.shared.up_proj.begin(), w.shared.up_proj.end(),
+                stacked.begin() + static_cast<size_t>(Is * H));
+
+      dense_attn::DBuf dh(*dev, vt::DType::kF32, {num_tokens, H}, hidden.data());
+      dense_attn::DBuf dsw(*dev, vt::DType::kF32, {2 * Is, H}, stacked.data());
+      dense_attn::DBuf dgu(*dev, vt::DType::kF32, {num_tokens, 2 * Is});
+      vt::MatmulBT(dev->q, dgu.t(), dh.t(), dsw.t());
+
+      dense_attn::DBuf da(*dev, vt::DType::kF32, {num_tokens, Is});
+      vt::ClampedSwiGLU(dev->q, da.t(), dgu.t(), d.swiglu_limit);
+
+      dense_attn::DBuf ddw(*dev, vt::DType::kF32, {H, Is},
+                           w.shared.down_proj.data());
+      dense_attn::DBuf dout(*dev, vt::DType::kF32, {num_tokens, H});
+      vt::MatmulBT(dev->q, dout.t(), da.t(), ddw.t());
+
+      shared.resize(static_cast<size_t>(num_tokens * H));
+      dout.Download(*dev, shared.data());
+    } else {
+      shared = DenseMlpForward(w.shared, hidden, H, d.shared_intermediate_size(),
+                               num_tokens, d.swiglu_limit);
+    }
   }
 
   std::vector<float> out(static_cast<size_t>(num_tokens * H), 0.0f);
-  // `cdev` and not `dev`: the parameter of that name is the DEVICE ARM, and
-  // this is the combine's HOST device. The combine reads `expert_out` and
-  // `topk_weights`, both host buffers, whichever arm filled them -- the device
-  // arm downloads before it returns -- so the combine stays on the host queue
-  // and W9c-3a does not move it. O43 lists it among the ten arms still there.
-  const vt::Device cdev = queue.device;
-  vt::Tensor t_out = MakeT(out.data(), vt::DType::kF32, cdev, {num_tokens, H});
-  vt::Tensor t_eo = MakeT(expert_out.data(), vt::DType::kF32, cdev, {num_tokens, K, H});
-  vt::Tensor t_w = MakeT(const_cast<float*>(r.topk_weights.data()), vt::DType::kF32, cdev,
-                         {num_tokens, K});
-  vt::Tensor t_sh;
-  if (!shared.empty()) {
-    t_sh = MakeT(shared.data(), vt::DType::kF32, cdev, {num_tokens, H});
+  if (dev != nullptr) {
+    // Device path: upload expert_out, topk_weights, and shared through DBuf
+    // (which issues backend Copy for non-CPU devices), run MoeCombine on the
+    // device queue, then download.
+    dense_attn::DBuf d_out(*dev, vt::DType::kF32, {num_tokens, H});
+    dense_attn::DBuf d_eo(*dev, vt::DType::kF32, {num_tokens, K, H},
+                          expert_out.data());
+    dense_attn::DBuf d_w(*dev, vt::DType::kF32, {num_tokens, K},
+                         r.topk_weights.data());
+    std::unique_ptr<dense_attn::DBuf> d_sh;
+    if (!shared.empty()) {
+      d_sh = std::make_unique<dense_attn::DBuf>(
+          *dev, vt::DType::kF32, {num_tokens, H}, shared.data());
+    }
+    vt::MoeCombine(dev->q, d_out.t(), d_eo.t(), d_w.t(),
+                   d_sh ? &d_sh->t() : nullptr,
+                   /*routed_scale=*/1.0f);
+    d_out.Download(*dev, out.data());
+  } else {
+    // Host path: alias host pointers (CPU queue Copy is a no-op).
+    const vt::Device cdev = queue.device;
+    vt::Tensor t_out = MakeT(out.data(), vt::DType::kF32, cdev, {num_tokens, H});
+    vt::Tensor t_eo =
+        MakeT(expert_out.data(), vt::DType::kF32, cdev, {num_tokens, K, H});
+    vt::Tensor t_w = MakeT(const_cast<float*>(r.topk_weights.data()),
+                           vt::DType::kF32, cdev, {num_tokens, K});
+    vt::Tensor t_sh;
+    if (!shared.empty()) {
+      t_sh = MakeT(shared.data(), vt::DType::kF32, cdev, {num_tokens, H});
+    }
+    vt::MoeCombine(queue, t_out, t_eo, t_w,
+                   shared.empty() ? nullptr : &t_sh,
+                   /*routed_scale=*/1.0f);
   }
-  // `routed_scale` stays 1.0f: `routed_scaling_factor` is already in the router
-  // weights (`MoeRouterTopKArgs::routed_scaling_factor` above), which is
-  // upstream's polarity — the SHARED term is added unscaled (`:206`).
-  vt::MoeCombine(queue, t_out, t_eo, t_w, shared.empty() ? nullptr : &t_sh,
-                 /*routed_scale=*/1.0f);
   return out;
 }
 

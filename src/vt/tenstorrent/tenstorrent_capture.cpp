@@ -12,6 +12,9 @@
 
 #include "vt/tenstorrent/tenstorrent_internal.h"
 
+#include <chrono>
+#include <vector>
+
 namespace vt::tenstorrent {
 
 // ---- ttnn mesh-trace capture (Backend graph-capture mapping) ----------------
@@ -139,6 +142,9 @@ void TraceReplayGraph(void* graph) {
   if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr)
     std::fprintf(stderr, "[TT-STEP] execute_trace begin\n");
   ttnn::operations::trace::execute_trace(&device, id, kTraceCq, /*blocking=*/false);
+  // TT-27B-STEP-DECOMPOSE: stamp the launch so the first blocking read after
+  // it (the logits download) reports the step's completion wait.
+  StepPhaseNoteLaunch("replay");
   if (std::getenv("VT_TT_TRACE_DEBUG") != nullptr)
     std::fprintf(stderr, "[TT-STEP] execute_trace enqueued\n");
   InvalidateHostCachesAfterTrace();
@@ -163,6 +169,93 @@ void TraceDestroyGraph(void* graph) {
   }
   delete id;
 }
+
+// ---- TT-27B-STEP-DECOMPOSE (VT_TT_STEP_PHASES): the step phase clock ---------
+// A READ-ONLY instrument for the captured decode step's cost decomposition
+// (.agents/specs/tenstorrent-27b-step-decompose.md). The driver brackets its
+// own phases (warmup refreshes, embed, capture begin/body/end, replay launch)
+// and prints one line per step; the SEAM half here closes the loop on the one
+// phase the driver cannot see — the completion wait. Replay enqueue is
+// NON-BLOCKING (see TraceReplayGraph), so the step's device time surfaces at
+// the next blocking host read (EnsureHostBytes' to_vector). StepPhaseNoteLaunch
+// stamps that launch; the first read after it reports the wait and consumes
+// the stamp. Zero cost when the env is unset.
+namespace {
+struct StepPhaseState {
+  std::chrono::steady_clock::time_point launch{};
+  std::chrono::steady_clock::time_point read_begin{};
+  bool has_launch = false;
+  char kind[16] = "none";
+};
+StepPhaseState& StepPhaseSt() {
+  static StepPhaseState* s = new StepPhaseState();  // never destroyed (#1486)
+  return *s;
+}
+double StepPhaseMs(std::chrono::steady_clock::time_point a,
+                   std::chrono::steady_clock::time_point b) {
+  return std::chrono::duration<double, std::milli>(b - a).count();
+}
+}  // namespace
+
+bool StepPhasesEnabled() { return std::getenv("VT_TT_STEP_PHASES") != nullptr; }
+const char* StepPhaseMode() {
+  const char* e = std::getenv("VT_TT_STEP_PHASES");
+  return e != nullptr ? e : "";
+}
+void StepPhaseNoteLaunch(const char* kind) {
+  if (!StepPhasesEnabled()) return;
+  StepPhaseState& s = StepPhaseSt();
+  s.launch = std::chrono::steady_clock::now();
+  s.has_launch = true;
+  std::snprintf(s.kind, sizeof s.kind, "%s", kind);
+}
+void StepPhaseReadBegin() {
+  if (!StepPhasesEnabled()) return;
+  StepPhaseSt().read_begin = std::chrono::steady_clock::now();
+}
+void StepPhaseReadEnd(int64_t bytes) {
+  if (!StepPhasesEnabled()) return;
+  StepPhaseState& s = StepPhaseSt();
+  const auto t_end = std::chrono::steady_clock::now();
+  const double wait_ms = StepPhaseMs(s.read_begin, t_end);
+  if (s.has_launch) {
+    // The first blocking read after the step's last launch pays the device
+    // tail: gap = host work between launch and the read, wait = the read
+    // itself (queue drain + D2H).
+    std::fprintf(stderr,
+                  "[TT-STEP-PHASE] sync kind=%s gap_ms=%.3f wait_ms=%.3f "
+                  "read=%lld\n",
+                  s.kind, StepPhaseMs(s.launch, s.read_begin), wait_ms,
+                  static_cast<long long>(bytes));
+    s.has_launch = false;
+  } else {
+    // No pending launch (a read outside the driver's step bracket, e.g. the
+    // prefill forward's own logits drain): its own duration is the device
+    // tail it paid.
+    std::fprintf(stderr,
+                  "[TT-STEP-PHASE] sync kind=host-read wait_ms=%.3f read=%lld\n",
+                  wait_ms, static_cast<long long>(bytes));
+  }
+}
+void StepPhaseSyncProbe() {
+  if (!StepPhasesEnabled()) return;
+  // The per-layer sampling probe's queue drain (VT_TT_STEP_PHASES=sync): a
+  // blocking read of a persistent 1-element device tensor. The CQ is
+  // in-order, so the read cannot complete before every prior enqueue has;
+  // per-layer probe time is therefore that layer's true DEVICE cost. The
+  // tensor is created on first use OUTSIDE capture and never freed (#1486).
+  static ttnn::Tensor* probe = nullptr;
+  MeshDevice& device = SharedMeshDevice();
+  if (probe == nullptr) {
+    const auto spec = SpecOf(tt::tt_metal::Shape({1}), ttnn::DataType::UINT32,
+                             ttnn::Layout::ROW_MAJOR);
+    probe = new ttnn::Tensor(ttnn::Tensor::from_vector<uint32_t>(
+        std::vector<uint32_t>{0}, spec, &device));
+  }
+  (void)probe->to_vector<uint32_t>();
+}
+bool TraceCaptureActive() { return tt_capture_active(); }
+
 
 // ---- HOST-FREE-DECODE: persistent decode ids + capture-safe embedding -----
 // The replay step must perform ZERO eager device allocations: per-step eager
@@ -394,6 +487,12 @@ int64_t FreeDeviceDramBytesForTest() {
   return static_cast<int64_t>(view.num_banks) *
          static_cast<int64_t>(view.total_bytes_free_per_bank);
 }
+
+// TT-27B-STEP-DECOMPOSE (VT_TT_STEP_PHASES): free DRAM across banks — the
+// public-name twin of FreeDeviceDramBytesForTest above (which stays test-
+// scoped), so the model-side phase clock can read the per-step retention
+// state without a ForTest name riding in product code.
+int64_t DeviceDramFreeBytes() { return FreeDeviceDramBytesForTest(); }
 
 // Total DRAM across banks — the number the placement fit needs as the
 // platform's probed total (ISSUE-LOCAL-01M2ACXRJYFW7R7BP2ABQS3VY2: without

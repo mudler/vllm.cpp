@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cerrno>
@@ -9851,6 +9852,65 @@ static void DenseEmbedInto(Dev d, DBuf& hidden,
   vt::Embedding(d.q, hidden.t(), dtab, dids.t());
 }
 
+// TT-27B-STEP-DECOMPOSE (VT_TT_STEP_PHASES): the dense captured step's host
+// phase clock (.agents/specs/tenstorrent-27b-step-decompose.md). READ-ONLY —
+// it brackets existing calls and prints one stderr line per step; with the
+// knob unset every check below is a getenv compare and nothing else runs.
+// The line decomposes the step the driver can see: warmup refreshes (does
+// each step re-warm, and how many warm passes does it make), embed, the
+// capture pass (begin/body/end, the tt-metal trace build), the replay launch
+// — plus the two things around it: `gap_prev` (the runner/sampler window
+// between the previous step's return and this entry, which the seam-side
+// `sync` lines further split into the blocking completion read and host
+// residue) and `dram_free` (the per-step retention read-out, the
+// ~950 MB/request staircase tt-metal#57970 names). `boundary=1` marks a
+// request's first decode step (the seq-continuation predicate), which is the
+// pressure-axis join: request 1's steps vs request 4's.
+namespace {
+using StepPhaseClk = std::chrono::steady_clock;
+inline double StepPhaseMsOf(StepPhaseClk::time_point a, StepPhaseClk::time_point b) {
+  return std::chrono::duration<double, std::milli>(b - a).count();
+}
+struct StepPhaseTrace {
+  bool on = false;
+  StepPhaseClk::time_point t0{};  // Step() entry
+  double warms_ms = 0, embed_ms = 0, pregrow_ms = 0, cap_begin_ms = 0,
+         cap_body_ms = 0, cap_end_ms = 0, pin_ms = 0, replay_ms = 0,
+         body_ms = 0;
+  int64_t warm_calls = 0;
+  bool boundary = false;
+  int64_t B = 0, S = 0;
+  int64_t dram_free = -1;
+};
+// One line per step, emitted at every return the captured arm takes. The
+// `gap_prev` half of the wall lives in the CALLER's window (sampler + runner
+// between this step's return and the next entry), so the sum check closes as
+// step wall + gap + the seam's sync (gap + wait) lines with no hidden residue.
+void StepPhaseEmit(const StepPhaseTrace& p, const char* kind) {
+  static int64_t n = 0;
+  static StepPhaseClk::time_point prev_return{};
+  const auto now = StepPhaseClk::now();
+  double gap_prev_ms = -1.0;
+  if (prev_return.time_since_epoch().count() != 0)
+    gap_prev_ms = StepPhaseMsOf(prev_return, p.t0);
+  prev_return = now;
+  ++n;
+  std::fprintf(stderr,
+               "[TT-STEP-PHASE] step=%lld kind=%s B=%lld S=%lld boundary=%d "
+               "warm_calls=%lld dram_free_mib=%lld wall_ms=%.1f warms_ms=%.1f "
+               "embed_ms=%.1f pregrow_ms=%.1f cap_begin_ms=%.1f "
+               "cap_body_ms=%.1f cap_end_ms=%.1f pin_ms=%.1f replay_ms=%.1f "
+               "body_ms=%.1f gap_prev_ms=%.1f\n",
+               static_cast<long long>(n), kind, static_cast<long long>(p.B),
+               static_cast<long long>(p.S), p.boundary ? 1 : 0,
+               static_cast<long long>(p.warm_calls),
+               static_cast<long long>(p.dram_free),
+               StepPhaseMsOf(p.t0, now), p.warms_ms, p.embed_ms, p.pregrow_ms,
+               p.cap_begin_ms, p.cap_body_ms, p.cap_end_ms, p.pin_ms,
+               p.replay_ms, p.body_ms, gap_prev_ms);
+}
+}  // namespace
+
 // The CAPTURABLE dense paged forward region (27B): everything AFTER the embedding
 // — the residual stream (res=0), the N paged dense decoder layers, the final
 // RMSNorm and the bf16 lm_head — returning the [n_out,vocab] f32 logits as a
@@ -9958,6 +10018,17 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
   // The MoE sibling has carried this snapshot since the Tenstorrent bisect.
   ActDumpStream(d, dump_step, -1, hidden, res, T, H);
 
+  // TT-27B-STEP-DECOMPOSE (VT_TT_STEP_PHASES): the per-layer sampling probe
+  // over the 64 layers — host record/enqueue cost per layer always, and with
+  // VT_TT_STEP_PHASES=sync a blocking queue drain (StepPhaseSyncProbe) after
+  // each layer so the line carries that layer's true DEVICE time. The drain
+  // is INERT while a trace capture is open (a readback inside the captured
+  // region is prohibited; the capture pass then reports record cost only)
+  // and on every backend the knob does not enable. Zero cost when unset.
+  const bool sph_layer = vt::tenstorrent::StepPhasesEnabled();
+  const bool sph_layer_sync =
+      sph_layer && d.q.device.type == vt::DeviceType::kTENSTORRENT &&
+      std::strcmp(vt::tenstorrent::StepPhaseMode(), "sync") == 0;
   int64_t fa_idx = 0, gdn_idx = 0;
   for (int64_t l = 0; l < config.num_hidden_layers; ++l) {
     const Qwen3_5DenseLayerWeights& layer = weights.layers[static_cast<size_t>(l)];
@@ -9965,6 +10036,8 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
         layer.is_linear_attention ? nullptr : &attn_kv[static_cast<size_t>(fa_idx++)];
     const GdnStateCache* gs =
         layer.is_linear_attention ? &gdn_state[static_cast<size_t>(gdn_idx++)] : nullptr;
+    const StepPhaseClk::time_point sph_l0 =
+        sph_layer ? StepPhaseClk::now() : StepPhaseClk::time_point{};
 #ifdef VLLM_CPP_TENSTORRENT
     // W4d (#3042) attribution: the chunk-loop ledger brackets only the
     // keep-quant webs; 13 GB of the 27B first pass lands in the spans this
@@ -9979,6 +10052,19 @@ static DBuf DenseForwardLayers(Dev d, const Tensor& hidden_in,
 #endif
     RunDenseLayerPaged(d, layer, config, hidden, res, sdi, attn_meta,
                        gdn_meta, kv, gs, T, l);
+    if (sph_layer) {
+      const double host_ms = StepPhaseMsOf(sph_l0, StepPhaseClk::now());
+      double dev_ms = -1.0;
+      if (sph_layer_sync && !vt::tenstorrent::TraceCaptureActive()) {
+        const StepPhaseClk::time_point sph_s0 = StepPhaseClk::now();
+        vt::tenstorrent::StepPhaseSyncProbe();
+        dev_ms = StepPhaseMsOf(sph_s0, StepPhaseClk::now());
+      }
+      std::fprintf(stderr,
+                   "[TT-STEP-PHASE] layer=%lld type=%s host_ms=%.3f dev_ms=%.3f\n",
+                   static_cast<long long>(l),
+                   layer.is_linear_attention ? "gdn" : "fa", host_ms, dev_ms);
+    }
 #ifdef VLLM_CPP_TENSTORRENT
     if (vt::tenstorrent::DeviceAvailable()) {
       std::snprintf(tt_lbl, sizeof tt_lbl, "block/%lld/post",
@@ -11893,6 +11979,8 @@ ForwardLogits Qwen3_5DecodeGraph::Step(
 // cublas lm_head), so a cold pre-warm at each size makes the capture region do
 // ZERO cudaMalloc — mirroring the MoE path's EnsureMoeScratch/EnsureCtmp/pool
 // discipline. The 35B MoE graph is UNTOUCHED.
+
+
 struct Qwen3_5DenseDecodeGraph::Impl {
   Impl(const Qwen3_5DenseWeights& w, const HfConfig& c, vt::Queue q,
        int64_t max_reqs)
@@ -12092,6 +12180,15 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   else ValidateFullAttnStepMetadata(B, attn_meta);
   Backend& b = vt::GetBackend(impl_->queue.device.type);
   Dev d{b, impl_->queue};
+  // TT-27B-STEP-DECOMPOSE (VT_TT_STEP_PHASES): the step phase clock. `on` is
+  // a getenv compare and every bracket below is `sph.on ? now : t0` — zero
+  // cost with the knob unset, on every backend.
+  StepPhaseTrace sph;
+  sph.on = vt::tenstorrent::StepPhasesEnabled();
+  sph.t0 = sph.on ? StepPhaseClk::now() : StepPhaseClk::time_point{};
+  sph.B = B;
+  if (sph.on && d.q.device.type == vt::DeviceType::kTENSTORRENT)
+    sph.dram_free = vt::tenstorrent::DeviceDramFreeBytes() >> 20;
   // #1380: open a fresh demand measurement for this step. `PreGrowForCapture`
   // reads the profile the COLD step at this shape recorded, and a profile is a
   // property of one step, so the boundary is here and not inside a branch.
@@ -12117,6 +12214,7 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   // because num_reqs is.
   const bool spec_step = has_gdn && gdn_meta.num_spec_decodes > 0;
   const int64_t S = spec_step ? B : PadToCaptureSize(B, impl_->max_num_reqs);
+  if (sph.on) sph.S = S;
   // ENG-CUDAGRAPH-BREAK W6 (#1374): this step's uniform query length, and the
   // ring key built from it. `Q == 0` means the batch does not divide evenly into
   // its requests, which no captured decode shape describes.
@@ -12140,13 +12238,23 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
       // The graph cannot serve this batch (disabled / unsupported size), so fall
       // back to the EAGER multi-tap forward, which fills aux_out itself. Without
       // this the drafter sees no taps at all.
+      StepPhaseEmit(sph, "eager-mtap");
       return Qwen3_5DenseModel::ForwardDeviceMultiTap(
           token_ids, positions, attn_meta, gdn_meta, attn_kv, gdn_state,
           impl_->weights, impl_->config, impl_->queue, aux_out, {});
     }
+    const StepPhaseClk::time_point sph_tb0 =
+        sph.on ? StepPhaseClk::now() : sph.t0;
     DBuf lg = DenseForwardBody(d, token_ids, positions, attn_meta, gdn_meta,
                                attn_kv, gdn_state, impl_->weights, impl_->config,
                                LastTokenLogitsIndices(attn_meta, B));
+    if (sph.on) {
+      sph.body_ms = StepPhaseMsOf(sph_tb0, StepPhaseClk::now());
+      // The eager forward's last enqueue: the seam's first blocking read after
+      // this stamp reports the step's completion wait.
+      vt::tenstorrent::StepPhaseNoteLaunch("eager");
+      StepPhaseEmit(sph, "eager-fallback");
+    }
     return WrapDeviceLogits(d, std::move(lg), vocab);
   }
 
@@ -12249,6 +12357,12 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   s.Refresh(ptok, ppos, pam, pgm);
   s.fa_cols = cols;
   bool seq_continuation = true;  // no seq_lens -> no boundary to detect
+  // TT-27B-STEP-DECOMPOSE: the per-step TT refresh block is the "warmup
+  // passes" phase — every Warm* call the captured arm makes per step is
+  // inside this bracket, and `warm_calls` counts them (cos|sin + one paged-KV
+  // shadow per full-attn layer + cur_pos + RAC idx + PA meta).
+  const StepPhaseClk::time_point sph_tw0 =
+      sph.on ? StepPhaseClk::now() : sph.t0;
   // TT captured arm (the WarmRopeCosSin populate-outside / content-HIT-inside
   // pattern; qwen3.cpp:827-900 ported to the dense driver): refresh every
   // persistent device input the captured region reads, OUTSIDE capture, on
@@ -12300,6 +12414,15 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
           static_cast<int64_t>(pam.block_table_num_cols), 1,
           pam.seq_lens.data());
     }
+  }
+  if (sph.on) {
+    sph.warms_ms = StepPhaseMsOf(sph_tw0, StepPhaseClk::now());
+    sph.warm_calls = 1 + static_cast<int64_t>(attn_kv.size()) +
+                     (pam.seq_lens.empty() ? 0 : 1) + 1 +
+                     (pam.block_table_tensor.empty() || pam.seq_lens.empty()
+                          ? 0
+                          : 1);
+    sph.boundary = !seq_continuation;
   }
   // #2469 (qwen3.cpp:903-921 port): a same-size request boundary must
   // re-capture, not seed-and-replay. The boundary seed alone leaves the first
@@ -12377,7 +12500,10 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     }
   }
   if (do_replay) {
+    const StepPhaseClk::time_point sph_te0 =
+        sph.on ? StepPhaseClk::now() : sph.t0;
     DenseEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
+    if (sph.on) sph.embed_ms = StepPhaseMsOf(sph_te0, StepPhaseClk::now());
     if (dbuf) {
       StageStepInputs(d, s);
       StageSpecStepInputs(d, s);
@@ -12392,7 +12518,13 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     // Through the seam's container, never `Backend::ReplayGraph` directly: the
     // container replays its segments in order (one, here, because a decode
     // capture is kFull) and owns the G3 replay counter the gate reads.
+    const StepPhaseClk::time_point sph_tr0 =
+        sph.on ? StepPhaseClk::now() : sph.t0;
     s.graph.Replay(impl_->queue);
+    if (sph.on) {
+      sph.replay_ms = StepPhaseMsOf(sph_tr0, StepPhaseClk::now());
+      StepPhaseEmit(sph, "replay");
+    }
     ++s.replays;
     ++impl_->replays;
     publish_aux();
@@ -12447,7 +12579,10 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     // following it. A pre-grow is `Backend::Alloc` and nothing else -- it
     // enqueues no work and reads no in-flight buffer -- and the drain still
     // happens before `BeginCapture`, which is the property it was added for.
+    const StepPhaseClk::time_point sph_tp0 =
+        sph.on ? StepPhaseClk::now() : sph.t0;
     Pool(b).PreGrowForCapture(b, s.demand);
+    if (sph.on) sph.pregrow_ms = StepPhaseMsOf(sph_tp0, StepPhaseClk::now());
     // dbuf: the runner may have skipped the depth-2 drain (the previous step
     // returned a slot view), so a prior replay can still be in flight. Capture must
     // begin on an idle stream — drain once here. One-time (≤2 captures per size);
@@ -12494,7 +12629,10 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
                   : 0;
       s.pin.Alloc(b, *s.dev, S, s.attn_meta.num_reqs, cols, idx, has_idx);
     }
+    const StepPhaseClk::time_point sph_te1 =
+        sph.on ? StepPhaseClk::now() : sph.t0;
     DenseEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
+    if (sph.on) sph.embed_ms = StepPhaseMsOf(sph_te1, StepPhaseClk::now());
     // ENG-CUDAGRAPH-BREAK W4 (#1307): the capture is the SHARED SEAM's, not this
     // driver's hand-rolled `BeginCapture`/`EndCaptureGraph` pair. The scope owns
     // the segment, the handle, its release and the drain a mid-capture throw
@@ -12520,8 +12658,18 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     // only thing keeping it inert on the 35B — GDN-MOE-BF16-OUT (#1168) made
     // outdt BF16 on both arms, so the bound is a toggle now, not a model shape.
     std::optional<DBuf> lg;
+    // TT-27B-STEP-DECOMPOSE: cap_begin brackets the scope CONSTRUCTION
+    // (BeginCapture: ttnn's begin_trace_capture), cap_body the recorded
+    // forward (host-side record cost per op — the capture body enqueues
+    // nothing), cap_end the scope DESTRUCTION (EndCaptureGraph: the tt-metal
+    // trace finalize + trace-buffer build — the capture-invocation cost).
+    StepPhaseClk::time_point sph_tc1{};
     {
+      const StepPhaseClk::time_point sph_tc0 =
+          sph.on ? StepPhaseClk::now() : sph.t0;
       vt::GraphCaptureScope scope(b, impl_->queue, s.graph, vt::GraphCaptureMode::kFull);
+      if (sph.on) sph.cap_begin_ms = StepPhaseMsOf(sph_tc0, StepPhaseClk::now());
+      sph_tc1 = StepPhaseClk::now();
       lg = DenseForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
                               s.gdn_meta, attn_kv, gdn_state, impl_->weights,
                               impl_->config, {}, nullptr, nullptr, aux_ids_arg,
@@ -12541,7 +12689,13 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
         vt::tenstorrent::CaptureDecodePosAdvance(
             static_cast<int64_t>(pam.num_reqs));
       }
+      if (sph.on) {
+        sph.cap_body_ms = StepPhaseMsOf(sph_tc1, StepPhaseClk::now());
+        // Re-stamp so the same variable brackets the scope DESTRUCTOR next.
+        sph_tc1 = StepPhaseClk::now();
+      }
     }  // ~GraphCaptureScope closes the segment and files it on s.graph
+    if (sph.on) sph.cap_end_ms = StepPhaseMsOf(sph_tc1, StepPhaseClk::now());
     // NOT CAPTURED covers TWO states, and returning the buffer is correct for
     // exactly one of them. `~GraphCaptureScope` must swallow a throwing
     // `EndCaptureGraph` — a destructor that propagates terminates — so a FAILED
@@ -12580,6 +12734,12 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
       }
       publish_aux();
       record_staged();
+      if (sph.on) {
+        // INERT scope: the region ran EAGERLY, so the drain read pays its own
+        // device tail (the launch stamp below attributes it).
+        vt::tenstorrent::StepPhaseNoteLaunch("eager");
+        StepPhaseEmit(sph, "capture-eager");
+      }
       ForwardLogits drained = WrapDeviceLogits(d, std::move(*lg), vocab);
       if (drained.rows != B) {
         drained.rows = B;
@@ -12611,14 +12771,23 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     // where it would be popped first and leave one of the graph's own blocks
     // reachable. Freeing the old logits is correct -- the graph it belonged to
     // was Reset -- it just must not happen while we are counting.
+    const StepPhaseClk::time_point sph_tpin0 =
+        sph.on ? StepPhaseClk::now() : sph.t0;
     if (s.pinned.empty()) s.pinned = Pool(b).PinForGraph(b, s.demand);
+    if (sph.on) sph.pin_ms = StepPhaseMsOf(sph_tpin0, StepPhaseClk::now());
     s.logits = std::make_unique<DBuf>(std::move(*lg));
     impl_->any_captured = true;
     if (std::getenv("VT_DECODE_GRAPH_STATS") != nullptr)
       std::fprintf(stderr, "[DenseDecodeGraph] captured Qwen3.5 dense decode graph "
                            "for padded size S=%lld (real B=%lld)\n",
                    static_cast<long long>(S), static_cast<long long>(B));
+    const StepPhaseClk::time_point sph_tr1 =
+        sph.on ? StepPhaseClk::now() : sph.t0;
     s.graph.Replay(impl_->queue);
+    if (sph.on) {
+      sph.replay_ms = StepPhaseMsOf(sph_tr1, StepPhaseClk::now());
+      StepPhaseEmit(sph, "capture");
+    }
     record_staged();
     s.replays = 1;
     ++impl_->replays;
@@ -12631,7 +12800,10 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   // same-size step. This is a real decode step (its padded output's real rows are
   // used). (Re)allocate the persistent hidden buffer to this size.
   s.hidden = std::make_unique<DBuf>(d, DType::kBF16, std::vector<int64_t>{S, H});
+  const StepPhaseClk::time_point sph_te2 =
+      sph.on ? StepPhaseClk::now() : sph.t0;
   DenseEmbedInto(d, *s.hidden, s.token_ids, impl_->weights, impl_->config);
+  if (sph.on) sph.embed_ms = StepPhaseMsOf(sph_te2, StepPhaseClk::now());
   // W2 (capture-warmup redesign): NO snapshot/restore around the warmup.
   // The restore 2ed5e912e4 added traded semantic correctness for program-
   // cache stability the commit already provides: the warmup's
@@ -12647,10 +12819,18 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
   // committed. (W1 already removed the conv slot for the serveability
   // reason; this removes the ssm slot for the same value-preservation
   // one, and the whole snapshot/restore with it.)
+  const StepPhaseClk::time_point sph_tb1 =
+      sph.on ? StepPhaseClk::now() : sph.t0;
   DBuf lg = DenseForwardLayers(d, s.hidden->t(), s.positions, s.attn_meta,
                                s.gdn_meta, attn_kv, gdn_state, impl_->weights,
                                impl_->config, {}, nullptr, nullptr, aux_ids_arg,
                                aux_out_arg);
+  if (sph.on) {
+    sph.body_ms = StepPhaseMsOf(sph_tb1, StepPhaseClk::now());
+    // The cold step's eager forward: the first blocking read after this stamp
+    // (its logits drain) reports the step's completion wait.
+    vt::tenstorrent::StepPhaseNoteLaunch("eager");
+  }
   s.warm = true;
   // #1380: the cold step is the ONE eager run of this exact forward at this exact
   // shape, so it is where the capture's allocation demand is measurable. Recorded
@@ -12667,6 +12847,7 @@ ForwardLogits Qwen3_5DenseDecodeGraph::Step(
     fl.device_tensor =
         MakeTensor(fl.device_storage.get(), DType::kF32, d.q.device, {B, vocab});
   }
+  if (sph.on) StepPhaseEmit(sph, "cold");
   return fl;
 }
 

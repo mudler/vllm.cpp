@@ -1125,7 +1125,13 @@ void EnsureHostBytes(void* host) {
     bytes = s->bytes;
     base = s->host;
   }
+  // TT-27B-STEP-DECOMPOSE (VT_TT_STEP_PHASES): to_vector is THE blocking
+  // sync point on this backend (no queue-synchronize primitive exists), so
+  // the phase clock brackets it — a read that lands after a replay launch
+  // reports the step's completion wait. Zero cost when the knob is unset.
+  vt::tenstorrent::StepPhaseReadBegin();
   std::vector<float> result = dev.to_vector<float>();
+  vt::tenstorrent::StepPhaseReadEnd(static_cast<int64_t>(bytes));
   const size_t n = result.size();
   {
     std::lock_guard<std::mutex> g(SlotMutex());

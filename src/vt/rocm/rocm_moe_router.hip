@@ -176,12 +176,72 @@ void MoeSiluMulKernelRocm(Queue& q, Tensor& out, const Tensor& gate, const Tenso
 
 void MoeRouterTopKKernelRocm(Queue& q, Tensor& weights, Tensor& indices, const Tensor& logits,
                              const MoeRouterTopKArgs& args, const Tensor* bias) {
-  // Grouped / bias path: fall back via host (rare for Gemma4).
+  // Grouped / bias / sigmoid path: fall back to the CPU kernel.
+  // The router is tiny (T tokens x E experts, typically T=1, E<512) so the
+  // DtoH/HtoD copy overhead is negligible compared to the expert GEMMs.
   if (args.num_expert_group > 0 || bias != nullptr ||
       args.scoring_func != MoeScoringFunc::kSoftmax) {
-    throw std::runtime_error(
-        "vt rocm: MoeRouterTopK only implements ungrouped softmax without bias; "
-        "use CPU backend for grouped/bias routers");
+    const int T = static_cast<int>(logits.shape[0]);
+    const int E = static_cast<int>(logits.shape[1]);
+    const int K = args.top_k;
+    if (T == 0 || K == 0) return;
+
+    // Element sizes
+    const size_t log_elem = (logits.dtype == DType::kF32) ? 4 : 2;
+    const size_t log_bytes = static_cast<size_t>(T) * E * log_elem;
+    const size_t w_bytes = static_cast<size_t>(T) * K * sizeof(float);
+    const size_t i_bytes = static_cast<size_t>(T) * K * sizeof(int32_t);
+    const size_t bias_bytes = bias ? (static_cast<size_t>(E) * 4) : 0;
+
+    // Host staging buffers
+    std::vector<uint8_t> h_log(log_bytes);
+    std::vector<uint8_t> h_w(w_bytes);
+    std::vector<uint8_t> h_i(i_bytes);
+    std::vector<uint8_t> h_bias(bias_bytes);
+
+    // Copy device -> host
+    hipStream_t s = static_cast<hipStream_t>(q.handle);
+    CheckHip(hipMemcpyAsync(h_log.data(), logits.data, log_bytes,
+                            hipMemcpyDeviceToHost, s), "router DtoH logits");
+    if (bias) {
+      CheckHip(hipMemcpyAsync(h_bias.data(), bias->data, bias_bytes,
+                              hipMemcpyDeviceToHost, s), "router DtoH bias");
+    }
+    CheckHip(hipStreamSynchronize(s), "router DtoH sync");
+
+    // Build CPU tensors + queue and dispatch
+    vt::Device cpu_dev{DeviceType::kCPU, 0};
+    vt::Queue cpu_q{cpu_dev, nullptr};
+    vt::Tensor t_log = logits;
+    t_log.data = h_log.data();
+    t_log.device = cpu_dev;
+    vt::Tensor t_w = weights;
+    t_w.data = h_w.data();
+    t_w.device = cpu_dev;
+    vt::Tensor t_i = indices;
+    t_i.data = h_i.data();
+    t_i.device = cpu_dev;
+    vt::Tensor t_bias;
+    const vt::Tensor* p_bias = nullptr;
+    if (bias) {
+      t_bias = *bias;
+      t_bias.data = h_bias.data();
+      t_bias.device = cpu_dev;
+      p_bias = &t_bias;
+    }
+
+    using MoeRouterTopKFn = void(*)(Queue&, Tensor&, Tensor&, const Tensor&,
+                                     const MoeRouterTopKArgs&, const Tensor*);
+    auto fn = GetTypedOp<MoeRouterTopKFn>(OpId::kMoeRouterTopK, DeviceType::kCPU);
+    fn(cpu_q, t_w, t_i, t_log, args, p_bias);
+
+    // Copy results host -> device
+    CheckHip(hipMemcpyAsync(weights.data, h_w.data(), w_bytes,
+                            hipMemcpyHostToDevice, s), "router HtoD weights");
+    CheckHip(hipMemcpyAsync(indices.data, h_i.data(), i_bytes,
+                            hipMemcpyHostToDevice, s), "router HtoD indices");
+    CheckHip(hipStreamSynchronize(s), "router HtoD sync");
+    return;
   }
   if ((logits.dtype != DType::kF32 && logits.dtype != DType::kBF16) ||
       weights.dtype != DType::kF32 || indices.dtype != DType::kI32) {

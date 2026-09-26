@@ -49,6 +49,7 @@
 #include "vllm/model_executor/models/deepseek_v2.h"  // MlaStep / BuildMlaStep
 #include "vllm/model_executor/models/deepseek_v4_device.h"  // MhcDeviceKernels / MhcDevice
 #include "vllm/model_executor/models/mla_attention.h"
+#include "vllm/model_executor/models/glm5_next_attn.h"  // Attention() / AttentionResult
 #include "vllm/model_executor/models/glm5_next.h"
 #include "vllm/model_executor/models/glm5_next_forward.h"
 #include "vllm/model_executor/models/glm5_next_layer.h"
@@ -77,8 +78,8 @@ thread_local size_t g_kpool_reach_count = 0;
 thread_local size_t g_skip_topk_count = 0;
 }  // namespace
 
-void ResetKpoolReachCount() { g_kpool_reach_count = 0; }
-size_t KpoolReachCount() { return g_kpool_reach_count; }
+[[maybe_unused]] void ResetKpoolReachCount() { g_kpool_reach_count = 0; }
+[[maybe_unused]] size_t KpoolReachCount() { return g_kpool_reach_count; }
 
 void ResetSkipTopkCount() { g_skip_topk_count = 0; }
 size_t SkipTopkCount() { return g_skip_topk_count; }
@@ -203,7 +204,7 @@ mla::MlaBlockDims Glm5NextMlaBlockDims(const Glm5NextParams& p) {
 // (kv_b_proj, w_uk_t, w_uv) were produced at load by `AbsorbMla`.
 // `rope_cos_sin_cache` stays empty — NoPE has no rotary. Indexer fields stay
 // empty — the k-pool indexer is NOT the seam's Lightning Indexer.
-mla::MlaBlockWeights Glm5NextResidentMla(Dev d, const Glm5NextMlaWeights& w,
+[[maybe_unused]] mla::MlaBlockWeights Glm5NextResidentMla(Dev d, const Glm5NextMlaWeights& w,
                                          const mla::MlaBlockDims& dm) {
   mla::MlaBlockWeights m;
   m.q_a_proj = ResidentWeight(d, w.q_a_proj);
@@ -306,7 +307,7 @@ std::vector<float> Glm5NextDeviceForward(
   // (glm_moe_dsa_forward.cpp:582-587). The persistent `caches` parameter is not
   // wired here; the test path passes caches == nullptr (single-shot prefill).
   const mla::MlaBlockDims mla_dims = Glm5NextMlaBlockDims(p);
-  const int64_t mla_head_size = mla_dims.head_size();
+  [[maybe_unused]] const int64_t mla_head_size = mla_dims.head_size();
   std::vector<int32_t> mla_positions(static_cast<size_t>(T));
   std::iota(mla_positions.begin(), mla_positions.end(), int32_t{0});
   CommonAttentionMetadata am;
@@ -319,7 +320,7 @@ std::vector<float> Glm5NextDeviceForward(
   am.num_computed_tokens_cpu = {0};
   am.max_query_len = static_cast<int>(T);
   am.max_seq_len = static_cast<int>(T);
-  const int64_t mla_block_size = T;
+  [[maybe_unused]] const int64_t mla_block_size = T;
   am.block_table_num_cols = 1;
   am.block_table_tensor = {0};
   am.slot_mapping.resize(static_cast<size_t>(T));
@@ -327,7 +328,7 @@ std::vector<float> Glm5NextDeviceForward(
   am.causal = true;
   const MlaStep mla_step =
       BuildMlaStep(d, mla_positions, am, mla_block_size, p.max_position_embeddings);
-  TritonMLAImpl mla_impl;
+  [[maybe_unused]] TritonMLAImpl mla_impl;
 
   // ── sparse step eligibility (O36, closes #2410) ────────────────────────
   // The k-pool indexer's `index_topk` decides whether the step prunes. When it
@@ -339,10 +340,10 @@ std::vector<float> Glm5NextDeviceForward(
   const MlaDims mla_md = MlaDimsFrom(p);
   const mla::SparseStepEligibility elig =
       mla::SparseStepEligibilityOf(indexer_dims.index_topk, am);
-  const bool sparse_active = elig.Active();
+  [[maybe_unused]] const bool sparse_active = elig.Active();
   const int64_t output_width = indexer_dims.OutputWidth();
 
-  mla::MlaBlockMetadata sparse_meta;
+  [[maybe_unused]] mla::MlaBlockMetadata sparse_meta;
   std::vector<DBuf> sparse_owned;
   if (sparse_active) {
     const int num_reqs = am.num_reqs;
@@ -392,6 +393,10 @@ std::vector<float> Glm5NextDeviceForward(
     shared.valid_counts = sel_cnt.t();
     shared_ptr = &shared;
   }
+
+  // prev_topk carries the sparse selection between layers (full→shared).
+  std::vector<int32_t> prev_topk;
+  int64_t prev_topk_width = 0;
 
   for (int64_t i = 0; i < L; ++i) {
     const DecoderLayerWeights& w = layers.Layer(i);
@@ -444,169 +449,30 @@ std::vector<float> Glm5NextDeviceForward(
         Fail("KDA layer output size mismatch");
       std::copy_n(out.data(), static_cast<size_t>(T * H), attn_out.data());
     } else {
-      // ── DSA/MLA attention — DEVICE via shared mla::ForwardMlaAttentionBlock ──
-      // The k-pool indexer runs BEFORE the MLA block (O36, closes #2410). When
-      // the step is sparse-eligible, the indexer produces `topk_indices` and
-      // `valid_counts` that are fed into the block through `shared` so every MLA
-      // layer takes the per-token MQA decode route. When the step is dense
-      // (seq_len <= index_topk), the indexer is skipped and `shared` is null.
-      //
-      // On a CPU queue the k-pool device ops are not registered, so the host
-      // fallback (`PackIndexerStates` + `QResid` + `SelectIndexerTopkFromPacked`)
-      // runs instead. On CUDA/ROCm the device ops are used when available.
-      //
-      // The CUDA FA2 prefill kernel requires bf16 query/key/value
-      // (cuda_mla_prefill.cu:185), and ConcatAndCacheMla is a raw byte copy
-      // (cpu_cache.cpp:88-89) so the kv_cache must match the compute dtype. The
-      // sibling (glm_moe_dsa_forward.cpp:444) narrows hidden to bf16 before MLA
-      // for the same reason. We cast f32 normed → bf16, run MLA in bf16, then
-      // widen the output back to f32 for the host-side mHC post island.
-      if (sparse_active) {
-        const IndexerWeights iw = w.dsa.IndexerView();
-        const std::vector<float> q_resid =
-            QResid(mla_md, w.dsa.mla, normed, 1, T);
-        const std::vector<float> packed =
-            PackIndexerStates(indexer_dims, iw, normed, mask, 1, T);
-        if (KpoolDeviceOpsAvailable()) {
-          // DEVICE PATH — vt::Glm5NextKpoolCompress + vt::Glm5NextKpoolSelect.
-          // The host builds the per-token q_states, head_weights, valid_keys,
-          // and q_mask and uploads them (the "island" pattern this file uses for
-          // KDA and MoE); the device ops run the pool compression and the
-          // top-k selection. topk_indices is downloaded only for the
-          // valid_counts round-trip the MLA block's shared selection expects.
-          const int64_t N = indexer_dims.n_heads;
-          const int64_t D = indexer_dims.head_dim;
-          const int64_t QL = indexer_dims.q_lora_rank;
-          const int64_t kpool = indexer_dims.index_kpool;
-
-          // q_states = wq_b(q_resid)  — f32 [1, T, N, D].
-          std::vector<float> q_states(static_cast<size_t>(T * N * D), 0.0f);
-          for (int64_t s = 0; s < T; ++s)
-            Linear(iw.wq_b, q_resid.data() + s * QL, N * D, QL,
-                   q_states.data() + s * N * D);
-          // head_weights = weights_proj(hidden) — f32 [1, T, N].
-          std::vector<float> head_weights(static_cast<size_t>(T * N), 0.0f);
-          for (int64_t s = 0; s < T; ++s)
-            Linear(iw.weights_proj, normed.data() + s * H, N, H,
-                   head_weights.data() + s * N);
-          // valid_keys — the packed row's validity channel, cast to i32 [1, T].
-          std::vector<int32_t> valid_keys(static_cast<size_t>(T), 0);
-          for (int64_t j = 0; j < T; ++j) {
-            const float v =
-                packed[static_cast<size_t>(j * (2 * D + 1) + 2 * D)];
-            valid_keys[static_cast<size_t>(j)] = (v != 0.0f) ? 1 : 0;
-          }
-          // q_mask — the query-side padding mask, cast to i32 [1, T].
-          std::vector<int32_t> q_mask(static_cast<size_t>(T), 0);
-          for (int64_t t = 0; t < T; ++t)
-            q_mask[static_cast<size_t>(t)] =
-                static_cast<int32_t>(mask[static_cast<size_t>(t)]);
-
-          // Upload inputs.
-          DBuf d_packed(d, DType::kF32, {1, T, 2 * D + 1}, packed.data());
-          DBuf d_ape(d, DType::kF32, {kpool, D}, iw.kpool_ape);
-          DBuf d_qstates(d, DType::kF32, {1, T, N, D}, q_states.data());
-          DBuf d_headw(d, DType::kF32, {1, T, N}, head_weights.data());
-          DBuf d_vkeys(d, DType::kI32, {1, T}, valid_keys.data());
-          DBuf d_qmask(d, DType::kI32, {1, T}, q_mask.data());
-
-          // Allocate device outputs for compress. np is the STATIC pool upper
-          // bound; num_pools (P <= np) stays on the device and is never read
-          // back to host.
-          const int64_t np = (T + kpool - 1) / kpool;
-          DBuf d_pool_keys(d, DType::kF32, {1, np, D});
-          DBuf d_pool_indices(d, DType::kI32, {1, np, kpool});
-          DBuf d_pool_valid(d, DType::kI32, {1, np});
-          DBuf d_num_pools(d, DType::kI32, {1});
-
-          vt::Glm5NextKpoolCompress(d.q, d_pool_keys.t(), d_pool_indices.t(),
-                                    d_pool_valid.t(), d_num_pools.t(),
-                                    d_packed.t(), d_ape.t());
-
-          // Allocate device outputs for select.
-          DBuf d_topk_indices(d, DType::kI32, {1, T, output_width});
-          DBuf d_index_scores(d, DType::kF32, {1, T, np});
-
-          vt::Glm5NextKpoolSelectArgs args;
-          args.index_topk = indexer_dims.index_topk;
-          args.current_length = T;
-          args.softmax_scale = indexer_dims.softmax_scale();
-          args.always_select_tail = indexer_dims.always_select_tail;
-
-          vt::Glm5NextKpoolSelect(d.q, d_topk_indices.t(), d_index_scores.t(),
-                                  d_qstates.t(), d_headw.t(), d_pool_keys.t(),
-                                  d_pool_indices.t(), d_pool_valid.t(),
-                                  d_num_pools.t(), d_vkeys.t(), d_qmask.t(),
-                                  args);
-
-          // Copy the device topk_indices into the shared selection buffer.
-          d.b.Copy(d.q, sel_idx.ptr(), d_topk_indices.ptr(), sel_idx.bytes());
-
-          // Download topk_indices for the valid_counts round-trip.
-          std::vector<int32_t> host_topk(static_cast<size_t>(T * output_width),
-                                         -1);
-          d_topk_indices.Download(d, host_topk.data());
-          std::vector<int32_t> valid_counts(static_cast<size_t>(T), 0);
-          for (int64_t t = 0; t < T; ++t) {
-            int32_t cnt = 0;
-            for (int64_t j = 0; j < output_width; ++j)
-              if (host_topk[static_cast<size_t>(t * output_width + j)] != -1)
-                ++cnt;
-            valid_counts[static_cast<size_t>(t)] = cnt;
-          }
-          d.b.Copy(d.q, sel_cnt.ptr(), valid_counts.data(), sel_cnt.bytes());
-          d.b.Synchronize(d.q);
-        } else {
-          // HOST FALLBACK — SelectIndexerTopkFromPacked (CPU queue: the device
-          // ops are not registered).
-          const IndexerSelection selection =
-              SelectIndexerTopkFromPacked(indexer_dims, iw, normed, q_resid,
-                                         mask, packed, 1, T, T);
-          // Upload the indexer's topk_indices into the shared selection buffer.
-          d.b.Copy(d.q, sel_idx.ptr(), selection.topk_indices.data(),
-                   sel_idx.bytes());
-          // Compute valid_counts: count non-(-1) entries per token row.
-          std::vector<int32_t> valid_counts(static_cast<size_t>(T), 0);
-          for (int64_t t = 0; t < T; ++t) {
-            int32_t cnt = 0;
-            for (int64_t j = 0; j < output_width; ++j)
-              if (selection.topk_indices[static_cast<size_t>(t * output_width + j)] != -1)
-                ++cnt;
-            valid_counts[static_cast<size_t>(t)] = cnt;
-          }
-          d.b.Copy(d.q, sel_cnt.ptr(), valid_counts.data(), sel_cnt.bytes());
-          d.b.Synchronize(d.q);
-        }
-        ++g_kpool_reach_count;
+      // ── DSA/MLA attention — HOST (Attention() handles DsaCache) ──────
+      // The device MLA block (mla::ForwardMlaAttentionBlock) uses a local
+      // KV cache DBuf that doesn't wire the engine's persistent DsaCache,
+      // so multi-step decode crashes at the KV binding check. Fall back to
+      // the host Attention() function, which reads and writes DsaCache
+      // correctly. The embedding, RMSNorm, dense MLP, and lm_head stay on
+      // device; only the attention arm runs on host.
+      const IndexerRole role = IndexerRoleFor(p, i);
+      const IndexerWeights iw = w.dsa.IndexerView();
+      const AttentionResult a = Attention(
+          mla_md, w.dsa.mla, indexer_dims,
+          role.skip_topk ? nullptr : &iw, role,
+          normed, mask,
+          prev_topk.empty() ? nullptr : &prev_topk, prev_topk_width,
+          /*batch=*/1, /*seq_len=*/T,
+          lc != nullptr ? &lc->dsa : nullptr);
+      attn_out = a.attn_output;
+      if (a.propagates_topk) {
+        prev_topk = a.topk_indices;
+        prev_topk_width = a.topk_width;
+      } else {
+        prev_topk.clear();
+        prev_topk_width = 0;
       }
-      const mla::MlaBlockWeights mw =
-          Glm5NextResidentMla(d, weights.layers[static_cast<size_t>(i)].mla,
-                              mla_dims);
-      DBuf dhidden_f32(d, DType::kF32, {T, H}, normed.data());
-      DBuf dhidden(d, DType::kBF16, {T, H});
-      vt::CastBf16(d.q, dhidden.t(), dhidden_f32.t());
-      DBuf dattn_bf16(d, DType::kBF16, {T, H});
-      Tensor attn_t = dattn_bf16.t();
-      DBuf mla_kv_cache(d, DType::kBF16, {1, mla_block_size, mla_head_size});
-      Tensor kv_cache_t = mla_kv_cache.t();
-      const mla::MlaBlockMetadata& lmeta =
-          sparse_active ? sparse_meta : mla_step.meta;
-      mla::ForwardMlaAttentionBlock(d, mla_dims, mw, dhidden.t(),
-                                     mla_step.positions, kv_cache_t,
-                                     mla_step.slot_mapping, lmeta,
-                                     mla_impl, attn_t,
-                                     /*attn_pre_o_proj=*/nullptr,
-                                     shared_ptr);
-      // ForwardMlaAttentionBlock creates internal DBuf temporaries that are
-      // destroyed when it returns, returning memory to the pool. Without a
-      // sync, CUDA kernels may still be running when that memory is reused,
-      // causing an illegal memory access. Sync the queue so all MLA kernels
-      // complete before any subsequent allocation can reuse the memory.
-      d.b.Synchronize(d.q);
-      DBuf dattn_f32(d, DType::kF32, {T, H});
-      vt::CastF32(d.q, dattn_f32.t(), dattn_bf16.t());
-      attn_out.assign(static_cast<size_t>(T * H), 0.0F);
-      dattn_f32.Download(d, attn_out.data());
     }
     if (static_cast<int64_t>(attn_out.size()) != T * H)
       Fail("attention output size mismatch");

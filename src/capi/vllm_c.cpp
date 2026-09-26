@@ -51,6 +51,7 @@
 #include "vllm/model_executor/models/kev_inference.h"      // KevInference (v28)
 #include "vllm/model_executor/models/laya_inference.h"      // LayaInference (v28)
 #include "vllm/model_executor/models/cua_s1_inference.h"    // CuaS1ScoreInference (v28)
+#include "vllm/model_executor/models/clm_inference.h"        // ClmInference (v29)
 #include "vllm/entrypoints/openai/systemone.h"  // shared SystemOne helpers (v28)
 #include "vllm/model_executor/models/minimax_h3.h"    // mux argv (v12)
 #include "vllm/multimodal/parakeet_transcription.h"     // vllm_transcribe (v11)
@@ -1711,17 +1712,18 @@ VLLM_API vllm_status vllm_decide(vllm_engine* engine,
   const bool is_kev = (arch == "KevModel");
   const bool is_laya = (arch == "LayaModel");
   const bool is_cua_s1 = (arch == "CuaS1Forms");
-  if (!is_kev && !is_laya && !is_cua_s1) {
+  const bool is_clm = (arch == "ClmModel");
+  if (!is_kev && !is_laya && !is_cua_s1 && !is_clm) {
     SetError(
         "vllm_decide: this engine's architecture is '" + arch +
-        "', not 'KevModel', 'LayaModel', or 'CuaS1Forms'; "
+        "', not 'KevModel', 'LayaModel', 'CuaS1Forms', or 'ClmModel'; "
         "use vllm_complete / vllm_embed");
     return VLLM_ERR_INVALID_ARGUMENT;
   }
   namespace so = vllm::entrypoints::openai::systemone;
 
-  if (is_kev || is_laya) {
-    // ── Decision pipeline (kev / laya) ──
+  if (is_kev || is_laya || is_clm) {
+    // ── Decision pipeline (kev / laya / clm) ──
     nlohmann::ordered_json body;
     try {
       body = nlohmann::ordered_json::parse(request_json);
@@ -1753,6 +1755,12 @@ VLLM_API vllm_status vllm_decide(vllm_engine* engine,
           dr.scores = std::move(result.scores);
           dr.act_logits = std::move(result.act_logits);
           dr.prompt_tokens = result.prompt_tokens;
+        } else if (is_clm) {
+          vllm::ClmDecisionResult result =
+              vllm::ClmInference(model, tokenizer, parsed.text,
+                                  q.type, q.instructions, options);
+          dr.scores = std::move(result.scores);
+          dr.prompt_tokens = result.prompt_tokens;
         } else {
           vllm::LayaDecisionResult result =
               vllm::LayaInference(model, tokenizer, parsed.text,
@@ -1762,7 +1770,9 @@ VLLM_API vllm_status vllm_decide(vllm_engine* engine,
           dr.prompt_tokens = result.prompt_tokens;
         }
         total_tokens += dr.prompt_tokens;
-        answers[q.id] = so::BuildSystemOneAnswerDecision(q, dr);
+        answers[q.id] = is_clm
+            ? so::BuildSystemOneAnswerClm(q, dr)
+            : so::BuildSystemOneAnswerDecision(q, dr);
       }
       auto end = std::chrono::steady_clock::now();
       double latency_ms =

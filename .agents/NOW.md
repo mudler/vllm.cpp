@@ -1,6 +1,6 @@
 # NOW — the one-Read resume surface
 
-<!-- now-updated: 2026-09-03 -->
+<!-- now-updated: 2026-09-25 -->
 
 Snapshot, not log. History is git; evidence:
 [parity ledger](parity-ledger.md), and benchmarks. Budget: 100 lines / 6,000
@@ -57,7 +57,12 @@ unanchored by design, and whoever takes it files the issue then. Also at
 4. **Invocation-parity prevention:** CI guard + checklist; build-verify
    `kGemvHeuristicAlgos` on dgx.
 5. **Restore `local-ai-worker`** on dgx at campaign end (`--restart=always`).
-6. **Protocol substrate — partly done.** Triage/audit + `STATUS.md` ratchet +
+6. **MiMoV2 port + EXL3 generalisation** (C13, 2026-09-25): specs filed
+   ([mimov2.md](specs/mimov2.md) + [quant-exl3-generalise.md](specs/quant-exl3-generalise.md)),
+   local issues created. Ready to start implementation: W1 (registry +
+   config + KV-cache spec) first. The EXL3 generalisation can proceed in
+   parallel — it does not depend on the model port.
+7. **Protocol substrate — partly done.** Triage/audit + `STATUS.md` ratchet +
    `AGENTS.md` tiering DONE. REMAINING: anchor backfill (6 model rows need a
    DECISION); record-era rollover BLOCKED on `DONE` rows bound to
    `parity-ledger.md` LINE anchors (re-anchor by ROW ID).

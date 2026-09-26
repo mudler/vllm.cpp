@@ -899,6 +899,8 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/gliner2_weights.cpp
   src/vllm/model_executor/models/gliner2_registry.cpp
   src/vllm/model_executor/models/gliner2_ner.cpp
+  src/vllm/model_executor/models/gliner25_decide_head.cpp
+  src/vllm/model_executor/models/gliner25_decide_registry.cpp
   src/vllm/model_executor/models/cua_s1.cpp
   src/vllm/model_executor/models/cua_s1_weights.cpp
   src/vllm/model_executor/models/cua_s1_registry.cpp

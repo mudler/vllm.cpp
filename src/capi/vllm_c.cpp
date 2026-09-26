@@ -51,6 +51,7 @@
 #include "vllm/model_executor/models/kev_inference.h"      // KevInference (v28)
 #include "vllm/model_executor/models/laya_inference.h"      // LayaInference (v28)
 #include "vllm/model_executor/models/cua_s1_inference.h"    // CuaS1ScoreInference (v28)
+#include "vllm/model_executor/models/gliner25_decide_inference.h"  // Gliner25DecideInference (v29)
 #include "vllm/entrypoints/openai/systemone.h"  // shared SystemOne helpers (v28)
 #include "vllm/model_executor/models/minimax_h3.h"    // mux argv (v12)
 #include "vllm/multimodal/parakeet_transcription.h"     // vllm_transcribe (v11)
@@ -1711,17 +1712,18 @@ VLLM_API vllm_status vllm_decide(vllm_engine* engine,
   const bool is_kev = (arch == "KevModel");
   const bool is_laya = (arch == "LayaModel");
   const bool is_cua_s1 = (arch == "CuaS1Forms");
-  if (!is_kev && !is_laya && !is_cua_s1) {
+  const bool is_gliner25_decide = (arch == "SpanExtractor");
+  if (!is_kev && !is_laya && !is_cua_s1 && !is_gliner25_decide) {
     SetError(
         "vllm_decide: this engine's architecture is '" + arch +
-        "', not 'KevModel', 'LayaModel', or 'CuaS1Forms'; "
+        "', not 'KevModel', 'LayaModel', 'CuaS1Forms', or 'SpanExtractor'; "
         "use vllm_complete / vllm_embed");
     return VLLM_ERR_INVALID_ARGUMENT;
   }
   namespace so = vllm::entrypoints::openai::systemone;
 
-  if (is_kev || is_laya) {
-    // ── Decision pipeline (kev / laya) ──
+  if (is_kev || is_laya || is_gliner25_decide) {
+    // ── Decision pipeline (kev / laya / gliner25_decide) ──
     nlohmann::ordered_json body;
     try {
       body = nlohmann::ordered_json::parse(request_json);
@@ -1752,6 +1754,12 @@ VLLM_API vllm_status vllm_decide(vllm_engine* engine,
                                   q.type, q.instructions, options);
           dr.scores = std::move(result.scores);
           dr.act_logits = std::move(result.act_logits);
+          dr.prompt_tokens = result.prompt_tokens;
+        } else if (is_gliner25_decide) {
+          vllm::Gliner25DecideResult result =
+              vllm::Gliner25DecideInference(model, tokenizer, parsed.text,
+                                             q.type, q.instructions, options);
+          dr.scores = std::move(result.scores);
           dr.prompt_tokens = result.prompt_tokens;
         } else {
           vllm::LayaDecisionResult result =

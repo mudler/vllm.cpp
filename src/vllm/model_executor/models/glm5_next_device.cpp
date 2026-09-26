@@ -114,13 +114,6 @@ void Linear(const float* w, const float* x, int64_t out_features,
   }
 }
 
-// Device-resident f32 weight view. On CPU this aliases the host bytes (host-
-// pointer aliasing is a CPU property); on CUDA it would need a staging upload
-// (the production path uses ResidentWeight for that — not wired here yet).
-inline Tensor WF32(const Dev& d, const std::vector<float>& v,
-                   const std::vector<int64_t>& shape) {
-  return MakeTensor(const_cast<float*>(v.data()), DType::kF32, d.q.device, shape);
-}
 
 // Standalone RMSNorm on device: upload [T,H], vt::RmsNorm (float acc), download.
 // The host reference uses double accumulation; the device kernel uses float.

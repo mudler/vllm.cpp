@@ -234,6 +234,37 @@ void DumpSlotCensus(const char* label);
 // W4d W3: release consumer shadows whose rows match the warm forward's
 // shape (recipe-gated via VT_TT_RELEASE_WARM_ROWS; see the ops-side comment).
 void ReleaseWarmShapeSlots(uint32_t rows);
+// TT-27B-STEP-DECOMPOSE (VT_TT_STEP_PHASES): the captured decode step's
+// host-side phase clock. READ-ONLY instrument — it brackets existing calls
+// and reads existing counters, touches no numeric surface, and the anchor's
+// token stream is byte-identical with the knob set (the row's gate 1). Zero
+// cost when the env is unset: every entry point is a getenv compare.
+//  - StepPhasesEnabled/StepPhaseMode: the knob and its raw value ("1" = the
+//    per-step phase lines; "sync" additionally enables the per-layer probe).
+//  - StepPhaseNoteLaunch: record the pending launch timestamp (the trace
+//    replay enqueue inside TraceReplayGraph, or an eager forward's last
+//    enqueue) so the FIRST blocking host read after it can report the step's
+//    completion wait.
+//  - StepPhaseReadBegin/End: bracket the blocking read (EnsureHostBytes'
+//    to_vector); End prints the per-read sync line and consumes the pending
+//    launch. A read with no pending launch reports its own duration (an
+//    eager path's device tail).
+//  - DeviceDramFreeBytes: free DRAM across banks — the per-step retention
+//    read-out (the ~950 MB/request staircase, tt-metal#57970).
+//  - StepPhaseSyncProbe: a blocking queue drain on a persistent 1-element
+//    device tensor, so the per-layer sampling probe (VT_TT_STEP_PHASES=sync)
+//    can report true per-layer DEVICE time on the eager pass. The probe
+//    tensor is created on first use OUTSIDE capture and never freed (#1486).
+//  - TraceCaptureActive: is a trace capture open right now (the layer probe
+//    is inert during capture — a readback inside the region is prohibited).
+bool StepPhasesEnabled();
+const char* StepPhaseMode();
+void StepPhaseNoteLaunch(const char* kind);
+void StepPhaseReadBegin();
+void StepPhaseReadEnd(int64_t bytes);
+int64_t DeviceDramFreeBytes();
+void StepPhaseSyncProbe();
+bool TraceCaptureActive();
 #else
 inline int64_t KeepQuantCaptureStagingWrites() { return 0; }
 inline void ResetKeepQuantCaptureStagingWritesForTest() {}
@@ -252,6 +283,14 @@ inline void StageWeightBf16ForTest(const Tensor&, MeshDevice&) {}
 inline void StageKeepQuantWordsFor(const Tensor&) {}
 inline void DumpSlotCensus(const char*) {}
 inline void ReleaseWarmShapeSlots(uint32_t) {}
+inline bool StepPhasesEnabled() { return false; }
+inline const char* StepPhaseMode() { return ""; }
+inline void StepPhaseNoteLaunch(const char*) {}
+inline void StepPhaseReadBegin() {}
+inline void StepPhaseReadEnd(int64_t) {}
+inline int64_t DeviceDramFreeBytes() { return 0; }
+inline void StepPhaseSyncProbe() {}
+inline bool TraceCaptureActive() { return false; }
 #endif
 
 // ITEM 5 (rope): driver-side warm hook — populate the persistent device
